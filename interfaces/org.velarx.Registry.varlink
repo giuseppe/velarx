@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The interface org.velarx.Registry: the calls about a repository of a
+# registry (its tags, a search, a login) and the download of a URL, served by the registry fetcher
+# (velarx-registry) on its socket beside the fetcher and pusher interfaces,
+# and by no other fetcher.  Generated from the Rust types
+# (crates/content/src/fetcher/proto.rs and crates/content/src/serve_fetch.rs) by
+# the test `interface_tests::the_registry_interface_file_is_current`:
+# VELARX_WRITE_INTERFACES=1 cargo test -p velarx-content --lib interface_tests writes it.
+#
+# A call names its repository and carries its own credentials: the JSON of a
+# `RegistryAccess` in a sealed memory file, a descriptor `Remote.access` names
+# (at most 1048576 bytes).  `Tags` and `Search` answer one item a reply
+# (at most `max_answer` of GetInfo); their last reply has no item.  A descriptor
+# is a field of type `int` whose value is its position among the descriptors
+# of its message.  The Authorization of a registry goes to that registry's host
+# only.  Closing the connection cancels the call.
+# Who may call: a peer of the same user or root (SO_PEERCRED); any
+# accepted peer may make every call.
+
+interface org.velarx.Registry
+
+# The repository a call of `org.velarx.Registry` is about, how it is
+# reached and who it is reached as.  No secret is in the message: the
+# credentials, certificates and auth file contents are the JSON of a
+# `RegistryAccess` in the sealed memory file `access`, a descriptor of the
+# call.
+type Remote (
+	# `registry/name`, with no tag or digest
+	repository: string,
+	# Whether TLS is verified (default: yes); when the asker says no for a
+	# registry that registries.conf does not mark insecure, only the
+	# credentials of the call are used
+	tls_verify: ?bool,
+	# The credentials: the position of a sealed memory file among the
+	# descriptors of the call; none: the fetcher's own
+	access: ?int
+)
+
+# A repository a search found.
+type Hit (name: string, description: string, stars: int, official: bool, automated: bool)
+
+# What kind of failure, for the party that reads it: what to do next.
+type FailureClass (
+	# This party does not have the item or cannot serve it now; nothing
+	# is wrong: the engine asks the next one
+	unavailable,
+	# It tried and failed in a way that may pass (a timeout, a cut
+	# connection, a server error): the engine asks the next one; the
+	# call may be tried again
+	transient,
+	# What it brought, or what it was handed, is not what it claims (a
+	# digest, a size, a table of contents): the operation fails and names
+	# this party; nobody else is asked
+	invalid,
+	# The origin says the item does not exist; from a party that is not
+	# the origin it is read as `unavailable`
+	not_found,
+	# Credentials missing or refused: the engine may `Renew` and ask again
+	unauthorized,
+	# The credentials were taken and do not allow it
+	forbidden,
+	# No space where the bytes go
+	no_space,
+	# It tried and failed for good (also what a value this side does not
+	# know is read as)
+	failed
+)
+
+# Why something failed.
+type Failure (class: FailureClass, reason: string)
+
+# Who serves the repository calls and what it can do.
+method GetInfo() -> (
+	name: string,
+	# The version of the package
+	version: string,
+	# The version of the protocol (1)
+	proto: int,
+	# Words; a client ignores those it does not know
+	capabilities: []string,
+	# Named limits (`max_objects`, `max_wants`, ...); a client ignores those it does not know
+	limits: [string]int
+)
+
+# The tags of the repository, every page of them.  Called with
+# `more`: one `tag` a reply, at most `max`, then a last reply
+# without one.
+method Tags(remote: Remote, max: int) -> (tag: ?string)
+
+# A search of the registry of `remote` for `needle` (the v1 search
+# where the registry has one, else its catalog; the fetcher
+# decides).  Called with `more`: one `hit` a reply, at most
+# `limit`, then a last reply without one.
+method Search(remote: Remote, needle: string, limit: int) -> (hit: ?Hit)
+
+# Whether the registry takes the credentials of `remote`; `Failed`
+# of class `unauthorized` or `forbidden` is a refusal.
+method Login(remote: Remote) -> ()
+
+# An http or https GET of `url` (a lookaside signature, an import,
+# an ADD of a build, a remote build context) into `file`, a file
+# with no name the engine made, open for writing, among the
+# descriptors of the call; at most `max` bytes.  No scope is
+# needed.  `modified`: the Last-Modified the server said.
+method Download(url: string, max: int, file: int) -> (
+	length: int,
+	media_type: ?string,
+	# The Last-Modified the server said
+	modified: ?string
+)
+
+# A request the registry fetcher does not take: a text too long, a
+# descriptor that is not what the call says, a URL that is not http or
+# https
+error InvalidArgument (reason: string)
+
+# The body of a `Download` is larger than `max`
+error TooLarge (max: int)
+
+# The call failed: what kind, and why
+error Failed (failure: Failure)

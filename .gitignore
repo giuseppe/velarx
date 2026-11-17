@@ -1,0 +1,8 @@
+/target
+.velarx-dev.mk
+/dist
+/share
+*.profraw
+/THIRD-PARTY-LICENSES
+__pycache__/
+/crates/*/fuzz/Cargo.lock

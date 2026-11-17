@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-graph"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The storage driver interface of velarx: the trait, its types, the stopped container view and the conformance suite"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# What a storage driver implements and the engine calls, without the engine:
+# a driver that lives in a package of its own depends on this one (the
+# conformance suite, behind the `conformance` feature, is what it registers
+# with in its tests).  The drivers and `storage_driver::open` are in
+# velarx-core.
+
+[lib]
+name = "velarx_graph"
+path = "src/lib.rs"
+doctest = false
+
+[features]
+# the conformance suite (`velarx_graph::conformance`): every driver's tests
+conformance = ["dep:futures", "dep:velarx-registry", "velarx-registry/net", "dep:velarx-registry-lib"]
+
+[dependencies]
+bytes.workspace = true
+velarx-base = { path = "../base" }
+velarx-sys = { path = "../sys" }
+velarx-types = { path = "../types" }
+velarx-wire = { path = "../wire" }
+velarx-proto = { path = "../proto", default-features = false }
+velarx-config = { path = "../config" }
+velarx-db = { path = "../db" }
+velarx-storage = { path = "../storage" }
+velarx-content = { path = "../content" }
+velarx-registry-lib = { path = "../registry-lib", optional = true }
+# (what the conformance suite serves blobs with ranges to)
+velarx-registry = { path = "../registry", optional = true }
+velarx-fuse = { path = "../fuse" }
+async-trait.workspace = true
+base64.workspace = true
+futures = { workspace = true, optional = true }
+hex.workspace = true
+libc.workspace = true
+rustix = { workspace = true, features = ["fs", "process", "mount", "event", "pipe", "time"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+# `blocking` (block_in_place); velarx-content already brings it with these
+# features, so no new package
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "net", "io-util"] }
+thiserror.workspace = true
+tracing.workspace = true
+xattr.workspace = true
+
+[dev-dependencies]
+# what the suite uses, for the tests of this package (it is compiled there
+# without the feature)
+futures.workspace = true
+velarx-registry = { path = "../registry" }
+
+[lints]
+workspace = true

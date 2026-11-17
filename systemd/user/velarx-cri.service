@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# The CRI of a user (rootless): a frontend of the engine of the user, which
+# its socket (velarx-engine.socket) starts.  It confines itself (Landlock,
+# seccomp).
+[Unit]
+Description=Velarx CRI (Kubernetes container runtime interface)
+Documentation=man:velarx(1) man:velarx.conf(5)
+Requires=velarx-cri.socket velarx-engine.socket
+After=velarx-cri.socket velarx-engine.socket
+
+# started by a connection after each end: no start limit
+StartLimitIntervalSec=0
+[Service]
+ExecStart=/usr/bin/velarx-cri
+Restart=on-failure
+RestartSec=1
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target
+Also=velarx-cri.socket

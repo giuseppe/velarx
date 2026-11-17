@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-registry-bin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The binary velarx-registry"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+build = "../../base/build-support/bin.rs"
+
+# The registry fetcher, a binary of its own beside velarx (as the frontends
+# are): the engine finds it next to itself (or
+# where `[pull] registry_path` says) and starts it; it holds the registry
+# credentials, talks to the registries through its confined pull workers
+# (`velarx-registry pull-worker`, this binary again) and serves the fetcher
+# interfaces on its socket.  A package apart from the library so that the
+# commit of `--version` reaches nothing but the link (see crates/bin).
+[[bin]]
+name = "velarx-registry"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+velarx-registry-lib = { path = ".." }
+velarx-base = { path = "../../base" }
+velarx-config = { path = "../../config" }
+velarx-sys = { path = "../../sys" }
+velarx-wire = { path = "../../wire" }
+anyhow.workspace = true
+
+[lints]
+workspace = true

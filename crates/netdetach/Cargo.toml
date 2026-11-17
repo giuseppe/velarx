@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-netdetach"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The release of the network of a container: the teardown the engine and the monitor of the container both run"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Reads the database through `velarx_db::sync::Access`, undoes what the setup
+# did with `velarx-netkernel`.  Blocking, no async runtime.
+
+[lib]
+name = "velarx_netdetach"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+velarx-sys = { path = "../sys" }
+velarx-base = { path = "../base" }
+velarx-types = { path = "../types" }
+velarx-wire = { path = "../wire" }
+velarx-proto = { path = "../proto", default-features = false, features = ["proxy"] }
+velarx-config = { path = "../config" }
+velarx-db = { path = "../db" }
+velarx-nsid = { path = "../nsid" }
+velarx-netkernel = { path = "../netkernel" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+rustix = { workspace = true, features = ["fs", "net", "process", "rand", "thread"] }
+tracing.workspace = true
+hex.workspace = true
+sha2.workspace = true
+tokio-rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

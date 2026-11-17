@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cfg
+data:
+  k: v
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  annotations:
+    io.podman.annotations.ulimit/c: nofile=10:10
+spec:
+  template:
+    spec:
+      initContainers:
+      - name: i
+        image: alpine:3
+        command: [true]
+      containers:
+      - name: c
+        image: alpine
+        args: ["sleep", "1"]
+        env:
+        - {name: A, valueFrom: {configMapKeyRef: {name: cfg, key: k}}}
+        ports: [{containerPort: 80, hostPort: 8080}]
+        resources: {limits: {memory: 64Mi, cpu: 500m}}
+        volumeMounts: [{name: v, mountPath: /v, subPath: a}]
+      volumes:
+      - name: v
+        persistentVolumeClaim: {claimName: data}

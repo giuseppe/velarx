@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The runtime of the velarx engine: the container runtime, the monitor, networks, user namespaces, CDI devices"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Below the services (velarx-core): an edit of the services rebuilds them
+# and the frontends, not this package.
+
+[lib]
+name = "velarx_runtime"
+path = "src/lib.rs"
+doctest = false
+
+[features]
+default = ["fuse"]
+# the monitor serves root file systems through FUSE; without it only
+# composefs images are available
+fuse = []
+
+[dependencies]
+velarx-sys = { path = "../sys", features = ["tokio", "seccompiler"] }
+velarx-base = { path = "../base" }
+velarx-types = { path = "../types" }
+velarx-wire = { path = "../wire" }
+velarx-proto = { path = "../proto", default-features = false, features = ["proxy"] }
+velarx-config = { path = "../config", features = ["engine"] }
+velarx-db = { path = "../db" }
+velarx-nsid = { path = "../nsid" }
+velarx-netkernel = { path = "../netkernel" }
+velarx-netdetach = { path = "../netdetach" }
+velarx-storage = { path = "../storage" }
+velarx-storage-client = { path = "../storage-client" }
+velarx-graph = { path = "../graph" }
+velarx-content = { path = "../content" }
+velarx-fuse = { path = "../fuse" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process", "net", "signal", "fs", "io-util", "io-std"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+toml.workspace = true
+rusqlite.workspace = true
+zlink = { workspace = true, features = ["tokio", "proxy", "service", "tracing"] }
+rustix = { workspace = true, features = ["mount", "fs", "termios", "process", "net", "rand", "event", "pipe", "pty", "stdio", "thread"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["std", "fmt", "ansi", "json"] }
+thiserror.workspace = true
+async-trait.workspace = true
+sha2.workspace = true
+hex.workspace = true
+libc.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+base64.workspace = true
+oci-spec.workspace = true
+landlock.workspace = true
+seccompiler.workspace = true
+tempfile.workspace = true
+yaml-rust2.workspace = true
+
+[dev-dependencies]
+velarx-storage = { path = "../storage", features = ["test-support"] }
+rand.workspace = true
+
+[lints]
+workspace = true

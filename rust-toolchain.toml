@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# The toolchain of CI and of a rustup checkout.  Raise it together with the
+# `rust-version` of Cargo.toml and the fixes of the new lints of its clippy.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

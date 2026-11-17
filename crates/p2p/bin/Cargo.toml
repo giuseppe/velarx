@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-p2p-bin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The binary velarx-p2p"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+build = "../../base/build-support/bin.rs"
+
+# The binary of the package velarx-p2p, apart from it so that the commit of
+# `--version` reaches nothing but the link (see crates/bin).  It also holds
+# the tests that run the binary.
+[[bin]]
+name = "velarx-p2p"
+path = "src/main.rs"
+test = false
+
+[[test]]
+name = "security"
+path = "tests/security.rs"
+
+[dependencies]
+velarx-p2p = { path = ".." }
+velarx-base = { path = "../../base" }
+velarx-config = { path = "../../config" }
+velarx-wire = { path = "../../wire" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util"] }
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rustix = { workspace = true, features = ["process"] }
+
+[lints]
+workspace = true

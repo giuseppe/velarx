@@ -1,0 +1,1 @@
+{"version":"1.0.0","hook":{"path":"/bin/true","args":["true"],"timeout":5},"when":{"always":true,"annotations":{"a":"b"},"commands":["sh"]},"stages":["prestart","poststop"]}

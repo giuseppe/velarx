@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-sys"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The only code of velarx that is unsafe: small safe wrappers of system calls"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Every other package forbids `unsafe`.  What cannot be done by the safe
+# interfaces of rustix and std is here, as a function that is safe to call
+# and carries the one `// SAFETY:` comment that says why.  It depends on
+# libc and rustix only (seccompiler with the feature of that name, for the
+# confined workers), so that the thin client can use it.
+
+[lib]
+name = "velarx_sys"
+path = "src/lib.rs"
+doctest = false
+
+[features]
+# `fd::register`: a descriptor in the reactor of tokio
+tokio = ["dep:tokio"]
+# `confine::seccompiler_program`: a seccompiler filter that refuses x32 calls
+seccompiler = ["dep:seccompiler"]
+# `ruleset`: the one builder of Landlock rulesets
+landlock = ["dep:landlock"]
+
+[dependencies]
+tokio = { workspace = true, features = ["net"], optional = true }
+libc.workspace = true
+seccompiler = { workspace = true, optional = true }
+landlock = { workspace = true, optional = true }
+rustix = { workspace = true, features = ["fs", "process", "net", "pipe", "thread", "mount", "stdio", "event", "mm", "termios"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"

@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Fail when a feature probe is kept by hand.  What the kernel and the tools of
+# this boot can do is kept as `<feature>-yes` / `<feature>-no` marker files in
+# the `features` directory of the run root, and only crates/runtime/src/
+# monitor/features.rs makes or reads them.  In the other Rust sources (their
+# code, not their comments or their `#[cfg(test)]` modules, which may name
+# the markers they check; tests/, fuzz/ and vendor/ are not looked at):
+#   - `FEATURES_DIR`, a `"features"` path component (`.join("features")`,
+#     `"features/x"`, `"run/features/x"`) or a `const` that is `"features"`
+#     (a hand made marker directory),
+#   - a string literal that ends in `-yes` or `-no` (a marker name, or the
+#     suffix of a copy of the helper: `"x-yes"`, `"-no"`, `"{name}-yes"`),
+# is an error; and the name given to `features::cached` must be a string
+# literal, or a `const` of the same file, in lowercase kebab-case
+# (`^[a-z0-9]+(-[a-z0-9]+)*$`) not ending in `-yes` or `-no`.
+#   tools/check-features            check the tracked sources
+#   tools/check-features FILE...    check these files (as if not the helper)
+import os
+import re
+import subprocess
+import sys
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(root)
+
+HELPER = "crates/runtime/src/monitor/features.rs"
+SKIP = re.compile(r"^(?:vendor|tests|fuzz)/")
+name_ok = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+by_hand = re.compile(
+    r'FEATURES_DIR|\.join\(\s*"features"\s*\)|"(?:[^"\s]*/)?features/[^"\s]*"'
+    r'|\bconst\s+\w+\s*:\s*&(?:\'static\s+)?str\s*=\s*"features"'
+)
+suffix = re.compile(r'"(?!--)[^"\s]*-(?:yes|no)"')
+call = re.compile(r"\b(?:features::)?cached\(")
+
+
+def strip_comments(text):
+    """TEXT with its comments blanked (lines kept), strings left whole."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append("\n" * text.count("\n", i, j))
+            i = j
+        elif c == "r" and re.match(r'r#*"', text[i:]) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            hashes = re.match(r'r(#*)"', text[i:]).group(1)
+            j = text.find('"' + hashes, i + len(hashes) + 2)
+            j = n if j < 0 else j + 1 + len(hashes)
+            out.append(text[i:j])
+            i = j
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i : j + 1])
+            i = j + 1
+        elif c == "'" and re.match(r"'(?:\\.|[^\\'])'", text[i:]):
+            m = re.match(r"'(?:\\.|[^\\'])'", text[i:])
+            out.append(m.group(0))
+            i += len(m.group(0))
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def without_test_modules(code):
+    """CODE (comments stripped) with its `#[cfg(test)] mod x { ... }` blanked."""
+    while True:
+        m = re.search(r"#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{", code)
+        if not m:
+            return code
+        depth, j = 0, m.end() - 1
+        while j < len(code):
+            c = code[j]
+            if c == '"':
+                j += 1
+                while j < len(code) and code[j] != '"':
+                    j += 2 if code[j] == "\\" else 1
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        code = code[: m.start()] + "\n" * code.count("\n", m.start(), j + 1) + code[j + 1 :]
+
+
+def second_argument(code, start):
+    """The second argument of the call whose `(` is at START, stripped."""
+    depth, args, cur, j = 0, [], [], start
+    while j < len(code):
+        c = code[j]
+        if c == '"':
+            k = j + 1
+            while k < len(code) and code[k] != '"':
+                k += 2 if code[k] == "\\" else 1
+            cur.append(code[j : k + 1])
+            j = k + 1
+            continue
+        if c in "([{":
+            depth += 1
+            if depth == 1:
+                j += 1
+                continue
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append("".join(cur))
+                break
+        elif c == "," and depth == 1:
+            args.append("".join(cur))
+            cur = []
+            if len(args) == 2:
+                break
+            j += 1
+            continue
+        cur.append(c)
+        j += 1
+    return args[1].strip() if len(args) > 1 else None
+
+
+def check(path, text, problems, is_helper):
+    code = strip_comments(text)
+    line_of = lambda pos: code.count("\n", 0, pos) + 1
+    body = without_test_modules(code)
+    if not is_helper:
+        for n, line in enumerate(body.splitlines(), 1):
+            if by_hand.search(line) or suffix.search(line):
+                problems.append(f"{path}:{n}: a marker by hand, use monitor::features::cached: {line.strip()[:90]}")
+    consts = dict(re.findall(r'\bconst\s+(\w+)\s*:\s*&(?:\'static\s+)?str\s*=\s*"([^"]*)"', code))
+    # (another function of that name, in a file that does not use the helper)
+    if "features" not in body:
+        return
+    for m in call.finditer(body):
+        if body[: m.start()].rstrip().endswith("fn"):
+            continue
+        arg = second_argument(body, m.end() - 1)
+        if arg is None:
+            continue
+        lit = re.fullmatch(r'"([^"\\]*)"', arg)
+        name = lit.group(1) if lit else consts.get(arg)
+        if name is None:
+            problems.append(f"{path}:{line_of(m.start())}: the feature name `{arg}` is not a string literal or a const of this file")
+        elif not name_ok.match(name) or name.endswith(("-yes", "-no")):
+            problems.append(f"{path}:{line_of(m.start())}: `{name}` is not a feature name (lowercase kebab-case, no -yes/-no)")
+
+
+def main():
+    explicit = sys.argv[1:]
+    if explicit:
+        files = explicit
+    else:
+        files = subprocess.check_output(["git", "ls-files", "-z", "*.rs"]).decode().split("\0")[:-1]
+        files = [f for f in files if not SKIP.match(f)]
+    problems = []
+    for path in files:
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        # (the helper spells the suffix and the directory; its calls are checked)
+        check(path, text, problems, is_helper=path == HELPER and not explicit)
+    if problems:
+        sys.exit("\n".join(problems) + "\nfeatures are kept by crates/runtime/src/monitor/features.rs only (tools/check-features)")
+    print(f"{len(files)} Rust files, features kept by the helper only")
+
+
+main()

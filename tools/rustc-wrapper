@@ -1,0 +1,43 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# The repository's rustc wrapper (.cargo/config.toml, build.rustc-wrapper):
+# cargo calls it as `tools/rustc-wrapper RUSTC ARGS...`. It runs the compiler
+# through the kache build cache when kache is installed, and the plain
+# compiler otherwise, so a machine without kache builds unchanged.
+#
+# Bypass the cache for one command with KACHE=0 (or KACHE_DISABLED=1, which
+# kache itself reads). kache is looked up in PATH, then ~/.local/bin and
+# ~/.cargo/bin; KACHE_BIN=/path/to/kache names one explicitly.
+#
+# RUSTC_WRAPPER in the environment overrides the config file, and then this
+# script is not used at all.
+#
+# It is a bash script, not a POSIX sh one: dash (the /bin/sh of Debian and
+# Ubuntu) drops from the environment of its children the variables whose
+# names are not valid shell names, and cargo passes CARGO_BIN_EXE_velarx-client
+# to rustc this way: `env!("CARGO_BIN_EXE_...")` of a test then fails to compile.
+
+case "${KACHE:-}" in
+0 | false | no | off) exec "$@" ;;
+esac
+case "${KACHE_DISABLED:-}" in
+1 | true | yes | on) exec "$@" ;;
+esac
+
+kache=${KACHE_BIN:-}
+if [ -z "$kache" ]; then
+  kache=$(command -v kache 2>/dev/null) || kache=
+fi
+if [ -z "$kache" ]; then
+  for d in "${HOME:-/nonexistent}/.local/bin" "${HOME:-/nonexistent}/.cargo/bin"; do
+    if [ -x "$d/kache" ]; then
+      kache=$d/kache
+      break
+    fi
+  done
+fi
+
+if [ -n "$kache" ] && [ -x "$kache" ]; then
+  exec "$kache" "$@"
+fi
+exec "$@"

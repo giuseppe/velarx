@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Velarx P2P overlay network
+Documentation=man:velarx-p2p(8) man:velarx.conf(5)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/velarx-p2p overlay
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=velarx
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+# The identity of the overlay node (identity_path of [overlay] in p2p.toml):
+# its peer id, and so the subnet it takes, outlive a restart and a boot
+StateDirectory=velarx/p2p
+StateDirectoryMode=0700
+
+# The overlay node is a member of a swarm of its own, apart from the content
+# service (velarx-p2p.service): it carries the packets of the containers and
+# the gossip of their subnets and names, and nothing of the layers.  It
+# needs its socket in /run/velarx/services (p2p-network.sock, the varlink
+# interface org.velarx.Network of the overlay network), its configuration and
+# swarm key (read), the network, and nothing else.  The overlay network's veth
+# pairs, routes, sysctls, packet sockets and the containers' network
+# namespaces are the job of the overlay helper, a process the node starts
+# before it confines itself (velarx-p2p overlay-helper): the unit lets it
+# have CAP_NET_ADMIN, CAP_NET_RAW, CAP_NET_BIND_SERVICE (port 53 of the DNS)
+# and CAP_SYS_ADMIN (setns into the network namespace the engine passes: the
+# kernel asks for it), the netlink and packet sockets, its mount namespace
+# and setns.  The node itself drops every capability and confines itself further
+# (Landlock, seccomp: crates/p2p/src/sandbox.rs); the helper keeps only those
+# capabilities, under seccomp, in a read-only mount namespace.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_ADMIN
+ProtectSystem=strict
+ReadWritePaths=/run/velarx
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=all
+RestrictNamespaces=net mnt
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_PACKET
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @module @reboot @swap @clock @debug @obsolete @cpu-emulation
+# what the node needs to confine itself (capabilities, limits, Landlock,
+# seccomp), and what the helper needs (the containers' namespaces); a call
+# the filter refuses fails, it does not kill
+SystemCallFilter=capset prlimit64 setrlimit landlock_create_ruleset landlock_add_rule landlock_restrict_self seccomp
+SystemCallFilter=setns mount mount_setattr unshare
+SystemCallErrorNumber=EPERM
+
+# What the process may hold (its tables of peers and names, its connections,
+# the packets that wait) is bounded by the unit: a node that goes over is
+# stopped and started again.
+MemoryMax=1G
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target

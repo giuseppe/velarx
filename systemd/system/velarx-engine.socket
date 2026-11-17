@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Velarx engine socket (org.velarx.Engine)
+Documentation=man:velarx(1) man:velarx.conf(5)
+
+[Socket]
+# The varlink interface of the engine, for the frontends (velarx-api, the
+# CRI): a connection starts the engine, which leaves when it has been idle
+# for [engine] idle_exit seconds.  Whoever can connect controls the engine.
+ListenStream=/run/velarx/engine/engine.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=root
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

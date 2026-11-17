@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Stands in for velarx-monitor in the tests of the spawn: `--varlink-fd N
+# DIR` writes what the process has inherited into DIR (a file of the
+# repository, never written by a test: no ETXTBSY from another test's fork).
+d="$3"
+cat /proc/self/cgroup > "$d/cgroup"
+ls /proc/self/fd > "$d/fds"
+readlink /proc/self/fd/0 > "$d/stdin"
+for n in 3 4 5 6 7; do if [ -e /proc/self/fd/$n ]; then
+  echo "$n $(readlink /proc/self/fd/$n)"; fi; done > "$d/out"

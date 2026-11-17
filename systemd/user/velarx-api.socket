@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# The API socket of a user (rootless): a connection starts velarx-api, whose
+# first request starts the engine through its own socket.
+[Unit]
+Description=Velarx REST API socket
+Documentation=man:velarx-api(8) man:velarx.conf(5)
+
+[Socket]
+ListenStream=%t/velarx/velarx.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

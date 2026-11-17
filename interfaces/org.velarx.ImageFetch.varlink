@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# What the image server of a container of a lazily pulled image asks the
+# engine that holds the pull for.  Generated from the Rust types
+# (crates/content/src/imagefetch.rs and crates/core/src/image_fetch.rs) by the
+# test `image_fetch::tests::the_interface_file_is_current`:
+# VELARX_WRITE_INTERFACES=1 cargo test -p velarx-core --lib image_fetch writes it.
+#
+# ONE CONNECTION.  The image server knows no fetcher.  It gives the connection
+# its image with Open (the id and the token of its pull), once.  For a file
+# that is in neither the store nor the staging of the pull it asks Miss, and holds the
+# lookup of the file until the reply.  The engine brings the file through
+# its own list of fetchers; the reply means it has its name.  The image server
+# then opens it and takes the kernel's fs-verity measure: nothing the engine
+# says is believed beyond that measure.
+#
+# THE SOCKET.  <services>/image-fetch/engine, ONE for the store, bound by the
+# engine service of the store (velarx varlink) while it runs, and bound again
+# by the next one.  Client and server run as the same user.  The token of the
+# pull is handed to the image server at its start.  A profile is a sealed
+# memory file of digests, one a line, which carries no length.  A descriptor
+# is a field of type `int` whose value is its position among the
+# descriptors of its message.
+#
+# WHEN NO ENGINE ANSWERS.  A miss is EIO for the container until the next
+# command starts the engine service; the files that are there are served as
+# before.
+# Who may call: a peer of the same user or root (SO_PEERCRED); any
+# accepted peer may make every call.
+
+interface org.velarx.ImageFetch
+
+# What kind of failure, for the party that reads it: what to do next.
+type FailureClass (
+	# This party does not have the item or cannot serve it now; nothing
+	# is wrong: the engine asks the next one
+	unavailable,
+	# It tried and failed in a way that may pass (a timeout, a cut
+	# connection, a server error): the engine asks the next one; the
+	# call may be tried again
+	transient,
+	# What it brought, or what it was handed, is not what it claims (a
+	# digest, a size, a table of contents): the operation fails and names
+	# this party; nobody else is asked
+	invalid,
+	# The origin says the item does not exist; from a party that is not
+	# the origin it is read as `unavailable`
+	not_found,
+	# Credentials missing or refused: the engine may `Renew` and ask again
+	unauthorized,
+	# The credentials were taken and do not allow it
+	forbidden,
+	# No space where the bytes go
+	no_space,
+	# It tried and failed for good (also what a value this side does not
+	# know is read as)
+	failed
+)
+
+# Why something failed.
+type Failure (class: FailureClass, reason: string)
+
+# Who serves the interface and what it can do.
+method GetInfo() -> (
+	name: string,
+	# The version of the package
+	version: string,
+	# The version of the protocol (1)
+	proto: int,
+	# Words; a client ignores those it does not know
+	capabilities: []string,
+	# Named limits (`max_objects`, `max_wants`, ...); a client ignores those it does not know
+	limits: [string]int
+)
+
+# Give the connection its image: `image` (its id) and `token`, the
+# token of its pull the image server was handed at its start.
+# Once, before any other call but GetInfo; `Refused` for a wrong
+# token.
+method Open(image: string, token: string) -> ()
+
+# The file `digest` (its fs-verity digest) of the layer `layer`
+# (the key of the layer as the pull names it) is in neither the
+# store nor the staging of the pull: bring it.  The reply comes
+# when it has its name; `Failed` when it cannot (the reader gets
+# EIO).
+method Miss(layer: string, digest: string) -> ()
+
+# The startup profile of the image: digests of files, one a line,
+# at most `max` bytes, in `file`, a sealed memory file in the
+# reply.
+method GetProfile(max: int) -> (file: int)
+
+# A call before `Open`, an `Open` twice
+error NotScoped (reason: string)
+
+# Not the token of the pull; a layer that is not of the pull
+error Refused (reason: string)
+
+error InvalidArgument (reason: string)
+
+# `party`: the fetcher that failed or gave invalid content (`invalid`)
+error Failed (failure: Failure, party: ?string)

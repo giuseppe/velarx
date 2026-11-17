@@ -1,0 +1,252 @@
+//! Modern Linux mount API support for composefs.
+//!
+//! This module provides functionality to mount composefs images using the
+//! new mount API (fsopen/fsmount) with overlay filesystem support and
+//! fs-verity verification.
+
+use std::{
+    io::Result,
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
+};
+
+use rustix::{
+    mount::{
+        FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, fsconfig_create,
+        fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, move_mount,
+    },
+    path,
+};
+
+use crate::{
+    mountcompat::{
+        make_erofs_mountable, overlayfs_set_fd, overlayfs_set_lower_and_data_fds, prepare_mount,
+    },
+    util::proc_self_fd,
+};
+
+/// A handle to a filesystem context created via the modern mount API.
+///
+/// This represents an open filesystem context (created by `fsopen()`) that can be
+/// configured and then mounted. The handle automatically reads and prints any
+/// error messages from the kernel when dropped.
+#[derive(Debug)]
+pub struct FsHandle {
+    /// The file descriptor for the filesystem context.
+    pub fd: OwnedFd,
+}
+
+impl FsHandle {
+    /// Opens a new filesystem context for the specified filesystem type.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the filesystem type (e.g., "erofs", "overlay")
+    ///
+    /// # Returns
+    ///
+    /// Returns a new `FsHandle` that can be configured and mounted.
+    pub fn open(name: &str) -> Result<FsHandle> {
+        Ok(FsHandle {
+            fd: fsopen(name, FsOpenFlags::FSOPEN_CLOEXEC)?,
+        })
+    }
+}
+
+impl AsFd for FsHandle {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl Drop for FsHandle {
+    fn drop(&mut self) {
+        let mut buffer = [0u8; 1024];
+        loop {
+            match rustix::io::read(&self.fd, &mut buffer) {
+                Err(_) => return, // ENODATA, among others?
+                Ok(0) => return,
+                // Surface the kernel's fsopen/fsconfig diagnostic messages,
+                // which are only readable from this fd. We have no error
+                // channel from `drop`, so stderr is the only option.
+                #[allow(clippy::print_stderr)]
+                Ok(size) => eprintln!("{}", String::from_utf8(buffer[0..size].to_vec()).unwrap()),
+            }
+        }
+    }
+}
+
+/// Moves a mounted filesystem to a target location.
+///
+/// # Arguments
+///
+/// * `fs_fd` - File descriptor for the mounted filesystem (from `fsmount()`)
+/// * `dirfd` - Directory file descriptor for the target mount point
+/// * `path` - Path relative to `dirfd` where the filesystem should be mounted
+///
+/// # Returns
+///
+/// Returns `Ok(())` on success, or an error if the mount operation fails.
+pub fn mount_at(
+    fs_fd: impl AsFd,
+    dirfd: impl AsFd,
+    path: impl path::Arg,
+) -> rustix::io::Result<()> {
+    move_mount(
+        fs_fd.as_fd(),
+        "",
+        dirfd.as_fd(),
+        path,
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )
+}
+
+/// Mounts an erofs image file.
+///
+/// Creates a read-only erofs mount from the provided image file descriptor.
+/// On older kernels, this may involve creating a loopback device.
+///
+/// # Arguments
+///
+/// * `image` - File descriptor for the erofs image file
+///
+/// # Returns
+///
+/// Returns a file descriptor for the mounted filesystem, which can be used with
+/// `mount_at()` or other mount operations.
+pub fn erofs_mount(image: OwnedFd) -> Result<OwnedFd> {
+    let image = make_erofs_mountable(image)?;
+    let erofs = FsHandle::open("erofs")?;
+    fsconfig_set_flag(erofs.as_fd(), "ro")?;
+    fsconfig_set_string(erofs.as_fd(), "source", proc_self_fd(&image))?;
+    fsconfig_create(erofs.as_fd())?;
+    Ok(fsmount(
+        erofs.as_fd(),
+        FsMountFlags::FSMOUNT_CLOEXEC,
+        MountAttrFlags::empty(),
+    )?)
+}
+
+/// Controls fs-verity enforcement for overlay file data.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum VerityRequirement {
+    /// Do not require fs-verity.
+    #[default]
+    Disabled,
+    /// Require fs-verity; fail if the kernel does not support it.
+    Required,
+    /// Try to enable fs-verity; silently continue if unsupported.
+    Try,
+}
+
+/// Options controlling how a composefs image is mounted.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct MountOptions {
+    /// Overlay upper layer and work directory: (upperdir, workdir).
+    upperdirs: Option<(OwnedFd, OwnedFd)>,
+    read_write: bool,
+    /// User namespace file descriptor for ID-mapped mounts.
+    idmap_fd: Option<OwnedFd>,
+}
+
+impl MountOptions {
+    /// Add an overlayfs upper layer and work directory to the mount.
+    pub fn set_overlay(&mut self, upperdir: OwnedFd, workdir: OwnedFd) -> &mut Self {
+        self.upperdirs = Some((upperdir, workdir));
+        self
+    }
+
+    /// Make the mount read-write (only meaningful with an overlay).
+    pub fn set_read_write(&mut self, read_write: bool) -> &mut Self {
+        self.read_write = read_write;
+        self
+    }
+
+    /// Set a user namespace file descriptor for ID-mapped mounts.
+    pub fn set_idmap(&mut self, fd: OwnedFd) -> &mut Self {
+        self.idmap_fd = Some(fd);
+        self
+    }
+
+    /// Whether an overlay upper layer was configured.
+    pub fn has_overlay(&self) -> bool {
+        self.upperdirs.is_some()
+    }
+
+    /// Whether the mount should be read-write.
+    pub fn read_write(&self) -> bool {
+        self.read_write
+    }
+
+    /// Consume the options, returning the overlay fds if set.
+    pub fn into_overlay(self) -> Option<(OwnedFd, OwnedFd)> {
+        self.upperdirs
+    }
+}
+
+/// Creates a composefs mount using overlayfs with an erofs image and base directories.
+///
+/// This mounts a composefs image by creating an overlayfs that layers the erofs image
+/// (as the lower layer) over base directories (as data layers). The overlayfs is
+/// configured with metacopy and redirect_dir enabled for composefs functionality.
+///
+/// # Arguments
+///
+/// * `image` - File descriptor for the composefs erofs image
+/// * `name` - Name for the mount source (appears as "composefs:{name}")
+/// * `basedirs` - File descriptors for the base directories containing actual file data
+/// * `verity` - Whether and how to enforce fs-verity verification for overlay files
+/// * `options` - Mount options controlling overlay and read-write behaviour
+///
+/// # Returns
+///
+/// Returns a file descriptor for the mounted composefs filesystem, which can be used
+/// with `mount_at()` to attach it to a mount point.
+pub fn composefs_fsmount(
+    image: OwnedFd,
+    name: &str,
+    basedirs: &[BorrowedFd<'_>],
+    verity: VerityRequirement,
+    options: &MountOptions,
+) -> Result<OwnedFd> {
+    let erofs_mnt = erofs_mount(image)?;
+    if let Some(idmap_fd) = &options.idmap_fd {
+        composefs_ioctls::mount::mount_setattr_idmap(erofs_mnt.as_fd(), idmap_fd.as_fd())?;
+    }
+    let erofs_mnt = prepare_mount(erofs_mnt)?;
+
+    let overlayfs = FsHandle::open("overlay")?;
+    fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;
+    fsconfig_set_string(overlayfs.as_fd(), "metacopy", "on")?;
+    fsconfig_set_string(overlayfs.as_fd(), "redirect_dir", "on")?;
+    match verity {
+        VerityRequirement::Disabled => {}
+        VerityRequirement::Required => {
+            fsconfig_set_string(overlayfs.as_fd(), "verity", "require")?;
+        }
+        VerityRequirement::Try => {
+            match fsconfig_set_string(overlayfs.as_fd(), "verity", "require") {
+                Ok(()) => {}
+                Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOSYS) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    if let Some((upperdir, workdir)) = &options.upperdirs {
+        overlayfs_set_fd(overlayfs.as_fd(), "upperdir", upperdir.as_fd())?;
+        overlayfs_set_fd(overlayfs.as_fd(), "workdir", workdir.as_fd())?;
+    }
+    overlayfs_set_lower_and_data_fds(&overlayfs, &erofs_mnt, basedirs)?;
+    fsconfig_create(overlayfs.as_fd())?;
+
+    let mount_attr = if options.read_write {
+        MountAttrFlags::empty()
+    } else {
+        MountAttrFlags::MOUNT_ATTR_RDONLY
+    };
+    Ok(fsmount(
+        overlayfs.as_fd(),
+        FsMountFlags::FSMOUNT_CLOEXEC,
+        mount_attr,
+    )?)
+}

@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Velarx store service
+Documentation=man:velarx(1) man:velarx.conf(5)
+Requires=velarx-store.socket
+After=velarx-store.socket
+
+[Service]
+# The socket comes from the .socket unit (LISTEN_FDS); the service leaves
+# when it has had no connection for a minute, and the next one starts it
+# again.  It runs without the daemon.
+ExecStart=/usr/bin/velarx store-service --idle-exit 60
+# (it ends with an error when it cannot follow the store any more)
+Restart=on-failure
+RestartSec=5
+# What it needs: the socket (from the .socket unit), the store (read and
+# write: the database, the objects, the startup profiles, the shares of
+# checkpoints), its configuration, and nothing else: no network, no
+# capabilities, no devices.  A store that is not in the default place is
+# added with a drop-in (ReadWritePaths=).
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# (the store of a user: $XDG_DATA_HOME/velarx)
+ReadWritePaths=-%h/.local/share/velarx

@@ -1,0 +1,33 @@
+# Multistage build used by tests/e2e/bats/api/build.bats.
+ARG BASE=localhost:5000/alpine:chunked
+
+FROM $BASE AS builder
+ARG MSG=default
+RUN echo "built $MSG" > /built.txt && \
+    mkdir -p /out && \
+    echo artifact > /out/artifact
+RUN ["/bin/sh", "-c", "echo exec-form > /out/exec"]
+
+FROM scratch AS assets
+COPY assets/ /assets/
+
+FROM ${BASE}
+LABEL org.example.test="yes" org.example.other=2
+ENV GREETING=hello APP_HOME=/app
+ENV LEGACY legacy value
+WORKDIR $APP_HOME
+COPY --from=builder /built.txt /out/ ./
+COPY --from=assets /assets/asset.txt ./
+COPY files/ ./files/
+COPY --chown=1000:1000 --chmod=640 hello.txt owned.txt
+ADD archive.tar.gz /app/extracted/
+ADD hello.txt /app/added.txt
+RUN echo "$GREETING from $(pwd)" > greeting.txt && rm /etc/motd && touch /tmp/x
+SHELL ["/bin/sh", "-e", "-c"]
+RUN test "$LEGACY" = "legacy value"
+USER 1000
+EXPOSE 8080 9090/udp
+VOLUME /data
+STOPSIGNAL SIGINT
+ENTRYPOINT ["/bin/sh", "-c"]
+CMD ["cat /app/greeting.txt"]

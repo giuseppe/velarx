@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-p2p"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The peer-to-peer service of velarx: libp2p, QUIC and the overlay network"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "velarx_p2p"
+path = "src/lib.rs"
+doctest = false
+
+[[test]]
+name = "p2p"
+path = "tests/p2p/main.rs"
+
+# The scenarios of the simulator (src/sim): they run only with its feature
+[[test]]
+name = "sim"
+path = "tests/sim/main.rs"
+required-features = ["sim"]
+
+[features]
+# The deterministic simulator of the peer layer, for tests and debugging:
+# not in the service (it needs the paused clock of tokio's test support)
+sim = ["tokio/test-util"]
+
+[dependencies]
+velarx-sandbox = { path = "../sandbox" }
+velarx-sys = { path = "../sys", features = ["tokio", "seccompiler", "landlock"] }
+velarx = { path = "../..", features = ["engine"] }
+velarx-base = { path = "../base" }
+velarx-config = { path = "../config" }
+velarx-content = { path = "../content" }
+velarx-core = { path = "../core" }
+velarx-proto = { path = "../proto", default-features = false, features = ["proxy"] }
+velarx-runtime = { path = "../runtime", default-features = false }
+velarx-netkernel = { path = "../netkernel" }
+velarx-netdetach = { path = "../netdetach" }
+velarx-types = { path = "../types" }
+velarx-storage = { path = "../storage" }
+velarx-fuse = { path = "../fuse" }
+
+# chunk transfer between peers over QUIC (quic.rs)
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+time = { version = "0.3", default-features = false }
+libp2p = { version = "0.57", features = [
+    "tokio",
+    "tcp",
+    "noise",
+    "yamux",
+    "kad",
+    "identify",
+    "mdns",
+    "macros",
+    "request-response",
+    "pnet",
+    "ping",
+] }
+ipnet = { version = "2", features = ["serde"] }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process", "net", "signal", "fs", "io-util", "io-std"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+toml.workspace = true
+zlink = { workspace = true, features = ["tokio", "proxy", "service", "tracing"] }
+rustix = { workspace = true, features = ["mount", "fs", "termios", "process", "net", "rand", "event", "pipe", "pty", "stdio", "thread"] }
+libc.workspace = true
+landlock.workspace = true
+clap.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+sha2.workspace = true
+base64.workspace = true
+hmac = "0.13"
+hex.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+velarx-db = { path = "../db" }
+# the log capture of the tests of the DNS answers (velarx_wire::logcapture)
+velarx-wire = { path = "../wire", features = ["test-support"] }
+velarx-registry = { path = "../registry", features = ["engine"] }
+axum = { workspace = true, features = ["tokio", "http1", "query"] }
+# the clock of the pacer tests is paused, not slept
+tokio = { workspace = true, features = ["test-util"] }
+tar.workspace = true
+zstd.workspace = true
+flate2.workspace = true
+openssl.workspace = true
+# The man pages of the service, written from its clap definition
+# (examples/generate-man-p2p.rs, `make man` runs it): only the example links it,
+# the shipped binary does not
+clap_mangen.workspace = true
+rand.workspace = true
+tracing-subscriber = { workspace = true, features = ["std", "fmt", "ansi", "json"] }
+tempfile.workspace = true
+# the in-process registry of tests/integration/common.rs
+# (the TLS registry of tests/integration/common.rs)
+
+[lints]
+workspace = true

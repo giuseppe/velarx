@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# The project of the attached `up` of tests/e2e/bats/api/compose.bats: a job that
+# must complete before the service that depends on it runs and fails.
+name: vxjob
+services:
+  job:
+    image: ${E2E_IMAGE:-localhost:5000/alpine:chunked}
+    command: ["sh", "-c", "echo job-output; sleep 1; exit 0"]
+  failing:
+    image: ${E2E_IMAGE:-localhost:5000/alpine:chunked}
+    command: ["sh", "-c", "echo failing; exit 7"]
+    depends_on:
+      job:
+        condition: service_completed_successfully

@@ -1,0 +1,7 @@
+FROM alpine
+RUN <<EOF
+echo a
+EOF
+COPY <<x /f
+content
+x

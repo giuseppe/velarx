@@ -1,0 +1,119 @@
+Velarx is licensed under the Apache License, version 2.0 (SPDX:
+Apache-2.0, see LICENSE).
+
+Copyright The Velarx Authors.  Contributors keep the copyright of their
+contributions and license them under these terms (Developer Certificate of
+Origin, no assignment); a notice that an author put in a file stays there.
+
+The binaries link the following third-party components under Apache-2.0
+(and many others under permissive licenses; `make licenses-binary` lists
+them all with their texts, as THIRD-PARTY-LICENSES.<binary>):
+oci-spec (velarx, velarx-p2p), openssl, the Rust binding (velarx, velarx-api,
+velarx-p2p), sync_wrapper (velarx, velarx-api, velarx-cri, velarx-p2p),
+rpassword and rtoolbox (velarx, velarx-p2p), prost, prost-types and
+prost-derive (velarx-cri, velarx-p2p), and the system OpenSSL 3 library
+(dynamically).
+
+The tree includes the following third-party material under its own license:
+
+crates/runtime/src/container/seccomp.json
+    The default seccomp profile, from the containers-common project
+    (https://github.com/containers/common, pkg/seccomp/seccomp.json), which
+    derives it from the default profile of Moby/Docker.
+    License: Apache-2.0.
+
+crates/registry/src/shortnames.conf
+    The table of short name aliases of the containers project
+    (https://github.com/containers/shortnames, 000-shortnames.conf, shipped
+    by containers-common).  License: Apache-2.0.
+
+crates/runtime/src/container/apparmor-profile.txt
+    The default AppArmor profile of containers (`velarx-default`), taken
+    from the default profile of the containers-common project
+    (https://github.com/containers/common, pkg/apparmor), which derives it
+    from the default profile of Moby/Docker.  License: Apache-2.0.
+
+crates/runtime/src/container/runtime.rs (the default masked and read-only paths)
+    The lists of paths that the runtime masks or mounts read-only follow
+    those of containers-common (pkg/config, DefaultMaskedPaths and
+    DefaultReadOnlyPaths), which derive them from Moby/Docker.  They are
+    lists of kernel paths and the default capability set in
+    crates/runtime/src/container/caps.rs is a list of capability names; both
+    are given for attribution.  License: Apache-2.0.
+
+vendor/zlink-core
+    zlink-core 0.7.1 (https://github.com/z-galaxy/zlink), the varlink
+    library, with these changes: in src/unix_utils.rs a descriptor
+    received over a socket is close-on-exec and a truncated control
+    message is an error; in src/connection/{read,write}_connection.rs the
+    trace messages no longer print the varlink messages (they carry
+    registry credentials and secrets), only their direction and size; in
+    src/connection/read_connection.rs the descriptors of a read go with
+    the message its last byte is in, and a call is taken with either form
+    of "no parameters" (`{}` or none), and a reply is read by a probe of
+    its kind (its `error` member) and then as the error or the reply,
+    instead of an untagged enum, with the reading of a message out of the
+    generic code (and in write_connection.rs the end of a written one); in
+    src/server/mod.rs a call that does not match its method is answered
+    InvalidParameter before the connection is closed; in
+    src/connection/{read,write}_connection.rs the buffers grow by doubling;
+    in src/varlink_service/interface_description.rs a description can be
+    a given text; in src/connection/{mod,read_connection,write_connection}.rs
+    the sending of a call, the growth of the buffer and the trace are out
+    of the generic code and the members of a reply are read before its
+    parameters, so that the code of a call that depends on its type is
+    its serialization and the decoding of its reply; in
+    src/connection/{socket,chain/reply_stream}.rs the stream of the
+    replies of a call with more is Send.
+    Copyright 2025 Zeeshan Ali Khan. License: MIT.
+
+vendor/zlink-idl
+    zlink-idl 0.7.1 (https://github.com/z-galaxy/zlink), the varlink
+    interface description types, with this change: src/field.rs,
+    custom_object.rs, error.rs, method.rs and type/mod.rs write a record,
+    an error, an inline object or the parameters of a method that have
+    comments one field a line, the comments above their field, and
+    src/comment.rs writes an empty comment as `#` (the parser and the
+    tests of the crate are kept, three of the tests, in interface.rs and
+    parse/tests.rs, expect the new layout).  Copyright 2025 Zeeshan Ali
+    Khan. License: MIT.
+
+vendor/zlink-macros
+    zlink-macros 0.7.1 (https://github.com/z-galaxy/zlink), the macros of
+    the varlink library, with this change: src/service/{attrs,codegen}.rs
+    the attribute `description` of the service macro gives the text of the
+    interface descriptions, and the generated descriptors exist only in the
+    tests (the tests and the dev-dependencies of the crate are not
+    vendored), and src/utils.rs the comment of a doc attribute loses the
+    space that follows its `///` (it was written twice).  Copyright 2025
+    Zeeshan Ali Khan. License: MIT.
+
+vendor/tar
+    tar 0.4.46 (https://github.com/composefs/tar-rs, from alexcrichton/tar-rs),
+    the tar reader and writer, with these changes: in src/archive.rs and
+    src/entry.rs the pieces of the map of an old GNU sparse entry are a
+    VecDeque of at most 32768, and src/entry.rs has
+    `Entry::take_sparse_blocks`, which drops the holes of such an entry and
+    returns where its data goes (the tests, the examples and the
+    dev-dependencies of the crate are not vendored).  Copyright Alex Crichton
+    and the tar-rs contributors.  License: MIT OR Apache-2.0.
+
+vendor/composefs
+    composefs 0.9.4 (https://github.com/containers/composefs-rs), the EROFS
+    images and fs-verity digests of composefs, with this change: the hashes
+    of src/digest.rs are the sha2 crate's instead of OpenSSL's (the tests
+    and the dev-dependencies of the crate are not vendored).  Copyright the
+    composefs-rs contributors.  License: MIT OR Apache-2.0.
+
+crates/cri/proto/runtime/v1/api.proto
+    The Container Runtime Interface (runtime.v1) of Kubernetes, vendored
+    unchanged from k8s.io/cri-api v0.37.0
+    (https://github.com/kubernetes/cri-api, pkg/apis/runtime/v1/api.proto).
+    Copyright 2020 The Kubernetes Authors. License: Apache-2.0. The gRPC
+    code that `velarx-cri` generates from it carries the same license.
+
+crates/cri/src/spdy_dictionary.bin
+    The dictionary of the header compression of SPDY/3 (the 1423 bytes the
+    SPDY/3 specification defines), taken from the table of
+    github.com/moby/spdystream (spdy/dictionary.go, Copyright 2013 The Go
+    Authors, BSD-3-Clause license).

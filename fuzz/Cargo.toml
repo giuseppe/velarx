@@ -1,0 +1,213 @@
+# SPDX-License-Identifier: Apache-2.0
+# Fuzz targets of the parsers that take untrusted bytes, for
+# cargo-fuzz: `cargo fuzz run TARGET -- -max_total_time=60` here, or
+# `cargo fuzz list`.  Each target is a function of velarx::fuzzing; the
+# seeds are in corpus/TARGET (what libFuzzer adds there is ignored by git:
+# keep an input by giving it a name).  tests/integration/fuzz_corpus.rs replays the
+# corpora and mutates the seeds in `cargo test`.
+#
+# cargo-fuzz needs a nightly compiler (RUSTC_BOOTSTRAP=1 with a stable one)
+# and a C++ compiler for libFuzzer; `-s none` builds without the address
+# sanitizer, much faster for a crate of this size (the targets are safe
+# Rust: a panic is what they find).
+[package]
+name = "velarx-fuzz"
+version = "0.1.0"
+publish = false
+license = "Apache-2.0"
+edition = "2021"
+authors = ["The Velarx Authors"]
+repository = "https://github.com/giuseppe/velarx"
+homepage = "https://github.com/giuseppe/velarx"
+rust-version = "1.99"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+velarx = { path = "..", features = ["fuzzing"] }
+velarx-kube = { path = "../crates/kube" }
+
+# not a member of the package above
+[workspace]
+members = ["."]
+
+# (a workspace of its own: the [patch] of the root Cargo.toml, here too;
+# `tools/check-patches` compares the two)
+[patch.crates-io]
+zlink-core = { path = "../vendor/zlink-core" }
+zlink-macros = { path = "../vendor/zlink-macros" }
+zlink-idl = { path = "../vendor/zlink-idl" }
+tar = { path = "../vendor/tar" }
+composefs = { path = "../vendor/composefs" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "tar"
+path = "fuzz_targets/tar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sparse"
+path = "fuzz_targets/sparse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tarsplit"
+path = "fuzz_targets/tarsplit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multipart"
+path = "fuzz_targets/multipart.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "digest"
+path = "fuzz_targets/digest.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "toc"
+path = "fuzz_targets/toc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "challenge"
+path = "fuzz_targets/challenge.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registries_conf"
+path = "fuzz_targets/registries_conf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy"
+path = "fuzz_targets/policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "containerfile"
+path = "fuzz_targets/containerfile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_line"
+path = "fuzz_targets/request_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yaml"
+path = "fuzz_targets/yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kube_play"
+path = "fuzz_targets/kube_play.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive"
+path = "fuzz_targets/archive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openpgp"
+path = "fuzz_targets/openpgp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sigstore"
+path = "fuzz_targets/sigstore.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fetcher"
+path = "fuzz_targets/fetcher.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fetcher_reply"
+path = "fuzz_targets/fetcher_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cdi"
+path = "fuzz_targets/cdi.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hooks"
+path = "fuzz_targets/hooks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_body"
+path = "fuzz_targets/api_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "monitor_call"
+path = "fuzz_targets/monitor_call.rs"
+test = false
+doc = false
+bench = false

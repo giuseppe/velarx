@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# Start at boot the rootless containers whose restart policy says so:
+# `always`, and `unless-stopped` ones that their user did not stop (podman's
+# podman-restart.service).  The user manager runs at boot with lingering
+# (`loginctl enable-linger`).
+[Unit]
+Description=Velarx: start the containers with a restart policy at boot
+Wants=velarx-user-wait-network-online.service
+After=velarx-user-wait-network-online.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/bin/velarx container start --service --all --filter should-start-on-boot=true
+ExecStop=/usr/bin/velarx container stop --all --service
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,82 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Make the source tarball of the checked out commit and its checksums.
+#
+#   tools/dist [DIR]
+#
+# DIR (default dist/ of the source tree; a relative DIR is one of the
+# current directory) gets velarx-VERSION.tar.gz (git archive of HEAD, under
+# the directory velarx-VERSION/, with a .git-commit file that gives the
+# build the commit and the time without a repository) and SHA256SUMS.  The
+# tarball is the same bytes whenever it is made from the same commit.  The
+# tree must be clean: what is archived is what is committed.
+#
+# DIST_CHECK=0 skips the last step, which unpacks the tarball into a
+# directory without a repository, builds velarx-monitor from it (debug,
+# CARGO_TARGET_DIR if set) and fails unless `velarx-monitor --version` names
+# the commit.  DIST_LICENSES=0 skips the THIRD-PARTY-LICENSES.BINARY files
+# that go into DIR/licenses (tools/licenses-binary).  CARGO is the cargo command.
+set -eu
+
+top=$(cd "$(dirname "$0")/.." && pwd)
+out=${1:-$top/dist}
+case $out in /*) ;; *) out=$PWD/$out ;; esac
+cd "$top"
+CARGO=${CARGO:-cargo}
+
+[ -z "$(git status --porcelain)" ] || {
+    echo "tools/dist: the working tree is not clean" >&2
+    exit 1
+}
+# the version of the workspace, which every package inherits
+version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+[ -n "$version" ] || {
+    echo "tools/dist: no version in Cargo.toml" >&2
+    exit 1
+}
+commit=$(git describe --always)
+epoch=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}
+name=velarx-$version
+
+mkdir -p "$out"
+out=$(cd "$out" && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+printf '%s\n%s\n' "$commit" "$epoch" > "$work/.git-commit"
+git archive --format=tar --prefix="$name/" --add-file="$work/.git-commit" HEAD |
+    gzip -n -9 > "$out/$name.tar.gz"
+(cd "$out" && sha256sum "$name.tar.gz" > SHA256SUMS)
+echo "$out/$name.tar.gz"
+cat "$out/SHA256SUMS"
+
+# The third-party licenses of the crates of each binary, to go with the
+# binaries of the release (DIST_LICENSES=0 skips them).
+if [ "${DIST_LICENSES:-1}" != 0 ]; then
+    mkdir -p "$out/licenses"
+    CARGO="$CARGO" tools/licenses-binary "$out/licenses"
+fi
+
+[ "${DIST_CHECK:-1}" = 0 ] && exit 0
+(cd "$out" && sha256sum -c SHA256SUMS)
+mkdir "$work/src"
+# -m: the files get the time of now, not that of the commit, so that cargo
+# does not take an earlier build in CARGO_TARGET_DIR of a later commit for
+# this one
+tar -xmzf "$out/$name.tar.gz" -C "$work/src"
+[ ! -e "$work/src/$name/.git" ] || {
+    echo "tools/dist: the tarball holds a .git" >&2
+    exit 1
+}
+# The unpacked tree is not inside the checkout: $work is in the temporary
+# directory.  The target directory is the caller's, so that the cache of the
+# dependencies is used.
+(cd "$work/src/$name" && $CARGO build --locked --bin velarx-monitor)
+target=${CARGO_TARGET_DIR:-$work/src/$name/target}
+got=$("$target/debug/velarx-monitor" --version)
+want="velarx-monitor $version ($commit)"
+[ "$got" = "$want" ] || {
+    echo "tools/dist: --version says '$got', expected '$want'" >&2
+    exit 1
+}
+echo "ok: $got"

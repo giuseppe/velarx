@@ -1,0 +1,299 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The interface of fetchers: a process that brings the
+# content of images into the staging directories of a store.  Every fetcher
+# serves it; nothing in it names a kind of fetcher.  Generated from the Rust
+# types (crates/content/src/fetcher/fetch.rs and crates/content/src/serve_fetch.rs)
+# by the test `serve_fetch::tests::the_interface_file_is_current`:
+# VELARX_WRITE_INTERFACES=1 cargo test -p velarx-content --lib serve_fetch writes it.
+#
+# ONE FETCHER.  A fetcher answers only for itself: what it does not have is
+# unavailable, what it tried and could not bring is failed, with a class that says what to do next.  It knows nothing
+# of other fetchers; the engine walks its ordered list of them, and is the
+# one that asks the next.  Every item of a call is answered exactly once.
+#
+# THE STAGING DIRECTORY OF A LAYER.  A directory open for reading (not O_PATH) on
+# the file system of the store, made by the engine, one per layer.  A fetcher
+# resolves every path beneath it with openat2(RESOLVE_BENEATH |
+# RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV) and uses
+# incoming/ (files with no name), files/ab/cd... (the files of the layer, named
+# after fs-verity was enabled, by the digest the table of contents gives), and
+# toc.claim and tarsplit (only for a layer without a table of contents).
+# A built-in fetcher may also be confined, at its start, to the staging
+# root of its store; that is its sandbox, not part of this interface: an
+# external fetcher reaches a layer's staging only through the descriptor
+# of `Layer`.
+#
+# THE OBJECT CONTRACT.  A file is written into a file with no name, each chunk
+# checked against the sha256 the table of contents gives for it; the file is
+# closed for writing; fs-verity is enabled on it (when the scope says verity);
+# its mode is 0444; then it is given its name with linkat, never replacing.  A
+# name that exists is success.  A fetcher syncs nothing, removes no name,
+# writes nowhere else, and never reads the store: the chunks of the store it
+# may take (`reuse` of Fetch, only for a fetcher that announces the word
+# reuse) come in one file the engine made of exactly those bytes, read-only.
+#
+# TRUST.  A fetcher is not trusted.  A name it made is a claim; the engine opens
+# it and takes the kernel's measure.  What it returns with GetManifest,
+# GetBlob, GetProfile and Probe is hashed by the engine before it is used.
+#
+# CAPABILITIES.  What a fetcher can do is a word of capabilities in GetInfo; a
+# client ignores the words it does not know; what it cannot do without is a
+# word of requires in Open, refused with NotSupported when unknown.  The
+# interface grows only so: a new parameter or reply field is optional, a new
+# value of an enum of a call is sent only to a fetcher that announces its word,
+# and a value of an enum of a reply that a client does not know is read as
+# the most general one (other, none, unsupported) or ignored (an event).
+#
+# DESCRIPTORS.  A descriptor is a field of type `int` (or `?int` when it may
+# be absent), named after what it is, whose value is its position among the
+# descriptors of its message; at most 16 for a message.  Nothing is
+# counted and nothing is implied by order.  A sealed memory file carries no
+# length: the receiver checks the seals and applies the interface's maximum.
+#
+# REPLIES.  A method called with more answers one record a reply; its last
+# reply carries no record and has continues false (`Fetch`: no event;
+# `Probe`: no probed; `Unpack`: no bytes).  A server whose connection is closed sends nothing
+# more.  `progress` carries `objects` (exactly one) and `bytes`, the cumulative
+# bytes of that object moved by this call; with no object, the cumulative
+# bytes of the blob of the layer; one with no object and no bytes is a beat.
+# Every other method has one reply.
+#
+# LIVENESS.  `Open` carries `idle_ms`.  A call with more sends a reply (a
+# progress when it has nothing else) at least every `idle_ms / 2`; a call with
+# one reply answers within `idle_ms`.  Otherwise the engine closes the
+# connection and records a transient failure, `silent for N ms`, for that
+# party.
+# Who may call: a peer of the same user or root (SO_PEERCRED); any
+# accepted peer may make every call.
+
+interface org.velarx.Fetcher
+
+# How much a request is waited for.  It orders a fetcher's work.
+type Urgency (
+	# The rest of an image that already runs
+	background,
+	# A guess
+	ahead,
+	# A command waits for the image
+	wait,
+	# A process of a container is blocked on it
+	on_demand
+)
+
+# A blob of the image, as the manifest the engine hashed describes it.
+type Blob (
+	digest: string,
+	size: int,
+	media_type: string,
+	# The annotations of its descriptor in the manifest (where a table of
+	# contents is, for zstd:chunked and eStargz)
+	annotations: ?[string]string
+)
+
+# A chunk the store of the engine holds: `length` bytes at `offset` of
+# the descriptor `fd` of the message (a file with no name the engine made
+# of the chunks it hints, read-only; never a file of the store).  A
+# fetcher may take a chunk of a file it writes whose sha256 is `chunk`
+# from there instead of fetching it, after it checked those bytes against
+# `chunk` as it checks every chunk; it may also ignore the hint.
+type Reuse (chunk: string, fd: int, offset: int, length: int)
+
+# How the table of contents of a layer comes.
+type TocSource (
+	# The blob has one (zstd:chunked, eStargz): the reply carries it (the
+	# table, then the tar-split)
+	carried,
+	# It has none: the layer is unpacked whole (`Unpack`), which
+	# gives the files, a table and a tar-split in one pass
+	unpack,
+	# This fetcher cannot bring the layer at all (also what a value this
+	# side does not know is read as)
+	none
+)
+
+# Why a layer cannot be served on demand (the Fetcher's answer to `Probe`,
+# and the engine's `ImageNotLazy`).
+type NotLazy (
+	# The blob has no table of contents (gzip, plain zstd)
+	no_toc,
+	# The origin does not serve ranges of the blob
+	no_ranges,
+	# This fetcher cannot reach the layer
+	unreachable,
+	# A regular file of the table has no fs-verity digest
+	no_file_digests,
+	# A compression or media type the fetcher does not read (also what a
+	# value this side does not know is read as)
+	unsupported
+)
+
+# What kind of failure, for the party that reads it: what to do next.
+type FailureClass (
+	# This party does not have the item or cannot serve it now; nothing
+	# is wrong: the engine asks the next one
+	unavailable,
+	# It tried and failed in a way that may pass (a timeout, a cut
+	# connection, a server error): the engine asks the next one; the
+	# call may be tried again
+	transient,
+	# What it brought, or what it was handed, is not what it claims (a
+	# digest, a size, a table of contents): the operation fails and names
+	# this party; nobody else is asked
+	invalid,
+	# The origin says the item does not exist; from a party that is not
+	# the origin it is read as `unavailable`
+	not_found,
+	# Credentials missing or refused: the engine may `Renew` and ask again
+	unauthorized,
+	# The credentials were taken and do not allow it
+	forbidden,
+	# No space where the bytes go
+	no_space,
+	# It tried and failed for good (also what a value this side does not
+	# know is read as)
+	failed
+)
+
+# Why something failed.
+type Failure (class: FailureClass, reason: string)
+
+# What an event of a `Fetch` tells.
+type EventKind (
+	# `objects` have their names in `files/` of the layer's staging
+	staged,
+	# This fetcher does not have `objects`
+	unavailable,
+	# It tried and failed for `objects`: `failure`
+	failed,
+	# `bytes` of the one object of `objects` are written so far by this
+	# call (of the blob of the layer, for a call with no objects)
+	progress,
+	# (what an event this side does not know is read as: ignored)
+	unknown
+)
+
+# What an event of a `Fetch` carries.
+type FetchEvent (
+	kind: EventKind,
+	# Positions in the call
+	objects: []int,
+	failure: ?Failure,
+	bytes: ?int
+)
+
+# What this fetcher can do for one layer of a `Probe`.
+type Probed (
+	# The position of the layer in the call
+	layer: int,
+	toc: TocSource,
+	# Its files can be fetched one by one, on demand
+	on_demand: bool,
+	# Why not, when `on_demand` is false
+	reason: ?NotLazy,
+	# With `toc` carried: the table of contents and the tar-split, sealed
+	# memory files among the descriptors of this reply
+	toc_file: ?int,
+	tarsplit_file: ?int
+)
+
+# Who the fetcher is and what it can do.
+method GetInfo() -> (
+	name: string,
+	# The version of the package
+	version: string,
+	# The version of the protocol (1)
+	proto: int,
+	# Words; a client ignores those it does not know
+	capabilities: []string,
+	# Named limits (`max_objects`, `max_wants`, ...); a client ignores those it does not know
+	limits: [string]int
+)
+
+# Give the connection its scope; once, before anything but
+# `GetInfo`.  `source`: what the origin's transport names
+# (`registry/name`, `oci:PATH`, `oci-archive:`, `SCHEME://...`);
+# absent for a fetcher that is not the origin.  `tls_verify`
+# (default yes) is how a network origin is reached.  `target`: the
+# origin the client opened, for an origin that is a path (a
+# directory, or a file open for reading).  `access`: the
+# credentials, a sealed memory file.  `idle_ms`: the most this
+# connection's calls stay silent.
+method Open(verity: bool, source: ?string, tls_verify: ?bool, target: ?int, access: ?int, idle_ms: int, requires: []string) -> ()
+
+# Another connection with the scope of this one: the reply carries
+# its descriptor.
+method Connect() -> ()
+
+# Replace the credentials of the scope.
+method Renew(access: int) -> ()
+
+# Tell this fetcher of a layer: `staging` its staging directory,
+# `toc` its table of contents (a sealed memory file).  `Layer`
+# again replaces it; the calls in flight on the one before end as
+# with `Forget`.  A scope keeps at most 1024 layers (`Busy`).
+method Layer(layer: string, staging: int, blob: ?Blob, toc: ?int) -> ()
+
+# Forget the layer: its calls end, later ones are `Refused`.
+method Forget(layer: string) -> ()
+
+# The manifest or index `reference` names (a tag or a digest), at
+# most `max` bytes: `file` a sealed memory file in the reply.  The
+# engine hashes it.
+method GetManifest(reference: string, max: int) -> (file: int, media_type: ?string)
+
+# A small blob (a configuration), its bytes in `file`, a sealed
+# memory file in the reply, which the engine hashes.
+method GetBlob(blob: Blob) -> (file: int)
+
+# The startup profile of the image `image` (its id): digests of
+# files, one a line, in the order the image read them, at most
+# `max` bytes, in `file`, a sealed memory file in the reply.  A
+# fetcher that does not keep profiles answers `Failed` of class
+# `unavailable`.
+method GetProfile(image: string, max: int) -> (file: int)
+
+# What can this fetcher do for `layers`?  Called with `more`: one
+# `probed` a reply, in any order, then a last reply without one.
+method Probe(layers: []Blob) -> (probed: ?Probed)
+
+# Read the whole blob of `layer` (one with no table of contents) and
+# give its files, `toc.claim` and `tarsplit` names in its staging.
+# Called with more: replies with `bytes` (of the blob, read so
+# far), then a last reply without it once the names are given.  A
+# failure is the error `Failed`.
+method Unpack(layer: string, urgency: Urgency) -> (bytes: ?int)
+
+# Bring files of `layer` into its staging directory, by the object
+# contract.  Called with more.  Each object is in exactly one of `staged`,
+# `unavailable`, `failed`; the last reply has no event.  Descriptors:
+# the file of the chunks of the store `reuse` names, by `fd` (the
+# engine made it of exactly those bytes; only for a fetcher that
+# announces `reuse`).
+method Fetch(layer: string, objects: []string, urgency: Urgency, reuse: ?[]Reuse) -> (event: ?FetchEvent)
+
+error InvalidArgument (reason: string)
+
+# A call before `Open`, an `Open` twice
+error NotScoped (reason: string)
+
+# A call this connection may not make; a file that is not of the layer;
+# a layer that was not told (`Layer`) or was forgotten (`Forget`)
+error Refused (reason: string)
+
+# A word of `requires` that is not known
+error NotSupported (feature: string)
+
+# The answer of a `GetManifest`, `GetBlob` or `GetProfile` is larger
+# than `max`
+error TooLarge (max: int)
+
+# No connection for this client now (its limit): asked again after
+# one of its own calls ended, not a fetcher that failed
+error Busy (reason: string)
+
+# Not a directory of a file system that has what the scope asks for
+error BadStaging (reason: string)
+
+# The call failed: what kind, and why
+error Failed (failure: Failure)

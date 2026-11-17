@@ -1,0 +1,5 @@
+target
+corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*
+artifacts
+coverage
+Cargo.lock

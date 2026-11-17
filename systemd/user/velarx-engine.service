@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# The engine of a user (rootless), started by its socket.  The engine runs
+# in a user namespace, as a child of the main process: that child notifies.
+[Unit]
+Description=Velarx engine
+Documentation=man:velarx(1) man:velarx.conf(5)
+Requires=velarx-engine.socket
+After=velarx-engine.socket
+
+# started by a connection after each idle exit: no start limit
+StartLimitIntervalSec=0
+[Service]
+Type=notify
+NotifyAccess=all
+# Started by its socket; it leaves when it has had no client for [engine]
+# idle_exit seconds (30) and no container runs.
+ExecStart=/usr/bin/velarx varlink
+# A reload executes the engine again: its configuration read again, the
+# containers and the socket kept
+ExecReload=/bin/kill -HUP $MAINPID
+Delegate=yes
+# A container or a pull worker the kernel kills for its memory leaves the
+# engine running
+OOMPolicy=continue
+# The containers are in the unit's cgroup (--cgroups=split, the default): a
+# stop or a restart of the unit stops them (see the system unit).
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
+Also=velarx-engine.socket

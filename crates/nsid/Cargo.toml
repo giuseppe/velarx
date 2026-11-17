@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-nsid"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The identity of the namespaces of a boot: file handles, holders, kept in the store's database"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Which namespace a file is (`name_to_handle_at`), which processes live in
+# it, how to open it again (`open_by_handle_at`) and the tables of the store
+# database that keep both per boot.  Any kind of namespace; the user and mount
+# namespaces of the rootless tree are the first.
+
+[lib]
+name = "velarx_nsid"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+velarx-sys = { path = "../sys" }
+velarx-base = { path = "../base" }
+velarx-db = { path = "../db" }
+rusqlite.workspace = true
+rustix = { workspace = true, features = ["fs"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rustix = { workspace = true, features = ["fs", "thread"] }
+
+[lints]
+workspace = true

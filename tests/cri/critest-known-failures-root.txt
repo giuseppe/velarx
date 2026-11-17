@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# critest specs that fail as root against velarx-cri (docs/CRI.md, Conformance): a failure whose
+# line contains one of these strings does not fail tests/cri/critest.sh.
+# None: every spec that can run on this host passes.  Add a spec only when it cannot pass on
+# the host, with the reason in a comment above it.

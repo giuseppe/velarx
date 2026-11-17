@@ -1,0 +1,14 @@
+unqualified-search-registries = ["docker.io", "quay.io"]
+short-name-mode = "enforcing"
+[[registry]]
+prefix = "example.com/foo"
+location = "mirror.example.com/bar"
+insecure = true
+[[registry.mirror]]
+location = "m1.example.com"
+pull-from-mirror = "digest-only"
+[[registry]]
+location = "*.evil.io"
+blocked = true
+[aliases]
+"alpine" = "docker.io/library/alpine"

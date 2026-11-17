@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Velarx engine
+Documentation=man:velarx(1) man:velarx.conf(5)
+Requires=velarx-engine.socket
+After=network.target velarx-engine.socket
+
+# started by a connection after each idle exit: no start limit
+StartLimitIntervalSec=0
+[Service]
+Type=notify
+# The engine is the main process (root does not re-execute itself): only it
+# may notify, never the monitors and containers it starts.
+NotifyAccess=main
+# Started by its socket; it leaves when it has had no client for [engine]
+# idle_exit seconds (30) and no container runs, and the next connection
+# starts it again.
+ExecStart=/usr/bin/velarx varlink
+# A reload executes the engine again: its configuration read again, the
+# containers and the socket kept
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+Delegate=yes
+# A container or a pull worker the kernel kills for its memory leaves the
+# engine running
+OOMPolicy=continue
+# The containers are in the unit's cgroup (--cgroups=split, the default):
+# a stop or a restart of the unit stops them (each monitor stops its
+# container with its stop signal and timeout).  systemd starts a unit in its
+# own cgroup, which cannot hold a process while the cgroups of containers
+# below it use its controllers: containers left running would make the next
+# start fail (EBUSY).  A reload keeps them; with [containers] cgroups =
+# "scope" they are outside the unit and a restart keeps them too.
+KillMode=control-group
+OOMScoreAdjust=-999
+
+# Store file descriptors for graceful restart
+FileDescriptorStoreMax=128
+
+# /run/velarx is the state of the containers that run: it stays when the
+# engine leaves, private to root as in tmpfiles.d
+RuntimeDirectory=velarx
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StateDirectory=velarx
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target
+Also=velarx-engine.socket

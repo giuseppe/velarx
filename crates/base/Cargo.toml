@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-base"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The few stable helpers the other packages of velarx build on"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The foundation of the packages that were split off the engine: small,
+# without a async runtime or any other heavy dependency, and rarely
+# changed.  Anything that changes often belongs in a package above it, or
+# every edit rebuilds everything that depends on this one.
+
+[lib]
+name = "velarx_base"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+rustix = { workspace = true, features = ["fs", "process", "net", "pipe", "thread", "time", "event", "mount", "rand"] }
+thiserror.workspace = true
+velarx-proto = { path = "../proto", default-features = false }
+libc.workspace = true
+velarx-sys = { path = "../sys" }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

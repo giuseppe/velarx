@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-netkernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The kernel and host side of the container networks: netlink, nftables, bridges, DNS records, CNI, the stop of the helper processes"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Everything is blocking, and nothing reads the database: the engine and the
+# monitor of a container run the same code to release a network.
+
+[lib]
+name = "velarx_netkernel"
+path = "src/lib.rs"
+doctest = false
+
+[features]
+# the sample bridge network of the tests of the packages above
+test-support = []
+
+[dependencies]
+velarx-sys = { path = "../sys" }
+velarx-base = { path = "../base" }
+velarx-types = { path = "../types" }
+velarx-wire = { path = "../wire" }
+velarx-nsid = { path = "../nsid" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+rustix = { workspace = true, features = ["fs", "net", "process", "thread", "event", "mount"] }
+libc.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+base64.workspace = true
+hex.workspace = true
+sha2.workspace = true
+rusqlite.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+
+[lints]
+workspace = true

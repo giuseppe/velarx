@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-tarsplit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "tar-split: record a tar stream without its file contents and rebuild it byte for byte, for storage drivers"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Nothing of the engine: a storage driver that keeps the files of a layer in
+# its own way depends on this package to get the layer back as the tar
+# stream it was pulled as.
+
+[lib]
+name = "velarx_tarsplit"
+path = "src/lib.rs"
+doctest = true
+
+[dependencies]
+zstd.workspace = true
+flate2.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tar.workspace = true
+rand.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Peers that stay silent, are slow or send wrong bytes (a damaged store): what
+//! a node accepts is still right, and the layer comes from a peer that has it.
+
+use crate::common::*;
+use std::time::Duration;
+use velarx_p2p::sim::{self, Behavior, NodeConfig};
+
+/// A peer that says it has the layer and never answers does not hold a
+/// pull that another peer can serve.
+#[test]
+fn a_provider_that_never_answers_is_passed_over_for_one_that_does() {
+    for seed in sim::seeds(&[1]) {
+        sim::run(seed, |world| async move {
+            let image = one_layer("silent", 21, 32);
+            let layer = image.layers[0].digest.clone();
+            let announcing = || NodeConfig {
+                announce: true,
+                ..Default::default()
+            };
+            let silent = world.add_node(NodeConfig {
+                behavior: Behavior::Silent,
+                ..announcing()
+            });
+            let holder = world.add_node(NodeConfig {
+                bootstrap: vec![silent.index],
+                ..announcing()
+            });
+            let asker = world.add_node(NodeConfig {
+                bootstrap: vec![silent.index],
+                ..announcing()
+            });
+            settle(30).await;
+            seed_image(&world, holder.index, &image).await;
+            silent.announce_falsely(&[layer]).await;
+            settle(5).await;
+            let t0 = tokio::time::Instant::now();
+            let r = pull(&asker, &image).await;
+            eprintln!(
+                "seed {seed}: the silent peer was passed over: peers {} registry {} in {:?}",
+                r.peer_chunks,
+                r.registry_chunks,
+                t0.elapsed()
+            );
+            assert_eq!(r.registry_chunks, 0, "the honest peer was not used");
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "waited {:?} for the silent peer",
+                t0.elapsed()
+            );
+        });
+    }
+}
+
+/// Peers that claim a layer and answer with bytes that are not its chunks:
+/// the chunks that are kept are right, and the layer comes from the honest
+/// peer that has it, not from the registry.
+#[test]
+fn chunks_a_peer_sends_that_are_not_the_chunks_are_not_kept() {
+    for seed in sim::seeds(&[1, 2]) {
+        sim::run(seed, |world| async move {
+            let image = one_layer("wrong", 23, 32);
+            let layer = image.layers[0].digest.clone();
+            let hub = world.add_node(NodeConfig::default());
+            let liars: Vec<_> = (0..3)
+                .map(|_| {
+                    world.add_node(NodeConfig {
+                        bootstrap: vec![hub.index],
+                        behavior: Behavior::Corrupt,
+                        ..Default::default()
+                    })
+                })
+                .collect();
+            // (the holder tells no filter: the liars, whose filters name the
+            // layer, are asked first)
+            let holder = world.add_node(NodeConfig {
+                bootstrap: vec![hub.index],
+                filter: velarx_p2p::filter::Config {
+                    advertise: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            // (it has these four peers and no others)
+            let known: Vec<usize> = liars.iter().chain([&holder]).map(|n| n.index).collect();
+            let asker = world.add_node(NodeConfig {
+                bootstrap: known,
+                max_outgoing: 4,
+                ..Default::default()
+            });
+            settle(30).await;
+            seed_image(&world, holder.index, &image).await;
+            // (the liars have the chunks, and send them damaged)
+            for l in &liars {
+                seed_image(&world, l.index, &image).await;
+            }
+            for l in &liars {
+                l.announce_falsely(std::slice::from_ref(&layer)).await;
+            }
+            settle(5).await;
+            let r = pull(&asker, &image).await;
+            let asked_liar = asker.live().source.decisions().about(&layer, &[]).iter().any(|d| {
+                d.events.iter().any(|e| matches!(e, velarx_p2p::explain::Event::Asked { peer, .. } if liars.iter().any(|l| l.id() == *peer)))
+            });
+            eprintln!(
+                "seed {seed}: wrong {} peers {} registry {} (a liar was asked: {asked_liar})",
+                r.wrong, r.peer_chunks, r.registry_chunks
+            );
+            assert!(asked_liar, "no liar was asked: the scenario shows nothing");
+            assert_eq!(r.wrong, 0);
+            assert_eq!(r.chunks, 32);
+            // the liars that announced the layer are asked first and sent
+            // damaged chunks: each is replaced by the next candidate, and the
+            // honest holder gives the layer
+            assert!(
+                asker.connected().contains(&holder.id()),
+                "the holder is not a peer of the asker: the scenario shows nothing"
+            );
+            assert!(
+                considered(&asker, &layer, holder.id()),
+                "the honest holder was never a candidate"
+            );
+            assert_eq!(
+                (r.peer_chunks, r.registry_chunks),
+                (32, 0),
+                "the holder did not give the layer"
+            );
+        });
+    }
+}
+
+/// An honest holder that is slow (each answer takes 600 ms) beside a peer
+/// that never answers: the pull takes about its time, and what is learnt of
+/// it is its own time, not the time the asker spent on other peers.
+#[test]
+fn a_slow_honest_holder_is_not_punished_for_being_slow() {
+    for seed in sim::seeds(&[1, 2]) {
+        sim::run(seed, |world| async move {
+            let image = one_layer("slowholder", 33, 32);
+            let layer = image.layers[0].digest.clone();
+            let hub = world.add_node(NodeConfig::default());
+            let silent = world.add_node(NodeConfig {
+                bootstrap: vec![hub.index],
+                behavior: Behavior::Silent,
+                ..Default::default()
+            });
+            let holder = world.add_node(NodeConfig {
+                bootstrap: vec![hub.index],
+                announce: true,
+                behavior: Behavior::Slow(Duration::from_millis(600)),
+                ..Default::default()
+            });
+            let asker = world.add_node(NodeConfig {
+                bootstrap: vec![hub.index, silent.index, holder.index],
+                announce: true,
+                ..Default::default()
+            });
+            settle(30).await;
+            seed_image(&world, holder.index, &image).await;
+            settle(10).await;
+            let t0 = tokio::time::Instant::now();
+            let r = pull(&asker, &image).await;
+            let took = t0.elapsed();
+            let k = asker.live().source.knowledge().clone();
+            let rtt = k.rtt(&holder.id());
+            eprintln!(
+                "seed {seed}: peers {} registry {} took {took:?}, the holder's time {rtt:?}, lacks {}",
+                r.peer_chunks,
+                r.registry_chunks,
+                k.lacks(&layer, &holder.id())
+            );
+            assert_eq!((r.peer_chunks, r.registry_chunks), (32, 0));
+            assert!(!k.lacks(&layer, &holder.id()));
+            assert!(!asker.live().strikes.banned(&holder.id()));
+            assert!(
+                rtt.is_some_and(|t| t < Duration::from_millis(1200)),
+                "the holder's time is taken as {rtt:?}"
+            );
+            assert!(took < Duration::from_millis(1500), "took {took:?}");
+        });
+    }
+}

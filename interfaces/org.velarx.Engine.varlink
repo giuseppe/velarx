@@ -1,0 +1,4088 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The interface org.velarx.Engine: the engine of velarx as a varlink service,
+# for its frontends (the REST API, the CRI, the command line)
+# and for programs in other languages.  Generated
+# from the Rust types of the engine (crates/proto, src/engine_service.rs) by the
+# test `engine_service::tests::the_interface_file_is_current`:
+# VELARX_WRITE_INTERFACES=1 cargo test --lib engine_service writes it.
+#
+# Names: mostly NounVerb (ContainerList, ImageRemove).  A method named
+# Podman... takes the document of podman's or Docker's API for velarx-api.
+#
+# Descriptors cross in the SCM_RIGHTS of the message, named in the JSON by
+# their position among the descriptors of the message; the comment of a
+# method says what its call and its reply carry.  An upload or a download
+# is a pipe of frames (a length, 4 bytes big endian, and that many bytes)
+# ended by an empty frame: a pipe that ends before the empty frame was cut
+# (the writer failed or went away), never the whole.
+#
+# Records that continue: the comment of a method that answers with more
+# says "one a reply" (or the like).  It is called with `more`, answers one
+# record in each reply, and `continues` is false in the last reply.
+#
+# Versions: GetInfo and Restart have this definition in every version.  A
+# client calls GetInfo on each connection and uses the engine only when
+# `interface` is its own, `version` is its own and `digest` is the FNV-1a
+# (64 bits, hexadecimal) of this file; else it calls Restart, which starts
+# the engine again from the binary installed after an upgrade, and
+# connects again.  There is no compatibility between versions.
+#
+# Cancellation: closing the connection stops a call that reads or waits (lists,
+# events, a wait, a pull); a call that changes something finishes once it
+# started.  Limits: 256 connections, 192 of one process and 10 seconds
+# for the first call of a connection (the defaults of `[services]` of
+# config.toml); 32 KiB of arguments (what is larger is a pipe).
+# Who may call: a peer of the same user or root (SO_PEERCRED); any
+# accepted peer may make every call.
+
+interface org.velarx.Engine
+
+# A filter of a list: the key and its values (`label`: `["a=b"]`).
+type Filter (key: string, values: []string)
+
+# A container `ContainerRemove` removed, with what named it in the call.
+type RemovedContainer (
+	id: string,
+	# The name or the id the call gave, as it gave it
+	named: string
+)
+
+# The first and the last address of a range of leases.
+type LeaseRange (start: string, end: string)
+
+# A static route of a network.
+type NetworkRoute (
+	# CIDR
+	destination: string,
+	gateway: string,
+	metric: ?int
+)
+
+# What `NetworkCreate` makes, from either API or the command line.
+type NetworkSpec (
+	name: string,
+	# Empty: `bridge`
+	driver: string,
+	subnet: ?string,
+	gateway: ?string,
+	subnet6: ?string,
+	gateway6: ?string,
+	# IPv6, with a subnet picked when none is given
+	ipv6: bool,
+	lease: ?LeaseRange,
+	dns_enabled: bool,
+	dns_servers: []string,
+	labels: [string]string,
+	internal: bool,
+	# The bridge (its name of the engine's when absent)
+	interface: ?string,
+	# The IP address management driver: absent or `host-local`, the
+	# only one
+	ipam_driver: ?string,
+	# The options of the driver (`mtu`, `parent`, `mode`)
+	options: [string]string,
+	# Static routes added in the containers of the network
+	routes: []NetworkRoute
+)
+
+# The driver of a network.
+type NetworkDriver (
+	# A bridge of the engine's, with NAT to the host's networks
+	bridge,
+	# The network of the host
+	host,
+	# Only a loopback
+	none,
+	# Made by a network provider
+	overlay,
+	# The LAN of a parent interface
+	macvlan
+)
+
+# A subnet of a network.
+type NetworkSubnet (
+	# CIDR
+	subnet: string,
+	# Empty: none
+	gateway: string,
+	# The addresses the containers are given, all of the subnet if absent
+	lease_range: ?LeaseRange
+)
+
+# A container on a network.
+type NetworkMember (
+	id: string,
+	name: string,
+	running: bool,
+	# The MAC address of its interface on the network, empty when it has
+	# none (it does not run, or the driver keeps no interface)
+	mac_address: string,
+	# Its IPv4 address, `ADDRESS/PREFIX`, empty when it has none
+	ipv4: string,
+	# Its IPv6 address, the same way
+	ipv6: string
+)
+
+# A network.
+type NetworkRecord (
+	name: string,
+	id: string,
+	driver: NetworkDriver,
+	# The bridge, or the parent of a macvlan network; empty for the
+	# other drivers
+	interface: string,
+	created_ns: int,
+	# One IPv4 and one IPv6 at most
+	subnets: []NetworkSubnet,
+	ipv6_enabled: bool,
+	internal: bool,
+	dns_enabled: bool,
+	# The servers of the names that are not containers
+	dns_servers: []string,
+	labels: [string]string,
+	# The options of the driver
+	options: [string]string,
+	# The options of the IP address management (`driver`)
+	ipam_options: [string]string,
+	# The static routes of the containers
+	routes: []NetworkRoute,
+	# The network of the configuration, which is not removed (Docker
+	# names it `bridge`)
+	builtin: bool,
+	# The containers on it
+	containers: []NetworkMember
+)
+
+# A secret.  Its data is no field of the definition: `SecretInspect`
+# with `show_data` carries it in a pipe, never in the JSON of a message.
+type SecretRecord (id: string, name: string, driver: string, driver_options: [string]string, labels: [string]string, created_ns: int, updated_ns: int)
+
+# What a request for the logs of a container asks.
+type LogOptions (
+	# The standard output (neither: both)
+	stdout: bool,
+	# The standard error
+	stderr: bool,
+	# What the container outputs from now on follows
+	follow: bool,
+	# Each line begins with its time (RFC 3339, nanoseconds)
+	timestamps: bool,
+	# The last lines; none: all of them
+	tail: ?int,
+	# Only the lines from this time (nanoseconds since the epoch); none: no
+	# limit
+	since_ns: ?int,
+	# Only the lines until this time (nanoseconds since the epoch); none: no
+	# limit
+	until_ns: ?int
+)
+
+# What a request for the logs of a pod asks.
+type PodLogOptions (
+	# The containers (names or ids) to read; none: all of the pod
+	containers: []string,
+	# The lines follow until the containers have exited
+	follow: bool,
+	# The last lines of each container; none: all of them
+	tail: ?int,
+	since_ns: ?int,
+	until_ns: ?int
+)
+
+# A line of the logs of a pod.
+type PodLogLine (
+	# The name of the container the line came from
+	container_name: string,
+	# The id of the container the line came from
+	container_id: string,
+	# Its place among the containers of the pod (the infra container is
+	# the first)
+	container_index: int,
+	# How many containers' logs the answer has
+	containers: int,
+	time_ns: int,
+	stream: LogStream,
+	message: string
+)
+
+# The stream a line of a log was written to.
+type LogStream (stdout, stderr)
+
+# A platform of an image of a registry.
+type ImagePlatform (architecture: string, os: string, os_version: string, os_features: []string, variant: string, features: []string)
+
+# How an image is an instance of a manifest list: what is not empty
+# replaces what the image has.
+type InstanceSpec (annotations: [string]string, architecture: string, os: string, os_version: string, variant: string, features: []string, os_features: []string)
+
+# What adding an artifact to a manifest list asks.  The call carries one
+# descriptor for each of `titles`, in their order: a regular file open for
+# reading, its content.
+type ManifestArtifactSpec (
+	# The titles of the files
+	titles: []string,
+	# Absent: the unknown artifact type; empty: no type
+	artifact_type: ?string,
+	layer_type: string,
+	config_type: string,
+	# The content of the configuration (a JSON document); empty: none
+	config: string,
+	# No title annotation on the layers
+	exclude_titles: bool,
+	annotations: [string]string,
+	# An image of a registry the artifact is about
+	subject: string,
+	# How the artifact is an instance of the list
+	instance: InstanceSpec
+)
+
+# A descriptor of OCI's: a blob or a manifest.
+type ManifestDescriptor (
+	media_type: string,
+	digest: string,
+	size: int,
+	# Empty: none
+	artifact_type: string,
+	annotations: [string]string,
+	# The content of a small blob, base64 (empty: none)
+	data: string
+)
+
+# An instance of a manifest list.
+type ManifestInstance (media_type: string, digest: string, size: int, artifact_type: string, annotations: [string]string, platform: ?ImagePlatform)
+
+# An artifact of the store: its manifest.
+type ArtifactRecord (
+	name: string,
+	# The digest of its manifest
+	digest: string,
+	schema_version: int,
+	media_type: string,
+	artifact_type: string,
+	config: ?ManifestDescriptor,
+	layers: []ManifestDescriptor,
+	subject: ?ManifestDescriptor,
+	annotations: [string]string
+)
+
+# What a request to attach to a container asks.
+type AttachOptions (
+	stdout: bool,
+	stderr: bool,
+	# The log so far is sent first
+	logs: bool,
+	# What the container outputs from now on is sent
+	stream: bool,
+	stdin: bool,
+	# As the client wrote them
+	detach_keys: ?string,
+	# The input of the container is closed when this client goes away
+	stdin_once: bool,
+	# The end of the input of this client is not the end of the
+	# container's: it stays open for the next attach (the CRI's attach of
+	# a container without `stdin_once`)
+	stdin_keep_open: bool,
+	# The container waits for this attach to start (`ContainerStartAttached`)
+	start: bool,
+	# The size of the terminal of the client, in characters (none: not
+	# known)
+	height: ?int,
+	width: ?int
+)
+
+# Where an attach or exec session is: what a reply says.
+type SessionPhase (
+	# The first reply: the session is taken (the client may be answered
+	# before the container runs: a container that waits for the attach to
+	# start has no streams yet)
+	accepted,
+	# The descriptors of the process's streams
+	streams,
+	# The last reply: how it ended
+	ended
+)
+
+# What a client is told about a session when it is taken.  The
+# reply carries, when `logs` is set, the pipe of the log so far (the bytes
+# the client is sent first, framed as the rest), at the position `logs`.
+type SessionOpened (
+	# Names the session in `SessionCloseStdin` and `SessionDetach`
+	session: string,
+	# The stream has no frames (a terminal)
+	tty: bool,
+	# The input of the client is the process's
+	stdin: bool,
+	# The output the client is sent
+	stdout: bool,
+	stderr: bool,
+	# The position of the log so far among the descriptors of the reply
+	logs: ?int,
+	# The bytes of the keys that end the session for the client (the
+	# process goes on); none: no keys
+	detach_keys: []int,
+	# The end of the client's input is not the end of the process's (an
+	# attach of the CRI only)
+	keep_open: bool
+)
+
+# The streams of a process, by position among the descriptors of the reply
+# (one-way stream sockets, or the pipe of the input).
+type SessionStreams (stdin: ?int, stdout: ?int, stderr: ?int)
+
+# A reply of `ContainerAttach` and `ExecStart`, called with `more`: the
+# session is taken (`opened`), the streams of the process (`streams`), and
+# the end (`exit`, what the engine says as errors of the process in
+# `message`).  The frontend copies between its client and the streams
+# (Docker's frames, raw with a terminal): nothing of the session passes
+# through the engine.  When the frontend closes the connection (its client
+# is gone) the process goes on.  No timeout applies.  An exec
+# session of `detach` has one reply, the last.
+type SessionReply (
+	phase: SessionPhase,
+	opened: ?SessionOpened,
+	streams: ?SessionStreams,
+	# The status of the process, when the engine knows it
+	exit: ?int,
+	# Errors of the process (the runtime's, or the monitor's), for the
+	# client's output
+	message: ?string
+)
+
+# What `ContainerCheckpoint` asks of CRIU and of the archive.
+type CheckpointFlags (
+	# The container goes on after the checkpoint
+	leave_running: bool,
+	# Make an image of this name of the checkpoint
+	create_image: ?string,
+	tcp_established: bool,
+	file_locks: bool,
+	# The container's own checkpoint is kept next to the archive
+	keep: bool,
+	# Leave the root file system out of the archive
+	ignore_rootfs: bool,
+	# Leave the volumes out of the archive
+	ignore_volumes: bool,
+	# Absent: zstd
+	compress: ?Compression,
+	# Read the statistics CRIU writes
+	print_stats: bool,
+	# Dump the memory only, the container goes on (`--pre-checkpoint`)
+	pre_checkpoint: bool,
+	# Checkpoint on top of the pre-checkpoint (`--with-previous`)
+	with_previous: bool
+)
+
+# What CRIU reports of a dump or a restore (`stats-dump`,
+# `stats-restore`), under podman's names: the times are microseconds,
+# the counts are pages; a value that is zero is not written (podman's
+# `omitempty`).
+type CriuStatistics (
+	# Time to freeze the processes
+	freezing_time: int,
+	# Time the processes did not run
+	frozen_time: int,
+	# Time to extract the memory pages
+	memdump_time: int,
+	# Time to write the memory pages
+	memwrite_time: int,
+	pages_scanned: int,
+	pages_written: int,
+	# Restore: pages compared
+	pages_compared: int,
+	# Restore: copy-on-write pages skipped
+	pages_skipped_cow: int,
+	# Restore: time to fork the processes
+	forking_time: int,
+	# Restore: time to restore
+	restore_time: int,
+	# Restore: pages restored
+	pages_restored: int
+)
+
+# The limits of the cgroup of a pod, the parent of the cgroups of all its
+# containers (the infra container included): what bounds their sum.  A
+# field that is not set is no limit (an update replaces the limits whole).
+type PodResources (
+	# `memory.max`, in bytes
+	memory: ?int,
+	# Memory and swap together (the OCI `memory.swap`), in bytes
+	memory_swap: ?int,
+	# CPU shares (`cpu.weight` is made of them)
+	cpu_shares: ?int,
+	# `cpu.max`: microseconds of CPU time per `cpu_period`
+	cpu_quota: ?int,
+	# The length of the period of the quota in microseconds
+	cpu_period: ?int,
+	# `cpuset.cpus`
+	cpuset_cpus: ?string,
+	# `cpuset.mems`
+	cpuset_mems: ?string,
+	# The block IO weight, 10 to 1000 (`--blkio-weight`; 0 is none)
+	blkio_weight: ?int,
+	# `--blkio-weight-device`: the weight of each device
+	blkio_weight_device: []PodDeviceLimit,
+	# `--device-read-bps`: bytes per second
+	device_read_bps: []PodDeviceLimit,
+	# `--device-write-bps`: bytes per second
+	device_write_bps: []PodDeviceLimit
+)
+
+# A limit of a block device of the pod's cgroup: the device is the one of
+# the OCI `major` and `minor` (the command line gives a path, which the
+# CLI looks up).
+type PodDeviceLimit (
+	major: int,
+	minor: int,
+	# The weight, or the rate in bytes per second
+	value: int,
+	# The path of the device as the pod was given it (else the engine names
+	# it from the kernel's name); only what `pod inspect` shows
+	path: string
+)
+
+# What a restore asks of CRIU, and what an import asks of the container it
+# makes.
+type RestoreFlags (
+	tcp_established: bool,
+	# The established TCP connections are closed
+	tcp_close: bool,
+	file_locks: bool,
+	# The checkpoint stays after the restore
+	keep: bool,
+	# The name of the container an import makes
+	name: ?string,
+	# Leave the changes of the root file system of the archive out
+	ignore_rootfs: bool,
+	# The container an import makes has not the static IP addresses of the
+	# archive
+	ignore_static_ip: bool,
+	# The container an import makes has not the static MAC addresses of the
+	# archive
+	ignore_static_mac: bool,
+	# The descriptor of the archive of a pre-checkpoint the archive of an
+	# import builds on
+	previous: ?int,
+	# The pod the container an import makes joins
+	pod: ?string,
+	# The ports (`-p` specifications) the container an import makes
+	# publishes, instead of those of the archive
+	publish: []string,
+	# Read the statistics CRIU writes
+	print_stats: bool,
+	# The digests typed on the command that restores, which the images of
+	# the container are held to (as for `container_start`)
+	verify_image: []string
+)
+
+# A change of a container or an image to a file.
+type FileChange (path: string, kind: ChangeKind)
+
+# What a registry has for a search.
+type SearchHit (
+	# The registry searched
+	index: string,
+	# The repository, with its registry
+	name: string,
+	description: string,
+	stars: int,
+	official: bool,
+	automated: bool,
+	# The tag (a search of the tags of a repository)
+	tag: string
+)
+
+# The platform a request names: Docker's `platform` (`os/arch[/variant]`,
+# or the JSON of a push), else `os`, `arch` and `variant` (the host's for
+# what is not given).
+type PlatformSpec (platform: ?string, os: ?string, arch: ?string, variant: ?string)
+
+# What a pull asks.
+type PullSpec (
+	# A docker reference, `oci:DIR[:REF]`, `oci-archive:FILE[:REF]`,
+	# `docker-archive:FILE[:REF]`, `dir:DIR`, `archive:FILE` (a load: every
+	# image of an archive of either kind) or `SCHEME://...` of a
+	# `[[transports]]`
+	source: string,
+	# The path of `source` as a descriptor the client opened (a file, a
+	# directory, or the read end of a pipe of frames, which the engine
+	# spools); absent: the engine opens the path (podman's local routes)
+	source_fd: ?int,
+	# An artifact, into the artifact store
+	artifact: bool,
+	# A short name is Docker Hub's when `[api] compat_api_enforce_docker_hub`
+	# says so (as Docker's clients mean it), not of the search registries
+	docker_hub: bool,
+	# Absent: always
+	policy: ?PullPolicy,
+	# Every tag of the repository
+	all_tags: bool,
+	# How a pull that fails on the way is tried again
+	retry: Retry,
+	platform: PlatformSpec,
+	tls_verify: bool,
+	# Only the metadata: the files are fetched when they are read
+	lazy: bool,
+	# The fetchers of this pull, in the order they are asked (`--sources`);
+	# absent: `[pull] sources`
+	sources: ?[]string
+)
+
+# A layer of an image that cannot be pulled lazily, and why: `no_toc`,
+# `no_file_digests`, `no_ranges`, `unsupported`, `unreachable`.
+type NotLazyLayer (
+	# Its position in the manifest, from 0
+	index: int,
+	digest: string,
+	media_type: string,
+	reason: NotLazy
+)
+
+# What a push asks.
+type PushSpec (
+	# What is pushed: one image, manifest list or artifact; several only to
+	# an archive (`oci-archive:`, `oci:`), each with its names (a save)
+	images: []string,
+	# `images` name artifacts
+	artifact: bool,
+	tag: ?string,
+	# Absent: the name of the image (or its repository with `tag`)
+	destination: ?string,
+	# The instance of a manifest list
+	platform: PlatformSpec,
+	# Every instance of a manifest list
+	all: bool,
+	# Every tag of the repository of the image
+	all_tags: bool,
+	tls_verify: bool,
+	# Absent: the layers keep theirs
+	compression: ?LayerCompression,
+	# The level of the layers compressed
+	compression_level: ?int,
+	# More instances of a manifest list, in these compressions
+	add_compression: []LayerCompression,
+	# How a push that fails on the way is tried again
+	retry: Retry,
+	format: ?ManifestFormat,
+	# Sign the manifests pushed with this key: the sealed memory file
+	# (the JSON of `SigningKey`) the call carries at this position
+	signing: ?int,
+	# The helper pushers of this push, in the order they are asked
+	# (`--sinks`): names of `[[sinks.external]]`; the destination's own
+	# pusher always follows them, chosen by the scheme of the destination
+	# and never named here; absent: `[push] sinks`
+	sinks: ?[]string,
+	# The destination is a path the client opened (`destination` is its
+	# text, `oci:PATH[:TAG]`, `dir:PATH` or `oci-archive:FILE[:TAG]`): the
+	# position of its descriptor among those of the call
+	destination_fd: ?int
+)
+
+# What a commit of the REST API asks.
+type CommitSpec (
+	container: string,
+	# A short `repo` is of Docker Hub when `[api] compat_api_enforce_docker_hub`
+	# says so (as Docker's clients mean it), else of `localhost`
+	docker_hub: bool,
+	format: ?string,
+	repo: ?string,
+	tag: ?string,
+	author: ?string,
+	comment: ?string,
+	changes: []string,
+	pause: bool,
+	include_volumes: bool,
+	squash: bool,
+	# `sha256` or `sha512`: the algorithm of the digests of the new image
+	# (none: that of the image of the container)
+	digest: ?string
+)
+
+# What an import of the REST API asks.
+type ImportSpec (
+	# A short `repo` is of Docker Hub, as `CommitSpec.docker_hub`
+	docker_hub: bool,
+	# Where the tar is (else it is the upload)
+	url: ?string,
+	changes: []string,
+	message: ?string,
+	platform: PlatformSpec,
+	# libpod's name of the image
+	reference: ?string,
+	# Docker's repository and tag of it
+	repo: ?string,
+	tag: ?string,
+	# `sha256` or `sha512`: the algorithm of the digests of the new image
+	# (none: the engine's `[build] digest`)
+	digest: ?string
+)
+
+# What adding a file to an artifact asks.
+type ArtifactAddSpec (
+	name: string,
+	# The title of the file in the artifact
+	file_name: string,
+	# To an artifact of the name that is there
+	append: bool,
+	# The artifact of the name that is there is replaced
+	replace: bool,
+	artifact_type: ?string,
+	file_type: ?string,
+	annotations: [string]string,
+	# `sha256` or `sha512`: the algorithm of the digests of a new artifact
+	# (none: the engine's `[build] digest`); an artifact that is appended to
+	# keeps its own
+	digest: ?string
+)
+
+# The tries after the first and the time between them.
+type Retry (
+	# The tries after the first.
+	count: int,
+	# The time between the tries in milliseconds; none: 1 s (podman's).
+	delay_ms: ?int
+)
+
+# The options of `generate systemd` (none: the default).
+type SystemdSpec (use_name: bool, no_header: bool, restart_policy: ?string, restart_sec: ?int, start_timeout: ?int, stop_timeout: ?int, container_prefix: ?string, pod_prefix: ?string, separator: ?string, wants: []string, after: []string, requires: []string, env: []string)
+
+# What an update of a container changes: what is not given stays.
+type UpdateSpec (
+	memory: ?int,
+	memory_reservation: ?int,
+	memory_swap: ?int,
+	cpu_quota: ?int,
+	cpu_period: ?int,
+	cpu_shares: ?int,
+	cpuset_cpus: ?string,
+	cpuset_mems: ?string,
+	pids_limit: ?int,
+	block_io: UpdateBlockIo,
+	# Rules that allow, after those of the container
+	device_rules: []RequestDeviceRule,
+	# `NAME=VALUE` set, and names unset, in the environment of the next
+	# start
+	env: []string,
+	unset_env: []string,
+	restart: ?RestartPolicy,
+	# The rlimits of the next start, which replace the container's; an
+	# empty list is the host's
+	ulimits: ?[]RequestUlimit,
+	health: ?UpdateHealth
+)
+
+# A device in an update: named by its path, or by its numbers (a path
+# that is no block device is refused), with the weight or the rate it is
+# given.
+type UpdateDevice (
+	path: ?string,
+	major: ?int,
+	minor: ?int,
+	# The weight (10 to 1000) or the rate in bytes or operations a second
+	value: int
+)
+
+# The block IO limits an update sets.
+type UpdateBlockIo (
+	# 10 to 1000
+	weight: ?int,
+	weight_devices: []UpdateDevice,
+	read_bps: []UpdateDevice,
+	write_bps: []UpdateDevice,
+	read_iops: []UpdateDevice,
+	write_iops: []UpdateDevice
+)
+
+# The health check an update changes (podman's `GetNewHealthCheckConfig`):
+# what is not given stays; the times are nanoseconds, 0 turns the timer
+# off.
+type UpdateHealth (
+	# No health check
+	none: bool,
+	cmd: ?string,
+	interval: ?int,
+	retries: ?int,
+	timeout: ?int,
+	start_period: ?int,
+	startup_cmd: ?string,
+	startup_interval: ?int,
+	startup_retries: ?int,
+	startup_timeout: ?int,
+	startup_success: ?int,
+	log_destination: ?string,
+	max_log_count: ?int,
+	max_log_size: ?int,
+	on_failure: ?OnFailure
+)
+
+# How an archive is compressed.
+type Compression (zstd, gzip, none)
+
+# What `PodRun` does to the containers of a pod.
+type PodAction (start, stop, kill, pause, unpause, restart)
+
+# A device of the host in a container.
+type DeviceSpec (host_path: string, container_path: string, permissions: string)
+
+# The limits of a container; 0 or empty is no limit.
+type Resources (
+	# Bytes
+	memory_limit: int,
+	# Memory and swap together, in bytes
+	memory_swap: int,
+	# Microseconds
+	cpu_period: int,
+	# Microseconds of CPU time per `cpu_period`
+	cpu_quota: int,
+	cpu_shares: int,
+	cpuset_cpus: string,
+	cpuset_mems: string,
+	oom_score_adj: int,
+	# cgroup v2 files and their values
+	unified: [string]string,
+	hugepage_limits: []HugepageLimit
+)
+
+# The most bytes of huge pages of a size (`2MB`, `1GB`) a container may
+# use.
+type HugepageLimit (page_size: string, limit: int)
+
+# What a mount of a container is.
+type MountKind (
+	# A directory or a file of the host
+	bind,
+	# A volume, or a directory of one
+	volume,
+	tmpfs,
+	# An image (or a directory of it)
+	image
+)
+
+# A mount a container was made with (not the files the engine binds at
+# start, `/etc/hosts`...).
+type MountSpec (
+	kind: MountKind,
+	# Of a volume: its name
+	name: string,
+	# The create named the volume (not a path)
+	named: bool,
+	# A path of the host; the ID of the image mounted; empty for a tmpfs
+	source: string,
+	# Where in the container, as the create wrote it
+	destination: string,
+	# Of an image: the directory of it mounted
+	sub_path: string,
+	options: []string,
+	read_only: bool,
+	# Of a bind mount: the propagation (`rprivate` unless asked)
+	propagation: string
+)
+
+# The state of the health check of a container.
+type HealthStatus (
+	# No result yet, or the startup check has not passed
+	starting,
+	healthy,
+	unhealthy,
+	# The container stopped while a check ran
+	stopped
+)
+
+# A result of a health check.
+type HealthResult (
+	# Nanoseconds since the epoch
+	start_ns: int,
+	# Nanoseconds since the epoch
+	end_ns: int,
+	exit_code: int,
+	# The start of what the check wrote
+	output: string
+)
+
+# The health of a container.  (`HealthState` in the interfaces: the Engine
+# has a method `Health`, and a type and a method share one namespace.)
+type HealthState (
+	status: HealthStatus,
+	# The failures since the last success
+	failing_streak: int,
+	# The last results, the oldest first
+	log: []HealthResult
+)
+
+# The check that runs until a container has started (podman's
+# `--health-startup-*`); the times are nanoseconds.
+type StartupHealthcheck (
+	# As the `test` of a health check
+	test: []string,
+	# 0: 30 s
+	interval_ns: int,
+	# 0: 30 s
+	timeout_ns: int,
+	# Failures before the container is restarted; 0: never
+	retries: int,
+	# Successes before the regular check begins; 0: one
+	successes: int
+)
+
+# The health check of a container (its own, or its image's): what the
+# create request carries, the container record stores and `inspect` shows,
+# and what the monitor runs.  The times are nanoseconds.
+type Healthcheck (
+	# `CMD-SHELL cmd`, `CMD arg...`, `NONE`, or an argument vector
+	test: []string,
+	# Between two checks; 0: 30 s
+	interval_ns: int,
+	# No timer: the checks are those of `healthcheck run` (podman's
+	# `--health-interval=disable`)
+	interval_disabled: bool,
+	# For one check; 0: no timeout (libpod's), the check runs until it ends
+	timeout_ns: int,
+	# Failures in it do not count
+	start_period_ns: int,
+	# Between two checks in the start period
+	start_interval_ns: int,
+	# Failures in a row before the container is unhealthy; 0 is one, as
+	# podman's `FailingStreak >= Retries`
+	retries: int,
+	# What a container that became unhealthy gets
+	on_failure: OnFailure,
+	# The check that runs until the container has started: the regular
+	# one begins once it passed.
+	startup: ?StartupHealthcheck,
+	# Where the results go: `local` (the default, the state of the
+	# container), `events_logger`, or a directory (`<dir>/<id>-healthcheck.log`)
+	log_destination: string,
+	# How many results are kept (default 5, 0: no limit)
+	max_log_count: ?int,
+	# How many characters of the output of a result are kept (default 500,
+	# 0: no limit)
+	max_log_size: ?int
+)
+
+# What a container that became unhealthy gets.
+type OnFailure (
+	# Nothing.
+	none,
+	# Kill the container.
+	kill,
+	# Kill the container and start it again, whatever its restart policy.
+	restart,
+	# Stop the container: no restart.
+	stop
+)
+
+# The checkpoint of a container and its last restore.
+type CheckpointState (
+	# Its images are there, to restore
+	checkpointed: bool,
+	checkpointed_ns: int,
+	# The directory of the images
+	path: string,
+	# The log of the dump, in the directory of the images
+	log_path: string,
+	restored: bool,
+	restored_ns: int
+)
+
+# What a container runs, and how.
+type ProcessConfig (
+	entrypoint: []string,
+	command: []string,
+	# `KEY=VALUE`, in order
+	env: []string,
+	work_dir: string,
+	user: string,
+	# The user the process runs as, from the specification the container
+	# was made with (none: it has not got one yet)
+	resolved_user: ?ProcessUser,
+	hostname: string,
+	domainname: string,
+	# What a stop sends first (the container's, its image's; empty:
+	# SIGTERM)
+	stop_signal: string,
+	# The same, by number
+	stop_signal_number: int,
+	# Seconds a stop waits before the kill
+	stop_timeout: int,
+	# Octal
+	umask: string,
+	# systemd mode
+	systemd: bool,
+	# An init process runs the command
+	init: bool,
+	# Its health check, with where its results go and how many are kept
+	healthcheck: ?Healthcheck,
+	# The command line that made it (none: the API made it)
+	create_command: []string,
+	# An entry of its user is added to its /etc/passwd when it lacks one
+	passwd: bool,
+	# How it tells systemd it is ready (`container`, `conmon`, `ignore`,
+	# `healthy`)
+	sdnotify_mode: string
+)
+
+# The user a process runs as: its ids and its supplementary groups.
+type ProcessUser (uid: int, gid: int, additional_gids: []int)
+
+# A limit of a resource of the processes of a container.
+type Ulimit (
+	# As given (`nofile`, `RLIMIT_NOFILE`)
+	name: string,
+	soft: int,
+	hard: int
+)
+
+# The namespaces, cgroup, log, policies and security of a container.
+type HostSettings (
+	# The mode of the cgroup namespace (`private`, `host`, `container:ID`...)
+	cgroupns_mode: string,
+	# The mode of the IPC namespace (`private`, `host`, `container:ID`...)
+	ipc_mode: string,
+	# The mode of the PID namespace (`private`, `host`, `container:ID`...)
+	pid_mode: string,
+	# The mode of the UTS namespace (`private`, `host`, `container:ID`...)
+	uts_mode: string,
+	# Empty: the user namespace of the engine
+	userns_mode: string,
+	# `systemd` or `cgroupfs`
+	cgroup_manager: string,
+	# The parent asked for (empty: the default)
+	cgroup_parent: string,
+	# `--cgroups`: `enabled` (or empty), `disabled`, `no-conmon`, `split`
+	cgroups: string,
+	# `k8s-file`, `journald`, `none`...
+	log_driver: string,
+	log_options: [string]string,
+	# The size a log file is rotated at (`max-size`; 0: none)
+	log_max_size: int,
+	# Empty: none
+	restart_policy: string,
+	restart_retries: int,
+	auto_remove: bool,
+	# With `auto_remove`: its image is removed too, unless another
+	# container uses it
+	auto_remove_image: bool,
+	cap_add: []string,
+	cap_drop: []string,
+	group_add: []string,
+	no_new_privileges: bool,
+	# Empty: the default profile
+	seccomp_profile: string,
+	apparmor_profile: string,
+	read_only_rootfs: bool,
+	# Bytes of /dev/shm
+	shm_size: int,
+	# The OCI runtime asked for (empty: the default)
+	runtime: string,
+	ulimits: []Ulimit,
+	# 0: no limit
+	pids_limit: int,
+	blkio_weight: int,
+	memory_reservation: int,
+	# The OOM killer leaves it alone
+	oom_kill_disable: bool,
+	# The file its /etc/hosts is made of (empty: the engine's)
+	hosts_file: string,
+	# The devices of the host it has
+	devices: []DeviceSpec,
+	# The read rate limits (bytes per second) of the block devices, by their
+	# paths
+	blkio_device_read_bps: []DeviceLimit,
+	# The write rate limits (bytes per second) of the block devices, by their
+	# paths
+	blkio_device_write_bps: []DeviceLimit,
+	# The read rate limits (operations per second) of the block devices, by
+	# their paths
+	blkio_device_read_iops: []DeviceLimit,
+	# The write rate limits (operations per second) of the block devices, by
+	# their paths
+	blkio_device_write_iops: []DeviceLimit,
+	# The weights of the block devices, by their paths
+	blkio_weight_device: []DeviceLimit,
+	# What the OCI configuration of the container gives its process (an
+	# inspect fills them, a list does not): the SELinux label of the
+	# process and of its files (empty: not confined), the AppArmor
+	# profile, the effective and the bounding capabilities (`CAP_CHOWN`)
+	process_label: string,
+	mount_label: string,
+	process_apparmor: string,
+	effective_caps: []string,
+	bounding_caps: []string
+)
+
+# A limit (a rate, a weight) of a block device of a container.
+type DeviceLimit (path: string, value: int)
+
+# A port of a container on the host.
+type ContainerPort (
+	container_port: int,
+	# 0: any free one
+	host_port: int,
+	# Empty: every address
+	host_ip: string,
+	# `tcp`, `udp` or `sctp`
+	protocol: string,
+	# The ports from these on (1: one)
+	range: int
+)
+
+# An interface of a container on a network.
+type ContainerInterface (
+	network: string,
+	network_id: string,
+	ip: string,
+	prefix_len: int,
+	ip6: string,
+	prefix6_len: int,
+	# Empty when it is no route of the container (an internal network)
+	gateway: string,
+	gateway6: string,
+	mac: string,
+	aliases: []string
+)
+
+# The network of a container.
+type ContainerNetwork (
+	# `bridge` (the default network), `host`, `none`, `pasta`,
+	# `container:ID`, `ns:PATH`, or the name of the first network
+	mode: string,
+	# The networks it is on
+	networks: []string,
+	# Its interfaces on them, once it runs
+	interfaces: []ContainerInterface,
+	# The ports published, as asked
+	ports: []ContainerPort,
+	# The ports bound, the free host ports picked (none: not known)
+	bound_ports: []ContainerPort,
+	# The ports exposed (`80/tcp`)
+	exposed: []string,
+	publish_all: bool,
+	# The address asked for
+	mac_address: string,
+	# Its network namespace, while it runs in one of its own
+	sandbox_key: string,
+	dns: []string,
+	dns_search: []string,
+	dns_options: []string,
+	# `NAME:IP`
+	extra_hosts: []string
+)
+
+# The files of a container on the host.
+type ContainerPaths (
+	# The directory of its OCI bundle
+	bundle: string,
+	oci_config: string,
+	resolv_conf: string,
+	hostname: string,
+	# Empty: no /etc/hosts is made
+	hosts: string,
+	# The pid file of its monitor
+	monitor_pid_file: string,
+	# The pid file of its process
+	pid_file: string,
+	# The file of its log, for a driver that writes one
+	log: string,
+	# The graph driver as podman and Docker report it (`overlay` for
+	# composefs)
+	graph_driver: string,
+	# What the driver says of the root file system (`GraphDriver.Data`)
+	graph_data: [string]string
+)
+
+# A container: what `ContainerInspect` and `ContainerList` answer.
+type ContainerRecord (
+	id: string,
+	name: string,
+	pid: int,
+	pod_id: string,
+	pod_name: string,
+	# The image as podman names it (with its tag), else its ID
+	image: string,
+	image_id: string,
+	# The digest of the manifest of its image
+	image_digest: string,
+	# The image the create named
+	image_ref: string,
+	labels: [string]string,
+	annotations: [string]string,
+	created_ns: int,
+	started_ns: int,
+	finished_ns: int,
+	state: RunState,
+	exit_code: int,
+	oom_killed: bool,
+	# Killed at the end of its time limit (`--timeout`)
+	timed_out: bool,
+	# Stopped by a user (stop, kill): its restart policy does not start it
+	stopped_by_user: bool,
+	restart_count: int,
+	should_start_on_boot: bool,
+	error: string,
+	is_infra: bool,
+	# Of its monitor, while it runs
+	monitor_pid: int,
+	health: ?HealthState,
+	checkpoint: CheckpointState,
+	tty: bool,
+	stdin: bool,
+	privileged: bool,
+	# The name of its OCI runtime
+	oci_runtime: string,
+	process: ProcessConfig,
+	host: HostSettings,
+	resources: Resources,
+	network: ContainerNetwork,
+	mounts: []MountSpec,
+	paths: ContainerPaths,
+	# The cgroup of its process while it runs (`/proc/PID/cgroup`)
+	cgroup_path: string,
+	# Bytes of its changes (when asked)
+	size_rw: ?int,
+	# Bytes of its changes and its image (when asked)
+	size_root_fs: ?int,
+	# The namespaces of its process (`Cgroup`, `Ipc`, `Mnt`, `Net`,
+	# `Pidns`, `Uts`, `User`), when asked
+	namespaces: [string]string
+)
+
+# Where a container is in its life (podman's states).
+type RunState (
+	# Made, never started
+	created,
+	# Made in the OCI runtime (`init`), not started
+	initialized,
+	running,
+	paused,
+	# Running, its stop under way
+	stopping,
+	# Ran and ended (or failed to start: `started_ns` is then 0)
+	exited,
+	unknown
+)
+
+# What a pod is, of the states of its containers.
+type PodStatus (
+	# Never started
+	created,
+	# All its containers run
+	running,
+	# Some of its containers run
+	degraded,
+	# Its containers are paused, none runs
+	paused,
+	# None of its containers runs
+	exited
+)
+
+# A container of a pod.
+type PodMember (
+	id: string,
+	name: string,
+	state: RunState,
+	# The times its restart policy restarted it
+	restart_count: int,
+	# An init container (`--init-ctr`): it runs to its end at the start of
+	# the pod, and does not count in its status
+	init: bool
+)
+
+# A device of the host given to a container (podman's `LinuxDevice`).
+type DeviceNode (
+	# Its path in the container
+	path: string,
+	# `c` or `b`; empty when the host has no such node
+	kind: string,
+	major: int,
+	minor: int,
+	file_mode: int
+)
+
+# A pod.
+type PodRecord (
+	id: string,
+	name: string,
+	created_ns: int,
+	status: PodStatus,
+	infra_id: string,
+	# Its containers, the infra container first
+	members: []PodMember,
+	# The networks it is on (the default one when its spec names none)
+	networks: []string,
+	# It is in the network namespace of the host
+	host_network: bool,
+	# Of the infra container, which `PodInspect` reads (`PodList` leaves
+	# it empty): its addresses
+	ips: []string,
+	# Of the infra container, which `PodInspect` reads (`PodList` leaves
+	# it false): it is in the IPC namespace of the host
+	host_ipc: bool,
+	# Of the infra container, which `PodInspect` reads (`PodList` leaves
+	# it false): it is in the PID namespace of the host
+	host_pid: bool,
+	# Of the infra container, which `PodInspect` reads (`PodList` leaves
+	# it empty): its process
+	infra_pid: int,
+	# Of the infra container, which `PodInspect` reads (`PodList` leaves
+	# it empty): the OCI runtime it runs with
+	oci_runtime: string,
+	# Of the infra container, which `PodInspect` reads (`PodList` leaves
+	# it empty): the path of its network namespace (when it has one of its
+	# own)
+	netns_path: string,
+	# The cgroup of the pod, relative to the cgroup file system, as
+	# `PodInspect` reads it (`PodList` leaves it empty; empty without one)
+	cgroup_path: string,
+	# What it was made with
+	spec: PodSpec,
+	# The devices of its spec, as the nodes of the host are
+	devices: []DeviceNode
+)
+
+# What `PodCreate` makes.
+type PodSpec (
+	name: string,
+	hostname: ?string,
+	networks: []string,
+	dns: PodDnsConfig,
+	add_hosts: []string,
+	security_context: PodSecurityContext,
+	ports: []PodPortMapping,
+	labels: [string]string,
+	annotations: [string]string,
+	# Share PID namespace among containers
+	share_pid: bool,
+	# Share IPC namespace among containers
+	share_ipc: bool,
+	# Share network namespace among containers (`--share net`: on by
+	# default, always off without an infra container)
+	share_net: bool,
+	# Share UTS namespace among containers
+	share_uts: bool,
+	# Share cgroup namespace among containers
+	share_cgroup: bool,
+	# The pod is in the PID namespace of the host: its infra container and
+	# its members use it (there is none to share)
+	host_pid: bool,
+	# The same for the IPC namespace of the host
+	host_ipc: bool,
+	# The user namespace of the infra container (`--userns`), which the
+	# members join
+	userns: ?string,
+	# `--uidmap` of the pod's user namespace
+	uid_mappings: []IdMapping,
+	# `--gidmap` of the pod's user namespace
+	gid_mappings: []IdMapping,
+	# Infra container image
+	infra_image: ?string,
+	# Infra container command
+	infra_command: ?[]string,
+	# Name of the infra container (default `<first 12 characters of the pod id>-infra`)
+	infra_name: ?string,
+	# What the pod does when all its containers exit
+	exit_policy: PodExitPolicy,
+	# `--infra-conmon-pidfile`: the pid file of the infra container's
+	# monitor (Quadlet's `Type=forking` pod units)
+	infra_conmon_pidfile: ?string,
+	# `--sysctl`: of the namespaces the pod shares (set on its infra)
+	sysctls: [string]string,
+	# `--shm-size`: of the infra, and of the members that set none
+	shm_size: ?int,
+	# `--volume`: mounted in the infra and in every member
+	volumes: []string,
+	# `--restart`: of the members that set none
+	restart_policy: ?RestartPolicy,
+	# The OCI runtime of the infra container and of the members that ask for
+	# none (`oci_runtime` of the pod create, the CRI's runtime handler)
+	runtime: ?string,
+	# `--cgroup-parent`: of the infra and of the members that set none
+	cgroup_parent: ?string,
+	# `--cgroups`: the mode of the infra container ("" the default,
+	# `enabled`, `scope`, `split`: the default of the engine service); in a pod made `disabled` the members are too
+	cgroups: string,
+	# `scope` of the infra container and of every member, chosen
+	# from `cgroups` when the pod is made (none for a pod without cgroups);
+	# the engine's, not an option: a `PodCreate` that sets it is refused
+	cgroup_mode: ?string,
+	# The limits of the cgroup of the pod
+	resources: ?PodResources,
+	# `--security-opt`: of the infra container
+	security_opts: []string,
+	# `--oom-score-adj` of the infra container
+	infra_oom_score_adj: ?int,
+	# `--read-only` of the infra container
+	infra_read_only: bool,
+	# `--privileged` of the infra container
+	infra_privileged: bool,
+	# `--ip`: the address of the pod (its infra) on its network
+	ip: ?string,
+	# `--ip6`: its IPv6 address
+	ip6: ?string,
+	# The annotations of the pod, for the CNI plugins of its network only
+	# (the bandwidth ones and the `io.kubernetes.cri.pod-annotations`
+	# capability); they are not annotations of the infra container
+	cni_annotations: [string]string,
+	# The subnets the node gives its pods (the pod CIDR of a kubelet), for
+	# the CNI plugins that ask for `ipRanges`
+	cni_ip_ranges: []string,
+	# Its MAC address on its network (podman's `--mac-address`)
+	mac: ?string,
+	# `--network-alias`: its names on its networks
+	network_aliases: []string,
+	# `--device` as typed (`HOST[:CONTAINER][:PERMISSIONS]`, or a CDI name;
+	# `--gpus` makes `nvidia.com/gpu=` ones): of the infra container and the
+	# members
+	devices: []string,
+	# `--volumes-from` as typed, for the inspect: the volumes of those
+	# containers are in `volumes`
+	volumes_from: []string,
+	# `--hosts-file`: the base of /etc/hosts of the pod (a path, `none`
+	# or `image`)
+	hosts_file: ?string,
+	# `--no-hosts`: the pod leaves the /etc/hosts of the images alone
+	no_hosts: bool,
+	# `--no-hostname`: no /etc/hostname
+	no_hostname: bool,
+	# `--uts host`: the pod is in the UTS namespace of the host (its
+	# infra container and its members use it; there is none to share)
+	host_uts: bool,
+	# `--infra=false`: the pod has no infra container, so its members
+	# share no namespace; the pod only groups their cgroup, their name and
+	# their lifecycle
+	no_infra: bool,
+	# `--share-parent=false`: the members are not in the cgroup of the
+	# pod
+	no_share_parent: bool,
+	# `--shm-size-systemd`: of the infra and of the members that set none
+	shm_size_systemd: ?int,
+	# `--subuidname`: the user namespace of the pod is made of the ranges of
+	# this user of /etc/subuid
+	subuidname: ?string,
+	# `--subgidname`: the user namespace of the pod is made of the ranges of
+	# this user of /etc/subgid
+	subgidname: ?string,
+	# The command line that made the pod (podman's `CreateCommand`)
+	create_command: []string
+)
+
+# What a pod does when all its containers exited.
+type PodExitPolicy (
+	# It stays, its infra container runs
+	continue,
+	# It stops
+	stop
+)
+
+# Pod DNS configuration
+type PodDnsConfig (servers: []string, searches: []string, options: []string)
+
+# Pod security context: of its infra container
+type PodSecurityContext (
+	# Run all containers as this user
+	run_as_user: ?int,
+	# Run all containers as this group
+	run_as_group: ?int,
+	# Supplemental groups for all containers
+	supplemental_groups: []int
+)
+
+# Port mapping for pod
+type PodPortMapping (container_port: int, host_port: ?int, host_ip: ?string, protocol: string)
+
+# A range of IDs of a user namespace: `size` IDs from `container_id`
+# are those from `host_id` on the host.
+type IdMapping (container_id: int, host_id: int, size: int)
+
+# Restart policy
+type RestartPolicy (
+	# Policy name: no, on-failure, always, unless-stopped
+	name: string,
+	# Maximum retry count for on-failure
+	maximum_retry_count: int
+)
+
+# The configuration an image gives its containers (the `config` of its
+# OCI configuration).
+type ImageConfigRecord (
+	user: string,
+	# `PORT/PROTOCOL`
+	exposed_ports: []string,
+	# `NAME=VALUE`
+	env: []string,
+	entrypoint: []string,
+	cmd: []string,
+	# The paths of its volumes
+	volumes: []string,
+	working_dir: string,
+	labels: [string]string,
+	stop_signal: string,
+	args_escaped: bool,
+	# The instructions a build on the image runs (Docker's)
+	on_build: []string,
+	# The shell of the instructions of a build (Docker's)
+	shell: []string,
+	# Docker's health check of the image
+	healthcheck: ?ImageHealthcheck
+)
+
+# The health check an image gives its containers (Docker's).
+type ImageHealthcheck (
+	# `CMD-SHELL cmd`, `CMD arg...` or `NONE`
+	test: []string,
+	# 0: not set
+	interval_ns: int,
+	timeout_ns: int,
+	start_period_ns: int,
+	start_interval_ns: int,
+	retries: int
+)
+
+# A step of the history of an image (of its configuration), and in the
+# replies of `ImageHistory` what that step made.
+type ImageHistoryEntry (
+	# 0: the configuration says no time
+	created_ns: int,
+	created_by: string,
+	author: string,
+	comment: string,
+	# The step made no layer
+	empty_layer: bool,
+	# `ImageHistory`: the id of the image for its last step, else empty
+	id: string,
+	# `ImageHistory`: the size of the layer the step made
+	size: int,
+	# `ImageHistory`: the names of the image, on its last step
+	tags: []string
+)
+
+# The fs-verity digests a manifest states for the EROFS image of a layer.
+type ComposefsLayer (
+	# The digest of the layer in the manifest
+	layer: string,
+	# `sha256:<hex>` or `sha512:<hex>`, as the annotation lists them
+	digests: []string
+)
+
+# An image, or (in `ImageList` with `manifest_lists`) a manifest list.
+type ImageRecord (
+	# The digest of its configuration, without its algorithm (64 hex
+	# digits for a sha256, 128 for a sha512; of a manifest list: its id)
+	id: string,
+	# `registry/repository:tag`, the newest first
+	names: []string,
+	# `registry/repository@digest`: the names a pull by digest gave it,
+	# the newest first (podman's names with a digest)
+	digest_names: []string,
+	# Every name it had, the last one given first
+	names_history: []string,
+	# `registry/repository@digest` of its names
+	digests: []string,
+	# The digest of its manifest
+	digest: string,
+	# The bytes of its manifest, configuration and uncompressed layers
+	size: int,
+	# The time its configuration says it was made at (0: none)
+	created_ns: int,
+	# When it came into the store
+	stored_ns: int,
+	# `ImageList`: the id of the image a build made it on (empty: none)
+	parent_id: string,
+	# `ImageList`: a build made other images on it
+	has_children: bool,
+	# `ImageList`: how many containers use it
+	containers: int,
+	# Of an additional, read-only image store
+	read_only: bool,
+	manifest_list: bool,
+	os: string,
+	architecture: string,
+	variant: string,
+	author: string,
+	# The comment of its configuration, else of the first step of its
+	# history
+	comment: string,
+	# The labels of its configuration
+	labels: [string]string,
+	# The annotations of its manifest
+	annotations: [string]string,
+	# The media type of its manifest
+	manifest_type: string,
+	config: ImageConfigRecord,
+	history: []ImageHistoryEntry,
+	# The digests of its uncompressed layers (`rootfs.diff_ids`), the
+	# lowest first
+	layers: []string,
+	# `ImageInspect`: the layers whose descriptors state the digest of
+	# their EROFS image, the lowest first
+	composefs: []ComposefsLayer,
+	# The graph driver as podman and Docker report it (`overlay` for
+	# composefs)
+	graph_driver: string
+)
+
+# An image (or a manifest list) a prune removed.
+type PrunedImage (
+	id: string,
+	# The bytes its removal freed: its record and the layers no other image,
+	# no container and no pull holds, each once, sized as `system df` sizes
+	# them (0: a manifest list).  podman reports the size of the whole image.
+	size: int
+)
+
+# A layer of an image in `ImageTree`.
+type ImageTreeLayer (
+	# Its digest uncompressed (else of its blob)
+	id: string,
+	size: int,
+	# The names of the images it is the top layer of
+	top_of: []string
+)
+
+# An image built on the one of `ImageTree`.
+type ImageTreeChild (id: string, names: []string)
+
+# The layers of an image and the images built on it.
+type ImageTreeRecord (
+	id: string,
+	names: []string,
+	size: int,
+	# The lowest first
+	layers: []ImageTreeLayer,
+	children: []ImageTreeChild
+)
+
+# An image a pull put in the store, with the names it was given.
+type PulledImage (id: string, names: []string)
+
+# What one source of a transfer moved: `name` is a fetcher or pusher of
+# the walk as configured, or `store` for what was there already.
+type BySource (name: string, bytes: int, files: int)
+
+# What a transfer (a pull, a completion) moved, and from where.
+type TransferStats (
+	# By source, in the order they were first seen
+	by_source: []BySource,
+	# The layers that were in the store already
+	layers_cached: int,
+	duration_ms: int
+)
+
+# A tag `ImagePush` pushed with `all_tags`, and the digest of its
+# manifest.
+type PushedTag (tag: string, digest: string)
+
+# What a push pushed.
+type PushedImage (
+	# The digest of the manifest pushed (none with `all_tags`)
+	digest: string,
+	# The size of the manifest
+	size: int,
+	# The blobs sent
+	blobs_uploaded: int,
+	# The blobs mounted from another repository
+	blobs_mounted: int,
+	# The blobs already there
+	blobs_existing: int,
+	# How the destination resolves the manifest by each name and by its
+	# digest
+	placed: []Placed,
+	# With `all_tags`, every tag pushed
+	tags: []PushedTag
+)
+
+# How the destination of a push resolves a manifest by one name: what the
+# Pusher answers to `Commit`, and what an engine says of the push.
+type Placed (
+	# A name of the call; absent: the manifest's own digest
+	name: ?string,
+	accepted: bool,
+	# The destination's answer when it refused it
+	reason: ?string
+)
+
+# Where a pull in progress is.
+type PullState (
+	queued,
+	running,
+	waiting_for_space,
+	needs_credentials,
+	failed,
+	cancelled,
+	# It should run and no process completes it
+	stalled
+)
+
+# Why a layer cannot be served on demand (the Fetcher's answer to `Probe`,
+# and the engine's `ImageNotLazy`).
+type NotLazy (
+	# The blob has no table of contents (gzip, plain zstd)
+	no_toc,
+	# The origin does not serve ranges of the blob
+	no_ranges,
+	# This fetcher cannot reach the layer
+	unreachable,
+	# A regular file of the table has no fs-verity digest
+	no_file_digests,
+	# A compression or media type the fetcher does not read (also what a
+	# value this side does not know is read as)
+	unsupported
+)
+
+# A sample of what a container uses.
+type StatsRecord (
+	id: string,
+	name: string,
+	# It runs: a container that does not has only zeros
+	running: bool,
+	# When the sample was read
+	time_ns: int,
+	# When the container started (0: it does not run)
+	started_ns: int,
+	# The CPU time of the container
+	cpu_nano: int,
+	# The user part of the CPU time of the container
+	cpu_user_nano: int,
+	# The system part of the CPU time of the container
+	cpu_system_nano: int,
+	# The CPU use in % (100 a CPU) since the sample before in the call,
+	# since its start for the first
+	cpu_percent: float,
+	# The CPU time of the host (all its CPUs) when the sample was read
+	host_cpu_nano: int,
+	online_cpus: int,
+	# The periods of the CPU quota that elapsed
+	cpu_periods: int,
+	# The periods of the CPU quota that were throttled
+	cpu_throttled_periods: int,
+	# The time throttled
+	cpu_throttled_nano: int,
+	mem_usage: int,
+	# Usage less the page cache that is reclaimed at once
+	mem_working_set: int,
+	mem_anon: int,
+	# The page cache
+	mem_file: int,
+	mem_swap: int,
+	# Its limit, the memory of the host when it has none
+	mem_limit: int,
+	page_faults: int,
+	major_page_faults: int,
+	# Bytes of the files the container wrote (asked for with `size`)
+	rw_bytes: ?int,
+	# Inodes of the files the container wrote (asked for with `size`)
+	rw_inodes: ?int,
+	# Bytes read from block devices
+	block_read: int,
+	# Bytes written to block devices
+	block_write: int,
+	# The interfaces of its network namespace but the loopback
+	networks: []InterfaceStats,
+	pids: int,
+	# `memory.swap.max`, 0 for no limit
+	swap_limit: int,
+	# The pressure stall information of its cgroup
+	pressure: Pressure
+)
+
+# The counters of a network interface of a container.
+type InterfaceStats (name: string, rx_bytes: int, rx_packets: int, rx_errors: int, rx_dropped: int, tx_bytes: int, tx_packets: int, tx_errors: int, tx_dropped: int)
+
+# The pressure stall information of a cgroup, of each resource whose file
+# it has (a kernel without PSI has none).
+type Pressure (cpu: ?Psi, memory: ?Psi, io: ?Psi)
+
+# The pressure of a resource: `some` while at least one task waited,
+# `full` while all of them did.
+type Psi (some: PsiData, full: PsiData)
+
+# A line of a pressure file of a cgroup (`cpu.pressure`...): the share of
+# the time (percent) in which tasks waited for the resource, averaged over
+# 10, 60 and 300 seconds, and the whole time they waited, in microseconds.
+type PsiData (total_us: int, avg10: float, avg60: float, avg300: float)
+
+# The command `ExecCreate` runs in a container.
+type ExecSpec (
+	# The program and its arguments
+	command: []string,
+	# Added to the environment of the container
+	env: [string]string,
+	# Empty: the container's
+	work_dir: string,
+	# Empty: the container's
+	user: string,
+	tty: bool,
+	stdin: bool,
+	stdout: bool,
+	stderr: bool,
+	privileged: bool,
+	# The keys that detach a client with a terminal from the command
+	# (`ctrl-p,ctrl-q`); empty: those
+	detach_keys: string,
+	# Kill the command after this many milliseconds; none: never
+	timeout_ms: ?int,
+	# The reason a command could not be run is not written to its output
+	# but kept in the `error` of the record (the command line reports it
+	# as its own error, with status 125)
+	errors_apart: bool
+)
+
+# An exec session.
+type ExecRecord (
+	id: string,
+	container_id: string,
+	running: bool,
+	# Once the command ended
+	exit_code: ?int,
+	# 0 before it started
+	pid: int,
+	# What it was made with (the environment and the timeout are not
+	# told again)
+	command: []string,
+	user: string,
+	tty: bool,
+	stdin: bool,
+	stdout: bool,
+	stderr: bool,
+	privileged: bool,
+	detach_keys: string,
+	# Why the command could not be run or followed to its end, for a
+	# session made with `errors_apart`
+	error: ?string
+)
+
+# A metric (cAdvisor's names): its name, help text, whether it only grows,
+# and the names of its labels.
+type MetricDescriptor (name: string, help: string, counter: bool, labels: []string)
+
+# A value of a metric.
+type MetricSample (
+	name: string,
+	# The values of the labels of the descriptor, in its order
+	labels: []string,
+	value: float
+)
+
+# The metrics of a container of a pod.
+type ContainerMetrics (id: string, name: string, samples: []MetricSample)
+
+# What the cgroup of a pod has used: the numbers of the pod itself, with
+# its infra container and whatever its members leave, not the sum of the
+# members.
+type PodUsage (
+	# `cpu.stat` usage, in nanoseconds
+	cpu_usage_ns: int,
+	# `memory.current`, in bytes
+	memory_usage: int,
+	# `memory.current` without the page cache that is at once reclaimable
+	memory_working_set: int,
+	# Anonymous memory (`anon` of `memory.stat`), in bytes
+	memory_rss: int,
+	# `memory.max`, 0 for no limit
+	memory_limit: int,
+	# `memory.swap.current`
+	swap_usage: int,
+	# `memory.swap.max` (0 for no limit)
+	swap_limit: int,
+	pressure: Pressure
+)
+
+# The metrics of a pod that runs.
+type PodMetrics (
+	id: string,
+	name: string,
+	# When the samples were read
+	time_ns: int,
+	# Of the pod: the network of its namespace
+	samples: []MetricSample,
+	containers: []ContainerMetrics,
+	# Of the cgroup of the pod, when it has one of its own (a pod with
+	# limits)
+	usage: ?PodUsage
+)
+
+# How far a pull is: of a layer (its digest), or of the image with none.
+type TransferProgress (
+	layer: string,
+	status: TransferStatus,
+	# The text of a `phase` or a `warning`
+	message: string,
+	current_bytes: int,
+	total_bytes: int,
+	complete: bool
+)
+
+# Something that happened to an object of the engine.
+type Event (
+	time_ns: int,
+	# What it is about
+	kind: EventKind,
+	# What happened (`create`, `start`, `died`, `remove`, `pull`...)
+	action: string,
+	id: string,
+	name: string,
+	# The image of a container
+	image: string,
+	# The labels of a container and what the action tells (`exitCode`...)
+	attributes: [string]string
+)
+
+# What a wait waits for: podman's conditions, Docker's (`not-running`,
+# `next-exit`, `removed`) among them.  The wire spells a word with `_`
+# (`next_exit`), podman with `-` (`next-exit`).
+type WaitCondition (
+	# The container is created and was never initialized (as `created`)
+	configured,
+	# The container is created and does not run
+	created,
+	# The container exited, or never ran: its exit code (0)
+	exited,
+	# Its health check says healthy
+	healthy,
+	# The runtime made it, it was not started
+	initialized,
+	# Its next exit, whatever its state is now: the exit code; its removal
+	# ends the wait too
+	next_exit,
+	# The container does not run (as `exited`)
+	not_running,
+	# The container is paused
+	paused,
+	# The container is gone: the code of its last exit (0 if it never ran)
+	removed,
+	# The container is being removed or gone (-1 if it never ran)
+	removing,
+	# The container runs
+	running,
+	# As `exited`
+	stopped,
+	# A stop is in progress
+	stopping,
+	# Its health check says unhealthy
+	unhealthy
+)
+
+# What `VolumeCreate` makes.
+type VolumeSpec (
+	# Empty: a name of the engine's
+	name: string,
+	# Empty or `local`: the only driver
+	driver: string,
+	labels: [string]string,
+	# The options of the driver (`type`, `device`, `o`, `copy`, `uid`,
+	# `gid`...)
+	options: [string]string
+)
+
+# A volume.
+type VolumeRecord (
+	name: string,
+	driver: string,
+	# Where its content is on the host
+	mountpoint: string,
+	created_ns: int,
+	labels: [string]string,
+	options: [string]string,
+	scope: string,
+	# The user id of the owner it was created with
+	uid: int,
+	# The group id of the owner it was created with
+	gid: int,
+	# Made for a container (`-v /path`, the `VOLUME` of an image)
+	anonymous: bool,
+	# The content of the image is copied in at its first use
+	needs_copy_up: bool,
+	# Its owner becomes the user of its first container
+	needs_chown: bool
+)
+
+# What a change did to a file.
+type ChangeKind (modified, added, deleted)
+
+# What `ContainerDiff` compares.
+type DiffType (
+	# The container of the name, else the image
+	all,
+	container,
+	image
+)
+
+# Who makes the cgroups of the containers.
+type CgroupManager (systemd, cgroupfs)
+
+# When a pull fetches the image (none: `always`).
+type PullPolicy (
+	# When the store has no image of the name
+	missing,
+	# Never: the image of the store, or an error
+	never,
+	# Every time
+	always,
+	# When the registry has another image than the store
+	newer
+)
+
+# The format of the manifests a push writes.
+type ManifestFormat (
+	oci,
+	# Docker's: refused (`NotSupported`)
+	docker_v2s2
+)
+
+# How the layers of a push are compressed.
+type LayerCompression (gzip, zstd_chunked, none)
+
+# What a pull does now.
+type TransferStatus (
+	# The layer is being fetched
+	downloading,
+	# The layer is in the store already
+	exists,
+	# The layer (or, without one, the image) is in the store
+	complete,
+	# What the pull does now for the image as a whole (`message`)
+	phase,
+	# What the person who pulls should know (`message`)
+	warning
+)
+
+# The kind of object an event is about.
+type EventKind (
+	container,
+	pod,
+	image,
+	volume,
+	network,
+	secret,
+	artifact,
+	machine,
+	# The engine
+	system
+)
+
+# The engine: its build.
+type VersionRecord (
+	# Of the package
+	version: string,
+	# The git commit it was built of
+	commit: string,
+	# When it was built (0: not known)
+	built_ns: int,
+	os: string,
+	# The architecture as Rust names it (`x86_64`, `aarch64`)
+	arch: string,
+	# The release of the kernel
+	kernel: string
+)
+
+# An executable of the host the engine uses: where, the package it came
+# from (rpm or dpkg), the first line of its `--version` (empty when it is
+# not there).
+type HostTool (path: string, package: string, version: string)
+
+# An OCI runtime the containers can be made with.
+type RuntimePath (
+	name: string,
+	path: string,
+	# The document its `features` prints, as `OciRuntimeRecord` has it
+	features: string
+)
+
+# The OCI runtime of the containers by default.
+type OciRuntimeRecord (
+	name: string,
+	path: string,
+	package: string,
+	# The first line of its `--version`
+	version: string,
+	# The document its `features` prints (the runtime-spec features), as
+	# it prints it: both podman's and Docker's documents carry it as
+	# text; empty when it has none
+	features: string
+)
+
+# Whether a rootless user's units run, and run at boot.
+type SystemdRecord (
+	# The user's manager answers
+	user_manager: bool,
+	# Lingering is on: the manager and its units run at boot
+	linger: bool,
+	# What does not work because of it (empty: nothing)
+	warning: string
+)
+
+# A pool of the subnets of new networks (`[[network.subnet_pools]]`).
+type SubnetPool (
+	base: string,
+	# The prefix length of each subnet
+	size: int
+)
+
+# The shares of the CPU time of the host since its boot, in percent.
+type CpuUtilization (user_percent: float, system_percent: float, idle_percent: float)
+
+# The host the engine runs on, and what it runs the containers with.
+type HostRecord (
+	hostname: string,
+	cpus: int,
+	mem_total: int,
+	mem_free: int,
+	mem_available: int,
+	swap_total: int,
+	swap_free: int,
+	# How long the host has run
+	uptime_ns: int,
+	cgroup_manager: CgroupManager,
+	# 1 or 2
+	cgroup_version: int,
+	# The cgroup controllers the containers can have
+	cgroup_controllers: []string,
+	cpu_utilization: CpuUtilization,
+	# The platforms (`linux/arm64`) the host runs through the binfmt_misc
+	# handlers of QEMU
+	emulated_architectures: []string,
+	# The UID mappings of the user namespace of a rootless engine (none for
+	# root)
+	uid_mappings: []IdMapping,
+	# The GID mappings of the user namespace of a rootless engine (none for
+	# root)
+	gid_mappings: []IdMapping,
+	# The engine runs in a user namespace
+	rootless: bool,
+	selinux: bool,
+	# Where the events are kept (`file`, `journald`, `memory`...)
+	event_logger: string,
+	# The log driver of a container that does not choose one
+	log_driver: string,
+	# The monitor of the containers (podman's conmon)
+	monitor_path: string,
+	# The executable of the engine
+	engine_path: string,
+	# The CDI spec directories
+	cdi_spec_dirs: []string,
+	# The CDI devices in the spec directories
+	cdi_devices: []string,
+	# The errors of the CDI spec files
+	cdi_errors: []string,
+	pasta: HostTool,
+	slirp4netns: HostTool,
+	oci_runtime: OciRuntimeRecord,
+	# The other runtimes a container can be made with (`[runtimes]` of
+	# the configuration, those that are there)
+	runtimes: []RuntimePath,
+	# The kernel passes the reads of FUSE through
+	fuse_passthrough: bool,
+	# Users may make user namespaces
+	userns: bool,
+	# The user's systemd manager, of a rootless engine
+	systemd: ?SystemdRecord
+)
+
+# The store of the engine.
+type StoreRecord (
+	# The configuration file of the engine (the default one when it read
+	# none)
+	config_file: string,
+	# The root of the storage (podman's graph root)
+	graph_root: string,
+	# The inodes of its file system (none when it cannot be asked)
+	graph_root_inodes: ?int,
+	# The inodes of its file system in use (none when it cannot be asked)
+	graph_root_inodes_used: ?int,
+	# The bytes of its file system
+	graph_root_allocated: int,
+	# The bytes of its file system that are used
+	graph_root_used: int,
+	# The state of the engine (podman's run root)
+	run_root: string,
+	# The root of what the engine keeps
+	root_dir: string,
+	volume_path: string,
+	containers: int,
+	running: int,
+	paused: int,
+	stopped: int,
+	images: int,
+	# The storage driver of the store, by its own name (`composefs`)
+	storage_driver: string,
+	# The graph driver as podman and Docker report it (`overlay` for
+	# composefs), which tools key on
+	graph_driver: string,
+	# What the driver reports of itself
+	graph_status: [string]string
+)
+
+# What `SystemInspect` answers: the engine, its host and its store.
+type SystemRecord (
+	version: VersionRecord,
+	host: HostRecord,
+	store: StoreRecord,
+	# The registries a short name is searched in
+	search_registries: []string,
+	subnet_pools: []SubnetPool
+)
+
+# What an image uses of the store.
+type ImageUsage (
+	id: string,
+	names: []string,
+	# `NAME@DIGEST` of each name, the digest of its manifest
+	digests: []string,
+	created_ns: int,
+	# Its metadata and its layers
+	size: int,
+	# What no other image shares of it
+	unique_size: int,
+	# The containers of it
+	containers: int
+)
+
+# What a container uses of the store.
+type ContainerUsage (
+	id: string,
+	name: string,
+	image_id: string,
+	# The command it runs (without the entrypoint)
+	command: []string,
+	# The volumes it mounts
+	volumes: int,
+	# What it wrote
+	rw_size: int,
+	# That and its image
+	size: int,
+	created_ns: int,
+	state: RunState
+)
+
+# What a volume uses.
+type VolumeUsage (
+	name: string,
+	mountpoint: string,
+	created_ns: int,
+	labels: [string]string,
+	# The containers that mount it
+	links: int,
+	size: int
+)
+
+# Files of the store: how many, their size, what a collection would free
+# of them now (none when it cannot tell).
+type StoreUsage (count: int, size: int, reclaimable: ?int)
+
+# What the images, the containers and the volumes use of the disk.
+type DiskUsageRecord (
+	# With `store`: the storage driver, by its own name, that holds
+	# `objects` and `composefs`
+	driver: string,
+	images: []ImageUsage,
+	containers: []ContainerUsage,
+	volumes: []VolumeUsage,
+	# All the images, a layer they share counted once
+	images_size: int,
+	# What removing the images no container uses frees
+	images_reclaimable: int,
+	# With `store`: the files of the layers, by their fs-verity digest
+	objects: ?StoreUsage,
+	# With `store`: the EROFS images of the layers and of the images
+	composefs: ?StoreUsage,
+	# With `store`: the pulls in progress (`staging/lazy`): how many, and
+	# the bytes of their staging area (the files fetched, the tables and
+	# the EROFS images of their layers), all of it reclaimable when every
+	# pull left is cancelled
+	pulling: ?StoreUsage
+)
+
+# A volume a prune removed.
+type PrunedVolume (
+	name: string,
+	# The bytes it had
+	size: int
+)
+
+# What `SystemPrune` removed.
+type SystemPruneReport (
+	pods: []string,
+	containers: []string,
+	networks: []string,
+	volumes: []PrunedVolume,
+	images: []PrunedImage,
+	# The bytes the prune freed: what the volumes and the writable layers
+	# of the containers removed had, the metadata of the images removed
+	# and their layers the store no longer has, each once (a layer an
+	# image left, a container or a pull holds is not counted; podman counts
+	# each image whole)
+	reclaimed: int
+)
+
+# What `SystemCheck` checks.
+type CheckSpec (
+	# Skip what reads the content of the files and of the images.
+	quick: bool,
+	# Fix what is derivable from the store, remove the images that are
+	# damaged and not in use (podman's `--repair`).
+	repair: bool,
+	# With `repair`: also remove the containers that use a damaged image,
+	# then the image (podman's `--force`, `repair_lossy`).  A running
+	# container is left alone.
+	repair_lossy: bool,
+	# Stop starting the check of another image after this many
+	# milliseconds (none: check them all).
+	timeout_ms: ?int,
+	# A file of the store that nothing accounts for is a leftover once it
+	# has been unchanged for this many milliseconds (podman's `--max`;
+	# none: `check_leftover_age_secs` of the configuration).
+	max_age_ms: ?int
+)
+
+# What was done about a problem the check found.
+type CheckAction (
+	# Nothing: the check does not repair, or the problem cannot be
+	# repaired here.
+	none,
+	# Repaired.
+	repaired,
+	# The image was removed: its damage cannot be repaired without
+	# pulling it again.
+	image_removed,
+	# The image is damaged and containers use it: it was left alone.
+	image_in_use
+)
+
+# A problem of the store, of an image if it has one.
+type CheckProblem (
+	# The id of the image the problem is of (none: of the store).
+	image: ?string,
+	# A name of that image.
+	name: ?string,
+	kind: string,
+	message: string,
+	path: ?string,
+	action: CheckAction
+)
+
+# A container that `repair_lossy` removed.
+type CheckRemovedContainer (id: string, name: string)
+
+# What a check of the store found and did.
+type CheckReport (
+	images_total: int,
+	images_checked: int,
+	# Not reached before `timeout_ms` ran out.
+	images_unchecked: int,
+	files_checked: int,
+	bytes_read: int,
+	elapsed_ms: int,
+	problems: []CheckProblem,
+	# The containers `repair_lossy` removed, with their images.
+	removed_containers: []CheckRemovedContainer
+)
+
+# What a collection of the garbage of the store removed (or, for a dry
+# run, would remove).
+type GcReport (
+	files_removed: int,
+	layers_removed: int,
+	# Leases of pulls that are gone
+	leases_removed: int,
+	# Staging directories of pulls that are gone
+	staging_removed: int,
+	bytes_freed: int,
+	# What failed on the way (the rest was collected)
+	errors: []string,
+	dry_run: bool
+)
+
+# A store of the storage service (`[storage] driver = "varlink"`) of the
+# engine's user.
+type ServiceStore (
+	# The id of the store (32 hex digits)
+	store: string,
+	# What the store takes on the service's disk
+	size: int,
+	# When an engine last opened it (0: the service does not know)
+	last_open_ns: int,
+	# The store of this engine, which is not dropped
+	current: bool
+)
+
+# `SystemStores` answers.
+type StoresReport (
+	# The stores the service holds for the engine's user, after the drop
+	stores: []ServiceStore,
+	# The store this call dropped
+	dropped: ?string
+)
+
+# The health of a part of the engine.
+type ComponentStatus (healthy, degraded, unhealthy)
+
+# A part of the engine (its database, its storage, its runtime).
+type ComponentHealth (
+	name: string,
+	status: ComponentStatus,
+	# Why it is not healthy
+	message: ?string
+)
+
+# What an image is built from and how: the document `ImageBuild` carries.  The frontend decodes its client's request into
+# it (the other options of the request it refuses by their names).
+type BuildSpec (
+	client: BuildClient,
+	# Only the id of the image in the progress
+	quiet: bool,
+	# The names of the image, as the client wrote them
+	tags: []string,
+	build_args: []BuildPair,
+	labels: []BuildPair,
+	no_cache: bool,
+	layers: bool,
+	target: ?string,
+	platform: ?string,
+	manifest: ?string,
+	all_platforms: bool,
+	squash: bool,
+	squash_all: bool,
+	# `none`, `host` or the name of a network
+	network: ?string,
+	# The entitlements the build is allowed to use (the command line's;
+	# for the others the configuration decides)
+	allow: []BuildEntitlement,
+	# `sha256` or `sha512`: the algorithm of the digests of everything the
+	# build makes (none: the engine's `[build] digest`)
+	digest: ?string,
+	tls_verify: bool,
+	pull: BuildPull,
+	# The client answers the questions of the build for credentials
+	ask_credentials: bool,
+	# What the RUN steps take
+	run: BuildRun,
+	# `--env`: environment variables of the final image
+	env: []BuildPair,
+	# `--unsetenv`: environment variables the final image does not have
+	unset_env: []string,
+	# `--unsetlabel`: labels the final image does not have
+	unset_labels: []string,
+	secrets: []BuildSecretSpec,
+	contexts: []BuildContextSpec,
+	# The ids of the agents of the client, in the order of its broker
+	ssh: []string,
+	# The call carries the standard input of the client, which the RUN
+	# steps read (`--stdin`): the command line's
+	stdin: bool,
+	flags: BuildFlags,
+	# The proxy variables of the engine's environment are in the RUN
+	# containers
+	http_proxy: bool,
+	# The Containerfile: a path in the context, never outside of it
+	containerfile: ?string,
+	# The Containerfile is a file of the host of the engine (the local
+	# build)
+	containerfile_host: ?string,
+	# The Containerfile is not in the directory of the context: the client
+	# put it in the upload as `dockerfile`
+	containerfile_outside: bool,
+	# The Containerfile is an http(s) URL the engine fetches (`-f URL`)
+	containerfile_url: ?string,
+	# The context is a git repository or the URL of a tar, not the upload
+	remote: ?string,
+	# The context is a directory of the host of the engine
+	local_dir: ?string,
+	output: ?BuildOutput
+)
+
+# What a build tells as it goes: the lines of the pipe `ImageBuild` answers
+# with, one JSON document of this type each line.
+# The last of them is `complete` or `error`; podman's and Docker's clients
+# are told neither `started` nor `progress` (their answers show neither).
+type BuildEvent (
+	kind: BuildEventKind,
+	# The number of the step (`step`, `output`); the number of steps
+	# (`started`)
+	step: int,
+	# The instruction (`step`), the text (`output`), the id of the image
+	# (`complete`), why the build failed (`error`)
+	text: string,
+	# What the text of an `output` is
+	stream: BuildStream,
+	# The progress of a blob (`progress`): a base image pulled, the image
+	# committed
+	progress: ?TransferProgress,
+	# The number of the question for credentials (`credentials`), to be
+	# answered with `ImageBuildAnswer`
+	ask: string,
+	# The registries (`REGISTRY` or `REGISTRY/REPOSITORY`) the question is
+	# about (`credentials`)
+	scopes: []string,
+	# The names the image got (`complete`), qualified (for podman's and
+	# Docker's clients: the command line has its own)
+	tags: []string
+)
+
+# What a build event is.
+type BuildEventKind (
+	# The build starts; `step` is the number of its steps
+	started,
+	# A step starts
+	step,
+	# What the build or a step says
+	output,
+	# A blob moves
+	progress,
+	# The build for a platform of several starts (`text`)
+	platform,
+	# The build asks for credentials
+	credentials,
+	# The image is built
+	complete,
+	# The build failed
+	error
+)
+
+# What the text of an `output` event is.
+type BuildStream (
+	# What the build says of a step
+	step,
+	# What a RUN writes to its standard output
+	stdout,
+	# What a RUN writes to its standard error
+	stderr,
+	# The pulls of the bases
+	report
+)
+
+# Who a build is for: the shape of the progress it answers, and what a
+# name or an option means when the client does not say.
+type BuildClient (
+	# The command line of velarx (its build goes on when the reader of
+	# its progress goes)
+	cli,
+	# podman's libpod routes
+	libpod,
+	# Docker's classic builder, its defaults and messages
+	docker
+)
+
+# A name and its value: an argument, a label, a variable.  The lists of
+# them keep the order and the repeated names the user gave (the last of a
+# name wins where a map is wanted).
+type BuildPair (name: string, value: string)
+
+# What a build step may ask for that is off unless it is allowed
+# (`--allow`).
+type BuildEntitlement (
+	# The steps share the network namespace of the host
+	network_host,
+	# `RUN --security=insecure`: the step runs as a privileged container
+	security_insecure
+)
+
+# When a build pulls its base images.
+type BuildPull (
+	# When the store does not have them
+	missing,
+	# Every time
+	always,
+	# When the registry serves another image than the store has
+	newer,
+	# Never: they must be in the store
+	never
+)
+
+# Where the value of a secret of a build is.
+type BuildSecretKind (
+	# The bytes themselves (base64), as the command line sends them
+	value,
+	# A file at the top of the context, taken out of it
+	context_file,
+	# A file of the host of the engine (the local build)
+	host_file
+)
+
+# A secret of a build, for `RUN --mount=type=secret`.  Its value is never
+# printed.
+type BuildSecretSpec (
+	id: string,
+	kind: BuildSecretKind,
+	# The value (base64), or the name of the file
+	source: string
+)
+
+# Where a named context (`--build-context`) of a build is.
+type BuildContextKind (
+	# An image
+	image,
+	# A git repository or the URL of a tar
+	url,
+	# A directory the client put at the top of the upload, under this name
+	upload,
+	# A directory of the host of the engine (the local build)
+	host
+)
+
+# A named context of a build (`--build-context NAME=SOURCE`).
+type BuildContextSpec (
+	name: string,
+	kind: BuildContextKind,
+	# The image, the URL, the name in the upload, the path
+	source: string
+)
+
+# Where the files of the image go (`outputs`).
+type BuildOutputKind (
+	# Extracted into a directory of the host of the engine
+	dir,
+	# A tar, in a file of the host of the engine
+	tar
+)
+
+# What a build does with the files of the image (`--output`).
+type BuildOutput (kind: BuildOutputKind, path: string)
+
+# The options of a build that are not those of its RUN containers.
+type BuildFlags (
+	# `--from`: the image of the first FROM.
+	from: ?string,
+	# `--retry`, `--retry-delay`: how a failed pull of a base image is
+	# tried again.
+	retry: Retry,
+	# `--timestamp`: the time of the image, its history and the files of
+	# its new layers (seconds since the epoch).
+	timestamp: ?int,
+	# `--source-date-epoch`: the time of the image and its history (and
+	# the build argument SOURCE_DATE_EPOCH).
+	source_date_epoch: ?int,
+	# With `source_date_epoch`: no file of a new layer is newer.
+	rewrite_timestamp: bool,
+	# `--omit-history`: the image has no history.
+	omit_history: bool,
+	# `--inherit-labels=false`: a stage does not keep the labels of its
+	# base.
+	inherit_labels: bool,
+	# `--skip-unused-stages=false`: every stage before the target is
+	# built, those it does not use too.
+	skip_unused_stages: bool,
+	# `--jobs`: how many independent stages run at the same time (0: as
+	# many as there are).
+	jobs: int,
+	# `--cache-ttl`: the images of the build cache made longer ago (in
+	# milliseconds) are not used.
+	cache_ttl_ms: ?int,
+	# `--annotation`: annotations of the manifest of the image.
+	annotations: []BuildPair,
+	# `--unsetannotation`: annotations the image does not have.
+	unset_annotations: []string,
+	# `--inherit-annotations=false`: the image does not keep the
+	# annotations of its base, nor names it in them.
+	inherit_annotations: bool,
+	# `--created-annotation=false`: no `org.opencontainers.image.created`.
+	created_annotation: bool,
+	# `--os-version`: the `os.version` of the configuration of the image.
+	os_version: ?string,
+	# `--os-feature`: the `os.features` of the configuration of the image.
+	os_features: []string,
+	# `--http-proxy`: the proxy variables of the client in the RUN
+	# containers, not in the image nor in the build cache.
+	proxy_env: []BuildPair,
+	# `--compat-volumes`: the RUN steps mount the VOLUMEs of the image
+	# (anonymous volumes), so that what they write there is discarded,
+	# as Docker's builder does; else, as buildah, they see the directory
+	# of the image and keep what they write.
+	compat_volumes: bool,
+	# `--identity-label`: absent is the default (the label that names the
+	# builder unless a time is fixed with `timestamp` or
+	# `source_date_epoch`), `true` always, `false` never.
+	identity_label: ?bool,
+	# `--cache-from`: repositories whose images are taken as the result of
+	# a step when they have one for its key.
+	cache_from: []string,
+	# `--cache-to`: repositories the image of every new step is pushed to.
+	cache_to: []string,
+	# `--layer-label`: labels of the intermediate images (not
+	# of the last image of a stage).
+	layer_labels: []BuildPair,
+	# The SBOM options.
+	sbom: SbomFlags
+)
+
+# What the SBOM options of a build say.
+type SbomFlags (
+	# `--sbom`: a preset of a scanner image, commands and merge strategy.
+	preset: ?string,
+	# `--sbom-scanner-image`
+	scanner_image: ?string,
+	# `--sbom-scanner-command`, in order.
+	scanner_commands: []string,
+	# `--sbom-merge-strategy`
+	merge_strategy: ?string,
+	# `--sbom-output`: a file of the host.
+	output: ?string,
+	# `--sbom-purl-output`: a file of the host.
+	purl_output: ?string,
+	# `--sbom-image-output`: a path in the built image.
+	image_output: ?string,
+	# `--sbom-image-purl-output`: a path in the built image.
+	image_purl_output: ?string
+)
+
+# What the RUN steps of a build take from the command line
+# (`build --volume`, `--add-host`, `--dns`, `--cap-add`, `--security-opt`,
+# `--ulimit`, `--device`, `--shm-size`...).
+type BuildRun (
+	volumes: []string,
+	add_hosts: []string,
+	dns: []string,
+	dns_search: []string,
+	dns_options: []string,
+	cap_add: []string,
+	cap_drop: []string,
+	security_opts: []string,
+	ulimits: []RequestUlimit,
+	devices: []RequestDevice,
+	shm_size: ?int,
+	# `--group-add`
+	group_add: []string,
+	# `--no-hosts`
+	no_hosts: bool,
+	# `--no-hostname`
+	no_hostname: bool,
+	# `--memory`, `--cpu-*`, `--cpuset-*` (none: no limit)
+	resources: ?RequestResources,
+	cgroup_parent: ?string,
+	# `--ipc`: the IPC namespace mode of `run`
+	ipc: string,
+	# `--pid`: the PID namespace mode of `run`
+	pid: string,
+	# `--uts`: the UTS namespace mode of `run`
+	uts: string,
+	# `--cgroupns`: the cgroup namespace mode of `run`
+	cgroupns: string,
+	# `--userns`: the user namespace mode of `run`
+	userns: string,
+	# `--userns-uid-map` (`CONTAINER:HOST:SIZE`)
+	uidmap: []string,
+	# `--userns-gid-map` (`CONTAINER:HOST:SIZE`)
+	gidmap: []string,
+	# `--userns-uid-map-user`
+	subuidname: ?string,
+	# `--userns-gid-map-group`
+	subgidname: ?string
+)
+
+# What a container is made with: the one creation record of the command
+# line, the CRI and the REST API.
+type CreateContainerRequest (
+	id: ?string,
+	name: ?string,
+	image: string,
+	command: []string,
+	entrypoint: []string,
+	# The entrypoint of the image is dropped and its command kept (Docker's
+	# `"Entrypoint": []`); `[""]` in `entrypoint` drops both
+	reset_entrypoint: bool,
+	working_dir: string,
+	env: []string,
+	labels: [string]string,
+	annotations: [string]string,
+	hostname: string,
+	user: string,
+	group_add: []string,
+	# The command line that made the container (podman's `CreateCommand`)
+	create_command: []string,
+	# The groups of the process are its group and `group_add` only, not
+	# those the image's /etc/group gives the user (the CRI's `Strict`
+	# supplemental groups policy)
+	groups_strict: bool,
+	# `--passwd-entry`: the entry added for a user the image lacks
+	passwd_entry: ?string,
+	# `--group-entry`
+	group_entry: ?string,
+	# `--passwd=false`: no entries are added
+	no_passwd: bool,
+	# `--unsetenv`: variables of the image and the defaults to drop
+	unsetenv: []string,
+	# `--unsetenv-all`
+	unsetenv_all: bool,
+	# `--env-merge`: `KEY=VALUE` where VALUE may use `${KEY}` of the image
+	env_merge: []string,
+	# `--personality`
+	personality: ?string,
+	# `--hosts-file`: the base of /etc/hosts, a path, `none` or `image`
+	hosts_file: ?string,
+	# The /etc/hosts of the image, read by the engine for `--hosts-file=image`
+	hosts_image: ?string,
+	# `--chrootdirs`: the files the engine mounts in the root are mounted
+	# below these directories too
+	chroot_dirs: []string,
+	# `--hostuser`: users of the host (names or ids) whose /etc/passwd
+	# entries the container gets
+	host_users: []string,
+	# `--rdt-class`: the class of service of Intel RDT
+	rdt_class: ?string,
+	# `--seccomp-policy`: `default`, or `image` (the profile named by the
+	# label `io.containers.seccomp.profile` of the image)
+	seccomp_policy: ?string,
+	# `--rootfs-propagation`
+	rootfs_propagation: ?string,
+	# `--read-only-tmpfs=false`
+	no_read_only_tmpfs: bool,
+	# `--no-hostname`: no /etc/hostname
+	no_hostname: bool,
+	# `--no-healthcheck`: not even the one of the image
+	no_healthcheck: bool,
+	# `--requires`: containers started before this one
+	requires: []string,
+	# `--shm-size-systemd`: the size of the tmpfs of systemd mode
+	shm_size_systemd: ?int,
+	# `--pidfile`: where the monitor writes the pid of the init process
+	pidfile: ?string,
+	# `--conmon-pidfile`: where the monitor writes its own pid
+	conmon_pidfile: ?string,
+	# The container whose SELinux label this one shares (the infra
+	# container of its pod), set by the engine, never by a client
+	selinux_share_with: ?string,
+	mounts: []RequestMount,
+	# `-v` as typed
+	volumes: []string,
+	# `--mount` as typed
+	mount: []string,
+	# Bind mounts as values (a path may hold any character, which the
+	# text of `-v` cannot say)
+	bind_mounts: []BindMountRequest,
+	# Mounts of an image as values
+	image_mounts: []ImageMountRequest,
+	# `bind` (default), `tmpfs` or `ignore`: what to do with the `VOLUME`s of the image
+	image_volume: string,
+	tmpfs: []string,
+	read_only_rootfs: bool,
+	privileged: bool,
+	cap_add: []string,
+	cap_drop: []string,
+	# Capabilities in every set of the process, the ambient one too
+	cap_ambient: []string,
+	userns_mode: string,
+	uid_mappings: []IdMapping,
+	gid_mappings: []IdMapping,
+	# `--uidmap` as typed (`[+ug]CONTAINER:[@]PARENT[:SIZE]`)
+	uidmap: []string,
+	# `--gidmap` as typed (`[+ug]CONTAINER:[@]PARENT[:SIZE]`)
+	gidmap: []string,
+	subuidname: ?string,
+	subgidname: ?string,
+	tty: bool,
+	stdin_open: bool,
+	# Security options
+	security_opt: RequestSecurityOptions,
+	# `--security-opt` as given, applied over `security_opt`
+	security_opts: []string,
+	# Resource limits
+	resources: ?RequestResources,
+	# Health check configuration
+	healthcheck: ?Healthcheck,
+	# Restart policy
+	restart_policy: ?RestartPolicy,
+	# Network mode (bridge, host, none, container:id)
+	network_mode: string,
+	# Network names to connect to
+	networks: []string,
+	# Network aliases
+	network_aliases: []string,
+	# The annotations of the pod, for the CNI plugins of the network (the
+	# infra container of a Kubernetes pod; not annotations of the
+	# container)
+	cni_annotations: [string]string,
+	# The subnets the node gives its pods, for the CNI plugins that ask
+	# for `ipRanges`
+	cni_ip_ranges: []string,
+	# DNS servers
+	dns: []string,
+	# DNS search domains
+	dns_search: []string,
+	# DNS options
+	dns_options: []string,
+	# Custom host-to-IP mappings
+	add_hosts: []string,
+	# Port mappings (host:container)
+	ports: []RequestPortMapping,
+	# Exposed ports
+	expose: []string,
+	# Every exposed port, of the image too, on a free host port (`-P`)
+	publish_all: bool,
+	# Static IP address
+	ip_address: ?string,
+	# Static IPv6 address
+	ip6_address: ?string,
+	# MAC address
+	mac_address: ?string,
+	# Stop signal
+	stop_signal: string,
+	# Stop timeout in seconds
+	stop_timeout: ?int,
+	# OOM score adjustment
+	oom_score_adj: ?int,
+	# Disable OOM killer
+	oom_kill_disable: bool,
+	# PID limit
+	pids_limit: ?int,
+	# Shared memory size
+	shm_size: ?int,
+	# Sysctls
+	sysctls: [string]string,
+	# Ulimits
+	ulimits: []RequestUlimit,
+	# Log configuration
+	log_config: ?RequestLogConfig,
+	# Devices to add to container
+	devices: []RequestDevice,
+	# Device cgroup rules
+	device_cgroup_rules: []string,
+	# Run an init process
+	init: bool,
+	# Path to init binary
+	init_path: ?string,
+	# PID namespace mode
+	pid_mode: string,
+	# IPC namespace mode
+	ipc_mode: string,
+	# UTS namespace mode
+	uts_mode: string,
+	# Cgroup namespace mode
+	cgroupns_mode: string,
+	# Cgroup parent
+	cgroup_parent: ?string,
+	# Timezone
+	timezone: ?string,
+	# Umask
+	umask: ?string,
+	# Automatically remove container on exit
+	auto_remove: bool,
+	# `--rmi`: its image is removed with it, unless another container
+	# uses it
+	auto_remove_image: bool,
+	# The root file system may lose what it holds in a crash (the overlay
+	# is mounted `volatile`): a container that is thrown away.  `--rm` has
+	# it already; a build step sets it, as its upper layer is read as soon
+	# as the step ends.
+	volatile: bool,
+	# Maximum container runtime in seconds
+	timeout: ?int,
+	# `--systemd`: `true`, `false` or `always`
+	systemd: ?string,
+	# Container cidfile path
+	cidfile: ?string,
+	# Pod to join
+	pod: ?string,
+	# The OCI runtime to make the container with: a name of `[runtimes]`,
+	# or the default one (none, its name or its path); never another path
+	# or a name in PATH.  A member of a pod takes the pod's
+	runtime: ?string,
+	# Replace existing container with same name
+	replace: bool,
+	# Do not create /etc/hosts
+	no_hosts: bool,
+	# Allow running with lazy-pulled image (files fetched on-demand)
+	lazy: bool,
+	# Secrets to add; the API layer turns them into mounts and variables
+	secrets: []RequestSecret,
+	# Set by the engine, never by a client: the secrets the API resolved
+	# into `env` and `mounts` (the request kept in the bundle has none)
+	resolved_secrets: []RequestSecret,
+	# Set by the engine, never by a client: the variables the API added for
+	# the secrets (the request kept in the bundle has none)
+	secret_env: []string,
+	# The SELinux level wanted (a restored container's: its processes
+	# keep their labels), taken only when no container's level overlaps
+	# it, else one is allocated
+	preferred_selinux_level: ?string,
+	# `image` is the directory of the root file system (`PATH[:O]`)
+	rootfs: bool,
+	# sd_notify: `container`, `conmon` or `ignore`
+	sdnotify: string,
+	# `--cgroups`: enabled, scope, disabled, no-conmon or split
+	cgroups: string,
+	# `scope` of a pod's members, set by the pod service (none: the
+	# engine's default); not an option (a create that sets it is
+	# refused): `--cgroups=scope` is resolved into it when the
+	# container is made
+	cgroup_mode: ?string,
+	# `run --no-monitor`: the process that runs the engine monitors the
+	# container; only the engine that it split from can do it.
+	no_monitor: bool
+)
+
+# Security options for container
+type RequestSecurityOptions (
+	# Disable seccomp
+	seccomp_unconfined: bool,
+	# Custom seccomp profile path or JSON
+	seccomp_profile: ?string,
+	# SELinux label for the container
+	selinux_label: ?string,
+	# SELinux user
+	selinux_user: ?string,
+	# SELinux role
+	selinux_role: ?string,
+	# SELinux type
+	selinux_type: ?string,
+	# SELinux level
+	selinux_level: ?string,
+	# `label=files`: the files of a privileged container are labelled
+	selinux_files: bool,
+	# AppArmor profile
+	apparmor_profile: ?string,
+	# Disable AppArmor
+	apparmor_unconfined: bool,
+	# No new privileges
+	no_new_privileges: bool,
+	# Mask paths (hidden from container)
+	mask_paths: []string,
+	# Read-only paths
+	readonly_paths: []string,
+	# Procfs mount options
+	proc_opts: ?string,
+	# Paths unmasked (`ALL` for all) of the masked and read-only ones
+	unmask_paths: []string,
+	# `label=filetype:TYPE`
+	selinux_filetype: ?string,
+	# `seccomp-bpf=PATH`: a compiled BPF filter
+	seccomp_bpf: ?string,
+	# `signature=check|require`: kept in the container.  `check` judges the
+	# whole signature policy (`reject` included) at create and at every
+	# start by the engine, and runs an image the policy accepts without a
+	# signature; `require` also refuses an image no signature rule of the
+	# policy accepted a signature of.  Without it the signature rules of
+	# the policy are judged at create only (`reject` refuses pulls)
+	signature: ?string,
+	# `verity=enforce`: the layers of the image (and of the images
+	# mounted in the container) must be the images whose fs-verity digests
+	# the manifest states, at every start
+	verity_enforce: bool
+)
+
+# Resource limits for container
+type RequestResources (
+	# CPU quota in microseconds per period
+	cpu_quota: ?int,
+	# CPU period in microseconds
+	cpu_period: ?int,
+	# CPU shares (relative weight)
+	cpu_shares: ?int,
+	# CPU set (e.g., "0-2,4")
+	cpuset_cpus: ?string,
+	# Memory set (e.g., "0-1")
+	cpuset_mems: ?string,
+	# Memory limit in bytes
+	memory: ?int,
+	# Memory + swap limit in bytes (-1 for unlimited)
+	memory_swap: ?int,
+	# Memory reservation (soft limit) in bytes
+	memory_reservation: ?int,
+	# Block IO weight
+	blkio_weight: ?int,
+	# Block IO weight devices
+	blkio_weight_device: []WeightDevice,
+	# Block IO read bandwidth limits
+	blkio_device_read_bps: []ThrottleDevice,
+	# Block IO write bandwidth limits
+	blkio_device_write_bps: []ThrottleDevice,
+	# Block IO read IOPS limits
+	blkio_device_read_iops: []ThrottleDevice,
+	# Block IO write IOPS limits
+	blkio_device_write_iops: []ThrottleDevice,
+	# Device read BPS limit (e.g., "/dev/sda:1mb")
+	device_read_bps: ?string,
+	# Device write BPS limit (e.g., "/dev/sda:1mb")
+	device_write_bps: ?string,
+	# Device read IOPS limit (e.g., "/dev/sda:1000")
+	device_read_iops: ?string,
+	# Device write IOPS limit (e.g., "/dev/sda:1000")
+	device_write_iops: ?string,
+	# Shared memory size (shm-size) in bytes
+	shm_size: ?int,
+	# Cgroup v2 arbitrary configuration (KEY=VALUE pairs)
+	cgroup_conf: ?[string]string,
+	# Hugepage limits: page size (`2MB`) and bytes
+	hugepage_limits: []RequestHugepageLimit
+)
+
+# A limit of the hugepages of one size.
+type RequestHugepageLimit (page_size: string, limit: int)
+
+# Block IO weight device
+type WeightDevice (
+	# The device node; empty when `device` names the device
+	path: string,
+	weight: int,
+	# Major and minor numbers of the block device
+	device: ?RequestDeviceNumbers
+)
+
+# Block IO throttle device
+type ThrottleDevice (path: string, rate: int)
+
+# Port mapping
+type RequestPortMapping (
+	# Container port
+	container_port: int,
+	# Host port (optional, auto-assigned if not specified)
+	host_port: ?int,
+	# Host IP to bind to
+	host_ip: string,
+	# Protocol (tcp, udp)
+	protocol: string
+)
+
+# Ulimit configuration
+type RequestUlimit (name: string, soft: int, hard: int)
+
+# Log configuration
+type RequestLogConfig (
+	# Log driver (json-file, syslog, journald, none)
+	driver: string,
+	# Log driver options
+	config: [string]string
+)
+
+# Device mapping
+type RequestDevice (
+	# Path on host
+	path_on_host: string,
+	# Path in container
+	path_in_container: string,
+	# Cgroup permissions (r, w, m)
+	cgroup_permissions: string
+)
+
+# Mount configuration for container volumes
+type RequestMount (
+	# Source path on host
+	source: string,
+	# Destination path in container (target)
+	target: string,
+	# Mount type (bind, volume, tmpfs, etc.)
+	mount_type: ?string,
+	# Mount options
+	options: []string,
+	# The named volume that is the source
+	volume: ?string,
+	# Only this directory of the volume
+	subpath: ?string,
+	# The source is (a directory of) an image
+	image: ?ImageMountConfig,
+	# `U`: the source is given to the user of the container
+	chown: bool,
+	# Do not copy the content of the image in a new volume
+	nocopy: bool,
+	# `z` or `Z`
+	relabel: ?string,
+	# `idmap` or `idmap=uids=..;gids=..` as given
+	idmap: ?string,
+	# The mappings of an idmapped mount, once worked out
+	uid_mappings: []IdMapping,
+	gid_mappings: []IdMapping,
+	# `O`: an overlay with the source as its lower layer
+	overlay: ?OverlayMountConfig,
+	# The directory of the volume whose `subpath` is mounted, once the
+	# container is created: the monitor looks the sub path up in it at
+	# each start, the source is then where it mounts it
+	subpath_root: ?string,
+	# A secret file of the container: its owner, ids of the container
+	# (`--secret ...,uid=,gid=`), given through the user namespace
+	secret_owner: ?RequestOwner,
+	# The engine added it (its files of the bundle, the init binary, the
+	# notify socket): the inspect does not list it
+	engine: bool
+)
+
+# A directory or file of the host bind-mounted in a container.
+type BindMountRequest (
+	# The absolute path on the host
+	source: string,
+	# The absolute path in the container
+	target: string,
+	# The options, one each, as the options of `-v` (`ro`, `rslave`, `rro`,
+	# `z`, `idmap=...`)
+	options: []string
+)
+
+# An image (or a directory of it) to mount, read-only, in a container.
+type ImageMountRequest (
+	image: string,
+	# The absolute path in the container
+	target: string,
+	subpath: ?string
+)
+
+# An overlay volume (`-v SRC:DST:O`): the source is the lower layer, the
+# container writes to an upper layer that is its own (discarded when it
+# stops) or the user's (`upperdir=`, `workdir=`).
+type OverlayMountConfig (
+	upperdir: ?string,
+	workdir: ?string,
+	# The lower layer (the source given), once the container is created;
+	# the source of the mount is then where the monitor mounts the overlay
+	lower: ?string,
+	# The owner of a new upper layer: the root of the container
+	owner: ?RequestOwner
+)
+
+# An image (or a directory of it) mounted in a container.
+type ImageMountConfig (
+	# the name given, then the id of the image
+	image: string,
+	subpath: ?string,
+	# read-write: changes go to a private layer
+	rw: bool,
+	# The digest the image was named by (`NAME@sha256:...`): what an
+	# enforced start verifies the image from
+	digest: ?string
+)
+
+# A secret a container uses (`--secret`): a file at `target` (default
+# `/run/secrets/NAME`), or with `env` the variable `target`.
+type RequestSecret (
+	name: string,
+	env: bool,
+	target: string,
+	uid: int,
+	gid: int,
+	# 0 is 0444
+	mode: int
+)
+
+# The major and minor numbers of a block device.
+type RequestDeviceNumbers (major: int, minor: int)
+
+# A cgroup device rule (`--device-cgroup-rule 'c 1:3 rwm'`).
+type RequestDeviceRule (
+	# `a`, `b` or `c`
+	typ: string,
+	# None: any
+	major: ?int,
+	minor: ?int,
+	# Some of `rwm`
+	access: string
+)
+
+# The user and the group that own a file.
+type RequestOwner (uid: int, gid: int)
+
+# The engine lives while the other end of the socket this call
+# carries is open (an engine a frontend started, with no service
+# manager, is held by the other frontends that use it).
+# The call carries one descriptor, the end of a connected unix
+# socket whose other end the frontend keeps.
+method Hold() -> ()
+
+# Who the engine is.
+method GetInfo() -> (
+	# What the engine calls itself
+	name: string,
+	# The version of the engine (the package's)
+	version: string,
+	# The version of the protocol (a client of another one calls
+	# `Restart`)
+	interface: int,
+	# The FNV-1a (64 bits, hexadecimal) of the text of the definition
+	# file the engine serves
+	digest: string,
+	# The engine runs as root of the host
+	rootful: bool
+)
+
+# Start again from the binary installed when it is not the one
+# that runs (an upgrade replaced it): the containers, the holds
+# and the socket go on, the connections end.  The reply says whether
+# it restarts.  A
+# frontend of another version calls it when `GetInfo` is not its
+# own, then connects again; called without arguments it has this
+# meaning in every version of the engine, as `GetInfo` has.  With
+# `running` the binary that runs starts again whatever is
+# installed, and reads its configuration again (`velarx system
+# restart`, as `SIGHUP`).
+method Restart(running: ?bool) -> (restarted: bool)
+
+# The health of the engine and of its parts (its database, its
+# storage, its runtime).
+method Health() -> (overall: ComponentStatus, components: []ComponentHealth)
+
+# Nothing: the engine answers.
+method Ping() -> ()
+
+# The container is there.
+method ContainerExists(name: string) -> ()
+
+# Ready to start, not started; `changed` is false for one that
+# is initialized or runs already.
+method ContainerInit(name: string) -> (changed: bool)
+
+# Start a container; `changed` is false for one that runs
+# already.
+method ContainerStart(name: string, verify_image: []string, service: ?bool, run: ?bool) -> (changed: bool)
+
+# Start a container with its monitor waiting for the client to
+# attach (`run`, `start --attach`): `changed` is false for one that
+# runs already.
+method ContainerStartAttached(name: string, verify_image: []string, service: ?bool, run: ?bool) -> (id: string, changed: bool)
+
+# Stop a container; `changed` is false for one that does not
+# run, `warning` is podman's when the stop signal did not stop it
+# in time.  `service`: a stop of the service manager (a shutdown),
+# not of a user, so that an `unless-stopped` container starts
+# again at the next boot.
+method ContainerStop(name: string, timeout: ?int, ignore: bool, service: ?bool) -> (changed: bool, warning: ?string)
+
+# Send a signal to a container.
+method ContainerKill(name: string, signal: ?string) -> ()
+
+# Stop and start a container.
+method ContainerRestart(name: string, timeout: ?int, verify_image: []string) -> ()
+
+# Pause a container, or unpause it.  With `lease` (seconds) a pause
+# ends by itself when nobody unpaused the container by then: the
+# engine stays up until it does.
+method ContainerPause(name: string, pause: bool, lease: ?int) -> ()
+
+# Rename a container.
+method ContainerRename(name: string, new_name: string) -> ()
+
+# Remove a container, and those that depend on it with `depend`;
+# a running one with `force`, stopped with its stop signal and
+# `timeout` seconds to obey it before the kill (none: its own).
+# `warnings`: podman's, of the stops the kill was needed for.
+method ContainerRemove(name: string, force: bool, volumes: bool, ignore: bool, depend: bool, timeout: ?int) -> (removed: []RemovedContainer, warnings: []string)
+
+# Wait until a container meets one of `conditions` (none: its
+# exit): the exit code and the condition met.  With `more`, a first
+# reply without them says the wait is armed: an exit after it is
+# not missed.  The wait ends when the client closes the connection.
+method ContainerWait(name: string, conditions: []WaitCondition, interval_ns: int) -> (
+	# The exit code; -1 for a condition that is no exit (`running`)
+	status_code: ?int,
+	# The condition that was met, one of those of the call
+	condition: ?WaitCondition
+)
+
+# The image is there.
+method ImageExists(name: string) -> ()
+
+# Give an image a name.
+method ImageTag(name: string, repo: string, tag: string, docker_hub: bool) -> ()
+
+# Take names (or every name) from an image.
+method ImageUntag(name: string, names: []string) -> ()
+
+# Remove an image: with `force` the containers that use it go too,
+# but those that run with `spare_running` (the image is then
+# refused); `noprune`: its parents stay; `manifest_list`: the name
+# is a manifest list's, which goes.
+method ImageRemove(name: string, force: bool, spare_running: bool, noprune: bool, ignore: bool, manifest_list: bool) -> (untagged: []string, deleted: []string, warnings: []string)
+
+# Remove the unused images (all, else the dangling ones; with
+# `all` the manifest lists too) that the filters select: what was
+# removed, one a reply.
+method ImagePrune(all: bool, filters: []Filter) -> (image: ?PrunedImage)
+
+# Remove the directories of RUN --mount=type=cache no build step
+# uses: the bytes they took.
+method BuildCachePrune() -> (space: int)
+
+# Create a network; with `ignore_if_exists`, one of the name asked
+# for is the answer (`changed` false).
+method NetworkCreate(spec: NetworkSpec, ignore_if_exists: bool) -> (changed: bool, network: NetworkRecord)
+
+# A network, by name, id or unique prefix of an id (`podman` and
+# `bridge` are the network of the configuration).
+method NetworkInspect(name: string) -> (network: NetworkRecord)
+
+# The networks the filters select (podman's filters of `network
+# ls`), one a reply.
+method NetworkList(filters: []Filter) -> (network: ?NetworkRecord)
+
+# The network is there.
+method NetworkExists(name: string) -> ()
+
+# Remove a network; with `force` the containers that use it go
+# first, stopped with `timeout` seconds (none: their own).
+# `warnings`: podman's, of the stops the kill was needed for.
+method NetworkRemove(name: string, force: bool, timeout: ?int) -> (name: string, warnings: []string)
+
+# Remove the networks no container uses that the filters select
+# (podman's filters of `network prune`): their names.
+method NetworkPrune(filters: []Filter) -> (removed: []string)
+
+# Change the DNS servers of a network.
+method NetworkUpdate(name: string, add_dns_servers: []string, remove_dns_servers: []string) -> ()
+
+# Connect a container to a network.
+method NetworkConnect(name: string, container: string, ip: ?string, ip6: ?string, mac: ?string, aliases: []string) -> ()
+
+# Apply the firewall rules of the networks of a running container
+# again.
+method NetworkReload(container: string, if_configured: bool) -> (id: string)
+
+# Disconnect a container from a network.
+method NetworkDisconnect(name: string, container: string, force: bool) -> ()
+
+# Create a volume; with `ignore_if_exists`, one of the name asked
+# for is the answer.
+method VolumeCreate(spec: VolumeSpec, ignore_if_exists: bool) -> (volume: VolumeRecord)
+
+# The volumes the filters select (podman's filters of `volume ls`),
+# one a reply.
+method VolumeList(filters: []Filter) -> (volume: ?VolumeRecord)
+
+# A volume.
+method VolumeInspect(name: string) -> (volume: VolumeRecord)
+
+# The volume is there.
+method VolumeExists(name: string) -> ()
+
+# Give a volume another name.
+method VolumeRename(name: string, new_name: string) -> ()
+
+# Remove a volume; with `force` the containers that use it go
+# first, given `timeout` seconds to stop (none: their own).
+# `warnings`: podman's, of the stops the kill was needed for.
+method VolumeRemove(name: string, force: bool, timeout: ?int) -> (warnings: []string)
+
+# Remove the volumes no container uses that the filters select
+# (podman's filters of `volume prune`): their names and the bytes
+# they had.  With `dry_run`, only those: nothing is removed.
+method VolumePrune(filters: []Filter, dry_run: bool) -> (removed: []PrunedVolume)
+
+# Mount what the options of a volume ask for (a device, a file
+# system): where its content is.
+method VolumeMount(name: string) -> (path: string)
+
+# Unmount what `VolumeMount` mounted.
+method VolumeUnmount(name: string) -> ()
+
+# Create a secret.
+# The data of the secret (at most 512,000 bytes) is one descriptor, the sealed
+# memory file `data` names.
+method SecretCreate(name: string, driver: ?string, driver_opts: [string]string, labels: [string]string, replace: bool, ignore: bool, data: int) -> (id: string)
+
+# The secrets the filters select (podman's filters of `secret
+# ls`), one a reply.
+method SecretList(filters: []Filter) -> (secret: ?SecretRecord)
+
+# A secret.  With `show_data`, its data is the sealed memory file
+# `data` names among the descriptors of the reply: it never crosses
+# in the JSON of the reply.
+method SecretInspect(name: string, show_data: bool) -> (secret: SecretRecord, data: ?int)
+
+# The secret is there.
+method SecretExists(name: string) -> ()
+
+# Remove a secret, or every secret.
+method SecretRemove(name: string, all: bool) -> ()
+
+# Create a pod: its id.
+# The call carries one descriptor, the read end of a pipe that
+# `spec` names: the `PodSpec` as JSON, read to its end (at most 1 MiB).
+method PodCreate(spec: int) -> (id: string)
+
+# The pod is there.
+method PodExists(name: string) -> ()
+
+# Replace the limits of the cgroup of a pod.
+method PodUpdate(name: string, resources: PodResources) -> (id: string)
+
+# Start, stop, kill, pause, unpause or restart a pod.
+method PodRun(name: string, op: PodAction, timeout: ?int, signal: ?string, verify_image: []string, service: ?bool) -> (changed: bool, id: string, errors: []string)
+
+# Remove a pod and its containers; with `force` the running ones
+# stop with `timeout` seconds (none: their own).  `warnings`:
+# podman's, of the stops the kill was needed for.
+method PodRemove(name: string, force: bool, timeout: ?int) -> (id: string, removed: []string, warnings: []string)
+
+# The processes of the containers of a pod that run, as `ps` shows
+# them with `ps_args`: podman's descriptors (`pid`, `user`,
+# `args`...; none: podman's default ones), or the arguments of ps.
+method PodTop(name: string, ps_args: []string) -> (titles: []string, processes: [][]string)
+
+# Remove the pods none of whose containers runs: their ids.
+method PodPrune() -> (removed: []string)
+
+# The manifest list is there.
+method ManifestExists(name: string) -> ()
+
+# Remove a manifest list (its instances stay): its id and names.
+method ManifestRemove(name: string) -> (
+	id: string,
+	# The names it had
+	names: []string
+)
+
+# The artifacts of the store, one a reply.
+method ArtifactList() -> (artifact: ?ArtifactRecord)
+
+# An artifact of the store.
+method ArtifactInspect(name: string) -> (artifact: ArtifactRecord)
+
+# Remove an artifact: its digest.
+method ArtifactRemove(name: string) -> (id: string)
+
+# The logs of a container: the lines `opts` selects (neither
+# stream: both), then those that follow.
+# The reply carries the read end of a pipe (descriptor 0): the
+# multiplexed frames of the log (one byte for the stream, three
+# zero bytes, the length, the data); `tty` says the container has
+# a terminal.
+method ContainerLogs(name: string, opts: LogOptions) -> (
+	# With `ContainerLogs`: the container has a terminal (the pipe has
+	# multiplexed frames all the same).  False for the other methods
+	tty: bool
+)
+
+# The logs of the containers of a pod (`opts.containers`: those
+# named, else all, the infra container first), merged by time, one
+# line a reply and a last reply without one.  A follow is
+# answered first with a reply without a line once the engine took
+# it, and goes on until the containers have exited and their logs
+# were read, or the client closes the connection.
+method PodLogs(name: string, opts: PodLogOptions) -> (line: ?PodLogLine)
+
+# The events, one a reply: those of `filters`
+# (`container`, `pod`, `image`, `volume`, `network`, `type`,
+# `event`, `label`), from `since_ns` (none: from now) to `until_ns`
+# (none: for ever) when `follow`, else those kept, and the last
+# reply without one.  A follow is answered first with a reply
+# without an event once the engine took it: the events after that
+# reply are sent.  A follow ends when the client closes the
+# connection.
+method EventList(filters: []Filter, since_ns: ?int, until_ns: ?int, follow: bool) -> (event: ?Event)
+
+# Resize the terminal of an exec session: `height` and `width` in
+# characters; `running`: only once the command runs.
+method ExecResize(id: string, height: int, width: int, running: bool) -> ()
+
+# Remove an exec session; `force`: also one whose command runs.
+method ExecRemove(id: string, force: bool) -> ()
+
+# Send the signal `signal` (a name or a number) to the command of an
+# exec session.
+method ExecKill(id: string, signal: string) -> ()
+
+# Attach to a container, called with `more` (see `SessionReply`):
+# the replies carry descriptors, the streams of the process; with
+# `opts.logs` the first one carries the pipe of the log so far,
+# which the client is sent first.
+method ContainerAttach(name: string, opts: AttachOptions) -> (
+	phase: SessionPhase,
+	opened: ?SessionOpened,
+	streams: ?SessionStreams,
+	# The status of the process, when the engine knows it
+	exit: ?int,
+	# Errors of the process (the runtime's, or the monitor's), for the
+	# client's output
+	message: ?string
+)
+
+# The input of the session `session` ends once what the client
+# wrote is read: the process's input is closed.  Called on a
+# connection of its own; answered once the monitor was told.
+method SessionCloseStdin(session: string) -> ()
+
+# The client of the session `session` typed the detach keys: the
+# session goes on without it.  Answered once the monitor was told.
+method SessionDetach(session: string) -> ()
+
+# Resize the terminal of a container: `height` and `width` in
+# characters.
+method ContainerResize(name: string, height: int, width: int) -> ()
+
+# Build an image from the spec the descriptor `spec` names (the read end
+# of a pipe) holds, read to its end.  `context`: the build context, the descriptor the
+# client opened: a pipe, a tar in frames (with `sections`, the
+# sections of a multipart body: the main context and the named
+# ones), or a directory, which the build
+# reads in place, through the descriptor (nothing is copied: COPY and
+# ADD, the digests their steps are cached under, the Containerfile and
+# the ignore files are looked up below it, no link followed out of it;
+# a file that changes meanwhile is read as it is when a step reads it).
+# A source of `RUN --mount` from it, and the context an SBOM scanner
+# mounts, is a copy that the confined worker makes for the step (the
+# kernel does not clone a mount of the client's mount namespace for the
+# runtime); a directory carries no `sections`, agent or input;
+# absent, the spec says where it is: `remote`, or `local_dir`, a
+# directory of the host of the engine (podman's local route), which
+# the engine opens as its own user.  After the pipes the call names come the socket of the
+# broker of the ssh agents when the spec names agents, and the
+# standard input of the client when the spec has `stdin`; the
+# credentials are the sealed memory file `access` names.
+# The reply carries the read end of a pipe: the progress, a
+# `BuildEvent` each line.
+method ImageBuild(spec: int, context: ?int, sections: bool, access: ?int) -> (
+	# With `ContainerLogs`: the container has a terminal (the pipe has
+	# multiplexed frames all the same).  False for the other methods
+	tty: bool
+)
+
+# Answer the question of a build for credentials (its event
+# `credentials` with this `ask`).  `answer` names one descriptor, the sealed memory
+# file with the answer (JSON: the credentials by `REGISTRY` or
+# `REGISTRY/REPOSITORY`).
+# `NoSuchObject` when no build waits for that answer (it was
+# answered, or the build ended).
+method ImageBuildAnswer(ask: string, answer: int) -> ()
+
+# The build cache nothing uses is removed: the ids of the images
+# and the bytes freed.
+method BuildPrune() -> (
+	# The ids of the images of the cache that went
+	ids: []string,
+	# The bytes freed
+	space: int
+)
+
+# Open the log file of a container again.
+method ContainerLogReopen(name: string) -> ()
+
+# A connection to a port of the loopback of a container or a pod.
+# The reply carries one descriptor, the connected socket.
+method PortConnect(pod: bool, name: string, port: int) -> ()
+
+# The build of the engine and the kernel it runs on (what
+# `SystemInspect` says of it, without the rest).
+method VersionInspect() -> (version: VersionRecord)
+
+# What the engine is and what it runs on: its build, its host
+# (the CPUs, the memory, the cgroups, the runtimes, the tools it
+# uses) and its store.
+method SystemInspect() -> (system: SystemRecord)
+
+# What the images, the containers and the volumes use of the
+# disk; with `store`, the files of the store too (the objects and
+# what a collection would free of them now, the composefs
+# images).
+method DiskUsageInspect(store: bool) -> (usage: DiskUsageRecord)
+
+# Remove what is not in use (`system prune`): the pods
+# that do not run, the containers that do not run (`build`: the
+# containers of builds that are gone too), the networks no
+# container uses, the volumes with `volumes`, the dangling images
+# (all those no container uses with `all`), as the filters
+# (`label`, `label!`, `until`) select; then the garbage of the
+# store is collected.
+method SystemPrune(all: bool, volumes: bool, build: bool, filters: []Filter) -> (report: SystemPruneReport)
+
+# Check the store, and repair it as `spec` asks (podman's `system
+# check`).
+method SystemCheck(spec: CheckSpec) -> (report: CheckReport)
+
+# Collect the garbage of the store: the files (`files`) and the
+# layers (`layers`) no image and no container uses, the leftovers
+# of pulls that are gone; with `dry_run`, only what would go.
+method SystemCollect(dry_run: bool, files: bool, layers: bool) -> (report: GcReport)
+
+# The stores the storage service holds for the engine's user, with
+# `drop` one of them dropped first (not the engine's own).
+method SystemStores(drop: ?string) -> (report: StoresReport)
+
+# Log in to a registry.  The credentials are one descriptor, the
+# sealed memory file `access` names.
+method RegistryLogin(host: string, access: ?int) -> (
+	# What the registry (or the connection) said; none: logged in
+	failure: ?string,
+	# The failure is the registry's refusal of the credentials
+	unauthorized: bool
+)
+
+# The descriptors of the metrics of pods, one a reply.
+method MetricDescriptorList() -> (descriptor: ?MetricDescriptor)
+
+# The metrics of the pods that run (of `name` only, with a name),
+# one pod a reply.
+method PodMetricsList(name: ?string) -> (pod: ?PodMetrics)
+
+# What the registry has for a name, without pulling it.
+method ImageRemoteInspect(name: string, tls_verify: bool) -> (media_type: string, digest: string, size: int, platforms: []ImagePlatform)
+
+# Who the engine is for the CRI: its version and the runtimes it has.
+method RuntimeInspect() -> (
+	# What the engine calls itself
+	name: string,
+	# The version of the engine
+	version: string,
+	# The version of the podman API the engine speaks
+	api_version: string,
+	cgroup_manager: CgroupManager,
+	# The OCI runtime containers run with by default
+	oci_runtime: string,
+	# The names of the other OCI runtimes a container can be made with
+	oci_runtimes: []string,
+	# What the default runtime and the others can do
+	handler_support: [](
+		# The name of the runtime (the default one's too)
+		name: string,
+		# It makes mounts read-only recursively (`rro`)
+		recursive_read_only_mounts: bool,
+		# It makes user namespaces and ID-mapped mounts
+		user_namespaces: bool
+	),
+	# The cgroup controllers the containers can have (`hugetlb`...)
+	cgroup_controllers: []string,
+	# The image of the infra container of a pod that names none: the
+	# configured one, else the local pause image
+	infra_image: string
+)
+
+# Create a container (the one creation record of the command line
+# and the CRI): its id.
+# The call carries one descriptor, the read end of a pipe that
+# `spec` names: the request as JSON, read to its end (at most 4 MiB).
+method ContainerCreate(spec: int) -> (id: string)
+
+# Create a container as another was made: the request of the
+# original again, under `new_name` (`NAME-clone` without), with
+# `image` and `pod` when given.  Its id.
+method ContainerClone(name: string, new_name: ?string, image: ?string, pod: ?string) -> (id: string)
+
+# A container; with `size`, the size of its changes, and of them
+# and its image.
+method ContainerInspect(name: string, size: bool) -> (container: ContainerRecord)
+
+# The OCI configuration of a container (its `config.json`), once it
+# is created.
+# The document is in `inline`, or when it is large the content of the
+# pipe the reply carries (descriptor `fd`, `length` bytes of JSON).
+method ContainerRuntimeSpec(name: string) -> (inline: ?object, fd: ?int)
+
+# The containers the filters (podman's of `ps`) select, the infra
+# containers of the pods too, the newest first, one a reply: those
+# that run, all with `all`, the `limit` newest (-1: all); with
+# `size` the size of their changes, with `namespace` the
+# namespaces of their processes.
+method ContainerList(filters: []Filter, all: bool, size: bool, namespace: bool, limit: int) -> (container: ?ContainerRecord)
+
+# A pod, with what its infra container says of its network.
+method PodInspect(name: string) -> (pod: PodRecord)
+
+# The pods the filters select (podman's filters of `pod ps`), one
+# a reply.
+method PodList(filters: []Filter) -> (pod: ?PodRecord)
+
+# An image.
+method ImageInspect(name: string) -> (image: ImageRecord)
+
+# The images the filters select (podman's filters of `images`),
+# the oldest first, one a reply: with `all` the intermediate images
+# of the builds too, with `manifest_lists` the manifest lists too.
+method ImageList(filters: []Filter, all: bool, manifest_lists: bool) -> (image: ?ImageRecord)
+
+# The steps of the history of an image, the newest first, one a
+# reply.
+method ImageHistory(name: string) -> (entry: ?ImageHistoryEntry)
+
+# Pull an image.  With more: the progress, one a reply, then what
+# was pulled (the last reply); without, what was pulled once it is
+# in the store.  The pull stops when the client closes the
+# connection.
+# The credentials are one descriptor, the sealed memory file `access` names.
+method ImagePull(spec: PullSpec, access: ?int) -> (
+	progress: ?TransferProgress,
+	# The id of the image asked for
+	id: ?string,
+	# The images pulled (every tag of `all_tags`, every image of an
+	# archive), the last the one asked for
+	images: ?[]PulledImage,
+	# What the (last) pull fetched, and from where
+	stats: ?TransferStats,
+	# The image of the store was the answer (the policy): nothing was
+	# pulled
+	present: ?bool
+)
+
+# Samples of what the containers `names` use (none: those that
+# run; with `all` all of them, those that do not run with zeros;
+# a container named that does not run has zeros), a container a
+# reply and a reply without one at the end of a sample; `size`:
+# with what they wrote.  With `stream` another sample follows
+# every `interval_ms` milliseconds (5 seconds if absent), its CPU
+# use since the one before, until the client closes the
+# connection (or the containers named are gone).
+method ContainerStats(names: []string, all: bool, size: bool, stream: bool, interval_ms: ?int) -> (stats: ?StatsRecord)
+
+# Create an exec session in the container `name`: its id.
+method ExecCreate(name: string, spec: ExecSpec) -> (id: string)
+
+# Start an exec session, called with `more` (see `SessionReply`;
+# the replies carry descriptors, the streams of the command),
+# whose only reply is the last one with `detach` (the command runs
+# on its own); with `input` the client can send the input of the
+# command; `height` and `width` (characters, 0: not known) are the
+# size of the terminal.  The call carries `preserved`, descriptors
+# the command gets as 3, 4, ..., but in the slots of
+# `preserve_holes` (slot 0 is 3), where it gets none (a `/dev/null`
+# stands in).
+method ExecStart(id: string, input: bool, detach: bool, height: int, width: int, preserve_holes: []int) -> (
+	phase: SessionPhase,
+	opened: ?SessionOpened,
+	streams: ?SessionStreams,
+	# The status of the process, when the engine knows it
+	exit: ?int,
+	# Errors of the process (the runtime's, or the monitor's), for the
+	# client's output
+	message: ?string
+)
+
+# An exec session.
+method ExecInspect(id: string) -> (exec: ExecRecord)
+
+# What the images and the containers use of the storage.
+method StorageInspect() -> (
+	mountpoint: string,
+	images_bytes: int,
+	containers_bytes: int,
+	# The inodes in use on the file system of the storage; none when the
+	# engine cannot tell
+	inodes_used: ?int
+)
+
+# Whether the plugins of the CNI network `network` (`cni:NAME`)
+# say it is ready.
+method NetworkCheck(network: string) -> (
+	ready: bool,
+	# Why it is not ready
+	message: string
+)
+
+# The content of a volume, a tar archive.
+# The reply carries the read end of a pipe (descriptor 0): the
+# frames of a download.
+method VolumeExport(name: string) -> ()
+
+# Extract the tar archive of the upload into a volume.
+# The call carries one descriptor, the read end of a pipe: the
+# upload, as frames.
+method VolumeImport(name: string) -> ()
+
+# Create a container from the document of a podman client the pipe
+# carries: libpod's SpecGenerator, or Docker's configuration with
+# `docker` (`name` and `platform` are of Docker's query).
+# The call carries one descriptor, the read end of a pipe that
+# `spec` names: the document of the request as JSON, read to its end.
+method PodmanContainerCreate(docker: bool, name: ?string, platform: ?string, spec: int) -> (id: string, warnings: []string)
+
+# Remove the containers that do not run and the filters select.
+method ContainerPrune(filters: []Filter) -> (removed: []string, space: int)
+
+# Change the limits, the environment, the restart policy, the
+# rlimits and the health check of a container: its id.
+method ContainerAmend(name: string, spec: UpdateSpec) -> (id: string)
+
+# Run the health check of a container that runs now: its health
+# after it (the result last in its log).
+method ContainerHealthcheck(name: string) -> (health: HealthState)
+
+# Checkpoint a container.  `archive` names a descriptor the client
+# opened: an empty regular file open for writing (not appending), in
+# which the engine writes the archive, or the write end of a pipe,
+# to which it writes the frames of a download.  Without it the
+# checkpoint is kept with the container for a restore in place.
+method ContainerCheckpoint(name: string, flags: CheckpointFlags, archive: ?int) -> (id: string, runtime_checkpoint_duration: int, criu_statistics: ?CriuStatistics)
+
+# Restore a container: `name` alone from its own checkpoint; with
+# `archive` (a descriptor the client opened: a regular file open
+# for reading, or the read end of a pipe of frames) or `reference` (one a node shares) a new container
+# made of the archive; with `stage` the archive is staged in the
+# container `name`, which was never started.
+method ContainerRestore(name: ?string, flags: RestoreFlags, archive: ?int, reference: ?string, stage: bool) -> (
+	id: string,
+	# None for a restore that is only staged
+	runtime_restore_duration: ?int,
+	criu_statistics: ?CriuStatistics
+)
+
+# What is at `path` in a container and, with `content`, its tar
+# archive.
+# With `content` the reply carries the read end of a pipe
+# (descriptor 0): the frames of a download.
+method ContainerArchiveGet(name: string, path: string, content: bool) -> (
+	# The last component of the path asked (`/` for the root)
+	name: string,
+	size: int,
+	# The Unix `st_mode`: the type and the permissions
+	mode: int,
+	mtime_ns: int,
+	# The path it resolves to in the container
+	link_target: string,
+	is_dir: bool
+)
+
+# Extract the tar archive of the upload into the directory `path`
+# of a container.
+# The call carries one descriptor, the read end of a pipe: the
+# upload, as frames.
+method ContainerArchivePut(name: string, path: string, rename: [string]string, chown: bool, overwrite_dir_non_dir: bool) -> ()
+
+# The root file system of a container as a tar archive.
+# The reply carries the read end of a pipe (descriptor 0): the
+# frames of a download.
+method ContainerExport(name: string) -> ()
+
+# The changes of a container to the files of its image, or of an
+# image to its parent's.
+method ContainerDiff(name: string, diff_type: ?DiffType, parent: ?string) -> (changes: []FileChange)
+
+# Share the checkpoint archive (of `ContainerCheckpoint`)
+# the pipe the call carries holds with the other nodes.
+# The call carries one descriptor, the read end of a pipe: the
+# archive.
+method CheckpointShare() -> (reference: string, size: int)
+
+# Stop sharing the checkpoint of `reference` (its manifest, the
+# public part of a reference).
+method CheckpointUnshare(reference: string) -> ()
+
+# The processes of a container that runs, as `ps` shows them with
+# `ps_args`: podman's descriptors (`pid`, `user`, `args`...; none:
+# podman's default ones), or the arguments of ps.
+method ContainerTop(name: string, ps_args: []string) -> (titles: []string, processes: [][]string)
+
+# Mount the root of a container that runs: where.
+method ContainerMount(name: string) -> (path: string)
+
+# Unmount the root of a container.
+method ContainerUnmount(name: string) -> ()
+
+# Search registries for `term`.
+# The credentials are one descriptor, the sealed memory file `access` names.
+method ImageSearch(term: string, limit: int, filters: []string, list_tags: bool, tls_verify: ?bool, access: ?int) -> (hits: []SearchHit)
+
+# The names a pull of `name` would try.
+method ImageResolve(name: string) -> (names: []string)
+
+# The layers of an image, the images they are the top layer of,
+# and the images built on it.
+method ImageTree(name: string) -> (tree: ImageTreeRecord)
+
+# Remove images: libpod's report.
+method ImageRemoveMany(names: []string, force: bool, ignore: bool, noprune: bool, all: bool, manifest_list: bool) -> (
+	deleted: []string,
+	untagged: []string,
+	exit_code: int,
+	errors: []string,
+	# podman's warnings of the stops of their containers that needed the
+	# kill
+	warnings: []string
+)
+
+# Where the credentials of the completion of a lazily pulled image
+# go.
+method ImageCredentialScopes(name: string) -> (scopes: []string)
+
+# Where the credentials of a pull or a push of `reference` go.
+method RegistryCredentialScopes(reference: string, push: bool) -> (scopes: []string)
+
+# The pulls in progress: images whose layers are not all in the
+# store (`images` lists only complete ones).
+method ImagePulls() -> (
+	pulls: [](
+		# The image id
+		id: string,
+		# `repository:tag` and `repository@digest`
+		names: []string,
+		state: PullState,
+		# Why it failed, or the last error that was retried (empty: none)
+		error: string,
+		# Whole percent of the bytes fetched
+		percent: int,
+		bytes_done: int,
+		bytes_total: int,
+		layers_done: int,
+		layers_total: int,
+		# The containers made on it
+		containers: int,
+		# RFC 3339
+		started_at: string
+	)
+)
+
+# Fetch what a lazily pulled image lacks and prove its layers.
+# The credentials are one descriptor, the sealed memory file `access` names.
+method ImageComplete(name: string, access: ?int) -> (stats: TransferStats)
+
+# The digest of the manifest the registry has for `reference` now.
+# The credentials are one descriptor, the sealed memory file `access` names.
+method RegistryDigest(reference: string, tls_verify: bool, platform: ?string, access: ?int) -> (digest: string)
+
+# Create an image from a tar: the upload, or what `spec.url` has.
+# The call carries the tar as the upload (one descriptor, the read
+# end of a pipe of frames), none with `spec.url`.
+method ImageImport(spec: ImportSpec) -> (id: string)
+
+# The changes of a container as a new image.  With more: the
+# progress of its layer, one a reply, then the id of the image (the
+# last reply); without, the id.  The commit goes on when the client
+# goes.
+# The call carries a descriptor when `changes` names one: the read
+# end of a pipe with the settings of the configuration (JSON, read
+# to its end).
+method ContainerCommit(spec: CommitSpec, changes: ?int) -> (progress: ?TransferProgress, id: ?string)
+
+# Add a file to an artifact.  Exactly one of `file`, the position
+# of the descriptor the client opened (a regular file, or the read
+# end of a pipe: the upload, as frames), and `path`, a file of the
+# host of the engine, which the engine opens as its own user, for
+# whoever calls it: the socket of the engine is as trusted as that
+# user (root for a rootful engine), and so is a frontend that passes
+# a client's path.
+method ArtifactAdd(spec: ArtifactAddSpec, file: ?int, path: ?string) -> (id: string)
+
+# A tar of the blobs of an artifact (those of `digest` or `title`),
+# named by their titles (by their digests with `by_digest`).
+# The reply carries the read end of a pipe (descriptor 0): the
+# frames of a download.
+method ArtifactExtract(name: string, digest: ?string, title: ?string, by_digest: bool) -> ()
+
+# Make a manifest list of images.  `digest` (`sha256` or `sha512`)
+# is the algorithm of the digest of the list (none: the engine's
+# `[build] digest`).
+# The credentials are one descriptor, the sealed memory file `access` names.
+method ManifestCreate(name: string, images: []string, amend: bool, all: bool, tls_verify: bool, annotations: [string]string, instance: InstanceSpec, subject: ?string, digest: ?string, access: ?int) -> (id: string)
+
+# A manifest list, of the store or of its registry, as OCI's index.
+# The credentials are one descriptor, the sealed memory file `access` names.
+method ManifestInspect(name: string, tls_verify: bool, access: ?int) -> (
+	# The id of a list of the store; empty: one of a registry
+	id: string,
+	schema_version: int,
+	media_type: string,
+	artifact_type: string,
+	subject: ?ManifestDescriptor,
+	annotations: [string]string,
+	manifests: []ManifestInstance,
+	config: ?ManifestDescriptor,
+	layers: []ManifestDescriptor
+)
+
+# Add images to a list: its id.
+# The credentials are one descriptor, the sealed memory file `access` names.
+method ManifestAddImages(name: string, images: []string, all: bool, instance: InstanceSpec, tls_verify: bool, access: ?int) -> (id: string)
+
+# Remove the instance `digest` from a list: its id.
+method ManifestRemoveInstance(name: string, digest: string) -> (id: string)
+
+# Annotate an instance of a list (an image or a digest; none: the
+# list), set the annotations of the index and its subject: its id.
+method ManifestAnnotate(name: string, instance: ?string, spec: InstanceSpec, index_annotations: [string]string, subject: ?string) -> (id: string)
+
+# Add an artifact made of files to a list: its digest.
+# The call carries the sealed memory file of the credentials `access`
+# names and one descriptor for each title of the spec (at most 64): a
+# regular file open for reading.
+method ManifestAddArtifact(name: string, spec: ManifestArtifactSpec, tls_verify: bool, access: ?int) -> (id: string)
+
+# The systemd units of a container or a pod.
+method SystemdGenerate(name: string, spec: SystemdSpec) -> (units: [string]string)
+
+# Push an image (or a manifest list).  With more: where the push
+# goes (the first reply), the progress of its blobs, one a reply,
+# then what was pushed (the last reply); without, what was pushed.
+# The push stops when the client closes the connection.
+# The credentials are one descriptor, the sealed memory file `access` names.
+method ImagePush(spec: PushSpec, access: ?int) -> (destination: ?string, progress: ?TransferProgress, pushed: ?PushedImage)
+
+# The containers whose root is mounted.
+method ContainerMountList() -> (mounts: [string]string)
+
+# The container is not there
+error NoSuchContainer (cause: string, message: string)
+
+# The image is not there
+error NoSuchImage (cause: string, message: string)
+
+# The pod is not there
+error NoSuchPod (cause: string, message: string)
+
+# The network is not there
+error NoSuchNetwork (cause: string, message: string)
+
+# The volume is not there
+error NoSuchVolume (cause: string, message: string)
+
+# The secret is not there
+error NoSuchSecret (cause: string, message: string)
+
+# The exec session is not there
+error NoSuchExecSession (cause: string, message: string)
+
+# Another object is not there (an artifact, a manifest list)
+error NoSuchObject (cause: string, message: string)
+
+# The name is taken: the object exists already
+error Conflict (cause: string, message: string)
+
+# The object is in a state that does not allow this (running, paused,
+# in use, has dependents)
+error InvalidState (cause: string, message: string)
+
+# The container has no checkpoint to restore
+error NoCheckpoint (cause: string, message: string)
+
+# An image reference the engine refuses before it looks for the image
+# (a capital in the repository, an id of the wrong length)
+error InvalidReference (cause: string, message: string)
+
+# The image has several names: removing it by its ID needs `force`
+error NeedsForce (cause: string, message: string)
+
+# An argument, a descriptor or the content of a pipe the engine does
+# not take
+error InvalidArgument (cause: string, message: string)
+
+# The name given to an object (a volume) is not one the engine takes
+error InvalidName (cause: string, message: string)
+
+# The bytes of an upload are not a tar archive (or a compressed one)
+error InvalidArchive (cause: string, message: string)
+
+# An argument, an upload or a document over its limit
+error TooLarge (cause: string, message: string)
+
+# The engine or a registry refused the caller
+error PermissionDenied (cause: string, message: string)
+
+# A registry wants credentials, or refused those it was given
+error Unauthorized (cause: string, message: string)
+
+# The engine does not do this
+error NotSupported (cause: string, message: string)
+
+# The storage or a quota is full
+error NoSpace (cause: string, message: string)
+
+# A connection the engine made for the call failed (to a port of a
+# container)
+error Unreachable (cause: string, message: string)
+
+# The engine cannot answer now (too many connections, stopping)
+error Unavailable (cause: string, message: string)
+
+# The container could not be started: the runtime refused it, or what
+# it runs with (its user, its working directory) is not there
+error NotStarted (cause: string, message: string)
+
+# The container could not be started: the command it runs is not there
+error CommandNotFound (cause: string, message: string)
+
+# A rootless container needs pasta for its network, and the engine
+# finds none, or none of the release needed (`--network none` needs no pasta)
+error NoPasta (cause: string, message: string)
+
+# The content a party gave is not what it claims (a digest, a size, a
+# table of contents): `party` is the fetcher, pusher or transport that
+# gave it, `object` the digest or key; nothing else was asked
+error InvalidContent (cause: string, message: string, party: string, object: string)
+
+# No source could give what the call needs: `party` the last one asked;
+# `transient`: the call may succeed if made again
+error SourceUnavailable (cause: string, message: string, party: string, transient: bool)
+
+# `lazy` was asked for an image that the list of fetchers of the pull cannot serve
+# lazily: its `layers` and why.  Nothing was created.
+error ImageNotLazy (cause: string, message: string, image: string, layers: []NotLazyLayer)
+
+# Anything else: the engine tried and failed
+error Failed (cause: string, message: string)

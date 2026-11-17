@@ -1,0 +1,131 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.\" Hand-written (the program has no clap definitions): what the engine
+.\" starts it with, not what a user types.
+.TH VELARX-DIR 1 "" "velarx" "Velarx"
+.SH NAME
+velarx\-dir \- the fetcher of a directory of items named by their digests
+.SH SYNOPSIS
+.B velarx\-dir
+.BI \-\-name " NAME"
+.BI \-\-dir " PATH"
+.BI \-\-varlink\-fd " N"
+.BI \-\-config\-fd " N"
+.BI \-\-staging\-fd " N"
+.RB [ \-\-self\-test ]
+.br
+.B velarx\-dir \-\-push
+.BI \-\-varlink\-fd " N"
+.BI \-\-config\-fd " N"
+.RB [ \-\-self\-test
+.IR SCHEME ]
+.br
+.B velarx\-dir \-\-origin
+.BI \-\-varlink\-fd " N"
+.BI \-\-config\-fd " N"
+.BI \-\-staging\-fd " N"
+.RB [ \-\-self\-test
+.IR SCHEME ]
+.SH DESCRIPTION
+.B velarx\-dir
+serves
+.B org.velarx.Fetcher
+for a directory that a
+.B [[sources.external]]
+entry with a
+.I dir
+names (see
+.BR velarx.conf (5)).  It is started by the engine, never by a user, one
+process for each connection of the engine, and found next to
+.BR velarx (1)
+(or where
+.I dir_path
+of
+.BR velarx.conf (5)
+says).  It reads the directory, writes the files of a layer beneath the
+staging directory it was given and does nothing else: it links no registry
+or HTTP code, and confines itself before it serves (Landlock: read the
+directory, write the staging; no network, no execution; seccomp), refusing
+to run on a kernel that cannot enforce all of it.  It leaves when its
+connection is closed.
+.SH OPTIONS
+.TP
+.BI \-\-name " NAME"
+The name of the source.
+.TP
+.BI \-\-dir " PATH"
+The directory served.
+.TP
+.BI \-\-varlink\-fd " N"
+The connection of the engine that started the process.
+.TP
+.BI \-\-config\-fd " N"
+The limits it takes of the configuration (the services, the largest file it writes and what it inflates), as JSON, in the descriptor
+.IR N .
+.TP
+.BI \-\-staging\-fd " N"
+The staging directory of the store.
+.TP
+.B \-\-self\-test
+Confine the process, try from inside what the confinement allows and
+refuses and print the results as JSON; nothing is served.  With
+.B \-\-push
+or
+.BR \-\-origin ,
+it takes the
+.I SCHEME
+the process is confined for (descriptor 5 is the target).
+.SH SEE ALSO
+.BR velarx (1),
+.BR velarx\-registry (1),
+.BR velarx.conf (5)
+.SH ORIGIN MODE
+With
+.B \-\-origin
+the process serves
+.B org.velarx.Fetcher
+as the origin of a pull whose source is a path (\fBoci:DIR[:REF]\fR,
+\fBoci\-archive:FILE[:REF]\fR, \fBdocker\-archive:FILE[:REF]\fR,
+\fBdir:DIR\fR, or \fBarchive:FILE\fR of
+.BR "velarx load" ),
+one process for each pull.  The
+.I source
+of
+.B Open
+is the scheme and the selector (never the path), the
+.I target
+the directory or the file that the client opened.  The process confines
+itself when
+.B Open
+is answered: it reads what it was handed, writes beneath the staging
+directory (\fB\-\-staging\-fd\fR), has no network and executes nothing.  Only then
+does it read the archive: the tar, its compression, the index and the
+manifests of a docker\-archive.  It serves the index of the images the selector
+takes (\fBGetManifest("")\fR), their manifests and blobs, and
+.B Unpack
+of every layer.  What it says is a claim: the engine checks the digests of
+the manifests and the configurations, and replays the layers against the
+diff ids.
+.SH PUSH MODE
+With
+.B \-\-push
+the process serves
+.B org.velarx.Pusher
+as the origin of a push to a path, one process for each push.  The mode
+is the scheme of the destination that
+.B Open
+names: \fBoci:\fR writes an OCI image layout, \fBdir:\fR a directory of one
+manifest and its blobs, \fBoci\-archive:\fR a tar of a layout; any other
+scheme is refused.  The
+.I target
+of
+.B Open
+is the directory, or the file, that the client opened.  The process confines
+itself when
+.B Open
+is answered (before it, it has no destination and every call but
+.B GetInfo
+and
+.B Open
+is refused):
+it writes beneath that directory (an archive: to that file) and nowhere else, has no
+network and executes nothing.

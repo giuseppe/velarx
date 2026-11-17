@@ -1,0 +1,107 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# The release table of README "Status": the stripped size, the shared
+# libraries and the startup time of every binary of a release build, one
+# line each -- the numbers a release refreshes in the README.
+#
+#   tools/bench-startup [-w WARMUP] [-r RUNS] [DIR]
+#
+# DIR is the directory of the release binaries (default
+# $CARGO_TARGET_DIR/release, else target/release); the release profile
+# strips them, so the size printed is the size that ships.  The startup time is `BIN --version`
+# measured with hyperfine --shell=none (-N), which times the exec of the
+# binary and nothing else; velarx-monitor answers --version too (with its
+# own name).  Without hyperfine the sizes and the libraries are printed
+# and a note says that the timing was skipped.  The exit status is 0 for
+# a built DIR whatever a benchmark said, so it works in a loop.
+#
+# The output is what goes into the README: run it on the commit it names
+# (`git describe --always`) and paste the table with the date.
+
+set -eu
+
+usage() {
+	echo "usage: tools/bench-startup [-w WARMUP] [-r RUNS] [DIR]" >&2
+}
+
+warmup=5
+runs=50
+while [ $# -gt 0 ]; do
+	case $1 in
+	-w)
+		[ $# -ge 2 ] || { usage; exit 2; }
+		warmup=$2
+		shift 2
+		;;
+	-r)
+		[ $# -ge 2 ] || { usage; exit 2; }
+		runs=$2
+		shift 2
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	-*)
+		usage
+		exit 2
+		;;
+	*)
+		break
+		;;
+	esac
+done
+dir=${1:-${CARGO_TARGET_DIR:-target}/release}
+[ $# -le 1 ] || { usage; exit 2; }
+
+names="velarx velarx-client velarx-monitor"
+found=
+for n in $names; do
+	[ -f "$dir/$n" ] && found="$found $n"
+done
+if [ -z "$found" ]; then
+	echo "bench-startup: no binary in $dir (make build PROFILE=release first)" >&2
+	exit 1
+fi
+
+commit=$(git describe --always 2>/dev/null || echo unknown)
+echo "# $commit, release build of $dir, $(date +%Y-%m-%d)"
+hyperfine=$(command -v hyperfine 2>/dev/null || true)
+if [ -z "$hyperfine" ]; then
+	echo "# hyperfine not found: sizes only, startup times skipped"
+fi
+
+# The shared libraries a binary links against: ldd's sonames without the
+# loader and the vdso, sorted.
+libs() {
+	ldd "$dir/$1" | sed -n 's/.*=> \([^[:space:]]*\.so[^[:space:]]*\).*/\1/p' |
+		sed 's|.*/||; s/\.so\..*//; s/-[0-9].*//' | sort -u | awk '{ printf "%s ", $0 }'
+	echo
+}
+
+# One row: name, stripped size, startup, shared libraries.  hyperfine's
+# CSV gives seconds, so the mean and the deviation become ms; the timing
+# column is empty when there is no hyperfine to time with.
+printf '%-15s %10s %7s   %-16s %s\n' binary bytes MiB startup libraries
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/bench-startup.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+for n in $found; do
+	size=$(stat -c %s "$dir/$n")
+	start=""
+	if [ -n "$hyperfine" ]; then
+		# a fresh file per binary: a failed run must not print the
+		# numbers of the binary before it
+		rm -f "$tmp/csv"
+		"$hyperfine" -N -w "$warmup" -r "$runs" --style basic -n "$n" \
+			"'$dir/$n' --version" --export-csv "$tmp/csv" > /dev/null 2>&1 || true
+		start=failed
+		if [ -s "$tmp/csv" ]; then
+			start=$(tail -n 1 "$tmp/csv" | awk -F, \
+				'{ if (NF > 2) printf "%.1f ms ± %.1f", $2 * 1000, $3 * 1000; else print "failed" }')
+		fi
+	fi
+	printf '%-15s %10s %7s   %-16s %s\n' "$n" "$size" \
+		"$(awk -v b="$size" 'BEGIN { printf "%.1f", b / 1048576 }')" "$start" "$(libs "$n")"
+done

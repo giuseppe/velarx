@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Velarx REST API socket
+Documentation=man:velarx-api(8) man:velarx.conf(5)
+
+[Socket]
+# A connection starts velarx-api, which leaves when it has been idle; its
+# first request starts the engine through velarx-engine.socket.  TCP is
+# not listened on unless a ListenStream= with an address is added here
+# (loopback only, unless velarx-api has TLS with verified clients).
+ListenStream=/run/velarx/velarx.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=root
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

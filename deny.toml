@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+# `make audit` (cargo deny check): the RustSec advisories, the bans (duplicate
+# crate versions), the sources and the licenses a dependency may have.
+# Anything else is reviewed by the owner before it is added here.
+[graph]
+all-features = true
+# Linux on the two architectures velarx is built for: the crates only the
+# other platforms (Windows, macOS, wasm) pull in are not in the product and
+# are not checked.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+# libp2p-quic (and with it libp2p-tls, rcgen 0.11, ring 0.16.20, which has no
+# license) is only a phantom of Cargo.lock: libp2p's `tokio` feature names
+# `libp2p-quic?/tokio` (weak), so the lock lists the crate, but the `quic`
+# feature is off and cargo never builds it (`cargo tree -p velarx-p2p -i
+# libp2p-quic` finds nothing).  Ours is rcgen 0.14 on ring 0.17.
+exclude = ["libp2p-quic"]
+
+# (the project is Apache-2.0 and CNCF compatible: only permissive licenses
+# are allowed, no GPL or LGPL dependency.  Unicode-3.0 and BSL-1.0
+# are not on the CNCF allowlist of third-party licenses: a dependency under
+# one of them needs a CNCF exception or a replacement.)
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "0BSD",
+    "BSL-1.0",
+]
+confidence-threshold = 0.9
+
+[advisories]
+# A vulnerability, an unsound, an unmaintained (also transitive) or a yanked
+# crate fails the check.
+unmaintained = "all"
+yanked = "deny"
+# Each entry: the reason, and what ends it.
+ignore = [
+    # paste (a macro, build time only) is unmaintained, with no replacement:
+    # netlink-packet-core 0.8 -> if-watch 3 -> libp2p-tcp and libp2p-mdns.
+    # Not a vulnerability; goes when libp2p drops it.  Checked 2026-10-31: the
+    # newest if-watch (3.2.2), libp2p-tcp 0.45.0, libp2p-mdns 0.49.0 and libp2p
+    # 0.57.1 all require netlink-packet-core ^0.8.1, whose 0.8.2 uses paste; the
+    # 0.9.0 release that does not cannot be selected (if-watch pins ^0.8.1), and
+    # a [patch] of paste would still be the advisory's crate name.  Both
+    # libp2p-tcp and libp2p-mdns need if-watch, and Velarx needs both.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained macro crate, build time only, through libp2p-mdns" },
+]
+
+[bans]
+# composefs and libp2p each pull their own versions of a few crates; they are
+# listed by `cargo deny check bans` as warnings.
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

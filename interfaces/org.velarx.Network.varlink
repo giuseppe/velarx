@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The interface org.velarx.Network: a network provider, a process on a unix
+# socket that makes the network of the containers that name it
+# (`--network provider:NAME`, `[[network.providers]]` of config.toml).  The
+# engine calls Prepare before the spec of a container is made (the
+# interfaces of the host to move into it, its name server), Start once it
+# runs (with its network namespace as the one descriptor of the call: never
+# a pid, which could be reused) and Stop when it does not run any more.  A
+# client calls GetInfo on each connection and refuses a `proto` other than
+# its own (1).  Generated from the overlay provider of velarx-p2p
+# (crates/runtime/src/network/provider.rs, crates/p2p/src/overlay_service.rs) by the
+# test `service::tests::the_interface_files_are_current`:
+# VELARX_WRITE_INTERFACES=1 cargo test -p velarx-p2p --lib service writes it.
+# Who may call: a peer of the same user or root (SO_PEERCRED); any
+# accepted peer may make every call.
+
+interface org.velarx.Network
+
+# An interface of the host to move into the container.
+type Device (
+	# The name of the interface on the host
+	host: string,
+	# The name it has in the container
+	container: string
+)
+
+# Who serves this interface and what it can do.  The first call of a
+# connection; a client refuses a `proto` other than its own.
+method GetInfo() -> (
+	name: string,
+	# The version of the package
+	version: string,
+	# The version of the protocol (1)
+	proto: int,
+	# Words; a client ignores those it does not know
+	capabilities: []string,
+	# Named limits (`max_objects`, `max_wants`, ...); a client ignores those it does not know
+	limits: [string]int
+)
+
+# The interfaces of the host to move into the container, and the
+# name server it uses (the overlay's is this node's address: it
+# resolves the names of the containers of all nodes).
+method Prepare(id: string) -> (
+	# The interfaces of the host the runtime moves into the container
+	devices: []Device,
+	# The name server of the network, for `resolv.conf`
+	dns: ?string
+)
+
+# Route the container in its network namespace, the one
+# descriptor the call carries, and give it the name `name` (the
+# overlay tells the other nodes about it).  `default_route`: this
+# network is its way out (no other network is).
+method Start(id: string, name: string, default_route: bool) -> ()
+
+# Undo the network of a container that does not run any more.
+# Idempotent: a `Stop` of a container that is not started, or was
+# stopped, is a success (the engine's reconcile and a monitor's
+# teardown may both call it).
+method Stop(id: string) -> ()
+
+# A request the provider does not take (an id it cannot use)
+error InvalidArgument (reason: string)
+
+# The provider knows no such container (`Start` before `Prepare`)
+error NotFound (reason: string)
+
+# The provider tried and failed
+error Failed (reason: string)

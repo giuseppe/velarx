@@ -1,0 +1,385 @@
+# SPDX-License-Identifier: Apache-2.0
+# The service of the peers is a package of its own, the only one that links
+# a peer-to-peer stack and QUIC, and the CRI frontend another, the only one that links
+# gRPC (tonic, prost; it needs protoc to build); the REST API frontend is a
+# third, the only one that links an HTTP server (axum): `cargo build` and
+# `cargo test` of velarx do not touch them (`-p velarx-p2p-bin`, `-p
+# velarx-cri-bin`, `-p velarx-api-bin`, or `--workspace`).  What the frontends
+# share with the engine, the interface org.velarx.Engine, is the package
+# `velarx-proto`.  The packages split off the engine to keep its
+# compilation units small (`velarx-base`, `velarx-types`, `velarx-registry`, `velarx-storage`, `velarx-fuse`, `velarx-config`, `velarx-db`, `velarx-nsid`, `velarx-netkernel`, `velarx-netdetach`, `velarx-content`, `velarx-registry-lib`, `velarx-dir`, `velarx-wire`, `velarx-core`, `velarx-graph`, `velarx-vfs`, `velarx-storage-client`, `velarx-storage-server`, `velarx-signature`, `velarx-kube`, `velarx-shape`, `velarx-tarsplit`) are default
+# members: `cargo build` and `cargo test` build and test them too.
+#
+# The binaries are packages of their own, `crates/bin` and `bin/` of each
+# frontend: they have the build script that reads the commit for
+# `--version`, which reruns at every commit, and a build script that reruns
+# recompiles everything of its package.
+[workspace]
+members = ["crates/bin", "crates/runtime/bin", "crates/registry-lib/bin", "crates/dir", "crates/api/bin", "crates/cri/bin", "crates/p2p/bin", "crates/p2p", "crates/cri", "crates/proto", "crates/api", "crates/base", "crates/signature", "crates/kube", "crates/types", "crates/registry", "crates/storage", "crates/fuse", "crates/config", "crates/db", "crates/nsid", "crates/netkernel", "crates/netdetach", "crates/content", "crates/registry-lib", "crates/wire", "crates/core", "crates/graph", "crates/vfs", "crates/storage-client", "crates/storage-server", "crates/runtime", "crates/sys", "crates/shape", "crates/tarsplit", "crates/sandbox", "crates/kube/bin"]
+default-members = [".", "crates/bin", "crates/runtime/bin", "crates/registry-lib/bin", "crates/dir", "crates/base", "crates/types", "crates/registry", "crates/storage", "crates/fuse", "crates/config", "crates/db", "crates/nsid", "crates/netkernel", "crates/netdetach", "crates/content", "crates/registry-lib", "crates/wire", "crates/core", "crates/graph", "crates/vfs", "crates/storage-client", "crates/storage-server", "crates/runtime", "crates/signature", "crates/kube", "crates/sys", "crates/shape", "crates/tarsplit", "crates/sandbox", "crates/kube/bin"]
+
+# What every package inherits.  The varlink `GetInfo` answers announce
+# `homepage`.  Nothing is published to crates.io (`publish = false`).
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["The Velarx Authors"]
+license = "Apache-2.0"
+repository = "https://github.com/giuseppe/velarx"
+homepage = "https://github.com/giuseppe/velarx"
+rust-version = "1.99"
+publish = false
+
+# `unsafe` lives in the package velarx-sys only, which has lints of its
+# own (the unit tests of src/testing.rs check that and the `// SAFETY:`
+# comments without clippy).
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unsafe_code = "forbid"
+
+# The lint policy of `make clippy` (`cargo clippy --workspace --all-targets
+# -- -D warnings`): the default groups of clippy (correctness, suspicious,
+# style, complexity, perf) at their default levels, which CI turns into
+# errors; no pedantic, nursery or restriction group, except the lints below.
+# The toolchain is pinned by rust-toolchain.toml to the `rust-version` above:
+# a new compiler adds warnings, so the pin is raised on purpose, together
+# with the fixes, never by a CI image that moved.
+# A warning is fixed (a parameter struct for too many arguments, a `Box`
+# for a large variant, a `type` alias for a complex type); an
+# `#[allow(clippy::...)]` is only for a lint that is wrong where it stands,
+# with a `reason`.
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+# Left-over debugging and code that is not written: an unimplemented thing
+# returns an error (AGENTS.md), it does not panic.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+# `[a..b]` as a list of one range is data here (the ranges of a pull and
+# their tests), not a mistaken `Vec` of the numbers a range has.
+single_range_in_vec_init = "allow"
+
+# One requirement (and the features all the users share) for each dependency
+# that more than one package names; a package adds its own features and
+# `optional`.  Dependencies of one package stay in its manifest.
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.7", default-features = false }
+base64 = "0.23"
+bytes = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+clap_mangen = "0.3"
+composefs = { version = "0.9.4", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+futures = "0.3"
+hex = "0.4"
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", features = ["tokio"] }
+landlock = "0.4"
+libc = "0.2"
+oci-spec = "0.7"
+openssl = "0.10"
+# the pieces of a shared checkpoint (pure Rust)
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+percent-encoding = "2"
+url = "2"
+rand = "0.8"
+rayon = "1.8"
+regex-lite = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
+rusqlite = "0.32"
+# (`use-libc-auxv`: the aux vector values, the page size and the vDSO among
+# them, come from the C library, which has them from the start; rustix's own
+# lazy read, prctl(PR_GET_AUXV) then /proc/self/auxv, is refused in the
+# confined processes and panics there)
+rustix = { version = "1", features = ["use-libc-auxv"] }
+seccompiler = { version = "0.5", default-features = false }
+serde = "1"
+serde_json = "1"
+sha2 = "0.11"
+tar = "0.4"
+tempfile = "3.24.0"
+thiserror = "2"
+tokio = { version = "1", default-features = false }
+tokio-rusqlite = "0.6"
+tokio-stream = "0.1"
+toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"] }
+tonic = { version = "0.12", default-features = false, features = ["server", "codegen", "prost"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.20", default-features = false }
+xattr = "1.6.1"
+yaml-rust2 = { version = "0.13", default-features = false }
+zeroize = "1"
+zlink = { version = "0.7", default-features = false }
+zlink-core = { version = "0.7", default-features = false }
+zstd = { version = "0.14", features = ["pkg-config"] }
+
+[package]
+name = "velarx"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "A container engine for Linux that runs OCI images"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+readme = "README.md"
+keywords = ["container", "oci", "runtime", "peer-to-peer", "linux"]
+categories = ["command-line-utilities", "virtualization"]
+
+[features]
+default = ["engine", "fuse"]
+# The engine: the services, the store, the API server, the monitors.  The
+# thin client `velarx-client` is built without it.
+engine = ["dep:velarx-core", "dep:velarx-runtime", "dep:velarx-fuse", "dep:velarx-db", "dep:velarx-nsid", "dep:velarx-netkernel", "dep:velarx-netdetach", "dep:velarx-content", "velarx-registry/engine", "velarx-config/engine", "velarx-types/sqlite", "dep:rusqlite", "dep:bytes", "dep:async-trait", "dep:futures", "dep:regex-lite", "dep:tokio-stream", "tokio/rt-multi-thread", "tokio/process", "tokio/net", "tokio/signal", "tokio/fs", "tokio/io-std", "dep:velarx-storage", "dep:velarx-signature", "dep:zlink", "dep:flate2", "dep:zstd", "velarx-proto/service"]
+# FUSE file systems for the layers and the merged images
+fuse = ["velarx-core/fuse"]
+# The functions the fuzz targets call (`velarx::fuzzing`): the fuzz crate and
+# the test of the corpora (`make test-fuzz-corpus`) turn it on, a build of the
+# engine and a build of the thin client do not have it.
+fuzzing = ["engine"]
+
+[dependencies]
+velarx-sys = { path = "crates/sys", features = ["tokio"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "io-util"] }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+toml.workspace = true
+
+rusqlite = { workspace = true, optional = true }
+
+# varlink: the store service, the fetchers and the network providers,
+# engine only
+zlink = { workspace = true, features = ["tokio", "proxy", "service", "tracing"], optional = true }
+
+
+# the interface org.velarx.Engine (types and client), shared with the
+# frontends; without the engine the interface and its proxy, but no runtime
+# (the thin client calls the engine on a blocking socket: no tokio)
+velarx-proto = { path = "crates/proto", default-features = false, features = ["proxy", "session"] }
+
+# the helpers that the packages split off the engine share with it (ids,
+# the paths of the configuration files, the CDI device names)
+velarx-base = { path = "crates/base" }
+velarx-types = { path = "crates/types", default-features = false }
+velarx-wire = { path = "crates/wire" }
+# what the command line prints of the engine's records where podman's does
+velarx-shape = { path = "crates/shape" }
+# gzip and zstd content read the same way everywhere (the build context on stdin)
+velarx-tarsplit = { path = "crates/tarsplit" }
+velarx-core = { path = "crates/core", optional = true }
+velarx-runtime = { path = "crates/runtime", default-features = false, optional = true }
+velarx-fuse = { path = "crates/fuse", optional = true }
+velarx-registry = { path = "crates/registry", default-features = false }
+velarx-config = { path = "crates/config", default-features = false }
+velarx-db = { path = "crates/db", optional = true }
+velarx-nsid = { path = "crates/nsid", optional = true }
+velarx-netkernel = { path = "crates/netkernel", optional = true }
+velarx-netdetach = { path = "crates/netdetach", optional = true }
+velarx-content = { path = "crates/content", optional = true }
+velarx-storage = { path = "crates/storage", optional = true }
+velarx-signature = { path = "crates/signature", optional = true }
+
+rustix = { workspace = true, features = ["mount", "fs", "termios", "process", "net", "rand", "event", "pipe", "pty", "stdio", "thread", "time", "system", "param"] }
+# (the engine only: the tests of its API server make archives)
+zstd = { workspace = true, optional = true }
+
+clap.workspace = true
+clap_complete = "4"
+rpassword = "7"
+zeroize.workspace = true
+tracing.workspace = true
+
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+
+# the status of the errors of the operations
+sha2.workspace = true
+
+libc.workspace = true
+
+chrono = { workspace = true, features = ["serde"] }
+base64.workspace = true
+# zlib-rs is the only backend (the default one, miniz_oxide, is not linked)
+flate2 = { workspace = true, optional = true }
+tar.workspace = true
+# The conditions of the OCI hooks and the name filters of the REST API (podman's are
+# Go regular expressions; regex-lite has the same syntax for what they use,
+# ASCII classes and no Unicode tables)
+regex-lite = { workspace = true, optional = true }
+xattr.workspace = true
+tempfile.workspace = true
+tokio-stream = { workspace = true, optional = true }
+indicatif = "0.18"
+# the EROFS images of the root file systems, written by this process
+
+[dev-dependencies]
+# (a test of the REST API: the error of a server with an untrusted certificate)
+openssl.workspace = true
+# (the tests make registry requests of their own)
+reqwest.workspace = true
+velarx-registry = { path = "crates/registry", features = ["net"] }
+# (the registry fetcher of the tests, in this process or its binary's)
+velarx-registry-lib = { path = "crates/registry-lib" }
+# (the tests of tests/integration: the seccomp profiles, the EROFS images)
+oci-spec.workspace = true
+composefs.workspace = true
+# (the tests serve a body over HTTP: a registry, a source of content)
+axum = { workspace = true, features = ["tokio", "http1", "query"] }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util.workspace = true
+velarx-storage = { path = "crates/storage", features = ["test-support"] }
+# (the test-only driver with image volumes: a monitor started with what the
+# engine asked of a driver)
+velarx-graph = { path = "crates/graph", features = ["conformance"] }
+rand.workspace = true
+# The man pages of the command line, written from the clap definitions
+# (examples/generate-man.rs, `make man` runs it): only the example links it,
+# the shipped binaries do not
+clap_mangen.workspace = true
+# (errors of the database that the tests make)
+tokio-rusqlite.workspace = true
+hex.workspace = true
+
+[lib]
+name = "velarx"
+path = "src/lib.rs"
+# No examples in the documentation are run: rustdoc would compile the
+# crate once more for none.
+doctest = false
+
+# Debug builds and tests: line tables only, enough for file:line in panics
+# and backtraces; full debug info made each test binary half a gigabyte
+# and the link of it the slowest step of `cargo test`.  For a debugger:
+# CARGO_PROFILE_DEV_DEBUG=true (velarx's own code; the dependencies have
+# none by the override below).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# The sums of a layer are of every byte of it, holes included: a debug build
+# does not take minutes for a few GiB.
+[profile.dev.package.sha2]
+opt-level = 3
+
+# The inflate of a gzip layer: unoptimized, it is most of the time of a pull
+# of a debug build, and that time depends on the layout of the binary.
+[profile.dev.package.zlib-rs]
+opt-level = 3
+
+# Size first: the crates on the hot paths of a pull (hashing, inflate) keep
+# opt-level 3.  zstd, sqlite and openssl are system libraries.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = "z"
+# A panic ends the process, and the monitors of the containers outlive it.
+panic = "abort"
+
+[profile.release.package.sha2]
+opt-level = 3
+
+[profile.release.package.zlib-rs]
+opt-level = 3
+
+[lints]
+workspace = true
+
+# zlink-core 0.7.1 with these changes, to be offered upstream (the patch goes
+# when a release has them):
+# * `recvmsg` passes MSG_CMSG_CLOEXEC, so a descriptor received over varlink
+#   is close-on-exec from the moment it exists (no thread that forks
+#   meanwhile passes it on), and a truncated control message is an error
+#   (vendor/zlink-core/src/unix_utils.rs);
+# * the descriptors of a read go with the message its last byte is in, not
+#   with the next message parsed: Linux ends a read after the bytes that came
+#   with descriptors, and zlink sends a message with descriptors in a sendmsg
+#   of its own (vendor/zlink-core/src/connection/read_connection.rs).  A
+#   reply without descriptors no longer shifts those of the next one, so the
+#   servers need not give every reply of a stream one;
+# * a call is taken with either form of "no parameters" (`"parameters": {}`
+#   or none, which varlink allows both): the method enums the macros derive
+#   take one form each, and the other closed the connection
+#   (read_connection.rs); a call that does not match its method is answered
+#   `org.varlink.service.InvalidParameter` before the connection is closed,
+#   not just dropped (vendor/zlink-core/src/server/mod.rs);
+# * `receive_reply` reads the kind of a reply once (a probe of its `error`
+#   member) and then the error or the reply, instead of an untagged enum per
+#   pair of types; the reading of a message and the end of a written one are
+#   out of the generic code (read_connection.rs, write_connection.rs): the
+#   same wire, a smaller velarx-api;
+# * the buffers grow by doubling, not by 256 bytes: a message was serialized
+#   again after each growth (quadratic in its size) and a large one read 256
+#   bytes at a time (read_connection.rs, write_connection.rs);
+# * what a call of the proxy sends does not depend on its type but for the
+#   serialization: the trace, the growth of the buffer and the future that
+#   sends the call and reads the reply are out of the generic code, and a
+#   reply is read as its members (the kind, `continues`, the parameters as
+#   raw JSON) once, the parameters then as the type of the method: a
+#   frontend with many typed calls is smaller (connection/mod.rs,
+#   read_connection.rs, write_connection.rs);
+# * the stream of the replies of a call with more is `Send` when the read
+#   half of the socket is (`ReadHalf::read` is a `Send` future, and
+#   `Socket::ReadHalf` is `Send`: connection/socket.rs,
+#   connection/chain/reply_stream.rs), so that a frontend can read it in a
+#   task;
+# * the future of a method of the proxy depends on the type of its reply
+#   only: the method serializes its call when it is called (`serialize_call`)
+#   and returns the future of `Connection::proxy_call` (`proxy_call_fds`,
+#   `proxy_stream`, `proxy_stream_fds`), which sends it at its first poll and
+#   reads the reply; a reply is told from an error, and the replies of a
+#   call with more are taken from the socket, by code of no type
+#   (`exchange`, `reply_parameters`, `ReadConnection::messages`), only their
+#   parameters read as the type of the method (connection/mod.rs,
+#   read_connection.rs, write_connection.rs).  A frontend with many methods
+#   has one copy of a call for each type of reply, not one for each method.
+#
+# zlink-macros 0.7.1 with these changes:
+# * a method of `#[zlink::proxy]` whose reply has parameters is a function
+#   that serializes its call and returns the future of
+#   `Connection::proxy_call` and the like (see zlink-core above), not an
+#   `async fn` of its own (vendor/zlink-macros/src/proxy/method_impl.rs);
+# * the service (vendor/zlink-macros/src/service):
+#   `#[zlink::service(description = <fn>)]` answers
+#   `org.varlink.service.GetInterfaceDescription` with the text that the
+#   function gives for the interface (the checked-in `interfaces/*.varlink`,
+#   embedded compressed) and generates the descriptor tree of the interface
+#   only under `cfg(test)`, for the test that compares it with that text: the
+#   binaries do not carry the descriptors of every type and method with their
+#   comments (zlink-core has `InterfaceDescription::from_text` for it);
+#   the comment of a doc attribute loses the space of its `///` (utils.rs),
+#   which was written twice (`#  text`).
+#
+# zlink-idl 0.7.1 with this change (vendor/zlink-idl/src): a record, an error
+#   and the parameters of a method with comments are written one field a
+#   line, its comments on the lines above it (as the variants of an enum
+#   were), not on one line where a comment follows the comma of the previous
+#   field and reads as that field's (field.rs `write_fields`).
+#
+# tar 0.4.46 with these changes (vendor/tar/src): the pieces of the map of a
+# sparse entry of the old GNU format are a `VecDeque` (a read took the first
+# piece of a `Vec` out, shifting the others) and at most 32768 (a map was
+# kept in memory in proportion to the archive); `Entry::take_sparse_blocks`
+# drops the holes of such an entry and returns where the data goes, so that
+# the holes are not read as zeros one block at a time.
+# composefs 0.9.4 hashes with the sha2 crate instead of openssl
+# (vendor/composefs/src/digest.rs): the processes that read layer images and
+# make no request (velarx-monitor, the frontends' closures) link no TLS
+# library; the other files are the release's.
+[patch.crates-io]
+zlink-core = { path = "vendor/zlink-core" }
+zlink-macros = { path = "vendor/zlink-macros" }
+zlink-idl = { path = "vendor/zlink-idl" }
+tar = { path = "vendor/tar" }
+composefs = { path = "vendor/composefs" }

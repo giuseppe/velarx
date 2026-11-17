@@ -1,0 +1,1 @@
+{"default": [{"type": "insecureAcceptAnything"}], "transports": {"docker": {"docker.io/library": [{"type": "signedBy", "keyType": "GPGKeys", "keyPath": "/k.gpg"}], "localhost:5000/a/b:latest": [{"type": "reject"}], "*.example.com": [{"type": "sigstoreSigned", "keyPath": "/k.pub", "signedIdentity": {"type": "matchRepository"}}]}}}

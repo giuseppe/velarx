@@ -1,0 +1,256 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The interface of pushers: a process that places the objects of an image
+# (blobs, configurations, manifests) at a destination.  Every pusher serves
+# it; nothing in it names a kind of pusher.  Generated from the Rust types
+# (crates/content/src/pusher/push.rs and crates/content/src/serve_fetch.rs)
+# by the test `interface_tests::the_pusher_interface_file_is_current`:
+# VELARX_WRITE_INTERFACES=1 cargo test -p velarx-content --lib interface_tests
+# writes it.  It is served on the socket of the fetcher interface of the
+# same process.
+#
+# ONE PUSHER.  A pusher answers only for itself: what it does not place is
+# unavailable, what it tried and could not place is failed.  It knows nothing
+# of other pushers; the engine walks its ordered list of them, the destination's own
+# pusher last, and is the one that asks the next.
+# Every object of a call is answered exactly once.  Only the pusher that owns
+# its destination (the word `origin`) takes a Commit.
+#
+# THE OBJECTS.  The engine made every digest it names, and compresses and
+# recreates every layer itself: a pusher places the bytes it is handed and
+# never reads the store.  Each data file is a regular file open for reading
+# only, which the engine keeps as it is until the call ends, in the
+# descriptors of the message in the order of the objects.
+#
+# TRUST.  An answer is a claim.  What a pusher that does not own the
+# destination says it placed is confirmed by the one that does before the
+# manifest is committed.
+#
+# CAPABILITIES.  What a pusher can do is a word of capabilities in GetInfo
+# (origin, link, parallel, sha512); a client ignores the words it does not
+# know; what it cannot do without is a word of requires in Open, refused with
+# NotSupported when unknown.  The interface grows only so: a new parameter or
+# reply field is optional, and a value of an enum of a reply that a client
+# does not know is read as the most general one (other, unknown) or ignored.
+#
+# DESCRIPTORS.  A descriptor is a field of type `int` (or `?int` when it may
+# be absent), named after what it is, whose value is its position among the
+# descriptors of its message; at most 16 for a message.  Nothing is
+# counted and nothing is implied by order.  The credentials are the JSON of a
+# `RegistryAccess` in a sealed memory file (at most 1048576 bytes),
+# which carries no length: the receiver checks the seals.
+#
+# REPLIES.  A method called with more answers one record a reply; its last
+# reply carries no record and has continues false (`Put`: no event; `Probe`:
+# no probed).  A server whose connection is closed sends nothing more.
+# `progress` carries `objects` (exactly one) and `bytes`, the cumulative
+# bytes of that object sent by this call; one with no object and no bytes is
+# a beat.  Every other method has one reply.
+#
+# CANCELLATION.  Closing the connection of a call cancels it; each `Probe` and
+# `Put` runs on a connection of its own (`Connect`).  An interrupted upload may
+# be resumed by a later `Put` of the same object or started again; a pusher
+# says nothing about it.
+#
+# LIVENESS.  `Open` carries `idle_ms`.  A call with more sends a reply (a
+# progress when it has nothing else) at least every `idle_ms / 2`; a call with
+# one reply answers within `idle_ms`.  Otherwise the engine closes the
+# connection and records a transient failure, `silent for N ms`, for that
+# party.
+# Who may call: a peer of the same user or root (SO_PEERCRED); any
+# accepted peer may make every call.
+
+interface org.velarx.Pusher
+
+# What an object is for the image.
+type Role (
+	config,
+	layer,
+	blob,
+	manifest,
+	# (also what a value this side does not know is read as)
+	unknown
+)
+
+# An object the engine wants at the destination.  Its digest is the one
+# the engine computed, never one a pusher made.
+type Object (
+	digest: string,
+	size: int,
+	media_type: string,
+	role: Role,
+	# Places of the destination it can be linked from (a hint: a pusher
+	# that cannot link ignores it)
+	known_at: ?[]string
+)
+
+# What a pusher has of an object, before anything is regenerated.
+type Have (
+	# The destination has it
+	present,
+	# This pusher linked it from where a hint said it is (a cross-repository
+	# mount): the destination has it now
+	linked,
+	# This pusher can place it and needs its bytes
+	needed,
+	# Not this pusher's to place
+	unavailable,
+	# (what a value this side does not know is read as)
+	unknown
+)
+
+# What kind of failure, for the party that reads it: what to do next.
+type FailureClass (
+	# This party does not have the item or cannot serve it now; nothing
+	# is wrong: the engine asks the next one
+	unavailable,
+	# It tried and failed in a way that may pass (a timeout, a cut
+	# connection, a server error): the engine asks the next one; the
+	# call may be tried again
+	transient,
+	# What it brought, or what it was handed, is not what it claims (a
+	# digest, a size, a table of contents): the operation fails and names
+	# this party; nobody else is asked
+	invalid,
+	# The origin says the item does not exist; from a party that is not
+	# the origin it is read as `unavailable`
+	not_found,
+	# Credentials missing or refused: the engine may `Renew` and ask again
+	unauthorized,
+	# The credentials were taken and do not allow it
+	forbidden,
+	# No space where the bytes go
+	no_space,
+	# It tried and failed for good (also what a value this side does not
+	# know is read as)
+	failed
+)
+
+# Why something failed.
+type Failure (class: FailureClass, reason: string)
+
+# What an event of a `Put` tells.
+type EventKind (
+	# `objects` are at the destination, this pusher put them there
+	placed,
+	# `objects` were at the destination already
+	present,
+	# `objects` are at the destination, linked from another repository
+	linked,
+	# This pusher does not place `objects`
+	unavailable,
+	# It tried and failed for `objects`: `failure`
+	failed,
+	# `bytes` of the one object of `objects` are sent so far by this call
+	progress,
+	# (what an event this side does not know is read as: ignored)
+	unknown
+)
+
+# What an event of a `Put` carries.
+type PutEvent (
+	kind: EventKind,
+	# Positions in the call
+	objects: []int,
+	failure: ?Failure,
+	bytes: ?int
+)
+
+# What this pusher has of one object of a `Probe`.
+type Probed (
+	# The position of the object in the call
+	index: int,
+	have: Have,
+	failure: ?Failure
+)
+
+# How the destination of a push resolves a manifest by one name: what the
+# Pusher answers to `Commit`, and what an engine says of the push.
+type Placed (
+	# A name of the call; absent: the manifest's own digest
+	name: ?string,
+	accepted: bool,
+	# The destination's answer when it refused it
+	reason: ?string
+)
+
+# Who the pusher is and what it can do.
+method GetInfo() -> (
+	name: string,
+	# The version of the package
+	version: string,
+	# The version of the protocol (1)
+	proto: int,
+	# Words; a client ignores those it does not know
+	capabilities: []string,
+	# Named limits (`max_objects`, `max_wants`, ...); a client ignores those it does not know
+	limits: [string]int
+)
+
+# Give the connection its scope; once, before anything but
+# `GetInfo`.  `destination`: what the destination's transport
+# names.  `target`: the destination the client opened (a directory,
+# or a file open for writing), for a pusher whose destination is a
+# path; `access`: the credentials, a sealed memory file.
+# `idle_ms`: the most this connection's calls stay silent.
+method Open(destination: string, tls_verify: ?bool, target: ?int, access: ?int, idle_ms: int, requires: []string) -> ()
+
+# Another connection with the scope of this one: the reply carries
+# its descriptor.
+method Connect() -> ()
+
+# Replace the credentials of the scope.
+method Renew(access: int) -> ()
+
+# What do you have, or what can you link, of these objects?  Called
+# with `more`: one `probed` a reply, in any order, then a last
+# reply without one.
+method Probe(objects: []Object) -> (probed: ?Probed)
+
+# Place the objects; `files`: for each object its data file, a
+# regular file open for reading only, among the descriptors of the
+# call.  Called with `more`: one `event` a reply, then a last reply
+# without one; each object is in exactly one of placed, present,
+# linked, unavailable, failed.
+method Put(objects: []Object, files: []int) -> (event: ?PutEvent)
+
+# Only to the pusher that owns its destination (the word
+# `origin`): put the manifest in `file` (among the descriptors of
+# the call) as each of `names` (tags; none: by its digest only).
+# `digest`: the digest the destination says it has; `placed`: one
+# for each name and one for the digest.
+method Commit(manifest: Object, file: int, names: []string) -> (
+	# The digest the destination says the manifest has
+	digest: string,
+	# One for each name and one for the digest
+	placed: []Placed
+)
+
+# To every other pusher of the push, after the commit: the
+# destination has the manifest `digest` by `names` now.  Its answer
+# is not waited for beyond `idle_ms`.
+method Committed(manifest: Object, digest: string, names: []string) -> ()
+
+# The end of the scope, for every pusher: the origin finishes what
+# it writes (the end of an archive), the others what they hold.
+method Finish() -> ()
+
+error InvalidArgument (reason: string)
+
+# A call before `Open`, an `Open` twice
+error NotScoped (reason: string)
+
+# A call this connection may not make
+error Refused (reason: string)
+
+# A word of `requires` that is not known
+error NotSupported (feature: string)
+
+# No connection for this client now (its limit)
+error Busy (reason: string)
+
+# `Commit`: the destination does not have these objects
+error ObjectsMissing (digests: []string)
+
+# The call failed: what kind, and why
+error Failed (failure: Failure)

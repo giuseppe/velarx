@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-shape"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "podman's and Docker's documents of the engine's typed records, for velarx-api and the command line"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The engine answers typed records (org.velarx.Engine); what podman's and
+# Docker's REST API and podman's command line print of them is shaped here,
+# once, for velarx-api and the command line.  Plain functions of the records:
+# no engine, no I/O, no async (the thin client links it).
+[lib]
+name = "velarx_shape"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+velarx-proto = { path = "../proto", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

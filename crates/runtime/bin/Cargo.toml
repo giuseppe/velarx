@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-monitor-bin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The binary velarx-monitor"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+build = "../../base/build-support/bin.rs"
+
+# The binary of the monitor, apart from crates/bin so that it links the
+# runtime (`velarx-runtime`) and not the services (`velarx-core`), and so that
+# the commit of `--version` reaches nothing but the link (see crates/bin).
+[[bin]]
+name = "velarx-monitor"
+path = "src/main.rs"
+test = false
+
+[[test]]
+name = "version"
+path = "tests/version.rs"
+
+[dependencies]
+velarx-runtime = { path = ".." }
+velarx-sys = { path = "../../sys" }
+
+[lints]
+workspace = true

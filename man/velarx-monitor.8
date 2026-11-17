@@ -1,0 +1,102 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.\" Hand-written (the monitor has no clap definitions): what the engine
+.\" starts it with, not what a user types.
+.TH VELARX-MONITOR 8 "" "velarx" "Velarx"
+.SH NAME
+velarx\-monitor \- the process that owns one container
+.SH SYNOPSIS
+.B velarx\-monitor
+.B \-\-varlink\-fd
+.IR N
+.IR RUNDIR
+.br
+.B velarx\-monitor
+.B \-\-image\-server
+.SH DESCRIPTION
+.B velarx\-monitor
+is started by the engine
+.RB ( velarx (1),
+or the engine service of
+.BR velarx\-api (8)),
+never by a user: it runs one container of the store, from all that the
+engine left in
+.IR RUNDIR ,
+its run directory under the state directory of the engine
+.RB ( \-\-runroot ,
+.I state_dir
+of
+.BR velarx.conf (5)).
+It is the parent of the init process of the container: it creates the
+cgroup of the container and its own below it
+.RB ( \-\-cgroups=disabled
+asks for none), starts the OCI runtime
+.RB ( \-\-runtime ,
+.I runtime
+of
+.BR velarx.conf (5))
+with
+.B create
+and
+.BR start ,
+follows the exit of the container (and of the processes it reaped), keeps
+its log pipe, runs the restart policy, its health checks and the OCI hooks,
+and serves
+.B org.velarx.Monitor
+.RI ( interfaces/org.velarx.Monitor.varlink )
+on the monitor socket of the run directory: the engine and
+.B "velarx healthcheck"
+call it there.
+.PP
+.I N
+is the descriptor of the first connection, which the engine hands the
+monitor (nothing is implied: the number is named).  Its first call is
+.B Create
+(create the container, or restore it from the directory of images that the
+call carries as a descriptor); the other descriptors the monitor was passed
+are named in
+.BR monitor.json .
+.B \-\-image\-server
+makes the binary the server of the layers of an image for the driver, not a
+monitor.
+The calls
+.BR GetInfo ,
+.BR GetCoreStatus ,
+.BR Stop ,
+.B Kill
+and
+.B Wait
+(the core) mean the same in every version of the monitor, so that the engine
+of a newer version still stops a container that an older one started.
+.PP
+Before the container is created the monitor mounts its root file system and
+the images mounted in it from the EROFS images of their layers.  It measures
+each image through the descriptor it mounts and refuses one whose fs\-verity
+digest is none of the values the engine wrote for that layer in
+.B monitor.json
+(taken, at that start, from the checked manifest of the image; the bundle's
+.B rootfs.json
+holds paths only).  When the engine enforces the digests the overlay has
+.BR verity=require ,
+and an image without fs\-verity is an error.  A restart of the container by
+the monitor finds the file systems mounted and checks nothing again.
+.PP
+With no engine service
+.RB ( velarx\ run\ \-\-no\-monitor )
+the container runs in the process of the command and there is no monitor.
+.SH OPTIONS
+.TP
+.I RUNDIR
+The run directory of the container: its settings, its sockets and its
+files, which the engine made.
+.TP
+.BR \-V ", " \-\-version
+Print the version and the commit of the build.
+.SH EXIT STATUS
+The exit status of the init process of the container; 1 when the monitor
+itself failed (its error is on the standard error), 2 when it was not
+given exactly one
+.IR RUNDIR .
+.SH SEE ALSO
+.BR velarx (1),
+.BR velarx.conf (5),
+.BR crun (1)

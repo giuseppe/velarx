@@ -1,0 +1,676 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The interface org.velarx.Monitor: the monitor of one container
+# (velarx-monitor), on the socket monitor.sock of the container's run
+# directory; the engine is its client (and the attach of a process that is
+# its own monitor).
+# Generated from the Rust types (crates/wire/src/monitor/iface.rs and
+# proto.rs) by the test `monitor::iface::tests::the_interface_file_is_current`:
+# VELARX_WRITE_INTERFACES=1 cargo test -p velarx-wire --lib monitor::iface
+# writes it.
+#
+# CORE.  GetInfo, GetCoreStatus, Stop, Kill and Wait, and the types CoreState
+# and CoreStatus, have this definition in every version of the monitor whose
+# GetInfo answers `core` 1.  A client may make them whatever the `digest`;
+# every other call needs the `digest` of the definition it speaks.  A monitor
+# lives as long as its container, across upgrades of the engine.
+#
+# The streams are one-way stream sockets (the input of a command without a
+# terminal is the pipe of its input) whose descriptors cross in the
+# SCM_RIGHTS of the first reply of Attach and Exec, named in the JSON by
+# their position among them.  The call Exec carries in its SCM_RIGHTS the
+# descriptors the command gets as 3, 4, ... (`preserve_fds` of them, less
+# the `preserve_holes`).
+#
+# While a call with `more` is answered, the other calls on its connection
+# are `oneway` (Resize, Signal, CloseStdin, Detach).  Closing the
+# connection leaves the session: a command goes on (Signal ends it).
+# Who may call: a peer of the same user or root (SO_PEERCRED); any
+# accepted peer may make every call.
+
+interface org.velarx.Monitor
+
+# What a restore of a checkpoint needs: the CRIU options the runtime passes
+# on, and the images.
+type RestoreRequest (
+	# The directory of the images (the runtime writes its log there too),
+	# by its position among the descriptors of the call
+	image_dir: int,
+	# Restore its established TCP connections (`--tcp-established`)
+	tcp_established: bool,
+	# Close its established TCP connections (`--tcp-close`)
+	tcp_close: bool,
+	# Restore the file locks it held (`--file-locks`)
+	file_locks: bool
+)
+
+# Where the container is in its life.
+# Where the container is in its life, as the core says it.
+type CoreState (
+	# The runtime created the container, the monitor waits for `Start`.
+	created,
+	running,
+	# The runtime froze the container.
+	paused,
+	# A stop is under way: the container runs and will not be restarted.
+	stopping,
+	# The container exited (a restart that waits is no exit for good, but
+	# the run did exit).
+	exited
+)
+
+# What every version of the monitor answers about its container.
+type CoreStatus (
+	state: CoreState,
+	# The init of the container, on the host.
+	pid: ?int,
+	# The exit status of the last run that ended; 128 plus a signal.
+	exit_code: ?int,
+	# Nanoseconds since the epoch.
+	finished_ns: ?int,
+	# The exit is recorded in the store (the monitor answered).
+	recorded: bool
+)
+
+# What happens at the exit for good.
+type ExitPlan (
+	# The container goes with its exit (`--rm`); false: it stays (a
+	# restart, a pod stop, a checkpoint that keeps it)
+	remove: bool,
+	# With `remove`: its anonymous volumes go too (`run --rm`, `rm -v`)
+	volumes: bool
+)
+
+# What the monitor did with the exit for good: in the store, the network
+# released, and with the plan the container removed.
+type Settled (
+	# The exit is in the store, with its `died` event.
+	recorded: bool,
+	# The container is gone (the plan, or `Remove`).
+	removed: bool,
+	# `--rmi`: what went of its image.
+	image: ?ImageChange,
+	# The step that failed and why; the engine's next command finishes it.
+	failure: ?Failure
+)
+
+# Why something failed.
+type Failure (class: FailureClass, reason: string)
+
+# What kind of failure, for the party that reads it: what to do next.
+type FailureClass (
+	# This party does not have the item or cannot serve it now; nothing
+	# is wrong: the engine asks the next one
+	unavailable,
+	# It tried and failed in a way that may pass (a timeout, a cut
+	# connection, a server error): the engine asks the next one; the
+	# call may be tried again
+	transient,
+	# What it brought, or what it was handed, is not what it claims (a
+	# digest, a size, a table of contents): the operation fails and names
+	# this party; nobody else is asked
+	invalid,
+	# The origin says the item does not exist; from a party that is not
+	# the origin it is read as `unavailable`
+	not_found,
+	# Credentials missing or refused: the engine may `Renew` and ask again
+	unauthorized,
+	# The credentials were taken and do not allow it
+	forbidden,
+	# No space where the bytes go
+	no_space,
+	# It tried and failed for good (also what a value this side does not
+	# know is read as)
+	failed
+)
+
+# Replace the restart policy: `policy` none is no policy.
+type RestartUpdate (policy: ?RestartSettings)
+
+# Replace the health check: `check` none is no check.
+type HealthUpdate (
+	check: ?Healthcheck,
+	# The directory of the results' file (`Healthcheck::log_dir`): its
+	# position among the descriptors of the call
+	log_dir: ?int
+)
+
+# What the monitor knows about the container.
+type Status (
+	state: RunState,
+	# The init of the container, on the host.
+	pid: ?int,
+	# Nanoseconds since the epoch.
+	started_ns: ?int,
+	# How the last run ended.
+	exit: ?ExitInfo,
+	# The kernel killed a process of the container for lack of memory.
+	oom: bool,
+	# The health checks, if the container has any
+	health: ?HealthState,
+	# The restarts made by the restart policy.
+	restart_count: int,
+	# The container exited and is going to be started again: how.
+	restarting: ?ExitInfo,
+	# What happens at the exit for good.
+	plan: ExitPlan,
+	# What the monitor did with the exit for good, once it did.
+	settled: ?Settled
+)
+
+type RunState (
+	# The runtime created the container, the monitor waits for `Start`.
+	created,
+	running,
+	# The runtime froze the container (`Pause`).
+	paused,
+	# A stop is under way: the container runs and will not be restarted.
+	stopping,
+	# The container exited and its exit status is recorded.
+	exited,
+	# The container exited for good and the monitor removes it.
+	removing,
+	# The container is gone: its files and rows.
+	removed
+)
+
+# How a run of the container ended.
+type ExitInfo (
+	# The exit status, 128 plus the signal that killed it.
+	code: int,
+	# Nanoseconds since the epoch.
+	finished_ns: int,
+	# The kernel killed a process of it for lack of memory.
+	oom: bool,
+	# A health check asked for a restart.
+	health_restart: bool,
+	# The container was stopped on purpose (by the user or the health
+	# check): the restart policy does not apply.
+	stop_requested: bool,
+	# The container ran for the time limit it was given and was killed.
+	timed_out: bool,
+	# The container was checkpointed: CRIU ended it.
+	checkpointed: bool,
+	# When the run that ended started (nanoseconds since the epoch, as the
+	# `Started` event says): an exit is the one of that run only.  Absent
+	# for an end nobody saw.
+	started_ns: ?int,
+	# The plan the exit was made with, which the monitor follows:
+	# the container goes with its exit.
+	remove: bool,
+	# With `remove`: its anonymous volumes go too
+	volumes: bool
+)
+
+# The health of a container.  (`HealthState` in the interfaces: the Engine
+# has a method `Health`, and a type and a method share one namespace.)
+type HealthState (
+	status: HealthStatus,
+	# The failures since the last success
+	failing_streak: int,
+	# The last results, the oldest first
+	log: []HealthResult
+)
+
+# A result of a health check.
+type HealthResult (
+	# Nanoseconds since the epoch
+	start_ns: int,
+	# Nanoseconds since the epoch
+	end_ns: int,
+	exit_code: int,
+	# The start of what the check wrote
+	output: string
+)
+
+# The state of the health check of a container.
+type HealthStatus (
+	# No result yet, or the startup check has not passed
+	starting,
+	healthy,
+	unhealthy,
+	# The container stopped while a check ran
+	stopped
+)
+
+# Something that happened to the container.
+type EventRecord (
+	kind: EventKind,
+	pid: ?int,
+	# Nanoseconds since the epoch.
+	started_ns: ?int,
+	restart_count: ?int,
+	# The restart policy started it again.
+	restarted: ?bool,
+	exit: ?ExitInfo,
+	health: ?HealthState,
+	settled: ?Settled
+)
+
+# The kind of an event.
+type EventKind (
+	# The container runs: `pid`, `started_ns`, `restart_count`, `restarted`.
+	started,
+	# It exited (`exit`).
+	exited,
+	# It exited (`exit`) and its restart policy starts it again
+	# (`restart_count`, this restart included).
+	restarting,
+	# The status of its health checks (`health`).
+	health,
+	# The kernel killed a process of it for lack of memory.
+	oom,
+	# The exit for good is settled (`settled`).
+	settled
+)
+
+# The image of a container the monitor removed, or untagged, as the
+# container went (`--rmi`).
+type ImageChange (
+	# The hex digest of its configuration.
+	id: string,
+	# The names it lost.
+	names: []ImageName,
+	# The image itself went, not only the names.
+	removed: bool
+)
+
+# A name of an image: `repository:tag`, or `repository@digest` for the tag
+# `@digest`.
+type ImageName (repository: string, tag: string)
+
+# How an exec session ended.
+type ExecExit (
+	# The exit status of the command; 126 or 127 when the runtime could
+	# not run it.
+	code: int,
+	reason: ExecReason,
+	# The runtime started the command: else the status is the runtime's.
+	started: bool
+)
+
+# Why an exec session ended.
+type ExecReason (
+	# The command ended (or the runtime could not start it).
+	exited,
+	# Its time limit was over: it was killed.
+	timed_out,
+	# Its client went away: it was killed.
+	cancelled
+)
+
+# Where a session (an attach, an exec) is.
+type SessionPhase (
+	# The first reply: the streams.
+	streams,
+	# The runtime started the command (an exec with `notify_start`).
+	started,
+	# The last reply: the session ended.
+	ended
+)
+
+# What to do when the container exits.
+type RestartPolicy (
+	# Nothing
+	no,
+	# When it failed (`RestartSettings::max_retries` times at most)
+	on_failure,
+	always,
+	# As `Always`, but not after the user stopped it
+	unless_stopped
+)
+
+# The restart policy with its limit.
+type RestartSettings (
+	policy: RestartPolicy,
+	# The most restarts of `on-failure`; 0: no limit.
+	max_retries: int
+)
+
+# The health check of a container (its own, or its image's): what the
+# create request carries, the container record stores and `inspect` shows,
+# and what the monitor runs.  The times are nanoseconds.
+type Healthcheck (
+	# `CMD-SHELL cmd`, `CMD arg...`, `NONE`, or an argument vector
+	test: []string,
+	# Between two checks; 0: 30 s
+	interval_ns: int,
+	# No timer: the checks are those of `healthcheck run` (podman's
+	# `--health-interval=disable`)
+	interval_disabled: bool,
+	# For one check; 0: no timeout (libpod's), the check runs until it ends
+	timeout_ns: int,
+	# Failures in it do not count
+	start_period_ns: int,
+	# Between two checks in the start period
+	start_interval_ns: int,
+	# Failures in a row before the container is unhealthy; 0 is one, as
+	# podman's `FailingStreak >= Retries`
+	retries: int,
+	# What a container that became unhealthy gets
+	on_failure: OnFailure,
+	# The check that runs until the container has started: the regular
+	# one begins once it passed.
+	startup: ?StartupHealthcheck,
+	# Where the results go: `local` (the default, the state of the
+	# container), `events_logger`, or a directory (`<dir>/<id>-healthcheck.log`)
+	log_destination: string,
+	# How many results are kept (default 5, 0: no limit)
+	max_log_count: ?int,
+	# How many characters of the output of a result are kept (default 500,
+	# 0: no limit)
+	max_log_size: ?int
+)
+
+# The check that runs until a container has started (podman's
+# `--health-startup-*`); the times are nanoseconds.
+type StartupHealthcheck (
+	# As the `test` of a health check
+	test: []string,
+	# 0: 30 s
+	interval_ns: int,
+	# 0: 30 s
+	timeout_ns: int,
+	# Failures before the container is restarted; 0: never
+	retries: int,
+	# Successes before the regular check begins; 0: one
+	successes: int
+)
+
+# What a container that became unhealthy gets.
+type OnFailure (
+	# Nothing.
+	none,
+	# Kill the container.
+	kill,
+	# Kill the container and start it again, whatever its restart policy.
+	restart,
+	# Stop the container: no restart.
+	stop
+)
+
+# Who the monitor is.  (Core.)  `core`: the version of the core (1).  A
+# client calls it first: it makes the core calls when `core` is the one it
+# speaks, the others when `digest` is the one of the definition it speaks.
+method GetInfo() -> (
+	# The version of velarx of the monitor.
+	version: string,
+	# The commit it was built from.
+	commit: string,
+	# The version of the core (1, [`CORE`]): `GetInfo`, `GetCoreStatus`,
+	# `Stop`, `Kill` and `Wait` mean the same in every version of the
+	# monitor that answers it.  0 (it is missing) is a monitor from before
+	# the core.
+	core: int,
+	# The FNV-1a (64 bits, hexadecimal) of the text of the definition
+	# the monitor serves: a client that speaks another one may make the
+	# core calls, not the others.
+	digest: string,
+	# The id of the container.
+	id: string
+)
+
+# (Core.)
+method GetCoreStatus() -> (status: CoreStatus)
+
+# Stop the container (core): no restart for the exit that follows, a restart
+# that waits is not made.  `signal` (none: the container's stop signal)
+# through the pidfd of the init, then SIGKILL after `timeout_ms` (none: the
+# container's stop timeout; 0: SIGKILL at once).  The monitor owns the
+# deadline: a client that goes away does not stop it.  The reply comes when
+# the container exited and its exit is recorded; a Stop of a container that
+# exited already is answered at once, a Stop during a Stop joins it (the
+# earlier deadline).  `killed`: SIGKILL was needed.  `InvalidState` for a
+# container that was not started.
+method Stop(
+	# The signal that asks the container to stop (none: the container's
+	# stop signal).
+	signal: ?int,
+	# Milliseconds until SIGKILL (none: the container's stop timeout; 0:
+	# at once).
+	timeout_ms: ?int
+) -> (
+	status: CoreStatus,
+	# SIGKILL was needed.
+	killed: bool
+)
+
+# Remove the container: with `force` a running one is stopped first (as
+# `Stop` with `timeout_ms`; none: 0), else `InvalidState`; the plan becomes
+# `remove` with `volumes`.  The reply comes once it is removed (its `status`
+# says `settled`), or the removal failed (`Failed`: the container stays
+# listed).  A container that was removed is answered at once.
+method Remove(
+	# Stop a container that runs first (as `Stop` with `timeout_ms`; none:
+	# 0); else a running container is `InvalidState`.
+	force: bool,
+	timeout_ms: ?int,
+	# Its anonymous volumes go too.
+	volumes: bool
+) -> (status: Status)
+
+# Send `signal` to the init through its pidfd (core).  The exit that follows
+# is not restarted (a kill of a user is a stop).  `NotRunning` when it does
+# not run.
+method Kill(signal: int) -> ()
+
+# The reply comes when the container exited for good (no restart follows)
+# and its exit is recorded; at once when that is so already.  (Core.)
+method Wait() -> (status: CoreStatus)
+
+# The first call of the boot connection (`--varlink-fd`), once: create the
+# container with the runtime, or restore it with `restore` (`image_dir`: the
+# directory of the images, among the descriptors of the call).  The reply is
+# the result of the creation (`Failed` when the runtime failed, and the monitor
+# ends).  After it the connection is an ordinary one.  `InvalidState` as any
+# other call, or as a second one.
+method Create(restore: ?RestoreRequest) -> (status: Status)
+
+# With `more`: the status of the container, then a reply for every
+# event.  The monitor records them itself (its store, its events): a
+# subscriber only observes.
+method Subscribe() -> (
+	# In the first reply.
+	status: ?Status,
+	# In the replies after the first.
+	event: ?EventRecord
+)
+
+# What the monitor knows of the container.
+method GetStatus() -> (status: Status)
+
+# Start the container the runtime created (`InvalidState` when it
+# ran already); a container waiting to be restarted starts now.
+method Start(
+	# Wait for the first `Attach` with `start` to start the container, at
+	# most this long (it is started at that bound if no client came); 0:
+	# start now.
+	attach_wait_ms: int
+) -> (status: ?Status)
+
+# End the monitor of a container that was created and not started;
+# `InvalidState` in any other state.
+method Quit() -> ()
+
+# Checkpoint the running container with the runtime (CRIU).
+method Checkpoint(
+	# The directory of the images, which the runtime writes: its position
+	# among the descriptors of the call
+	image_dir: int,
+	# The container goes on; else it ends, and its end is a checkpoint
+	# (no restart policy)
+	leave_running: bool,
+	# Checkpoint its established TCP connections (`--tcp-established`)
+	tcp_established: bool,
+	# Checkpoint the file locks it holds (`--file-locks`)
+	file_locks: bool,
+	# Dump the memory only (`--pre-dump`): the container goes on
+	pre_dump: bool,
+	# The images of a pre-dump to build on (`--parent-path`): a directory
+	# among the descriptors of the call, by its position
+	parent_dir: ?int
+) -> (status: Status)
+
+# Change what is given: the restart policy, the health check, the
+# resources (`resources`: a sealed memory file with the OCI
+# `linux.resources` JSON, which the monitor gives the runtime's update; the
+# runtime's refusal is `InvalidArgument`), the exit plan.
+method Update(
+	# The restart policy from now on
+	restart: ?RestartUpdate,
+	# The health check from now on
+	health: ?HealthUpdate,
+	# A sealed memory file with the OCI `linux.resources` JSON, by its
+	# position among the descriptors of the call: the monitor gives it to
+	# the runtime's update
+	resources: ?int,
+	# What happens at the exit for good
+	plan: ?ExitPlan
+) -> ()
+
+# Freeze the container with the runtime (`InvalidState` when it does not
+# run); the health checks wait while it is paused.
+method Pause() -> (status: Status)
+
+# Thaw a paused container (`InvalidState` else).
+method Resume() -> (status: Status)
+
+# Run the health check now; the reply comes with its result.
+method RunHealthCheck() -> (health: HealthState)
+
+# Open the log file again (it was rotated by somebody else).
+method ReopenLog() -> ()
+
+# With `more`: the streams of the container (first reply), its
+# exit status (last reply).  `start` starts a container that waits for
+# its first client.  Closing the connection detaches.
+method Attach(
+	# Send the client's input to the container (a stream for it).
+	stdin: bool,
+	# The container's standard output (a stream for it; with a terminal,
+	# what the terminal shows).
+	stdout: bool,
+	# The container's standard error (a stream for it).
+	stderr: bool,
+	# The container is waiting for its first client before it starts.
+	start: bool,
+	# Close the container's stdin when this client goes away.
+	stdin_once: bool
+) -> (
+	# Where the session is.
+	phase: SessionPhase,
+	# In the first reply: the stream of the container's input (the client
+	# writes to it), by its position among the descriptors of the reply.
+	stdin: ?int,
+	# In the first reply: the stream of its output.
+	stdout: ?int,
+	# In the first reply: the stream of its errors.
+	stderr: ?int,
+	# In the last reply: the exit status of the run; the streams are written
+	# out and closed before it.
+	exit: ?int,
+	# In the last reply: the client did not read its output fast enough,
+	# its streams were closed early and the rest of the output dropped.
+	output_dropped: bool
+)
+
+# With `more`: run a command in the container, its streams
+# (first reply), its start (with `notify_start`), its end (last reply).
+# Closing the connection detaches: the command goes on, its output dropped.
+method Exec(
+	# The program and its arguments.
+	command: []string,
+	# `NAME=VALUE` added to the environment of the container.
+	env: []string,
+	# The working directory, in the container.
+	cwd: ?string,
+	# `USER[:GROUP]`, names or ids of the container's files.
+	user: ?string,
+	# A terminal: one stream for the input, one for what it shows.
+	tty: bool,
+	# A stream for the input of the command (without a terminal: the pipe
+	# of its input itself).
+	stdin: bool,
+	# Kill the command (its process group) after this long.
+	timeout_ms: ?int,
+	# With `CAP_SYS_ADMIN`.
+	privileged: bool,
+	# `exec -d`: the output of the command is dropped from the start (a
+	# command goes on when its client goes away in any case).
+	detach: bool,
+	# A reply with `started` when the runtime started the command (it
+	# wrote its pid): the status of a session that ends without one is the
+	# runtime's.
+	notify_start: bool,
+	# `--preserve-fds`: the command gets this many descriptors (at most
+	# 64) as 3, 4, ...; the call carries those that are not holes (at most
+	# 16).
+	preserve_fds: int,
+	# Which of them (0 is the command's 3) the command does not get: the
+	# gaps of `--preserve-fd`, a `/dev/null` of the monitor stands in for
+	# them.
+	preserve_holes: []int
+) -> (
+	# Where the session is.
+	phase: SessionPhase,
+	# In the first reply: the stream of the input (without a terminal, the
+	# pipe of the command's input itself).
+	stdin: ?int,
+	# In the first reply: the stream of the output (with a
+	# terminal, what it shows).
+	stdout: ?int,
+	# In the first reply: the stream of the errors.
+	stderr: ?int,
+	# In the last reply; the streams are written out and closed before it.
+	exit: ?ExecExit,
+	# In the last reply: the client did not read its output fast enough,
+	# its streams were closed early and the rest of the output dropped.
+	output_dropped: bool
+)
+
+# The size of the terminal: `oneway` on the connection of an `Attach`
+# or `Exec` (of that session), or alone (the container's);
+# `InvalidState` without a terminal.
+method Resize(rows: int, cols: int) -> ()
+
+# A signal to the command: `oneway` on the connection of an `Exec`.
+# `InvalidState` elsewhere (a container gets `Kill`).
+method Signal(signal: int) -> ()
+
+# `oneway` on the connection of an `Attach` or `Exec`: the input ends
+# once its stream is read to its end (a stream closed without it is a client
+# that went away).
+method CloseStdin() -> ()
+
+# A pidfd of the init of the running container (`NotRunning` else):
+# what is done to its process (its network namespace) is done to it,
+# not to a process that got its number.
+method OpenInit() -> (
+	# Its position among the descriptors of the reply.
+	pidfd: int
+)
+
+# `oneway` on the connection of an `Exec`: its output is dropped from now
+# on (the command goes on, as when the connection closes).
+method Detach() -> ()
+
+# The container does not run (exec, checkpoint, a health check).
+error NotRunning (reason: string)
+
+# The container is not in the state the call needs.
+error InvalidState (reason: string)
+
+# The container has no health check.
+error NoHealthCheck (reason: string)
+
+# A value of the call that cannot be (an empty command, a signal out of
+# range).
+error InvalidArgument (reason: string)
+
+# The runtime or the system failed.
+error Failed (reason: string)
+
+# The runtime could not be started for the command of an exec (a user it runs
+# as that is not there, a runtime or a bundle that is gone): the engine's
+# condition NotStarted.
+error NotStarted (reason: string)

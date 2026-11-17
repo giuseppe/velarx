@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-bin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The binaries velarx and velarx-client"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+build = "../base/build-support/bin.rs"
+
+# The binaries of the engine and the command line.  They are packages of
+# their own because the build script that reads the commit (`--version`) runs
+# again at every commit, checkout and rebase, and a build script that reruns
+# recompiles every target of its package: here that is a few lines and a
+# link, not the library.  The libraries get the commit from `main`
+# (`velarx_base::buildinfo::set`).
+[features]
+default = ["engine", "fuse"]
+# The engine: velarx.  The thin client velarx-client is
+# built without it (`make build-client`).
+engine = ["velarx/engine", "dep:velarx-core", "dep:velarx-runtime", "dep:velarx-content"]
+fuse = ["velarx/fuse"]
+
+[[bin]]
+name = "velarx"
+path = "src/velarx.rs"
+test = false
+required-features = ["engine"]
+
+[[bin]]
+name = "velarx-client"
+path = "src/velarx-client.rs"
+test = false
+
+[[test]]
+name = "version"
+path = "tests/version.rs"
+required-features = ["engine"]
+
+[dependencies]
+velarx = { path = "../..", default-features = false }
+velarx-base = { path = "../base" }
+velarx-wire = { path = "../wire" }
+velarx-sys = { path = "../sys" }
+velarx-core = { path = "../core", optional = true }
+velarx-runtime = { path = "../runtime", default-features = false, optional = true }
+velarx-content = { path = "../content", optional = true }
+anyhow.workspace = true
+
+[lints]
+workspace = true

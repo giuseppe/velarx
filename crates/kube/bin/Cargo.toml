@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-kube-bin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The binary velarx-kube: play, down, generate and apply of Kubernetes YAML"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+build = "../../base/build-support/bin.rs"
+
+# The command `velarx-kube`, run directly by the user like velarx-api and
+# velarx-cri: a frontend of the engine service, which knows nothing of it.
+# It confines itself before it does anything with what it read (Landlock
+# ABI 9, seccomp: see crates/kube/bin/src/confine.rs).
+[[bin]]
+name = "velarx-kube"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+velarx-kube = { path = ".." }
+velarx-base = { path = "../../base" }
+velarx-proto = { path = "../../proto" }
+velarx-sandbox = { path = "../../sandbox" }
+velarx-sys = { path = "../../sys" }
+velarx-registry = { path = "../../registry", default-features = false }
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "time", "macros", "signal", "io-util"] }
+rustix = { workspace = true, features = ["fs", "net", "process", "mount"] }
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,40 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# The podman parity report: velarx against podman, every surface.
+#
+#   tools/parity-report/run VELARX_BIN_DIR PODMAN_SRC OUT_DIR [IMAGE]
+#
+# VELARX_BIN_DIR holds velarx and velarx-monitor (a debug build is fine),
+# PODMAN_SRC a podman checkout of the installed podman's version (its
+# routes, man pages, vendor directory and Quadlet fixtures), OUT_DIR gets
+# one Markdown and one JSON file per surface.  With IMAGE (an OCI image
+# of a registry, pulled with --tls-verify=false) the --format fields are
+# compared too, on objects made in throwaway stores under OUT_DIR (velarx
+# with HOME and XDG_* there, podman with --root/--runroot and vfs): two
+# containers, a pod, a volume, a network and a secret, removed at the end.
+set -eu
+[ $# -ge 3 ] || { sed -n '4,15p' "$0"; exit 2; }
+bin=$(cd "$1" && pwd); src=$2; out=$3; image=${4:-}
+here=$(cd "$(dirname "$0")" && pwd); repo=$(cd "$here/../.." && pwd)
+mkdir -p "$out"
+py() { python3 -I "$@"; }
+py "$here/cli.py" "$bin/velarx" podman --src "$repo" --json "$out/cli.json" >"$out/cli.md"
+py "$here/api.py" "$repo" "$src" --json "$out/api.json" >"$out/api.md"
+py "$here/config.py" "$repo" "$src" --json "$out/config.json" >"$out/config.md"
+PODMAN_SRC=$src py "$here/quadlet.py" "$bin/velarx" --json "$out/quadlet.json" >"$out/quadlet.md" || true
+if [ -n "$image" ]; then
+    h=$out/home
+    mkdir -p "$h/run" && chmod 700 "$h/run"
+    podman="podman --root $h/pstore --runroot $h/prun --storage-driver vfs --tmpdir $h/ptmp"
+    xdg() { env HOME="$h" XDG_RUNTIME_DIR="$h/run" XDG_CONFIG_HOME="$h/.config" XDG_DATA_HOME="$h/.local/share" "$@"; }
+    xdg VELARX="$bin/velarx" PODMAN="$podman" \
+        python3 -I "$here/formats.py" "$src" "$image" --json "$out/formats.json" >"$out/formats.md" || true
+    for t in "$bin/velarx" "$podman"; do
+        xdg sh -c "$t rm -af -t0; $t pod rm -af; $t network rm -f n1; $t secret rm -a; $t system prune -af --volumes" >/dev/null 2>&1 || true
+    done
+    # the mounts of podman's rootless store are in the namespace of its pause process
+    xdg podman unshare sh -c "grep ' $h' /proc/self/mountinfo | cut -d' ' -f5 | sort -r | xargs -r -n1 umount -l; rm -rf '$h/pstore' '$h/prun' '$h/ptmp' '$h/.local'" 2>/dev/null || true
+    [ -f "$h/run/libpod/tmp/pause.pid" ] && kill "$(cat "$h/run/libpod/tmp/pause.pid")" 2>/dev/null || true
+    podman unshare rm -rf "$h" 2>/dev/null || rm -rf "$h" || true
+fi
+head -n 4 "$out/cli.md"

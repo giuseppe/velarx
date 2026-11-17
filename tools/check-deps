@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Fail when the engine links what only a fetcher needs: the engine and its
+# libraries fetch nothing themselves (every pull goes through a fetcher
+# binary: velarx-registry for registries, velarx-p2p for peers, velarx-dir for
+# a directory), so no HTTP client, TLS stack, QUIC or libp2p may be among their
+# normal dependencies; the light registry package (without its `net` feature),
+# the sandbox and the directory fetcher are held to the same, and so are the
+# monitor, the thin client (`velarx-bin --no-default-features`), the FUSE
+# image server and the storage library.
+#   tools/check-deps
+import os
+import subprocess
+import sys
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+PACKAGES = (
+    ("velarx-bin", []),
+    ("velarx-bin", ["--no-default-features"]),
+    ("velarx-core", []),
+    ("velarx-content", []),
+    ("velarx-runtime", []),
+    ("velarx-netkernel", []),
+    ("velarx-netdetach", []),
+    ("velarx-monitor-bin", []),
+    ("velarx-fuse", []),
+    ("velarx-storage", []),
+    ("velarx-registry", []),
+    ("velarx-sandbox", []),
+    ("velarx-dir", []),
+)
+FORBIDDEN = {
+    "reqwest",
+    "hyper",
+    "hyper-util",
+    "hyper-rustls",
+    "rustls",
+    "native-tls",
+    "h2",
+    "quinn",
+    "quinn-proto",
+    "libp2p",
+}
+
+# What the monitor of a container and the libraries it records and releases
+# with may not link either: the engine's services, the signature code, the
+# sandbox, the vfs driver and OpenSSL.
+MONITOR_PACKAGES = ("velarx-monitor-bin", "velarx-netkernel", "velarx-netdetach")
+MONITOR_FORBIDDEN = {
+    "openssl",
+    "openssl-sys",
+    "velarx-core",
+    "velarx-signature",
+    "velarx-sandbox",
+    "velarx-vfs",
+}
+
+bad = False
+for package, flags in PACKAGES:
+    shown = " ".join([package, *flags])
+    out = subprocess.run(
+        ["cargo", "tree", "-p", package, *flags, "-e", "normal", "--prefix", "none"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        print(f"check-deps: cargo tree -p {shown}: {out.stderr.strip()}")
+        sys.exit(1)
+    forbidden = FORBIDDEN | (MONITOR_FORBIDDEN if package in MONITOR_PACKAGES else set())
+    found = sorted(
+        {
+            line.split()[0]
+            for line in out.stdout.splitlines()
+            if line.split() and (line.split()[0] in forbidden or line.split()[0].startswith("libp2p-"))
+        }
+    )
+    if found:
+        bad = True
+        print(f"check-deps: {shown} depends on {', '.join(found)}")
+sys.exit(1 if bad else 0)

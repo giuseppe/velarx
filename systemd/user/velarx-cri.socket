@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Velarx CRI socket (Kubernetes container runtime interface)
+Documentation=man:velarx(1) man:velarx.conf(5)
+
+[Socket]
+# kubelet --container-runtime-endpoint unix://%t/velarx/cri.sock
+# A connection starts velarx-cri; it also serves the image service on it
+# (--image-service-endpoint is the same).  Only the user (and root) is served,
+# whatever the mode says (SO_PEERCRED).
+ListenStream=%t/velarx/cri.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

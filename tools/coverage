@@ -1,0 +1,115 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Line coverage of the fast test tier (make test) with cargo-llvm-cov: the
+# tests of the default members and of the REST API frontend, in instrumented
+# builds, reported as an lcov tracefile, HTML pages and a per-package
+# summary table (the baseline of the issue).
+#
+#   tools/coverage
+#
+# The report goes to COVERAGE_OUT (default $CARGO_TARGET_DIR/coverage, else
+# target/coverage): coverage.lcov, html/ (html/index.html) and summary.txt.
+# TESTARGS filters the tests, as for make test.  CARGO is the cargo command.
+#
+# The confined helpers the tests spawn (the build and the git worker, two
+# modes of the velarx binary) run without their environment in a read-only
+# mount namespace: an instrumented one cannot write its profile, and its
+# error text ends up in the answer the tests parse.  The tests read
+# VELARX_TEST_WORKER, so a plain (uninstrumented) velarx is built first and
+# handed to them; the code only such a helper runs is not counted.
+#
+# cargo-llvm-cov finds llvm-cov and llvm-profdata in the rustup sysroot
+# (the llvm-tools-preview component).  A compiler without one (Fedora's
+# rustc package) needs LLVM_COV and LLVM_PROFDATA of the compiler's LLVM
+# version in the environment (here: /usr/bin/llvm-cov-18 is too old for
+# rustc 1.99's LLVM 22; a matching pair has to be named explicitly).
+set -eu
+
+top=$(cd "$(dirname "$0")/.." && pwd)
+cd "$top"
+CARGO=${CARGO:-cargo}
+TESTARGS=${TESTARGS:-}
+covout=${COVERAGE_OUT:-${CARGO_TARGET_DIR:-target}/coverage}
+
+if ! command -v cargo-llvm-cov > /dev/null 2>&1; then
+    echo "tools/coverage: cargo-llvm-cov is not installed" >&2
+    echo "install it with: cargo install --locked cargo-llvm-cov" >&2
+    exit 2
+fi
+
+# The confined helpers of the tests run this plain velarx (see above); it
+# is built before anything is instrumented, so it stays out of the report.
+if [ -z "${VELARX_TEST_WORKER:-}" ]; then
+    ${CARGO} build -p velarx-bin --bin velarx
+    # (an absolute CARGO_TARGET_DIR is taken as it is)
+    case ${CARGO_TARGET_DIR:-target} in
+    /*) VELARX_TEST_WORKER=$CARGO_TARGET_DIR/debug/velarx ;;
+    *) VELARX_TEST_WORKER=$PWD/${CARGO_TARGET_DIR:-target}/debug/velarx ;;
+    esac
+    export VELARX_TEST_WORKER
+fi
+
+# The profiles of the two runs (the default members, then velarx-api) are
+# merged into one report: --no-report keeps them for it.  The integration
+# tests run the example dircache as a program (examples/dircache next to
+# their deps/), which cargo-llvm-cov's `cargo test --tests` does not build
+# (and `--examples` builds the examples as test harnesses only): it is built
+# here, instrumented, by a run without arguments (it prints its usage and
+# exits 2).  A failing test does not stop the runs
+# (--no-fail-fast) nor the report: the numbers cover what ran, the exit
+# status at the end still names the failure.
+status=0
+${CARGO} llvm-cov clean --profraw-only
+${CARGO} llvm-cov run --no-report --example dircache || true
+${CARGO} llvm-cov --no-report --no-fail-fast \
+    ${TESTARGS:+-- $TESTARGS} || status=$?
+${CARGO} llvm-cov --no-report --no-fail-fast -p velarx-api \
+    ${TESTARGS:+-- $TESTARGS} || status=$?
+
+mkdir -p "$covout"
+# (the whole tracefile, with the counts of every line: --summary-only would
+# keep only the totals of each file, which no lcov tool can show)
+${CARGO} llvm-cov report --workspace --lcov \
+    --output-path "$covout/coverage.lcov"
+${CARGO} llvm-cov report --workspace --html --output-dir "$covout"
+
+# The per-package table from the tracefile: a package is a directory of
+# crates/ (velarx-<dir>), the root package is velarx itself.  What is
+# outside the workspace (the dependencies) counts for the total only.
+awk -v root="$PWD" '
+    function num(f) { return 0 + substr(f, 4) }
+    /^SF:/ {
+        sf = substr($0, 4)
+        if (index(sf, root "/") == 1) {
+            rest = substr(sf, length(root) + 2)
+            if (rest ~ /^crates\//) {
+                sub(/^crates\//, "", rest)
+                cur = "velarx-" substr(rest, 1, index(rest, "/") - 1)
+            } else {
+                cur = "velarx"
+            }
+        } else {
+            cur = "(dependencies)"
+        }
+        next
+    }
+    /^LF:/ { lf[cur] += num($1); tlf += num($1); next }
+    /^LH:/ { lh[cur] += num($1); tlh += num($1); next }
+    END {
+        for (p in lf)
+            if (p != "(dependencies)" && lf[p] > 0)
+                printf "%-16s %6d/%-6d %6.2f%%\n", p, lh[p], lf[p], 100 * lh[p] / lf[p]
+        printf "%-16s %6d/%-6d %6.2f%%\n", "TOTAL", tlh, tlf, 100 * tlh / tlf
+    }
+' "$covout/coverage.lcov" > "$covout/summary.new"
+{ sed '$d' "$covout/summary.new" | sort; tail -n 1 "$covout/summary.new"; } | tee "$covout/summary.txt"
+rm -f "$covout/summary.new"
+
+echo
+echo "lcov: $covout/coverage.lcov"
+echo "html: $covout/html/index.html"
+
+if [ "$status" -ne 0 ]; then
+    echo "tools/coverage: a test run failed (status $status): the report is partial" >&2
+fi
+exit "$status"

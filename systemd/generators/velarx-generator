@@ -1,0 +1,35 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# velarx's Quadlet generator: podman's own generator, quadlet, with
+# PODMAN=velarx, so that the .container, .volume, .network, .pod, .build
+# and .image files of the Quadlet directories become units that run
+# velarx.  Installed as system-generators/velarx-system-generator and
+# user-generators/velarx-user-generator (the name says which).
+#
+# Both generators read the same files and would write the same units: this
+# one does nothing while podman's is active.  `velarx quadlet enable
+# [--user]` masks podman's (a link to /dev/null in /etc), `velarx quadlet
+# disable` unmasks it.
+#
+velarx=/usr/bin/velarx
+quadlet=/usr/libexec/podman/quadlet
+case "$0" in
+*user*) kind=user; mode=-user ;;
+*) kind=system; mode= ;;
+esac
+podman_generator=podman-$kind-generator
+
+# podman's generator is active if it is installed and not masked
+active=
+for d in /usr/lib /usr/local/lib; do
+    [ -e "$d/systemd/$kind-generators/$podman_generator" ] && active=yes
+done
+for d in /etc /run; do
+    if [ "$(readlink "$d/systemd/$kind-generators/$podman_generator" 2> /dev/null)" = /dev/null ]; then
+        active=
+    fi
+done
+[ -n "$active" ] && exit 0
+# no podman: no generator to run
+[ -x "$quadlet" ] || exit 0
+PODMAN=$velarx exec "$quadlet" $mode "$@"

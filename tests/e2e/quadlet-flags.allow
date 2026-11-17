@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# What tools/parity-report/quadlet.py allows: COMMAND... OPTION  # why
+# (COMMAND * for the whole command, no COMMAND for any command)
+
+# placeholders of podman's fixtures (PodmanArgs=, Exec=)
+--foo        # fixture placeholder
+--bar        # fixture placeholder
+--also       # fixture placeholder
+--with-key   # fixture placeholder
+--with-space # fixture placeholder
+--arg1       # fixture placeholder
+
+# podman's global options of GlobalArgs= that velarx refuses with a message
+(global) --conmon             # refused: the monitor is velarx-monitor
+(global) --identity           # refused: no ssh connections
+(global) --imagestore         # refused: a store of its own
+(global) --network-config-dir # refused: networks in the state directory
+(global) --network-cmd-path   # refused: pasta from PATH
+(global) --syslog             # refused: logs to the standard error
+(global) --volumepath         # refused: volumes in the root directory
+
+# image pull options refused with a message
+image pull --all-tags       # refused: pull the tags one by one
+image pull --decryption-key # refused: no encrypted images
+

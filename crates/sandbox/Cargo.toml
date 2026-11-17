@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-sandbox"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The confinement of velarx's helpers that parse what the network sends: user namespace, Landlock, seccomp"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Nothing but the confinement: the helpers that use it (the registry
+# fetcher's workers, the build worker, the peers) link no
+# more of velarx than this for it.
+
+[lib]
+name = "velarx_sandbox"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+velarx-sys = { path = "../sys", features = ["seccompiler", "landlock"] }
+velarx-base = { path = "../base" }
+velarx-storage = { path = "../storage" }
+landlock.workspace = true
+seccompiler.workspace = true
+rustix = { workspace = true, features = ["fs", "process", "thread", "net", "mount"] }
+libc.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

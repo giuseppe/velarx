@@ -1,0 +1,98 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.\" Hand-written (the program has no clap definitions): what the engine
+.\" starts it with, and what a service manager runs.
+.TH VELARX-REGISTRY 1 "" "velarx" "Velarx"
+.SH NAME
+velarx\-registry \- the registry fetcher of velarx
+.SH SYNOPSIS
+.B velarx\-registry
+.RB [ \-\-config
+.IR FILE " | " \-\-config\-fd
+.IR N ]
+.RB [ \-\-listen\-fd
+.IR N " | " \-\-varlink\-fd
+.IR N ]
+.RB [ \-\-staging\-fd
+.IR N ]
+.RB [ \-\-idle\-exit
+.IR SECS " | " \-\-shared
+.IR PATH ]
+.RB [ \-\-self\-test ]
+.br
+.B velarx\-registry pull\-worker
+.SH DESCRIPTION
+.B velarx\-registry
+is the process that talks to the registries for velarx.  It is installed
+next to
+.BR velarx (1),
+and the engine finds it there (or where
+.I registry_path
+of
+.BR velarx.conf (5)
+says) and starts it under the lock of its socket (no service manager runs
+it).
+It serves
+.B org.velarx.Fetcher
+(the pull of manifests, tables of contents and files, written into the
+staging directory of the store) and
+.B org.velarx.Pusher
+(the blobs and manifests of a push, placed at the repository of its scope) and
+.B org.velarx.Registry
+(login, tags and search), and holds the credentials
+only of the registries it is asked about.
+.PP
+A connection is given its scope once, by
+.B Open
+(a second one is refused, so is any other call before it), and
+.B Connect
+and
+.B Renew
+act on that scope only, for both interfaces alike: the credentials of a
+connection are never those of another client.
+.PP
+It confines itself before it serves anything (Landlock, seccomp, no
+capability but the one that reads) and refuses to run on a kernel that
+cannot enforce all of it.  The requests to the registries and the
+decompression are made by its confined workers,
+.BR "velarx\-registry pull\-worker" ,
+which it starts through a spawner process forked before the confinement:
+this is not a command for users.
+.SH OPTIONS
+.TP
+.BI \-\-config " FILE"
+The configuration file (default: the one of
+.BR velarx.conf (5)).
+.TP
+.BI \-\-config\-fd " N"
+The configuration as JSON in the descriptor
+.IR N ,
+given by the engine that started the process.
+.TP
+.BI \-\-listen\-fd " N"
+The listening socket, bound by the starter.
+.TP
+.BI \-\-varlink\-fd " N"
+The one connection to serve, which the engine of a command started the
+process for; it leaves when that connection is closed.
+.TP
+.BI \-\-staging\-fd " N"
+The staging directory of the store: the only place the process writes.
+.TP
+.BI \-\-idle\-exit " SECS"
+Leave when no connection was open for this long.
+.TP
+.BI \-\-shared " PATH"
+The socket is at
+.IR PATH :
+leave when the last connection is closed and take the socket away.
+.TP
+.B \-\-self\-test
+Confine the process, try from inside what the confinement allows and
+refuses and print the results as JSON; nothing is served.
+.TP
+.BR \-V ", " \-\-version
+Print the version and the commit of the build.
+.SH SEE ALSO
+.BR velarx (1),
+.BR velarx\-dir (1),
+.BR velarx.conf (5)

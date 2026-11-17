@@ -1,0 +1,299 @@
+# SPDX-License-Identifier: Apache-2.0
+# The settings of `velarx-p2p`, the service that is a member of a swarm of
+# nodes: a content source of the pulls (a fetcher, `org.velarx.Fetcher`, on
+# `p2p-fetcher.sock`), serving the store of the node to the peers through
+# the store service (`store.sock`, started with it when nothing serves it).
+#
+# The file is `p2p.toml` next to the configuration of the engine
+# (/etc/velarx/p2p.toml, ~/.config/velarx/p2p.toml), or the path of
+# `--p2p-config`.  The engine knows the service only as a source of its
+# configuration:
+#
+#   [[sources.external]]
+#   name = "peers"
+#   socket = "/run/velarx/services/p2p-fetcher.sock"
+#   peer = true
+#   idle_timeout_secs = 30
+#   [pull]
+#   sources = ["peers", "registry"]
+
+# Control socket of the service, the varlink interface `org.velarx.P2p` that
+# `velarx p2p status` calls (default: p2p.sock in the services directory of
+# the engine).  The sockets of the fetcher (p2p-fetcher.sock) and of the
+# overlay network (p2p-network.sock) are next to it.
+# socket = "/run/velarx/services/p2p.sock"
+# Listen addresses (multiaddr format).  The default is the loopback address, so
+# that starting the service opens nothing to the network until this is edited:
+# name the address the peers reach the node on (a LAN address), or 0.0.0.0 for
+# every interface.  One address keeps the QUIC endpoint there too.  The port
+# of the first TCP address is also the UDP port of the QUIC endpoint (see
+# `quic_port`): UDP and TCP must be reachable between the nodes.
+listen_addresses = ["/ip4/127.0.0.1/tcp/4001"]
+# Bootstrap peer addresses
+bootstrap_peers = []
+# The connections the node keeps up.  With fewer the bootstrap peers are dialed
+# again (a peer that is full refuses a node, one that is down comes back): the
+# first time after a second, then after twice as long each time, up to
+# `bootstrap_retry_max_secs`, each wait cut by up to half at random so that
+# nodes refused together do not return together.  0: the bootstrap peers are
+# dialed once, when the service starts.  A node with no more than this many
+# peers also asks a few of them which other peers they know, and connects to
+# some (at most 8 for an answer, only addresses the dial filter below allows):
+# a node that a full bootstrap peer refused joins through the peers it is told.
+min_peers = 4
+bootstrap_retry_max_secs = 60
+# Where the node may dial.  One filter is applied to every dial, TCP and QUIC
+# (the addresses of the DHT, the peers it is told of and mDNS).
+# Refused unless allowed: loopback, link-local, multicast, unspecified and
+# reserved addresses, and the addresses of the interfaces of the node itself.
+# Always refused: an address that is not an IP address and a TCP port (a name
+# such as /dns4/...; an address in an address; port 0).  Private ranges are
+# allowed (10/8, 172.16/12, 192.168/16, fd00::/8: clusters live there).  The
+# bootstrap peers named above are exempt.  What was refused is counted by reason
+# in `velarx p2p status` (lookups, dials_refused) and logged at debug level.
+# `dial_allow` lets networks through those refusals (a swarm of nodes on one
+# host needs 127.0.0.0/8).
+# dial_allow = ["127.0.0.0/8"]
+# Connections taken from the peers and made to them, at most.  With thousands
+# of nodes a bootstrap peer is full at `max_incoming`: it takes up to 16 more,
+# each for 3 seconds at most (one second after the newcomer was answered), in
+# which the newcomer asks it which peers it knows, and joins the swarm through
+# them.  The places are for newcomers (not for a peer that is a member already)
+# and shared: one address (an IPv6 /64) holds two at most, so that it takes
+# eight addresses to hold all of them.
+max_incoming = 100
+max_outgoing = 50
+# Seconds a connection that nothing uses is kept (a day): a connection is what
+# makes a peer a member of the node's tables, and it is not worth closing while
+# the peer answers.
+idle_timeout_secs = 86400
+# Find the other nodes of the swarm on the local network with mDNS (UDP 5353 on
+# all interfaces).  The default is off: name the peers in bootstrap_peers, or
+# set it to true on a trusted network.
+mdns = false
+# Private network (swarm) key.  REQUIRED unless the swarm has a certificate
+# authority (below): velarx-p2p does not start without one, so that strangers
+# on the network (or the LAN, where nodes find each other with mDNS when it is
+# on) cannot join.  It can also be given in the environment
+# variable VELARX_P2P_SWARM_KEY.  The file must be readable by its owner
+# only (mode 0600).  Generate it once and copy it to every node:
+#   velarx-p2p generate-key /etc/velarx/swarm.key
+private_key_path = "/etc/velarx/swarm.key"
+# A certificate authority instead of one key shared by every node (the swarm
+# key above is then optional).  The operator makes the authority once, on a
+# machine of their own that no node needs to reach, and signs each node:
+#   velarx-p2p ca init /secure/swarm-ca            (ca.key stays there)
+#   velarx-p2p ca request > node.request           (on each node)
+#   velarx-p2p ca sign --ca /secure/swarm-ca --name rack1-a --zone zone-1 \
+#       --role both --days 30 node.request > node.crt
+# `ca_path` is the PEM file with the certificate(s) of the authority (several
+# authorities are trusted at once, which is how an authority is replaced) and
+# `certificate_path` the certificate of this node; both are set or neither.
+# The peers are then admitted by their certificates, in the QUIC handshake and
+# when a libp2p connection is made, with no fallback to the swarm key; a
+# certificate is for the key of `identity_path`.  Both files are read again
+# when they change (the service may read their directories), so a renewed
+# certificate needs no restart: sign again before it ends.  See docs/THREAT-MODEL.md.
+# ca_path = "/etc/velarx/ca.crt"
+# certificate_path = "/etc/velarx/node.crt"
+# The revocation lists of the authority (`ca revoke`: every peer revoked so
+# far, signed), read again when the file changes and passed to the peers a node
+# connects to; a revoked peer is disconnected at the next sweep.  A file that
+# is set and not valid stops the start.
+# revocation_path = "/etc/velarx/revoked"
+# No peer is admitted when the file was not read for this many seconds (a
+# file that is not valid does not count as read; 0: not checked)
+revocation_max_age_secs = 0
+# Only peers with certificates of these names, or these peer ids, are
+# admitted (both empty: every certificate of the authority; the node itself
+# need not be listed)
+allow_names = []
+allow_peers = []
+# Seconds between two readings of these files and two judgements of the peers
+# admitted
+ca_sweep_secs = 10
+# The identity of the node (its libp2p key pair, so its peer id), made at the
+# first start and read at every other, so that the node is the same peer after
+# a restart: what the peers keep of it by peer id then applies to it again, and the overlay subnet it takes (a hash of the peer id) is
+# the same.  Mode 0600, owned by the user of the service, never logged.  To get
+# a new identity stop the service and remove the file.  It is no credential
+# unless the swarm has a certificate authority (docs/THREAT-MODEL.md).  By default
+# `p2p/identity.key` in the root directory of the engine; a relative path is
+# relative to this file.
+# identity_path = "/var/lib/velarx/p2p/identity.key"
+# Chunks, files, layer indexes, startup profiles and the question whether a
+# peer has a chunk travel between peers over QUIC (UDP) and over nothing else:
+# libp2p (TCP) carries the membership, the discovery and the announcements,
+# never data.  Both ends prove the swarm key (or present a certificate of the
+# authority) on each connection.  A peer that cannot be reached over UDP (a firewall, a
+# NAT with no port forwarded, no endpoint advertised) is still a member and is
+# not asked for data: the pull goes on to the next peer and then to the next
+# source; `velarx p2p status` and `velarx p2p peers` say which peers have no
+# QUIC path and why.
+#
+# The UDP port of that endpoint, which the firewall must let through between
+# the nodes (0: any port, only for tests).  By default it is the port of the
+# first TCP address of `listen_addresses` (4001: UDP 4001 and TCP 4001).
+# quic_port = 4001
+# The QUIC streams a request for chunks to one peer is spread over, which the
+# peer answers at the same time (1 to 8)
+quic_streams = 4
+# Chunks are asked of the peer that served the layer before, quickest first
+# (the peers of this node's zone, the `--zone` of the certificates, before
+# the others, and of equals the one this node asks the least at the moment),
+# and the peers that had none of a layer are not asked for it for a minute.
+# When the peer asked has not answered after a while a second peer is asked
+# too: the first answer that checks out against its digest is used and the
+# other request is dropped.  The wait is `hedge_ms`, or with 0 three times
+# the time that peer usually takes (between 50 ms and 2 s).  A group that
+# waited five seconds while the peers give this node less than a quarter of
+# the most they gave it is left to the next source (the registry).
+hedge = true
+hedge_ms = 0
+# A big group of chunks (4 MiB or more, a big file read lazily or a pull) is
+# spread over this many of the connected peers that served or announced the
+# layer: each peer takes the next 2 MiB of the group when it is done with its
+# last (two at a time), a part that a peer is late with (three times what
+# the quickest of them takes, or `hedge_ms`) is asked of another too, as
+# long as the bytes asked twice for nothing stay within an eighth of the
+# bytes asked (or one part), and what a peer does not have goes to the
+# others.  0 or 1: one peer at a time.
+stripe_peers = 3
+# What the node tells the other nodes of the swarm about what it has.
+#
+# THE FILTER OF THE LAYERS.  The node tells each peer a Bloom filter of the
+# layers it holds and may give (the layers of pulls without credentials or
+# from `share_registries`, complete and proven, and the layers a pull of the
+# node is staging, from their first file: the files staged and checked so
+# far are given while the pull goes on): a few KiB, sent when the
+# peer connects and then as small updates, at most one every
+# `filter_interval_secs`, so that a pull asks the peers whose filter says
+# "maybe" for the layer and none of the others (a filter that says "maybe"
+# to a layer the node does not hold costs one request that is answered no).
+# The filter is not a list: a peer cannot get the layers out of it, only
+# test whether the node holds a layer whose digest it already knows, which a
+# question for one digest allows too.  Any member of the swarm can do that
+# (one swarm is one trust domain), without the limits of the questions.
+# `false`: the node tells no filter, and the peers ask it one digest at a
+# time.  Filters of the peers are used whatever this says.
+advertise_layers = true
+# The rate at which the filter says "maybe" to a layer the node does not
+# hold (0.0001 to 0.1), and what it costs: about 9.6 bits a layer at 0.01,
+# 14.4 at 0.001, 4.8 at 0.1.  The filter is sized for the next power of two
+# of layers (at least 256), so it is not made again for each layer: 5000
+# layers take 9.6 KiB at 0.01 (sized for 8192), 14.4 KiB at 0.001, 4.8 KiB at
+# 0.1.
+filter_fpr = 0.01
+# The largest filter the node sends, in KiB (1 to 4096): a node that holds more
+# layers than 256 KiB takes at 1% (about 210000) says "maybe" more often: 4%
+# at 300000 layers; past about 500000 its peers take it for no information and
+# ask it one digest at a time.  A node that keeps 150 peers (`max_incoming`
+# and `max_outgoing`) with 5000 layers each holds about 1.4 MiB of filters;
+# 1000 peers about 9.4 MiB, 10000 about 94 MiB.
+filter_max_kib = 256
+# The least time between two updates of the filter sent to the peers, in
+# seconds (1 to 3600): the layers that complete meanwhile go in one update
+# (8 bytes a layer, or the filter when that is smaller).  A peer that pulls a
+# layer that completed in the last seconds does not see it yet.  Every peer is also sent the
+# whole filter about every 10 minutes (at a random time between 8 and 12),
+# and at once after an update that could not be delivered to it.
+filter_interval_secs = 2
+#
+# THE LIST OF THE IMAGES.  By default NOTHING of the kind: the node refuses
+# the question for its images, there is no search by prefix and no "what do
+# you have".
+#
+# `true`: the node announces its images (ids, digests, tags, the layers of
+# each) to the swarm and answers the question for the list of its images, and
+# publishes each layer it holds in the DHT (what a peer far away that is
+# connected to nobody that holds the layer finds it by).  EVERY peer of the
+# swarm, and anyone who has the swarm key, can then list what the node has.
+# The names of the images are told only when `[pull] share_image_names` of
+# the engine is set too (default: not).
+announce_images = false
+# The connected peers asked at once ("do you have this chunk?"; the answer is
+# yes or no, the chunk is not sent) when no peer is known to have the chunk of
+# a pull, for 2 seconds at most.  The ones that say yes are asked for the
+# chunks first, the ones that say no are not asked for a minute.  0: the
+# chunks are asked of the first peers, without the question (1 to 64).
+query_peers = 8
+# The largest file the service writes, in MiB: the chunks of one request (at
+# most 256).  A source that keeps the descriptor of the file of a call and
+# writes to it later cannot make it larger than this (and the engine empties
+# it when it is next used); a request that needs more is served by the next
+# source.
+max_incoming_mib = 256
+
+[serving]
+# What the node serves to the peers over QUIC, at most.
+#
+# Requests answered at the same time, for all peers
+quic_slots = 64
+# QUIC connections open
+quic_connections = 256
+# The window of a QUIC connection, in MiB (1 to 1024): what the node sends a
+# peer and has no acknowledgement of yet, at most, and what a peer may send it
+# on one stream that it has not read yet (four times that on a connection).  A
+# connection moves at most a window a round trip: 8 MiB is 67 Gbit/s at 1 ms,
+# 6.7 Gbit/s at 10 ms (a pull asks up to three peers at once).  Raise it for
+# fast paths with long round trips (10 Gbit/s at 20 ms needs 24); each of the
+# `quic_connections` may hold this much of the node's memory for a peer that
+# acknowledges nothing.
+quic_window_mib = 8
+# What the node uploads to the peers in all (Mbit/s); 0: no limit.  Chunks
+# are sent no faster.  The credit is
+# given before the files are read, to the addresses that ask in turn (an
+# address with many requests, or large ones, gets no more bytes than one with
+# one small request), so a node that is asked for more than it may send reads
+# no more than it may send and holds no more than a piece of an answer for
+# each request it serves.  A request whose first credit does not come in time
+# is answered busy (ask again).  Answers without data (busy, absent, a probe)
+# are never delayed.
+upload_limit_mbit = 0
+
+[overlay]
+# The overlay network of the containers: their IP packets for another node
+# travel over libp2p streams.  It is a process of its own, `velarx-p2p
+# overlay` (the unit velarx-p2p-overlay.service), and a node of a swarm of its
+# own: the swarm key or the authority of the settings above, but its own
+# identity, port and DHT, and none of the content (the containers' packets
+# do not compete with the layers, nor the other way).  It is a network
+# provider (`org.velarx.Network`) on `p2p-network.sock`; the engine's
+# configuration names it, and a container uses it with `--network
+# provider:overlay`:
+#   [[network.providers]]
+#   name = "overlay"
+#   socket = "/run/velarx/services/p2p-network.sock"
+# Where the overlay node listens (loopback by default, as above) and the
+# overlay addresses of the nodes it joins (the port of this node, 4002, as
+# they are named): the swarm of the overlay is not the one of the content.
+listen_addresses = ["/ip4/127.0.0.1/tcp/4002"]
+# bootstrap_peers = ["/ip4/192.0.2.7/tcp/4002/p2p/12D3KooW..."]
+# The identity of the overlay node (its peer id, and the subnet it takes):
+# `p2p/overlay-identity.key` in the root directory of the engine by default.
+# With an authority (`ca_path`) it has a certificate of its own: `velarx-p2p
+# ca request --identity` this file, `ca sign` it, and name it here.
+# identity_path = "/var/lib/velarx/p2p/overlay-identity.key"
+# certificate_path = "/etc/velarx/overlay.crt"
+# Each node takes a /24 of this range: a network of /8 to /16 (a /10 has
+# 16384 subnets, a /16 has 256).
+cidr = "10.192.0.0/10"
+# The /24 of a node is one of 16 that a hash of its peer id gives, numbered
+# from 0 (a peer cannot choose another one).  When two nodes get the same
+# subnet, nobody routes to either of them (a member cannot take the subnet of
+# another): the log of every node says so (an error naming the peers), and
+# one of the two sets this to another number (1 to 15) and restarts, or
+# leaves.
+# subnet_attempt = 0
+# The name servers that the names that are not containers are asked of, in
+# order (an address, with a port or without: 53).  Not set: the name servers
+# of the host's /etc/resolv.conf, as glibc reads them (the first three; none:
+# 127.0.0.1).
+# dns_upstreams = ["192.0.2.53"]
+# The node's address (the containers' name server) is no address of the host:
+# rules of this priority send the packets to its port 53 to a routing table
+# where it is local.  Change them when the host already uses them (the
+# defaults are the table 53053 and the priority 5353; the priority is 1 to
+# 32765).
+# dns_table = 53053
+# dns_rule_priority = 5353

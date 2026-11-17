@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The types the layers of the engine share: errors, image references, OCI documents, digests"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# What the registry client, the fetcher, the pull code and the services all
+# name, without the code that changes often: with these types here the
+# lower layers do not depend on the services.
+
+[lib]
+name = "velarx_types"
+path = "src/lib.rs"
+doctest = false
+
+[features]
+# SQLite on by default: the engine's crates use it.  The thin client reaches
+# this crate through velarx-config without it, so that it does not link
+# SQLite for an error variant and the conversions to SQL values.
+default = ["sqlite"]
+# `ImageError::Http` from the errors of the HTTP client (with the TLS
+# failure that its causes carry): only the processes that make requests,
+# the fetchers, enable it, so that the engine links no HTTP client and no
+# TLS stack.
+http = ["dep:reqwest", "dep:native-tls"]
+# `DbError::Sqlite` and the conversions of `Digest` and `LayerKey` to and
+# from SQL values
+sqlite = ["dep:rusqlite", "dep:tokio-rusqlite"]
+
+[dependencies]
+velarx-base = { path = "../base" }
+velarx-proto = { path = "../proto", default-features = false }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+reqwest = { workspace = true, optional = true }
+native-tls = { version = "0.2", optional = true }
+tokio-rusqlite = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

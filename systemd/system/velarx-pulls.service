@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# Resume at boot the lazy pulls in progress: a pull always completes, and the
+# engine service of the store completes it again when any command of the
+# store starts it; this one runs `velarx image pulls`, which starts the
+# service and has it complete every pull in progress.  For the system
+# manager and for users' managers (rootless: with lingering, `loginctl
+# enable-linger`, to run at boot).
+[Unit]
+Description=Velarx: resume the lazy pulls in progress at boot
+Documentation=man:velarx(1)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/bin/velarx image pulls -q
+# (the engine service it starts outlives the command, in the cgroup of the unit)
+KillMode=process
+
+[Install]
+WantedBy=default.target

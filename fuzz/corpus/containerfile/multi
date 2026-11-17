@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1
+ARG BASE=alpine
+FROM $BASE AS build
+ENV A=1 B="two words"
+RUN --mount=type=cache,target=/c set -e; \
+    echo hi > /x
+COPY --from=build --chown=1:1 /x /y
+FROM scratch
+COPY --from=build /x /
+LABEL a=b "c d"=e
+HEALTHCHECK --interval=5s CMD ["true"]
+ENTRYPOINT ["/x"]
+CMD ["a", "b"]
+ONBUILD RUN true

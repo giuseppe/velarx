@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# The pinned versions of the compose tools of tests/e2e/bats/api/compose.bats
+# and the sha256 of their release files.  NAME=VALUE lines only.
+DOCKER_COMPOSE_VERSION=v2.40.3
+DOCKER_COMPOSE_SHA256_X86_64=dba9d98e1ba5bfe11d88c99b9bd32fc4a0624a30fafe68eea34d61a3e42fd372
+DOCKER_COMPOSE_SHA256_AARCH64=d26373b19e89160546d15407516cc59f453030d9bc5b43ba7faf16f7b4980137
+# podman-compose and python-dotenv, its dependency other than PyYAML: the
+# wheels of PyPI (pure Python), run from the files with the PyYAML of the
+# system (python3-pyyaml, python3-yaml)
+PODMAN_COMPOSE_VERSION=1.6.0
+PODMAN_COMPOSE_URL=https://files.pythonhosted.org/packages/93/31/b38c2656bad6265168902793c60145b172788a79e4b15de212af9bd78728/podman_compose-1.6.0-py3-none-any.whl
+PODMAN_COMPOSE_SHA256=98e48af25d44c10ecef948163bfcca002e32aa8bbb7e66593fbd4faff7270c30
+PYTHON_DOTENV_VERSION=1.2.4
+PYTHON_DOTENV_URL=https://files.pythonhosted.org/packages/60/d1/38f3a3405989a89ac18390803e70c6ad7c7760da4f9b83cbeca0c44a0c72/python_dotenv-1.2.4-py3-none-any.whl
+PYTHON_DOTENV_SHA256=42269a8a5b3fd54ffa6f3d84b18abed50064717576b4ecf03dc4a55d8aa04fdc

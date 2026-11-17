@@ -1,0 +1,581 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The interface org.velarx.Storage: a storage driver that is a program of its
+# own, asked by the engine for the content of its images and the root file
+# systems of its containers.  The driver owns where the bytes live and how a
+# root is made of them; the engine owns the network, the table of contents and
+# tar-split of each layer, the identities (diff ids, EROFS digests, owners) and
+# the reachability of everything.  The pull is driven by the driver through
+# org.velarx.StorageFeed (BeginPull).  Generated from the Rust types
+# (crates/storage-client/src/proto.rs and interface.rs) by the test
+# `interface::tests::the_interface_file_is_current`:
+# VELARX_WRITE_INTERFACES=1 cargo test -p velarx-storage-client --lib interface
+# writes it.  docs/STORAGE.md maps it to the StorageDriver trait.
+#
+# Versions: the engine calls GetInfo first on each connection and refuses a
+# `proto` other than its own (1); there is no negotiation and no
+# compatibility.  A change of a shape is a new version, so what is announced for
+# later is a capability (`later` in GetInfo), not a new shape.  Unknown fields
+# are ignored.  A value of an enum the engine does not know, in a reply, is a
+# Storage error that names it, not a protocol error; the engine asks only for
+# what it can take (it asks `idmap_mount: true` only when it can handle `mount`).
+# What the engine learns to do within a version is an optional field of
+# `capabilities` (absent: false), `objects` so far (HasObjects, and the `copy`
+# events of the feed): the engine asks and sends only what the driver
+# announces, and a driver that announces what an older engine does not know is
+# asked nothing of it.
+#
+# One connection for each call, from the engine's user or root; the engine
+# talks only to a driver served by its own user or root (SO_PEERCRED).  A
+# connection with no reply for `[storage.varlink] timeout_secs`, a connect not
+# accepted and a request not read within it, are failed (TimedOut).  A call
+# that can take longer (CreateRoot, CreateImageVolume, BeginPull, Collect,
+# Repair, Check) is made with `more`, and the driver sends a `progress` reply at
+# least every timeout_secs / 2; every reply starts the deadline again.
+#
+# Limits (GetInfo `limits`, applied by the engine, which splits a request that
+# would exceed one and never sends it): a message is at most 1048576 bytes of JSON and
+# carries at most 16 descriptors; a Fetch asks for at most 4096 objects, a ReadObjects
+# for at most 4096 ranges (the ranges are answered in the order asked, across calls).
+# What can be longer than a message does not travel in one: the keep set of
+# Collect is a sealed memory file of JSON lines, and its length is the argument.
+#
+# Descriptors are named, not counted: a reply that carries descriptors says for
+# each which one it is by its position in the reply (Mounted.fd).  A position used
+# twice, outside the reply, or a descriptor no mount names, is a refused reply.
+# The driver makes a new mount for each reply and closes every copy of it after
+# sending it; the monitor attaches a clone of it.
+#
+# Every call but GetInfo and ListStores takes the `store`, the id of the store the
+# engine keeps in a file of its graph root (32 hex digits); a driver isolates
+# stores by the pair (uid of the peer, store).
+#
+# Roots: a `directory` root is made beneath the `workdir` of CreateRoot (the
+# work directory of the store, the engine's) and named relative to it; any
+# other path is refused, and the monitor resolves it beneath that base without
+# following a link.  Every other root is a `mount_fd`.
+#
+# Errors: Missing and Corrupt carry a `remedy` (pull_again, repair,
+# recreate_container); Unsupported, NotFound, Busy, Unavailable and Failed carry a
+# reason.  An error name the engine does not know is a Storage error that carries
+# the name in its message.  The engine makes Unavailable (connect refused, the
+# socket gone: start the storage service), TimedOut and ProtocolMismatch (both
+# versions named: upgrade the driver or velarx) of a transport that failed; a driver
+# whose own backend does not answer sends Unavailable.  Contradicted,
+# DigestEnforced and Refused are verdicts of the engine, and a driver never sends
+# them.
+#
+# Lazy images: the driver sees none.  An image pulled with --lazy is staged and
+# run by the engine from its own files (the table of contents of each layer is
+# the engine's), and when its files are all there the engine pulls its layers
+# into the driver as an eager pull does (BeginPull, Index, Fetch, the read-back
+# of ReadObjects, Commit).  An image with a layer that cannot be served that way
+# is refused by the engine before anything is staged.  `capabilities.lazy` is
+# the engine's word for itself, not a driver's; what a driver says is ignored.
+#
+# Idempotence: CreateRoot, CreateImageVolume, RemoveRoot, RemoveImage, Repair,
+# Collect, Commit, Abort and DropStore can be called again with the same arguments
+# and give the same state.  Mounts is asked at every start and MountImage at every
+# read of an image, and both give new descriptors each time.  The engine does
+# not call Collect while a create, a removal or a pull of the same store is
+# between its first call and the record of its result.
+
+interface org.velarx.Storage
+
+# A layer as the engine names it to the driver: the key the driver stores it
+# under, the diff id of its image's configuration, and its OCI chain id
+# (computed by the engine; a driver whose layers are not chained ignores it).
+type LayerRef (
+	# `sha256:HEX` (a layer pulled whole) or `toc:sha256:HEX` (through its
+	# table of contents); `sha512:` in place of `sha256:` for an image of
+	# that algorithm
+	key: string,
+	# The diff id of the layer, `sha256:HEX` or `sha512:HEX`
+	diff_id: string,
+	# The OCI ChainID of the layer as the top of its stack
+	chain_id: string
+)
+
+# A layer of the image a pull is for: all of the image's layers, in order.
+type PullLayer (
+	key: string,
+	diff_id: string,
+	chain_id: string,
+	# The chain id of the layer below it, none for the first
+	parent: ?string,
+	# The driver has the layer (`HasLayers` said so for this place of the
+	# stack): it is in the list so that every layer knows its parent, and
+	# nothing of it is fetched
+	stored: bool
+)
+
+# A range of the bytes of one stored object.
+type Range (
+	# The key of the object, as the table of contents of a layer names it
+	# (its fs-verity digest)
+	key: string,
+	# The first byte
+	offset: int,
+	# How many bytes: the object must have them all
+	length: int
+)
+
+# A range of ids: the ids from `container_id` of the container are those
+# from `host_id` on the host.
+type IdMap (container_id: int, host_id: int, size: int)
+
+# The user namespace of the container.
+type Mapping (
+	uid: []IdMap,
+	gid: []IdMap,
+	# An owner no range maps is shown as the root of the container (else
+	# the image does not start)
+	squash: bool
+)
+
+# The uid and gid, as the host sees them, of the root of the container's
+# user namespace.
+type Owner (uid: int, gid: int)
+
+# The fs-verity digests the engine accepts for the image of one layer.
+type Accepted (digests: []string)
+
+# What the engine asks of a mount, the same for a root and for an image
+# mounted in the container.
+type MountAsk (
+	# The user namespace of the container, none: the ids of the engine
+	mapping: ?Mapping,
+	# The monitor can put the mapping on the mount (the engine is root of
+	# the initial user namespace): the driver may answer `idmap: mount`.
+	# False: it never does
+	idmap_mount: bool,
+	# The SELinux context of the mount of the container
+	label: ?string,
+	# The digests the engine accepts for the image of each layer, in order
+	# (the digests are enforced): a driver that cannot check them answers
+	# `Unsupported`
+	verity: ?[]Accepted
+)
+
+# An image mount of the container: its index among the `--mount
+# type=image` of the container, counted from 0, and what is asked of it.
+type VolumeAsk (index: int, ask: MountAsk)
+
+# What a mount is.
+type MountKind (
+	# A directory that the driver made for the container beneath the work
+	# directory of the store: `path`.  A root only
+	directory,
+	# A detached mount (`open_tree(OPEN_TREE_CLONE)` or `fsmount`), one
+	# mount, its root: the descriptor `fd` of the reply
+	mount_fd
+)
+
+# Who put the container's id mapping on the mount.
+type Idmap (
+	# No mapping was asked
+	none,
+	# The driver delivers the container's ids itself (the copy was made
+	# with them, a server translates them, its lowers are idmapped)
+	applied,
+	# The mount carries the ids of the image, and the monitor puts the
+	# mapping on the clone it attaches; only when `idmap_mount` was asked
+	mount
+)
+
+# Whether the SELinux label that was asked is on the mount.
+type Label (
+	# The driver did nothing about it (or none was asked): the engine
+	# labels the files of a root, and refuses an image mount, when one was
+	# asked
+	none,
+	# The mount carries it as its `context=`
+	mount_context,
+	# The driver labelled the files as it made them
+	files
+)
+
+# What a mount is, as the driver says it.
+type Mounted (
+	kind: MountKind,
+	# With `mount_fd` in the reply of `Mounts`: the position of the
+	# descriptor among those of the reply.  Every mount that has one says
+	# which it is; a position used twice, outside the reply, or a
+	# descriptor no mount names, is a refused reply.  Never with a
+	# `CreateRoot` or `CreateImageVolume`, which hand over none
+	fd: ?int,
+	# With `directory`: the path of the directory relative to the `workdir`
+	# of `CreateRoot` (plain names: no `/` first, no `.`, `..` or empty
+	# one).  The work directory is the base the monitor checks and opens
+	# without following a link, and the directory is resolved beneath it:
+	# a root is never anywhere else on the host
+	path: ?string,
+	idmap: Idmap,
+	label: Label
+)
+
+# How a container with a user namespace gets the layers owned by its ids.
+type IdmapWay (
+	# One mount whose files carry the ids of the image, the monitor puts
+	# the mapping on the clone it attaches (needs root of the initial user
+	# namespace)
+	monitor_mount,
+	# The driver idmaps its own mounts
+	driver_mount,
+	# The ids are translated as the files are copied for the container
+	at_copy,
+	# A file system server translates them
+	translate
+)
+
+# What a driver does for one purpose of a mount.
+type MountCaps (
+	# How user namespaces are supported, in the order the driver prefers;
+	# empty: a mapping is not supported
+	idmap: []IdmapWay
+)
+
+# The mounts a driver makes: how the root of a container and the images
+# mounted in it get their owners.
+type MountWays (
+	# The root file system of a container
+	root: MountCaps,
+	# The images mounted in a container; none: no image mounts
+	volume: ?MountCaps
+)
+
+# What a long call tells while it goes.
+type Progress (
+	# What the driver is at, for the person who waits
+	message: ?string,
+	done: ?int,
+	total: ?int
+)
+
+# What a reply of `BeginPull` is.
+type PullEventKind (
+	# The pull goes on (`continues`); sent at least every `timeout_secs / 2`,
+	# also while the driver's own calls to the feed run
+	progress,
+	# Every object the driver needs is staged: the last reply
+	staged
+)
+
+# What a check found wrong with what a driver made of an image.
+type ProblemKind (artifact_missing, artifact_unreadable, artifact_writable, artifact_id_mismatch, artifact_differs, artifact_seal_mismatch, annotation_missing, annotation_mismatch, identity_missing, toc_missing, toc_differs, object_missing, object_differs)
+
+# A problem a check found.
+type Problem (
+	kind: ProblemKind,
+	message: string,
+	# The layer it is about
+	layer: ?string,
+	# The file it is about, when the driver has one to name
+	path: ?string,
+	# Making the artifacts again mends it
+	repair: bool
+)
+
+# What a driver made of a layer, for the engine to record.
+type Artifact (
+	# The layer
+	key: string,
+	# The digest the driver's image of the layer has (composefs: the
+	# fs-verity digest of its EROFS image); the engine records it as the
+	# identity of what the driver made
+	image_digest: string,
+	owners: Owners
+)
+
+# The users and groups that own the files of a layer.
+type Owners (uids: []int, gids: []int)
+
+# A name and a value the driver reports of itself.
+type Pair (name: string, value: string)
+
+# A store the driver holds.
+type StoreEntry (
+	# The id of the store: 32 hex digits
+	store: string,
+	# What it takes on the driver's disk
+	bytes: int,
+	# When an engine last opened it (seconds since the epoch), none if the
+	# driver does not know
+	last_open: ?int
+)
+
+# What mends an artifact that is missing or wrong.
+type Remedy (
+	# The image is pulled again
+	pull_again,
+	# The artifacts are made again from what the driver keeps (`Repair`)
+	repair,
+	# The container is removed and created again: what it wrote in its
+	# writable layer is lost with it
+	recreate_container
+)
+
+# Who the driver is and what it does.  The first call of every
+# connection: the engine refuses a `proto` other than its own.
+method GetInfo() -> (
+	# What the driver calls itself, for the logs and the messages
+	name: string,
+	# The version of the driver (its package's)
+	version: string,
+	# The version of the protocol: the engine refuses another one
+	proto: int,
+	# Words; a client ignores those it does not know
+	capabilities: []string,
+	# Named limits; a client ignores those it does not know
+	limits: [string]int,
+	mounts: MountWays
+)
+
+# Which of `layers` the driver has: one answer for each, in the order
+# asked (at most `max_layers` of the capabilities), true for a layer
+# that is committed and complete.  A layer that is only staged, or
+# committed with another diff id, is not reported.  A chained driver
+# answers for the place of each layer in its stack.
+method HasLayers(store: string, layers: []LayerRef) -> (
+	# One for each layer asked, in the order asked (the same layer at two
+	# places of a stack is two questions): true for a layer that is
+	# committed and complete
+	have: []bool
+)
+
+# Which of `objects` the driver holds: one answer for each, in the
+# order asked (at most `limits.wants` of them), true for an object
+# it has committed and can read now, under that key or by an alias
+# of it (the hash of its content, for an object it names by its
+# fs-verity digest).  An object that is only staged by a pull, or
+# that a collection removed, is not held.  Answered from the driver's
+# own store.  Asked only of a driver that says `objects` in its
+# capabilities; the engine names a held object as the source of a
+# `copy` event of a `Fetch`.
+method HasObjects(store: string, objects: []string) -> (
+	# One for each object asked, in the order asked: true for an object the
+	# driver has committed and can read now
+	have: []bool
+)
+
+# The pull of the layers of an image, driven by the driver.  `layers`
+# is the whole ordered list of the image, those `stored` included.
+# The call carries the descriptor 0: the driver's end of a socket
+# pair on which the engine serves `org.velarx.StorageFeed` for this
+# pull only.  Called with `more`, it lives as long as the pull: the
+# driver replies `progress` at least every `timeout_secs / 2`, also
+# while its own calls to the feed run, and `staged` once every object
+# it needs is staged (the engine keeps the feed open after it until it
+# has committed or aborted the pull: org.velarx.StorageFeed, "The
+# end").  Closing the connection cancels the pull.  The
+# `pull` is a random id the engine made for this attempt (32 hex
+# digits): a call with the id of a pull the driver has resumes it, an
+# id it does not know is a new pull, and the engine reuses an id only
+# to resume its own.
+method BeginPull(store: string, pull: string, layers: []PullLayer) -> (kind: PullEventKind, progress: ?Progress)
+
+# The bytes of objects, committed or staged by `pull`, in pipe form.
+# The call carries the descriptor 0: the write end of a pipe.  Called
+# with `more`: one reply for each range, in the order asked, and the
+# reply for range `i` is sent **before** the `length` bytes of its
+# range are written to the pipe (a range larger than the pipe buffer
+# would block the driver, and the engine too, were the bytes first).
+# At most `limits.ranges` ranges.  A key that is no object's name is
+# `Missing` with the remedy `pull_again`; an object with fewer bytes
+# than a range wants is `Corrupt`.  The engine checks what it needs
+# of the bytes: a driver is trusted to store, not to be right.
+method ReadObjects(store: string, pull: ?string, ranges: []Range) -> (
+	# The index of the range among those asked: in the order asked
+	index: int,
+	# How many bytes the object has (a driver that tells it lets the engine
+	# see an object longer than its index)
+	size: ?int
+)
+
+# Publish the layers of the pull and their objects, all or nothing,
+# with one barrier.  Idempotent: succeeds when each layer is
+# committed by this pull or already committed, by anyone, with the
+# same diff id; `Busy` with another.
+method Commit(store: string, pull: string, layers: []LayerRef) -> ()
+
+# End the pull: drop only what no other live pull and no committed
+# layer uses.  Idempotent.
+method Abort(store: string, pull: string) -> ()
+
+# Make what the driver keeps for the root of a container, and say what
+# the root will be: the reply has the kind of the mount, the mapping
+# and the label it will have, and **no descriptor** (none without an
+# image, `--rootfs`).  Every later `Mounts` answers the same kind,
+# `idmap` and `label`.  `workdir` is the work directory of the store,
+# a directory of the engine's user closed to others: a `directory`
+# root is made beneath it and named relative to it, and a driver
+# that answers `mount_fd` may ignore it.  Idempotent.  Called with `more`: a call that
+# costs O(image) for a driver that copies sends `progress` at least
+# every `timeout_secs / 2`.  `Busy` for a second `CreateRoot` of one
+# container that runs.
+method CreateRoot(store: string, container: string, workdir: string, image: ?string, layers: []LayerRef, owner: ?Owner, ask: MountAsk, size_limit: ?int) -> (
+	progress: ?Progress,
+	# In the last reply: what the root will be, with no descriptor (none
+	# without an image)
+	root: ?Mounted
+)
+
+# The same for the image mounted in a container as its `--mount
+# type=image` number `index`.  Idempotent; `progress` as `CreateRoot`.
+# The engine counts the volumes that are `mount_fd` and refuses more
+# than 15 at create.
+method CreateImageVolume(store: string, container: string, index: int, image: string, layers: []LayerRef, ask: MountAsk) -> (
+	progress: ?Progress,
+	# In the last reply: what the volume will be, with no descriptor
+	volume: ?Mounted
+)
+
+# The root file system of a container and the images mounted in it,
+# as the monitor mounts them for this start: **the only source of
+# descriptors**.  Asked at every start, restart of the engine and
+# restore, and gives new descriptors each time.  The mounts of one
+# container per call.  The reply carries the descriptors of the
+# `mount_fd` mounts, each named by its position among them
+# (`Mounted.fd`).  The driver makes a **new** mount for each reply, a
+# detached `open_tree(OPEN_TREE_CLONE)` or `fsmount`, closes every
+# copy of it after sending it, and never hands the same mount twice.
+# A volume that was never created is `Missing` with the remedy
+# `recreate_container`.
+method Mounts(store: string, container: string, root: ?MountAsk, volumes: []VolumeAsk) -> (
+	# When it was asked
+	root: ?Mounted,
+	# In the order asked
+	volumes: []Mounted
+)
+
+# The root file system of the image made of `layers` as its containers
+# see it, as the one descriptor of the reply: a read-only mount of it (a detached
+# `open_tree(OPEN_TREE_CLONE)` or `fsmount`) or, where the service
+# cannot make one, a directory.  For the engine's reads of what a
+# create needs of the image (the user's entries of `/etc/passwd` and
+# `/etc/group`, `/etc/localtime`, the `--workdir`, the sub path of an
+# image mount, the content of a volume that takes the image's): the
+# engine opens every name below it with `openat2` (beneath, no link,
+# no magic link, no other mount), reads regular files only and at
+# most what it needs, refuses the root of the host, and closes the
+# descriptor when it is done.  The mount is new for each reply and
+# the service keeps no hold on it (as for `Mounts`); what it keeps
+# to make one (a copy of the image, for a service that copies its
+# layers) is its own, dropped by the `Collect` that no longer keeps
+# a layer of it.  It carries the ids of the image, no mapping.  A
+# layer the service does not have is `Missing` with the remedy
+# `pull_again`.
+method MountImage(store: string, layers: []LayerRef) -> ()
+
+# The root of the writable layer of the container, as the one
+# descriptor of the reply: a directory, or a detached clone of the
+# mount the container runs on (the same superblock), never a second
+# mount of the same upper.  For the engine's walks: the user files and
+# the label at create, `cp` and `export` of a stopped container, and
+# `diff`, `changes` and `commit`, which may be of a running one.
+method WritableRoot(store: string, container: string) -> ()
+
+# The bytes of the files the container wrote.
+method Size(store: string, container: string) -> (
+	# The bytes of the files the container wrote
+	bytes: int
+)
+
+# Whether the container has a writable layer made.
+method Exists(store: string, container: string) -> (exists: bool)
+
+# Remove the writable layer of the container, its image volumes with
+# it.  Idempotent.
+method RemoveRoot(store: string, container: string) -> ()
+
+# Forget what the driver keeps of a removed image (the layers go at a
+# collection).  Idempotent.
+method RemoveImage(store: string, image: string) -> ()
+
+# What is wrong with what the driver made of the layers of `image`;
+# `full` reads it and compares it with what the tables of contents
+# make.  Called with `more`: `progress` as `CreateRoot`.
+method Check(store: string, image: string, layers: []LayerRef, full: bool) -> (
+	progress: ?Progress,
+	# In the last reply
+	problems: ?[]Problem
+)
+
+# Make the artifacts of the layers again from what the driver keeps,
+# and answer their identities, which the engine checks against those
+# it makes from the tables of contents before it records them.
+# Idempotent.  Called with `more`: `progress` as `CreateRoot`.
+method Repair(store: string, layers: []LayerRef) -> (
+	progress: ?Progress,
+	# In the last reply: made again from what the driver keeps, and
+	# answered for the engine to check against the identities it makes from
+	# the tables of contents
+	artifacts: ?[]Artifact
+)
+
+# What the driver holds on its disk for itself: the files and bytes
+# of its own artifacts (the objects are the engine's).
+method Usage(store: string) -> (files: int, bytes: int)
+
+# What the driver reports of itself, as names and values.
+method Status(store: string) -> (pairs: []Pair)
+
+# The stores of the caller's uid that the driver holds, for a driver
+# that serves several: each with what it takes and when an engine last
+# opened it, so that a store no engine opens any more is found (the
+# id of the engine's store is in a file of its graph root).  A driver
+# isolates stores by the pair (uid of the peer, store).
+method ListStores() -> (stores: []StoreEntry)
+
+# Remove the store and everything under it (layers, roots, image
+# mounts, staging).  Idempotent.  `Busy` while a pull or a container
+# of it is in progress; a name that is not a store id (32 hex digits)
+# is refused before it names a path.
+method DropStore(store: string) -> ()
+
+# Remove what the driver holds that the keep set does not name, and
+# what an interrupted pull left.  The keep set is the JSON lines of
+# the descriptor 0, a sealed memory file of `keep_length` bytes (the
+# grace period, then one record for each layer, chain, image,
+# container and pull: a set can be larger than a message).  What the
+# driver finds that nothing names it keeps while it has changed within
+# the grace period.  Idempotent.  Called with `more`: `progress` as
+# `CreateRoot`.
+method Collect(store: string, keep_length: int) -> (
+	progress: ?Progress,
+	# In the last reply
+	bytes_freed: ?int,
+	# In the last reply: what could not be removed, one line each
+	errors: []string
+)
+
+# An artifact is not there or not recorded; `remedy` mends it, and the
+# message ends with it
+error Missing (reason: string, layer: ?string, remedy: Remedy)
+
+# An artifact is not the one recorded or cannot be read; `remedy` mends
+# it (`recreate_container` loses what the container wrote in its
+# writable layer, and the message says so)
+error Corrupt (reason: string, layer: ?string, remedy: Remedy)
+
+# The driver cannot do what was asked: a capability it lacks
+error Unsupported (reason: string)
+
+# Something the call names is not there: a pull, a container
+error NotFound (reason: string)
+
+# The call conflicts with one in progress (two `CreateRoot` of one
+# container, a `Collect` during a `Commit` of another process): it is
+# made again later
+error Busy (reason: string)
+
+# The host refuses the SELinux label asked for the files of an image
+# mount: another label, or none, is asked
+error LabelRefused (reason: string)
+
+# The driver's own backend does not answer (an object store, a
+# service): the storage service is started
+error Unavailable (reason: string)
+
+# The driver tried and failed
+error Failed (reason: string)

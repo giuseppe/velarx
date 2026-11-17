@@ -1,0 +1,79 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# The test images of lazy pulls, made from an image of a private registry:
+#
+#   <DEST>:lazy-verity          zstd:chunked; the table of contents gives the
+#                               fs-verity digest of every regular file with
+#                               content (`fsverity`, `sha256-12:HEX`) besides
+#                               its sha256 (`digest`): a lazy pull takes it
+#   <DEST>:chunked-sha256-only  zstd:chunked; the table of contents gives only
+#                               the sha256 `digest`: no_file_digests, a lazy
+#                               pull refuses it with ImageNotLazy
+#   <DEST>:gzip                 gzip layers, no table of contents: no_toc,
+#                               refused with ImageNotLazy
+#
+#   tools/make-lazy-fixtures [--example PATH] SRC DEST
+#
+# SRC is the image (HOST:PORT/NAME:TAG) and DEST the repository the three
+# tags are pushed to (HOST:PORT/NAME).  Both are copied with skopeo
+# registry to registry (never from or to containers-storage), over plain HTTP
+# for a host that is localhost or 127.0.0.1, with TLS otherwise;
+# SKOPEO_FLAGS adds options to both copies.  The layers are written again by
+# `cargo run -p velarx-content --example lazy_fixture` (the code the engine
+# pushes layers with), or by PATH, a build of that example; the diff ids and
+# the configuration are those of SRC.  The work is in a directory of
+# TMPDIR (the size of the image three times), removed at the end.
+#
+#   cargo build -p velarx-content --example lazy_fixture
+#   tools/make-lazy-fixtures --example target/debug/examples/lazy_fixture \
+#       localhost:5000/alpine:latest localhost:5000/lazy/alpine
+#
+# The digest the example computes for a file is the one the kernel measures
+# (`lazy_fixture digest FILE...` prints it as `fsverity measure` does); the
+# e2e test tests/e2e/bats/lazy-fixtures.bats compares them on a file system
+# with fs-verity.
+set -eu
+
+example=
+while [ $# -gt 0 ]; do
+    case $1 in
+    --example) example=${2:?--example needs a path}; shift 2 ;;
+    --) shift; break ;;
+    -*) echo "usage: $0 [--example PATH] SRC DEST" >&2; exit 2 ;;
+    *) break ;;
+    esac
+done
+[ $# = 2 ] || { echo "usage: $0 [--example PATH] SRC DEST" >&2; exit 2; }
+src=$1
+dest=$2
+
+tls () { # side (src or dest), reference: the skopeo option of its host
+    case ${2%%/*} in
+    localhost:* | 127.0.0.1:* | localhost | 127.0.0.1) echo "--$1-tls-verify=false" ;;
+    *) echo "--$1-tls-verify=true" ;;
+    esac
+}
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/lazy-fixtures.XXXXXX")
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+
+if [ -z "$example" ]; then
+    cargo build -q -p velarx-content --example lazy_fixture
+    example=${CARGO_TARGET_DIR:-target}/debug/examples/lazy_fixture
+fi
+[ -x "$example" ] || { echo "no example at $example" >&2; exit 1; }
+
+# (the architecture of this host: one image, not an index of them)
+# shellcheck disable=SC2046,SC2086
+skopeo copy ${SKOPEO_FLAGS:-} $(tls src "$src") --override-os linux --format oci \
+    "docker://$src" "oci:$work/src"
+
+for pair in lazy-verity:verity chunked-sha256-only:sha256 gzip:gzip; do
+    tag=${pair%%:*}
+    mode=${pair#*:}
+    "$example" rewrite "$work/src" "$work/$tag" "$mode"
+    # shellcheck disable=SC2046,SC2086
+    skopeo copy ${SKOPEO_FLAGS:-} $(tls dest "$dest") --format oci \
+        "oci:$work/$tag" "docker://$dest:$tag"
+    rm -rf "${work:?}/$tag"
+done

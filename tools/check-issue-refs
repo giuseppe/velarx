@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Fail when a tracked file refers to an issue or a pull request by a bare
+# number (`#NNN`, `issue #NNN`, `PR #NNN`): the numbers of a tracker mean
+# nothing once the tracker is another one.  Write the fact the number stands
+# for.  What is allowed is a reference to an upstream project, which names it:
+# `owner/repo#NNN`, a URL, or `podman #NNN` (the projects of ALLOWED_PROJECTS
+# below).  vendor/ and the lock file are not ours and are skipped, and this
+# file, whose examples are what it looks for.
+import os
+import re
+import subprocess
+import sys
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(root)
+
+# The projects whose issues may be named as `NAME #NNN`.
+ALLOWED_PROJECTS = ("podman", "docker", "buildah", "crun", "runc", "skopeo", "moby", "netavark")
+# `#` and digits that are not an issue: a shell length (`${#x}`, `$#`), an
+# HTML entity (`&#39;`), `PKCS#1`, the `#` of an idmap mount option
+# (`0-1000-1#1-0-1`), `socket #4` of one test.
+bare = re.compile(r"(?<![\w&/#${])#\d+\b")
+# A number named by a word: glued (`PR#12`, `issue#12`, `GH-12`) or after
+# `issue`, `pull request` or `PR` (`issue 12`, `PR #12`, `pull request 12`).
+worded = re.compile(
+    r"(?i:\b(?:issues?|prs?|pull[ -]requests?|merge[ -]requests?|tickets?|bugs?"
+    r"|refs?|fix(?:es|ed)?|close[sd]?|resolve[sd]?|see)#\d+\b|\bgh-\d+\b"
+    r"|\b(?:issues?|pull[ -]requests?|merge[ -]requests?|tickets?)[ \t]+#?\d{2,}\b)"
+    r"|\bPRs?[ \t]+#?\d{2,}\b"
+)
+upstream = re.compile(r"\b(?:%s) #\d+\b" % "|".join(ALLOWED_PROJECTS), re.I)
+other_ok = re.compile(r"\bsocket #4\b")
+skip = re.compile(
+    r"(?:^|/)(?:vendor/|Cargo\.lock$)|\.(?:png|svg|gz|zst|tar|erofs)$|^tools/check-issue-refs$"
+)
+
+files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")[:-1]
+problems = []
+for path in files:
+    if skip.search(path) or not os.path.isfile(path) or os.path.islink(path):
+        continue
+    with open(path, "rb") as f:
+        data = f.read()
+    if b"\0" in data:
+        continue
+    for n, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+        rest = other_ok.sub("", upstream.sub("", line))
+        if bare.search(rest) or worded.search(rest):
+            problems.append(f"{path}:{n}: {line.strip()[:100]}")
+
+if problems:
+    sys.exit(
+        "\n".join(problems)
+        + "\nbare issue or pull request numbers: write the fact they stand for (tools/check-issue-refs)"
+    )
+print(f"{len(files)} tracked files, no bare issue numbers")

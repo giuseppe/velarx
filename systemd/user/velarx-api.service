@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# The API of a user (rootless): a frontend of the engine, with no engine in
+# it.  It confines itself (Landlock, seccomp) to the engine's socket.
+[Unit]
+Description=Velarx REST API
+Documentation=man:velarx-api(8) man:velarx.conf(5)
+Requires=velarx-api.socket
+After=velarx-api.socket
+
+# started by a connection after each idle exit: no start limit
+StartLimitIntervalSec=0
+[Service]
+ExecStart=/usr/bin/velarx-api
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target
+Also=velarx-api.socket

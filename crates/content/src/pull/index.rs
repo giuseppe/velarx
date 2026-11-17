@@ -1,0 +1,198 @@
+// SPDX-License-Identifier: Apache-2.0
+//! The index of a layer: its TOC and its tar-split, what a node that
+//! has the layer can give a peer pulling it, so that the peer takes the
+//! files from nodes by digest instead of the whole blob from the registry.
+//!
+//! An index is named by the digest of its layer, not by its own: nothing in
+//! it is trusted.  Its size and what it decodes to are bounded, the files
+//! it names are checked against their digests when they arrive, and the
+//! layer they make is checked against the diff id of the image's
+//! configuration by replaying the tar-split: an index that lies makes a
+//! pull fall back to the registry, nothing else.
+//!
+//! The encoding: `SHIDX1\n`, the length of the compressed TOC (8 bytes,
+//! little endian), the TOC (JSON, zstd), the tar-split (zstd).
+
+use super::entry::MAX_ENTRIES;
+use std::io::Read;
+use velarx_storage::Toc;
+
+const MAGIC: &[u8] = b"SHIDX1\n";
+
+/// The largest index: what a peer may send.
+pub const MAX_INDEX: u64 = velarx_storage::MAX_SERVED_BYTES as u64;
+
+/// The largest TOC JSON an index decodes to, whatever the layer.
+const MAX_TOC_JSON: u64 = 32 * 1024 * 1024;
+
+/// The largest TOC JSON of the index of a layer of `layer_size` bytes:
+/// 16 times its size, at least 4 MiB, at most 32 MiB.
+pub fn json_cap(layer_size: i64) -> u64 {
+    (layer_size.max(0) as u64)
+        .saturating_mul(16)
+        .clamp(4 * 1024 * 1024, MAX_TOC_JSON)
+}
+
+/// A TOC whose entries are counted as they are read.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BoundedToc {
+    version: i32,
+    #[serde(deserialize_with = "bounded_entries")]
+    entries: Vec<velarx_storage::TocEntry>,
+    #[serde(default)]
+    tar_split_digest: Option<String>,
+}
+
+fn bounded_entries<'de, D>(d: D) -> Result<Vec<velarx_storage::TocEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Entries;
+    impl<'de> serde::de::Visitor<'de> for Entries {
+        type Value = Vec<velarx_storage::TocEntry>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("the entries of a TOC")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(e) = seq.next_element()? {
+                if out.len() >= MAX_ENTRIES {
+                    return Err(serde::de::Error::custom("the TOC has too many entries"));
+                }
+                out.push(e);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_seq(Entries)
+}
+
+/// The index of a layer whose TOC (JSON) and compressed tar-split are
+/// these; None when it would be larger than [`MAX_INDEX`].
+pub fn encode(toc_json: &[u8], tarsplit_z: &[u8]) -> Option<Vec<u8>> {
+    let toc_z = zstd::encode_all(toc_json, 3).ok()?;
+    let total = MAGIC.len() + 8 + toc_z.len() + tarsplit_z.len();
+    if total as u64 > MAX_INDEX {
+        return None;
+    }
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&(toc_z.len() as u64).to_le_bytes());
+    out.extend_from_slice(&toc_z);
+    out.extend_from_slice(tarsplit_z);
+    Some(out)
+}
+
+/// The TOC and the compressed tar-split of an index, checked for their
+/// sizes and their form only: its TOC decodes to at most `max_json` bytes
+/// of JSON, its entries are counted as they are read.
+pub fn decode(data: &[u8], max_json: u64) -> Result<(Toc, Vec<u8>), String> {
+    let max_json = max_json.min(MAX_TOC_JSON);
+    if data.len() as u64 > MAX_INDEX {
+        return Err("the index is too large".into());
+    }
+    let rest = data
+        .strip_prefix(MAGIC)
+        .ok_or_else(|| "not an index".to_string())?;
+    if rest.len() < 8 {
+        return Err("a truncated index".into());
+    }
+    let (len, rest) = rest.split_at(8);
+    let len = u64::from_le_bytes(len.try_into().expect("8 bytes"));
+    let len = usize::try_from(len)
+        .ok()
+        .filter(|&l| l <= rest.len())
+        .ok_or_else(|| "a truncated index".to_string())?;
+    let (toc_z, tarsplit_z) = rest.split_at(len);
+    if tarsplit_z.is_empty() {
+        return Err("an index without tar-split".into());
+    }
+    let mut json = Vec::new();
+    super::zstd_decoder(toc_z)
+        .map_err(|e| format!("the TOC of the index: {e}"))?
+        .take(max_json + 1)
+        .read_to_end(&mut json)
+        .map_err(|e| format!("the TOC of the index: {e}"))?;
+    if json.len() as u64 > max_json {
+        return Err("the TOC of the index is too large".into());
+    }
+    let toc: BoundedToc =
+        serde_json::from_slice(&json).map_err(|e| format!("the TOC of the index: {e}"))?;
+    let toc = Toc {
+        version: toc.version,
+        entries: toc.entries,
+        tar_split_digest: toc.tar_split_digest,
+    };
+    Ok((toc, tarsplit_z.to_vec()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_index_is_decoded_and_bounded() {
+        let toc = r#"{"version":1,"entries":[]}"#;
+        let index = encode(toc.as_bytes(), b"tarsplit").unwrap();
+        let (t, ts) = decode(&index, MAX_TOC_JSON).unwrap();
+        assert!(t.entries.is_empty());
+        assert_eq!(ts, b"tarsplit");
+        // not one, cut, lengths that lie, no tar-split, not a TOC
+        assert!(decode(b"garbage", MAX_TOC_JSON).is_err());
+        assert!(decode(&index[..index.len() - 8 - 9], MAX_TOC_JSON).is_err());
+        let mut lie = index.clone();
+        lie[MAGIC.len()..MAGIC.len() + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(decode(&lie, MAX_TOC_JSON).is_err());
+        assert!(decode(&encode(toc.as_bytes(), b"").unwrap(), MAX_TOC_JSON).is_err());
+        assert!(decode(&encode(b"[1, 2]", b"ts").unwrap(), MAX_TOC_JSON).is_err());
+        // a TOC that decompresses to a bomb is cut
+        let bomb = vec![b' '; (MAX_TOC_JSON + 10) as usize];
+        let mut big = MAGIC.to_vec();
+        let z = zstd::encode_all(&bomb[..], 19).unwrap();
+        big.extend_from_slice(&(z.len() as u64).to_le_bytes());
+        big.extend_from_slice(&z);
+        big.extend_from_slice(b"ts");
+        assert!(decode(&big, MAX_TOC_JSON).is_err());
+        // too large to give
+        assert!(encode(b"{}", &vec![0u8; MAX_INDEX as usize]).is_none());
+        // a TOC larger than the cap of the layer
+        let entries: Vec<String> = (0..2000)
+            .map(|i| format!(r#"{{"type":"reg","name":"f{i}","size":1}}"#))
+            .collect();
+        let long = format!(r#"{{"version":1,"entries":[{}]}}"#, entries.join(","));
+        let index = encode(long.as_bytes(), b"ts").unwrap();
+        assert!(decode(&index, MAX_TOC_JSON).is_ok());
+        assert!(decode(&index, 1000).is_err());
+        assert_eq!(json_cap(1), 4 * 1024 * 1024);
+        assert_eq!(json_cap(i64::MAX), MAX_TOC_JSON);
+    }
+
+    /// The layer index travels between nodes: its bytes must not change.
+    #[test]
+    fn the_encoding_of_an_index_is_fixed() {
+        // the frame of `{"version":1,"entries":[]}` made by zstd -3
+        let toc_z =
+            hex::decode("28b52ffd0058d100007b2276657273696f6e223a312c22656e7472696573223a5b5d7d")
+                .unwrap();
+        let mut golden = b"SHIDX1\n".to_vec();
+        golden.extend_from_slice(&[toc_z.len() as u8, 0, 0, 0, 0, 0, 0, 0]);
+        golden.extend_from_slice(&toc_z);
+        golden.extend_from_slice(b"TARSPLIT");
+        assert_eq!(&golden[..15], b"SHIDX1\n\x23\0\0\0\0\0\0\0");
+        let (toc, tarsplit) = decode(&golden, MAX_TOC_JSON).unwrap();
+        assert_eq!((toc.version, toc.entries.len()), (1, 0));
+        assert_eq!(tarsplit, b"TARSPLIT");
+        // and what is encoded has the same framing: magic, the length of
+        // the compressed TOC (8 bytes, little endian), the TOC, the tar-split
+        let index = encode(br#"{"version":1,"entries":[]}"#, b"TARSPLIT").unwrap();
+        let len = u64::from_le_bytes(index[7..15].try_into().unwrap()) as usize;
+        assert_eq!(&index[..7], b"SHIDX1\n");
+        assert_eq!(&index[15 + len..], b"TARSPLIT");
+        let json = zstd::decode_all(&index[15..15 + len]).unwrap();
+        assert_eq!(json, br#"{"version":1,"entries":[]}"#);
+    }
+}

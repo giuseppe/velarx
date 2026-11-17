@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Velarx P2P service
+Documentation=man:velarx-p2p(8) man:velarx.conf(5)
+# (it needs no daemon: the store service has the content it serves)
+Wants=velarx-store.socket
+After=network.target velarx-store.socket
+
+[Service]
+ExecStart=/usr/bin/velarx-p2p
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=velarx
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+# The identity of the node (identity_path of p2p.toml): its peer id outlives a
+# restart and a boot; and the staging of the layers of the store, which the
+# service opens before any pull made it (the rest of the store stays read-only)
+StateDirectory=velarx/staging/layers velarx/p2p
+StateDirectoryMode=0700
+
+# The service talks to the network: it needs its sockets in
+# /run/velarx/services (p2p.sock, the varlink interface org.velarx.P2p
+# of `velarx p2p`; p2p-fetcher.sock, org.velarx.Fetcher for the pulls;
+# it is not socket-activated: it is a member of a swarm while it runs), its
+# configuration and swarm key (read), the network, and nothing else.  The
+# process confines itself further (Landlock, seccomp:
+# crates/p2p/src/sandbox.rs).  The overlay network of the containers is
+# another process with the privileges it needs: velarx-p2p-overlay.service.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/run/velarx
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+# netlink: the interfaces mDNS watches
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @module @reboot @swap @clock @debug @obsolete @cpu-emulation
+# what the process needs to confine itself (capabilities, limits,
+# Landlock, seccomp); a call the filter refuses fails, it does not kill
+SystemCallFilter=capset prlimit64 setrlimit landlock_create_ruleset landlock_add_rule landlock_restrict_self seccomp
+SystemCallErrorNumber=EPERM
+
+# What the process may hold (its tables of peers and filters, its
+# connections) is bounded by the unit: a service that goes over is stopped and
+# started again, and the pulls go to the registry meanwhile.  Raise them with
+# a drop-in for a node with many peers.
+MemoryMax=4G
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target

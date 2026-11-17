@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Fail when a tracked file has no license information: an SPDX line in its
+# first 4 KiB (which must name Apache-2.0, the license of the project) or an
+# annotation of REUSE.toml.  Also fails on a path of an annotation that
+# matches no tracked file and on a path of NOTICE that does not exist.
+import os
+import re
+import subprocess
+import sys
+import tomllib
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(root)
+files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")[:-1]
+files = [f for f in files if os.path.lexists(f)]
+
+
+def glob(pattern):
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif pattern.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif pattern[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        else:
+            out, i = out + re.escape(pattern[i]), i + 1
+    return re.compile(out + r"\Z")
+
+
+with open("REUSE.toml", "rb") as f:
+    annotations = tomllib.load(f).get("annotations", [])
+rules = []
+for a in annotations:
+    paths = a["path"] if isinstance(a["path"], list) else [a["path"]]
+    for key in ("SPDX-FileCopyrightText", "SPDX-License-Identifier"):
+        if key not in a:
+            sys.exit(f"REUSE.toml: annotation of {paths} has no {key}")
+    rules += [(p, glob(p)) for p in paths]
+
+# The license of the project: the SPDX line of every file that REUSE.toml
+# does not annotate names it, and nothing else.
+LICENSE = "Apache-2.0"
+SPDX_LINE = re.compile(rb"SPDX-License-Identifier:[ \t]*(.*?)[ \t]*(?:-->|\*/|#\})?[ \t]*\r?$", re.M)
+
+problems = []
+used = set()
+for path in files:
+    covered = False
+    for pattern, regex in rules:
+        if regex.match(path):
+            used.add(pattern)
+            covered = True
+    if covered or os.path.islink(path):
+        continue
+    with open(path, "rb") as f:
+        m = SPDX_LINE.search(f.read(4096))
+    if not m:
+        problems.append(f"{path}: no SPDX line and no annotation in REUSE.toml")
+    elif m.group(1).decode(errors="replace") != LICENSE:
+        problems.append(
+            f"{path}: SPDX license {m.group(1).decode(errors='replace')!r}, not {LICENSE!r}"
+            " (a file under another license is annotated in REUSE.toml)"
+        )
+for pattern, _ in rules:
+    if pattern not in used:
+        problems.append(f"REUSE.toml: {pattern} matches no tracked file")
+
+with open("NOTICE") as f:
+    for line in f:
+        # A path heads its entry: the first word of an unindented line.
+        m = re.match(r"([A-Za-z0-9_.][^\s]*/[^\s]*)(\s|$)", line)
+        if m and not os.path.exists(m.group(1)):
+            problems.append(f"NOTICE: {m.group(1)} does not exist")
+
+if problems:
+    sys.exit("\n".join(problems))
+print(f"{len(files)} tracked files, all with license information")

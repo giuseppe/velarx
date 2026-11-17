@@ -1,0 +1,803 @@
+# SPDX-License-Identifier: Apache-2.0
+# Velarx Container Runtime Configuration
+#
+# Default locations.  Root of the host (not of a user namespace) uses the
+# host's directories and ignores HOME and XDG_* (they stay set under sudo):
+#   Config: /etc/velarx/config.toml
+#   Socket: /run/velarx/velarx.sock
+#   State:  /run/velarx
+#   Data:   /var/lib/velarx
+# Everybody else follows the XDG Base Directory Specification:
+#   Config: $XDG_CONFIG_HOME/velarx/config.toml (~/.config/velarx/config.toml)
+#   Socket: $XDG_RUNTIME_DIR/velarx/velarx.sock
+#   State:  $XDG_RUNTIME_DIR/velarx
+#   Data:   $XDG_DATA_HOME/velarx (~/.local/share/velarx)
+
+[server]
+# Unix socket of the REST API (velarx-api); its directory is the runtime
+# directory of velarx, where the engine's socket is (engine/engine.sock)
+# Default: root: /run/velarx/velarx.sock, rootless: $XDG_RUNTIME_DIR/velarx/velarx.sock
+# socket = "/run/velarx/velarx.sock"
+# Runtime state directory (default: root: /run/velarx, rootless: $XDG_RUNTIME_DIR/velarx)
+# state_dir = "/run/velarx"
+# Persistent data directory (default: root: /var/lib/velarx, rootless: $XDG_DATA_HOME/velarx)
+# root_dir = "/var/lib/velarx"
+# Graceful shutdown timeout in seconds; a restart also waits that long for the
+# calls in progress that change something (a create, a remove) before it ends
+# the connections
+shutdown_timeout_secs = 30
+# Options for every call of the OCI runtime (default: none; a rootless daemon
+# that gets no delegated cgroup uses ["--cgroup-manager", "disabled"])
+# runtime_args = []
+# The OCI runtime of the containers: a name of [runtimes], a name (crun,
+# runc, ...) looked up in PATH and where runtimes are installed, or a path.
+# The option of the command line takes the place of this.  (default: crun)
+# runtime = "crun"
+
+# What makes the cgroups of the containers of the daemon.  The daemon splits
+# its cgroup <cgroup> when it starts (--cgroups=split, the default): it moves
+# to <cgroup>/engine, and a container is <cgroup>/<id>/container with its
+# monitor in <cgroup>/<id>/runtime, a container of a pod
+# <cgroup>/<pod id>/<id>/...; <id> is the full id, a memory or pids limit
+# applies to <id>/container, and the runtime and the daemon make the container
+# and the monitor in their cgroup directly (clone3 CLONE_INTO_CGROUP: no move,
+# no wait for the kernel).  <cgroup> is the daemon's own when a unit with
+# Delegate=yes holds it alone (systemctl status of the unit shows the whole
+# tree);
+# a daemon started from a session or a shell, in a cgroup it does not own,
+# asks the systemd manager for a new scope with Delegate=yes around itself,
+# velarx-<pid>.scope, and uses that.  The two values differ when the daemon
+# owns no cgroup and no manager makes it one: "cgroupfs" (the default) makes
+# a cgroup next to its own, or goes on without cgroups for the containers
+# (with [containers] cgroups = "split" it does not start); "systemd" does not
+# start and says why.  --cgroup-parent replaces <cgroup> with "cgroupfs";
+# with "systemd" it is a slice (NAME.slice) and the container is a scope of
+# the manager in it, velarx-<id>.scope, with its monitor in the daemon's.
+# The containers of "split" are processes of the daemon's unit: a stop or a
+# `systemctl restart` of the unit (KillMode=control-group) stops them, as a
+# crash of the daemon that systemd restarts does (systemd cannot start the
+# unit again while containers' cgroups use the controllers of its cgroup:
+# EBUSY, also with DelegateSubgroup=); with "scope" they outlive it;
+# `systemctl reload` and `velarx system restart` keep the containers.
+# A command run with no server (in its own process), outside a unit (in a
+# unit they share its cgroup), when a systemd manager answers: every
+# container gets a systemd scope, velarx-<id>.scope (in user.slice of the
+# user's manager; machine.slice for root). With no limits the command asks
+# for it when it starts and puts the container in `container` and its monitor
+# in `monitor` below it; a container with limits or a --cgroup-parent gets
+# the scope from the runtime, which applies them, and its monitor
+# velarx-monitor-<id>.scope. --cgroups=disabled makes no cgroup and asks no
+# manager, in every case above: the container and its monitor stay in the
+# cgroup of the command or of the daemon that starts them. The default mode
+# is `[containers] cgroups` below, for run, create, kube play, the API and
+# the infra containers of pods.
+# cgroup_manager = "cgroupfs"
+
+# Serve the store service (`org.velarx.Store`, the content of the store by
+# digest) from the daemon, unless another process serves it already (systemd:
+# velarx-store.socket, or the service that needs it, which starts it).  A
+# service that gives the content to others (a source of other nodes, for
+# one) reads the store through it.
+# store_service = false
+
+# Where the events are kept beyond the daemon (`velarx events --since`):
+# "journald", "file" or "none" (only in memory); unset: the journal when it is
+# there, else the file.  --events-backend takes the place of this
+# events_logger = "journald"
+# The file of the "file" backend (default: <root_dir>/events/events.log)
+# events_logfile_path = "/var/lib/velarx/events/events.log"
+# The size past which the events file is rotated (one older file is kept)
+# events_logfile_max_size = "1m"
+
+[engine]
+# The engine service (`velarx varlink`): the varlink interface
+# org.velarx.Engine that the command line, the thin client and the frontends
+# (velarx-api, velarx-cri) call.
+# Its socket (default: engine/engine.sock next to [server] socket; the
+# directory is the engine's alone, which the frontends may connect in)
+# socket = "/run/velarx/engine/engine.sock"
+# When its socket unit (velarx-engine.socket) started it, it leaves after this
+# many seconds with no client connected, whatever containers run: their
+# monitors go on (restart policy, health checks, logs) and the next engine
+# follows them again; 0 keeps it.  One that was started by hand stays until it
+# is stopped (`varlink --time SECONDS` makes it leave too)
+# idle_exit = 30
+
+[services]
+# The limits of each varlink service of velarx: the engine, the store
+# service, the fetchers and the services of external sources
+# (interfaces/*.varlink).
+# A connection over a limit is answered Unavailable to its first call.
+# The most connections a service serves at once
+# max_connections = 256
+# The most connections of one client process (as SO_PEERCRED names it) at
+# once, so that one frontend leaves room for the others (of the registry
+# fetcher the engine shares, a monitor's connection and those it asks for
+# on it are a client of their own)
+# max_per_client = 192
+# A connection that sends no call within this many seconds of its connect is
+# closed
+# first_call_secs = 10
+
+[api]
+# `velarx-api`: the REST API, a frontend of the engine.
+# It reads this section and the engine's socket above, and nothing else.
+# The unix socket when nothing passes one (default: [server] socket)
+# socket = "/run/velarx/velarx.sock"
+# Where else to listen: tcp://HOST:PORT, tcp://:PORT (the loopback
+# addresses, 127.0.0.1 and ::1) or unix:///PATH.  No TCP unless listed.  An
+# address that is not loopback is bound and warned about unless TLS is on
+# (tls_cert).  Whoever reaches the API controls
+# the engine, and any local user can reach a loopback port, so a TCP listener
+# needs token_file, tls_client_ca or allow_unauthenticated (the frontend does not start
+# without one of them); prefer the unix socket.
+# listen = ["tcp://:8080"]
+# The file with the token that the requests on TCP carry as
+# `Authorization: Bearer TOKEN`: at least 16 printable characters, mode 0600
+# token_file = "/etc/velarx/api-token"
+# TLS 1.3 for the TCP listeners (PEM files); tls_client_ca serves only clients whose certificate that CA
+# signed, and then needs no token
+# tls_cert = "/etc/velarx/api.crt"
+# tls_key = "/etc/velarx/api.key"
+# tls_client_ca = "/etc/velarx/clients-ca.crt"
+# No authentication on TCP: every local user controls the engine
+# allow_unauthenticated = false
+# A frontend that systemd started leaves after this many seconds with no
+# connection (its socket starts it again); 0 keeps it
+# idle_exit = 30
+# Start the engine (`velarx varlink`, the `velarx` next
+# to velarx-api) when no socket unit started the frontend: it then runs as
+# long as the frontend does.  Default: when not started by systemd
+# start_engine = true
+# (read by the engine) The short names of the Docker API (`/images/create`,
+# tags, builds, commits) are docker.io names, as Docker's; false: they are
+# resolved as the libpod API resolves them
+# compat_api_enforce_docker_hub = true
+
+[storage]
+# Storage root directory (default: root: /var/lib/velarx, rootless: $XDG_DATA_HOME/velarx)
+# Subdirectories: objects/ (the files, each named by its fs-verity digest as
+# in a composefs-rs repository, which is how the store knows them),
+# composefs/ (the EROFS image of each layer), layers/,
+# staging/, db.sqlite, and storage.lock (shared by pulls, exclusive for the
+# garbage collection)
+# root = "/var/lib/velarx"
+# The storage driver of a store that is made now: "composefs" (the default:
+# the files named by their fs-verity digest and one EROFS image per layer,
+# mounted as the root file system of a container: a container costs the same
+# whatever the size of its image) or "vfs" (the
+# root file system of a container is a full copy of the files of its image,
+# made when the container is created, with the ids of its user namespace given
+# as the files are copied, and with reflinks where the
+# file system has them: the cost of a container is linear in the size of its
+# image; nothing is mounted for the layers, so it works rootless without
+# FUSE, and it takes no `--lazy` pull, no `--mount type=image` and no
+# `--storage-opt size`; fs-verity is checked only when a layer is pulled, see
+# fsverity_best_effort; docs/STORAGE.md).  vfs is never chosen for you.  A
+# store keeps the driver it was made with, recorded in
+# its database; opening it with another is an error that names both, and with
+# none asked for the store's own is used.  The command line says it with
+# --storage-driver, which wins over this file; the order is: --storage-driver,
+# this key, the driver of the store, "composefs" for a new one.  An unknown
+# name is an error that lists the known ones.  (--storage-driver also takes
+# "overlay", the name reported for composefs, which chooses nothing.)
+# The third driver, "varlink", passes the storage to a program of its own that
+# serves org.velarx.Storage on a unix socket ([storage.varlink] below;
+# docs/STORAGE.md): it is never chosen for you either.
+# driver = "composefs"
+# Enable fs-verity on the stored files (kernel 5.4+ and a file system that
+# has it); without it the files are not protected against changes
+fsverity = true
+# Every file of the store must have fs-verity: a file whose fs-verity cannot
+# be enabled fails its pull, and a file without it is not served
+fsverity_require = false
+# A driver that checks fs-verity only when a layer is pulled (vfs) cannot
+# enforce it while a container runs: with it, `fsverity_require`,
+# `composefs_digests = "require"` and `--security-opt verity=enforce` are an
+# error.  true accepts them as checks at pull (a file without fs-verity fails
+# the pull, a manifest that states no digest is refused), and nothing is
+# promised after: the copy of the layers a container runs on is not held to
+# the digests.  No effect with composefs, which enforces at run time
+fsverity_best_effort = false
+# The vfs driver run by a process that may not give files the owners the image
+# has (it is neither root nor in a user namespace that maps them; rootless
+# velarx is in one): false fails the create of the container with the file and
+# the owner; true leaves the files owned by that process (containers-storage's
+# ignore_chown_errors): every file of a container is then that user's, and
+# the changes of a container take the files of that owner for the image's
+vfs_ignore_chown_errors = false
+# The EROFS images of the layers of the containers of root mounted by the
+# kernel: "auto" where it can (root, a kernel that mounts them, a complete
+# image whose owners the user namespace maps), or "off": the monitor serves
+# the same images by FUSE (as it does rootless)
+composefs = "auto"
+# Read-only stores of other velarx instances (their roots): their images
+# are found and run without a pull, and nothing in them is written or
+# collected.  A store is used when its owner has closed it cleanly (its
+# velarx daemon stopped); one with a velarx running on it, left by a
+# command without a daemon, or made with another storage driver than this
+# store's, is skipped and the log says why (docs/STORAGE.md)
+# additional_image_stores = ["/usr/lib/velarx-images"]
+# Read-only directories of files that other tools keep, searched for the files
+# a pull would otherwise fetch: a composefs-rs repository (kind
+# "composefs-rs", the directory with meta.json), the graph root of a podman
+# or CRI-O store with `use_composefs` ("containers-storage", image layers
+# only), another velarx store ("velarx").  A file found is checked (fs-verity
+# or hashed) and imported as a reflink, a copy, or, with `link = true`, a hard
+# link when it already has fs-verity and is the user's; nothing in the store
+# is ever written, collected or mounted.  One that cannot be read or is not
+# what its kind says is skipped with a warning (docs/STORAGE.md)
+# foreign_object_stores = [{ path = "/sysroot/composefs", kind = "composefs-rs" }]
+# Garbage collection interval in seconds; skipped while a pull runs.  It
+# also removes the staging directories of pulls whose process is gone
+gc_interval_secs = 3600
+# `system check` takes a temporary file, an object no row of the database
+# names, or the staging directory of a container that is gone for a leftover
+# once it has been unchanged for this many seconds (a pull that is running
+# may be writing it); `system check --max` sets it for one run
+check_leftover_age_secs = 86400
+# How a pull or a commit makes its files durable:
+#   "syncfs"  two `syncfs` barriers: of the staging file system before the
+#             files get their names, and of the store before the database
+#             rows are written, and one for the EROFS images of the
+#             layers with a sync of their directory (the default)
+#   "none"    no barrier: a crash or a power loss right after a pull may
+#             leave names and rows of files whose data is not on the disk
+#             (the store may need `system check --repair`).  For tests,
+#             caches, CI, tmpfs and benchmarks
+sync = "syncfs"
+# The fs-verity digests of the EROFS images of the layers that a manifest
+# states, one annotation of each layer descriptor
+# (io.containers.composefs.digest: a comma separated list, of which Velarx reads the sha256:<hex> and sha512:<hex> values: empty
+# entries, other algorithms and anything else are ignored).  Velarx writes it in every
+# manifest it makes (commit, build, import, a push that rebuilds it) and reads
+# it at every pull and load, eager or lazy.  Every start of a container by
+# the engine checks the stored manifest against the id of the image and gives
+# the monitor the digests of the layers from that manifest: it refuses a layer
+# image that measures differently.
+#   "check"    an image whose manifest states none, or states none that is the
+#              digest of the image Velarx makes of the layer (another writer's
+#              or one that was edited: nothing tells them apart), is accepted (the default); its layers are held against
+#              their records
+#   "require"  every layer of an image that is pulled, loaded or started must
+#              state the digest of the image Velarx makes: an image without
+#              it (also one in a Docker
+#              format) is refused, also when it is stored already; a layer
+#              image without fs-verity is an error and the overlay of every
+#              container has verity=require, so the store needs a file system
+#              with fs-verity; an image that is not all in the store (a lazy
+#              pull), --mount type=artifact and --rootfs are refused.
+#              `--security-opt verity=enforce` asks the same of one container
+composefs_digests = "check"
+
+# The storage service of `driver = "varlink"` (refused with another driver).
+# The engine connects to it when it starts: a service that is not running,
+# or that speaks another version of org.velarx.Storage, is an error that says
+# so and what to do.  It must be run by the engine's user or root (checked on
+# every connection: a socket another user put at the path is refused).  The
+# options the service does not advertise (fs-verity enforced while a container
+# runs, read-only image stores, a lazy pull, a quota of the writable layer...)
+# are refused up front, naming the driver.  `system prune --all --volumes` that leaves nothing in the store tells
+# the service to drop it.
+# Running a service (a unit, rootless and root), what it cannot do yet and what
+# the engine trusts of it: docs/STORAGE.md, "Running a storage service", and
+# docs/THREAT-MODEL.md, "A storage service".
+[storage.varlink]
+# The unix socket of the service: an absolute path, required
+# socket = "/run/user/1000/velarx-storage/storage.sock"
+# How long a call may be silent before it fails, in seconds (2 to 86400).
+# A long call (making a root, a pull, a collection, a check) is answered with
+# progress at least every half of it; the others (HasLayers, Commit,
+# RemoveImage, Usage, DropStore...) must be answered whole within it: raise it
+# for a service whose store is large.  No call lasts more than a day (or four
+# times this, when that is longer), whatever progress the service sends
+timeout_secs = 60
+# The name the service must give itself (its GetInfo `name`: 1 to 64 letters,
+# digits, `.`, `_`, `-`); another is refused, which tells a socket that is not
+# the expected service.  Unset: any
+# name = "velarx-storage-server"
+
+[pull]
+# What is given to the peers (the sources of the pulls that ask other
+# nodes, `peer = true`): nothing unless listed here.  An entry
+# is a registry or a repository prefix of the upstream registry (not a
+# mirror); what is pulled from it without credentials nor client certificate
+# is shared, `{ prefix = "...", with_credentials = true }` shares what is
+# pulled with credentials too (entries that match the same image combine).
+# A registry of a private network that needs
+# no authentication is private all the same: do not list it.
+# share_registries = ["docker.io/library", "quay.io", "ghcr.io"]
+# Whether the images given to the peers carry their names (repository:tag,
+# as the shared pull named them): off, the peers learn the digests only (and
+# only when the peer-to-peer service announces its images: its `announce_images` setting)
+share_image_names = false
+# Layers fetched at the same time
+parallel_layers = 6
+# Range requests in flight for one zstd:chunked layer
+range_concurrency = 4
+# Memory for the chunks being decompressed and written, for a pull
+memory_budget_mib = 128
+# Threads decompressing and hashing chunks (0 = three per CPU, between 4 and 16)
+workers = 0
+# A layer that inflates to more than this is refused
+max_layer_gib = 32
+# A layer or an archive inflates to at most this many times its compressed
+# size, or inflate_floor_mib if more (the bytes are counted while they are
+# decompressed, before they are written)
+max_inflate_ratio = 128
+inflate_floor_mib = 64
+# A download (a layer, a blob, a range) fails when it has brought less than
+# min_speed_kib KiB per second, on average over min_speed_secs seconds: a
+# server that sends a byte now and then never reaches the timeout of a read
+# (either 0 = no check).  Downloads of URLs (load/import from a URL, ADD of a
+# build, signatures) have the same minimum
+min_speed_kib = 1
+min_speed_secs = 120
+# The workers of a pull (network, decompression) and its job (the process that
+# handles the zstd:chunked layers) are put in a cgroup of their
+# own (the job has pids_max only: its memory is bounded by memory_max_mib as
+# the size of its heap, which does not count the page cache of the files it
+# writes): in the daemon, `pulls/<id>` next to its containers when its systemd
+# unit has OOMPolicy=continue (the units of velarx have it: with systemd's
+# default, stop, the OOM kill of a worker would stop the daemon); otherwise a
+# transient scope of the user's systemd for each worker (the limits are then
+# those of each worker, not of the whole pull).  Above memory_high_mib
+# they are slowed down, above memory_max_mib they are killed and the pull
+# fails; at most pids_max tasks.  0 removes a limit.  Without cgroups to put
+# them in (no delegation, no systemd) the workers have only the rlimits of
+# their sandbox.
+memory_high_mib = 768
+memory_max_mib = 1024
+pids_max = 128
+# Fail the pull instead when the workers cannot get a cgroup
+require_cgroup = false
+# An archive given to `load` that inflates to more than this is refused
+max_archive_gib = 256
+# Signature policy, in the format of containers-policy.json(5) (default: the first
+# of ~/.config/velarx/policy.json (rootless only), /etc/velarx/policy.json;
+# without either file the built-in default accepts every image and verifies
+# nothing).  The signatures an image needs are looked for where registries.d
+# says.
+# policy_path = "/etc/velarx/policy.json"
+# The registries.d directory of the signature storage, instead of the
+# drop-in directories (~/.config/velarx/registries.d for a rootless engine,
+# /etc/velarx/registries.d, /usr/share/velarx/registries.d); it must exist.
+# The registries themselves (search list, aliases, mirrors, insecure and
+# blocked registries) are in registries.conf, in the format of
+# containers-registries.conf(5):
+# ~/.config/velarx/registries.conf (rootless) or /etc/velarx/registries.conf,
+# with their registries.conf.d drop-ins, or the file $VELARX_REGISTRIES_CONF
+# names.  The certificates of a registry are in certs.d/HOST[:PORT] of
+# /etc/velarx, ~/.config/velarx (rootless) or /etc/docker; the credentials in
+# $XDG_RUNTIME_DIR/velarx/auth/auth.json (/run/velarx/auth/auth.json for
+# root), ~/.config/velarx/auth/auth.json, or the file $REGISTRY_AUTH_FILE
+# names.  A short name (`alpine`) is an alias of registries.conf or of
+# the built-in table, else it is tried on each of
+# unqualified-search-registries in order; there are none by default, so a
+# short name that is no alias is refused.  short-name-mode is permissive by
+# default; enforcing refuses a name with several candidates (Velarx never
+# asks).
+# registries_d = "/etc/velarx/registries.d"
+# Every pull fetches and decompresses in confined worker processes: Landlock
+# (nothing is writable), seccomp, no capability, no access to the store; the
+# engine checks what they send.  The credentials are held by the registry
+# fetcher, the binary velarx-registry, which the engine finds or starts (one
+# for each configuration) when no service manager does: a pull that cannot
+# have it fails with the cause, it never goes without it.
+# The registry fetcher (default: velarx-registry next to velarx)
+# registry_path = "/usr/bin/velarx-registry"
+# The fetcher of a directory source (default: velarx-dir next to velarx)
+# dir_path = "/usr/bin/velarx-dir"
+# The worker executable (default: the registry fetcher itself, `pull-worker`)
+# worker_path = "/usr/bin/velarx-registry"
+# Worker processes of a pull at the same time
+max_workers = 12
+# Remember for each registry how it asks for a token (the realm and service
+# of its 401, never a token or a credential) and the host its blobs are
+# redirected to (its CDN), in $XDG_CACHE_HOME/velarx (root:
+# /var/cache/velarx; mode 0600, at most 256 registries, 7 days): the next pull asks the token endpoint at once instead
+# of going without a token first, and its workers connect to the CDN while
+# they take their token, so that the first ranges do not wait for the
+# handshake.  A hint that does not work is dropped with a warning and the
+# registry is asked as usual.  false: neither the hints nor the connections
+# in advance.
+registry_hints = true
+# The confined workers must have a user namespace of their own: a kernel
+# without them fails the pulls instead of confining the workers without one
+# (Landlock, seccomp, no capability, nobody)
+require_userns = false
+# Files of lazily pulled images fetched at the same time by one process
+lazy_fetches = 8
+# A lazy pull is the engine service's (`velarx varlink`, found or started for the
+# store by the command that pulls), which goes on after the command ends: the
+# files of the layers that no container reads are fetched, each layer is
+# committed to the store as it is complete and the image with the last one.
+# Groups of files (at most 64 files or 8 MiB, one request) a completion fetches
+# at the same time; a pull that a `run` or a `pull` waits for fetches
+# `lazy_fetches` at a time
+lazy_complete_fetches = 4
+# Lazy pulls the engine service completes in the background at the same time;
+# the others are queued (a pull that a container is made on, or that a command
+# waits for, is not).  0: none is completed in the background, only when a
+# command asks for it (`velarx image complete`, a pull or a run without --lazy)
+lazy_completers = 2
+# Seconds a completion waits at most between two tries of a fetch that failed
+# for a reason that may pass (the network, a registry that answers 5xx or 429);
+# it starts at one second and doubles.  A completion never gives up on those; an
+# error that trying again cannot mend (the layer is not what its table says, the
+# registry has lost the blob) stops it, the staging is kept and `velarx image
+# pulls` says why
+lazy_retry_max_secs = 600
+# The files of lazily pulled images come from the fetchers of `sources`, and
+# last from the registry, a fetcher too (`velarx-registry`, with
+# the pull workers above): the one the engine starts (its socket is
+# `registry-<digest>/registry.sock` in the services directory) and shares with
+# the monitors of its containers (and with the engines of the same
+# configuration): it is held by their connections and leaves when the last
+# one closes.  The most connections
+# it serves at once: each monitor of a container with lazy layers holds one,
+# and one or two more while it fetches.
+fetcher_connections = 1024
+# A file a container misses is fetched at once; the files that follow it in
+# its layer (the order of the startup profile when it names the file, else
+# that of the tar, where programs keep what they read together) are fetched
+# in the background in one plan, so that their chunks go to a peer in one
+# request or to the registry in one merged range.  At most
+# this many files and KiB (0 for either: only the file that was asked for);
+# files the store has or another fetch holds are left out.
+lazy_window_files = 64
+lazy_window_kib = 4096
+# The first time a lazily pulled image runs, the files its container looks up
+# in the first seconds are noted (a list of digests in the store's composefs
+# directory).  Containers of the image started
+# after that fetch those files first, in that order, before the rest of the
+# image: a cold start reads what is already there.  Later runs add the files
+# the list lacked; a run the list served poorly (most of what it looked up was
+# not in it, or most of it was not looked up) replaces it, at most three times
+# per image.  The list is only an order: its files must belong to the
+# image and are fetched and verified like any other.  Delete the
+# `*.profile.json` file to record again.  0 seconds: no profile.
+lazy_profile_secs = 10
+# Files in a profile at most
+lazy_profile_files = 4096
+# The first container of an image this node has no profile for asks the
+# sources (the peers of the swarm) for theirs, and fetches the files of the
+# image in that order.  Only an order: every file is checked as it is fetched.
+lazy_profile_peers = true
+# Where the content of images comes from, in order.  The registry is the
+# origin and always last (it is added when missing).  Every source is untrusted:
+# sizes and digests are verified and a source that fails, sends wrong bytes or
+# is too slow is skipped and the next one is asked.  By default
+# ["registry"].  interfaces/org.velarx.Fetcher.varlink is the interface to
+# write one.
+# sources = ["dircache", "peers", "registry"]
+# Chunks asked of a source in one request
+# source_batch = 64
+# Time a source gets: to say what it has, to serve a request (plus its bytes
+# at the minimum rate), and how long it is skipped after it failed
+# source_has_timeout_ms = 3000
+# source_fetch_timeout_secs = 20
+# source_min_rate_kib = 1024
+# source_cooldown_secs = 30
+
+[push]
+# Layers regenerated and uploaded at the same time
+parallel_layers = 3
+# Size of the pieces of a blob upload
+chunk_mib = 16
+# The helper sinks of a push, in order: names of [[sinks.external]].  The
+# destination's own pusher (registry, directory, or the [[transports]] of
+# its scheme) always follows them, added by the engine: do not name it.
+# What a helper says it placed is confirmed by the destination's own before
+# the manifest is put.  `velarx push --sinks NAME,...` sets it for one push; a
+# helper silent for its idle_timeout_secs fails the push that named it and is
+# left out of a push by this list.
+# sinks = []
+# The compression of the layers that are regenerated: gzip, zstd or
+# zstd:chunked (by default each keeps its own, and one stored uncompressed
+# is compressed as zstd:chunked), and its level
+# compression = "zstd:chunked"
+# compression_level = 3
+# Send the repositories known to have a blob, so a pusher can link it
+# mount = true
+# Ask the pushers what the destination has before regenerating a layer
+# skip_existing = true
+
+[build]
+# What one COPY, ADD or context extraction may write, in GiB
+max_extract_gib = 64
+# Archive entries one ADD or context extraction may have
+max_extract_entries = 4194304
+# A copy worker that runs longer is killed, in seconds
+worker_timeout_secs = 3600
+# Builds that run at the same time; the others wait
+max_concurrent = 4
+# Builds that run or wait at the same time (each holds its context): above
+# it a build is refused before its context is read (the REST API answers 503)
+max_pending = 16
+# The scratch space of all the builds together (contexts, the layers of
+# COPY and ADD, --squash), in GiB
+max_scratch_gib = 100
+# The algorithm of the digests of the images that `build`, `import`,
+# `manifest create` and `artifact add` make (their layers, configuration,
+# manifest and annotations), "sha256" or "sha512"; `--digest` overrides it.
+# `commit` follows the image of its container (`commit --digest` sets it).
+# It never applies to pulls: an image is pulled with the digests it has.
+# On a store whose file system has fs-verity, "sha512" needs its SHA-512
+# hash: without it the command fails by name before it makes anything (a
+# file system without fs-verity follows the rules of sha256).  Pushing the
+# result needs a registry that takes sha512 digests.
+digest = "sha256"
+# What a build may do that goes beyond the sandbox of its RUN steps (as
+# BuildKit's entitlements; none by default):
+#   "network.host"      RUN --network=host, and a build with --network=host:
+#                       the steps share the network of the engine (for an
+#                       engine run as root, the real network of the host;
+#                       rootless, the network namespace of the user)
+#   "security.insecure" RUN --security=insecure: the step runs as
+#                       `run --privileged` does (all capabilities, no seccomp,
+#                       AppArmor or SELinux confinement, the devices of the host)
+# A build that needs an entitlement fails before its first step unless it is
+# listed here AND the request allows it (`velarx build --allow network.host`).
+# The REST build routes (Docker's and podman's) cannot say `allow`: for them
+# this list alone decides, as with Docker's classic builder where the daemon
+# does.  Whoever can reach the API is an administrator (docs/THREAT-MODEL.md).
+insecure_entitlements = []
+
+# The OCI runtimes a container can be made with besides the default one ([server]
+# runtime, --runtime): a name and the path of the runtime, or a list of paths
+# (the first that is there).  The name is what
+# `oci_runtime` of the API, the runtime handler of a Kubernetes RuntimeClass,
+# [server] runtime and --runtime say; a client of the API can ask only for
+# these names and the default one.  The options of [server] runtime_args go to
+# every runtime (crun's --cgroup-manager only to crun and krun).  A table
+# gives a runtime options of its own, after those: gVisor's runsc rootless needs
+# --rootless and --ignore-cgroups, which no other runtime knows.
+# [runtimes]
+# krun = "/usr/bin/krun"
+# runc = ["/usr/bin/runc", "/usr/local/bin/runc"]
+# [runtimes.runsc]
+# path = "/usr/local/bin/runsc"
+# args = ["--rootless", "--ignore-cgroups"]
+
+[containers]
+# What the signature policy must say of the image of a container.  "policy":
+# when the container is created, the signedBy and sigstoreSigned rules of
+# policy.json for each name of the image must accept a signature stored with
+# it; an image whose rules ask for no signature runs, and so does one under a
+# "reject" rule ("reject" refuses pulls only).  A start does not check again.  "require": checked when the container
+# is created and at every start by the engine, with the policy of that moment:
+# a signedBy or sigstoreSigned rule must have accepted a signature for every
+# name of the image (its tags and the names it was pulled by); an image with no
+# name (no tag, never pulled) asked for by its id, one whose name the policy
+# accepts without a signature (insecureAcceptAnything), or one under
+# a "reject" rule, is refused.  The images mounted in a container (--mount
+# type=image) are judged too, and so is the infra image of a pod: the pause
+# image velarx builds has no signature, so set infra_image to a signed image
+# under "require", or where the policy asks a signature of
+# localhost/velarx-pause.  A --rootfs container has no image and is not
+# checked.  --security-opt signature=require asks for "require" for one
+# container; signature=check judges the whole policy, "reject" included (an image the
+# policy accepts without a signature runs), at the create, keeps that in the
+# container and judges again at every start by the engine; an image with no name (no tag, asked for by
+# its id, never pulled) cannot be judged and is refused; check is
+# refused under "require".  A restart by the monitor's own restart policy
+# checks nothing.
+# docs/SIGNING.md is a walk through keys, signed pushes and these options.
+image_signature = "policy"
+# The log driver of containers that do not choose one with --log-driver:
+# "k8s-file" (the CRI format, in a file), "journald", "none" or "passthrough"
+# (the container writes to the output of its monitor).  Empty: "journald" on
+# a host that runs systemd with a journal the user can read (a directory of
+# a machine in /run/log/journal or /var/log/journal), else "k8s-file".  The driver is kept with the container when it is created.
+log_driver = ""
+# Rotate the log of a container when it grows past this size (0: never);
+# --log-opt max-size=SIZE sets it for one container
+log_max_size = "0"
+# Log files kept for a container, the current one included (--log-opt max-file=N)
+# A `logs --follow` that falls further behind than the files kept loses the
+# records of the files deleted meanwhile
+log_max_files = 1
+# The most all the log files of a container may take, 0 for no limit
+# (--log-opt global-size-max=SIZE)
+log_global_size_max = "0"
+# Compress the rotated log files (gzip; the newest stays plain)
+log_compress = false
+# The directories a `--log-opt path` must be in (empty: any); the monitor opens
+# the file below one without following symbolic links
+# log_path_allowlist = ["/var/log/containers"]
+# The image of the infra containers of pods, pulled when it is missing.  Unset:
+# a local image (localhost/velarx-pause:VERSION) is made from the host's
+# static catatonit, with nothing to pull.
+# infra_image = "registry.k8s.io/pause:3.10"
+# What the infra container of infra_image runs (default: the image's command)
+# infra_command = ["/pause"]
+# CDI devices (--device vendor.com/class=name) are read from the spec files
+# (.json and .yaml) of these directories, at each create; a later directory has
+# priority over an earlier one (default: /etc/cdi and /var/run/cdi).
+# A spec file is used only when root or the user of the engine owns it and
+# neither it nor its directory is writable by others: its hooks are programs the
+# runtime runs and its mounts and nodes reach the host.
+# cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
+# After a container exits, how long its monitor waits for the rest of its
+# output, in milliseconds
+output_drain_ms = 1000
+# How long an attached client may refuse the output of a container before it
+# is disconnected, in seconds (the container waits for it meanwhile)
+client_stall_secs = 30
+# `pod logs --follow` merges the logs of the containers of the pod by the time
+# of their lines.  A line is held back at most this long (milliseconds) to be
+# put in order with the lines of the other containers.  A line that arrives
+# later than that (after a line with a later time was given) comes out of
+# order.  A larger value orders more strictly, a smaller one shows the lines
+# sooner
+log_follow_window_ms = 100
+# The --cgroups mode of a container that asks for none (run, create, kube
+# play, the API, the infra containers of pods): "enabled" (the default),
+# "disabled" (no cgroup at all: a resource limit is then an error),
+# "no-conmon" or "split"; for the engine service "enabled" and the default
+# are "split": the containers are next to the daemon's engine/ cgroup
+# (<cgroup>/<id>/container, its monitor in <cgroup>/<id>/runtime), stopped
+# with the daemon's unit (a reload or `velarx system restart` keeps them and
+# finds them again by their ids), and the daemon does not start with "split"
+# where it has no delegated cgroup.  "scope" puts every container in a systemd
+# scope of its own, velarx-<id>.scope, outside the cgroup of the engine's
+# unit, so that the containers outlive a `systemctl restart`; with no systemd manager to make scopes it is an
+# error.  A container keeps the one it was made with.  The containers of the
+# CRI (the kubelet's cgroups) and the RUN steps of a build do not take it
+# cgroups = "enabled"
+# The network mode of a container that asks for none: "bridge", "host",
+# "none", "pasta", "private", "ns:PATH"... (default: a bridge for root, pasta
+# rootless)
+# netns = "host"
+# No /etc/hosts for the containers (--no-hosts)
+# no_hosts = false
+# The file the /etc/hosts of the containers starts with (default: the host's
+# /etc/hosts; "none": no entries of the host)
+# base_hosts_file = "/etc/velarx/hosts"
+# The keys that detach from a container or an exec session with a terminal
+# when the command names none (--detach-keys; "" for none)
+# detach_keys = "ctrl-p,ctrl-q"
+# The directories of the OCI hooks; --hooks-dir takes the place of this.
+# Default: /usr/share/velarx/oci/hooks.d and /etc/velarx/oci/hooks.d (a file of
+# the later one replaces the one of the same name) for root, none rootless
+# hooks_dir = ["/etc/velarx/oci/hooks.d"]
+# Whether the OCI runtime gives each container a kernel session keyring of its
+# own.  The keys count against the quota of the user
+# (kernel.keys.maxkeys, 200 and maxbytes, 20000 by default): a rootless user
+# runs about 190 containers, the next one fails with `join keyctl: Disk quota
+# exceeded`.  false creates the containers with --no-new-keyring: they keep the
+# session keyring of their monitor, which is not a keyring of their own (no
+# key, and the processes of the containers of a user share it and the keys in
+# it).  The CRI follows it too; the RUN steps of a build do not (as buildah's:
+# a rootless one always gets --no-new-keyring, a root one never); `exec` and
+# `restore` take no such option (a restored container never has a keyring of
+# its own: CRIU does not restore one).  A runtime whose `create --help` lacks
+# --no-new-keyring (youki, runsc, kata) refuses the containers when this is
+# false.
+# keyring = true
+# The pids limit of a container that gives none (--pids-limit): a fork bomb in a container stops there.  0 or less: no limit.
+# A container with no cgroup of its own (--cgroups=disabled) has none.
+# pids_limit = 2048
+
+[userns]
+# Ranges (START-END) that --userns=auto and private take their ids from when
+# the daemon runs as root.  Without them, the sub ids of the user `auto_user`
+# in /etc/subuid and /etc/subgid are used (add `containers:786432:65536`).
+# A rootless daemon uses the ids of its own user namespace.
+# uid_ranges = ["786432-852967"]
+# gid_ranges = ["786432-852967"]
+# The user of /etc/subuid that delegates the ids of automatic namespaces
+auto_user = "containers"
+# Smallest and largest number of ids of --userns=auto (0: no limit)
+auto_min_size = 1024
+auto_max_size = 65536
+# IDs per --userns=private namespace
+allocation_size = 65536
+# Serve the files of an image whose owner has no id in the user namespace as
+# owned by the root of the container, instead of refusing to start it
+squash_unmapped_owners = false
+
+[network]
+[network.bridge]
+# Default bridge name
+default_bridge = "velarx0"
+# Bridge subnet
+subnet = "10.90.0.0/24"
+# Bridge gateway
+gateway = "10.90.0.1"
+
+# A network provider: a separate process on a unix socket speaking
+# `org.velarx.Network` (interfaces for the container before it is created,
+# its network when it runs, and when it is gone).  A container uses it with
+# `--network provider:NAME`, through the engine service (the engine of a command
+# alone has no providers).  The provider runs as the user of the server or as
+# root.
+# [[network.providers]]
+# name = "overlay"
+# socket = "/run/velarx/services/p2p-network.sock"
+
+# CNI networks (`--network cni:NAME`, or `cni:` for the first configuration):
+# the plugins of a configuration of conf_dir are run by a daemon running as
+# root, for the containers that name it.  Kubernetes pods (velarx-cri
+# --pod-network cni) use it.
+[network.cni]
+# Network configurations (.conflist, .conf, .json)
+conf_dir = "/etc/cni/net.d"
+# The plugins, searched in this order
+bin_dirs = ["/opt/cni/bin", "/usr/libexec/cni"]
+# The cache of the results (results/ below), in libcni's format and of this
+# daemon only: it releases the attachments of the containers it does not know
+cache_dir = "/var/lib/velarx/cni"
+# Seconds a plugin may take for a command before it is killed
+timeout_secs = 60
+
+# Where the subnets of the bridge networks created without one come from;
+# none: the /24s of 10.90.0.0/16
+# [[network.subnet_pools]]
+# base = "10.89.0.0/16"
+# size = 24
+
+[sources]
+# A content source: a separate process on a unix socket speaking
+# `org.velarx.Fetcher` (interfaces/org.velarx.Fetcher.varlink; examples/dircache.rs serves a
+# directory of files named by digest).  It runs as the user of the process
+# that asks, or as root; its socket is in a directory only that user can
+# enter.  The process that pulls connects when it needs the source, so a
+# source that is not running is skipped, and one that is started by systemd
+# socket activation is started by the connection.
+# [[sources.external]]
+# name = "dircache"
+# socket = "/run/user/1000/velarx/services/dircache.sock"
+# Seconds without a reply after which the source is given up
+# idle_timeout_secs = 15
+# Every pull asks a source, private ones included: it is the user's own.  One
+# that asks other nodes says so, and only the pulls that may be shared
+# ([pull] share_registries) ask it, like the service of a swarm of nodes:
+# peer = false
+#
+# [[sources.external]]
+# name = "peers"
+# socket = "/run/velarx/services/p2p-fetcher.sock"
+# idle_timeout_secs = 30
+# peer = true
+#
+# or a directory of files named by the hex of their SHA-256, read in the
+# process that pulls (no daemon, no socket):
+# [[sources.external]]
+# name = "mirror"
+# dir = "/srv/velarx-mirror"
+#
+# Helper sinks (the process on a socket is asked first for the objects the
+# engine hands it, named in [push] sinks; it knows nothing of the other
+# pushers).  It is given the credentials of the destination only when its
+# definition says so:
+# [[sinks.external]]
+# name = "backup"
+# socket = "/run/user/1000/velarx/services/backup.sock"
+# idle_timeout_secs = 15
+# credentials = false
+#
+# (examples/dirsink.rs is one: `velarx push --sinks backup IMAGE DEST` and
+# `velarx manifest push --sinks backup LIST DEST` ask it first)
+#
+# A process that is the origin of a scheme of its own, for both directions:
+# `velarx push IMAGE s3://bucket/name` is put there by the pusher on the socket
+# and `velarx pull s3://bucket/name` is served by its fetcher (it announces the
+# capability `origin` in the `GetInfo` of each interface it serves).  The scheme is none of velarx's transports.  The pusher
+# and the helpers are told the destination as written (`s3://bucket/name:1`) and
+# the commit names the tag it has (`1`; none: the manifest by its digest);
+# `velarx manifest push LIST s3://bucket/name:1` goes there too (the images by
+# their digests to `s3://bucket/name`).  No more than 15 seconds of silence in
+# a call (a long Put must send Progress events, each reply restarts the time;
+# the wait for the engine's own connection does not count), and the push fails
+# naming `s3`.  A destination has no `user:secret@`: use `velarx login
+# s3://bucket`, which writes the entry.  With `credentials = true` the
+# pusher gets `--creds`, `--cert-dir` and the auth file entry of exactly
+# `s3://bucket` (SCHEME://AUTHORITY: never a docker.io or registry entry, whatever
+# --tls-verify says); with false it gets none:
+# [[transports]]
+# scheme = "s3"
+# socket = "/run/user/1000/velarx/services/s3.sock"
+# idle_timeout_secs = 15
+# credentials = false

@@ -1,0 +1,949 @@
+// SPDX-License-Identifier: Apache-2.0
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum ChunkedError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON parse error: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+pub type ChunkedResult<T> = Result<T, ChunkedError>;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TocEntryType {
+    Dir,
+    Reg,
+    Symlink,
+    Hardlink,
+    Char,
+    Block,
+    Fifo,
+    Chunk,
+}
+
+impl TocEntryType {
+    #[cfg(test)]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TocEntryType::Dir => "dir",
+            TocEntryType::Reg => "reg",
+            TocEntryType::Symlink => "symlink",
+            TocEntryType::Hardlink => "hardlink",
+            TocEntryType::Char => "char",
+            TocEntryType::Block => "block",
+            TocEntryType::Fifo => "fifo",
+            TocEntryType::Chunk => "chunk",
+        }
+    }
+}
+
+/// Chunk type constants matching Go implementation
+/// ChunkTypeData is "" (empty string) for normal data chunks
+/// ChunkTypeZeros is "zeros" for zero-filled chunks (sparse file holes)
+#[cfg(test)]
+pub const CHUNK_TYPE_DATA: &str = "";
+pub const CHUNK_TYPE_ZEROS: &str = "zeros";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TocEntry {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub entry_type: TocEntryType,
+    #[serde(default)]
+    pub mode: u32,
+    #[serde(default)]
+    pub uid: u32,
+    #[serde(default)]
+    pub gid: u32,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// The fs-verity digest of a regular file with content
+    /// (`sha256-12:HEX`, see [`crate::from_toc`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fsverity: Option<String>,
+    #[serde(default)]
+    pub offset: u64,
+    #[serde(default, rename = "endOffset")]
+    pub end_offset: u64,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "chunkDigest")]
+    pub chunk_digest: Option<String>,
+    #[serde(default, rename = "chunkSize")]
+    pub chunk_size: u64,
+    #[serde(default, rename = "chunkOffset")]
+    pub chunk_offset: u64,
+    /// Chunk type: "" for data chunks, "zeros" for zero-filled chunks
+    /// Matches Go's ChunkTypeData and ChunkTypeZeros constants
+    #[serde(skip_serializing_if = "Option::is_none", rename = "chunkType")]
+    pub chunk_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "linkName")]
+    pub link_name: Option<String>,
+    /// Modification time - Go uses lowercase "modtime"
+    #[serde(skip_serializing_if = "Option::is_none", rename = "modtime")]
+    pub mod_time: Option<String>,
+    /// Access time - Go uses lowercase "accesstime"
+    #[serde(skip_serializing_if = "Option::is_none", rename = "accesstime")]
+    pub access_time: Option<String>,
+    /// Change time - Go uses lowercase "changetime"
+    #[serde(skip_serializing_if = "Option::is_none", rename = "changetime")]
+    pub change_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "devMajor")]
+    pub dev_major: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "devMinor")]
+    pub dev_minor: Option<u32>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub xattrs: HashMap<String, String>,
+}
+
+/// A time of a table of contents (RFC 3339) as seconds since the epoch
+/// (negative before it) and nanoseconds (0 to 999 999 999, after the
+/// seconds); none when there is none or it is not RFC 3339.
+pub fn toc_time(t: Option<&str>) -> Option<(i64, u32)> {
+    let d = chrono::DateTime::parse_from_rfc3339(t?).ok()?;
+    Some((d.timestamp(), d.timestamp_subsec_nanos()))
+}
+
+impl TocEntry {
+    /// The modification time in seconds since the epoch (0 when the entry
+    /// has none or it is not RFC 3339).
+    pub fn mtime_secs(&self) -> i64 {
+        self.mtime().0
+    }
+
+    /// The modification time: seconds since the epoch (before it for a
+    /// time before 1970) and nanoseconds; `(0, 0)` when the entry has none
+    /// or it is not RFC 3339.  The one reading of the times of a table of
+    /// contents.
+    pub fn mtime(&self) -> (i64, u32) {
+        toc_time(self.mod_time.as_deref()).unwrap_or((0, 0))
+    }
+
+    /// The object digest (`sha256:HEX`) the TOC gives for the file, if it
+    /// gives one of the kind the store uses.
+    pub fn verity(&self) -> Option<String> {
+        self.fsverity.as_deref().and_then(super::from_toc)
+    }
+
+    /// What a pull knows the content of a regular file by: its fs-verity
+    /// digest, or the sha256 the TOC gives when it gives no fs-verity digest
+    /// (the pull finds the fs-verity digest of the content it checked).
+    pub fn content_key(&self) -> Option<String> {
+        self.verity().or_else(|| self.digest.clone())
+    }
+
+    /// Returns true if this is a zero-filled chunk (sparse file hole)
+    pub fn is_zeros_chunk(&self) -> bool {
+        self.chunk_type.as_deref() == Some(CHUNK_TYPE_ZEROS)
+    }
+
+    /// Returns true if this is a data chunk (default)
+    #[cfg(test)]
+    pub fn is_data_chunk(&self) -> bool {
+        match &self.chunk_type {
+            None => true,
+            Some(t) => t.is_empty() || t == CHUNK_TYPE_DATA,
+        }
+    }
+}
+
+/// TOC version
+pub const TOC_VERSION: i32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Toc {
+    pub version: i32,
+    pub entries: Vec<TocEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tar_split_digest: Option<String>,
+}
+
+impl AsRef<[TocEntry]> for Toc {
+    fn as_ref(&self) -> &[TocEntry] {
+        &self.entries
+    }
+}
+
+impl Toc {
+    pub fn find_by_name(&self, name: &str) -> Option<&TocEntry> {
+        self.entries.iter().find(|e| e.name == name)
+    }
+
+    pub fn get_file_chunks(&self, name: &str) -> Vec<&TocEntry> {
+        let mut chunks = Vec::new();
+        let mut found = false;
+
+        for entry in &self.entries {
+            if entry.name == name && entry.entry_type == TocEntryType::Reg {
+                chunks.push(entry);
+                found = true;
+            } else if found && entry.entry_type == TocEntryType::Chunk && entry.name == name {
+                chunks.push(entry);
+            } else if found && entry.name != name {
+                break;
+            }
+        }
+
+        chunks
+    }
+}
+
+pub fn parse_toc_from_bytes(data: &[u8]) -> ChunkedResult<Toc> {
+    let toc: Toc = serde_json::from_slice(data)?;
+    Ok(toc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_toc_entry_type_serialization() {
+        let entry = TocEntry {
+            name: "test.txt".to_string(),
+            entry_type: TocEntryType::Reg,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            size: 100,
+            digest: Some("sha256:abc".to_string()),
+            fsverity: None,
+            offset: 0,
+            end_offset: 100,
+            chunk_digest: None,
+            chunk_size: 0,
+            chunk_offset: 0,
+            chunk_type: None,
+            link_name: None,
+            mod_time: None,
+            access_time: None,
+            change_time: None,
+            dev_major: None,
+            dev_minor: None,
+            xattrs: HashMap::new(),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"type\":\"reg\""));
+    }
+
+    #[test]
+    fn test_toc_parsing() {
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "name": "etc",
+                    "type": "dir",
+                    "mode": 493,
+                    "uid": 0,
+                    "gid": 0,
+                    "size": 0
+                },
+                {
+                    "name": "etc/passwd",
+                    "type": "reg",
+                    "mode": 420,
+                    "uid": 0,
+                    "gid": 0,
+                    "size": 1024,
+                    "digest": "sha256:abc123",
+                    "offset": 0,
+                    "endOffset": 512
+                }
+            ]
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+        assert_eq!(toc.version, 1);
+        assert_eq!(toc.entries.len(), 2);
+        assert_eq!(toc.entries[0].entry_type, TocEntryType::Dir);
+        assert_eq!(toc.entries[1].entry_type, TocEntryType::Reg);
+    }
+
+    /// Test all entry types match the Go implementation
+    /// Corresponds to: TypeReg, TypeLink, TypeChar, TypeBlock, TypeDir, TypeFifo, TypeSymlink, TypeChunk
+    #[test]
+    fn test_all_entry_types() {
+        assert_eq!(TocEntryType::Reg.as_str(), "reg");
+        assert_eq!(TocEntryType::Hardlink.as_str(), "hardlink");
+        assert_eq!(TocEntryType::Char.as_str(), "char");
+        assert_eq!(TocEntryType::Block.as_str(), "block");
+        assert_eq!(TocEntryType::Dir.as_str(), "dir");
+        assert_eq!(TocEntryType::Fifo.as_str(), "fifo");
+        assert_eq!(TocEntryType::Symlink.as_str(), "symlink");
+        assert_eq!(TocEntryType::Chunk.as_str(), "chunk");
+    }
+
+    /// Test FileMetadata fields match the Go struct
+    /// Go struct: Type, Name, Linkname, Mode, Size, UID, GID, ModTime, AccessTime, ChangeTime,
+    ///            Devmajor, Devminor, Xattrs, Digest, Offset, EndOffset, ChunkSize, ChunkOffset, ChunkDigest, ChunkType
+    #[test]
+    fn test_file_metadata_fields_match_go() {
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "type": "reg",
+                    "name": "/usr/bin/test",
+                    "linkName": "",
+                    "mode": 493,
+                    "size": 12345,
+                    "uid": 1000,
+                    "gid": 1000,
+                    "modtime": "2024-01-15T10:30:00Z",
+                    "accesstime": "2024-01-15T11:00:00Z",
+                    "changetime": "2024-01-15T10:30:00Z",
+                    "devMajor": 0,
+                    "devMinor": 0,
+                    "xattrs": {
+                        "security.selinux": "dW5jb25maW5lZF91Om9iamVjdF9yOnVzZXJfaG9tZV90OnMw"
+                    },
+                    "digest": "sha256:abc123def456",
+                    "offset": 100,
+                    "endOffset": 12445,
+                    "chunkSize": 1048576,
+                    "chunkOffset": 0,
+                    "chunkDigest": "sha256:chunk123"
+                }
+            ]
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+        assert_eq!(toc.entries.len(), 1);
+
+        let entry = &toc.entries[0];
+        assert_eq!(entry.entry_type, TocEntryType::Reg);
+        assert_eq!(entry.name, "/usr/bin/test");
+        assert_eq!(entry.mode, 493);
+        assert_eq!(entry.size, 12345);
+        assert_eq!(entry.uid, 1000);
+        assert_eq!(entry.gid, 1000);
+        assert_eq!(entry.mod_time, Some("2024-01-15T10:30:00Z".to_string()));
+        assert_eq!(entry.access_time, Some("2024-01-15T11:00:00Z".to_string()));
+        assert_eq!(entry.change_time, Some("2024-01-15T10:30:00Z".to_string()));
+        assert_eq!(entry.dev_major, Some(0));
+        assert_eq!(entry.dev_minor, Some(0));
+        assert_eq!(
+            entry.xattrs.get("security.selinux"),
+            Some(&"dW5jb25maW5lZF91Om9iamVjdF9yOnVzZXJfaG9tZV90OnMw".to_string())
+        );
+        assert_eq!(entry.digest, Some("sha256:abc123def456".to_string()));
+        assert_eq!(entry.offset, 100);
+        assert_eq!(entry.end_offset, 12445);
+        assert_eq!(entry.chunk_size, 1048576);
+        assert_eq!(entry.chunk_offset, 0);
+        assert_eq!(entry.chunk_digest, Some("sha256:chunk123".to_string()));
+    }
+
+    /// Test symlink entry with linkName field
+    #[test]
+    fn test_symlink_entry() {
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "type": "symlink",
+                    "name": "/usr/bin/python",
+                    "linkName": "/usr/bin/python3",
+                    "mode": 511,
+                    "uid": 0,
+                    "gid": 0
+                }
+            ]
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+        let entry = &toc.entries[0];
+        assert_eq!(entry.entry_type, TocEntryType::Symlink);
+        assert_eq!(entry.name, "/usr/bin/python");
+        assert_eq!(entry.link_name, Some("/usr/bin/python3".to_string()));
+    }
+
+    /// Test hardlink entry with linkName field
+    #[test]
+    fn test_hardlink_entry() {
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "type": "hardlink",
+                    "name": "/usr/bin/link",
+                    "linkName": "/usr/bin/original",
+                    "mode": 493,
+                    "uid": 0,
+                    "gid": 0
+                }
+            ]
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+        let entry = &toc.entries[0];
+        assert_eq!(entry.entry_type, TocEntryType::Hardlink);
+        assert_eq!(entry.name, "/usr/bin/link");
+        assert_eq!(entry.link_name, Some("/usr/bin/original".to_string()));
+    }
+
+    /// Test device entries with devMajor/devMinor
+    #[test]
+    fn test_device_entries() {
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "type": "char",
+                    "name": "/dev/null",
+                    "mode": 438,
+                    "uid": 0,
+                    "gid": 0,
+                    "devMajor": 1,
+                    "devMinor": 3
+                },
+                {
+                    "type": "block",
+                    "name": "/dev/sda",
+                    "mode": 432,
+                    "uid": 0,
+                    "gid": 6,
+                    "devMajor": 8,
+                    "devMinor": 0
+                }
+            ]
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+
+        let char_dev = &toc.entries[0];
+        assert_eq!(char_dev.entry_type, TocEntryType::Char);
+        assert_eq!(char_dev.dev_major, Some(1));
+        assert_eq!(char_dev.dev_minor, Some(3));
+
+        let block_dev = &toc.entries[1];
+        assert_eq!(block_dev.entry_type, TocEntryType::Block);
+        assert_eq!(block_dev.dev_major, Some(8));
+        assert_eq!(block_dev.dev_minor, Some(0));
+    }
+
+    /// Test chunk entries (TypeChunk in Go)
+    /// Chunks represent portions of large files for deduplication
+    #[test]
+    fn test_chunk_entries() {
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "type": "reg",
+                    "name": "/large_file",
+                    "mode": 420,
+                    "size": 3145728,
+                    "uid": 0,
+                    "gid": 0,
+                    "digest": "sha256:wholefile",
+                    "offset": 0,
+                    "endOffset": 1048576,
+                    "chunkSize": 1048576,
+                    "chunkOffset": 0,
+                    "chunkDigest": "sha256:chunk1"
+                },
+                {
+                    "type": "chunk",
+                    "name": "/large_file",
+                    "offset": 1048576,
+                    "endOffset": 2097152,
+                    "chunkSize": 1048576,
+                    "chunkOffset": 1048576,
+                    "chunkDigest": "sha256:chunk2"
+                },
+                {
+                    "type": "chunk",
+                    "name": "/large_file",
+                    "offset": 2097152,
+                    "endOffset": 3145728,
+                    "chunkSize": 1048576,
+                    "chunkOffset": 2097152,
+                    "chunkDigest": "sha256:chunk3"
+                }
+            ]
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+        assert_eq!(toc.entries.len(), 3);
+
+        assert_eq!(toc.entries[0].entry_type, TocEntryType::Reg);
+        assert_eq!(toc.entries[0].size, 3145728);
+        assert_eq!(
+            toc.entries[0].chunk_digest,
+            Some("sha256:chunk1".to_string())
+        );
+
+        assert_eq!(toc.entries[1].entry_type, TocEntryType::Chunk);
+        assert_eq!(toc.entries[1].chunk_offset, 1048576);
+
+        assert_eq!(toc.entries[2].entry_type, TocEntryType::Chunk);
+        assert_eq!(toc.entries[2].chunk_offset, 2097152);
+
+        let chunks = toc.get_file_chunks("/large_file");
+        assert_eq!(chunks.len(), 3);
+    }
+
+    /// Test TOC with tarSplitDigest field
+    #[test]
+    fn test_toc_with_tarsplit_digest() {
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [],
+            "tarSplitDigest": "sha256:tarsplit123"
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+        assert_eq!(toc.version, 1);
+        assert_eq!(toc.tar_split_digest, Some("sha256:tarsplit123".to_string()));
+    }
+
+    /// Test xattrs are base64 encoded (matching Go implementation)
+    #[test]
+    fn test_xattrs_base64_encoded() {
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "type": "reg",
+                    "name": "/test",
+                    "mode": 420,
+                    "uid": 0,
+                    "gid": 0,
+                    "size": 0,
+                    "xattrs": {
+                        "user.test": "dGVzdCB2YWx1ZQ=="
+                    }
+                }
+            ]
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+        let entry = &toc.entries[0];
+
+        // xattrs values are base64 encoded in TOC
+        let encoded_value = entry.xattrs.get("user.test").unwrap();
+        assert_eq!(encoded_value, "dGVzdCB2YWx1ZQ==");
+
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded_value)
+                .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "test value");
+    }
+
+    /// Test the lookup of an entry by name
+    #[test]
+    fn test_find_by_name() {
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [
+                {"type": "reg", "name": "/usr/bin/test", "mode": 493, "uid": 0, "gid": 0, "size": 100}
+            ]
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+
+        let found = toc.find_by_name("/usr/bin/test");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().entry_type, TocEntryType::Reg);
+
+        let not_found = toc.find_by_name("/nonexistent");
+        assert!(not_found.is_none());
+    }
+
+    /// Test parsing TOC with empty optional fields (defaults)
+    #[test]
+    fn test_toc_optional_field_defaults() {
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "type": "reg",
+                    "name": "/minimal"
+                }
+            ]
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+        let entry = &toc.entries[0];
+
+        assert_eq!(entry.mode, 0);
+        assert_eq!(entry.uid, 0);
+        assert_eq!(entry.gid, 0);
+        assert_eq!(entry.size, 0);
+        assert_eq!(entry.offset, 0);
+        assert_eq!(entry.end_offset, 0);
+        assert_eq!(entry.chunk_size, 0);
+        assert_eq!(entry.chunk_offset, 0);
+
+        assert!(entry.digest.is_none());
+        assert!(entry.chunk_digest.is_none());
+        assert!(entry.link_name.is_none());
+        assert!(entry.mod_time.is_none());
+        assert!(entry.access_time.is_none());
+        assert!(entry.change_time.is_none());
+        assert!(entry.dev_major.is_none());
+        assert!(entry.dev_minor.is_none());
+
+        assert!(entry.xattrs.is_empty());
+    }
+
+    /// Test serialization roundtrip
+    #[test]
+    fn test_toc_serialization_roundtrip() {
+        let original = Toc {
+            version: 1,
+            entries: vec![TocEntry {
+                name: "/test/file".to_string(),
+                entry_type: TocEntryType::Reg,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                size: 1234,
+                digest: Some("sha256:abc".to_string()),
+                fsverity: None,
+                offset: 100,
+                end_offset: 1334,
+                chunk_digest: None,
+                chunk_size: 0,
+                chunk_offset: 0,
+                chunk_type: None,
+                link_name: None,
+                mod_time: Some("2024-01-15T10:30:00Z".to_string()),
+                access_time: None,
+                change_time: None,
+                dev_major: None,
+                dev_minor: None,
+                xattrs: HashMap::new(),
+            }],
+            tar_split_digest: Some("sha256:tarsplit".to_string()),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: Toc = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.version, original.version);
+        assert_eq!(parsed.entries.len(), original.entries.len());
+        assert_eq!(parsed.entries[0].name, original.entries[0].name);
+        assert_eq!(parsed.entries[0].digest, original.entries[0].digest);
+        assert_eq!(parsed.tar_split_digest, original.tar_split_digest);
+    }
+
+    // the chunk types, as Go's containers/storage has them
+
+    /// Test ChunkType constants match Go implementation
+    /// Go: ChunkTypeData = "", ChunkTypeZeros = "zeros"
+    #[test]
+    fn test_chunk_type_constants() {
+        assert_eq!(CHUNK_TYPE_DATA, "");
+        assert_eq!(CHUNK_TYPE_ZEROS, "zeros");
+    }
+
+    /// Test parsing TOC with zeros chunk type (sparse file holes)
+    /// This matches Go's handling of ChunkTypeZeros in containers/storage
+    #[test]
+    fn test_zeros_chunk_type_parsing() {
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "type": "reg",
+                    "name": "/sparse_file",
+                    "mode": 420,
+                    "size": 10485760,
+                    "uid": 0,
+                    "gid": 0,
+                    "digest": "sha256:sparsedigest",
+                    "offset": 0,
+                    "endOffset": 1048576,
+                    "chunkSize": 1048576,
+                    "chunkOffset": 0,
+                    "chunkDigest": "sha256:datachunk1"
+                },
+                {
+                    "type": "chunk",
+                    "name": "/sparse_file",
+                    "chunkSize": 8388608,
+                    "chunkOffset": 1048576,
+                    "chunkType": "zeros"
+                },
+                {
+                    "type": "chunk",
+                    "name": "/sparse_file",
+                    "offset": 1048576,
+                    "endOffset": 2097152,
+                    "chunkSize": 1048576,
+                    "chunkOffset": 9437184,
+                    "chunkDigest": "sha256:datachunk2"
+                }
+            ]
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+        assert_eq!(toc.entries.len(), 3);
+
+        let file_entry = &toc.entries[0];
+        assert_eq!(file_entry.entry_type, TocEntryType::Reg);
+        assert_eq!(file_entry.size, 10485760); // 10MB file
+        assert!(file_entry.is_data_chunk());
+        assert!(!file_entry.is_zeros_chunk());
+
+        let zeros_chunk = &toc.entries[1];
+        assert_eq!(zeros_chunk.entry_type, TocEntryType::Chunk);
+        assert_eq!(zeros_chunk.chunk_type, Some("zeros".to_string()));
+        assert_eq!(zeros_chunk.chunk_size, 8388608); // 8MB of zeros
+        assert_eq!(zeros_chunk.chunk_offset, 1048576); // starts at 1MB
+        assert!(zeros_chunk.is_zeros_chunk());
+        assert!(!zeros_chunk.is_data_chunk());
+
+        let data_chunk = &toc.entries[2];
+        assert_eq!(data_chunk.entry_type, TocEntryType::Chunk);
+        assert!(data_chunk.is_data_chunk());
+        assert!(!data_chunk.is_zeros_chunk());
+        assert_eq!(
+            data_chunk.chunk_digest,
+            Some("sha256:datachunk2".to_string())
+        );
+    }
+
+    /// Test is_zeros_chunk and is_data_chunk helper methods
+    #[test]
+    fn test_chunk_type_helpers() {
+        let entry_no_type = TocEntry {
+            name: "test".to_string(),
+            entry_type: TocEntryType::Chunk,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            digest: None,
+            fsverity: None,
+            offset: 0,
+            end_offset: 0,
+            chunk_digest: None,
+            chunk_size: 1024,
+            chunk_offset: 0,
+            chunk_type: None,
+            link_name: None,
+            mod_time: None,
+            access_time: None,
+            change_time: None,
+            dev_major: None,
+            dev_minor: None,
+            xattrs: HashMap::new(),
+        };
+        assert!(entry_no_type.is_data_chunk());
+        assert!(!entry_no_type.is_zeros_chunk());
+
+        let entry_empty_type = TocEntry {
+            chunk_type: Some("".to_string()),
+            ..entry_no_type.clone()
+        };
+        assert!(entry_empty_type.is_data_chunk());
+        assert!(!entry_empty_type.is_zeros_chunk());
+
+        let entry_zeros_type = TocEntry {
+            chunk_type: Some("zeros".to_string()),
+            ..entry_no_type.clone()
+        };
+        assert!(!entry_zeros_type.is_data_chunk());
+        assert!(entry_zeros_type.is_zeros_chunk());
+    }
+
+    /// Test that chunkType is not serialized when None (matching Go omitempty behavior)
+    #[test]
+    fn test_chunk_type_omit_empty() {
+        let entry = TocEntry {
+            name: "test".to_string(),
+            entry_type: TocEntryType::Reg,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            size: 100,
+            digest: None,
+            fsverity: None,
+            offset: 0,
+            end_offset: 100,
+            chunk_digest: None,
+            chunk_size: 100,
+            chunk_offset: 0,
+            chunk_type: None, // Should not appear in JSON
+            link_name: None,
+            mod_time: None,
+            access_time: None,
+            change_time: None,
+            dev_major: None,
+            dev_minor: None,
+            xattrs: HashMap::new(),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.contains("chunkType"),
+            "chunkType should be omitted when None"
+        );
+
+        let entry_with_zeros = TocEntry {
+            chunk_type: Some("zeros".to_string()),
+            ..entry
+        };
+        let json_with_zeros = serde_json::to_string(&entry_with_zeros).unwrap();
+        assert!(json_with_zeros.contains("\"chunkType\":\"zeros\""));
+    }
+
+    /// Test get_file_chunks returns all chunks including zeros chunks
+    #[test]
+    fn test_get_file_chunks_with_zeros() {
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "type": "reg",
+                    "name": "/sparse",
+                    "mode": 420,
+                    "size": 4096,
+                    "uid": 0,
+                    "gid": 0,
+                    "chunkSize": 1024,
+                    "chunkOffset": 0
+                },
+                {
+                    "type": "chunk",
+                    "name": "/sparse",
+                    "chunkSize": 2048,
+                    "chunkOffset": 1024,
+                    "chunkType": "zeros"
+                },
+                {
+                    "type": "chunk",
+                    "name": "/sparse",
+                    "chunkSize": 1024,
+                    "chunkOffset": 3072
+                }
+            ]
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+        let chunks = toc.get_file_chunks("/sparse");
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].entry_type, TocEntryType::Reg);
+        assert_eq!(chunks[1].entry_type, TocEntryType::Chunk);
+        assert!(chunks[1].is_zeros_chunk());
+        assert_eq!(chunks[2].entry_type, TocEntryType::Chunk);
+        assert!(chunks[2].is_data_chunk());
+    }
+
+    /// Test chunk ordering and coverage validation
+    #[test]
+    fn test_chunk_coverage() {
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "type": "reg",
+                    "name": "/file",
+                    "size": 3000,
+                    "chunkSize": 1000,
+                    "chunkOffset": 0
+                },
+                {
+                    "type": "chunk",
+                    "name": "/file",
+                    "chunkSize": 1000,
+                    "chunkOffset": 1000
+                },
+                {
+                    "type": "chunk",
+                    "name": "/file",
+                    "chunkSize": 1000,
+                    "chunkOffset": 2000
+                }
+            ]
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+        let chunks = toc.get_file_chunks("/file");
+        let file_size = toc.find_by_name("/file").unwrap().size;
+
+        let mut covered_bytes: u64 = 0;
+        for chunk in &chunks {
+            covered_bytes += chunk.chunk_size;
+        }
+        assert_eq!(covered_bytes, file_size, "Chunks should cover entire file");
+
+        let mut expected_offset: u64 = 0;
+        for chunk in &chunks {
+            assert_eq!(
+                chunk.chunk_offset, expected_offset,
+                "Chunk offset should be contiguous"
+            );
+            expected_offset += chunk.chunk_size;
+        }
+    }
+
+    /// Test mixed data and zeros chunks coverage
+    #[test]
+    fn test_mixed_chunk_coverage() {
+        // File: 1MB data + 8MB zeros + 1MB data = 10MB total
+        let toc_json = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "type": "reg",
+                    "name": "/sparse10mb",
+                    "size": 10485760,
+                    "chunkSize": 1048576,
+                    "chunkOffset": 0,
+                    "chunkDigest": "sha256:chunk1"
+                },
+                {
+                    "type": "chunk",
+                    "name": "/sparse10mb",
+                    "chunkSize": 8388608,
+                    "chunkOffset": 1048576,
+                    "chunkType": "zeros"
+                },
+                {
+                    "type": "chunk",
+                    "name": "/sparse10mb",
+                    "chunkSize": 1048576,
+                    "chunkOffset": 9437184,
+                    "chunkDigest": "sha256:chunk2"
+                }
+            ]
+        }"#;
+
+        let toc: Toc = serde_json::from_str(toc_json).unwrap();
+        let file_entry = toc.find_by_name("/sparse10mb").unwrap();
+        let chunks = toc.get_file_chunks("/sparse10mb");
+
+        let mut data_bytes: u64 = 0;
+        let mut zero_bytes: u64 = 0;
+
+        for chunk in &chunks {
+            if chunk.is_zeros_chunk() {
+                zero_bytes += chunk.chunk_size;
+            } else {
+                data_bytes += chunk.chunk_size;
+            }
+        }
+
+        assert_eq!(data_bytes, 2 * 1048576, "Should have 2MB of data");
+        assert_eq!(zero_bytes, 8388608, "Should have 8MB of zeros");
+        assert_eq!(
+            data_bytes + zero_bytes,
+            file_entry.size,
+            "Data + zeros should equal file size"
+        );
+    }
+}

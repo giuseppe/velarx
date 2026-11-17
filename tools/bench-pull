@@ -1,0 +1,50 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# The time of an eager pull of a big image into an empty store: hyperfine
+# of `velarx pull IMAGE` for each binary given, one store per run, all
+# under one directory (put it on the file system the store lives on: the
+# time is mostly the file system's, and an XFS or ext4 store without
+# fs-verity is the case where every file a fetcher staged is read once to
+# verify it, then linked).
+#
+#   tools/bench-pull [-w WARMUP] [-r RUNS] IMAGE BIN...
+#
+# IMAGE is read from a registry of the machine (insecure registries are
+# those of $VELARX_REGISTRIES_CONF, which this script does not make); each
+# BIN is a `velarx` with its sibling binaries next to it.  Compare two
+# builds by giving both (main first).  It is a measurement to run by hand
+# and to quote: nothing in the test suite asserts a time.
+
+set -eu
+
+warmup=2
+runs=10
+while getopts w:r: opt; do
+	case $opt in
+	w) warmup=$OPTARG ;;
+	r) runs=$OPTARG ;;
+	*) echo "usage: tools/bench-pull [-w WARMUP] [-r RUNS] IMAGE BIN..." >&2; exit 2 ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 2 ] || { echo "usage: tools/bench-pull [-w WARMUP] [-r RUNS] IMAGE BIN..." >&2; exit 2; }
+command -v hyperfine >/dev/null || { echo "bench-pull: hyperfine is not installed" >&2; exit 1; }
+image=$1
+shift
+
+work=$(mktemp -d "${BENCH_DIR:-${TMPDIR:-/var/tmp}}/bench-pull.XXXXXX")
+trap 'rm -rf "$work"' EXIT INT TERM
+
+# (hyperfine runs each command through a shell: what goes into one is quoted)
+quote() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
+n=$#
+while [ "$n" -gt 0 ]; do
+	bin=$1
+	shift
+	set -- "$@" --command-name "$bin" \
+		"$(quote "$bin") --root $(quote "$work/store") --runroot $(quote "$work/run") pull $(quote "$image") >/dev/null"
+	n=$((n - 1))
+done
+# (a store of each run: removed by --prepare, which no timing includes)
+hyperfine --warmup "$warmup" --runs "$runs" \
+	--prepare "rm -rf $(quote "$work/store") $(quote "$work/run")" "$@"

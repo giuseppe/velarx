@@ -1,0 +1,743 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# shellcheck disable=SC1090,SC2034,SC2046,SC2054
+# Validate the fetch path of velarx end to end, on this host (node A) and on a
+# second host (node B, over ssh): the syncs of a pull, the deduplication of
+# the store, what a second pull fetches, and what a peer gives instead of the
+# registry.  Everything it starts is private (a registry on a free port,
+# stores and daemons under one work directory) and is removed at the end.
+#
+#   tools/validate-fetch [--bindir DIR] [--node-b USER@HOST]
+#                        [--host-addr ADDR] [--sources-config FILE]
+#                        [--out FILE.json] [--work DIR] [--keep]
+#                        [--seed-image REF]... [--skip STEP]...
+#
+#   --bindir DIR          the binaries (velarx, velarx-p2p, velarx-monitor,
+#                         velarx-registry and velarx-dir); default
+#                         $CARGO_TARGET_DIR/release, else target/release
+#   --node-b TARGET       node B (without it, steps 1 to 3 only); the password is
+#                         $SSHPASS, used with `sshpass -e`.  The
+#                         binaries are copied there (the same Fedora and
+#                         architecture as this host: the shared libraries
+#                         are checked with ldd and reported when missing)
+#   --link tunnel|direct  how node B reaches this host: `tunnel` (default) opens
+#                         one ssh connection with -R forwards of the registry
+#                         port and the peer-to-peer port to node B's loopback,
+#                         so the registry is 127.0.0.1:PORT on both nodes and
+#                         no port of this host has to be open (the firewall of a
+#                         workstation drops them; QUIC, which is UDP, is off
+#                         then, the peers talk over TCP); `direct`: node B
+#                         connects to --host-addr
+#   --host-addr ADDR      `direct`: the address of this host that node B
+#                         reaches (the registry and the peer-to-peer port are
+#                         there); default the source address of `ip route get`
+#                         to node B
+#   --sources-config FILE the `[pull]` / `[[sources.external]]` part of the
+#                         configuration of both nodes; @SOCKDIR@ in it is the
+#                         directory of the sockets of the node, @REGISTRY@ the
+#                         registry.  Default: a `peers` socket source and
+#                         `sources = ["peers", "registry"]`.  Step 4 is
+#                         skipped with the reason when the P2P service does
+#                         not start with it
+#   --out FILE.json       the result file (default: validate-fetch.json in the
+#                         current directory)
+#   --keep                keep the work directories (both nodes) and say where
+#   --seed-image REF      an image of a registry to copy into the private one
+#                         (registry to registry, skopeo; default
+#                         docker.io/library/alpine:latest and
+#                         docker.io/library/nginx:alpine)
+#   --skip STEP           skip a step: seed build pulls dedup p2p
+#
+# What it does:
+#   1. A registry (`registry serve`, from distribution) on a free port, behind
+#      a small logging proxy (tools/validate-fetch-report proxy) that writes
+#      one line per request with the bytes it sent.  The seed images are
+#      copied into it with `skopeo copy` from their registry (no local
+#      storage).  Then `velarx build` makes, on a builder store, a base image
+#      (alpine + one layer holding BIG), `vf/app1` (the base and three layers
+#      in which BIG repeats under other names, and a small file repeats) and
+#      `vf/app2` (the same base and two other layers, BIG again), and pushes
+#      both: the same file is in 8 places of 5 layers of 2 images.  Then
+#      `vf/app3`, an update of app1: one more layer holding BIG with 16 bytes
+#      changed.
+#   2. Node A, rootless, a private store, no daemon (each command is a process
+#      of its own), pulls alpine, the multi-layer seed image, app1, app1 again
+#      and app2, each under `strace -f -ttt -y -e trace=syncfs,fsync,
+#      fdatasync,sync_file_range,sync` with RUST_LOG=debug.  Expected: at most
+#      one syncfs before the link step (of the staging file system) and one
+#      after it (of the store) per layer.
+#      Attribution of a call to a layer: the commit ends at the debug line
+#      `commit of N files took` of the pull, and the calls between the end of the
+#      previous commit and that line are the commit's (the report prints the
+#      N of the `commit of N files took` lines tells which layer it was when the
+#      layers are told apart by their size); -y gives the path behind
+#      the descriptor, which tells a syncfs of the staging area (before the
+#      link step) from one of the store (after it), and the fsyncs of the
+#      records of a layer.  The pull commits per layer or per image, the
+#      report says how many commits there were against how many layers
+#      the image has, and `syncfs_per_layer` is the calls divided by the
+#      layers it pulled.
+#   3. Deduplication: the objects of the store (tools/validate-fetch-report
+#      store): no content twice, the number of objects with BIG's size (1),
+#      files with more than one name, the disk use of the store against the
+#      bytes of the files of the images pulled; the second pull of app1 asks
+#      the registry for no blob; the pull of app2 asks for the blobs its
+#      layers have that nothing pulled before has, and no other; the pull of
+#      app3 (the update) takes the chunks of BIG from the store and asks the
+#      registry for less than a tenth of BIG.
+#   4. The peers: both nodes run `velarx-p2p` (node A on this host, listening
+#      on --host-addr, B bootstraps to it with its peer id and the swarm key
+#      is copied); A has the images; B pulls them with
+#      `[pull] sources = ["peers", "registry"]` under strace.  It prints the
+#      bytes B got from the peers (`velarx p2p status` of B: bytes_received)
+#      and from the registry (the request log: blob bodies), and the sync calls
+#      of B.
+#   5. A table on stdout and the JSON file, then the cleanup of both nodes:
+#      the processes it started (by pid, TERM, then KILL after a wait), the
+#      mounts, the work directories, the listening ports; the result of that
+#      check is last in the table, and the exit status is 1 when anything
+#      is left.
+#
+# Needs: registry (distribution), skopeo, strace, curl, python3, ip, ss, and
+# for node B sshpass and ssh.  It never runs podman, buildah or skopeo with a
+# storage, and does not touch other registries or stores.
+
+set -u
+
+BINDIR=${CARGO_TARGET_DIR:-target}/release
+NODEB=
+USEB=0
+HOSTADDR=
+LINK=tunnel
+SOURCES_CONFIG=
+OUT=$PWD/validate-fetch.json
+WORK=
+KEEP=
+SEEDS=()
+SKIP=" "
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPORT=$HERE/validate-fetch-report
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	--bindir) BINDIR=$2; shift 2 ;;
+	--node-b) NODEB=$2; USEB=1; shift 2 ;;
+	--host-addr) HOSTADDR=$2; LINK=direct; shift 2 ;;
+	--link) LINK=$2; shift 2 ;;
+	--sources-config) SOURCES_CONFIG=$2; shift 2 ;;
+	--out) OUT=$(realpath -m "$2"); shift 2 ;;
+	--work) WORK=$2; shift 2 ;;
+	--keep) KEEP=1; shift ;;
+	--seed-image) SEEDS+=("$2"); shift 2 ;;
+	--skip) SKIP="$SKIP$2 "; shift 2 ;;
+	-h | --help) sed -n '4,/^set -u/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
+	*) echo "validate-fetch: unknown argument $1" >&2; exit 2 ;;
+	esac
+done
+[ ${#SEEDS[@]} -gt 0 ] || SEEDS=(docker.io/library/alpine:latest docker.io/library/nginx:alpine)
+BINDIR=$(realpath "$BINDIR")
+skip_step() { case $SKIP in *" $1 "*) return 0 ;; esac; return 1; }
+
+say() { echo "validate-fetch: $*" >&2; }
+die() { say "$*"; exit 1; }
+
+for t in registry skopeo strace curl python3 ip ss; do
+	command -v "$t" > /dev/null || die "$t is not installed"
+done
+[ -x "$BINDIR/velarx" ] || die "no $BINDIR/velarx (make build-engine, or --bindir)"
+if [ "$USEB" = 1 ]; then
+	command -v sshpass > /dev/null || die "sshpass is not installed"
+fi
+
+WORK=${WORK:-$(mktemp -d /var/tmp/velarx-validate-fetch.XXXXXX)}
+case $WORK in /var/tmp/velarx-validate-fetch.*) ;; *) [ -n "$KEEP" ] || die "--work must be /var/tmp/velarx-validate-fetch.* (it is removed at the end)" ;; esac
+mkdir -p "$WORK"
+chmod 700 "$WORK"
+RW=/var/tmp/velarx-validate-fetch.$$      # the work directory of node B
+RESULT=$WORK/result.json
+echo '{}' > "$RESULT"
+: > "$WORK/pids"
+TABLE=$WORK/table.txt
+: > "$TABLE"
+
+# put KEY JSON: the JSON value of KEY in the result file
+put() { python3 -I -c '
+import json, sys
+p, k, v = sys.argv[1:4]
+r = json.load(open(p))
+r[k] = json.loads(v)
+json.dump(r, open(p, "w"), indent=1, sort_keys=True)' "$RESULT" "$1" "$2"; }
+# row LABEL VALUE: a line of the table
+row() { printf '%s\t%s\n' "$1" "$2" >> "$TABLE"; }
+jq_() { python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in sys.argv[1].split("."):
+    d = d[int(k)] if isinstance(d, list) else d.get(k, 0)
+print(d)' "$1"; }
+
+# spawn LOGFILE CMD...: a background process, its pid in the list of the
+# processes that the cleanup stops (and its descendants at that time)
+spawn() { local log=$1; shift; "$@" >> "$log" 2>&1 3>&- < /dev/null & echo $! >> "$WORK/pids"; }
+descendants() {
+	local p c
+	for p in "$@"; do
+		for c in $(ps -o pid= --ppid "$p" 2> /dev/null); do echo "$c"; descendants "$c"; done
+	done
+}
+
+SSHOPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10)
+rsh() { sshpass -e ssh "${SSHOPTS[@]}" "$NODEB" "$@"; }
+rcp() { sshpass -e scp -q "${SSHOPTS[@]}" "$@"; }
+
+# wait_gone SECONDS PID...: return when every process is gone (a pidfd of each
+# becomes readable when it exits: no polling), 1 when some still run after
+# SECONDS (the bound of a process that does not stop, not a pause).  GONE_PY
+# has no quote, backslash or dollar so that it also goes in a remote command.
+GONE_PY='
+import os, select, sys, time
+end = time.monotonic() + float(sys.argv[1])
+ep = select.epoll()
+left = 0
+for a in sys.argv[2:]:
+    try:
+        ep.register(os.pidfd_open(int(a)), select.EPOLLIN)
+        left += 1
+    except ProcessLookupError:
+        pass
+while left:
+    got = ep.poll(max(0, end - time.monotonic()))
+    if not got:
+        break
+    for fd, _ in got:
+        ep.unregister(fd)
+    left -= len(got)
+sys.exit(1 if left else 0)
+'
+wait_gone() { python3 -I -c "$GONE_PY" "$@"; }
+
+REMOTE_UP=
+cleanup_remote() {
+	[ -n "$REMOTE_UP" ] || return 0
+	rsh "
+	for p in \$(cat $RW/pids 2>/dev/null); do
+		for c in \$(ps -o pid= --ppid \$p 2>/dev/null); do echo \$c; done
+		echo \$p
+	done > $RW/all 2>/dev/null
+	for s in TERM KILL; do
+		for p in \$(cat $RW/all 2>/dev/null); do kill -\$s \$p 2>/dev/null; done
+		python3 -I -c '$GONE_PY' 5 \$(cat $RW/all 2>/dev/null)
+	done
+	awk -v d=$RW/ 'index(\$5, d) == 1 { print \$5 }' /proc/self/mountinfo | sort -r | while read -r m; do umount -l \"\$m\"; done
+	chmod -R u+rwX $RW 2>/dev/null
+	$([ -n "$KEEP" ] && echo "echo kept $RW >&2" || echo "rm -rf $RW")
+	" > /dev/null 2>&1
+}
+# the verification: nothing of ours is left on the node
+verify_remote() {
+	[ -n "$REMOTE_UP" ] || { echo ok; return; }
+	local left
+	left=$(rsh "
+	for p in \$(cat $RW/all 2>/dev/null); do [ -d /proc/\$p ] && echo pid \$p; done
+	awk -v d=$RW/ 'index(\$5, d) == 1 { print \"mount\", \$5 }' /proc/self/mountinfo
+	[ -d $RW ] && echo dir $RW
+	ss -ltnH 2>/dev/null | grep -E ':($PORT_A_P2P|$PORT_PROXY) ' | sed 's/^/port /'
+	true")
+	[ -n "$KEEP" ] && left=$(echo "$left" | grep -v "^dir ")
+	[ -z "$left" ] && echo ok || echo "$left" | tr '\n' ';'
+}
+
+cleaned=
+cleanup() {
+	[ -z "$cleaned" ] || return 0
+	cleaned=1
+	trap '' INT TERM
+	local p all s
+	all=$(cat "$WORK/pids" 2> /dev/null)
+	# (a service started by a command lives on after it: its descendants)
+	all="$all $(descendants $all)"
+	echo "$all" > "$WORK/allpids"
+	for s in TERM KILL; do
+		for p in $all; do kill -"$s" "$p" 2> /dev/null; done
+		wait_gone 5 $all
+	done
+	cleanup_remote
+	awk -v d="$WORK/" 'index($5, d) == 1 { print $5 }' /proc/self/mountinfo | sort -r | while read -r m; do umount -l "$m" 2> /dev/null; done
+	LEFT=$(verify_remote)
+	LEFTLOCAL=
+	for q in $all; do [ -d "/proc/$q" ] && LEFTLOCAL="$LEFTLOCAL pid $q;"; done
+	awk -v d="$WORK/" 'index($5, d) == 1 { print $5 }' /proc/self/mountinfo | grep -q . && LEFTLOCAL="$LEFTLOCAL mounts;"
+	for pt in $PORT_PROXY $PORT_UP $PORT_A_P2P; do
+		[ -n "$pt" ] && ss -ltnH 2> /dev/null | grep -qE ":$pt " && LEFTLOCAL="$LEFTLOCAL port $pt;"
+	done
+	finish
+}
+
+# the result, the table and the verdict, once everything is stopped
+finish() {
+	mkdir -p "$(dirname "$OUT")"
+	local clean=ok
+	[ -z "$LEFTLOCAL" ] || clean="host A: $LEFTLOCAL"
+	[ "$LEFT" = ok ] || clean="$clean node B: $LEFT"
+	# (the work directory goes after the check, the result file is copied first)
+	row "cleanup (processes, mounts, ports, dirs)" "$clean"
+	put cleanup "\"$clean\""
+	python3 -I -c '
+import json, sys
+p, t = sys.argv[1:3]
+r = json.load(open(p))
+r["table"] = dict(l.rstrip("\n").split("\t", 1) for l in open(t))
+json.dump(r, open(p, "w"), indent=1)' "$RESULT" "$TABLE"
+	cp "$RESULT" "$OUT"
+	python3 -I "$REPORT" table "$OUT"
+	if [ -n "$KEEP" ]; then
+		say "kept $WORK (node A) and $RW (node B)"
+	else
+		chmod -R u+rwX "$WORK" 2> /dev/null
+		rm -rf "$WORK"
+		[ ! -e "$WORK" ] || { say "$WORK is still there"; clean=left; }
+	fi
+	say "result in $OUT"
+	[ "$clean" = ok ] && exit "${RC:-0}" || exit 1
+}
+PORT_PROXY=
+PORT_UP=
+PORT_A_P2P=
+PORT_B_P2P=
+RC=0
+LEFT=ok
+LEFTLOCAL=
+trap cleanup EXIT
+trap 'RC=130; exit 130' INT TERM
+
+freeport() { python3 -I -c '
+import socket
+s = socket.socket(); s.bind(("0.0.0.0", 0)); print(s.getsockname()[1])'; }
+
+# a check that failed: the exit status of the run
+FAILS=0
+check() { # check LABEL "ok"|"FAIL: why"
+	row "$1" "$2"
+	case $2 in FAIL*) FAILS=$((FAILS + 1)); RC=1 ;; esac
+}
+
+if [ "$USEB" = 1 ] && [ "$LINK" = direct ] && [ -z "$HOSTADDR" ]; then
+	vm=${NODEB#*@}
+	HOSTADDR=$(ip -4 route get "$vm" 2> /dev/null | grep -oE 'src [0-9.]+' | head -1 | cut -d' ' -f2)
+	[ -n "$HOSTADDR" ] || die "no route to $vm: give --host-addr"
+fi
+# (in tunnel mode node B reaches this host's ports on its own loopback)
+[ "$LINK" = direct ] || HOSTADDR=127.0.0.1
+put host_addr "\"$HOSTADDR\""
+put bindir "\"$BINDIR\""
+
+PORT_UP=$(freeport)
+mkdir -p "$WORK/reg"
+cat > "$WORK/reg.yml" <<EOF
+version: 0.1
+log:
+  level: warn
+storage:
+  filesystem:
+    rootdirectory: $WORK/reg
+http:
+  addr: 127.0.0.1:$PORT_UP
+EOF
+spawn "$WORK/registry.log" registry serve "$WORK/reg.yml"
+REGLOG=$WORK/reg-requests.log
+: > "$REGLOG"
+# (curl waits for the registry: it retries a refused connection)
+curl -sf -m 2 --retry 50 --retry-connrefused --retry-delay 1 "http://127.0.0.1:$PORT_UP/v2/" > /dev/null || { say "the private registry does not start"; cat "$WORK/registry.log" >&2; RC=1; exit 1; }
+# (the proxy prints its port, which is the registry that the nodes use)
+mkfifo "$WORK/proxy.port"
+python3 -I "$REPORT" proxy "127.0.0.1:$PORT_UP" "$REGLOG" > "$WORK/proxy.port" 2> "$WORK/proxy.err" 3>&- &
+echo $! >> "$WORK/pids"
+# (the read ends when the proxy has written its port)
+read -r PORT_PROXY < "$WORK/proxy.port"
+[ -n "$PORT_PROXY" ] || { say "the logging proxy does not start"; cat "$WORK/proxy.err" >&2; RC=1; exit 1; }
+REG=$HOSTADDR:$PORT_PROXY
+put registry "\"$REG\""
+say "registry $REG (upstream 127.0.0.1:$PORT_UP, log $REGLOG)"
+
+SEEDED=()
+if ! skip_step seed; then
+	for ref in "${SEEDS[@]}"; do
+		name=${ref#*/}; name=${name#library/}
+		say "seed $ref"
+		skopeo copy --dest-tls-verify=false "docker://$ref" "docker://127.0.0.1:$PORT_UP/$name" > "$WORK/seed.log" 2>&1 ||
+			{ say "cannot seed $ref"; cat "$WORK/seed.log" >&2; RC=1; exit 1; }
+		SEEDED+=("$name")
+	done
+fi
+put seeded "$(python3 -I -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${SEEDED[@]:-}")"
+
+# node_env NAME ROOT: the environment of the commands of a node, as a file
+# to source: its own HOME, runtime directory and registries.conf (the private
+# registry is plain HTTP)
+mknode() { # mknode NAME ROOT REGISTRY-HOST:PORT -> writes ROOT/NAME.toml, ROOT/NAME.env
+	local n=$1 root=$2 reg=$3 sock
+	mkdir -p "$root/$n/home/.config/velarx" "$root/$n/run" "$root/$n/data"
+	chmod 700 "$root/$n" "$root/$n/run"
+	sock=$root/$n/run/services
+	cat > "$root/$n.registries.conf" <<EOF
+[[registry]]
+location = "$reg"
+insecure = true
+EOF
+	if [ -n "$SOURCES_CONFIG" ]; then
+		sed -e "s|@SOCKDIR@|$sock|g" -e "s|@REGISTRY@|$reg|g" "$SOURCES_CONFIG" > "$root/$n.sources.toml"
+	else
+		cat > "$root/$n.sources.toml" <<EOF
+[pull]
+share_registries = ["$reg"]
+sources = ["peers", "registry"]
+[[sources.external]]
+name = "peers"
+socket = "$sock/p2p-fetcher.sock"
+peer = true
+idle_timeout_secs = 30
+EOF
+	fi
+	{
+		cat <<EOF
+[engine]
+socket = "$root/$n/run/sh.sock"
+[server]
+socket = "$root/$n/run/sh.sock"
+state_dir = "$root/$n/run/velarx"
+root_dir = "$root/$n/data/velarx"
+[storage]
+root = "$root/$n/store"
+[userns]
+uid_ranges = ["655360-720895"]
+gid_ranges = ["655360-720895"]
+allocation_size = 65536
+EOF
+		cat "$root/$n.sources.toml"
+	} > "$root/$n.toml"
+	cat > "$root/$n.env" <<EOF
+export HOME=$root/$n/home XDG_RUNTIME_DIR=$root/$n/run XDG_DATA_HOME=$root/$n/data
+export XDG_CONFIG_HOME=$root/$n/home/.config VELARX_REGISTRIES_CONF=$root/$n.registries.conf
+export NO_COLOR=1
+EOF
+}
+# vx NODE ARGS: the command line of a node, in its own process
+vx() { local n=$1; shift; ( . "$WORK/$n.env"; exec "$BINDIR/velarx" --config "$WORK/$n.toml" "$@" ); }
+
+BIGSIZE=3145728
+if ! skip_step build; then
+	say "build the images (node S, builder store)"
+	UPREG=127.0.0.1:$PORT_UP
+	mknode s "$WORK" "$UPREG"
+	ctx=$WORK/ctx
+	mkdir -p "$ctx"
+	head -c $BIGSIZE /dev/urandom > "$ctx/big.bin"
+	printf 'small file that repeats\n' > "$ctx/small.txt"
+	printf 'only in app1\n' > "$ctx/one.txt"
+	printf 'only in app2\n' > "$ctx/two.txt"
+	printf 'FROM %s/alpine:latest\nCOPY big.bin /opt/base/big.bin\n' "$UPREG" > "$ctx/Containerfile.base"
+	cat > "$ctx/Containerfile.app1" <<EOF
+FROM $UPREG/vf/base:1
+COPY big.bin /app1/layer1/big.bin
+COPY big.bin /app1/layer2/copy-of-big.bin
+COPY small.txt /app1/layer2/small.txt
+COPY one.txt big.bin /app1/layer3/
+EOF
+	cat > "$ctx/Containerfile.app2" <<EOF
+FROM $UPREG/vf/base:1
+COPY big.bin /app2/big.bin
+COPY two.txt small.txt /app2/
+EOF
+	# the update of app1: BIG with 16 bytes changed in the middle
+	cp "$ctx/big.bin" "$ctx/big2.bin"
+	head -c 16 /dev/urandom | dd of="$ctx/big2.bin" bs=1 seek=$((BIGSIZE / 2)) conv=notrunc status=none
+	printf 'FROM %s/vf/app1:1\nCOPY big2.bin /app3/big.bin\n' "$UPREG" > "$ctx/Containerfile.app3"
+	built=ok
+	if [ ! -x "$BINDIR/velarx-monitor" ]; then built="FAIL: no velarx-monitor in $BINDIR"; fi
+	if [ "$built" = ok ]; then
+		for i in base app1 app2 app3; do
+			{
+				vx s build -f "$ctx/Containerfile.$i" -t "$UPREG/vf/$i:1" "$ctx" &&
+					vx s image push --tls-verify=false "$UPREG/vf/$i:1" &&
+					{ [ "$i" = base ] || vx s image push --tls-verify=false --compression-format zstd:chunked "$UPREG/vf/$i:1" "$UPREG/vf/$i:z"; }
+			} > "$WORK/build-$i.log" 2>&1 || { built="FAIL: build or push of $i (see below)"; cat "$WORK/build-$i.log" >&2; break; }
+		done
+	fi
+	check "images built and pushed (base app1 app2 app3)" "$built"
+	[ "$built" = ok ] || { say "no images: the rest cannot run"; RC=1; exit 1; }
+fi
+
+mknode a "$WORK" "$REG"
+# strace -f also traces newuidmap, the setuid program that maps the sub ids of
+# a rootless command, and a traced exec is not setuid: it fails.  A process
+# that lives in the namespaces of the store is started first, untraced; the
+# traced commands join its namespaces and run no newuidmap.
+mkfifo "$WORK/a.holder.ready"
+( . "$WORK/a.env"; spawn "$WORK/a.holder.log" "$BINDIR/velarx" --config "$WORK/a.toml" unshare sh -c 'echo > "$1"; exec sleep 86400' sh "$WORK/a.holder.ready" )
+# (the read ends when the holder is in the namespaces)
+read -r < "$WORK/a.holder.ready"
+STRACE=(strace -f -ttt -y -e trace=syncfs,fsync,fdatasync,sync_file_range,sync)
+
+# pulled NAME REF: pull REF on node A under strace; the lines of the request
+# log of the pull go to the result
+pull_traced() { # pull_traced NODE NAME REF
+	local node=$1 name=$2 ref=$3 from to rc
+	from=$(($(wc -l < "$REGLOG") + 1))
+	( . "$WORK/$node.env"; export RUST_LOG=${PULL_LOG:-debug}
+	  exec "${STRACE[@]}" -o "$WORK/$node.$name.strace" "$BINDIR/velarx" --config "$WORK/$node.toml" image pull --tls-verify=false "$ref" ) > "$WORK/$node.$name.log" 2>&1
+	rc=$?
+	to=$(wc -l < "$REGLOG")
+	echo "$from $to" > "$WORK/$node.$name.window"
+	return $rc
+}
+
+pull_report() { # pull_report NODE NAME LAYERS -> prints json (sync + requests)
+	local node=$1 name=$2 w
+	w=$(cat "$WORK/$node.$name.window")
+	python3 -I - "$REPORT" "$WORK/$node.$name.strace" "$WORK/$node.$name.log" "$REGLOG" $w <<'EOF'
+import json, subprocess, sys
+rep, strace, log, reqlog, a, b = sys.argv[1:7]
+def run(*args):
+    return json.loads(subprocess.check_output(["python3", "-I", rep, *args]))
+print(json.dumps({"sync": run("sync", strace, log), "requests": run("requests", reqlog, a, b)}))
+EOF
+}
+
+if ! skip_step pulls; then
+	PULLS=()
+	for n in "${SEEDED[@]}"; do PULLS+=("seed:$n"); done
+	PULLS+=("vf/app1:1" "vf/app1:1#again" "vf/app2:1" "vf/app1:z" "vf/app2:z" "vf/app3:1" "vf/app3:z")
+	PULLED_IMAGES=()
+	for p in "${PULLS[@]}"; do
+		case $p in seed:*) ref=${p#seed:} ;; *) ref=${p%%#*} ;; esac
+		name=$(echo "$p" | tr '/:#' '___')
+		repo=${ref%:*}; tag=${ref##*:}
+		say "pull $ref (node A, traced)"
+		if pull_traced a "$name" "$REG/$ref"; then st=ok; else st="FAIL: pull exits non-zero"; cat "$WORK/a.$name.log" >&2; fi
+		nl=$(python3 -I "$REPORT" image "127.0.0.1:$PORT_UP" "$repo" "$tag" | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)["layers"]))')
+		rep=$(pull_report a "$name")
+		put "pull_a_$name" "$(python3 -I -c '
+import json, sys
+r = json.loads(sys.argv[1]); r["layers"] = int(sys.argv[2]); r["ref"] = sys.argv[3]
+print(json.dumps(r))' "$rep" "$nl" "$ref")"
+		sf=$(echo "$rep" | python3 -I -c '
+import json, sys
+r = json.load(sys.stdin)["sync"]
+k = r["by_kind"]
+other = sum(v for n, v in k.items() if n in ("fsync", "fdatasync", "sync_file_range", "sync"))
+db = sum(v for n, v in k.items() if n.startswith("db_"))
+print(k.get("syncfs_staging", 0), k.get("syncfs_objects", 0), k.get("syncfs_composefs", 0) + k.get("syncfs_other", 0), other, db, r["commits_logged"])')
+		set -- $sf
+		blobs=$(echo "$rep" | python3 -I -c 'import json,sys; r=json.load(sys.stdin)["requests"]; print(r["blob_gets"], r["blob_bytes"])')
+		check "pull $ref: $nl layers, $6 commit(s); syncfs staging=$1 objects=$2 composefs/other=$3; other fsync=$4, db=$5; blobs(count bytes)=$blobs" "$st"
+		# the verdict on the syncs: at most one before and one after the link step per layer
+		if [ "$nl" -gt 0 ] && [ "$st" = ok ] && [ "${p#*#}" = "$p" ]; then
+			if [ "$1" -le "$nl" ] && [ "$2" -le "$nl" ]; then
+				row "  $ref: at most 1 syncfs per layer before and after the link step" "yes ($1 before, $2 after, for $nl layers; $3 more of the EROFS images, which is no step of a layer)"
+			else
+				row "  $ref: at most 1 syncfs per layer before and after the link step" "NO ($1 before, $2 after, for $nl layers)"
+			fi
+		fi
+		PULLED_IMAGES+=("$repo:$tag")
+	done
+	# a second pull of the same image fetches no blob; app2 only what is new
+	again=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["pull_a_vf_app1_1_again"]["requests"]["blob_gets"])' "$RESULT")
+	[ "$again" = 0 ] && check "second pull of app1 fetches no blob" ok || check "second pull of app1 fetches no blob" "FAIL: $again blobs"
+	# the update fetches the chunks of the 16 changed bytes, not the layer of BIG
+	upd=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["pull_a_vf_app3_1"]["requests"]["blob_bytes"])' "$RESULT")
+	if [ "$upd" -lt $((BIGSIZE / 10)) ]; then
+		check "pull of the update app3 fetches $upd bytes (BIG is $BIGSIZE)" ok
+	else
+		check "pull of the update app3 fetches $upd bytes (BIG is $BIGSIZE)" "FAIL: more than a tenth of BIG"
+	fi
+fi
+
+if ! skip_step dedup && ! skip_step pulls; then
+	say "the store of node A"
+	st=$(python3 -I "$REPORT" store "$WORK/a/store")
+	put store_a "$st"
+	sizes=0
+	declare -A SEEN
+	for img in "${PULLED_IMAGES[@]}"; do
+		[ -z "${SEEN[$img]:-}" ] || continue
+		SEEN[$img]=1
+		s=$(python3 -I "$REPORT" image "127.0.0.1:$PORT_UP" "${img%:*}" "${img##*:}" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["file_bytes"])')
+		sizes=$((sizes + s))
+	done
+	disk=$(echo "$st" | jq_ store_disk_bytes)
+	objs=$(echo "$st" | jq_ objects)
+	linked=$(echo "$st" | jq_ objects_with_links)
+	dups=$(echo "$st" | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)["duplicate_contents"]))')
+	bigobjs=$(find "$WORK/a/store/objects" -type f -size "${BIGSIZE}c" 2> /dev/null | wc -l)
+	check "store: objects / disk bytes vs file bytes of the images" "$objs objects, $disk B on disk vs $sizes B of files in the images (sum over images: $(( (disk * 100) / (sizes > 0 ? sizes : 1) ))%)"
+	[ "$dups" = 0 ] && check "store: a content stored twice" "none" || check "store: a content stored twice" "FAIL: $dups contents"
+	# (BIG, 8 files in 5 layers of 2 images, and its update in app3)
+	label="store: objects of the size of BIG (BIG and its update)"
+	[ "$bigobjs" = 2 ] && check "$label" "2" || check "$label" "FAIL: $bigobjs"
+	row "store: objects with more than one name (link count > 1)" "$linked"
+	# app2 fetched only the blobs that nothing pulled before has
+	python3 -I - "$RESULT" "$PORT_UP" "$REPORT" <<'EOF2' > "$WORK/dedup.out"
+import json, subprocess, sys
+res, port, rep = sys.argv[1:4]
+r = json.load(open(res))
+def blobs(key):
+    return set(r.get(key, {}).get("requests", {}).get("blobs", {}))
+j = json.loads(subprocess.check_output(["python3", "-I", rep, "image", f"127.0.0.1:{port}", "vf/app2", "1"]))
+before = set()
+for k in r:
+    if k.startswith("pull_a_") and k != "pull_a_vf_app2_1" and not k.endswith("_z"):
+        before |= blobs(k)
+want = {l["digest"] for l in j["layers"]} - before
+want.add(j["config"])
+got = blobs("pull_a_vf_app2_1")
+print("ok" if got == want else "FAIL:_fetched_%d_blobs_new_ones_(layers_and_config)_are_%d" % (len(got), len(want)), len(got), len(want))
+EOF2
+	set -- $(cat "$WORK/dedup.out")
+	check "pull of app2 fetches only its new layers and its config ($2 blobs fetched, $3 new)" "$1"
+fi
+
+b_status=skipped
+if [ "$USEB" = 1 ] && ! skip_step p2p; then
+	P2P_SKIP=
+	[ -x "$BINDIR/velarx-p2p" ] || P2P_SKIP="no velarx-p2p in $BINDIR"
+	if [ -z "$P2P_SKIP" ]; then
+		say "node B: $NODEB"
+		if ! rsh "command -v python3" > /dev/null 2> "$WORK/ssh.err"; then P2P_SKIP="cannot reach $NODEB over ssh, or it has no python3: $(head -1 "$WORK/ssh.err")"; fi
+	fi
+	if [ -z "$P2P_SKIP" ]; then
+		REMOTE_UP=1
+		rsh "mkdir -p $RW/bin && chmod 700 $RW && : > $RW/pids"
+		for b in velarx velarx-p2p velarx-monitor velarx-registry velarx-dir; do
+			[ -x "$BINDIR/$b" ] && rcp "$BINDIR/$b" "$NODEB:$RW/bin/$b"
+		done
+		missing=$(rsh "for b in $RW/bin/*; do ldd \$b 2>&1 | grep 'not found' | sed \"s|^|\$(basename \$b): |\"; done")
+		if [ -n "$missing" ]; then P2P_SKIP="node B lacks libraries: $(echo "$missing" | tr '\n' ' ')"; fi
+	fi
+	if [ -z "$P2P_SKIP" ]; then
+		PORT_A_P2P=$(freeport)
+		PORT_B_P2P=$(freeport)
+		QUIC=true; LISTEN_B=0.0.0.0
+		[ "$LINK" = direct ] || { QUIC=false; LISTEN_B=127.0.0.1; }
+		if [ "$LINK" = tunnel ]; then
+			# (a pid in the list of the processes the cleanup stops: sshpass, then its ssh)
+			# (-v: ssh says "remote forward success" for each forward the moment
+			# it is set up, which is what the tunnel is waited for by)
+			spawn "$WORK/tunnel.log" sshpass -e ssh "${SSHOPTS[@]}" -v -N -o ExitOnForwardFailure=yes \
+				-R "$PORT_PROXY:127.0.0.1:$PORT_PROXY" -R "$PORT_A_P2P:127.0.0.1:$PORT_A_P2P" "$NODEB"
+			timeout 20 tail -n +1 -F "$WORK/tunnel.log" 2> /dev/null | grep -q -m2 'remote forward success'
+			[ "$(grep -c 'remote forward success' "$WORK/tunnel.log" 2> /dev/null)" -ge 2 ] ||
+				P2P_SKIP="the ssh tunnel to node B does not come up: $(tail -3 "$WORK/tunnel.log" | tr '\n' ' ')"
+		fi
+		( . "$WORK/a.env"; "$BINDIR/velarx-p2p" generate-key "$WORK/swarm.key" > /dev/null )
+		rcp "$WORK/swarm.key" "$NODEB:$RW/swarm.key"
+		rsh "chmod 600 $RW/swarm.key"
+		# node A: the P2P service (it serves the store that pulled the images)
+		cat > "$WORK/a.p2p.toml" <<EOF
+mdns = false
+private_key_path = "$WORK/swarm.key"
+listen_addresses = ["/ip4/$HOSTADDR/tcp/$PORT_A_P2P"]
+bootstrap_peers = []
+quic = $QUIC
+EOF
+		( . "$WORK/a.env"; RUST_LOG=info spawn "$WORK/a.p2p.log" "$BINDIR/velarx-p2p" --config "$WORK/a.toml" --p2p-config "$WORK/a.p2p.toml" )
+		timeout 20 tail -n +1 -F "$WORK/a.p2p.log" 2> /dev/null | grep -q -m1 'Chunk provider set'
+		if ! grep -q 'Chunk provider set' "$WORK/a.p2p.log" 2> /dev/null; then
+			P2P_SKIP="the P2P service of node A does not start with this configuration (see $WORK/a.p2p.log: $(tail -2 "$WORK/a.p2p.log" | tr '\n' ' '))"
+		fi
+	fi
+	if [ -z "$P2P_SKIP" ]; then
+		peerid=$(vx a p2p status 2>&1 | grep -oE '12D3KooW[A-Za-z0-9]+' | head -1)
+		[ -n "$peerid" ] || P2P_SKIP="no peer id of node A (velarx p2p status)"
+	fi
+	if [ -z "$P2P_SKIP" ]; then
+		# node B: the same configuration with the registry of this host
+		mknode b "$WORK" "$REG"
+		sed -i "s|$WORK/b/|$RW/b/|g;s|$WORK/b\.|$RW/b.|g" "$WORK/b.toml" "$WORK/b.env" "$WORK/b.registries.conf" "$WORK/b.sources.toml"
+		sed -i "s|$WORK/|$RW/|g" "$WORK/b.toml" "$WORK/b.env"
+		cat > "$WORK/b.p2p.toml" <<EOF
+mdns = false
+private_key_path = "$RW/swarm.key"
+listen_addresses = ["/ip4/$LISTEN_B/tcp/$PORT_B_P2P"]
+bootstrap_peers = ["/ip4/$HOSTADDR/tcp/$PORT_A_P2P/p2p/$peerid"]
+quic = $QUIC
+EOF
+		for f in b.toml b.env b.registries.conf b.p2p.toml; do rcp "$WORK/$f" "$NODEB:$RW/$f"; done
+		rsh "mkdir -p $RW/b/home/.config/velarx $RW/b/run $RW/b/data && chmod 700 $RW/b $RW/b/run"
+		rsh ". $RW/b.env; RUST_LOG=info,velarx_p2p=debug nohup $RW/bin/velarx-p2p --config $RW/b.toml --p2p-config $RW/b.p2p.toml >> $RW/b.p2p.log 2>&1 < /dev/null & echo \$! >> $RW/pids"
+		rsh "touch $RW/b.p2p.log; timeout 30 tail -n +1 -F $RW/b.p2p.log 2> /dev/null | grep -q -m1 'Chunk provider set'" || P2P_SKIP="the P2P service of node B does not start (see its log: $(rsh "tail -2 $RW/b.p2p.log" | tr '\n' ' '))"
+	fi
+	if [ -z "$P2P_SKIP" ]; then
+		# (the node says so when it has found A, which is what is waited for)
+		rsh "timeout 60 tail -n +1 -F $RW/b.p2p.log 2> /dev/null | grep -q -m1 'Connected to $peerid'" ||
+			say "node B did not report a connection to node A ($peerid) within 60 s"
+		prev=0
+		# The chunked images are pulled lazily and completed by `image complete`
+		# (the files come from the sources in a lazy pull: that is what the
+		# peers serve on main); the slots of the background completers are
+		# held first, so that no completer outlives the run.
+		rsh "d=$RW/b/store/staging/lazy/slots; mkdir -p -m 700 \$d
+		rm -f \$d/ready; mkfifo \$d/ready
+		for i in 0 1; do ( exec 9> \$d/\$i; flock -x 9; echo > \$d/ready; exec sleep 3600 ) > /dev/null 2>&1 < /dev/null & echo \$! >> $RW/pids; done
+		{ read -r; read -r; } < \$d/ready"
+		# (the chunked images first: the node has none of their files yet, a gzip image after has them from them)
+		for img in vf/app1:z vf/app2:z vf/app1:1 "${SEEDED[1]:-}"; do
+			[ -n "$img" ] || continue
+			name=$(echo "$img" | tr '/:' '__')
+			from=$(($(wc -l < "$REGLOG") + 1))
+			bx="$RW/bin/velarx --config $RW/b.toml"
+			case $img in
+			*:z) cmd="$bx image pull --lazy --tls-verify=false $REG/$img && $bx container run --rm --lazy --network none $REG/$img sh -c 'cat /opt/base/big.bin > /dev/null; find /app1 /app2 -type f 2> /dev/null | xargs cat > /dev/null; echo read' && $bx image complete $REG/$img" ;;
+			*) cmd="$bx image pull --tls-verify=false $REG/$img" ;;
+			esac
+			rsh ". $RW/b.env; export RUST_LOG=debug; strace -f -ttt -y -e trace=syncfs,fsync,fdatasync,sync_file_range,sync -o $RW/b.$name.strace sh -c \"$cmd\"" > "$WORK/b.$name.log" 2>&1
+			rc=$?
+			echo "$from $(wc -l < "$REGLOG")" > "$WORK/b.$name.window"
+			rcp "$NODEB:$RW/b.$name.strace" "$WORK/b.$name.strace" 2> /dev/null || : > "$WORK/b.$name.strace"
+			peerstat=$(rsh ". $RW/b.env; $RW/bin/velarx --config $RW/b.toml p2p status 2>&1")
+			echo "$peerstat" > "$WORK/b.$name.p2pstatus"
+			rep=$(pull_report b "$name")
+			put "pull_b_$name" "$rep"
+			rb=$(echo "$rep" | python3 -I -c 'import json,sys; r=json.load(sys.stdin)["requests"]; print(r["blob_gets"], r["blob_bytes"])')
+			pb=$(echo "$peerstat" | python3 -I -c '
+import json, sys
+t = sys.stdin.read()
+try:
+    d = json.loads(t)
+    peers = d.get("peers", {})
+    items = peers.values() if isinstance(peers, dict) else peers
+    print(sum(int(p.get("bytes_received", 0)) for p in items))
+except Exception:
+    import re
+    print(sum(int(x) for x in re.findall(r"bytes_received\D+(\d+)", t)))')
+			st=ok; [ "$rc" = 0 ] || { st="FAIL: pull exits $rc"; cat "$WORK/b.$name.log" >&2; }
+			# node A has every file of the vf images (BIG too, in layers of
+			# which some were made of what its store had): the peers give them
+			# all, the registry only the metadata and what A has not.  BIG
+			# from the registry is a file a peer should have given
+			case $img in
+			vf/*)
+				[ "${rb#* }" -lt "$BIGSIZE" ] || st="FAIL: the registry gave ${rb#* } bytes, BIG ($BIGSIZE) is a file the peers have"
+				[ "$((pb - prev))" -gt 0 ] || [ "$img" = vf/app2:z ] || st="FAIL: nothing from the peers"
+				;;
+			esac
+			check "node B pull $img: bytes from peers / from the registry (blob GETs: count, bytes)" "$((pb - prev)) / $rb  $st"
+			put "peer_bytes_b_$name" "$((pb - prev))"
+			prev=$pb
+		done
+		# what each service says of its peers, and the end of their logs, for the one who reads the result
+		put p2p_peers_b "$(rsh ". $RW/b.env; $RW/bin/velarx --config $RW/b.toml p2p peers 2>&1" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+		put p2p_status_b "$(rsh ". $RW/b.env; $RW/bin/velarx --config $RW/b.toml p2p status 2>&1" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+		put p2p_status_a "$(vx a p2p status 2>&1 | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+		put p2p_log_a "$(tail -15 "$WORK/a.p2p.log" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+		put p2p_log_b "$(rsh "tail -15 $RW/b.p2p.log" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+		b_status=ran
+	fi
+	if [ -n "$P2P_SKIP" ]; then
+		check "peers step" "SKIPPED: $P2P_SKIP"
+		put p2p_skipped "\"$P2P_SKIP\""
+	fi
+elif [ "$USEB" = 1 ]; then
+	check "peers step" "SKIPPED (--skip p2p)"
+fi
+
+exit "$RC"

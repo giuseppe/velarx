@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Velarx auto-update service
+Documentation=man:velarx(1) man:velarx.conf(5)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/velarx auto-update
+ExecStartPost=/usr/bin/velarx image prune --force
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

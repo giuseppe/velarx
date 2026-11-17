@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The interface org.velarx.Store: what the store of a node may give to the
+# other nodes, served on services/store.sock to the fetchers of the node
+# that serve its peers.  Generated from the Rust types
+# (crates/core/src/store_service.rs) by the test
+# `store_service::tests::the_interface_file_is_current`:
+# VELARX_WRITE_INTERFACES=1 cargo test -p velarx-core --lib store_service writes it.
+#
+# A client calls GetInfo on each connection and refuses a `proto` other than its
+# own (1).  Only what shareable pulls stored is given (the layers of
+# public pulls, and the images whose layers are all public); the files cross as
+# read-only descriptors in the SCM_RIGHTS of the reply, named in the JSON by
+# their position, and a client checks every byte it reads from them.
+# Who may call: a peer of the same user or root (SO_PEERCRED); any
+# accepted peer may make every call.
+
+interface org.velarx.Store
+
+# What a client wants: the sha256 of a file or a chunk, and its size if
+# it knows it (an item of another size is not given).
+type Want (
+	# `sha256:` and 64 lowercase hex digits, or `sha512:` and 128
+	digest: string,
+	# The size the client expects, in bytes
+	size: ?int
+)
+
+# The answer for one digest: its bytes are `length` bytes from `offset` of
+# the file `fd`.
+type Item (
+	# The digest asked for
+	digest: string,
+	# The position of its file among the descriptors of the reply; absent
+	# when it is not given
+	fd: ?int,
+	# Where its bytes begin in the file
+	offset: int,
+	# How many bytes it has
+	length: int
+)
+
+# An image that may be announced: the digests of what it is made of, and
+# the names a shared pull gave it when the configuration shares them.
+type ImageInfo (
+	# Its id (the digest of its manifest without its algorithm: 64 hex
+	# digits for a sha256, 128 for a sha512)
+	id: string,
+	# The digest of its manifest
+	manifest_digest: string,
+	# The digest of its configuration
+	config_digest: string,
+	# `repository:tag`; empty unless the names are shared
+	tags: []string,
+	# `repository@manifest digest`; empty unless the names are shared
+	repo_digests: []string,
+	# The layers, in order, by their keys (`sha256:<hex>`, the blob of a
+	# layer pulled whole; `toc:sha256:<hex>`, the TOC of a layer pulled
+	# through it: never one for the other): each one's index is asked of
+	# the service by it (`Index`), its files by theirs (`Lookup`)
+	layers: []string,
+	# The sizes of the layers, together
+	size: int,
+	# When it was made, as its configuration says (RFC 3339)
+	created_at: string,
+	# Every layer is proven and every file is in the store: the image is
+	# given whole.  False for a lazy image, until its completion.
+	complete: bool
+)
+
+# What a change of `Subscribe` is.
+type ChangeKind (
+	# Everything that may be announced (the first change of a stream, and
+	# again after the subscriber fell behind)
+	snapshot,
+	# New layers and content, and the images that are new or changed (an
+	# image that became complete is one of them: take it as it is now)
+	added,
+	# What is not there any more (an image by its id)
+	removed
+)
+
+# Who serves this interface and what it can do.  The first call of a
+# connection; a client refuses a `proto` other than its own.
+method GetInfo() -> (
+	name: string,
+	# The version of the package
+	version: string,
+	# The version of the protocol (1)
+	proto: int,
+	# Words; a client ignores those it does not know
+	capabilities: []string,
+	# Named limits (`max_objects`, `max_wants`, ...); a client ignores those it does not know
+	limits: [string]int
+)
+
+# The images that may be given to peers, complete or not, one a
+# reply.
+method ImageList() -> (image: ?ImageInfo)
+
+# One image, by id, manifest digest or name.
+method ImageInspect(image: string) -> (image: ImageInfo)
+
+# Read-only descriptors of the files that hold `wants`, for those
+# that may be given to peers.
+method Lookup(wants: []Want) -> (
+	# One for each digest asked, in order
+	items: []Item
+)
+
+# The index of a shareable layer, in a file with no name.
+method Index(layer: string, max: int) -> (
+	# The position of the file among the descriptors of the reply
+	fd: int
+)
+
+# The startup profile of an image: the file of the store.
+method Profile(image: string, max: int) -> (
+	# The position of the file among the descriptors of the reply
+	file: int
+)
+
+# What may be announced, then what changes in it, called with
+# `more`: a `snapshot`, then `added` and `removed` as the store
+# changes, until the client closes the connection.
+method Subscribe() -> (
+	kind: ChangeKind,
+	# The digests of layers
+	layers: []string,
+	# The images (with `removed`, only their `id` is meaningful)
+	images: []ImageInfo,
+	# Digests of content announced by itself: the pieces and manifests of
+	# the checkpoints this node shares
+	content: []string
+)
+
+# A request the service does not take: too many digests, a digest
+# that is not `sha256:` and 64 lowercase hex digits or `sha512:` and
+# 128
+error InvalidArgument (reason: string)
+
+# The store cannot answer now (its database)
+error Unavailable (reason: string)
+
+# The store has nothing to give: no such image, or one that is not for
+# the peers; for `Index` and `Profile`: no file, because the layer or
+# the image is not shareable, the store has none for it, or it is
+# larger than `max`
+error NotFound (reason: string)

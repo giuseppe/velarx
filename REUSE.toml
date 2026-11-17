@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: Apache-2.0
+# The license of the tracked files that cannot carry an SPDX line (data,
+# fixtures, binaries, license texts), in the format of https://reuse.software
+# (REUSE.toml, version 1).  `make reuse` (tools/check-spdx) fails on a tracked
+# file with neither an SPDX line nor an annotation here.
+version = 1
+
+# The third-party material of NOTICE, under its own license.
+[[annotations]]
+path = "crates/runtime/src/container/seccomp.json"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "The containers-common and Moby authors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "crates/runtime/src/container/apparmor-profile.txt"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "The containers-common and Moby authors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "crates/cri/proto/runtime/v1/api.proto"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2020 The Kubernetes Authors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "crates/cri/src/spdy_dictionary.bin"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2013 The Go Authors"
+SPDX-License-Identifier = "BSD-3-Clause"
+
+[[annotations]]
+path = "vendor/zlink-core/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2025 Zeeshan Ali Khan"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "vendor/composefs/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "The composefs-rs contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "vendor/tar/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Alex Crichton and the tar-rs contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "vendor/zlink-idl/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2025 Zeeshan Ali Khan"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "vendor/zlink-macros/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2025 Zeeshan Ali Khan"
+SPDX-License-Identifier = "MIT"
+
+# The texts of the licenses themselves.
+[[annotations]]
+path = "LICENSE"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "The Apache Software Foundation"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Made for the project (generated with gpg and sigstore tools in a scratch
+# directory, or seeds and minimized inputs of the fuzz targets, or files the
+# build tests copy into images, or tar-splits the Go tool wrote of archives
+# made here): the license of the project.
+[[annotations]]
+path = [
+    "crates/signature/tests/fixtures/signature/**",
+    "fuzz/corpus/**",
+    "crates/*/fuzz/corpus/**",
+    "crates/tarsplit/tests/fixtures/**",
+    "tests/fixtures/build/**",
+    "crates/base/src/testing/*.features.json",
+    ".gitignore",
+    "fuzz/.gitignore",
+    "Cargo.lock",
+    "NOTICE",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "The Velarx Authors"
+SPDX-License-Identifier = "Apache-2.0"

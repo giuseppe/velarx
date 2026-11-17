@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+# Fuzz targets of what the service reads from peers, for cargo-fuzz like
+# those of ../../fuzz (`make fuzz FUZZ=p2p_gossip`).  Each target is a
+# function of velarx_p2p::fuzzing; the seeds are in corpus/TARGET, replayed
+# by `cargo test -p velarx-p2p --test p2p fuzz_corpus_tests`.
+[package]
+name = "velarx-p2p-fuzz"
+version = "0.0.0"
+publish = false
+license = "Apache-2.0"
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+velarx-p2p = { path = ".." }
+
+# not a member of the workspace above
+[workspace]
+members = ["."]
+
+# (a workspace of its own: the [patch] of the root Cargo.toml, here too;
+# `tools/check-patches` compares the two)
+[patch.crates-io]
+zlink-core = { path = "../../../vendor/zlink-core" }
+zlink-macros = { path = "../../../vendor/zlink-macros" }
+zlink-idl = { path = "../../../vendor/zlink-idl" }
+tar = { path = "../../../vendor/tar" }
+composefs = { path = "../../../vendor/composefs" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "p2p_gossip"
+path = "fuzz_targets/p2p_gossip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p2p_quic_request"
+path = "fuzz_targets/p2p_quic_request.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+# The project of tests/e2e/bats/api/compose.bats: a database with a health check,
+# a web service built from a context that waits for it, a network with an
+# alias, a named volume shared by both, an environment file, a published
+# port, restart policies and a service of a profile.
+name: vxcompose
+services:
+  db:
+    image: ${E2E_IMAGE:-localhost:5000/alpine:chunked}
+    command: ["sh", "-c", "touch /tmp/ready; echo db-ready; exec sleep 3600"]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - dbdata:/data
+    networks:
+      backend:
+        aliases:
+          - database
+    restart: unless-stopped
+  web:
+    build:
+      context: ./web
+      args:
+        BASE: ${E2E_IMAGE:-localhost:5000/alpine:chunked}
+        GREETING: hi
+    # (a name no registry has: compose tries a pull first, then builds)
+    image: ${E2E_REGISTRY:-localhost:5000}/vxcompose/web:test
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: app.env
+    environment:
+      DB_HOST: database
+    ports:
+      - "127.0.0.1:${WEB_PORT:-18080}:80"
+    networks:
+      - backend
+    volumes:
+      - dbdata:/shared
+    restart: on-failure
+  debug:
+    image: ${E2E_IMAGE:-localhost:5000/alpine:chunked}
+    command: ["sleep", "3600"]
+    profiles: ["debug"]
+networks:
+  backend: {}
+volumes:
+  dbdata: {}

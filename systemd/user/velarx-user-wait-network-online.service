@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# The user manager has no network-online.target of its own: this waits for
+# the system's, for the user units that need the network (as podman's
+# podman-user-wait-network-online.service).
+[Unit]
+Description=Wait for system level network-online.target as user
+Documentation=man:velarx(1) man:velarx.conf(5)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'until systemctl is-active network-online.target; do sleep 0.5; done'
+RemainAfterExit=yes

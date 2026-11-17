@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Keep the documents true:
+#
+#   tools/check-docs                static checks, no build needed (`make docs-check`)
+#   tools/check-docs --commands DIR commands and flags shown in the documents
+#                                   against the --help of the binaries of DIR
+#                                   (`make docs-commands`)
+#
+# The static checks fail on
+#  * names and options that no longer exist (the earlier project name, the
+#    removed `system service` command and `--cgroup-mode`, the policy file
+#    that is no longer read...): the list STALE below, with the lines that
+#    may name one on purpose (a refusal that says it is gone);
+#  * a relative link of a document to a file that is not tracked, and a
+#    `#anchor` that is no heading of the file it points to;
+#  * a `path/to/file` in code quotes of a document (src/, crates/, tests/,
+#    tools/, docs/, systemd/...) that is not a tracked file or directory;
+#  * a `make TARGET` of a fenced block or of code quotes that the Makefile
+#    does not have.
+# Anchors are the ids GitHub gives the headings.
+# With --commands, every `velarx WORDS...` and `velarx-kube WORDS...` of a
+# fenced block (lines continued
+# with a backslash joined) or of code quotes in the documents must start
+# with a command that `velarx WORDS --help` knows, and the `--flags` that
+# follow must be in the help of that command or of `velarx --help`.  The
+# words after a command that has no subcommands are its arguments, and a
+# placeholder (UPPERCASE words, <angle brackets>) ends the words.  Nothing
+# but `--help` of a command is run, in a scratch home.
+import fnmatch
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+start = os.getcwd()
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(root)
+
+files = [
+    f
+    for f in subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")[:-1]
+    if os.path.isfile(f) and not f.startswith("vendor/") and f != "Cargo.lock"
+]
+fileset = set(files)
+dirset = set()
+for f in files:
+    d = os.path.dirname(f)
+    while d:
+        dirset.add(d)
+        d = os.path.dirname(d)
+
+# The documents: the Markdown files, the examples of configuration, the man
+# pages, the unit files, the interface definitions and the workflows.
+DOCS = [
+    f
+    for f in files
+    if f.endswith((".md", ".example", ".varlink", ".service", ".socket", ".timer", ".yml"))
+    or f.startswith("man/")
+]
+DOCSET = set(DOCS)
+MARKDOWN = [f for f in DOCS if f.endswith(".md") and not f.startswith(".github/")]
+
+# (regular expression, files it applies to, lines that may match): "*" is
+# every tracked file, "docs" the documents (DOCS) and a regular expression the
+# files whose whole name it matches
+STALE = [
+    # the earlier names of the project
+    (r"(?i)seahorse|cmanage", "*", None),
+    # the engine service is `velarx varlink`
+    (r"velarx system service", "docs", r"podman system service|is refused"),
+    # the cgroup mode of the engine is `[containers] cgroups` and --cgroups
+    (r"--cgroup-mode|\[engine\][^\n]*cgroup_mode", "docs", None),
+    # the monitor owns the life of a container; the engine follows nothing
+    (r"container_followers", "docs", None),
+    # no policy file of the packages is read: the built-in default applies
+    (r"/usr/share/velarx/policy\.json", "docs", None),
+    # velarx reads its own files, not podman's
+    (
+        r"containers\.conf",
+        r"(README\.md|CHANGELOG\.md|docs/.*|man/.*|config\.toml\.example"
+        r"|interfaces/.*|systemd/.*|Makefile)",
+        r"reads no containers\.conf|not read|reads nothing|nothing of",
+    ),
+    # the setting is [containers] client_stall_secs
+    (r"client_stall_ms", "docs", None),
+    # system check reads the content unless --quick; there is no --full
+    (r"system check --full", "docs", None),
+    # velarx-cri is checked with critest and a kubelet, it is no probe
+    (r"velarx-cri[^.\n]*\ba probe\b", "docs", None),
+]
+
+problems = []
+
+
+def problem(where, what):
+    problems.append(f"{where}: {what}")
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (UnicodeDecodeError, OSError):
+        return None
+
+
+texts = {f: read(f) for f in files}
+
+SELF = ("tools/check-docs",)
+for pattern, scope, ok in STALE:
+    rx = re.compile(pattern)
+    allowed = re.compile(ok) if ok else None
+    for f in files:
+        t = texts[f]
+        if t is None or f in SELF or f == "src/testing.rs":
+            continue
+        if scope == "docs":
+            if f not in DOCSET:
+                continue
+        elif scope != "*" and not re.fullmatch(scope, f):
+            continue
+        for n, line in enumerate(t.split("\n"), 1):
+            if rx.search(line) and not (allowed and allowed.search(line)):
+                problem(f"{f}:{n}", f"stale: {line.strip()[:100]}")
+
+
+FENCE = re.compile(r" {0,3}(```|~~~)")
+
+
+def slug(heading):
+    """The id GitHub gives a heading: lower case, every run of characters
+    other than letters, digits and _ a -, no - at either end."""
+    s = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", heading)  # a link: its text
+    return re.sub(r"[^\w]+", "-", s.strip().lower()).strip("-")
+
+
+def anchors(path):
+    t = texts.get(path) or ""
+    out, fence = set(), None
+    for line in t.split("\n"):
+        m = FENCE.match(line)
+        if m and (fence is None or m.group(1) == fence):
+            fence = None if fence else m.group(1)
+        elif fence is None and re.match(r" {0,3}#{1,6}(\s|$)", line):
+            base = slug(re.sub(r"\s#+\s*$", "", line.strip().lstrip("#")))
+            # a second heading of the same id gets -1, -2...
+            name, k = base, 0
+            while name in out:
+                k += 1
+                name = f"{base}-{k}"
+            out.add(name)
+    return out
+
+
+def unfenced(t):
+    """The text of a Markdown file with its fenced blocks blank."""
+    out, fence = [], None
+    for line in t.split("\n"):
+        m = FENCE.match(line)
+        if m and (fence is None or m.group(1) == fence):
+            fence = None if fence else m.group(1)
+            out.append("")
+        else:
+            out.append("" if fence else line)
+    return "\n".join(out)
+
+
+for f in MARKDOWN:
+    t = texts[f] or ""
+    for n, line in enumerate(unfenced(t).split("\n"), 1):
+        for target, frag in re.findall(r"\]\(([^)#\s]*)(#[^)\s]*)?\)", line):
+            if "://" in target or target.startswith("mailto:"):
+                continue
+            path = f if not target else os.path.normpath(os.path.join(os.path.dirname(f), target))
+            if path not in fileset and path not in dirset:
+                problem(f"{f}:{n}", f"link to {target}: no such file")
+            elif frag and path.endswith(".md") and frag[1:] not in anchors(path):
+                problem(f"{f}:{n}", f"link to {target}{frag}: no such heading")
+
+TREE = r"(?:src|crates|tests|tools|docs|systemd|contrib|interfaces|man|examples|fuzz)"
+for f in MARKDOWN:
+    for n, line in enumerate((texts[f] or "").split("\n"), 1):
+        for path in sorted(set(re.findall(r"`(" + TREE + r"/[A-Za-z0-9_./*-]*)(?::[0-9]+)?`", line))):
+            p = path.rstrip("/")
+            if "*" in p:
+                if not any(fnmatch.fnmatch(x, p) for x in files):
+                    problem(f"{f}:{n}", f"`{path}` matches no file")
+            elif p not in fileset and p not in dirset:
+                problem(f"{f}:{n}", f"`{path}` is not in the tree")
+
+TARGETS = set()
+for line in (texts.get("Makefile") or "").split("\n"):
+    m = re.match(r"([A-Za-z0-9_.%-]+(?:[ \t]+[A-Za-z0-9_.%-]+)*)[ \t]*:(?!=)", line)
+    if m:
+        TARGETS.update(m.group(1).split())
+for f in MARKDOWN:
+    fence = None
+    for n, line in enumerate((texts[f] or "").split("\n"), 1):
+        m = FENCE.match(line)
+        if m and (fence is None or m.group(1) == fence):
+            fence = None if fence else m.group(1)
+            continue
+        spans = [line] if fence else re.findall(r"`([^`]*)`", line)
+        for span in spans:
+            for target in re.findall(r"(?:^\s*(?:\$ )?|[;&|(]\s*)make\s+(?:-\S+\s+)*([a-z][a-z0-9_-]*)(?![\w=-])", span):
+                if target not in TARGETS:
+                    problem(f"{f}:{n}", f"make {target}: no such target")
+
+
+# Commands that exist but are internal (the engine and the monitor start
+# them) and flags that are accepted and hidden from --help.
+INTERNAL = {"pull-complete", "pull-job", "pull-worker", "netns-holder", "fetcher", "cleanup", "store-service"}
+HIDDEN_FLAGS = {
+    "--listen-fd", "--lifeline-fd", "--config-fd", "--keep-socket",
+    "--self-test", "--service", "--all-tags", "--signature-policy",
+    # podman's signing options velarx refuses by name
+    "--sign-by-sigstore", "--sign-by-sq-fingerprint",
+}
+# podman's commands that velarx refuses by name may be named where the line
+# says so
+REFUSAL = r"refused|not supported|there is no|has no|no `velarx"
+
+
+def commands(bindir):
+    """Only `velarx WORDS --help` runs, for WORDS that are commands: a word
+    is looked up only under a command that has subcommands, never as an
+    argument of one (that `--help` could reach a container), and the
+    internal commands not at all.  The binaries see a scratch home, no
+    variable of the caller's environment and BINDIR as PATH, so that
+    `velarx NAME` runs the velarx-NAME of BINDIR, never an older one
+    installed; one that is not built (`make ci` builds the default members
+    only) is not checked (`make test-all` builds every program)."""
+    helps, refused, absent = {}, set(), set()
+    scratch = tempfile.mkdtemp(prefix="check-docs-")
+    env = {
+        "PATH": bindir,
+        "HOME": scratch,
+        "XDG_CONFIG_HOME": os.path.join(scratch, "config"),
+        "XDG_DATA_HOME": os.path.join(scratch, "data"),
+        "XDG_CACHE_HOME": os.path.join(scratch, "cache"),
+        "XDG_RUNTIME_DIR": os.path.join(scratch, "run"),
+        "LC_ALL": "C",
+    }
+
+    def help_of(words, program="velarx"):
+        key = (program, *words)
+        if key not in helps:
+            try:
+                r = subprocess.run(
+                    [os.path.join(bindir, program), *words, "--help"],
+                    capture_output=True, text=True, timeout=10,
+                    stdin=subprocess.DEVNULL, env=env, cwd=scratch,
+                )
+                helps[key] = r.stdout if r.returncode == 0 else None
+                if "is not supported by velarx" in r.stderr:
+                    refused.add(key)
+                if "is not next to velarx nor in PATH" in r.stderr:
+                    absent.add(key)
+            except (subprocess.TimeoutExpired, OSError):
+                helps[key] = None
+        return helps[key]
+
+    def has_option(text, flag):
+        return re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", text) is not None
+
+    try:
+        for program in PROGRAMS:
+            check_commands(program, help_of, has_option, refused, absent)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+# The binaries whose commands the documents show.
+PROGRAMS = ("velarx", "velarx-kube")
+
+
+def check_commands(program, help_of, has_option, refused, absent):
+    top = help_of([], program) or ""
+    if not top:
+        problem(f"{program} --help", "fails")
+        return
+    seen = {}
+    for f in MARKDOWN:
+        if f == "AGENTS.md":
+            continue
+        fence = None
+        lines = (texts[f] or "").split("\n")
+        n = 0
+        while n < len(lines):
+            line, first = lines[n], n + 1
+            n += 1
+            m = FENCE.match(line)
+            if m and (fence is None or m.group(1) == fence):
+                fence = None if fence else m.group(1)
+                continue
+            if fence:
+                # a command continued on the next lines with a backslash
+                while line.endswith("\\") and n < len(lines):
+                    line = line[:-1] + " " + lines[n]
+                    n += 1
+                spans = [re.sub(r"(^|\s)#\s.*$", "", line)]
+                lead = r"(?:^|[\s|&;(])"
+            else:  # in code quotes the command starts the quote
+                spans = re.findall(r"`(?:\$ )?(" + re.escape(program) + r"\b[^`]*)`", line)
+                lead = r"^"
+            for span in spans:
+                for m in re.finditer(lead + re.escape(program) + r"(?=\s|$)((?:\s+[a-z][a-z0-9-]*)*)([^|&;)]*)", span):
+                    words = m.group(1).split()
+                    flags = re.findall(r"(?<![\w-])--[a-z][a-z0-9-]+", m.group(2))
+                    if words or flags:
+                        seen.setdefault((f, first, tuple(words)), [set(), line])[0].update(flags)
+    for (f, n, words), (flags, line) in sorted(seen.items()):
+        if words[:1] and words[0] in INTERNAL:
+            continue
+        # the longest prefix of commands: the words after a command with no
+        # subcommands are its arguments
+        known, text = 0, top
+        while known < len(words) and "Commands:" in text:
+            sub = help_of(words[: known + 1], program)
+            if sub is None and (program, *words[: known + 1]) in refused and re.search(REFUSAL, line):
+                break
+            if sub is None and (program, *words[: known + 1]) in absent:
+                break
+            if sub is None:
+                problem(f"{f}:{n}", f"{program} {' '.join(words[:known + 1])}: no such command")
+                break
+            known, text = known + 1, sub
+        else:
+            for flag in sorted(flags):
+                if not (has_option(text, flag) or has_option(top, flag) or flag in HIDDEN_FLAGS):
+                    problem(f"{f}:{n}", f"{program} {' '.join(words[:known])}: no option {flag}")
+
+
+args = sys.argv[1:]
+if args[:1] == ["--commands"] and len(args) == 2:
+    commands(os.path.join(start, args[1]))
+elif args:
+    print("usage: tools/check-docs [--commands BINDIR]", file=sys.stderr)
+    sys.exit(2)
+
+if problems:
+    print("\n".join(problems), file=sys.stderr)
+    print(f"{len(problems)} problem(s) in the documents", file=sys.stderr)
+    sys.exit(1)

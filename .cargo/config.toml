@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+[build]
+# The kache build cache when it is installed, the plain rustc when not
+# (the script decides). A path with a slash is relative to the directory that
+# contains .cargo. RUSTC_WRAPPER in the environment wins; KACHE=0 bypasses.
+rustc-wrapper = "tools/rustc-wrapper"
+
+# Optional faster linkers are not selected here (`make setup-env`
+# detects mold). For example, for wild with gcc:
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "link-arg=-B/home/you/.local/lib/wild"]

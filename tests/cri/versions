@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# The pinned versions of the tools of the CRI tests and their sha256 (of the
+# release files): read by tests/cri/run-all.sh.
+# NAME=VALUE lines only (no quotes, no spaces): a CI job can add them to its
+# environment as they are.
+CRI_TOOLS_VERSION=1.37.0
+CRITEST_SHA256=e39780b83deac72e3d70599a6641f4db7661b63ebe15aa6d9f6d46dde06a4c05
+CRICTL_SHA256=67c983ee8a6bbce73d39a186e633c5fe4f8a70e62171ac3bd92a9c1b2c601670
+KUBELET_VERSION=1.37.1
+KUBELET_SHA256=cee008c1640c3b41820ef31d35b3cffc132b0c4b78c288be2b8022ebc7aa8293
+REGISTRY_VERSION=3.0.0
+REGISTRY_SHA256=61c9a2c0d5981a78482025b6b69728521fbc78506d68b223d4a2eb825de5ca3d
+# the image of a registry started with podman (--own-registry): registry:2 (2.8.3) by digest
+REGISTRY_IMAGE=docker.io/library/registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373

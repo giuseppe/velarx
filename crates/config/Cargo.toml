@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-config"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The configuration file of velarx (config.toml)"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Read by the thin client too; the methods that name the store (`engine`)
+# need velarx-storage.
+
+[lib]
+name = "velarx_config"
+path = "src/lib.rs"
+doctest = false
+
+[features]
+default = []
+engine = ["dep:velarx-storage"]
+
+[dependencies]
+velarx-base = { path = "../base" }
+velarx-types = { path = "../types", default-features = false }
+velarx-storage = { path = "../storage", optional = true }
+serde = { workspace = true, features = ["derive"] }
+toml.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

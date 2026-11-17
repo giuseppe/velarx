@@ -1,0 +1,270 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.\" Hand-written: the knobs are many and their comments long, so this page
+.\" says where each group is and what it does, and points at
+.\" config.toml.example (installed in /usr/share/doc/velarx), which the
+.\" project keeps complete and which a test of src/ holds in step with this
+.\" page's sections.
+.TH VELARX.CONF 5 "" "velarx" "Velarx"
+.SH NAME
+velarx.conf \- the configuration file of velarx
+.SH SYNOPSIS
+.B /etc/velarx/config.toml
+.br
+.IB $XDG_CONFIG_HOME /velarx/config.toml
+.SH DESCRIPTION
+The configuration of the engine, the command line, the monitor and the
+frontends
+.RB ( velarx\-api (8)),
+in the TOML format.  The root of the host reads
+.BR /etc/velarx/config.toml ;
+everybody else
+.IB $XDG_CONFIG_HOME /velarx/config.toml
+.RI ( ~/.config/velarx/config.toml ).
+The file is optional: every knob has a default.  The engine of a user is
+independent of the one of the root (another store, another state
+directory, another configuration), and a setting of the command line
+.RB ( \-\-root ", " \-\-runtime ", " \-\-events\-backend ", ...)"
+takes the place of the knob it matches.
+.PP
+Every knob, its default and a comment that says what it does are in
+.IR config.toml.example ,
+installed in
+.BR /usr/share/doc/velarx/config.toml.example ,
+which the project keeps complete.  What follows is what each section is
+for.
+.SH SECTIONS
+.TP
+.B server
+The service of the command line: its sockets and directories
+.RB ( socket ", " state_dir ", " root_dir ),
+the shutdown timeout, the OCI runtime and its options
+.RB ( runtime ", " runtime_args ,
+the table
+.BR [runtimes] ),
+how the cgroups of the containers are made
+.RB ( cgroup_manager ),
+the store service and where the events are kept.
+.TP
+.B engine
+The engine service
+.RB ( "velarx varlink" ):
+its socket and how long it stays with no client connected
+.RB ( idle_exit ).
+.TP
+.B services
+The limits of each varlink service: the engine, the store, the fetchers
+and the services of external sources
+.RB ( max_connections ", " max_per_client ", " first_call_secs );
+the fetcher the engine shares with the monitors of its
+containers has its own
+.RB ( "[pull] fetcher_connections" ).
+.TP
+.B api
+.BR velarx\-api (8):
+where it listens, the token of its TCP listeners and whether it starts the
+engine.
+.TP
+.B storage
+The store: its root, the storage driver
+.RB ( driver :
+.B composefs
+is the default, the EROFS image of each layer;
+.B vfs
+is a full copy of the files of the image for
+each container, made when it is created (the cost of a container is linear in the size of its
+image, reflinks make it cheap where the file system has them; it needs no
+mount, and takes no
+.BR \-\-lazy ", " "\-\-mount type=image" " nor " "\-\-storage\-opt size" ;
+it is never chosen for you;
+.B varlink
+passes the storage to a program of its own that serves
+.B org.velarx.Storage
+on the unix socket of the table
+.BR [storage.varlink] :
+.B socket
+(an absolute path, required),
+.B timeout_secs
+(how long a call may be silent, 60 by default: a long call is answered with progress
+at least every half of it, the others whole within it) and
+.B name
+(the name the service must give itself); the engine connects when it starts,
+and a service that is not running or speaks another version is an error that
+says so, as is a setting that the service does not advertise, and
+.B "[pull] job = true"
+with this driver);
+a store keeps the driver it was made with, and
+opening it with another is an error), the fs\-verity of its files, which
+.B fsverity_require
+makes necessary for every file, and which a driver that checks it only when a
+layer is pulled (vfs) accepts, for
+.BR fsverity_require ", " "composefs_digests = \(dqrequire\(dq" " and " "\-\-security\-opt verity=enforce" ,
+only with
+.B fsverity_best_effort = true
+(the check is at pull and nothing is promised while a container runs; without
+it those settings are an error with vfs; a process that may not give files
+the owners of the image leaves them its own with
+.BR vfs_ignore_chown_errors ),
+the EROFS images of the
+layers
+.RB ( composefs ),
+the digests of those images that a manifest states (the values of other
+writers in the list are ignored), which every start of a container checks,
+strictly with
+.B require
+.RB ( composefs_digests ),
+the read\-only stores of other instances
+.RB ( additional_image_stores ),
+the read\-only directories of other tools whose files a pull may import
+(composefs\-rs repositories, podman stores with
+.BR use_composefs ,
+other instances:
+.BR foreign_object_stores ,
+each
+.B { path, kind, link }
+with
+.B kind
+.BR composefs\-rs ", " containers\-storage " (its graph root) or " velarx ;
+only image data is read, nothing in them is written, and a file is verified
+before it is used), the garbage collection and how a
+pull makes its files durable.
+.TP
+.B pull
+The pulls: what is shared with the peers, the layers fetched at the same
+time, the memory and the cgroups of the workers, the limits that stop a
+runaway layer or archive
+.RB ( max_layer_gib ", " max_inflate_ratio ", " min_speed_kib ),
+the confined workers and the pull job
+.RB ( confine ", " job ),
+the signature policy, the lazily pulled images and the background process that
+completes their pull
+.RB ( lazy_complete_fetches ", " lazy_completers ", " lazy_retry_max_secs ),
+the fetcher
+.RB ( fetcher_connections ),
+and the sources of the content
+.RB ( sources ,
+.BR [[sources.external]] ).
+.TP
+.B push
+The pushes: the layers regenerated at the same time and the size of the
+pieces of an upload
+.RB ( parallel_layers ", " chunk_mib ),
+the compression of the layers that are regenerated
+.RB ( compression ", " compression_level ),
+whether the pushers are told where a blob may be linked from
+.RB ( mount ),
+whether they are asked what the destination has before a layer is
+regenerated
+.RB ( skip_existing ),
+the helper pushers of every push, in order
+.RB ( sinks ,
+names of
+.BR [[sinks.external]] ;
+the destination's own pusher always follows them and is not named),
+and the process of each scheme that is none of velarx's own
+.RB ( [[transports]] :
+.BR scheme ", " socket ", " idle_timeout_secs " and " credentials ;
+a top level table for both directions: it serves
+.B org.velarx.Fetcher
+and/or
+.B org.velarx.Pusher
+on its socket and announces the word
+.B origin
+in the
+.B GetInfo
+of each interface it is the origin for).
+A pusher that says nothing for
+.B idle_timeout_secs
+in a call ends the call (a long
+.B Put
+must send
+.B Progress
+events; the wait for the engine's own connection does not count); the push fails naming it, unless it is a helper of
+.BR "[push] sinks" ,
+which is left out.
+A transport gets the credentials of
+.I SCHEME://AUTHORITY
+only, and only with
+.BR "credentials = true" .
+The process serving the
+.B socket
+of a transport must run as the user of the engine or as root; the engine
+checks it
+.RB ( SO_PEERCRED )
+on every connection and refuses another.
+.TP
+.B sinks
+The helper pushers
+.RB ( [[sinks.external]] ):
+separate processes that speak
+.IR org.velarx.Pusher ,
+asked before the destination's own pusher
+.RB ( name ", " socket ", " idle_timeout_secs ", " credentials ).
+The process serving
+.B socket
+must run as the user of the engine or as root; the engine checks it
+.RB ( SO_PEERCRED )
+on every connection and refuses another.
+.TP
+.B build
+The builds: what an extraction may write, the builds that run or wait at
+the same time, the scratch space, the entitlements a build may ask for, and
+the algorithm of the digests of the images that are made
+.RB ( digest ,
+.B sha256
+by default, or
+.BR sha512 ;
+.B \-\-digest
+overrides it, it never applies to a pull, and
+.B commit
+follows the image of its container).
+.TP
+.B containers
+The containers: the log driver and its files
+.RB ( log_driver ", " log_max_size ,
+.BR log_max_files ", " log_path_allowlist ),
+the signature a container's image must have
+.RB ( image_signature ;
+under
+.B require
+an image without a name, no tag and never pulled, cannot be judged and is
+refused, as under
+.BR "\-\-security\-opt signature=check" ),
+the infra containers of pods, the CDI devices, the output of a container
+and its clients, the cgroups and the network mode of a container that asks
+for neither, the
+.I /etc/hosts
+of the containers, the keys that detach, and the pids limit of a container
+that gives none
+.RB ( pids_limit ,
+2048; 0 or less: none).
+.TP
+.B userns
+The automatic user namespaces of the root: the ranges of the ids, the user
+that delegates them and the sizes of the namespaces.
+.TP
+.B network
+The networks: the bridge
+.RB ( [network.bridge] ),
+the CNI plugins
+.RB ( [network.cni] ),
+the subnets of the new networks
+.RB ( [[network.subnet_pools]] )
+and the providers
+.RB ( [[network.providers]] ,
+separate processes that speak
+.IR org.velarx.Network ).
+.TP
+.B sources
+The external sources of content
+.RB ( [[sources.external]] ):
+separate processes that speak
+.IR org.velarx.Fetcher ,
+in the place of or before the registry.
+The process serving
+.B socket
+must run as the user of the engine or as root; the engine checks it
+.RB ( SO_PEERCRED )
+on every connection and refuses another.
+.SH SEE ALSO
+.BR velarx (1),
+.BR velarx\-api (8)

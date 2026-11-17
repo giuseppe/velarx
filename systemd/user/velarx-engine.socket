@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# The engine socket of a user (rootless): a connection starts the engine,
+# which leaves when it has been idle for a while.
+[Unit]
+Description=Velarx engine socket (org.velarx.Engine)
+Documentation=man:velarx(1) man:velarx.conf(5)
+
+[Socket]
+ListenStream=%t/velarx/engine/engine.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-cri-bin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The binary velarx-cri"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+# The binary of the package velarx-cri, apart from it so that the commit of
+# `--version` reaches nothing but the link (see crates/bin).
+[[bin]]
+name = "velarx-cri"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+velarx-cri = { path = ".." }
+velarx-sys = { path = "../../sys" }
+velarx-proto = { path = "../../proto" }
+velarx-base = { path = "../../base" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util"] }
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["std", "fmt", "ansi"] }
+anyhow.workspace = true
+rustix = { workspace = true, features = ["process", "fs", "net"] }
+tonic.workspace = true
+
+[lints]
+workspace = true

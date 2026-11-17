@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-wire"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The requests, wire types, option and address syntax and the Containerfile parser shared by the command line and the engine"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Shared by the thin client and the engine: blocking code only.
+
+[lib]
+name = "velarx_wire"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+velarx-base = { path = "../base" }
+velarx-sys = { path = "../sys" }
+velarx-registry = { path = "../registry" }
+velarx-proto = { path = "../proto", default-features = false, features = ["proxy"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+rustix = { workspace = true, features = ["fs", "process", "rand", "event", "net", "pipe", "termios", "stdio", "thread", "pty", "mount"] }
+libc.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["std", "fmt", "ansi", "json"] }
+flate2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+base64.workspace = true
+chrono.workspace = true
+
+[features]
+# the capture of the log for the tests of the packages above (logcapture)
+test-support = []
+
+[dev-dependencies]
+oci-spec.workspace = true
+# The definition of org.velarx.Monitor is made from the types by a test
+# (`monitor::iface`): the introspection of zlink, in the tests only.
+zlink-core = { workspace = true, features = ["std", "tracing", "introspection"] }
+
+[lints]
+workspace = true

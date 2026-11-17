@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Fail when the [patch] sections of the fuzz workspaces (fuzz/ and
+# crates/p2p/fuzz/, each a workspace of its own) differ from the root's: the
+# product builds with the forks of vendor/ (tar, zlink-*), and a fuzzer that
+# builds the crates.io release fuzzes another parser than the one that ships
+# (or does not build at all).  The paths are compared as paths from the
+# repository root.
+#   tools/check-patches
+import os
+import sys
+import tomllib
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def patches(manifest):
+    path = os.path.join(root, manifest)
+    with open(path, "rb") as f:
+        sections = tomllib.load(f).get("patch", {})
+    out = {}
+    for source, crates in sections.items():
+        for name, spec in crates.items():
+            where = spec.get("path")
+            if where is not None:
+                where = os.path.relpath(
+                    os.path.join(os.path.dirname(path), where), root
+                )
+            out[(source, name)] = where if where is not None else spec
+    return out
+
+
+want = patches("Cargo.toml")
+bad = False
+for manifest in ("fuzz/Cargo.toml", "crates/p2p/fuzz/Cargo.toml"):
+    have = patches(manifest)
+    for key in sorted(set(want) | set(have)):
+        if want.get(key) != have.get(key):
+            bad = True
+            print(
+                f"{manifest}: [patch.{key[0]}] {key[1]} is {have.get(key)!r}, "
+                f"the root's is {want.get(key)!r}",
+                file=sys.stderr,
+            )
+sys.exit(1 if bad else 0)

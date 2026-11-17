@@ -1,0 +1,146 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.\" Hand-written (the API frontend parses its arguments by hand, without
+.\" clap): what it serves and where it listens.
+.TH VELARX-API 8 "" "velarx" "Velarx"
+.SH NAME
+velarx\-api \- the REST API frontend of the engine
+.SH SYNOPSIS
+.B velarx\-api
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-listen
+.IR URI ]...
+.RB [ \-\-engine\-socket
+.IR PATH ]
+.RB [ \-\-idle\-exit
+.IR SECS ]
+.RB [ \-\-log\-level
+.IR LEVEL ]
+.RB [ \-\-start\-engine " | " \-\-no\-start\-engine ]
+.SH DESCRIPTION
+.B velarx\-api
+serves the REST API for podman and Docker clients (the routes of
+.IR /libpod
+and of
+.IR /api/* )
+as a frontend of the engine: it holds no container and no image of its
+own, every call goes to the engine service
+.RB ( velarx (1)
+.IR varlink ),
+which it starts when nothing else did
+.RB ( \-\-no\-start\-engine
+says something else does).
+.PP
+The sockets come from systemd
+.RB ( LISTEN_FDS ),
+or are bound here: the unix socket of the configuration
+.RI ( [ api ]\ socket
+of
+.BR velarx.conf (5))
+unless
+.B \-\-listen
+or
+.I [api]\ listen
+name others.  TCP only when named (see TCP below).  Everything the
+process needs from the system is done before it confines itself: the
+configuration is read, the sockets are bound, the engine is started if
+nothing activates it.
+.SH OPTIONS
+.TP
+.BI "\-\-config " PATH
+The configuration file of the engine
+.RI ( default:
+.B /etc/velarx/config.toml
+as root,
+.I $XDG_CONFIG_HOME/velarx/config.toml
+otherwise).  The
+.I [api]
+section is its own.
+.TP
+.BI "\-\-listen " URI
+Where to listen:
+.IR unix:///PATH ,
+.IR tcp://HOST:PORT ,
+.I tcp://:PORT
+(the loopback addresses) or the address of the unix socket.  May be given
+more than once; the default is
+.I [api]\ listen
+of the configuration, else its socket.
+.TP
+.BI "\-\-engine\-socket " PATH
+The socket of the engine service, in the place of the configuration's
+.RI ( [engine]\ socket ).
+.TP
+.BI "\-\-idle\-exit " SECS
+Leave after this many seconds with no client connected (an engine started
+by its socket; the default is
+.IR [api]\ idle_exit ,
+30).
+.TP
+.BI "\-\-log\-level " LEVEL
+The level of the messages on the standard error
+.RI ( default:
+.BR warn ).
+.TP
+.B \-\-start\-engine
+Start the engine when none runs (the default when systemd did not start
+this process).
+.TP
+.B \-\-no\-start\-engine
+Never start the engine: what starts it is running
+.RB ( "velarx varlink \-\-listen\-fd 3" ,
+for one).
+.TP
+.BR \-V ", " \-\-version
+Print the version and the commit of the build.
+.SH TCP
+A
+.I tcp://HOST:PORT
+listener binds the address named (\fItcp://:PORT\fR the loopback addresses).  Whoever can connect to the
+port controls the engine with the user of this process (root's engine: the
+host), and any local user can connect to a loopback port, so velarx-api does
+not start with a TCP listener unless the requests are authenticated: by a
+token
+.RI ( [api]\ token_file ,
+sent as
+.BR "Authorization: Bearer TOKEN" ),
+by a client certificate
+.RB ( \-\-tls\-client\-ca ),
+or
+.I [api]\ allow_unauthenticated
+says that nobody needs one.
+.PP
+.B \-\-tls\-cert
+.IR PEM ,
+.B \-\-tls\-key
+.I PEM
+(or
+.IR [api]\ tls_cert ,
+.IR tls_key )
+serve every TCP listener with TLS 1.3; the certificate file holds the chain.
+.B \-\-tls\-client\-ca
+.I PEM
+(\fItls_client_ca\fR) serves only the clients whose certificate that CA
+signed, and the certificate then authenticates: no token is needed.  The
+files are read once, at the start.  A listener with no TLS is warned about, and puts the token on the network in clear text on an address
+that is not loopback.  The podman client:
+.B podman \-\-url tcp://HOST:PORT \-\-tls\-ca CA \-\-tls\-cert CERT \-\-tls\-key KEY
+(it speaks https when a TLS option is given).  The unix socket is not
+affected.
+.SH ENVIRONMENT
+.TP
+.I LISTEN_FDS
+The sockets systemd passed, from descriptor 3
+.RB ( LISTEN_FDNAMES
+names them).
+.SH EXIT STATUS
+.TP
+.B 0
+A signal asked it to leave, or the last client went and the idle time
+passed.
+.TP
+.B 1
+It could not bind a socket, read the configuration or confine itself.
+.SH SEE ALSO
+.BR velarx (1),
+.BR velarx.conf (5)

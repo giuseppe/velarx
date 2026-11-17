@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-signature"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Image signature verification: the signature policy of containers/image, OpenPGP and sigstore"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# A leaf of the engine (`velarx` uses it, the other way is never): it
+# changes rarely, so an edit of the engine does not rebuild it.
+
+[lib]
+name = "velarx_signature"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+velarx-base = { path = "../base" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rustix = { workspace = true, features = ["process"] }
+libc.workspace = true
+hex.workspace = true
+base64.workspace = true
+flate2.workspace = true
+openssl.workspace = true
+yaml-rust2.workspace = true
+# the NaCl secretbox of an encrypted cosign key (OpenSSL has no XSalsa20)
+# in versions the lock file already has
+salsa20 = { version = "0.11", features = ["zeroize"] }
+poly1305 = { version = "0.8", features = ["zeroize"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

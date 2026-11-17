@@ -1,0 +1,224 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.\" Hand-written: the command is a binary of its own, not part of velarx(1).
+.TH VELARX-KUBE 1 "" "velarx" "Velarx"
+.SH NAME
+velarx\-kube \- play, take down, generate and apply Kubernetes YAML
+.SH SYNOPSIS
+.B velarx\-kube
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-engine\-socket
+.IR PATH ]
+.RB [ \-\-no\-start\-engine ]
+.I COMMAND
+.RI [ ARGUMENTS ]
+.br
+.B velarx\-kube play
+.RI [ OPTIONS ]
+.IR FILE ...
+.br
+.B velarx\-kube down
+.RB [ \-\-force ]
+.I FILE
+.br
+.B velarx\-kube generate
+.RI [ OPTIONS ]
+.IR NAME ...
+.br
+.B velarx\-kube apply
+.RI [ OPTIONS ]
+.RI [ NAME ...]
+.SH DESCRIPTION
+.B velarx\-kube
+is run by the user, as
+.BR velarx\-api (8)
+is: a client of the engine service
+.RB ( velarx (1)
+.IR varlink ),
+which it calls over the typed interface
+.IR org.velarx.Engine .
+It starts an engine when none serves its
+socket, and holds it while it runs.  It links no code of the engine, and the
+engine has no command of it.
+.PP
+It reads what it needs (the YAML, the kubeconfig, the credentials, the secrets
+of the engine the YAML refers to), then confines itself and does the work: see
+CONFINEMENT.
+.SH COMMANDS
+.TP
+.B play
+Create the pods, containers, volumes and secrets the YAML files describe, and
+start the pods.  The files, or the \fBhttp://\fR and \fBhttps://\fR addresses, are read in order (\fB\-\fR is the standard input),
+the documents of the ConfigMap files of
+.B \-\-configmap
+last.  The documents of a kind that is not played (a Service, a StatefulSet...)
+are skipped.  The report lists the volumes and secrets made, then each pod and its
+containers.
+.TP
+.B down
+Remove the pods of the YAML and the secrets its documents made (with
+.BR \-\-force ,
+its volumes too), and print what was removed.
+.TP
+.B generate
+Write the YAML of pods, containers and volumes of the engine.
+.TP
+.B apply
+Create the YAML of a file, or of containers, pods and volumes (as
+.BR generate ),
+in the Kubernetes cluster of a kubeconfig, through its API server.
+.SH GLOBAL OPTIONS
+.TP
+.BI "\-\-config " PATH
+The configuration file of the engine this command starts when none answers.
+.TP
+.BI "\-\-engine\-socket " PATH
+The socket of the engine service (default:
+.I engine/engine.sock
+in the runtime directory of the user).
+.TP
+.B \-\-no\-start\-engine
+Do not start an engine when none answers (something else does: the socket
+unit of the engine).
+.TP
+.BI "\-\-log\-level " LEVEL ", \-\-log\-format " FORMAT
+The options of
+.BR velarx (1)
+that
+.B velarx kube
+passes on to every program it runs.  The warnings and errors of this command
+are lines of text on its standard error whatever they say.
+.TP
+.B \-V, \-\-version
+Print the version.
+.SH OPTIONS OF PLAY
+.TP
+.B \-\-replace
+Remove the pods of the YAML that exist, then make them.
+.TP
+.BR \-\-start [ =false ]
+Start the pods (\fB\-\-start=false\fR only creates them; init containers need
+the start).
+.TP
+.BI "\-\-network " NAME
+The networks of the pods (comma separated or repeated).
+.TP
+.BR \-\-tls\-verify [ =false ]
+Verify the TLS certificates of the registries.
+.TP
+.BI "\-\-log\-driver " DRIVER ", \-\-log\-opt " KEY=VALUE
+The log driver of the containers and its options.
+.TP
+.BI "\-\-userns " MODE
+The user namespace of the pods.
+.TP
+.BI "\-\-annotation " KEY=VALUE
+Annotations of the containers.
+.TP
+.BI "\-\-publish " [[IP:]HOSTPORT:]CONTAINERPORT[/PROTO]
+Publish a port of the pods, over the YAML's.
+.TP
+.B \-\-publish\-all
+Publish every containerPort of the YAML on the same port of the host.
+.TP
+.BI "\-\-configmap " FILE
+YAML files of ConfigMaps the pods use (comma separated or repeated).
+.TP
+.BI "\-\-ip " ADDRESS ", \-\-mac\-address " ADDRESS
+Static addresses of the pods, the n\-th to the n\-th pod (comma separated or
+repeated); the pods must be on one bridge network.
+.TP
+.BR \-\-build [ =false ]
+Build the images of the YAML that have a directory of their name with a
+Containerfile in the context directory (by default those that are not in the
+store).
+.TP
+.BI "\-\-context\-dir " DIR
+The directory of the build directories (default: the current one); needs
+.BR \-\-build .
+.TP
+.B \-\-wait
+Stay until the pods exit or a SIGINT or SIGTERM comes, then remove what the
+YAML made (volumes too).
+.TP
+.BR \-\-service\-container [ =true ]
+Stay while the pods run, as the main process of a systemd unit: tell systemd
+(\fBNOTIFY_SOCKET\fR) when they run, stop them when the unit stops, and exit
+when all their containers did.
+.TP
+.BI "\-\-service\-exit\-code\-propagation " none|all|any
+With \fB\-\-service\-container\fR, the exit status: 0 (\fBnone\fR), that of a
+container when all of them failed (\fBall\fR) or when one did (\fBany\fR).
+.TP
+.B \-\-no\-hosts, \-\-no\-hostname
+The containers keep the /etc/hosts and the /etc/hostname of their image.
+.TP
+.B \-\-no\-pod\-prefix
+Name a container NAME, not POD\-NAME.
+.TP
+.BI "\-\-seccomp\-profile\-root " DIR
+The directory of the \fBLocalhost\fR seccomp profiles (default
+/var/lib/kubelet/seccomp).
+.TP
+.BI "\-\-creds " USER[:PASSWORD] ", \-\-authfile " FILE ", \-\-cert\-dir " DIR
+How the pulls and the builds authenticate to the registry.
+.TP
+.B \-q, \-\-quiet
+Accepted; a play prints nothing of the pulls.
+.PP
+The environment variable \fBPODMAN_SYSTEMD_UNIT\fR names the unit that runs
+the play: a label of its containers, which
+.B auto\-update
+reads.
+.SH OPTIONS OF GENERATE
+.TP
+.B \-s, \-\-service
+Add a Service of the published ports.
+.TP
+.BI "\-t, \-\-type " pod|deployment|daemonset|job
+The kind of the workload (default pod).
+.TP
+.BI "\-r, \-\-replicas " N
+The replicas of a Deployment.
+.TP
+.BI "\-f, \-\-filename " FILE
+Write to this file instead of the standard output.
+.TP
+.B \-\-podman\-only
+Add podman's own annotations of the containers, which Kubernetes does not read.
+.SH OPTIONS OF APPLY
+.TP
+.BI "\-k, \-\-kubeconfig " FILE
+The kubeconfig of the cluster (default: $KUBECONFIG).  Its first cluster and
+user are used.
+.TP
+.BI "\-\-ca\-cert\-file " FILE|insecure
+The CA of the API server, or \fBinsecure\fR to skip its verification.
+.TP
+.BI "\-\-ns " NAMESPACE
+The namespace (default: default).
+.TP
+.BI "\-f, \-\-file " FILE
+The YAML file or http(s) address, or \- for the standard input; without it, the names are
+containers, pods or volumes of the engine whose YAML is made first.
+.TP
+.B \-s, \-\-service
+With names: add a Service of the published ports.
+.SH CONFINEMENT
+Once it has read its inputs the process gives up what it does not need, with
+every right of Landlock ABI 9 a must (a kernel that cannot enforce them does
+not run it) and a seccomp filter: it reads no file; it makes files and
+directories only beneath the nearest existing directory of the host paths
+Kubernetes creates (\fBDirectoryOrCreate\fR, \fBFileOrCreate\fR) and of the
+file of \fBgenerate \-\-filename\fR; it looks up UNIX sockets only beneath the
+directory of the engine's socket (and of \fBNOTIFY_SOCKET\fR); it connects to
+no TCP port, except, for \fBapply\fR, the port of the API server of the
+kubeconfig; it executes nothing, makes no process, and signals nothing outside
+itself.
+.SH EXIT STATUS
+0, or 125 for an error (the message is on the standard error).  With
+\fB\-\-service\-container\fR, the status of \fB\-\-service\-exit\-code\-propagation\fR.
+.SH SEE ALSO
+.BR velarx (1),
+.BR velarx\-api (8),
+.BR velarx.conf (5)

@@ -1,0 +1,4 @@
+# ignored files
+files/secret*
+**/*.tmp
+!files/keep.tmp

@@ -1,0 +1,723 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# velarx-kubeadm: a single-node Kubernetes cluster (control plane and workloads
+# on this node) with velarx as the container runtime, through velarx-cri.
+#
+#   velarx-kubeadm up    [options]   # prerequisites, host settings, services, CNI, kubeadm init, wait for Ready
+#   velarx-kubeadm reset [--purge]   # kubeadm reset, the pods, the CNI file and rules, the unit drop-ins
+#   velarx-kubeadm check [options]   # only the prerequisites
+#
+# Run as root, on a systemd host with cgroup v2.  kubelet, kubeadm, kubectl and
+# crictl (all of one Kubernetes release), the CNI plugins (bridge, host-local,
+# portmap, loopback) and velarx with velarx-cri and an OCI runtime are installed
+# before: the script installs no package and downloads nothing but what
+# kubeadm pulls (the images of the control plane, through velarx).
+# docs/CRI.md ("A single-node cluster") describes it.
+set -u
+set -o pipefail
+
+NAME=velarx-kubeadm
+MARK="Written by $NAME"
+
+DEFAULT_CRI_SOCKET=/run/velarx/cri.sock
+CRI_SOCKET=$DEFAULT_CRI_SOCKET
+POD_CIDR=10.244.0.0/16
+SERVICE_CIDR=10.96.0.0/12
+K8S_VERSION=
+SANDBOX_IMAGE=
+KUBECONFIG_OUT=
+TIMEOUT=600
+CNI=bridge
+CNI_CONF_DIR=/etc/cni/net.d
+CNI_BIN_DIRS="/opt/cni/bin /usr/libexec/cni"
+HOST_CONFIG=1
+ALLOW_SWAP=0
+SMOKE=0
+IGNORE_PREFLIGHT=
+SMOKE_IMAGE=docker.io/library/busybox:1.36
+PURGE=0
+DRY=0
+
+KUBE_DIR=/etc/kubernetes
+KUBEADM_CONF=$KUBE_DIR/velarx-kubeadm.yaml
+UNIT_DROPIN_DIR=/etc/systemd/system/velarx-cri.service.d
+UNIT_DROPIN=$UNIT_DROPIN_DIR/10-kubernetes.conf
+SOCKET_DROPIN_DIR=/etc/systemd/system/velarx-cri.socket.d
+SOCKET_DROPIN=$SOCKET_DROPIN_DIR/10-kubernetes.conf
+MODULES_FILE=/etc/modules-load.d/velarx-kubernetes.conf
+SYSCTL_FILE=/etc/sysctl.d/99-velarx-kubernetes.conf
+CNI_CONF=$CNI_CONF_DIR/10-velarx.conflist
+CNI_NETWORK=velarx
+IPAM_DIR=/var/lib/cni/networks/$CNI_NETWORK
+BRIDGE=cni0
+CONTROL_PORTS="6443 2379 2380 10250 10257 10259"
+
+FAILED=0
+
+say () { printf '%s: %s\n' "$NAME" "$*"; }
+die () { printf '%s: %s\n' "$NAME" "$*" >&2; exit 1; }
+
+usage () {
+    sed -n '4,16p' "$0" | sed 's/^# \{0,1\}//'
+    cat <<'EOF'
+
+options:
+  --dry-run              print every file and command instead of running them (the
+                         prerequisites are still looked at)
+  --cri-socket PATH      the socket of velarx-cri (default /run/velarx/cri.sock)
+  --pod-cidr CIDR        the pods' network (default 10.244.0.0/16)
+  --service-cidr CIDR    the services' network (default 10.96.0.0/12)
+  --kubernetes-version V the release of the control plane (default: kubeadm's own)
+  --sandbox-image IMAGE  the infra (pause) image of the pods (default: the pause image kubeadm lists)
+  --cni bridge|none      bridge: write the reference bridge configuration; none: the
+                         pod network is installed by the user
+  --kubeconfig PATH      where the admin kubeconfig is copied (default $HOME/.kube/config,
+                         never over a file this script did not write)
+  --timeout SECONDS      the longest any wait takes (default 600)
+  --no-host-config       do not load modules or write sysctls: only check them
+  --allow-swap           run with swap on (failSwapOn: false)
+  --ignore-preflight-errors LIST
+                         passed to kubeadm init (its own checks, e.g. Swap)
+  --smoke                after the node is Ready, run a pod and exec, logs and port-forward
+  --smoke-image IMAGE    the image of that pod (default docker.io/library/busybox:1.36)
+  --purge                reset: also remove the modules and sysctl files
+EOF
+}
+
+# ---------------------------------------------------------------- helpers
+
+# run COMMAND...: run it, or print it with --dry-run
+run () {
+    if [ "$DRY" = 1 ]; then
+        printf '+'
+        if [ "$1" = crictl_cri ]; then
+            printf ' %q' crictl --runtime-endpoint "unix://$CRI_SOCKET" "${@:2}"
+        else
+            printf ' %q' "$@"
+        fi
+        printf '\n'
+    else
+        "$@"
+    fi
+}
+
+# write_file PATH MODE CONTENT: PATH gets CONTENT (and a newline), replaced
+# at once.  Returns 0 when it was written (or would be), 1 when it already
+# has this content; the script ends when it cannot be written.
+write_file () {
+    local path=$1 mode=$2 content=$3 tmp
+    if [ -f "$path" ] && printf '%s\n' "$content" | cmp -s - "$path"; then
+        return 1
+    fi
+    if [ "$DRY" = 1 ]; then
+        printf -- '--- %s (mode %s)\n%s\n---\n' "$path" "$mode" "$content"
+        return 0
+    fi
+    mkdir -p "$(dirname "$path")" || die "cannot make the directory of $path"
+    tmp=$(mktemp "$path.XXXXXX") || die "cannot write $path"
+    if ! { printf '%s\n' "$content" > "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$path"; }; then
+        rm -f "$tmp"
+        die "cannot write $path"
+    fi
+    return 0
+}
+
+problem () {
+    printf '%s: FAILED: %s\n' "$NAME" "$*" >&2
+    FAILED=1
+}
+
+crictl_cri () { crictl --timeout 60s --runtime-endpoint "unix://$CRI_SOCKET" --image-endpoint "unix://$CRI_SOCKET" "$@"; }
+
+# the minor ("1.37") of a version string
+minor_of () { sed -n 's/.*v\{0,1\}\([0-9]\{1,\}\.[0-9]\{1,\}\)\.[0-9].*/\1/p' | head -n 1; }
+
+# ---------------------------------------------------------------- prerequisites
+
+check_root () {
+    [ "$(id -u)" = 0 ] || problem "run as root: the kubelet and the CRI need it, and so does the node's configuration"
+}
+
+check_cgroups () {
+    [ "$(stat -fc %T /sys/fs/cgroup 2> /dev/null)" = cgroup2fs ] \
+        || { problem "cgroup v2 is not mounted on /sys/fs/cgroup (boot without systemd.unified_cgroup_hierarchy=0)"; return; }
+    local c
+    for c in cpu memory pids; do
+        grep -qw "$c" /sys/fs/cgroup/cgroup.controllers 2> /dev/null \
+            || problem "the cgroup controller $c is not available at the root of the cgroup tree"
+    done
+    [ "$(ps -o comm= -p 1 2> /dev/null)" = systemd ] \
+        || problem "systemd is not PID 1: the kubelet and velarx-cri run as units with the systemd cgroup driver"
+}
+
+check_binaries () {
+    local b missing=0
+    for b in kubelet kubeadm kubectl crictl velarx velarx-cri velarx-monitor systemctl; do
+        command -v "$b" > /dev/null 2>&1 || { problem "$b is not in the PATH"; missing=1; }
+    done
+    command -v crun > /dev/null 2>&1 || command -v runc > /dev/null 2>&1 \
+        || problem "no OCI runtime (crun) is in the PATH"
+    command -v iptables > /dev/null 2>&1 || command -v nft > /dev/null 2>&1 \
+        || problem "neither iptables nor nft is installed (kube-proxy and the bridge plugin need one)"
+    [ "$missing" = 0 ] || return 0
+    local kubelet kubeadm kubectl
+    kubelet=$(kubelet --version 2> /dev/null | minor_of)
+    kubeadm=$(kubeadm version -o short 2> /dev/null | minor_of)
+    kubectl=$(kubectl version --client 2> /dev/null | minor_of)
+    if [ -n "$kubelet" ] && [ -n "$kubeadm" ] && [ "$kubelet" != "$kubeadm" ]; then
+        problem "kubelet is $kubelet and kubeadm $kubeadm: they have to be of the same minor release"
+    fi
+    if [ -n "$kubeadm" ] && [ -n "$kubectl" ]; then
+        local a=${kubeadm#*.} b=${kubectl#*.}
+        { [ "${kubeadm%%.*}" = "${kubectl%%.*}" ] && [ $((a - b)) -le 1 ] && [ $((b - a)) -le 1 ]; } \
+            || problem "kubectl is $kubectl and kubeadm $kubeadm: kubectl may differ by one minor release at the most"
+    fi
+    if command -v getenforce > /dev/null 2>&1 && [ "$(getenforce 2> /dev/null)" = Enforcing ]; then
+        local mon
+        say "warning: SELinux is enforcing: the control plane's pods mount host directories (/etc/kubernetes, /var/lib/etcd); label them container_file_t, or do as the Kubernetes documentation does and set it permissive"
+        mon=$(command -v velarx-monitor)
+        [[ $(stat -c %C "$mon" 2> /dev/null) == *:conmon_exec_t:* ]] \
+            || say "warning: SELinux is enforcing and $mon is not labelled conmon_exec_t (docs/CRI.md)"
+    fi
+}
+
+check_units () {
+    command -v systemctl > /dev/null 2>&1 || return 0
+    local u
+    for u in velarx-cri.socket velarx-engine.socket kubelet.service; do
+        systemctl cat "$u" > /dev/null 2>&1 || problem "the systemd unit $u is not installed"
+    done
+    # (the kubelet gets its configuration from kubeadm through the drop-in
+    # of the Kubernetes packages, 10-kubeadm.conf)
+    if systemctl cat kubelet.service > /dev/null 2>&1 \
+        && ! systemctl cat kubelet.service 2> /dev/null | grep -q KUBELET_KUBEADM_ARGS; then
+        problem "kubelet.service does not read the flags kubeadm writes (KUBELET_KUBEADM_ARGS: the 10-kubeadm.conf drop-in of the Kubernetes packages)"
+    fi
+}
+
+check_cni () {
+    [ "$CNI" = bridge ] || return 0
+    local p d found
+    for p in bridge host-local portmap loopback; do
+        found=0
+        for d in $CNI_BIN_DIRS; do
+            [ -x "$d/$p" ] && { found=1; break; }
+        done
+        [ "$found" = 1 ] || problem "the CNI plugin $p is not in $CNI_BIN_DIRS (package containernetworking-plugins)"
+    done
+}
+
+check_swap () {
+    [ "$ALLOW_SWAP" = 1 ] && return 0
+    if [ -n "$(swapon --noheadings --show 2> /dev/null)" ]; then
+        problem "swap is on: run swapoff -a (and remove it from /etc/fstab), or use --allow-swap"
+    fi
+}
+
+check_ports () {
+    local p listening
+    listening=$(ss -H -ltn 2> /dev/null | awk '{ n = split($4, a, ":"); print a[n] }')
+    for p in $CONTROL_PORTS; do
+        printf '%s\n' "$listening" | grep -qx "$p" && problem "the TCP port $p is in use"
+    done
+}
+
+# the modules and sysctls of the Kubernetes network: loaded and set when
+# HOST_CONFIG is on, only checked otherwise
+KERNEL_MODULES="overlay br_netfilter"
+SYSCTLS="net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables net.bridge.bridge-nf-call-ip6tables"
+
+check_kernel () {
+    local m
+    for m in $KERNEL_MODULES; do
+        [ -d "/sys/module/$m" ] && continue
+        if [ "$HOST_CONFIG" = 1 ]; then
+            modprobe -n "$m" > /dev/null 2>&1 || problem "the kernel module $m is neither loaded nor available"
+        else
+            problem "the kernel module $m is not loaded"
+        fi
+    done
+    if [ "$HOST_CONFIG" = 0 ]; then
+        local s
+        for s in $SYSCTLS; do
+            [ "$(sysctl -n "$s" 2> /dev/null)" = 1 ] || problem "the sysctl $s is not 1"
+        done
+    fi
+}
+
+preflight () {
+    check_root
+    check_cgroups
+    check_binaries
+    check_units
+    check_cni
+    check_swap
+    check_kernel
+}
+
+# ---------------------------------------------------------------- the pieces
+
+host_config () {
+    [ "$HOST_CONFIG" = 1 ] || return 0
+    local m changed=0
+    write_file "$MODULES_FILE" 0644 "# $MARK
+${KERNEL_MODULES// /$'\n'}" && changed=1
+    for m in $KERNEL_MODULES; do
+        [ -d "/sys/module/$m" ] || { run modprobe "$m" || die "cannot load the kernel module $m"; }
+    done
+    write_file "$SYSCTL_FILE" 0644 "# $MARK
+net.ipv4.ip_forward = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1" && changed=1
+    local s
+    for s in $SYSCTLS; do
+        [ "$(sysctl -n "$s" 2> /dev/null)" = 1 ] || { changed=1; break; }
+    done
+    if [ "$changed" = 1 ]; then
+        run sysctl -q -p "$SYSCTL_FILE" > /dev/null || die "cannot set the sysctls of $SYSCTL_FILE"
+    fi
+}
+
+# velarx-cri.service with the options of a node: unit drop-ins, the engine's
+# own configuration is not edited.  Under its socket unit the frontend serves
+# the socket systemd passes: another path is a drop-in of the socket.
+velarx_cri () {
+    local bin
+    bin=$(systemctl show -p ExecStart --value velarx-cri.service 2> /dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n 1)
+    [ -n "$bin" ] || bin=$(command -v velarx-cri || echo /usr/bin/velarx-cri)
+    local network=cni:
+    [ "$CNI" = bridge ] && network=cni:$CNI_NETWORK
+    local service_changed=0 socket_changed=0
+    write_file "$UNIT_DROPIN" 0644 "# $MARK
+[Service]
+ExecStart=
+ExecStart=$bin --pod-network $network --sandbox-image $SANDBOX_IMAGE" && service_changed=1
+    if [ "$CRI_SOCKET" != "$DEFAULT_CRI_SOCKET" ]; then
+        write_file "$SOCKET_DROPIN" 0644 "# $MARK
+[Socket]
+ListenStream=
+ListenStream=$CRI_SOCKET" && socket_changed=1
+    elif [ -f "$SOCKET_DROPIN" ]; then
+        run rm -f "$SOCKET_DROPIN" || die "cannot remove $SOCKET_DROPIN"
+        run rmdir --ignore-fail-on-non-empty "$SOCKET_DROPIN_DIR"
+        socket_changed=1
+    fi
+    if [ "$service_changed" = 1 ] || [ "$socket_changed" = 1 ]; then
+        run systemctl daemon-reload || die "systemctl daemon-reload failed"
+    fi
+    # (a running service gets the new options, a listening socket the new
+    # path; otherwise the start below makes them)
+    if [ "$socket_changed" = 1 ] && systemctl is-active --quiet velarx-cri.socket; then
+        run systemctl stop velarx-cri.service || die "cannot stop velarx-cri.service"
+        run systemctl restart velarx-cri.socket || die "cannot restart velarx-cri.socket"
+    elif [ "$service_changed" = 1 ] && systemctl is-active --quiet velarx-cri.service; then
+        run systemctl restart velarx-cri.service || die "cannot restart velarx-cri.service"
+    fi
+    run systemctl enable --now velarx-cri.socket || die "cannot start velarx-cri.socket"
+    # (the first call starts the service by the socket; it answers when the
+    # engine behind it does)
+    if [ "$DRY" = 0 ]; then
+        crictl_cri version > /dev/null || die "velarx-cri does not answer on $CRI_SOCKET (journalctl -u velarx-cri.service velarx-engine.service)"
+    fi
+}
+
+# CGROUP_DRIVER: the cgroup driver the runtime says the kubelet must use.
+# A dry run asks only a runtime that runs (a connection to the socket would
+# start it).
+CGROUP_DRIVER=
+cgroup_driver () {
+    if [ "$DRY" = 1 ] && ! systemctl is-active --quiet velarx-cri.service; then
+        CGROUP_DRIVER="<the cgroup driver of crictl runtime-config>"
+        return 0
+    fi
+    CGROUP_DRIVER=$(crictl_cri runtime-config 2> /dev/null | sed -n 's/^cgroup driver: *\([A-Za-z]*\).*/\1/p' | head -n 1 | tr '[:upper:]' '[:lower:]')
+    case $CGROUP_DRIVER in
+        systemd | cgroupfs) ;;
+        *) die "crictl runtime-config does not tell the cgroup driver of the runtime" ;;
+    esac
+}
+
+cni_config () {
+    [ "$CNI" = bridge ] || return 0
+    # the bridge asks for the range of the node (ipRanges: the pod CIDR that
+    # the kubelet gets from the controller manager and gives to the runtime)
+    write_file "$CNI_CONF" 0644 "$(cat << EOF
+{
+  "cniVersion": "1.1.0",
+  "name": "$CNI_NETWORK",
+  "plugins": [
+    {
+      "type": "bridge",
+      "bridge": "$BRIDGE",
+      "isGateway": true,
+      "ipMasq": true,
+      "hairpinMode": true,
+      "capabilities": {"ipRanges": true},
+      "ipam": {
+        "type": "host-local",
+        "dataDir": "$IPAM_DIR",
+        "routes": [{"dst": "0.0.0.0/0"}]
+      }
+    },
+    {
+      "type": "portmap",
+      "capabilities": {"portMappings": true},
+      "snat": true
+    },
+    {
+      "type": "loopback"
+    }
+  ]
+}
+EOF
+)"
+}
+
+kubeadm_config () {
+    cat << EOF
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+nodeRegistration:
+  criSocket: unix://$CRI_SOCKET
+  imagePullPolicy: IfNotPresent
+  taints: []
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+EOF
+    [ -z "$K8S_VERSION" ] || echo "kubernetesVersion: $K8S_VERSION"
+    cat << EOF
+networking:
+  podSubnet: $POD_CIDR
+  serviceSubnet: $SERVICE_CIDR
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: $CGROUP_DRIVER
+EOF
+    [ "$ALLOW_SWAP" = 0 ] || echo "failSwapOn: false"
+    return 0
+}
+
+# the images of the control plane and the infra image, through velarx; the
+# ones the store has are not asked for again (a host with no network, or
+# with the images loaded, comes up)
+pull_images () {
+    local img missing=$DRY
+    if [ "$DRY" = 0 ]; then
+        for img in $SANDBOX_IMAGE $(kubeadm config images list --config "$KUBEADM_CONF" 2> /dev/null); do
+            crictl_cri inspecti "$img" > /dev/null 2>&1 || { missing=1; break; }
+        done
+    fi
+    [ "$missing" = 0 ] && return 0
+    say "pulling the images through velarx"
+    run crictl_cri pull "$SANDBOX_IMAGE" || die "cannot pull $SANDBOX_IMAGE"
+    run kubeadm config images pull --config "$KUBEADM_CONF" || die "kubeadm cannot pull the images of the control plane"
+}
+
+# an apiserver that answers /readyz at the address of admin.conf, whose
+# certificate names it (after a reboot the kubelet starts it: curl's own
+# retries, bounded by TIMEOUT; kubectl wait fails at once on a refused
+# connection)
+api_ready () {
+    local server
+    server=$(kubectl config view -o 'jsonpath={.clusters[0].cluster.server}' 2> /dev/null)
+    [ -n "$server" ] || die "$KUBECONFIG names no API server"
+    curl -sf --cacert "$KUBE_DIR/pki/ca.crt" --retry 1000 --retry-delay 1 --retry-connrefused --retry-all-errors \
+        --retry-max-time "$TIMEOUT" --max-time 10 -o /dev/null "$server/readyz"
+}
+
+node_is_up () { [ -f "$KUBE_DIR/admin.conf" ]; }
+
+kubeconfig_path () {
+    if [ -n "$KUBECONFIG_OUT" ]; then
+        echo "$KUBECONFIG_OUT"
+    else
+        echo "${HOME:-/root}/.kube/config"
+    fi
+}
+
+install_kubeconfig () {
+    local dest
+    dest=$(kubeconfig_path)
+    if [ "$DRY" = 1 ]; then
+        say "would copy $KUBE_DIR/admin.conf to $dest (not over a file that is not ours)"
+        return 0
+    fi
+    if [ -e "$dest" ] && ! grep -q "^# $MARK" "$dest" 2> /dev/null; then
+        say "$dest exists and is not ours: not replaced (use KUBECONFIG=$KUBE_DIR/admin.conf)"
+        return 0
+    fi
+    local conf
+    conf=$(cat "$KUBE_DIR/admin.conf") || die "cannot read $KUBE_DIR/admin.conf"
+    write_file "$dest" 0600 "# $MARK
+$conf" && say "kubeconfig: $dest"
+    return 0
+}
+
+# the node Ready and DNS running: the conditions of the cluster, waited for
+# with the tools' own waits
+wait_ready () {
+    export KUBECONFIG=$KUBE_DIR/admin.conf
+    [ "$DRY" = 1 ] && { run kubectl wait --for=condition=Ready node --all "--timeout=${TIMEOUT}s"; return 0; }
+    api_ready || die "the API server is not ready after ${TIMEOUT} s (journalctl -u kubelet; crictl ps -a)"
+    kubectl wait --for=condition=Ready node --all "--timeout=${TIMEOUT}s" > /dev/null \
+        || die "the node is not Ready after ${TIMEOUT} s (kubectl describe node)"
+    kubectl -n kube-system rollout status deployment/coredns "--timeout=${TIMEOUT}s" > /dev/null \
+        || die "CoreDNS is not available after ${TIMEOUT} s (kubectl -n kube-system describe pods)"
+}
+
+smoke () {
+    export KUBECONFIG=$KUBE_DIR/admin.conf
+    local pod=velarx-smoke
+    if [ "$DRY" = 1 ]; then
+        say "smoke test: run $SMOKE_IMAGE, then exec, logs and port-forward, then remove it"
+        return 0
+    fi
+    kubectl delete pod "$pod" --ignore-not-found --wait=true "--timeout=${TIMEOUT}s" > /dev/null
+    kubectl apply -f - > /dev/null << EOF || die "cannot create the smoke test pod"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $pod
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+  - name: web
+    image: $SMOKE_IMAGE
+    command: ["sh", "-c", "mkdir -p /www && echo smoke > /www/index.html && echo started && exec httpd -f -p 8080 -h /www"]
+EOF
+    local ok=1
+    kubectl wait --for=condition=Ready "pod/$pod" "--timeout=${TIMEOUT}s" > /dev/null || { problem "the smoke test pod is not Ready"; ok=0; }
+    if [ "$ok" = 1 ]; then
+        [ "$(kubectl exec "$pod" -- echo exec-ok 2> /dev/null)" = exec-ok ] || { problem "kubectl exec"; ok=0; }
+        kubectl logs "$pod" 2> /dev/null | grep -qx started || { problem "kubectl logs"; ok=0; }
+        local out port
+        coproc PF { kubectl port-forward --address 127.0.0.1 "pod/$pod" :8080 2> /dev/null; }
+        if read -r -t "$TIMEOUT" -u "${PF[0]}" out && port=$(printf '%s' "$out" | sed -n 's/^Forwarding from 127.0.0.1:\([0-9]*\) -> 8080.*/\1/p') && [ -n "$port" ]; then
+            [ "$(curl -sf -m 20 "http://127.0.0.1:$port/")" = smoke ] || { problem "kubectl port-forward"; ok=0; }
+        else
+            problem "kubectl port-forward"
+            ok=0
+        fi
+        kill "$PF_PID" 2> /dev/null
+        wait "$PF_PID" 2> /dev/null
+    fi
+    kubectl delete pod "$pod" --wait=true "--timeout=${TIMEOUT}s" > /dev/null
+    [ "$ok" = 1 ] && say "smoke test passed: run, exec, logs, port-forward"
+    return 0
+}
+
+# the rules kube-proxy and the kubelet made, which kubeadm reset leaves: their
+# KUBE-* chains and the rules that jump to them (what kube-proxy --cleanup
+# removes, without its image)
+remove_kube_rules () {
+    local cmd table rules
+    for cmd in iptables ip6tables; do
+        command -v "$cmd-save" > /dev/null 2>&1 || continue
+        for table in filter nat mangle; do
+            rules=$("$cmd-save" -t "$table" 2> /dev/null | kube_rules_removal)
+            [ -n "$rules" ] || continue
+            if [ "$DRY" = 1 ]; then
+                printf '+ %s-restore --noflush <<EOF\n%s\nEOF\n' "$cmd" "$rules"
+            else
+                printf '%s\n' "$rules" | "$cmd-restore" --noflush || die "cannot remove the rules of Kubernetes from the $table table ($cmd)"
+            fi
+        done
+    done
+}
+
+# the iptables-restore input that removes, from the iptables-save output of
+# one table on the standard input, the KUBE-* chains and the rules of the
+# other chains that jump to them; nothing when there are none
+kube_rules_removal () {
+    awk '
+        /^\*/ { table = $0; next }
+        /^:KUBE-/ { kube[++k] = substr($1, 2); next }
+        /^-A / && $2 !~ /^KUBE-/ && / -j KUBE-/ { r = $0; sub(/^-A /, "-D ", r); jump[++j] = r }
+        END {
+            if (k == 0 && j == 0) exit
+            print table
+            for (i = 1; i <= j; i++) print jump[i]
+            for (i = 1; i <= k; i++) print "-F " kube[i]
+            for (i = 1; i <= k; i++) print "-X " kube[i]
+            print "COMMIT"
+        }'
+}
+
+# the cgroups of the kubelet's pods, empty once the pods are gone, which
+# kubeadm reset leaves: the kubepods slice of the systemd driver, or the
+# kubepods tree of the cgroupfs one (only empty directories are removed)
+remove_kube_cgroups () {
+    if command -v systemctl > /dev/null 2>&1 && systemctl is-active --quiet kubepods.slice; then
+        run systemctl stop kubepods.slice || die "cannot stop kubepods.slice"
+    fi
+    if [ -d /sys/fs/cgroup/kubepods ]; then
+        if [ "$DRY" = 1 ]; then
+            say "would remove the empty cgroups of /sys/fs/cgroup/kubepods"
+        else
+            find /sys/fs/cgroup/kubepods -depth -type d -exec rmdir {} + \
+                || die "the cgroups of /sys/fs/cgroup/kubepods are not empty: a process of a pod is left"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------- commands
+
+node_up_message () {
+    if [ "$DRY" = 1 ]; then
+        say "(dry run: nothing was changed)"
+    else
+        say "the node is up"
+    fi
+}
+
+cmd_up () {
+    preflight
+    if node_is_up; then
+        :
+    else
+        check_ports
+        if [ -n "$(ls -A "$KUBE_DIR/manifests" 2> /dev/null)" ] || [ -n "$(ls -A /var/lib/etcd 2> /dev/null)" ]; then
+            problem "a part of a cluster is here (no $KUBE_DIR/admin.conf, but manifests or /var/lib/etcd): run $NAME reset"
+        fi
+    fi
+    if [ "$FAILED" = 1 ]; then
+        [ "$DRY" = 1 ] && say "(dry run: the plan follows, but the node would not come up)" || exit 1
+    fi
+
+    host_config
+    velarx_cri
+    cni_config
+    run systemctl enable kubelet.service || die "cannot enable kubelet.service"
+
+    if node_is_up; then
+        # (after a reboot the kubelet starts the control plane again)
+        run systemctl start kubelet.service || die "cannot start kubelet.service"
+        wait_ready
+        install_kubeconfig
+        [ "$SMOKE" = 1 ] && smoke
+        node_up_message
+        [ "$FAILED" = 0 ] || exit 1
+        return 0
+    fi
+
+    cgroup_driver
+    write_file "$KUBEADM_CONF" 0600 "$(kubeadm_config)"
+    pull_images
+    run kubeadm init --config "$KUBEADM_CONF" ${IGNORE_PREFLIGHT:+--ignore-preflight-errors "$IGNORE_PREFLIGHT"} || die "kubeadm init failed (see $NAME reset)"
+    wait_ready
+    install_kubeconfig
+    [ "$SMOKE" = 1 ] && smoke
+    node_up_message
+    [ "$FAILED" = 0 ] || exit 1
+}
+
+cmd_reset () {
+    [ "$DRY" = 1 ] || [ "$(id -u)" = 0 ] || die "run as root"
+    # (it stops the kubelet, removes the pods through the CRI, the control
+    # plane's files and the kubelet's directory)
+    if command -v kubeadm > /dev/null 2>&1; then
+        run kubeadm reset -f --cri-socket "unix://$CRI_SOCKET" || say "kubeadm reset failed: what is left is removed below"
+    fi
+    # what kubeadm did not remove: pods the kubelet left, if the runtime is up
+    if command -v crictl > /dev/null 2>&1 && [ -S "$CRI_SOCKET" ] && [ "$DRY" = 0 ]; then
+        local pods
+        pods=$(crictl_cri pods -q 2> /dev/null)
+        # shellcheck disable=SC2086 # one word for each pod
+        [ -z "$pods" ] || crictl_cri rmp -f $pods > /dev/null || die "cannot remove the pods $pods"
+    fi
+    if command -v systemctl > /dev/null 2>&1 && systemctl is-enabled --quiet kubelet.service 2> /dev/null; then
+        run systemctl disable --now kubelet.service || die "cannot disable kubelet.service"
+    fi
+    remove_kube_rules
+    remove_kube_cgroups
+    [ -e "$KUBEADM_CONF" ] && { run rm -f "$KUBEADM_CONF" || die "cannot remove $KUBEADM_CONF"; }
+    [ -d "$IPAM_DIR" ] && { run rm -rf "$IPAM_DIR" || die "cannot remove $IPAM_DIR"; }
+    [ -f "$CNI_CONF" ] && { run rm -f "$CNI_CONF" || die "cannot remove $CNI_CONF"; }
+    if ip link show "$BRIDGE" > /dev/null 2>&1; then
+        run ip link delete "$BRIDGE" || die "cannot delete the bridge $BRIDGE"
+    fi
+    local dest
+    dest=$(kubeconfig_path)
+    if grep -q "^# $MARK" "$dest" 2> /dev/null; then
+        run rm -f "$dest" || die "cannot remove $dest"
+        run rmdir --ignore-fail-on-non-empty "$(dirname "$dest")"
+    fi
+    if [ -f "$UNIT_DROPIN" ] || [ -f "$SOCKET_DROPIN" ]; then
+        run systemctl disable --now velarx-cri.socket velarx-cri.service || die "cannot stop velarx-cri"
+        run rm -f "$UNIT_DROPIN" "$SOCKET_DROPIN" || die "cannot remove the drop-ins of velarx-cri"
+        run rmdir --ignore-fail-on-non-empty "$UNIT_DROPIN_DIR" "$SOCKET_DROPIN_DIR" 2> /dev/null
+        run systemctl daemon-reload || die "systemctl daemon-reload failed"
+    fi
+    if [ "$PURGE" = 1 ]; then
+        run rm -f "$MODULES_FILE" "$SYSCTL_FILE" || die "cannot remove $MODULES_FILE $SYSCTL_FILE"
+        say "the modules and sysctls already loaded stay until the next boot"
+    fi
+    [ "$DRY" = 1 ] && say "(dry run: nothing was changed)"
+    say "reset done"
+}
+
+cmd_check () {
+    preflight
+    # (the ports of a node that is up are its own)
+    node_is_up || check_ports
+    if [ "$FAILED" = 0 ]; then
+        say "the prerequisites are met"
+    else
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------- main
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+COMMAND=$1
+shift
+case $COMMAND in
+    -h | --help | help) usage; exit 0 ;;
+    up | reset | check) ;;
+    *) usage >&2; exit 2 ;;
+esac
+while [ $# -gt 0 ]; do
+    case $1 in
+        --dry-run) DRY=1 ;;
+        --cri-socket) CRI_SOCKET=${2:?--cri-socket needs a path}; shift ;;
+        --pod-cidr) POD_CIDR=${2:?--pod-cidr needs a network}; shift ;;
+        --service-cidr) SERVICE_CIDR=${2:?--service-cidr needs a network}; shift ;;
+        --kubernetes-version) K8S_VERSION=${2:?--kubernetes-version needs a version}; shift ;;
+        --sandbox-image) SANDBOX_IMAGE=${2:?--sandbox-image needs an image}; shift ;;
+        --cni) CNI=${2:?--cni needs bridge or none}; shift ;;
+        --kubeconfig) KUBECONFIG_OUT=${2:?--kubeconfig needs a path}; shift ;;
+        --timeout) TIMEOUT=${2:?--timeout needs seconds}; shift ;;
+        --no-host-config) HOST_CONFIG=0 ;;
+        --allow-swap) ALLOW_SWAP=1 ;;
+        --ignore-preflight-errors) IGNORE_PREFLIGHT=${2:?--ignore-preflight-errors needs a list}; shift ;;
+        --smoke) SMOKE=1 ;;
+        --smoke-image) SMOKE_IMAGE=${2:?--smoke-image needs an image}; shift ;;
+        --purge) PURGE=1 ;;
+        -h | --help) usage; exit 0 ;;
+        *) die "unknown option $1 (--help)" ;;
+    esac
+    shift
+done
+# the release of the control plane: kubeadm's own (kubeadm's default would
+# ask the internet for the latest one); the infra image: its pause image,
+# which is the one it compares the runtime's with
+if [ "$COMMAND" != reset ] && command -v kubeadm > /dev/null 2>&1; then
+    [ -n "$K8S_VERSION" ] || K8S_VERSION=$(kubeadm version -o short 2> /dev/null)
+    if [ -z "$SANDBOX_IMAGE" ]; then
+        SANDBOX_IMAGE=$(kubeadm config images list ${K8S_VERSION:+--kubernetes-version "$K8S_VERSION"} 2> /dev/null | grep '/pause:' | head -n 1)
+    fi
+fi
+[ -n "$SANDBOX_IMAGE" ] || SANDBOX_IMAGE=registry.k8s.io/pause:3.10
+case $CNI in bridge | none) ;; *) die "--cni is bridge or none" ;; esac
+case $TIMEOUT in '' | *[!0-9]*) die "--timeout is a number of seconds" ;; esac
+CRI_SOCKET=${CRI_SOCKET#unix://}
+
+case $COMMAND in
+    up) cmd_up ;;
+    reset) cmd_reset ;;
+    check) cmd_check ;;
+esac

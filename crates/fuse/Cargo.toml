@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-fuse"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The FUSE file systems of velarx: image layers and merged images served from the store"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The only code that links fuser; it reads the store (`velarx-storage`) and
+# knows nothing of the database or the services.
+
+[lib]
+name = "velarx_fuse"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+velarx-base = { path = "../base" }
+velarx-storage = { path = "../storage" }
+velarx-types = { path = "../types" }
+velarx-proto = { path = "../proto", default-features = false }
+fuser = { version = "0.16", features = ["abi-7-40"] }
+composefs.workspace = true
+velarx-sys = { path = "../sys" }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "std"] }
+rustix = { workspace = true, features = ["fs", "process", "mount", "event"] }
+libc.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+chrono.workspace = true
+base64.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Fail when the library tests of a package leave a `.tmp*` directory in
+# TMPDIR.  Each package is tested alone (`cargo test -p PKG --lib`) with a
+# private, empty TMPDIR, which is listed afterwards: what a test makes in its
+# TempDir is removed with it, so a name left is a directory that outlived its
+# test (a kept or forgotten TempDir, a thread or a confined child that makes
+# or holds it, a mount in it).  The cheap static check of the same is the lint
+# test `no_test_keeps_a_temporary_directory` of src/testing.rs.
+#   tools/check-test-leaks                   every package of the workspace
+#   tools/check-test-leaks PKG...            these packages
+# CARGO (default `cargo`) and CARGOFLAGS (default `--all-features`: a package
+# such as velarx-graph does not build alone without the features the rest of
+# the workspace turns on) are taken from the environment.
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(root)
+cargo = shlex.split(os.environ.get("CARGO", "cargo"))
+flags = shlex.split(os.environ.get("CARGOFLAGS", "--all-features"))
+
+packages = sys.argv[1:]
+if not packages:
+    meta = subprocess.run(
+        cargo + ["metadata", "--no-deps", "--format-version", "1"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    packages = sorted(
+        p["name"]
+        for p in json.loads(meta.stdout)["packages"]
+        if any("lib" in t["kind"] for t in p["targets"])
+    )
+
+private = tempfile.mkdtemp(prefix="velarx-test-leaks.")
+failed = []
+try:
+    for pkg in packages:
+        test = cargo + ["test", "-p", pkg, "--lib", "--quiet"] + flags
+        # (built first with the TMPDIR of the caller: what the compiler and
+        # the linker leave in theirs is not the tests')
+        build = subprocess.run(
+            test + ["--no-run"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if build.returncode != 0:
+            sys.stdout.write(build.stdout)
+            failed.append(f"{pkg}: the tests do not build")
+            continue
+        tmp = tempfile.mkdtemp(dir=private)
+        run = subprocess.run(
+            test,
+            env=dict(os.environ, TMPDIR=tmp),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if run.returncode != 0:
+            sys.stdout.write(run.stdout)
+            failed.append(f"{pkg}: the tests fail")
+        left = sorted(os.listdir(tmp))
+        if left:
+            failed.append(f"{pkg}: leaves {len(left)}: " + " ".join(left))
+        else:
+            print(f"{pkg}: leaves nothing")
+finally:
+    # (the tree of a test that was killed may hold a directory without access)
+    subprocess.run(["chmod", "-R", "u+rwx", private], check=False)
+    shutil.rmtree(private, ignore_errors=True)
+    if os.path.lexists(private):
+        # (a mount a test left in it, or a file of another owner)
+        print(f"{private} could not be removed", file=sys.stderr)
+if failed:
+    print("\n".join(failed), file=sys.stderr)
+    sys.exit(1)

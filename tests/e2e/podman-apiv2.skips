@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+# The checks of podman's apiv2 suite (tests/e2e/bats/podman-apiv2.bats) that are
+# expected to fail because they test what velarx does not do on purpose.  One per line,
+# three fields separated by tabs:
+#
+#   FILE  REGEX  REASON
+#
+# FILE is the .at file ("20-containers"); REGEX is an extended regular
+# expression that matches the rest of the failed check after "not ok N [FILE] ":
+# its description and the "# expected / actual / response" lines the suite
+# prints under it, joined by spaces.  A failed check that no line matches, and
+# a line of a file that ran that matches no failed check (a stale skip), fail
+# the run.
+#
+10-images	number of images in tar archive	OCI only: GET images/get is an oci-archive, which has an index.json and no docker-archive manifest.json
+10-images	POST images/load : \.stream .*Loaded image: quay\.io/libpod/busybox:latest,quay\.io/libpod/alpine:latest	OCI only: the order podman names the images of a docker-archive in; the shim saves an oci-archive, which names them in the order they were saved
+12-imagesMore	POST libpod/images/scp/	refused on purpose: `image scp` (the route answers 501, podman 500 with its exit status)
+20-containers	POST (libpod/)?commit\?.*format=docker	OCI only: the Docker image format is refused (501)
+20-containers	GET libpod/images/newrepo:(latest|v2)/json : status	OCI only: the image of the commit in Docker format that was refused
+20-containers	DELETE images/(localhost/newrepo:(v2|latest)\?force=true|docker\.io/library/newrepo:v3\?force=false) 	OCI only: the image of the commit in Docker format that was refused
+20-containers	GET images/null/json : status	OCI only: the image id of the commit in Docker format that was refused
+20-containers	GET libpod/containers/([0-9a-f]+|myctr)/json : \.(ResolvConfPath|HostnamePath|HostsPath) #  expected: /	layout: podman keeps the conmon pid file and these files in one directory (the userdata dir); velarx keeps the monitor's pid file in its run dir and the files in the bundle
+20-containers	GET libpod/containers/myctr/json : \.NetworkSettings\.SandboxKey	layout: netavark's named network namespace /run/netns/netns-ID; velarx names the namespace of the process
+20-containers	GET libpod/containers/myctr/json : \.GraphDriver\.Data\.MergedDir	layout: podman's overlay driver has a merged directory; velarx mounts the root file system of the container in its bundle (rootfs)
+23-containersArchive	fetched tarball: file uid/gid	the test asserts a bug of podman (its TODO: the owner is 0/0 instead of 1042/1043)
+45-system	GET (libpod/)?system/df : \.(LayersSize|ImagesSize)	the size is that of podman's storage, which counts the manifest twice and the manifest list; velarx counts the layers, the manifest and the configuration

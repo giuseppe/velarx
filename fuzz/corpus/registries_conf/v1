@@ -1,0 +1,6 @@
+[registries.search]
+registries = ["docker.io"]
+[registries.insecure]
+registries = ["localhost:5000"]
+[registries.block]
+registries = ["evil.io"]

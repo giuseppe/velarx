@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The core of the velarx engine: the services and the store service, above velarx-runtime"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# What the frontends (the command line, the API server, the daemon) call:
+# the services, below them and above velarx-runtime.
+
+[lib]
+name = "velarx_core"
+path = "src/lib.rs"
+doctest = false
+
+[features]
+default = ["fuse"]
+# the code that serves root file systems through FUSE; without it only
+# composefs images are available
+fuse = ["velarx-runtime/fuse"]
+
+[dependencies]
+velarx-sandbox = { path = "../sandbox" }
+velarx-sys = { path = "../sys", features = ["tokio", "seccompiler"] }
+velarx-runtime = { path = "../runtime", default-features = false }
+velarx-nsid = { path = "../nsid" }
+velarx-netkernel = { path = "../netkernel" }
+velarx-netdetach = { path = "../netdetach" }
+velarx-base = { path = "../base" }
+velarx-types = { path = "../types" }
+velarx-wire = { path = "../wire" }
+velarx-proto = { path = "../proto", features = ["service"] }
+velarx-registry = { path = "../registry", features = ["engine"] }
+velarx-config = { path = "../config", features = ["engine"] }
+velarx-db = { path = "../db" }
+velarx-storage = { path = "../storage" }
+velarx-content = { path = "../content" }
+velarx-graph = { path = "../graph" }
+velarx-vfs = { path = "../vfs" }
+velarx-storage-client = { path = "../storage-client" }
+velarx-signature = { path = "../signature" }
+velarx-fuse = { path = "../fuse" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process", "net", "signal", "fs", "io-util", "io-std"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+toml.workspace = true
+rusqlite.workspace = true
+tokio-rusqlite.workspace = true
+zlink = { workspace = true, features = ["tokio", "proxy", "service", "tracing"] }
+rustix = { workspace = true, features = ["mount", "fs", "termios", "process", "net", "rand", "event", "pipe", "pty", "stdio", "thread", "system", "param"] }
+zstd.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+hex.workspace = true
+libc.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+base64.workspace = true
+flate2.workspace = true
+tar.workspace = true
+regex-lite.workspace = true
+xattr.workspace = true
+landlock.workspace = true
+seccompiler.workspace = true
+percent-encoding.workspace = true
+tempfile.workspace = true
+rayon.workspace = true
+chacha20poly1305.workspace = true
+
+[dev-dependencies]
+velarx-graph = { path = "../graph", features = ["conformance"] }
+velarx-wire = { path = "../wire", features = ["test-support"] }
+velarx-storage = { path = "../storage", features = ["test-support"] }
+velarx-db = { path = "../db", features = ["test-support"] }
+velarx-content = { path = "../content", features = ["test-support"] }
+velarx-storage-server = { path = "../storage-server", features = ["conformance"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

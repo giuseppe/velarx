@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# The store service of a user (rootless): org.velarx.Store, the content of
+# the store for the P2P service.  Started by the first connection.
+[Unit]
+Description=Velarx store service socket
+Documentation=man:velarx(1) man:velarx.conf(5)
+
+[Socket]
+ListenStream=%t/velarx/services/store.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

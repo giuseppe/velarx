@@ -1,0 +1,242 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+# Threat model
+
+What velarx protects, whom it trusts, what each kind of adversary can and
+cannot do, and what is left.  A statement without a mechanism is a
+limit, not a guarantee.
+
+## What is protected
+
+* **The host**: its files, processes and network, from a container and from
+  what an image, a registry or a peer sends.  The engine runs as root (or as
+  a user, rootless) and is the most privileged code on the path of every
+  byte that comes from outside.
+* **The store**: the files of the images (`<root>/objects`), the database
+  (`db.sqlite`), the containers' state, volumes, secrets and credentials.
+  What is in the store is run as the container's root file system.
+* **The control of the engine**: whoever can send requests to the API
+  controls the containers, and as root can run anything on the host (a
+  container with `--privileged` or a host bind mount is the host).
+* **Secrets in transit and at rest**: registry credentials, `secret`
+  values, the swarm key of the peer-to-peer network.
+* **What the user pulls and runs** (privacy toward peers and sources).
+
+## Who is trusted
+
+| Party | Trusted for | Why and where |
+| --- | --- | --- |
+| root of the host | everything | owns the store, the sockets, the configuration |
+| the user of a rootless engine | the engine of that user | the engine runs as that user; `SO_PEERCRED` checks (below) |
+| the configuration files (`config.toml`, `registries.conf`, `policy.json`, hooks, credential helpers, runtime path) | all of it | they name programs the engine runs with its privileges; they are the administrator's, and are read as such |
+| the OCI runtime (`crun`) and the kernel | the isolation of containers | velarx sets up the specification; the runtime and the kernel enforce it |
+| the processes of velarx of the same user (daemon, monitors, fetchers, the peer-to-peer service) | each other, through private sockets | a socket directory of mode 0700 and `SO_PEERCRED` of both ends: `crates/base/src/ipc.rs`, `crates/proto/src/serving.rs` |
+| the members of the peer-to-peer swarm (the holders of the swarm key, or the nodes with a certificate of the authority) | not to misbehave: there is no defence against a member that floods, hoards or claims what it does not have | admission is the boundary ("The peer-to-peer swarm"); what a member sends is still checked by digest, and a member is removed by revocation or a new key |
+| the storage service of `[storage] driver = "varlink"` | what the files of a container's root file system are, and keeping what it was given, like the OCI runtime | it is run by the user of the engine or by root (`SO_PEERCRED` on every connection) and is chosen by the administrator in `config.toml`; everything else it says is checked ("A storage service") |
+
+Not trusted: images (content, configuration, labels, annotations), registries
+and everything they send (manifests, tokens, redirects, blobs), content
+sources, nodes that are not admitted to the peer-to-peer swarm, the processes
+of a container, and the other users of the host.
+
+## Trust boundaries
+
+```
+  registry ──https──►  pull worker (Landlock + seccomp, no store access) ─┐
+  content source ──unix socket (0600, SO_PEERCRED)──► engine (checks digests) ──► store
+  peer ──libp2p/QUIC──► velarx-p2p (Landlock + seccomp, no caps) ──unix──┘      │
+                                                                                 ▼
+  client ──unix socket (varlink)──► engine ──► monitor (one per container) ──► OCI runtime ──► container
+```
+
+Everything on the left of the engine is untrusted (a member of the swarm is
+trusted not to misbehave, not for its bytes), and is handled by a
+process that has given up what it does not need before it reads the first
+byte (below).  The engine does not trust what those processes tell it either:
+it bounds lengths before allocating and verifies every digest.
+
+## Adversaries
+
+* **A malicious image** controls the layers, the configuration and the
+  annotations. Layers are parsed in a confined pull worker (Landlock and
+  seccomp, no access to the store), not in the engine: names, extension
+  headers, extended attributes and entry counts are bounded; `..`, NUL,
+  sparse files and the `trusted.`, `security.`, `system.` and overlay
+  attributes are refused or dropped; decompression is cut at
+  `max_inflate_ratio` times the compressed size and at `max_layer_gib`.
+* **A malicious or compromised registry or content source** is verified:
+  the manifest by policy, the configuration and layers by digest and diff id,
+  chunks by their hash, files by fs-verity digest. A source cannot make a pull
+  wrong, only slower, and a circuit breaker skips one that fails.
+* **A node outside the peer-to-peer swarm**: see "The peer-to-peer swarm"
+  below.
+* **A storage service** (`[storage] driver = "varlink"`) is chosen by the
+  administrator and trusted like the OCI runtime: it makes the files a
+  container runs on. The engine does not take its word for anything else and
+  bounds and validates every reply.
+* **A compromised container** gets the defaults: the default capability
+  set, the default seccomp profile, masked and read-only paths, an AppArmor
+  profile and SELinux labels where enabled, a pid limit. Rootful containers
+  have no user namespace unless `--userns` asks for one, so an escape of the
+  kernel's or the runtime's isolation is root on the host.  The monitor
+  mounts the root file system `nodev`; whether the container's root keeps
+  the flag is the OCI runtime's doing, and Velarx does not repair it.  crun
+  older than 1.31 does not keep it (crun 1.30 remounts the root without its
+  flags on kernels with `OPEN_TREE_NAMESPACE`, 7.0 and later, and every
+  crun before 1.31 with `--read-only`): with such a crun and a root engine
+  the container root has no `nodev`, so a device node of an image, or one
+  made with `CAP_MKNOD`, opens any device the device cgroup allows (any
+  device with `--cgroups disabled`).  crun 1.31 keeps the flags (commits
+  2594140d and 775d4c65); runc 1.5.2 keeps them except with `--read-only`.
+* **An imported checkpoint** (`container restore --import`) carries process
+  images that `crun restore` restores as root unchecked: importing an archive
+  from someone else is running their code as root.
+* **The monitor's socket** (`org.velarx.Monitor`, mode 0700 directory) accepts
+  only the monitor's user and root (`SO_PEERCRED`), with bounded calls,
+  connections and idle time.
+* **A local unprivileged user** cannot reach the sockets of a root engine
+  (0660 root:root in a 0700 directory). `velarx-api` serves TCP only with
+  `--listen tcp://` and does not start without a bearer token
+  (`[api] token_file`), a client CA (`tls_client_ca`: only clients with a
+  certificate it signed are served) or the explicit
+  `allow_unauthenticated = true`, which lets every local user control the
+  engine.  TLS 1.3 is on with `tls_cert` and `tls_key`; without it, on an
+  address that is not loopback the token crosses the network in clear text.
+* **A writer of the store** (its user, or root) controls what that engine
+  runs: fs-verity makes accidental or low-privilege changes fail, it is no
+  defence against whoever owns the store.  At every start by the engine the
+  stored manifest is hashed against the image id and the layer images are
+  held to the digests it states ([STORAGE.md](STORAGE.md)); with
+  `--security-opt verity=enforce` or `[storage] composefs_digests =
+  "require"` an image without those digests is refused, so the image, its
+  record and the bundle cannot be changed together and believed.
+* **A client of the API** that can connect is an administrator of the
+  engine: there are no per-user permissions. The REST and CRI frontends are
+  separate confined processes that decode requests and call the engine over
+  its private socket; they have no access to the store or the credentials.
+
+## The peer-to-peer swarm
+
+`velarx-p2p` is off unless it is started and named as a source.  libp2p (TCP)
+carries membership, discovery and announcements; QUIC (UDP) carries all the
+data.  Admission is the boundary: a node without the swarm key or a valid
+certificate is refused before anything is served, and the members are trusted
+not to misbehave (there are no rate limits, quotas or caps against a member;
+one that misbehaves is removed by revocation, or by a new key).  Everything a
+peer sends is still checked by digest, since a store can be damaged, and the
+service is confined (Landlock, seccomp, no capabilities, no exec): a peer can
+make a pull slower, not wrong, and cannot run anything on the node.  Who is a
+member:
+
+* **The swarm key** (the default).  The libp2p transport is wrapped in a
+  pre-shared key handshake and every QUIC connection proves the key before
+  anything is served.  The key file must be 0600 (or
+  `VELARX_P2P_SWARM_KEY`).  Whoever holds the key is a full member: there is
+  no per-node credential.  The identity file (`identity_path`) keeps a node
+  the same peer across restarts.  Removing one node means a new key on every node and a restart of all.
+* **A certificate authority** (`ca_path` and `certificate_path`,
+  `velarx-p2p ca ...`).  A node's certificate is an X.509 certificate for the
+  ed25519 key of its identity file (so for its peer id) with a name, an
+  optional zone and a role (`both`, `serve`, `pull`).  QUIC is mutual TLS: a
+  peer without a valid certificate fails in the handshake, before any
+  stream; on libp2p the certificates are exchanged after Noise and must be for
+  the peer id Noise proved.  There is no fallback to the swarm key, which may
+  still be set as an outer layer of the TCP transport only.  The checks are
+  the chain to one of the authorities of `ca_path` (several at once: that is
+  how an authority is replaced), validity, revocation, `allow_names` and
+  `allow_peers`, and the role (a `serve` node is not served, a `pull` node is
+  not asked for data).  A refusal is a typed error, counted
+  (`admission_refused` of `velarx p2p status`) and logged.  A node whose own certificate is for another key, expired,
+  or not signed by its `ca_path` does not start.
+  * **The key of the authority** is made by `ca init` on the operator's
+    machine and stays there: no setting names it, so a compromised node can
+    neither sign nor revoke.
+  * **Revocation** is by peer id: `ca revoke` signs a list of every peer
+    revoked so far, with a number that only grows.  A node reads
+    `revocation_path` when it changes, and two admitted nodes hand each other
+    their whole lists: a newer list signed by one of the node's authorities is
+    adopted, in memory only, so every node's file must still get every list
+    (the file is what survives a restart).  A revoked peer is refused at once
+    and its connections are closed at the next sweep (`ca_sweep_secs`, 10 s),
+    which also cuts off expired certificates.  A revoked key does not come
+    back: a new key needs a new certificate.  A list that is set and cannot
+    be read or is not valid stops the start; one that cannot be read later
+    keeps the last good list (a warning).  `revocation_max_age_secs` (0: off)
+    makes the node admit nobody new when the file was not read for that long
+    (fail closed; a file with an invalid list does not count as read).
+  * **Rotation**: certificates are short (`ca sign --days`, 30 by default)
+    and renewed by signing again; the certificate and `ca_path` files are read
+    again when they change, with no restart.  A node whose certificate
+    expired is refused by the others and disconnected at their next sweep;
+    it never falls back to anything weaker.
+* **One swarm is one trust domain**, with the key and with an authority:
+  there is no per-image access control.  A member may be served any layer,
+  chunk, file or index that a node holds and shares (the pulls without
+  credentials, and those of `share_registries`), may test whether a node
+  holds a digest it already knows (a probe, or offline in the filter of the
+  layers that `advertise_layers`, on by default, tells every member), and,
+  when a node sets `announce_images = true`, may list its images.
+  Certificates say who a node is, not what it may see.  **Do not put nodes of
+  different trust in one swarm**: an image that must not reach every member
+  needs a swarm of its own (its own key or authority), or no peer-to-peer
+  source.  A node that pulls through the peers also gives them the files it
+  has staged so far (each checked by its chunk digests and its fs-verity
+  name, as everything the peers get, and by the asker again), before the
+  layer is complete and in the store; they are the files of pulls the peers
+  may take (never one with credentials), and the layer is told in the filter
+  from the first file.
+* **The peer layer**: wrong bytes are refused by digest and the peer is ranked
+  last.  Every dial goes through one filter that refuses addresses that can
+  never be a peer's: loopback, link-local, multicast, reserved addresses and
+  the node's own interfaces; private ranges
+  are allowed (`dial_allow` lets through, the bootstrap peers are exempt).  The
+  overlay network is a process of its own (`velarx-p2p overlay`), a node of a
+  swarm of its own (the same key or authority, its own identity and port, no
+  content), and the process that talks to peers about layers has no
+  capability.  A subnet that two peers claim is routed to neither.  The
+  kernel forwards between the containers of a node, and each host veth has a
+  strict reverse-path filter (`rp_filter`) so that a container cannot send
+  with another one's address; it holds when `net.ipv4.conf.all.rp_filter` is
+  0 or 1 (the larger of the two settings applies, and 2 is loose).  A
+  container name resolves to the container of the first peer that claimed it,
+  as the node heard them, for as long as that peer claims it (a node that
+  starts when both claim it takes the smaller container id), the log tells of
+  the collision, and `name.<peer id>` reaches the container of one peer.
+* With `mdns = true` the node announces itself on the local network.
+
+## Denial of service
+
+Bounded: the size of what a pull writes and holds in memory, decompression,
+the entries and names of an archive, the number of tasks of
+a pull worker, the datagrams of the notify socket.  Not bounded: what a
+container itself does within its cgroup limits, and the load a trusted client
+of the API can cause.
+
+## Configuration choices that lower the guarantees
+
+| Setting | Effect |
+| --- | --- |
+| `[storage] fsverity = false` or a file system without it | no kernel re-check of files; integrity relies on permissions |
+| `[storage] composefs_digests = "check"` (the default) | a manifest without the digests of the EROFS images of its layers is accepted and its layers are held against their records; so is a manifest whose list has no digest of the EROFS image Velarx makes (another writer's, or one that was edited: nothing tells them apart, and the other writers' values in a list are ignored), which before failed the pull. A list that has Velarx's digest is always checked. `"require"`, and `--security-opt verity=enforce` for one container, make the start strict (see "A writer of the store") |
+| `[storage] driver = "vfs"` | fs-verity is checked **when a layer is pulled only** (`VerityEnforcement::PullOnly`): the root file system of a container is a plain copy of the layers, whose files carry no digest, so nothing holds them to one while the container runs, and no kernel `verity=` or FUSE open check exists for it. The copy is private to the container (a directory of its bundle, which only the engine's user can write, opened without following a link and mounted `nodev`), so the exposure is the integrity of the store between the pull and the copy: the objects are checked against the digests at the pull, and where the store has fs-verity each object that has it is measured again as it is copied (an ioctl: the kernel keeps the digest), so one replaced by a file with another digest is refused, and with `fsverity_require` one without fs-verity is refused too; on a file system without fs-verity (XFS, the reflink case) an object replaced by something that can write the store, before a copy is made, is copied as it is (`system check` measures them again unless `--quick`); the copy itself carries no fs-verity (a reflink does not carry it over). The tables of contents the copies are made from (`vfs/tocs`) are in the same store, written atomically, and `system check` compares each with the layer's record (`toc_differs`, made again by `--repair`). Where SELinux is on, the copy gets the container's file label when it is made (no mount labels it, as an overlay's `context=` does), and the labels of the image (`security.selinux`) are never set. A copy is made from the objects and the tables of contents directly: there is no second tree in the store (no directory of a layer, none for a user namespace) that could differ from them. `fsverity_require`, `composefs_digests = "require"` and `--security-opt verity=enforce` are an error with vfs (never silently weakened); `[storage] fsverity_best_effort = true` accepts them as the checks at pull and nothing more, and `info` says "checked at pull only". The chain of trust of a start (the manifest, the layer digests the monitor holds the images to) is not run, since there are no images to hold. The copy gets the owners of the image translated by the container's mapping: a process that may chown to any id (root, or the rootless engine in its user namespace) writes it, and an image whose owners the mapping does not cover is refused, never given other ids; no hard link of an object is made, since the owner would change the shared inode |
+| `[storage] vfs_ignore_chown_errors = true` | the files of a container of the vfs driver are all owned by the user of the engine where it may not give them the image's owners, so a container that relies on the owners of its files (a service that checks the owner of its configuration) sees none of them |
+| `[storage] fsverity_best_effort = true` | a driver that checks fs-verity at pull only (vfs) is run with the settings that enforce it at run time: the pull is strict, and nothing is checked after it |
+| `[api] allow_unauthenticated` | an API without authentication on its TCP port (a loopback port unless another address is named) |
+| starting `velarx-p2p`, `mdns` (p2p.toml), `share_registries`, `share_image_names` | what is shared with, and visible to, the holders of the swarm key, or the nodes with a certificate of the authority (the names of the images only with the last) |
+| `ca_path` and `certificate_path` (p2p.toml) | admission by certificates instead of the shared key; `private_key_path` may be left out; the key of the authority (`velarx-p2p ca init`) is the root of trust of the swarm and must stay off the nodes; the revocation list and the sweep decide how fast a node is removed |
+| `allow_names`, `allow_peers`, `revocation_max_age_secs` (p2p.toml) | who of the authority's nodes is admitted at all, and when a stale revocation list stops admissions |
+| `announce_images = true` (p2p.toml) | the node announces its images and its layers in the DHT: every member of the swarm, and anyone with the swarm key, can list what it has; off (the default), only the digests a peer already knows can be tested (in a probe, or in the filter of the layers) |
+| `advertise_layers = false` (p2p.toml; on by default) | the node tells no filter of its layers: the peers cannot test them offline, and probe the node instead |
+| `--privileged`, `--security-opt seccomp=unconfined`, host namespaces, devices | the container is as powerful as the host allows |
+| `[build] insecure_entitlements` (`network.host`, `security.insecure`) | a build step may use the host network or run privileged when the request allows it too (`velarx build --allow`); the REST build routes cannot say `allow`, so there the list alone decides |
+| `allow-private-addresses` of a registry in `registries.conf` | the registry can make the engine send requests to private addresses (token realm, redirects) |
+| `[storage] driver = "varlink"` with a service the administrator does not trust | the service makes the files every container of the store runs on, sees what is pulled, and as root is root; the engine checks what it can ("A storage service") and nothing holds a running container's files to a digest. The socket is checked to be the engine's user's or root's, not that the program behind it is the one expected (`name` helps) |
+| `additional_image_stores` | other stores are trusted for the files they hold and for their database; nothing is written to them, whatever their permissions (the database is opened `immutable=1`), and a store whose owner has not closed it cleanly is not used |
+
+## How this is checked
+
+The properties above are exercised by the unit and integration tests of the
+packages named, the end-to-end scripts under `tests/e2e` (confinement of the
+fetcher, the pull workers, the user namespace tree), and the fuzz targets in
+`fuzz/`.  The lint tests in `src/testing.rs` check the rules about `unsafe`.
+This document is reviewed with every change to a privileged path of the table
+above.
