@@ -707,9 +707,8 @@ pub struct Ended {
 /// client that left altogether, at the end of its input or later, closes
 /// the channel at once, idle process or not: the process goes on without it
 /// (the engine still records the status of an exec's command).  The end of the
-/// client's input is passed on (or, for an attach that keeps the input of the
-/// container open, ends the response): the process goes on and its output is
-/// still sent.  A client that typed the detach keys and goes away before
+/// client's input is passed on (not for an attach that keeps the input of the
+/// container open): the process goes on and its output is still sent.  A client that typed the detach keys and goes away before
 /// what it typed was written detaches all the same.
 pub async fn serve(
     session: Session,
@@ -841,8 +840,6 @@ async fn copy(
                 stdin = None;
                 // (not waited for: the output goes on meanwhile)
                 tokio::spawn(controller(Control::CloseStdin));
-            } else if !h.tty {
-                return writer.finish(&said).await;
             }
         }
         if stdout.is_none() && stderr.is_none() && closed {
@@ -1245,12 +1242,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_attach_that_keeps_the_input_open_ends_with_the_client_input() {
+    async fn an_attach_that_keeps_the_input_open_goes_on_after_the_client_input() {
         let mut h = opened();
         h.keep_open = true;
         let (session, engine) = session(h);
         let (_mon_in, stdin) = pipe(4096);
-        let (_mon_out, out) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut mon_out, out) = std::os::unix::net::UnixStream::pair().unwrap();
         engine
             .send_streams(
                 Some(stdin.try_clone().unwrap()),
@@ -1268,14 +1265,16 @@ mod tests {
             None,
         ));
         client_in.shutdown().await.unwrap();
-        // (no terminal: the end of the client's input ends the response, the
-        // input of the container stays open, and the engine is told nothing
-        // but the client gone)
+        // (the end of the client's input is not the end of the output: what
+        // the process prints afterwards, for `kubectl attach -i < file`,
+        // is sent, and the input of the container stays open)
+        mon_out.write_all(b"after").unwrap();
+        drop(mon_out);
+        drop(engine);
         let mut shown = Vec::new();
         client_out.read_to_end(&mut shown).await.unwrap();
-        assert!(shown.is_empty());
+        assert_eq!(shown, b"\x01\0\0\0\0\0\0\x05after");
         serving.await.unwrap();
-        assert_eq!(engine.event().await, Event::Gone);
     }
 
     /// The engine sees a client that left, also an idle one, at its input's
