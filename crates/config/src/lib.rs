@@ -78,6 +78,9 @@ pub struct ApiConfig {
     pub idle_exit: Option<u64>,
     pub start_engine: Option<bool>,
     pub token_file: Option<PathBuf>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub tls_client_ca: Option<PathBuf>,
     #[serde(default)]
     pub allow_unauthenticated: bool,
     /// The short names of the Docker API are docker.io names, as Docker's
@@ -94,6 +97,9 @@ impl Default for ApiConfig {
             idle_exit: None,
             start_engine: None,
             token_file: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_client_ca: None,
             allow_unauthenticated: false,
             compat_api_enforce_docker_hub: true,
         }
