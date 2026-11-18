@@ -823,8 +823,8 @@ fn a_file_opened_and_never_read_fails_the_replay() {
         name: "f".into(),
         size: 1,
         digest: String::new(),
-        measure: None,
         copy: None,
+        verified: false,
     };
     match replay(Some(stale)) {
         Err(e) => assert!(
@@ -856,8 +856,8 @@ fn a_file_that_is_not_what_a_claim_says_fails_the_replay() {
                 name: name.into(),
                 size,
                 digest: self.1.clone(),
-                measure: None,
                 copy: None,
+                verified: false,
             });
             Ok(Box::new(Cursor::new(b"data".to_vec())))
         }
@@ -895,6 +895,55 @@ fn a_file_that_is_not_what_a_claim_says_fails_the_replay() {
     }
 }
 
+/// A file is not hashed by the replay only when the copy it reads was proved
+/// to be its digest: a file opened before its content (whose bytes may come
+/// from elsewhere) fails the replay.
+#[test]
+fn a_verified_file_opened_before_its_content_fails_the_replay() {
+    use crate::pull::tarsplit::{decoder, Recorder, MAX_SIZE};
+    use std::io::Cursor;
+
+    struct Early(Option<Opened>);
+    impl Opens for Early {
+        fn opened(&mut self) -> &mut Option<Opened> {
+            &mut self.0
+        }
+    }
+    impl Contents for Early {
+        fn open(&mut self, _: &str, _: u64) -> io::Result<Box<dyn Read + Send>> {
+            Ok(Box::new(Cursor::new(b"data".to_vec())))
+        }
+    }
+
+    let mut b = tar::Builder::new(Vec::new());
+    let mut h = tar::Header::new_gnu();
+    h.set_size(4);
+    h.set_mode(0o644);
+    b.append_data(&mut h, "f", &b"data"[..]).unwrap();
+    let stream = b.into_inner().unwrap();
+    let mut r = TarReader::with_sink(Cursor::new(stream), Recorder::new().unwrap());
+    while r.next_entry().unwrap().is_some() {}
+    let (_, recorder) = r.finish().unwrap();
+    let tarsplit = recorder.finish().unwrap().compressed;
+    let early = Opened {
+        name: "f".into(),
+        size: 4,
+        digest: Digest::of(Algorithm::Sha256, b"else").to_string(),
+        copy: None,
+        verified: true,
+    };
+    let input = decoder(tarsplit, MAX_SIZE).unwrap();
+    match replay_of(
+        input,
+        Early(Some(early)),
+        Algorithm::Sha256,
+        Algorithm::Sha256,
+    ) {
+        Err(e) => assert!(e.to_string().contains("does not match the archive"), "{e}"),
+        Ok(_) => panic!("a file was taken as a copy it was not read from"),
+    }
+}
+
 /// A file of `OFFLOAD_FROM` bytes or more has its hash computed beside the
 /// read of it (the stream's too): the replay says the same as for a small
 /// one, the diff id of the stream and the digest of the file, and refuses
@@ -916,8 +965,8 @@ fn a_big_file_is_hashed_beside_its_read_to_the_same_digests() {
                 name: name.into(),
                 size,
                 digest: self.1.clone(),
-                measure: None,
                 copy: None,
+                verified: false,
             });
             Ok(Box::new(Cursor::new(self.2.clone())))
         }
@@ -1152,4 +1201,201 @@ fn test_a_chunk_the_driver_holds_is_copied_not_written() {
         "the copy is not made here"
     );
     assert_eq!(&back[100..], &tail[..]);
+}
+
+/// A session with a store, for the files an intake takes in.
+fn intake_session(tmp: &std::path::Path) -> Arc<crate::pull::session::Session> {
+    let store = Arc::new(velarx_storage::FileStore::new(tmp.join("files")).unwrap());
+    crate::pull::session::Session::create(&tmp.join("staging"), store).unwrap()
+}
+
+/// A file with no name that holds `content`, as a fetcher hands it over: the
+/// descriptor is at the end of the file, and another one that can write to
+/// it is kept.
+fn handed(content: &[u8]) -> (File, File) {
+    use std::io::Write;
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(content).unwrap();
+    let writer = file.try_clone().unwrap();
+    (file, writer)
+}
+
+/// The files a fetcher hands over are copied by threads as they come, and
+/// each is known by the digest of the bytes the engine copied, whatever
+/// the fetcher says of it: a file of a content that is there already is one
+/// copy, a copy is read from the start of the file, and what is hashed is
+/// what is written.
+#[tokio::test]
+async fn files_handed_over_are_known_by_what_the_engine_copied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = intake_session(tmp.path());
+    let intake = Intake::new(session.clone(), Algorithm::Sha256, 4);
+    let key_of = |content: &[u8]| Digest::of(Algorithm::Sha256, content).to_string();
+    let (good, other) = (b"good".to_vec(), b"another one".to_vec());
+    for content in [&good, &other, &good] {
+        intake.give(handed(content).0).await.unwrap();
+    }
+    let taken = intake.finish().await.unwrap();
+    assert_eq!(taken.len(), 2);
+    for content in [&good, &other] {
+        let copy = &taken[&key_of(content)];
+        assert_eq!(std::fs::read(&copy.path).unwrap(), *content);
+        assert_eq!(copy.size, content.len() as u64);
+        assert_eq!(
+            copy.verity,
+            velarx_storage::fsverity_digest_of(Algorithm::Sha256, content)
+        );
+    }
+    // (the copy of the second `good` is gone: two files are left)
+    let left = session.temp_files().len();
+    assert_eq!(left, 2);
+}
+
+/// A fetcher that keeps a descriptor it can write to changes nothing of what
+/// the engine holds: the copy is the bytes that were read.
+#[tokio::test]
+async fn a_file_a_fetcher_changes_after_the_hand_over_is_not_what_was_copied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let intake = Intake::new(intake_session(tmp.path()), Algorithm::Sha256, 1);
+    let (file, writer) = handed(b"as it was");
+    intake.give(file).await.unwrap();
+    let taken = intake.finish().await.unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&writer, b"CHANGED!!", 0).unwrap();
+    let key = Digest::of(Algorithm::Sha256, b"as it was").to_string();
+    assert_eq!(std::fs::read(&taken[&key].path).unwrap(), b"as it was");
+}
+
+/// A file is read from its start at positions of its own, wherever the
+/// fetcher moves the offset of the descriptor it kept: the bytes hashed are
+/// those of the file, in their order.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_is_read_whatever_the_fetcher_does_to_its_offset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let intake = Intake::new(intake_session(tmp.path()), Algorithm::Sha256, 1);
+    let content: Vec<u8> = (0..8u32 << 20).map(|i| (i % 251) as u8).collect();
+    let (file, writer) = handed(&content);
+    let done = Arc::new(AtomicBool::new(false));
+    let mover = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                io::Seek::seek(&mut &writer, io::SeekFrom::End(0)).unwrap();
+            }
+        })
+    };
+    intake.give(file).await.unwrap();
+    let taken = intake.finish().await.unwrap();
+    done.store(true, Ordering::Relaxed);
+    mover.join().unwrap();
+    let key = Digest::of(Algorithm::Sha256, &content).to_string();
+    assert_eq!(taken[&key].size, content.len() as u64);
+}
+
+/// A file that a claim names by a digest and that no file handed over has
+/// that digest for is missing for the replay: a fetcher that hands over other
+/// content cannot have it taken for the claimed one.
+#[test]
+fn a_file_the_claim_names_that_was_not_handed_over_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = |content: &[u8]| Digest::of(Algorithm::Sha256, content).to_string();
+    let toc: Toc = serde_json::from_str(&format!(
+        r#"{{"version":1,"entries":[{{"type":"reg","name":"a","size":4,"digest":"{}"}}]}}"#,
+        key(b"good")
+    ))
+    .unwrap();
+    let evil = tmp.path().join("evil");
+    std::fs::write(&evil, b"evil").unwrap();
+    let mut source = StagedFiles {
+        index: tarsplit::content_index(&toc),
+        store: None,
+        handed: HashMap::from([(
+            key(b"evil"),
+            Copied {
+                path: evil,
+                size: 4,
+                verity: String::new(),
+            },
+        )]),
+        used: HashSet::new(),
+        stored: HashMap::new(),
+        last: None,
+    };
+    match (&mut source).open("a", 4) {
+        Err(e) => assert!(e.to_string().contains("was not handed over"), "{e}"),
+        Ok(_) => panic!("other content was taken for the claimed one"),
+    }
+}
+
+/// A file of two names is opened twice and copied once: the second open reads
+/// the same copy and does not claim it again.
+#[test]
+fn a_file_of_two_names_is_one_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = Digest::of(Algorithm::Sha256, b"same").to_string();
+    let toc: Toc = serde_json::from_str(&format!(
+        r#"{{"version":1,"entries":[{{"type":"reg","name":"a","size":4,"digest":"{key}"}},{{"type":"reg","name":"b","size":4,"digest":"{key}"}}]}}"#
+    ))
+    .unwrap();
+    let path = tmp.path().join("copy");
+    std::fs::write(&path, b"same").unwrap();
+    let mut source = StagedFiles {
+        index: tarsplit::content_index(&toc),
+        store: None,
+        handed: HashMap::from([(
+            key,
+            Copied {
+                path,
+                size: 4,
+                verity: "verity".into(),
+            },
+        )]),
+        used: HashSet::new(),
+        stored: HashMap::new(),
+        last: None,
+    };
+    for (name, first) in [("a", true), ("b", false)] {
+        let mut content = Vec::new();
+        (&mut source)
+            .open(name, 4)
+            .unwrap()
+            .read_to_end(&mut content)
+            .unwrap();
+        assert_eq!(content, b"same");
+        let opened = source.last.take().unwrap();
+        assert_eq!(opened.copy.is_some(), first);
+        assert!(opened.verified);
+    }
+}
+
+/// A file handed over with the digest the claim names it by but not the size
+/// the claim says is refused: the copy is not what the layer has there.
+#[test]
+fn a_file_of_another_size_than_the_claim_says_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = Digest::of(Algorithm::Sha256, b"abcd").to_string();
+    let toc: Toc = serde_json::from_str(&format!(
+        r#"{{"version":1,"entries":[{{"type":"reg","name":"a","size":3,"digest":"{key}"}}]}}"#
+    ))
+    .unwrap();
+    let path = tmp.path().join("copy");
+    std::fs::write(&path, b"abcd").unwrap();
+    let mut source = StagedFiles {
+        index: tarsplit::content_index(&toc),
+        store: None,
+        handed: HashMap::from([(
+            key,
+            Copied {
+                path,
+                size: 4,
+                verity: String::new(),
+            },
+        )]),
+        used: HashSet::new(),
+        stored: HashMap::new(),
+        last: None,
+    };
+    match (&mut source).open("a", 3) {
+        Err(e) => assert!(e.to_string().contains("invalid content"), "{e}"),
+        Ok(_) => panic!("a copy of another size was taken"),
+    }
 }

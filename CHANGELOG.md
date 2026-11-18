@@ -132,6 +132,14 @@ without the numbers of issues or pull requests of any tracker.
 
 ### Changed
 
+- A pull of a layer that has no table of contents (a gzip layer) is faster,
+  for the layers of many small files most: the fetcher hands the files it
+  unpacks over to the engine as descriptors of the replies of `Unpack` (a
+  small file is a file in memory), not as names in the staging, and the
+  engine copies them with several threads while the rest of the layer is
+  unpacked, starts their write-back as they are made, and knows each by the
+  digest of the bytes it read.  Fetchers that serve `org.velarx.Fetcher` hand
+  the files of `Unpack` over so (`interfaces/org.velarx.Fetcher.varlink`).
 - Bridge networks: a long range of published ports starts and is removed (the
   rules go as several transactions, and the soft limit of open files is raised
   for a socket per port); a name that several containers have answers all

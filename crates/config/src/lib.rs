@@ -439,7 +439,8 @@ pub struct PullConfig {
     /// Memory for the chunks being decompressed and written, for a pull
     #[serde(default = "default_pull_memory_mib")]
     pub memory_budget_mib: u64,
-    /// Threads decompressing and hashing chunks; 0 uses three per CPU
+    /// Threads decompressing and hashing chunks, and copying the files a
+    /// fetcher unpacked; 0 uses three per CPU
     #[serde(default)]
     pub workers: usize,
     /// A layer that inflates to more than this is refused

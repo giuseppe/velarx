@@ -522,6 +522,7 @@ impl StagingFetcher for DirOrigin {
             s.max_file_bytes,
         );
         let (archive, verity, size) = (read.archive.clone(), scope.verity, blob.size);
+        let mut handing = crate::unpack::Files::new(out.clone());
         let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let counted = count.clone();
         let work = tokio::task::spawn_blocking(move || {
@@ -555,7 +556,7 @@ impl StagingFetcher for DirOrigin {
             // (what inflates past the cap is cut: a bomb ends the layer)
             let limited = LimitedRead::new(decoder, cap);
             let (toc, tarsplit) =
-                crate::unpack::unpack_tar(limited, &staging, digest.alg(), verity)
+                crate::unpack::unpack_tar(limited, &staging, (digest.alg(), verity), &mut handing)
                     .map_err(ImageFailure::Image)?;
             // (the tar ends before the blob does: the rest is read, for the
             // hash of the blob)

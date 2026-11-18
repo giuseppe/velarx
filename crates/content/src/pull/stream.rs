@@ -750,11 +750,7 @@ mod tests {
         );
         let session = session_of(&second);
         assert_eq!(session.staged_totals(), (0, 0));
-        assert_eq!(
-            std::fs::read_dir(session.dir()).unwrap().count(),
-            0,
-            "no temporary file is left"
-        );
+        assert_eq!(session.temp_files().len(), 0, "no temporary file is left");
         let keys: Vec<&str> = done.files.iter().map(|f| f.digest.as_str()).collect();
         assert_eq!(keys, [verity(&big), verity(&small), verity(&small)]);
         for key in keys {
@@ -1064,11 +1060,11 @@ mod tests {
         ]);
         let ctx = ctx(dir.path()).await;
         let session = session_of(&ctx);
-        let names = Names::watching(&[
-            session.dir(),
-            &dir.path().join("staging"),
-            session.store().root(),
-        ]);
+        let temp_dirs = session.temp_dirs();
+        let mut watched: Vec<&std::path::Path> = temp_dirs.iter().map(|d| d.as_path()).collect();
+        let staging = dir.path().join("staging");
+        watched.extend([staging.as_path(), session.store().root()]);
+        let names = Names::watching(&watched);
         let body = futures::stream::iter(
             gz.chunks(16 * 1024)
                 .map(|c| Ok::<_, ImageError>(Bytes::copy_from_slice(c)))

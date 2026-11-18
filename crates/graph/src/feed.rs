@@ -752,7 +752,7 @@ impl ContentFeed {
                         from_local_source: false,
                     };
                     (
-                        Arc::new(StagedContent(unpacked.staging)),
+                        Arc::new(HandedContent(w.copies)),
                         ingested,
                         unpacked.by_registry,
                     )
@@ -1106,12 +1106,11 @@ impl LocalContent for Spool {
     }
 }
 
-/// The files a fetcher staged for a layer read whole, by their key: each
-/// opened beneath the staging as a plain file of it.  The staging goes with
-/// it.
-struct StagedContent(Arc<pull::staged_fetch::LayerStaging>);
+/// The files a fetcher handed over for a layer read whole, as the engine holds
+/// them, by their key: the copy of each, in the session of the pull.
+struct HandedContent(HashMap<String, (std::path::PathBuf, u64, String)>);
 
-impl LocalContent for StagedContent {
+impl LocalContent for HandedContent {
     fn copy_to(
         &self,
         key: &str,
@@ -1120,12 +1119,14 @@ impl LocalContent for StagedContent {
         step: &mut dyn FnMut() -> std::io::Result<()>,
         hole: &mut dyn FnMut(u64, u64),
     ) -> std::io::Result<()> {
-        let file = self
-            .0
-            .open(key)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        let size = file.metadata()?.len();
-        velarx_storage::copy_region_holes(&file, 0, to, to_at, size, step, hole)
+        let (path, size, _) = self.0.get(key).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{key} was not handed over"),
+            )
+        })?;
+        let file = std::fs::File::open(path)?;
+        velarx_storage::copy_region_holes(&file, 0, to, to_at, *size, step, hole)
     }
 }
 

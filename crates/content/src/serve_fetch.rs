@@ -183,6 +183,11 @@ impl<T> Out<T> {
     pub async fn send_with(&self, reply: T, fds: Vec<OwnedFd>) -> Result<(), Gone> {
         self.tx.send((reply, fds)).await.map_err(|_| Gone)
     }
+
+    /// [`Out::send_with`] for a thread that is not one of the runtime's.
+    pub fn blocking_send_with(&self, reply: T, fds: Vec<OwnedFd>) -> Result<(), Gone> {
+        self.tx.blocking_send((reply, fds)).map_err(|_| Gone)
+    }
 }
 
 /// What a fetcher does.  The defaults are those of a fetcher that has
@@ -251,9 +256,10 @@ pub trait StagingFetcher: Send + Sync + 'static {
     }
 
     /// Read the whole blob of the layer (one with no table of contents) and
-    /// give its files, `toc.claim` and `tarsplit` names in its staging
-    /// directory.  `out` gets `progress` events with the cumulative bytes
-    /// of the blob.  Ends with `Ok` when the names are given.
+    /// give its files, as the descriptors of `staged` events (the positions
+    /// of the events' `objects`), and `toc.claim` and `tarsplit` names in its
+    /// staging directory.  `out` gets `progress` events with the cumulative
+    /// bytes of the blob.  Ends with `Ok` when the names are given.
     async fn unpack(
         &self,
         _scope: &Scope,
@@ -1217,10 +1223,13 @@ mod service {
         }
 
         /// Read the whole blob of `layer` (one with no table of contents) and
-        /// give its files, `toc.claim` and `tarsplit` names in its staging.
-        /// Called with more: replies with `bytes` (of the blob, read so
-        /// far), then a last reply without it once the names are given.  A
-        /// failure is the error `Failed`.
+        /// hand over its files, then give `toc.claim` and `tarsplit` names in
+        /// its staging.  Called with more: replies with `bytes` (of the blob,
+        /// read so far) or `files` (complete files of the layer: the
+        /// position of a descriptor of the reply each, regular files with no
+        /// name, in memory when small, with fs-verity when the scope says
+        /// verity), then a last reply with neither once the names are given.
+        /// A failure is the error `Failed`.
         #[zlink(more, return_fds)]
         pub async fn unpack(
             &self,
@@ -1273,17 +1282,24 @@ mod service {
                 task,
                 None,
                 (
-                    |event| {
+                    |event| match event.kind {
                         // (the bytes of the blob so far; a beat has none:
                         // it says the same as the call began with)
-                        (event.kind == EventKind::Progress && event.objects.is_empty()).then_some(
-                            UnpackReply {
-                                bytes: Some(event.bytes.unwrap_or(0)),
-                            },
-                        )
+                        EventKind::Progress if event.objects.is_empty() => Some(UnpackReply {
+                            bytes: Some(event.bytes.unwrap_or(0)),
+                            files: None,
+                        }),
+                        EventKind::Staged => Some(UnpackReply {
+                            bytes: None,
+                            files: Some(event.objects),
+                        }),
+                        _ => None,
                     },
                     |reason| FetcherError::failed(reason),
-                    Some(|| UnpackReply { bytes: None }),
+                    Some(|| UnpackReply {
+                        bytes: None,
+                        files: None,
+                    }),
                 ),
             )
         }
@@ -2039,8 +2055,17 @@ pub fn definition() -> String {
          # may take (`reuse` of Fetch, only for a fetcher that announces the word\n\
          # reuse) come in one file the engine made of exactly those bytes, read-only.\n\
          #\n\
+         # UNPACK.  A layer with no table of contents is read whole, and its regular files\n\
+         # are handed over, not named: each is a descriptor of a reply of `Unpack`, a\n\
+         # complete file with no name (a small one may be a file in memory) that has\n\
+         # fs-verity when the scope says verity.  Then the fetcher gives `toc.claim` and\n\
+         # `tarsplit` their names in the staging directory.  A file of two names is handed\n\
+         # over once.\n\
+         #\n\
          # TRUST.  A fetcher is not trusted.  A name it made is a claim; the engine opens\n\
-         # it and takes the kernel's measure.  What it returns with GetManifest,\n\
+         # it and takes the kernel's measure.  A file it hands over is a claim too: the\n\
+         # engine copies it, or takes the kernel's measure of it, and knows it by the\n\
+         # digest of the bytes it read.  What it returns with GetManifest,\n\
          # GetBlob, GetProfile and Probe is hashed by the engine before it is used.\n\
          #\n\
          # CAPABILITIES.  What a fetcher can do is a word of capabilities in GetInfo; a\n\
@@ -2059,7 +2084,7 @@ pub fn definition() -> String {
          #\n\
          # REPLIES.  A method called with more answers one record a reply; its last\n\
          # reply carries no record and has continues false (`Fetch`: no event;\n\
-         # `Probe`: no probed; `Unpack`: no bytes).  A server whose connection is closed sends nothing\n\
+         # `Probe`: no probed; `Unpack`: neither bytes nor files).  A server whose connection is closed sends nothing\n\
          # more.  `progress` carries `objects` (exactly one) and `bytes`, the cumulative\n\
          # bytes of that object moved by this call; with no object, the cumulative\n\
          # bytes of the blob of the layer; one with no object and no bytes is a beat.\n\

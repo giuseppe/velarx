@@ -65,13 +65,24 @@ struct Staged {
     own: bool,
 }
 
+/// The directories of a session that its temporary files are spread over.
+const SHARDS: u64 = 64;
+
 impl Session {
     /// Create `<staging_root>/<random>`.
     pub fn create(staging_root: &Path, store: Arc<FileStore>) -> io::Result<Arc<Self>> {
         fs::create_dir_all(staging_root)?;
         let dir = staging_root.join(format!("pull-{}", velarx_base::random::uuid()));
         // Only the owner may see or touch what is being pulled.
-        std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700).create(&dir)?;
+        let private = || {
+            let mut dir = fs::DirBuilder::new();
+            std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+            dir
+        };
+        private().create(&dir)?;
+        for shard in 0..SHARDS {
+            private().create(dir.join(format!("{shard:02x}")))?;
+        }
         Ok(Arc::new(Self {
             dir,
             store,
@@ -83,6 +94,22 @@ impl Session {
             by_content: Mutex::new(HashMap::new()),
             verified: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// The directories the temporary files of the session are in.
+    #[cfg(test)]
+    pub(crate) fn temp_dirs(&self) -> Vec<PathBuf> {
+        (0..SHARDS)
+            .map(|shard| self.dir.join(format!("{shard:02x}")))
+            .collect()
+    }
+
+    /// The temporary files the session holds, whatever directory they are
+    /// in.
+    #[cfg(test)]
+    pub(crate) fn temp_files(&self) -> Vec<PathBuf> {
+        let in_dir = |dir: PathBuf| fs::read_dir(dir).unwrap().flatten().map(|e| e.path());
+        self.temp_dirs().into_iter().flat_map(in_dir).collect()
     }
 
     /// Remove the sessions left by pulls that stopped in the middle: those
@@ -307,12 +334,11 @@ impl Session {
     }
 
     /// A name for a file of this session: it is made of a counter, never of
-    /// a digest.
+    /// a digest.  The files are spread over directories: threads that make
+    /// them side by side would wait for the one lock of a directory.
     fn temp_path(&self) -> PathBuf {
-        self.dir.join(format!(
-            "tmp-{}",
-            self.counter.fetch_add(1, Ordering::Relaxed)
-        ))
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        self.dir.join(format!("{:02x}/tmp-{n}", n % SHARDS))
     }
 
     /// A new file for content whose digest is not known yet.  Created
@@ -329,6 +355,28 @@ impl Session {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)?;
         Ok((file, path))
+    }
+
+    /// A name of the session for `file`, a file that has none: it is linked
+    /// there, and the name is the file's.
+    pub fn link_temp(&self, file: &File) -> io::Result<PathBuf> {
+        use rustix::fs::{linkat, AtFlags, CWD};
+        let to = self.temp_path();
+        // (an unprivileged process may link a file with no name by its
+        // descriptor on newer kernels only: the other way works on all)
+        match linkat(file, "", CWD, &to, AtFlags::EMPTY_PATH) {
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::PERM | rustix::io::Errno::INVAL) => {
+                linkat(
+                    CWD,
+                    velarx_sys::fd::proc_str(&file),
+                    CWD,
+                    &to,
+                    AtFlags::SYMLINK_FOLLOW,
+                )
+            }
+            r => r,
+        }?;
+        Ok(to)
     }
 
     /// Stage the complete file `temp` as `digest`; `copy`: the file is a copy
@@ -362,7 +410,7 @@ impl Session {
         }
         // (a file of the session already; one of another session, which goes
         // with that one, moves in)
-        let path = if temp.parent() == Some(self.dir.as_path()) {
+        let path = if temp.parent().and_then(Path::parent) == Some(self.dir.as_path()) {
             temp.to_path_buf()
         } else {
             let to = self.temp_path();
@@ -471,27 +519,11 @@ impl Session {
         copy: bool,
         verity_keyed: Option<&str>,
     ) -> io::Result<bool> {
-        use rustix::fs::{linkat, AtFlags, CWD};
         let size = file.metadata()?.len();
         if self.staged.lock().unwrap().contains_key(digest) || self.store.contains_local(digest) {
             return Ok(false);
         }
-        let to = self.temp_path();
-        // (an unprivileged process may link a file with no name by its
-        // descriptor on newer kernels only: the other way works on all)
-        let linked = match linkat(file, "", CWD, &to, AtFlags::EMPTY_PATH) {
-            Err(rustix::io::Errno::NOENT | rustix::io::Errno::PERM | rustix::io::Errno::INVAL) => {
-                linkat(
-                    CWD,
-                    velarx_sys::fd::proc_str(&file),
-                    CWD,
-                    &to,
-                    AtFlags::SYMLINK_FOLLOW,
-                )
-            }
-            r => r,
-        };
-        linked?;
+        let to = self.link_temp(file)?;
         let mut staged = self.staged.lock().unwrap();
         if staged.contains_key(digest) {
             drop(staged);
@@ -658,28 +690,6 @@ impl Session {
             },
         );
         Ok(true)
-    }
-
-    /// A replay read the file of a job known by `digest` (the hash of its
-    /// content, checked on what it read) with the content of the fs-verity
-    /// digest `verity`: the commit stores no other.  Two replays that read
-    /// other contents (the job changed it in between) are an error.
-    pub fn replayed_as(&self, digest: &str, verity: &str) -> io::Result<()> {
-        let mut by_content = self.by_content.lock().unwrap_or_else(|e| e.into_inner());
-        // (a file the session had already, not the job's, is not one)
-        let Some(read) = by_content.get_mut(digest) else {
-            return Ok(());
-        };
-        match read {
-            Some(v) if v != verity => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{digest} was read with two contents"),
-            )),
-            _ => {
-                *read = Some(verity.to_string());
-                Ok(())
-            }
-        }
     }
 
     /// Stage content that is in memory; a `copy` (of what the store or a
@@ -1038,7 +1048,7 @@ mod tests {
             );
             assert_eq!(s.is_copy(&d), copy);
             assert_eq!(s.from_store(&d), copy);
-            let left = fs::read_dir(s.dir()).unwrap().count();
+            let left = s.temp_files().len();
             assert_eq!(left, 1);
         }
     }
@@ -1282,14 +1292,12 @@ mod tests {
 
     /// A file a job gave, known by its sha256, that was written after it
     /// was checked (the job kept a descriptor) is not committed; one that
-    /// was not is.  Checked against what a replay read of it when one did,
-    /// else against its sha256 (a change after a replay read it is the
-    /// accepted trade-off of a store without fs-verity).
+    /// was not is.
     #[test]
     fn a_file_a_job_changed_after_it_was_checked_is_not_committed() {
         use std::io::Write;
         use std::os::unix::fs::FileExt;
-        for (change, replayed) in [(false, false), (true, false), (false, true), (true, true)] {
+        for change in [false, true] {
             let (_tmp, s) = session();
             let key = crate::sha256_text(b"abc");
             let mut kept = File::from(
@@ -1303,33 +1311,11 @@ mod tests {
             kept.write_all(b"abc").unwrap();
             let given = File::open(velarx_sys::fd::proc_str(&kept)).unwrap();
             assert!(s.adopt_file(&given, &key, false, None).unwrap());
-            if replayed {
-                let verity = velarx_storage::fsverity_digest_of(
-                    velarx_types::digest::Algorithm::Sha256,
-                    b"abc",
-                );
-                s.replayed_as(&key, &verity).unwrap();
-                s.replayed_as(&key, &verity).unwrap();
-                // (two replays that read two contents)
-                assert!(s
-                    .replayed_as(
-                        &key,
-                        &velarx_storage::fsverity_digest_of(
-                            velarx_types::digest::Algorithm::Sha256,
-                            b"xyz"
-                        )
-                    )
-                    .is_err());
-            }
             if change {
                 kept.write_all_at(b"xyz", 0).unwrap();
             }
             let committed = s.commit(None);
-            // (a file a replay read after it was staged is verified by that
-            // read: without fs-verity a change after it is not seen, the
-            // trade-off of the threat model; one nothing read is read by the
-            // verification, and the change is)
-            if change && !replayed {
+            if change {
                 let err = committed.unwrap_err();
                 assert!(err.to_string().contains("is not committed"), "{err}");
                 assert!(s
@@ -1549,7 +1535,7 @@ mod tests {
             s.put_measured(&key, &verity, &in_store, false).unwrap(),
             (verity.clone(), false)
         );
-        assert_eq!(fs::read_dir(s.dir()).unwrap().count(), 0);
+        assert_eq!(s.temp_files().len(), 0);
         assert_eq!(s.staged_totals(), (0, 0));
 
         // a file the session staged by its fs-verity digest (a layer of a
@@ -1676,10 +1662,21 @@ mod tests {
     }
 
     #[test]
+    fn the_temporary_files_are_spread_over_directories() {
+        let (_tmp, s) = session();
+        let made: Vec<_> = (0..SHARDS * 2)
+            .map(|_| s.create_temp().unwrap().1)
+            .collect();
+        let dirs: std::collections::HashSet<_> = made.iter().map(|p| p.parent()).collect();
+        assert_eq!(dirs.len() as u64, SHARDS);
+        assert!(made.iter().all(|p| p.is_file()));
+    }
+
+    #[test]
     fn test_temp_files_are_exclusive() {
         let (_tmp, s) = session();
         let (_f, p) = s.create_temp().unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", s.dir().join("tmp-5")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", s.dir().join("05/tmp-5")).unwrap();
         s.counter.store(5, Ordering::Relaxed);
         assert!(s.create_temp().is_err());
         assert!(p.exists());
@@ -1894,6 +1891,6 @@ mod tests {
         Session::sweep(&staging, |s| s == parent.name());
         assert!(scratch.dir().is_dir());
         drop(scratch);
-        assert_eq!(fs::read_dir(parent.dir()).unwrap().count(), 0);
+        assert_eq!(parent.temp_files().len(), 0);
     }
 }

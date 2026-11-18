@@ -190,14 +190,15 @@ fn stage_file(
     Ok(true)
 }
 
-/// Stage the layer of the blob `layer` from its index and the items of its
-/// files it has: whether it did (`toc.claim` and `tarsplit` named last).
+/// Unpack the layer of the blob `layer` from its index and the items of its
+/// files it has, handing the files over to `files`: whether it did
+/// (`toc.claim` and `tarsplit` named last).
 fn stage_whole(
     items: &dyn Items,
     layer: &str,
     blob_size: Option<u64>,
-    staging: &std::fs::File,
-    verity: bool,
+    (staging, verity): (&std::fs::File, bool),
+    files: &mut crate::unpack::Files,
 ) -> Result<bool, stager::StageError> {
     let Some(index) = items.index(layer) else {
         return Ok(false);
@@ -210,14 +211,14 @@ fn stage_whole(
     // (what an index makes this fetcher stage is bounded, before anything
     // is asked: each file by what a source may give, all of them by the
     // layer when its size is known)
-    let files = toc
+    let regular = toc
         .entries
         .iter()
         .filter(|e| e.entry_type == TocEntryType::Reg);
-    if files.clone().any(|e| e.size > MAX_ITEM) {
+    if regular.clone().any(|e| e.size > MAX_ITEM) {
         return Ok(false);
     }
-    let total = files.map(|e| e.size).fold(0, u64::saturating_add);
+    let total = regular.map(|e| e.size).fold(0, u64::saturating_add);
     if blob_size.is_some_and(|s| total > s.saturating_mul(4).max(64 << 20)) {
         return Ok(false);
     }
@@ -241,10 +242,11 @@ fn stage_whole(
         else {
             continue;
         };
-        let file = Unnamed::begin(staging.as_fd(), e.size)?;
+        let file = Unnamed::for_handover(staging.as_fd(), e.size, verity)?;
         file.write_chunk(0, &data, None)?;
-        file.finish(staging.as_fd(), &Name::Content(content), verity)?;
+        files.give(file.sealed(&Name::Content(content), verity)?, e.size)?;
     }
+    files.send()?;
     let json = serde_json::to_vec(&toc).map_err(std::io::Error::other)?;
     stager::put_named(staging.as_fd(), TOC_CLAIM, &json)?;
     stager::put_named(staging.as_fd(), TARSPLIT, &tarsplit)?;
@@ -310,10 +312,11 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
             .try_clone()
             .map_err(|e| failed(e.to_string()))?;
         let (items, verity) = (self.items.clone(), scope.verity);
+        let mut files = crate::unpack::Files::new(out.clone());
         let (name, blob_size) = (layer.layer.clone(), layer.blob.as_ref().map(|b| b.size));
         let (staged, progress) = tokio::task::spawn_blocking(move || {
             let counted = Counted(&*items, Default::default());
-            let staged = stage_whole(&counted, &name, blob_size, &staging, verity);
+            let staged = stage_whole(&counted, &name, blob_size, (&staging, verity), &mut files);
             // (only the bytes of what it staged count)
             let progress = match staged {
                 Ok(true) => counted.progress(),

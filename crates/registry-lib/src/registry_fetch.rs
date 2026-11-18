@@ -444,8 +444,10 @@ impl RegistryFetch {
             let mut frames = pool.layer(&digest, size, max).await?;
             let (tx, rx) = tokio::sync::mpsc::channel(velarx_content::pull::stream::CHANNEL_DEPTH);
             let dir = staging.try_clone()?;
-            let unpacking =
-                tokio::task::spawn_blocking(move || unpack(rx, &dir, digest.alg(), verity));
+            let files = velarx_content::unpack::Files::new(out.clone());
+            let unpacking = tokio::task::spawn_blocking(move || {
+                unpack(rx, &dir, (digest.alg(), verity), files)
+            });
             let mut sent = 0u64;
             let mut network = None;
             loop {
@@ -520,16 +522,16 @@ impl RegistryFetch {
 /// its table of contents (a claim) and its tar-split.
 pub use velarx_content::fetcher::fetch::{TARSPLIT, TOC_CLAIM};
 
-/// Unpack the tar stream of `frames` into the staging directory `staging`
+/// Unpack the tar stream of `frames`, handing the files over to `files`
 /// ([`velarx_content::unpack::unpack_tar`]).
 fn unpack(
     frames: tokio::sync::mpsc::Receiver<velarx_content::pull::stream::Frame>,
     staging: &File,
-    alg: velarx_types::digest::Algorithm,
-    verity: bool,
+    kind: (velarx_types::digest::Algorithm, bool),
+    mut files: velarx_content::unpack::Files,
 ) -> Result<(Toc, Vec<u8>), ImageError> {
     let reader = velarx_content::pull::stream::ChannelReader::new(frames);
-    velarx_content::unpack::unpack_tar(reader, staging, alg, verity)
+    velarx_content::unpack::unpack_tar(reader, staging, kind, &mut files)
 }
 
 /// The bytes of `ranges` of the blob `digest`, appended to `got` (the

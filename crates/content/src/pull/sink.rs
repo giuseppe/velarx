@@ -74,6 +74,11 @@ pub trait Stage: Send + Sync {
     /// A new file for content whose digest is not known yet, and the path
     /// it has until it is adopted (none when it has no name).
     fn create_temp(&self) -> io::Result<(File, Option<PathBuf>)>;
+    /// A name of the stage for `file`, which has none: linked to it, not
+    /// copied.
+    fn link_temp(&self, _file: &File) -> io::Result<PathBuf> {
+        Err(not_here("a file with a name"))
+    }
     /// The place for the content of `key` (`size` bytes): the file is at
     /// least `base + size` bytes long, and nothing but this content is
     /// written there.  The default is a file of its own, sized.
@@ -245,11 +250,6 @@ pub trait Sink: Stage {
     ) -> io::Result<super::session::Adopted> {
         Err(not_here("a file the engine verified"))
     }
-    /// A replay read the file known by `key` with the content of the
-    /// fs-verity digest `verity`: the commit stores no other.
-    fn replayed_as(&self, _key: &str, _verity: &str) -> io::Result<()> {
-        Ok(())
-    }
     /// A sink inside this one, for what is not checked yet.
     fn scratch(self: Arc<Self>) -> io::Result<Arc<dyn Sink>>;
     /// Move what this sink staged and `keep` names into `other`.
@@ -269,6 +269,10 @@ pub trait Sink: Stage {
 impl Stage for Session {
     fn create_temp(&self) -> io::Result<(File, Option<PathBuf>)> {
         Session::create_temp(self).map(|(f, p)| (f, Some(p)))
+    }
+
+    fn link_temp(&self, file: &File) -> io::Result<PathBuf> {
+        Session::link_temp(self, file)
     }
 
     fn takes_files(&self) -> bool {
@@ -388,10 +392,6 @@ impl Sink for Session {
         verity_keyed: Option<&str>,
     ) -> io::Result<bool> {
         Session::adopt_staged(self, layer, file, key, copy, verity_keyed)
-    }
-
-    fn replayed_as(&self, key: &str, verity: &str) -> io::Result<()> {
-        Session::replayed_as(self, key, verity)
     }
 
     fn scratch(self: Arc<Self>) -> io::Result<Arc<dyn Sink>> {

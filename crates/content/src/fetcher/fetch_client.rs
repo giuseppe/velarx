@@ -163,14 +163,60 @@ impl Replies<'_, ProbeReply> {
     }
 }
 
+/// What an `Unpack` tells.
+pub enum Unpacking {
+    /// The bytes of the blob read so far
+    Bytes(u64),
+    /// Complete files of the layer, regular files with no name
+    Files(Vec<File>),
+}
+
 impl Replies<'_, UnpackReply> {
-    /// The bytes of the blob read so far; none after the last reply.
-    pub async fn bytes(&mut self) -> Result<Option<u64>, CallError> {
-        Ok(self
-            .next_with(|r| r.bytes.is_none())
+    /// The next thing an `Unpack` tells; none after the last reply.
+    pub async fn unpacking(&mut self) -> Result<Option<Unpacking>, CallError> {
+        let Some((reply, fds)) = self
+            .next_with(|r| r.bytes.is_none() && r.files.is_none())
             .await?
-            .and_then(|(r, _)| r.bytes))
+        else {
+            return Ok(None);
+        };
+        let Some(places) = reply.files else {
+            return Ok(Some(Unpacking::Bytes(reply.bytes.unwrap_or(0))));
+        };
+        let mut fds: Vec<Option<OwnedFd>> = fds.into_iter().map(Some).collect();
+        let files = places
+            .iter()
+            .map(|&at| {
+                let fd = fds
+                    .get_mut(at as usize)
+                    .and_then(Option::take)
+                    .ok_or_else(|| {
+                        CallError::Protocol(format!(
+                            "a file is descriptor {at}, and the reply has {}",
+                            fds.len()
+                        ))
+                    })?;
+                readable_file(fd).ok_or_else(|| {
+                    CallError::Protocol(format!(
+                        "descriptor {at} is not a regular file open for reading"
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Some(Unpacking::Files(files)))
     }
+}
+
+/// `fd` as a file the engine reads: a regular file open for reading.  A pipe
+/// or a socket could keep a read waiting forever, and a descriptor with no
+/// read access (`O_PATH`, write-only) reads nothing: either is the fetcher's
+/// failure, not the engine's.
+fn readable_file(fd: OwnedFd) -> Option<File> {
+    use rustix::fs::{FileType, OFlags};
+    let regular = FileType::from_raw_mode(rustix::fs::fstat(&fd).ok()?.st_mode).is_file();
+    let flags = rustix::fs::fcntl_getfl(&fd).ok()?;
+    let readable = !flags.contains(OFlags::PATH) && !flags.contains(OFlags::WRONLY);
+    (regular && readable).then(|| File::from(fd))
 }
 
 impl Replies<'_, Tagged> {
@@ -456,7 +502,7 @@ impl FetchConn {
     ) -> Result<Replies<'_, UnpackReply>, CallError> {
         let (conn, busy) = self.begin().await?;
         match conn.unpack(layer.to_string(), urgency).await {
-            Ok(stream) => Ok(replies(stream, &busy)),
+            Ok(stream) => Ok(replies_fds(stream, &busy)),
             Err(e) => {
                 busy.store(false, Ordering::Release);
                 Err(zerr(e))

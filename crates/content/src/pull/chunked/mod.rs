@@ -1396,21 +1396,21 @@ struct Opened {
     name: String,
     size: u64,
     digest: String,
-    /// The fs-verity digest the kernel measured for the file before it was
-    /// read: a file with fs-verity cannot change, so what the replay reads
-    /// is what this names
-    measure: Option<String>,
-    /// The copy of the content that is made as it is read, for a file the
-    /// kernel does not measure: the replay is the one read of the file, and
-    /// the commit links what it wrote
-    copy: Option<Copying>,
+    /// The copy of the file the engine made when the fetcher handed it over
+    /// (the first time the file is opened): the replay reads the copy,
+    /// which no one but the engine holds, and the commit links it
+    copy: Option<(PathBuf, String)>,
+    /// The content of the file was hashed as it was copied and is the
+    /// digest it is known by: the replay does not hash it again
+    verified: bool,
 }
 
-/// A copy of a file in the making: written, with the fs-verity digest of its
-/// blocks computed, in the pass that reads the file for the replay.
-struct Copying {
+/// A file a fetcher handed over, as the engine holds it: where, its size,
+/// and the fs-verity digest of its blocks.
+pub(crate) struct Copied {
     path: PathBuf,
-    state: Arc<Mutex<Option<CopyState>>>,
+    size: u64,
+    verity: String,
 }
 
 /// The fs-verity digest of a file being copied: of a long one, hashed beside
@@ -1444,73 +1444,164 @@ impl Merkle {
     }
 }
 
-struct CopyState {
-    writer: velarx_storage::SparseWriter<File>,
-    verity: Merkle,
-    read: u64,
+/// The files a fetcher hands over while it unpacks a layer, taken in as they
+/// come by as many threads as the pull has workers, so that they are ready
+/// when the replay needs them.  A fetcher may hold another descriptor of what
+/// it hands over, so a file the kernel does not measure is copied, the
+/// content and the fs-verity digest hashed as it is written, and each file is
+/// known by the digest of the bytes the engine read: what the fetcher says of
+/// it is not asked.
+pub struct Intake {
+    sink: Arc<dyn super::sink::Sink>,
+    alg: Algorithm,
+    /// The files in the making: one permit for each thread
+    room: Arc<tokio::sync::Semaphore>,
+    threads: u32,
+    taken: Arc<Mutex<Taken>>,
 }
 
-impl Copying {
-    /// A copy in a new file of `sink`, when it has files with a name.
-    fn begin(sink: &dyn super::sink::Sink, alg: Algorithm, size: u64) -> io::Result<Option<Self>> {
-        let (file, path) = sink.create_temp()?;
-        let Some(path) = path else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            path,
-            state: Arc::new(Mutex::new(Some(CopyState {
-                writer: velarx_storage::SparseWriter::new(file),
-                verity: Merkle::new(alg, size),
-                read: 0,
-            }))),
-        }))
+#[derive(Default)]
+struct Taken {
+    files: HashMap<String, Copied>,
+    failed: Option<io::Error>,
+}
+
+impl Intake {
+    /// The intake of the files of a layer whose blob is named in `alg`, for
+    /// `threads` at a time.
+    pub fn new(sink: Arc<dyn super::sink::Sink>, alg: Algorithm, threads: usize) -> Self {
+        let threads = u32::try_from(threads.max(1)).unwrap_or(u32::MAX >> 4);
+        Self {
+            sink,
+            alg,
+            room: Arc::new(tokio::sync::Semaphore::new(threads as usize)),
+            threads,
+            taken: Arc::default(),
+        }
     }
 
-    /// The reader of `file` that writes the copy as it reads.
-    fn tee(&self, file: File) -> Box<dyn Read + Send> {
-        Box::new(Tee {
-            inner: file,
-            state: self.state.clone(),
-        })
+    /// Take in `file`, as soon as a thread is free.  The error of a file that
+    /// could not be taken in, which the files before it had.
+    pub async fn give(&self, file: File) -> io::Result<()> {
+        if let Some(e) = self.lock().failed.take() {
+            return Err(e);
+        }
+        let permit = self
+            .room
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(io::Error::other)?;
+        let (sink, alg, taken) = (self.sink.clone(), self.alg, self.taken.clone());
+        tokio::task::spawn_blocking(move || {
+            let made = take_in(file, alg, sink.as_ref());
+            let mut taken = taken.lock().unwrap_or_else(|e| e.into_inner());
+            match made {
+                Ok((key, copy)) => match taken.files.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(copy);
+                    }
+                    // (the content is held: this one is one file too many)
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        let _ = std::fs::remove_file(&copy.path);
+                    }
+                },
+                Err(e) => {
+                    taken.failed.get_or_insert(e);
+                }
+            }
+            drop(permit);
+        });
+        Ok(())
     }
 
-    /// The copy once the `size` bytes of the file were read: its path and
-    /// the fs-verity digest of what was written.  None (and no file) when
-    /// what was read is not all of it.
-    fn finish(self, size: u64) -> io::Result<Option<(PathBuf, String)>> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner()).take();
-        match state {
-            Some(s) if s.read == size => {
-                s.writer.finish()?;
-                Ok(Some((self.path, s.verity.finish())))
-            }
-            _ => {
-                let _ = std::fs::remove_file(&self.path);
-                Ok(None)
-            }
+    /// The files taken in, by the digest of their content, once every file
+    /// handed over is.
+    pub(crate) async fn finish(&self) -> io::Result<HashMap<String, Copied>> {
+        let _all = self
+            .room
+            .acquire_many(self.threads)
+            .await
+            .map_err(io::Error::other)?;
+        let mut taken = self.lock();
+        match taken.failed.take() {
+            Some(e) => Err(e),
+            None => Ok(std::mem::take(&mut taken.files)),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Taken> {
+        self.taken.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Take in the file `file` a fetcher handed over: the digest of its content in
+/// `alg` and where the engine holds it.  A file the kernel measures cannot
+/// change: it is linked, and read for its digest; any other is copied to a
+/// file of the sink, and the digest is that of the bytes written.
+fn take_in(
+    file: File,
+    alg: Algorithm,
+    sink: &dyn super::sink::Sink,
+) -> io::Result<(String, Copied)> {
+    let size = file.metadata()?.len();
+    let mut content = match size >= OFFLOAD_FROM {
+        true => Content::Beside(Offloaded::new(DigestWriter::new(alg))),
+        false => Content::Here(DigestWriter::new(alg)),
+    };
+    let mut from = Read::take(FromStart { file: &file, at: 0 }, size + 1);
+    if let Some(verity) = super::commit::measure(&file, alg) {
+        let path = sink.link_temp(&file)?;
+        let size = io::copy(&mut from, &mut content)?;
+        return Ok((
+            content.finalize().to_string(),
+            Copied { path, size, verity },
+        ));
+    }
+    let (to, path) = sink.create_temp()?;
+    let Some(path) = path else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the files of this sink have no names",
+        ));
+    };
+    let mut verity = Merkle::new(alg, size);
+    let copied = velarx_storage::copy_sparse(from, &to, |piece| {
+        verity.update(piece);
+        content.update(piece);
+    });
+    // (the disk starts on it now, not on all of them at the barrier of the
+    // commit)
+    super::session::start_writeback(&to);
+    match copied {
+        Ok(size) => Ok((
+            content.finalize().to_string(),
+            Copied {
+                path,
+                size,
+                verity: verity.finish(),
+            },
+        )),
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            Err(e)
         }
     }
 }
 
-struct Tee {
-    inner: File,
-    state: Arc<Mutex<Option<CopyState>>>,
+/// A file a fetcher handed over, read from its start at positions of its own:
+/// the offset of the descriptor is the fetcher's too, which could move it
+/// while the engine reads, and a file of fs-verity, which is linked, would be
+/// known by the digest of its bytes in another order.
+struct FromStart<'a> {
+    file: &'a File,
+    at: u64,
 }
 
-impl Read for Tee {
+impl Read for FromStart<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        if let Some(s) = self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_mut()
-        {
-            s.verity.update(&buf[..n]);
-            s.writer.write(&buf[..n])?;
-            s.read += n as u64;
-        }
+        let n = std::os::unix::fs::FileExt::read_at(self.file, buf, self.at)?;
+        self.at += n as u64;
         Ok(n)
     }
 }
@@ -1526,12 +1617,9 @@ pub(crate) struct Replayed {
     pub diff_id: Digest,
     pub entries: Vec<TocEntry>,
     pub files: Vec<FileUse>,
-    /// The files whose content the replay read and found to be the digest
-    /// they are staged by, with the kernel's measure of each: the commit
-    /// does not read them again
-    pub measures: HashMap<String, String>,
-    /// The files the kernel does not measure, which the replay copied as it
-    /// read them: by their key, the copy, its size and its fs-verity digest
+    /// The files the fetcher handed over, which the engine took in before
+    /// the replay read them: by their key, the copy, its size and its
+    /// fs-verity digest
     pub copies: HashMap<String, (PathBuf, u64, String)>,
 }
 
@@ -1575,6 +1663,17 @@ impl Content {
     }
 }
 
+impl io::Write for Content {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.update(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Replay a tar-split over the files of `source`: the table of contents is
 /// a fetcher's claim (of a layer it unpacked), not one the descriptor names:
 /// the content of each file is hashed here and must be the digest the claim
@@ -1594,7 +1693,6 @@ fn replay_of(
     let mut buf = vec![0u8; 1 << 20];
     let mut entries = Vec::new();
     let mut files = Vec::new();
-    let mut measures = HashMap::new();
     let mut copies = HashMap::new();
     while let Some(h) = tar.next_entry().map_err(data_fail)? {
         if entries.len() >= MAX_ENTRIES {
@@ -1605,21 +1703,40 @@ fn replay_of(
             if h.size == 0 {
                 Some(Digest::empty(alg).to_string())
             } else {
+                // (nothing is open yet: the first read below opens this
+                // file, so a file whose copy was verified is all the bytes
+                // whose hash is skipped)
+                if tar.get_mut().inner.contents_mut().opened().is_some() {
+                    return Err(fail("tar-split does not match the archive"));
+                }
                 // Large reads: the files are read again from the disk
                 // (the page cache), a syscall and a hash call per piece.
                 let mut left = h.size;
-                // (the hash of a long file runs beside the read of it)
-                let mut content = match h.size >= OFFLOAD_FROM {
-                    true => Content::Beside(Offloaded::new(DigestWriter::new(alg))),
-                    false => Content::Here(DigestWriter::new(alg)),
-                };
+                // (the hash of a long file runs beside the read of it; a
+                // file that was hashed as it was copied is not hashed again)
+                let mut content = None;
                 while left > 0 {
                     let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
                     let n = tar.read(&mut buf[..want]).map_err(io_fail)?;
                     if n == 0 {
                         return Err(fail("the archive ends in a file"));
                     }
-                    content.update(&buf[..n]);
+                    if left == h.size {
+                        let verified = tar
+                            .get_mut()
+                            .inner
+                            .contents_mut()
+                            .opened()
+                            .as_ref()
+                            .is_some_and(|o| o.verified);
+                        content = (!verified).then(|| match h.size >= OFFLOAD_FROM {
+                            true => Content::Beside(Offloaded::new(DigestWriter::new(alg))),
+                            false => Content::Here(DigestWriter::new(alg)),
+                        });
+                    }
+                    if let Some(c) = &mut content {
+                        c.update(&buf[..n]);
+                    }
                     left -= n as u64;
                 }
                 let mut opened = tar
@@ -1638,7 +1755,10 @@ fn replay_of(
                 }
                 // (a file the store has is its object, named by its
                 // fs-verity digest: the store's, not the fetcher's)
-                let read = content.finalize().to_string();
+                let read = match content {
+                    Some(c) => c.finalize().to_string(),
+                    None => opened.digest.clone(),
+                };
                 let object = velarx_storage::to_toc(&opened.digest);
                 if object.is_none() && read != opened.digest {
                     return Err(ImageError::Contradicted(format!(
@@ -1647,17 +1767,7 @@ fn replay_of(
                     )));
                 }
                 claimed_object = object;
-                if let Some(m) = &opened.measure {
-                    measures.insert(opened.digest.clone(), m.clone());
-                }
-                if let Some((path, verity)) = opened
-                    .copy
-                    .take()
-                    .map(|c| c.finish(h.size))
-                    .transpose()
-                    .map_err(io_fail)?
-                    .flatten()
-                {
+                if let Some((path, verity)) = opened.copy.take() {
                     copies.insert(opened.digest.clone(), (path, h.size, verity));
                 }
                 files.push(FileUse {
@@ -1685,7 +1795,6 @@ fn replay_of(
         diff_id: rest.hasher.finish().finalize(),
         entries,
         files,
-        measures,
         copies,
     })
 }
@@ -1916,16 +2025,12 @@ pub async fn pull_whole(
 ) -> ImageResult<(Pulled, bool)> {
     let unpacked = unpack_whole(ctx, layer, expected_diff_id, registry_only, progress).await?;
     let Unpacked {
-        staging,
         mut ingested,
         by_registry,
     } = unpacked;
-    let (layer_staging, sink) = (staging.clone(), ctx.sink.clone());
+    let sink = ctx.sink.clone();
     let files: Vec<String> = ingested.files.iter().map(|f| f.digest.clone()).collect();
     let from_store = std::mem::take(&mut ingested.stored);
-    // (the replay read each file once and took the kernel's measure of it
-    // before: no other read here or in the commit)
-    let measures = std::mem::take(&mut ingested.measures);
     let mut copies = std::mem::take(&mut ingested.copies);
     let (objects, kept, reused) = tokio::task::spawn_blocking(move || {
         let (mut objects, mut kept, mut reused) = (HashMap::new(), 0u64, 0u64);
@@ -1940,50 +2045,32 @@ pub async fn pull_whole(
                 reused += 1;
                 continue;
             }
-            // (the replay copied it as it read it: the copy is the file, and
-            // it is already named by what the replay computed)
-            if let Some((path, size, verity)) = copies.remove(&key) {
-                let (known, added) = sink.adopt_measured(&path, &key, &verity, size, false)?;
-                match (known == key, added) {
-                    (true, true) => {
-                        kept += 1;
-                        objects.insert(key, None);
-                    }
-                    (true, false) => {
-                        reused += 1;
-                        objects.insert(key, None);
-                    }
-                    // (the sink has the object: the file is its one)
-                    (false, _) => {
-                        reused += 1;
-                        objects.insert(key, Some(known));
-                    }
+            // (the engine took in the file when it was handed over: the file
+            // is what it holds, and it is already named by what it computed)
+            let Some((path, size, verity)) = copies.remove(&key) else {
+                return Err(ImageError::Layer(format!("{key} was not handed over")));
+            };
+            let (known, added) = sink.adopt_measured(&path, &key, &verity, size, false)?;
+            match (known == key, added) {
+                (true, true) => {
+                    kept += 1;
+                    objects.insert(key, None);
                 }
-                continue;
+                (true, false) => {
+                    reused += 1;
+                    objects.insert(key, None);
+                }
+                // (the sink has the object: the file is its one)
+                (false, _) => {
+                    reused += 1;
+                    objects.insert(key, Some(known));
+                }
             }
-            let file = layer_staging.open(&key)?;
-            let measure = measures.get(&key);
-            if let Some(object) = measure.filter(|o| sink.have(o)) {
-                objects.insert(key, Some(object.clone()));
-                reused += 1;
-                continue;
-            }
-            match sink.adopt_staged(&layer_staging, &file, &key, false, None)? {
-                true => kept += 1,
-                false => reused += 1,
-            }
-            // (what the replay proved of the file: the commit names it by
-            // its measure without a read of its own)
-            if let Some(measure) = measure {
-                sink.replayed_as(&key, measure)?;
-            }
-            objects.insert(key, None);
         }
         Ok::<_, ImageError>((objects, kept, reused))
     })
     .await
     .map_err(|e| fail(format!("the files of a layer: {e}")))??;
-    drop(staging);
     if let Some(staged) = &ctx.staged {
         staged.forget(&layer.digest.to_string()).await;
     }
@@ -2018,13 +2105,11 @@ pub async fn pull_whole(
     ))
 }
 
-/// A layer with no table of contents that one of the fetchers unpacked whole
-/// into its staging, checked: the stream recreated from the tar-split and the
-/// staged files hashes to the diff id, each file is the digest it is staged
-/// by, and the table of contents is what the verified headers say.  Its
-/// files stay in `staging` (by their key) until it is dropped.
+/// A layer with no table of contents that one of the fetchers unpacked whole,
+/// checked: the stream recreated from the tar-split and the files it handed
+/// over hashes to the diff id, each file is the digest it is known by, and
+/// the table of contents is what the verified headers say.
 pub struct Unpacked {
-    pub staging: Arc<super::staged_fetch::LayerStaging>,
     pub ingested: Whole,
     /// The registry fetcher unpacked it (its workers hashed the blob)
     pub by_registry: bool,
@@ -2037,10 +2122,7 @@ pub struct Whole {
     pub report: LayerReport,
     pub diff_id: Digest,
     pub tarsplit: bytes::Bytes,
-    /// The files the replay read, by their key, with the kernel's measure
-    /// of each (taken before the read)
-    pub measures: HashMap<String, String>,
-    /// The copies the replay made of the files the kernel does not measure
+    /// The files the fetcher handed over, as the engine holds them
     /// ([`Replayed::copies`])
     pub copies: HashMap<String, (PathBuf, u64, String)>,
     /// The files the store had and the fetcher left out, by their key: the
@@ -2048,14 +2130,13 @@ pub struct Whole {
     pub stored: HashMap<String, String>,
 }
 
-/// Pull `layer`, which has no table of contents, through the fetchers into
-/// its staging and check it there ([`Unpacked`]).  A fetcher before the
+/// Pull `layer`, which has no table of contents, through the fetchers and
+/// check it ([`Unpacked`]).  A fetcher before the
 /// registry fetcher may leave out the files the claim names that it has not
 /// got: the replay takes them from the store, by the object the claim says
 /// (a word it checks: the content must be the digest the claim names the
 /// file by).  A claim of such a fetcher that does not replay to the diff id
-/// is given up for the registry fetcher's.  The files of a storage driver
-/// are copied from the staging, at the places the driver gives.
+/// is given up for the registry fetcher's.
 pub async fn unpack_whole(
     ctx: &PullCtx,
     layer: &OciDescriptor,
@@ -2091,15 +2172,16 @@ async fn unpack_from(
         .open_layer_as(LayerKey::Whole(layer.digest))
         .await
         .map_err(|e| (e, false))?;
+    let alg = LayerKey::expected(layer).digest().alg();
+    let intake = Intake::new(ctx.sink.clone(), alg, ctx.limits.workers);
     let whole = staged
-        .fetch_whole(&staging, layer, registry_only, progress)
+        .fetch_whole(&staging, layer, registry_only, progress, &intake)
         .await
         .map_err(|e| (e, false))?;
     let sourced = !whole.by_registry;
-    let alg = LayerKey::expected(layer).digest().alg();
     let diff_alg = expected_diff_id.alg();
     let tarsplit = bytes::Bytes::from(whole.tarsplit);
-    let dir = staging.dir().try_clone().map_err(|e| (e.into(), false))?;
+    let handed = intake.finish().await.map_err(|e| (e.into(), false))?;
     // (the objects the claim says its files are: a hint for those the
     // fetcher left out, nothing more)
     let mut toc = whole.toc;
@@ -2112,15 +2194,13 @@ async fn unpack_from(
     }
     let store = sourced.then(|| (ctx.sink.clone(), hints));
     let z = tarsplit.clone();
-    let sink = ctx.sink.clone();
     let replayed = tokio::task::spawn_blocking(
         move || -> ImageResult<(Replayed, HashMap<String, String>)> {
             let mut source = StagedFiles {
                 index: tarsplit::content_index(&toc),
-                dir,
                 store,
-                sink,
-                teed: HashSet::new(),
+                handed,
+                used: HashSet::new(),
                 stored: HashMap::new(),
                 last: None,
             };
@@ -2175,29 +2255,26 @@ async fn unpack_from(
         files: replayed.files,
         diff_id: replayed.diff_id,
         tarsplit,
-        measures: replayed.measures,
         copies: replayed.copies,
         stored,
     };
     Ok(Unpacked {
-        staging,
         ingested,
         by_registry: whole.by_registry,
     })
 }
 
-/// The files a fetcher staged for a layer, by their key, for a replay of its
-/// claim: each opened beneath the staging as a plain file of it; with
-/// `store`, a file the fetcher left out from the store, by the object the
-/// claim says it is (`stored`: those taken so).
+/// The files a fetcher handed over for a layer, by their key, for a replay of
+/// its claim: each read from the engine's own copy of it; with `store`, a file
+/// the fetcher left out from the store, by the object the claim says it is
+/// (`stored`: those taken so).
 struct StagedFiles {
     index: ContentIndex,
-    dir: File,
     store: Option<(Arc<dyn super::sink::Sink>, HashMap<String, String>)>,
-    /// Where the copies of the files the kernel does not measure are made
-    sink: Arc<dyn super::sink::Sink>,
-    /// The files that have a copy in the making or made (one each)
-    teed: HashSet<String>,
+    /// What the intake holds, by the key of each file
+    handed: HashMap<String, Copied>,
+    /// The files opened, by their key (a file of two names is one copy)
+    used: HashSet<String>,
     stored: HashMap<String, String>,
     last: Option<Opened>,
 }
@@ -2216,52 +2293,44 @@ impl Contents for &mut StagedFiles {
             ..
         } = self.index.take(name, size)?;
         let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidData, e);
-        let file = match super::staged_fetch::open_staged(&self.dir, &digest) {
-            Ok(file) => file,
-            Err(e) => {
-                let stored = self.store.as_ref().and_then(|(sink, hints)| {
-                    let object = hints.get(&digest)?;
-                    let file = File::open(sink.content_path(object)?).ok()?;
-                    Some((object.clone(), file))
-                });
-                let Some((object, file)) = stored else {
-                    return Err(invalid(e.to_string()));
-                };
-                self.stored.insert(digest.clone(), object);
-                file
+        if let Some(copy) = self.handed.get(&digest) {
+            if copy.size != size {
+                return Err(invalid(format!("invalid content for `{norm}`")));
             }
+            let reader = File::open(&copy.path)?;
+            let copy = self
+                .used
+                .insert(digest.clone())
+                .then(|| (copy.path.clone(), copy.verity.clone()));
+            self.last = Some(Opened {
+                name: norm,
+                size,
+                digest,
+                copy,
+                verified: true,
+            });
+            return Ok(Box::new(reader));
+        }
+        let stored = self.store.as_ref().and_then(|(sink, hints)| {
+            let object = hints.get(&digest)?;
+            let file = File::open(sink.content_path(object)?).ok()?;
+            Some((object.clone(), file))
+        });
+        let Some((object, file)) = stored else {
+            return Err(invalid(format!("`{norm}` was not handed over")));
         };
         if file.metadata()?.len() != size {
             return Err(invalid(format!("invalid content for `{norm}`")));
         }
-        // (measured before it is read: with fs-verity it cannot change)
-        let alg = super::key_algorithm(&digest);
-        let measure = alg.and_then(|alg| super::commit::measure(&file, alg));
-        // (what the kernel does not measure can change while it is read: the
-        // replay is the one read, and what it reads is written to a file
-        // of the engine's own, which the commit links)
-        let copy = match (&measure, alg) {
-            (None, Some(alg))
-                if size > 0
-                    && !self.stored.contains_key(&digest)
-                    && self.teed.insert(digest.clone()) =>
-            {
-                Copying::begin(self.sink.as_ref(), alg, size)?
-            }
-            _ => None,
-        };
-        let reader: Box<dyn Read + Send> = match &copy {
-            Some(copy) => copy.tee(file),
-            None => Box::new(file),
-        };
+        self.stored.insert(digest.clone(), object);
         self.last = Some(Opened {
             name: norm,
             size,
             digest,
-            measure,
-            copy,
+            copy: None,
+            verified: false,
         });
-        Ok(reader)
+        Ok(Box::new(file))
     }
 }
 

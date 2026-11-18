@@ -220,11 +220,14 @@ pub struct FetchReply {
     pub event: Option<FetchEvent>,
 }
 
-/// What an `Unpack` answers: the bytes of the blob read so far, or nothing in
-/// the last reply.
+/// What an `Unpack` answers: the bytes of the blob read so far, or files of
+/// the layer, or nothing in the last reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::Type)]
 pub struct UnpackReply {
     pub bytes: Option<u64>,
+    /// Complete files of the layer, each the position of a descriptor of the
+    /// reply
+    pub files: Option<Vec<u32>>,
 }
 
 /// What a call that returns nothing answers.
@@ -415,15 +418,17 @@ mod proxy {
             impl futures::Stream<Item = zlink::Result<(Result<ProbeReply, FetcherError>, Vec<OwnedFd>)>>,
         >;
 
-        /// Read the whole blob of `layer` and give its files, `toc.claim` and
-        /// `tarsplit` names in its staging.
-        #[zlink(more)]
+        /// Read the whole blob of `layer`, hand over its files and give
+        /// `toc.claim` and `tarsplit` names in its staging.
+        #[zlink(more, return_fds)]
         async fn unpack(
             &mut self,
             layer: String,
             urgency: Urgency,
         ) -> zlink::Result<
-            impl futures::Stream<Item = zlink::Result<Result<UnpackReply, FetcherError>>>,
+            impl futures::Stream<
+                Item = zlink::Result<(Result<UnpackReply, FetcherError>, Vec<OwnedFd>)>,
+            >,
         >;
 
         /// Bring files of `layer` into its staging directory.

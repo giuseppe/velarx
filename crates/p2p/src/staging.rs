@@ -109,6 +109,10 @@ struct Files<'a> {
     /// came since it was looked at
     kept_in: Option<(std::sync::Arc<crate::staged::Staged>, Option<String>)>,
     kept: usize,
+    /// A layer unpacked whole: the files that are complete are handed over
+    /// to the engine, not named in the staging
+    handing: bool,
+    handed: Vec<File>,
 }
 
 impl<'a> Files<'a> {
@@ -125,7 +129,16 @@ impl<'a> Files<'a> {
             out,
             kept_in: None,
             kept: 0,
+            handing: false,
+            handed: Vec::new(),
         }
+    }
+
+    /// The files it makes are handed over to the engine (a layer unpacked
+    /// whole), each as a file with no name.
+    fn handing(mut self) -> Self {
+        self.handing = true;
+        self
     }
 
     /// The same, giving the files it names to the peers through `staged`.
@@ -161,7 +174,14 @@ impl Files<'_> {
             if f.left == 0 {
                 f.done = true;
                 let file = f.file.take().expect("begun");
-                let (made, kept) = file.finish_kept(self.staging.as_fd(), &f.name, self.verity)?;
+                let (made, kept) = match self.handing {
+                    true => {
+                        let kept = file.sealed(&f.name, self.verity)?;
+                        self.handed.push(velarx_sys::fd::reopen_read_only(&kept)?);
+                        (true, kept)
+                    }
+                    false => file.finish_kept(self.staging.as_fd(), &f.name, self.verity)?,
+                };
                 // (a file that was there already is not this copy: it is not
                 // kept)
                 if let (Some((staged, layer)), true, false) =
@@ -232,6 +252,28 @@ impl Sink for Files<'_> {
                     objects,
                     ..Event::of(EventKind::Staged)
                 })
+                .await
+                .map_err(|_| "the asker is gone".to_string())?;
+        }
+        while !self.handed.is_empty() {
+            let files: Vec<std::os::fd::OwnedFd> = self
+                .handed
+                .drain(
+                    ..self
+                        .handed
+                        .len()
+                        .min(velarx_content::fetcher::fetch::MAX_FDS),
+                )
+                .map(Into::into)
+                .collect();
+            self.out
+                .send_with(
+                    Event {
+                        objects: (0..files.len() as u32).collect(),
+                        ..Event::of(EventKind::Staged)
+                    },
+                    files,
+                )
                 .await
                 .map_err(|_| "the asker is gone".to_string())?;
         }
@@ -388,8 +430,9 @@ impl PeerSource {
         let (toc, tarsplit) = velarx_content::pull::index::decode(&index, cap).map_err(failed)?;
         // each file once, by the digest of its content (what the engine
         // knows it by), asked of the peers by the digest they serve it by
-        let mut files =
-            Files::new(&layer.staging, scope.verity, out).keeping(&self.staged, &layer.layer);
+        let mut files = Files::new(&layer.staging, scope.verity, out)
+            .keeping(&self.staged, &layer.layer)
+            .handing();
         let mut seen = std::collections::HashSet::new();
         let mut total = 0u64;
         for e in &toc.entries {

@@ -12,9 +12,10 @@
 //! commit links them; the staging of a layer a lazy pull staged
 //! (`meta/<stem>/layer.json`) is never removed by an eager pull or the sweep.
 
+use super::chunked::Intake;
 use super::sink::Sink;
 use crate::fetcher::fetch::{Blob, EventKind, FetchEvent, Probed, Reuse, TocSource, Urgency};
-use crate::fetcher::fetch_client::{CallError, FetchConn, Scoping};
+use crate::fetcher::fetch_client::{CallError, FetchConn, Scoping, Unpacking};
 use crate::stager::staged_rel;
 use rustix::fs::{FlockOperation, Mode, OFlags, ResolveFlags};
 use std::collections::HashMap;
@@ -976,19 +977,20 @@ impl StagedFetch {
         Ok(())
     }
 
-    /// Bring the whole of `layer`, which has no table of contents, into its
-    /// staging `staging`: the list walked until a fetcher unpacked it
-    /// (`indexed`), only the registry fetcher when `registry_only`; then the
-    /// table of contents it claims and the tar-split are read.  The files
-    /// stay in the staging, by their key, for the caller to read.  Nothing
-    /// of it is believed: the caller recreates the stream from the tar-split
-    /// and the files and checks it.
+    /// Bring the whole of `layer`, which has no table of contents: the list
+    /// walked until a fetcher unpacked it (`indexed`), only the registry
+    /// fetcher when `registry_only`; the files it hands over go to `intake`
+    /// as they come, and the table of contents it claims and the tar-split
+    /// are read from the staging `staging` at the end.  Nothing of it is
+    /// believed: the caller recreates the stream from the tar-split and the
+    /// files and checks it.
     pub async fn fetch_whole(
         &self,
         staging: &LayerStaging,
         layer: &OciDescriptor,
         registry_only: bool,
         progress: &(dyn Fn(u64) + Send + Sync),
+        intake: &Intake,
     ) -> ImageResult<Whole> {
         use crate::fetcher::fetch::{TARSPLIT, TOC_CLAIM};
         let name = layer.digest.to_string();
@@ -1016,13 +1018,26 @@ impl StagedFetch {
                 let mut replies =
                     crate::idle::within(fetcher.idle, conn.unpack(&name, Urgency::Wait)).await?;
                 loop {
-                    match crate::idle::within(fetcher.idle, replies.bytes()).await {
+                    match crate::idle::within(fetcher.idle, replies.unpacking()).await {
                         // (cumulative bytes of the blob; a beat repeats
                         // what was said or says none)
-                        Ok(Some(said)) => {
+                        Ok(Some(Unpacking::Bytes(said))) => {
                             theirs = theirs.max(said);
                             bytes = bytes.max(said);
                             progress(bytes);
+                        }
+                        Ok(Some(Unpacking::Files(files))) => {
+                            // (a file that cannot be taken in is the
+                            // engine's failure, not the fetcher's)
+                            for file in files {
+                                if let Err(e) = intake.give(file).await {
+                                    fatal.get_or_insert(e.into());
+                                    break;
+                                }
+                            }
+                            if fatal.is_some() {
+                                break;
+                            }
                         }
                         // (the last reply: the names are given)
                         Ok(None) => {
@@ -1519,12 +1534,6 @@ impl LayerStaging {
     /// The staging directory of the layer.
     pub fn dir(&self) -> &File {
         &self.dir
-    }
-
-    /// The staged file of `key`, opened beneath the staging as a plain file
-    /// of it.
-    pub fn open(&self, key: &str) -> ImageResult<File> {
-        open_staged(&self.dir, key)
     }
 }
 
@@ -2530,5 +2539,166 @@ mod tests {
             .unwrap();
         let peers = walked.sources.iter().find(|s| s.name == "peers").unwrap();
         assert_eq!((peers.bytes, peers.files), (0, 0), "{walked:?}");
+    }
+
+    /// A file in memory that holds `bytes`.
+    fn in_memory(bytes: &[u8]) -> OwnedFd {
+        use std::io::Write;
+        let fd = rustix::fs::memfd_create(
+            "file",
+            rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+        )
+        .unwrap();
+        File::from(fd.try_clone().unwrap())
+            .write_all(bytes)
+            .unwrap();
+        fd
+    }
+
+    /// A fetcher that unpacks a layer of an empty table of contents and hands
+    /// over the descriptors `give` makes, and says that the descriptors of
+    /// its message are the positions `at`.
+    struct Hands {
+        give: fn() -> Vec<OwnedFd>,
+        at: Vec<u32>,
+    }
+
+    #[async_trait]
+    impl StagingFetcher for Hands {
+        fn described(&self) -> Described {
+            Described {
+                name: "hands".into(),
+                capabilities: vec!["objects".into(), "metadata".into(), "unpack".into()],
+                max_objects: 8,
+            }
+        }
+
+        async fn unpack(
+            &self,
+            _scope: &Scope,
+            layer: &crate::serve_fetch::LayerScope,
+            _call: crate::serve_fetch::UnpackCall,
+            out: &Out<Event>,
+        ) -> Result<(), FetcherError> {
+            let event = Event {
+                objects: self.at.clone(),
+                ..Event::of(EventKind::Staged)
+            };
+            out.send_with(event, (self.give)())
+                .await
+                .map_err(|_| FetcherError::failed("gone"))?;
+            let toc = Toc {
+                version: 1,
+                entries: Vec::new(),
+                tar_split_digest: None,
+            };
+            crate::unpack::put_claim(&layer.staging, &toc, b"split")
+                .map_err(|e| FetcherError::failed(e.to_string()))
+        }
+    }
+
+    /// An intake into the session of a new store, of the layer of
+    /// [`layer_and_toc`], and its staging.
+    async fn intake_of(
+        staged: &StagedFetch,
+        root: &Path,
+    ) -> (Intake, Arc<LayerStaging>, OciDescriptor) {
+        let store = Arc::new(velarx_storage::FileStore::new(root.join("files")).unwrap());
+        let session = crate::pull::session::Session::create(&root.join("session"), store).unwrap();
+        let intake = Intake::new(session, velarx_types::digest::Algorithm::Sha256, 2);
+        let (desc, _) = layer_and_toc();
+        let staging = staged
+            .open_layer_as(velarx_types::LayerKey::Whole(desc.digest))
+            .await
+            .unwrap();
+        (intake, staging, desc)
+    }
+
+    /// The files an unpack hands over in its replies are taken in by the
+    /// intake, each known by the digest of its content, and the claim is read
+    /// from the staging once the last reply says the names are given.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_files_an_unpack_hands_over_are_taken_in() {
+        let root = tempfile::tempdir().unwrap();
+        let hands = Hands {
+            give: || vec![in_memory(b"one"), in_memory(b"two")],
+            at: vec![0, 1],
+        };
+        let (staged, _keep) = walk_of(vec![], Arc::new(hands), root.path()).await;
+        let (intake, staging, desc) = intake_of(&staged, root.path()).await;
+        let whole = staged
+            .fetch_whole(&staging, &desc, true, &|_| {}, &intake)
+            .await
+            .unwrap();
+        assert_eq!(whole.tarsplit, b"split");
+        let taken = intake.finish().await.unwrap();
+        let mut keys: Vec<_> = taken.keys().cloned().collect();
+        keys.sort();
+        let mut want: Vec<_> = [&b"one"[..], b"two"]
+            .iter()
+            .map(|b| Digest::of(velarx_types::digest::Algorithm::Sha256, b).to_string())
+            .collect();
+        want.sort();
+        assert_eq!(keys, want);
+    }
+
+    /// A reply that names a descriptor it does not carry is a fetcher that
+    /// broke the protocol: the layer is not unpacked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reply_that_names_a_descriptor_it_lacks_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let hands = Hands {
+            give: || vec![in_memory(b"one")],
+            at: vec![0, 1],
+        };
+        let (staged, _keep) = walk_of(vec![], Arc::new(hands), root.path()).await;
+        let (intake, staging, desc) = intake_of(&staged, root.path()).await;
+        let e = staged
+            .fetch_whole(&staging, &desc, true, &|_| {}, &intake)
+            .await
+            .err()
+            .expect("a refusal");
+        assert!(e.to_string().contains("descriptor"), "{e}");
+    }
+
+    /// A descriptor that is not a regular file open for reading (a pipe, whose
+    /// read would wait forever, a descriptor of `O_PATH`, a write-only one) is
+    /// a fetcher that broke the protocol: nothing of it is read, and the layer
+    /// is not unpacked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_descriptor_that_is_not_a_readable_regular_file_is_refused() {
+        let pipe: fn() -> Vec<OwnedFd> = || {
+            let (read, write) = rustix::pipe::pipe().unwrap();
+            // (the end that writes stays open: a read would wait)
+            std::mem::forget(write);
+            vec![read]
+        };
+        let path: fn() -> Vec<OwnedFd> = || {
+            let fd = in_memory(b"one");
+            let proc = velarx_sys::fd::proc_path(&fd);
+            vec![rustix::fs::open(&proc, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).unwrap()]
+        };
+        let write_only: fn() -> Vec<OwnedFd> = || {
+            let fd = in_memory(b"one");
+            let proc = velarx_sys::fd::proc_path(&fd);
+            vec![rustix::fs::open(&proc, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty()).unwrap()]
+        };
+        for give in [pipe, path, write_only] {
+            let root = tempfile::tempdir().unwrap();
+            let hands = Hands { give, at: vec![0] };
+            let (staged, _keep) = walk_of(vec![], Arc::new(hands), root.path()).await;
+            let (intake, staging, desc) = intake_of(&staged, root.path()).await;
+            let e = staged
+                .fetch_whole(&staging, &desc, true, &|_| {}, &intake)
+                .await
+                .err()
+                .expect("a refusal");
+            assert!(
+                e.to_string()
+                    .contains("not a regular file open for reading"),
+                "{e}"
+            );
+            assert!(intake.finish().await.unwrap().is_empty());
+        }
     }
 }

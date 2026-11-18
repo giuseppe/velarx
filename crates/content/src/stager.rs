@@ -147,6 +147,27 @@ impl Unnamed {
         })
     }
 
+    /// A file for a file of `size` bytes that is handed over to the engine
+    /// ([`Unnamed::sealed`] and no name): one that is small and needs no
+    /// fs-verity is written in memory, which costs no inode of the file
+    /// system (a layer has tens of thousands of them, and the engine reads
+    /// each once).
+    pub fn for_handover(staging: BorrowedFd<'_>, size: u64, verity: bool) -> io::Result<Self> {
+        if verity || size > IN_MEMORY {
+            return Self::begin(staging, size);
+        }
+        // (the flags the filter of the fetchers allows)
+        let fd = rustix::fs::memfd_create(
+            "file",
+            rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+        )?;
+        Ok(Self {
+            file: File::from(fd),
+            size,
+            content: None,
+        })
+    }
+
     /// The table gives the digest of the content too (besides the fs-verity
     /// digest the file is named by): the file must have it.  Hashed as the
     /// chunks come in order; read again at the end where they did not.
@@ -212,11 +233,24 @@ impl Unnamed {
 
     /// [`Self::finish`], and the file as it was named, read-only.
     pub fn finish_kept(
-        mut self,
+        self,
         staging: BorrowedFd<'_>,
         name: &Name,
         verity: bool,
     ) -> Result<(bool, File), StageError> {
+        let ro = self.sealed(name, verity)?;
+        let hex = name.digest().hex();
+        let files = open_beneath(staging, "files", true)?;
+        let prefix = open_beneath(files.as_fd(), &hex[..2], true)?;
+        let made = link_new(&ro, prefix.as_fd(), &hex[2..])?;
+        Ok((made, ro))
+    }
+
+    /// The file is complete: fs-verity is enabled on it when `verity` (which
+    /// wants no writer: it is opened again read-only), and it is checked
+    /// against `name`.  It has no name: what takes it from here gives it one,
+    /// or reads it through the descriptor.
+    pub fn sealed(mut self, name: &Name, verity: bool) -> Result<File, StageError> {
         let alg = name.digest().alg();
         // (the length is made only where the writes left it short, a file
         // that ends in a hole: a `ftruncate` is a transaction of the file
@@ -229,36 +263,39 @@ impl Unnamed {
             let done = (!order.broken && order.next == self.size).then(|| order.hasher.finalize());
             (want, done)
         });
-        // closed for writing: fs-verity wants no writer, and nobody may
-        // change the file after the check
-        let ro = velarx_sys::fd::reopen_read_only(&self.file)?;
-        drop(self.file);
-        if verity {
-            let manager = FsVerityManager::new().for_algorithm(alg);
+        // (without fs-verity nothing is gained by a second descriptor of the
+        // file: whoever is given it copies what it reads)
+        let file = if verity {
+            let file = velarx_sys::fd::reopen_read_only(&self.file)?;
+            drop(self.file);
             // (the mode stays: no fetcher can change one)
-            manager
-                .enable_file_keeping_mode(&ro, &velarx_sys::fd::proc_path(&ro))
+            FsVerityManager::new()
+                .for_algorithm(alg)
+                .enable_file_keeping_mode(&file, &velarx_sys::fd::proc_path(&file))
                 .map_err(|e| StageError::Verity(e.to_string()))?;
-        }
+            file
+        } else {
+            self.file
+        };
         // the hash of the content made as it was written, else read again
         let content_of = |want: &Digest| -> Result<Digest, StageError> {
             match &hashed {
                 Some((_, Some(d))) if d.alg() == want.alg() => Ok(*d),
                 _ => {
-                    io::Seek::rewind(&mut &ro)?;
-                    Ok(Digest::of_reader(want.alg(), &ro)?)
+                    io::Seek::rewind(&mut &file)?;
+                    Ok(Digest::of_reader(want.alg(), &file)?)
                 }
             }
         };
         match name {
             Name::Verity(want) => {
                 let measured = match verity {
-                    true => measure_file(&ro)
+                    true => measure_file(&file)
                         .map_err(|e| StageError::Verity(e.to_string()))?
                         .object()
                         .map(|o| o.to_string())
                         .ok_or_else(|| StageError::Verity("not the digest of an object".into()))?,
-                    false => velarx_storage::fsverity_digest_file(alg, &ro)?,
+                    false => velarx_storage::fsverity_digest_file(alg, &file)?,
                 };
                 if measured != want.to_string() {
                     return Err(StageError::Wrong(format!("the fs-verity digest {want}")));
@@ -275,22 +312,13 @@ impl Unnamed {
                 return Err(StageError::Wrong(format!("the content digest {want}")));
             }
         }
-        let hex = name.digest().hex();
-        let files = open_beneath(staging, "files", true)?;
-        let prefix = open_beneath(files.as_fd(), &hex[..2], true)?;
-        let made = link_new(&ro, prefix.as_fd(), &hex[2..])?;
-        Ok((made, ro))
+        Ok(file)
     }
 
     /// The file, written in order from its start ([`Unnamed::hashed`]), is
-    /// complete: named by the digest of what was written, as
-    /// [`Unnamed::finish`] names it.  Returns that digest and whether this
-    /// call made the name.
-    pub fn finish_written(
-        self,
-        staging: BorrowedFd<'_>,
-        verity: bool,
-    ) -> Result<(Digest, bool), StageError> {
+    /// complete: sealed ([`Unnamed::sealed`]) as the digest of what was
+    /// written.  Returns that digest and the file.
+    pub fn finish_written(self, verity: bool) -> Result<(Digest, File), StageError> {
         let digest = {
             let Some((None, order)) = &self.content else {
                 return Err(StageError::Wrong("a file written in order".into()));
@@ -301,10 +329,13 @@ impl Unnamed {
             }
             order.hasher.clone().finalize()
         };
-        let made = self.finish(staging, &Name::Content(digest), verity)?;
-        Ok((digest, made))
+        let file = self.sealed(&Name::Content(digest), verity)?;
+        Ok((digest, file))
     }
 }
+
+/// The most bytes of a file that is handed over in memory.
+const IN_MEMORY: u64 = 256 << 10;
 
 /// The size of the blocks of zeros left as holes.
 const HOLE: u64 = 4096;
@@ -550,28 +581,46 @@ mod tests {
     }
 
     #[test]
-    fn a_file_written_in_order_is_named_by_what_was_written() {
-        let (_tmp, dir) = staging();
+    fn a_file_written_in_order_is_known_by_what_was_written() {
         let data = b"some content, then zeros".to_vec();
         let mut bytes = data.clone();
         bytes.extend_from_slice(&[0u8; 8192]);
+        let (_tmp, dir) = staging();
         let file = Unnamed::begin(dir.as_fd(), bytes.len() as u64)
             .unwrap()
             .hashed(Algorithm::Sha256);
         file.write_chunk(0, &bytes[..10], None).unwrap();
         file.write_chunk(10, &bytes[10..], None).unwrap();
-        let (d, made) = file.finish_written(dir.as_fd(), false).unwrap();
-        assert!(made);
+        let (d, file) = file.finish_written(false).unwrap();
         assert_eq!(d, Digest::of(Algorithm::Sha256, &bytes));
-        let path = _tmp.path().join(rel(&d));
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        // (out of order: no name it could not prove)
+        let mut read = Vec::new();
+        io::Read::read_to_end(&mut &file, &mut read).unwrap();
+        assert_eq!(read, bytes);
+        // (it has no name: nothing is in the staging but the directory of
+        // the files with none)
+        assert_eq!(std::fs::read_dir(_tmp.path()).unwrap().count(), 1);
+        // (out of order: no digest it could not prove)
         let file = Unnamed::begin(dir.as_fd(), 4)
             .unwrap()
             .hashed(Algorithm::Sha256);
         file.write_chunk(2, b"cd", None).unwrap();
         file.write_chunk(0, b"ab", None).unwrap();
-        assert!(file.finish_written(dir.as_fd(), false).is_err());
+        assert!(file.finish_written(false).is_err());
+    }
+
+    #[test]
+    fn a_small_file_handed_over_is_in_memory_and_a_big_one_is_on_the_disk() {
+        let (tmp, dir) = staging();
+        for (size, on_disk) in [(IN_MEMORY, false), (IN_MEMORY + 1, true)] {
+            let file = Unnamed::for_handover(dir.as_fd(), size, false)
+                .unwrap()
+                .hashed(Algorithm::Sha256);
+            file.write_chunk(0, &vec![7u8; size as usize], None)
+                .unwrap();
+            let (_, file) = file.finish_written(false).unwrap();
+            assert_eq!(file.metadata().unwrap().len(), size);
+            assert_eq!(tmp.path().join("incoming").exists(), on_disk);
+        }
     }
 
     #[test]
