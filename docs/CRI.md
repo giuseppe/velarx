@@ -67,7 +67,17 @@ kubelet --container-runtime-endpoint unix:///run/velarx/cri.sock ...
   keyring = false`; a node with many pods can hit the key quota.
 
 `tests/cri/kubelet.sh` (`make cri-kubelet`) runs a standalone kubelet
-against `velarx-cri`.
+against `velarx-cri`.  `tests/cri/cluster.sh` (the `cluster` step of
+`make cri-tests`, the pinned binaries of `tests/cri/versions` are downloaded)
+runs a single-node cluster on it, as root: etcd, kube-apiserver,
+kube-controller-manager, kube-scheduler and a kubelet that registers its
+node, with the reference `bridge` and `host-local` CNI plugins.  It checks
+that a Deployment and pods reach Running with addresses of the bridge, the
+logs, `kubectl exec` (stdin, exit code), `attach -i` and `port-forward`,
+the cgroups and limits of a Guaranteed, a Burstable and a BestEffort pod
+(cgroupfs driver), that deleting them leaves no container, sandbox, cgroup,
+lease or interface, and that the kubelet's eviction manager evicts a pod
+under a memory pressure threshold.
 
 ## A single-node cluster: `contrib/velarx-kubeadm`
 

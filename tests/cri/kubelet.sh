@@ -100,6 +100,11 @@ in_namespace () {
         chcon -t container_file_t "$W/hostdir" || fail "cannot label the shared directory"
     fi
     mount --bind "$W/kubelet" /var/lib/kubelet || fail "cannot mount over /var/lib/kubelet"
+    # (the kubelet's log directories: the host's stay as they are)
+    for t in pods containers; do
+        [ -d "/var/log/$t" ] || { mkdir "/var/log/$t" && MADE_VARLOG="${MADE_VARLOG:-} /var/log/$t"; }
+        mkdir "$W/$t" && mount --bind "$W/$t" "/var/log/$t" || fail "cannot mount over /var/log/$t"
+    done
     cat > "$W/etc/config.toml" <<TOML
 storage.root = "$W/data"
 [engine]
@@ -246,8 +251,9 @@ cleanup () {
     # (mount points of mktemp's names: no white space)
     # shellcheck disable=SC2013
     for m in $(awk -v w="$W" 'index($2, w) == 1 { print $2 }' /proc/self/mounts | sort -r); do umount -l "$m" 2> /dev/null; done
-    mountpoint -q /var/lib/kubelet && umount -l /var/lib/kubelet
+    for m in /var/lib/kubelet /var/log/pods /var/log/containers; do mountpoint -q "$m" && umount -l "$m"; done
     [ "${MADE_VARLIB:-0}" = 1 ] && rmdir /var/lib/kubelet
+    for m in ${MADE_VARLOG:-}; do rmdir "$m"; done
     if [ "${KEEP:-0}" = 1 ] && [ -z "${KUBELET_LOGS:-}" ]; then
         echo "kept: $W" >&2
     else

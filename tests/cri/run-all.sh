@@ -10,6 +10,9 @@
 #   mirror    the images of critest, as they are, in the registry, the ones it lacks only
 #   critest   the CRI validation suite of cri-tools, as root (tests/cri/critest.sh)
 #   kubelet   a kubelet runs a static pod on velarx-cri, as root (tests/cri/kubelet.sh)
+#   cluster   etcd, kube-apiserver, controller-manager, scheduler and a kubelet with the CNI
+#             bridge plugin: Deployment, kubectl exec/attach/port-forward, QoS cgroups,
+#             eviction (tests/cri/cluster.sh)
 #
 # The CRI is run and tested as root, as Kubernetes does.  Running it twice gives the
 # same result and the second run redoes only what is needed: the build skips what is
@@ -26,7 +29,7 @@ set -u
 set -o pipefail
 
 TOP=$(cd "$(dirname "$0")/../.." && pwd)
-STEPS="prereq build unit bats mirror critest kubelet"
+STEPS="prereq build unit bats mirror critest kubelet cluster"
 CACHE=${VELARX_TEST_CACHE:-${XDG_CACHE_HOME:-${HOME:?}/.cache}/velarx-tests}
 LOGDIR=${CRI_TESTS_LOGS:-$CACHE/cri-tests-logs}
 REGISTRY=${REGISTRY:-localhost:5000}
@@ -65,6 +68,7 @@ the script is not run by root).  The steps, in this order:
   mirror   copy the images of critest into the registry, the ones it lacks only
   critest  critest (cri-tools), as root, in a private mount namespace
   kubelet  a kubelet runs a static pod on velarx-cri, as root
+  cluster  a single-node cluster (etcd, API server, controllers, kubelet, CNI) on velarx-cri, as root
 
 Options:
   --only STEP[,STEP...]  run only these steps (repeatable)
@@ -217,6 +221,7 @@ collect_needs () {
     needs mirror && need mirror skopeo curl
     needs critest && { need critest critest crictl crun unshare curl; need_root critest; }
     needs kubelet && { need kubelet crun crictl unshare sha256sum curl skopeo; need_root kubelet; }
+    needs cluster && { need cluster crun crictl unshare sha256sum curl skopeo openssl tar ip; need_root cluster; }
 }
 
 hint () { # TOOL: how to get it
@@ -375,6 +380,69 @@ step_kubelet () {
     # (kubelet.sh ends with 0 and SKIP: when something is missing)
 }
 
+# pinned_file URL SHA256 NAME: the file of URL in $RUN/NAME, as the pinned sha256 says; kept in
+# the cache by its hash (verified again on every use).  Returns 2 when there is no network.
+pinned_file () {
+    local url=$1 sum=$2 out=$RUN/$3 rc cached=$CACHE/pinned/$2
+    if [ -f "$cached" ]; then
+        cp "$cached" "$out" || return 1
+        [ "$(sha256_of "$out")" = "$sum" ] && return 0
+        rm -f "$cached" "$out"
+    fi
+    curl -fsSL --proto =https --proto-redir =https -m 600 -o "$out" "$url" 2> "$RUN/curl.err"
+    rc=$?
+    if [ "$rc" != 0 ]; then
+        rm -f "$out"
+        echo "cannot download $url ($(tail -n 1 "$RUN/curl.err"))" >&2
+        case $rc in 5 | 6 | 7 | 28 | 35 | 56) return 2 ;; esac
+        return 1
+    fi
+    if [ "$(sha256_of "$out")" != "$sum" ]; then
+        echo "the sha256 of $url is $(sha256_of "$out"), not the pinned $sum" >&2
+        rm -f "$out"
+        return 1
+    fi
+    mkdir -p "$CACHE/pinned" && cp "$out" "$cached.tmp" && mv -f "$cached.tmp" "$cached"
+    echo "downloaded $url (sha256 verified)" >&2
+}
+
+# the tools of the cluster step in $RUN/cluster-tools (and the CNI plugins in $RUN/cni): the
+# kubelet as kubelet_binary says, the rest of the pins of tests/cri/versions
+cluster_tools () {
+    local t=$RUN/cluster-tools rel=https://dl.k8s.io/release/v$KUBELET_VERSION/bin/linux/amd64 rc n var k
+    mkdir -p "$t" "$RUN/cni" "$RUN/etcd" || return 1
+    k=$(kubelet_binary)
+    rc=$?
+    [ "$rc" = 0 ] || return "$rc"
+    ln -sf "$k" "$t/kubelet"
+    for n in kube-apiserver kube-controller-manager kube-scheduler kubectl; do
+        var=$(echo "$n" | tr a-z- A-Z_)_SHA256
+        pinned_file "$rel/$n" "$(pin "$var")" "$n" || return $?
+        chmod 0755 "$RUN/$n" && mv "$RUN/$n" "$t/$n" || return 1
+    done
+    local v
+    v=$(pin ETCD_VERSION)
+    pinned_file "https://github.com/etcd-io/etcd/releases/download/v$v/etcd-v$v-linux-amd64.tar.gz" "$(pin ETCD_SHA256)" etcd.tar.gz || return $?
+    tar -xzf "$RUN/etcd.tar.gz" -C "$RUN/etcd" --strip-components=1 "etcd-v$v-linux-amd64/etcd" && ln -sf "$RUN/etcd/etcd" "$t/etcd" || return 1
+    v=$(pin CNI_PLUGINS_VERSION)
+    pinned_file "https://github.com/containernetworking/plugins/releases/download/v$v/cni-plugins-linux-amd64-v$v.tgz" "$(pin CNI_PLUGINS_SHA256)" cni.tgz || return $?
+    tar -xzf "$RUN/cni.tgz" -C "$RUN/cni" ./bridge ./host-local || return 1
+}
+
+step_cluster () {
+    have_binaries || exit 1
+    local rc
+    cluster_tools
+    rc=$?
+    [ "$rc" = 2 ] && skip_step "the tools of the cluster cannot be downloaded (no network): KUBELET=path does not give the others"
+    [ "$rc" = 0 ] || exit 1
+    ensure_image || exit 1
+    mkdir -p "$LOGDIR/cluster"
+    cd "$TOP" || exit 1
+    as_root env IMAGE="$CRI_IMAGE" REGISTRY_INSECURE="$REGISTRY" CLUSTER_LOGS="$LOGDIR/cluster" \
+        tests/cri/cluster.sh "$BINDIR" "$RUN/cluster-tools" "$RUN/cni" || exit 1
+}
+
 REG_STATE=       # existing, own, none
 registry_resolve () {
     [ -z "$REG_STATE" ] || return 0
@@ -453,7 +521,7 @@ run_step () {
         return 0
     fi
     case $s in
-    mirror | critest | kubelet | bats)
+    mirror | critest | kubelet | cluster | bats)
         registry_resolve
         if [ "$REG_STATE" = none ]; then
             report "$s" FAILED "no registry answers at $REGISTRY (start one, or --own-registry)"
@@ -474,7 +542,7 @@ run_step () {
         report "$s" skipped "$(cat "$RUN/skip")"
     elif [ "$rc" = 0 ]; then
         case $s in
-        kubelet)
+        kubelet | cluster)
             if grep -q '^SKIP:' "$log"; then report "$s" skipped "$(grep -m1 '^SKIP:' "$log" | sed 's/^SKIP: //')"
             elif grep -q '^PASS' "$log"; then report "$s" ok ""
             else report "$s" FAILED "no PASS in $log"; fi ;;
@@ -507,7 +575,7 @@ counts () {
 
 mkdir -p "$LOGDIR" || die "cannot make $LOGDIR"
 # this run replaces the logs of the last
-rm -rf "$LOGDIR/bats" "$LOGDIR/kubelet" "$LOGDIR/registry.log" "$LOGDIR/critest.out"
+rm -rf "$LOGDIR/bats" "$LOGDIR/kubelet" "$LOGDIR/cluster" "$LOGDIR/registry.log" "$LOGDIR/critest.out"
 for s in $STEPS; do rm -f "$LOGDIR/$s.log"; done
 
 collect_needs
@@ -526,11 +594,11 @@ if want prereq; then
 fi
 
 # root: the sudo password is asked here, in the foreground, not in a step
-if [ "$(id -u)" != 0 ] && { want bats || want critest || want kubelet; } && command -v sudo > /dev/null 2>&1; then
+if [ "$(id -u)" != 0 ] && { want bats || want critest || want kubelet || want cluster; } && command -v sudo > /dev/null 2>&1; then
     sudo -v || die "sudo is needed for the steps that run as root"
 fi
 
-for s in build unit bats mirror critest kubelet; do
+for s in build unit bats mirror critest kubelet cluster; do
     run_step "$s"
 done
 

@@ -12,3 +12,13 @@ REGISTRY_VERSION=3.0.0
 REGISTRY_SHA256=61c9a2c0d5981a78482025b6b69728521fbc78506d68b223d4a2eb825de5ca3d
 # the image of a registry started with podman (--own-registry): registry:2 (2.8.3) by digest
 REGISTRY_IMAGE=docker.io/library/registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+# the control plane and the CNI plugins of the cluster step (tests/cri/cluster.sh); the Kubernetes
+# binaries are the release of KUBELET_VERSION (dl.k8s.io), etcd and the plugins are GitHub releases
+KUBE_APISERVER_SHA256=de9b1b43c10143f448408b3aaf15f44fd5248b97a56301417a1fe2f1fc47a691
+KUBE_CONTROLLER_MANAGER_SHA256=acd67c8f8871d4594f307d2816bf11aa972f47617ee6e1f84b0ce92a091f7290
+KUBE_SCHEDULER_SHA256=8d10dfc64de70b1670cc1ce52701eb6a219c0905a95bdde608edc5432f9eca43
+KUBECTL_SHA256=65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8
+ETCD_VERSION=3.7.3
+ETCD_SHA256=5dfa9cc3b3ce3b4b491fbcc2057d3daa166bcc6676f743fcd20f8e5760cb9775
+CNI_PLUGINS_VERSION=1.10.0
+CNI_PLUGINS_SHA256=ce8603d6a1bd448efba5bd6dc44f38dce349f821aa57e1bb354b52628ebf1853
