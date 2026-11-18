@@ -174,10 +174,11 @@ pub enum ErofsSource {
     ProcPath,
 }
 
-/// The EROFS image `image`, mounted read only and detached.
-pub fn mount_erofs(image: &std::fs::File, source: ErofsSource) -> io::Result<OwnedFd> {
+/// The EROFS image `image`, mounted read only and detached; with `share`
+/// the mounts of the same image share one superblock (`erofs_of_file`).
+pub fn mount_erofs(image: &std::fs::File, source: ErofsSource, share: bool) -> io::Result<OwnedFd> {
     use rustix::mount::{fsmount, FsMountFlags, MountAttrFlags};
-    let erofs = erofs_of_file(image, source)?;
+    let erofs = erofs_of_file(image, source, share)?;
     fsmount(
         erofs.as_fd(),
         FsMountFlags::FSMOUNT_CLOEXEC,
@@ -188,13 +189,19 @@ pub fn mount_erofs(image: &std::fs::File, source: ErofsSource) -> io::Result<Own
 
 /// The EROFS file system of the open image `image`, not yet mounted, with
 /// the source given as `source` says.  A kernel that does not take it
-/// refuses the call ([`refuses_a_file`]).
+/// refuses the call ([`refuses_a_file`]).  With `share` (the feature
+/// `erofs-superblock-share`; a kernel without it refuses the option) the
+/// mounts of the same image with the same options are one superblock, which
+/// keeps the first open file (and its lock) until the last of them is
+/// unmounted.
 pub fn erofs_of_file(
     image: &std::fs::File,
     source: ErofsSource,
+    share: bool,
 ) -> io::Result<std::os::fd::OwnedFd> {
     use rustix::mount::{
-        fsconfig_create, fsconfig_set_fd, fsconfig_set_string, fsopen, FsOpenFlags,
+        fsconfig_create, fsconfig_set_fd, fsconfig_set_flag, fsconfig_set_string, fsopen,
+        FsOpenFlags,
     };
     let erofs =
         fsopen("erofs", FsOpenFlags::FSOPEN_CLOEXEC).map_err(|e| failed("fsopen(erofs)", e))?;
@@ -205,6 +212,10 @@ pub fn erofs_of_file(
         }
     }
     .map_err(|e| failed("fsconfig(source)", e))?;
+    if share {
+        fsconfig_set_flag(erofs.as_fd(), "superblock_share")
+            .map_err(|e| failed("fsconfig(superblock_share)", e))?;
+    }
     fsconfig_create(erofs.as_fd()).map_err(|e| failed("fsconfig_create(erofs)", e))?;
     Ok(erofs)
 }
@@ -548,7 +559,7 @@ mod tests {
             std::fs::hard_link(&image, dir.path().join("kept.erofs")).unwrap();
             let asker = std::fs::File::open(dir.path().join("kept.erofs")).unwrap();
             std::fs::rename(&other, &image).unwrap();
-            let erofs = match erofs_of_file(&file, ErofsSource::ProcPath) {
+            let erofs = match erofs_of_file(&file, ErofsSource::ProcPath, false) {
                 Ok(erofs) => erofs,
                 Err(e) if refuses_a_file(&e) => {
                     return eprintln!("skipped: no file-backed EROFS: {e}")
@@ -588,7 +599,7 @@ mod tests {
             let file = velarx_fuse::composefs::open_layer_image(&image).unwrap();
             std::fs::hard_link(&image, dir.path().join("kept.erofs")).unwrap();
             let asker = std::fs::File::open(dir.path().join("kept.erofs")).unwrap();
-            let erofs = match erofs_of_file(&file, ErofsSource::Descriptor) {
+            let erofs = match erofs_of_file(&file, ErofsSource::Descriptor, false) {
                 Ok(erofs) => erofs,
                 Err(e) => {
                     assert!(refuses_a_file(&e), "{e}");
@@ -604,6 +615,44 @@ mod tests {
                 Err(rustix::io::Errno::WOULDBLOCK)
             );
             drop(root);
+            assert_eq!(exclusive_lock_of(&asker), Ok(()));
+        });
+    }
+
+    /// Two mounts of one image with `superblock_share` are one superblock (one
+    /// device), which keeps the lock of the image taken by the first open until
+    /// the last of them is gone; a kernel without the option refuses it.
+    /// (in a process of its own, as the tests of the lock)
+    #[test]
+    fn mounts_of_one_image_share_a_superblock_or_the_kernel_refuses() {
+        velarx_base::testing::in_child(|| {
+            let Some((dir, image)) = image_with_a_file() else {
+                return;
+            };
+            std::fs::hard_link(&image, dir.path().join("kept.erofs")).unwrap();
+            let asker = std::fs::File::open(dir.path().join("kept.erofs")).unwrap();
+            let file = velarx_fuse::composefs::open_layer_image(&image).unwrap();
+            let other = velarx_fuse::composefs::open_layer_image(&image).unwrap();
+            let first = match mount_erofs(&file, ErofsSource::Descriptor, true) {
+                Ok(first) => first,
+                Err(e) if refuses_a_file(&e) => {
+                    return eprintln!("skipped: no superblock_share or no descriptor source: {e}")
+                }
+                Err(e) => panic!("{e}"),
+            };
+            let second = mount_erofs(&other, ErofsSource::Descriptor, true).unwrap();
+            assert_eq!(
+                rustix::fs::fstat(&first).unwrap().st_dev,
+                rustix::fs::fstat(&second).unwrap().st_dev
+            );
+            drop((file, other));
+            drop(first);
+            assert_eq!(read_f(&second), "contents");
+            assert_eq!(
+                exclusive_lock_of(&asker),
+                Err(rustix::io::Errno::WOULDBLOCK)
+            );
+            drop(second);
             assert_eq!(exclusive_lock_of(&asker), Ok(()));
         });
     }

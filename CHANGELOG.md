@@ -13,6 +13,10 @@ without the numbers of issues or pull requests of any tracker.
 
 ### Added
 
+- Containers of one image share the in-memory file system of its layers
+  where the kernel has the EROFS mount option `superblock_share` (Linux
+  7.4): a second container adds no inodes or memory for the files the first
+  has read.  The layer stays in use until the last of them is gone.
 - The overlay network of the containers is a process of its own, `velarx-p2p
   overlay` (`velarx-p2p-overlay.service`, which replaces the drop-in of
   `velarx-p2p.service`), a node of a swarm of its own: the swarm key or

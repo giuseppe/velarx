@@ -93,6 +93,10 @@ pub struct ComposefsOptions {
     /// of its descriptor and no lock is held: only the rows of the container
     /// (`container_layers`) keep the layer of the mount.
     pub kernel_lock: bool,
+    /// Whether the mounts of the same image share one superblock
+    /// (`shared_superblock`): the kernel mounts get the option
+    /// `superblock_share`.
+    pub superblock_share: bool,
     /// What the manifests must say of the EROFS images of their layers.
     pub digests: ComposefsDigests,
     /// The image server that serves the layers the kernel does not mount
@@ -140,6 +144,7 @@ impl ComposefsOptions {
             enabled: Err("not configured".into()),
             kernel_mount: Err("not configured".into()),
             kernel_lock: false,
+            superblock_share: false,
             digests: ComposefsDigests::default(),
             server,
         }
@@ -155,7 +160,7 @@ impl ComposefsOptions {
         let native = enabled
             .clone()
             .and_then(|()| native_availability(&server.run_root, images));
-        let kernel_lock = native == Ok(true);
+        let (kernel_lock, superblock_share) = native.clone().unwrap_or_default();
         let kernel_mount = native.map(drop);
         match (&enabled, &kernel_mount) {
             (Ok(()), Ok(())) => {
@@ -174,6 +179,7 @@ impl ComposefsOptions {
             enabled,
             kernel_mount,
             kernel_lock,
+            superblock_share,
             ..Self::new(server)
         }
     }
@@ -199,14 +205,20 @@ const FILE_BACKED_EROFS: &str = "erofs-file";
 /// file at all.
 const LOCKED_EROFS: &str = "erofs-lock";
 
+/// The feature of the run root that says whether two mounts of the same EROFS
+/// image with the option `superblock_share` are one superblock.  It is looked
+/// for only where the kernel mounts from a file at all.
+const SUPERBLOCK_SHARE: &str = "erofs-superblock-share";
+
 /// Whether the kernel mounts them: this process is root of the initial user
 /// namespace (an unprivileged user cannot mount EROFS images, or an overlay
 /// with data-only layers), knows EROFS, and mounts an image from a regular
 /// file without a block device (`file_backed_erofs`).  The answer says
 /// whether the mount holds the lock of the image (`locked_erofs`): the
 /// collection finds the layers the kernel has mounted by that lock, and does
-/// not find those of a kernel that holds none.
-fn native_availability(run_root: &Path, images: &Path) -> Result<bool, String> {
+/// not find those of a kernel that holds none.  The second answer says whether
+/// the mounts of one image share their superblock (`shared_superblock`).
+fn native_availability(run_root: &Path, images: &Path) -> Result<(bool, bool), String> {
     if !velarx_base::ids::rootful().map_err(|e| e.to_string())? {
         return Err("not root of the initial user namespace".into());
     }
@@ -220,7 +232,9 @@ fn native_availability(run_root: &Path, images: &Path) -> Result<bool, String> {
         images.display()
     );
     file_backed(run_root, &key, || file_backed_erofs(images))?;
-    locked(run_root, &key, || locked_erofs(images))
+    let lock = locked(run_root, &key, || locked_erofs(images))?;
+    let share = shared_superblock(run_root, &key, || shares_superblock(images))?;
+    Ok((lock, share))
 }
 
 /// The answer of the feature `erofs-file` of the run root (`probe` finds it
@@ -256,6 +270,23 @@ fn locked(
         Ok(answer) => Ok(answer == Some(true)),
         Err(e) => Err(format!(
             "cannot find out whether the kernel mounts an EROFS image from an open file: {e}"
+        )),
+    }
+}
+
+/// The answer of the feature `erofs-superblock-share` of the run root (asked
+/// where the kernel mounts from a file): whether the option is known and the
+/// mounts of one image are one superblock.  No is not an error, each mount has
+/// its own; an answer that cannot be found out is.
+fn shared_superblock(
+    run_root: &Path,
+    key: &str,
+    probe: impl FnOnce() -> std::io::Result<Option<bool>>,
+) -> Result<bool, String> {
+    match velarx_runtime::monitor::features::cached(run_root, SUPERBLOCK_SHARE, key, probe) {
+        Ok(answer) => Ok(answer == Some(true)),
+        Err(e) => Err(format!(
+            "cannot find out whether the kernel shares the superblock of EROFS mounts: {e}"
         )),
     }
 }
@@ -299,6 +330,7 @@ fn file_backed_erofs(images: &Path) -> std::io::Result<Option<bool>> {
             velarx_runtime::imagemount::mount_erofs(
                 &probe,
                 velarx_runtime::imagemount::ErofsSource::ProcPath,
+                false,
             )
             .map(drop),
         )
@@ -329,6 +361,7 @@ fn locked_erofs(images: &Path) -> std::io::Result<Option<bool>> {
         let mounted = velarx_runtime::imagemount::mount_erofs(
             &probe,
             velarx_runtime::imagemount::ErofsSource::Descriptor,
+            false,
         );
         drop(probe);
         // (the mount is alive while the lock is asked)
@@ -339,6 +372,39 @@ fn locked_erofs(images: &Path) -> std::io::Result<Option<bool>> {
             ))
         }))
     })
+}
+
+/// Whether the kernel shares the superblock of two mounts of an image with
+/// `superblock_share`: the empty image is mounted twice, detached, and the
+/// roots of the mounts are one device.
+///
+/// (The probes of `erofs-file` and `erofs-lock` mount without the option: they
+/// ask what the kernel does with a file, before the option is looked for.)
+fn shares_superblock(images: &Path) -> std::io::Result<Option<bool>> {
+    on_probe_image(images, |_, probe| {
+        use velarx_runtime::imagemount::{mount_erofs, ErofsSource};
+        let first = mount_erofs(&probe, ErofsSource::ProcPath, true);
+        let second = mount_erofs(&probe, ErofsSource::ProcPath, true);
+        shared_answer(first.and_then(|first| {
+            let second = second?;
+            Ok(rustix::fs::fstat(first)?.st_dev == rustix::fs::fstat(second)?.st_dev)
+        }))
+    })
+}
+
+/// What the mounts of the image of the probe say: yes where both are mounted
+/// and are one device, no where they are two or the kernel refuses the option
+/// (`EINVAL`, an unknown parameter), an error for a failure that says nothing
+/// of the kernel.
+fn shared_answer(mounted: std::io::Result<bool>) -> std::io::Result<Option<bool>> {
+    match mounted {
+        Ok(shared) => Ok(Some(shared)),
+        Err(e) if velarx_runtime::imagemount::refuses_a_file(&e) => {
+            debug!("composefs: the kernel does not share the superblock of EROFS mounts: {e}");
+            Ok(Some(false))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// What the mount of the image of the probe says: yes where it is mounted
@@ -1515,7 +1581,7 @@ impl ComposefsDriver {
         };
         let metas = images
             .iter()
-            .map(|image| mount_erofs(image, source))
+            .map(|image| mount_erofs(image, source, self.options.superblock_share))
             .collect::<std::io::Result<Vec<_>>>()?;
         let data = std::iter::once(&m.objects)
             .chain(&m.more_objects)
@@ -2684,6 +2750,9 @@ mod tests {
         assert_eq!(locked_answer(Ok(true)).unwrap(), Some(true));
         assert_eq!(locked_answer(Ok(false)).unwrap(), Some(false));
         assert!(locked_answer(Err(std::io::Error::other("x"))).is_err());
+        assert_eq!(shared_answer(Ok(true)).unwrap(), Some(true));
+        assert_eq!(shared_answer(Ok(false)).unwrap(), Some(false));
+        assert!(shared_answer(Err(std::io::Error::other("x"))).is_err());
     }
 
     /// The answers are the features `erofs-file` and `erofs-lock` of the run
@@ -2732,12 +2801,31 @@ mod tests {
         assert!(!features.join("erofs-lock-yes").exists());
         assert_eq!(locked(run, "boot1 /other", probe(Some(true))), Ok(false));
         assert_eq!(asked.get(), 2, "kept");
+        // the sharing of the superblock is a feature of its own, no is not an error
+        asked.set(0);
+        assert_eq!(
+            shared_superblock(run, "boot1 /s", probe(Some(true))),
+            Ok(true)
+        );
+        assert!(features.join("erofs-superblock-share-yes").is_file());
+        assert_eq!(
+            shared_superblock(run, "boot1 /s", probe(Some(false))),
+            Ok(true)
+        );
+        assert_eq!(asked.get(), 1, "kept");
+        assert_eq!(
+            shared_superblock(run, "boot1 /other", probe(Some(false))),
+            Ok(false)
+        );
+        assert!(features.join("erofs-superblock-share-no").is_file());
+        assert!(!features.join("erofs-superblock-share-yes").exists());
         // a failure that says nothing is not kept, and says why
         std::fs::remove_dir_all(&features).unwrap();
         let failing = || Err(std::io::Error::other("no memory"));
         for e in [
             file_backed(run, "boot1 /s", failing).unwrap_err(),
             locked(run, "boot1 /s", failing).unwrap_err(),
+            shared_superblock(run, "boot1 /s", failing).unwrap_err(),
         ] {
             assert!(
                 e.contains("cannot find out") && e.contains("no memory"),
@@ -2748,6 +2836,7 @@ mod tests {
         // (an answer of the kernel to the image is of the file system it is on)
         assert_eq!(file_backed(run, "boot1 /s", probe(None)), Ok(()));
         assert_eq!(locked(run, "boot1 /s", probe(None)), Ok(false));
+        assert_eq!(shared_superblock(run, "boot1 /s", probe(None)), Ok(false));
         assert!(!features.exists(), "no answer, nothing kept");
     }
 
@@ -2763,6 +2852,7 @@ mod tests {
         let objects = tmp.path().join("objects");
         let file = file_backed_erofs(&objects);
         let lock = locked_erofs(&objects);
+        let share = shares_superblock(&objects);
         let left: Vec<_> = std::fs::read_dir(cfs::images_dir(&objects))
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -2772,18 +2862,19 @@ mod tests {
             return eprintln!("skipped: only root mounts an EROFS image: {file:?} {lock:?}");
         }
         eprintln!(
-            "the kernel mounts an EROFS image from a file: {file:?}, keeps its lock: {lock:?}"
+            "the kernel mounts an EROFS image from a file: {file:?}, keeps its lock: {lock:?}, shares the superblock: {share:?}"
         );
+        assert!(share.unwrap().is_some());
         assert_eq!(file.unwrap(), Some(true));
         assert!(lock.unwrap().is_some());
     }
 
-    /// The kernel reads no EROFS image from a file of a tmpfs (it has no
-    /// page cache reads of its own to give): the probe of a store there
-    /// answers no, not an error, and leaves nothing.  As root, where
-    /// `/dev/shm` is a tmpfs.
+    /// The probe of a store on a tmpfs gets an answer of the kernel, not an
+    /// error, and leaves nothing: no from a kernel that reads the image only
+    /// through `read_folio`, which a tmpfs has not, yes from a newer one
+    /// (Linux 7.4 mounts it).  As root, where `/dev/shm` is a tmpfs.
     #[test]
-    fn the_probe_of_a_store_on_tmpfs_answers_no() {
+    fn the_probe_of_a_store_on_tmpfs_answers() {
         let shm = Path::new("/dev/shm");
         let on_tmpfs = rustix::fs::statfs(shm).is_ok_and(|s| s.f_type == libc::TMPFS_MAGIC);
         if !velarx_base::ids::rootful().unwrap_or(false) || !on_tmpfs {
@@ -2793,7 +2884,7 @@ mod tests {
         let objects = tmp.path().join("objects");
         let answer = file_backed_erofs(&objects);
         eprintln!("a store on tmpfs: {answer:?}");
-        assert_eq!(answer.unwrap(), Some(false));
+        assert!(answer.unwrap().is_some());
         assert_eq!(
             std::fs::read_dir(cfs::images_dir(&objects))
                 .unwrap()

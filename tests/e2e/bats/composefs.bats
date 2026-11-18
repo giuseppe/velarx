@@ -96,7 +96,7 @@ teardown () {
     local c
     [ -d "$MNT/store/composefs.away" ] && mv "$MNT/store/composefs.away" "$MNT/store/composefs"
     if [ -n "${SOCK:-}" ] && [ -S "$SOCK" ]; then
-        for c in c1 ci ciu cu ce cm c2 c3 c4 pm; do sh_ container rm -t 0 -f "$c" > /dev/null 2>&1; done
+        for c in c1 ci ciu cu cu2 ce cm c2 c3 c4 pm; do sh_ container rm -t 0 -f "$c" > /dev/null 2>&1; done
         sh_ image rm -f localhost/e2e-cfs-commit:1 localhost/e2e-cfs-deep:1 > /dev/null 2>&1
     fi
     return 0
@@ -246,6 +246,21 @@ teardown_file () {
     sh_ container exec cu sh -c 'echo w > /etc/written && cat /etc/written' > /dev/null 2>&1
     check "and writes in its upper layer" 0 $?
     sh_ container rm -t 0 -f cu > /dev/null
+}
+
+# (where the kernel shares the superblock of the mounts of an image, each mount
+# has its own mapping all the same)
+@test "two containers with a user namespace each: their own mappings on the layers of one image" {
+    need_daemon
+    sh_ container run -d --name cu --userns auto --network none "$IMAGE" sleep 300 > /dev/null 2>&1
+    check "the first runs" 0 $?
+    sh_ container run -d --name cu2 --userns auto --network none "$IMAGE" sleep 300 > /dev/null 2>&1
+    check "the second runs" 0 $?
+    check "the first sees its root as the owner" "0 0" "$(sh_ container exec cu stat -c '%u %g' /etc/alpine-release 2>&1)"
+    check "the second too" "0 0" "$(sh_ container exec cu2 stat -c '%u %g' /etc/alpine-release 2>&1)"
+    sh_ container rm -t 0 -f cu > /dev/null
+    check "the second after the first is gone" "0 0" "$(sh_ container exec cu2 stat -c '%u %g' /etc/alpine-release 2>&1)"
+    sh_ container rm -t 0 -f cu2 > /dev/null
 }
 
 @test "changes of a container on composefs" {
@@ -498,6 +513,47 @@ PY
     start_daemon on || { echo "the daemon does not start"; cat "$WORKDIR/on.log"; exit 1; }
     sh_ container rm -t 0 -f c1 > /dev/null
     check "not after" unused "$(image_unused "$img")"
+}
+
+# The number of EROFS inodes the kernel has in memory: one tree of an image
+# per superblock.
+erofs_inodes () {
+    awk '$1 == "erofs_inode" { print $2 }' /proc/slabinfo
+}
+# the files of the container read, so that the kernel has their inodes
+read_tree () { # container
+    sh_ container exec "$1" sh -c 'find /bin /etc /lib /sbin /usr -type f | xargs cat > /dev/null 2>&1; true'
+}
+
+# Two containers of one image mount its layers with the option
+# superblock_share where the kernel has it (the feature
+# erofs-superblock-share, found out like the others): one superblock for both,
+# whose lock stays until the last of them is gone.  Without it each has its own.
+@test "containers of one image share the superblock of its layers where the kernel does" {
+    start_daemon on || { echo "the daemon does not start"; cat "$WORKDIR/on.log"; exit 1; }
+    sh_ image pull --tls-verify=false "$IMAGE" > /dev/null 2>&1 || e2e_die "pull"
+    local img shared=no before first second
+    img=$(ls "$MNT"/store/composefs/layer-*.erofs | head -1)
+    [ -f "$WORKDIR/state/features/erofs-superblock-share-yes" ] && shared=yes
+    check "the answer is kept with the boot and the images" "$(cat /proc/sys/kernel/random/boot_id) $MNT/store/objects" "$(cat "$WORKDIR"/state/features/erofs-superblock-share-* | head -1)"
+    sh_ container run -d --name c1 --network none "$IMAGE" sleep 300 > /dev/null || e2e_die "run c1"
+    sh_ container run -d --name c2 --network none "$IMAGE" sleep 300 > /dev/null || e2e_die "run c2"
+    before=$(erofs_inodes)
+    read_tree c1
+    first=$(( $(erofs_inodes) - before ))
+    read_tree c2
+    second=$(( $(erofs_inodes) - before - first ))
+    if [ "$shared" = yes ]; then
+        check "the second container adds few inodes" 1 "$([ "$second" -lt $((first / 4)) ] && echo 1 || echo 0)"
+        sh_ container rm -t 0 -f c1 > /dev/null
+        check_match "the other reads its files" "^[0-9]+\\." "$(sh_ container exec c2 cat /etc/alpine-release 2>&1)"
+        check "the layer is still locked" "$(mount_locks)" "$(image_unused "$img")"
+        sh_ container rm -t 0 -f c2 > /dev/null
+    else
+        check "each container has its own inodes" 1 "$([ "$second" -gt $((first / 2)) ] && echo 1 || echo 0)"
+        sh_ container rm -t 0 -f c1 c2 > /dev/null
+    fi
+    check "the layer is free after the last" unused "$(image_unused "$img")"
 }
 
 @test "a layer whose image is mounted is collected where the kernel keeps no lock, and kept where it does" {
