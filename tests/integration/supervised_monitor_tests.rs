@@ -21,7 +21,8 @@ fn the_exit_is_in_the_store_before_the_monitor_exits() {
     assert!(ctl(&fx.run_dir, &Ctl::Start { attach_wait_ms: 0 }).ok);
     assert_eq!(child.wait().unwrap().code(), Some(4));
     assert_eq!(store.row(), Some(("stopped".into(), Some(4))));
-    assert_eq!(store.events(), ["container/died"]);
+    // (the container ends for good and stays: its cleanup follows the died)
+    assert_eq!(store.events(), ["container/died", "container/cleanup"]);
 }
 
 #[test]
@@ -36,14 +37,18 @@ fn the_restarts_and_the_exit_are_recorded_in_order() {
     assert!(ctl(&fx.run_dir, &Ctl::Start { attach_wait_ms: 0 }).ok);
     fx.wait_for_exit(&mut m);
     assert_eq!(store.row(), Some(("stopped".into(), Some(1))));
-    // a died event for each exit, a restart event for each start again
+    // a died event for each exit, a restart event for each start again, and
+    // one cleanup after the last exit
     let events = store.events();
     assert_eq!(events.iter().filter(|e| *e == "container/died").count(), 3);
     assert_eq!(
         events.iter().filter(|e| *e == "container/restart").count(),
         2
     );
-    assert_eq!(events.last().map(String::as_str), Some("container/died"));
+    assert_eq!(
+        events[events.len().saturating_sub(2)..],
+        ["container/died", "container/cleanup"]
+    );
 }
 
 #[test]

@@ -355,7 +355,7 @@ fn test_the_git_helper_is_confined() {
         .take()
         .unwrap()
         .write_all(
-            br#"{"source":{"url":"https://h/r.git","reference":"HEAD","subdir":""},"max_bytes":1048576,"ssh_auth_sock":null,"known_hosts":null,"self_test":true}"#,
+            br#"{"source":{"url":"https://h/r.git","reference":"HEAD","subdir":""},"max_bytes":1048576,"max_entries":1000,"ssh_auth_sock":null,"known_hosts":null,"self_test":true}"#,
         )
         .unwrap();
     let out = child.wait_with_output().unwrap();
