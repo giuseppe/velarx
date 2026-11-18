@@ -54,6 +54,10 @@ pub struct State {
     pub pulls: HashMap<String, Pull>,
     /// The layers a live pull is fetching, and the pull.
     pub claimed: HashMap<String, String>,
+    /// The objects of the pulls that are staged, by pull: verified and not
+    /// named in the store until the engine commits, where their bytes are
+    /// (the engine reads them back before it decides).
+    pub staged: HashMap<String, HashMap<String, PathBuf>>,
 }
 
 /// What the server keeps of a container: where its bundle is and what it was

@@ -140,7 +140,7 @@ async fn setup() -> Setup {
 }
 
 fn settled() -> Settled {
-    Box::new(|_| {
+    Box::new(|_, _| {
         Ok(Settlement {
             identities: Identities::default(),
             verdict: Verdict::sealed(

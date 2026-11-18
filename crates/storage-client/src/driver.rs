@@ -1659,10 +1659,11 @@ impl VarlinkDriver {
         })
         .await
         .map_err(|e| DriverError::storage(name, e.to_string()))??;
-        // the engine's check, before the driver publishes
+        // the engine's check, before the driver publishes (the driver keeps
+        // the objects: the engine reads none)
         let (pulled, settlement) = tokio::task::spawn_blocking(move || {
             let mut pulled = pulled;
-            settled(&mut pulled).map(|s| (pulled, s))
+            settled(&mut pulled, &|_| None).map(|s| (pulled, s))
         })
         .await
         .map_err(|e| DriverError::storage(name, e.to_string()))?

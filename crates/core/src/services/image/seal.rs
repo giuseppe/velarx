@@ -26,7 +26,7 @@
 use super::*;
 use velarx_config::ComposefsDigests;
 use velarx_db::LayerRecord;
-use velarx_storage::{FileStore, Toc};
+use velarx_storage::Toc;
 use velarx_wire::chain::Chain;
 
 /// The annotation of a layer descriptor with the fs-verity digests of the
@@ -396,7 +396,8 @@ pub fn check_statable(manifest: &OciManifest, layers: &[Algorithm]) -> ImageResu
 }
 
 /// The digest of the merged EROFS of the layers whose TOCs are `tocs`, in
-/// order, whose files are all in `store`: an error if it is not the one
+/// order, whose files are where `objects` says (by their fs-verity digest):
+/// an error if it is not the one
 /// `want` states (when given).  The merged EROFS is made of the objects of
 /// the layers, in one algorithm, so a digest the manifest states (in the
 /// algorithm `A` of its annotation) is checked when every layer has `A`
@@ -409,12 +410,12 @@ pub(super) fn merged_erofs(
     alg: Algorithm,
     layers: &[Algorithm],
     tocs: &[&Toc],
-    store: &FileStore,
+    objects: &dyn Fn(&str) -> Option<std::path::PathBuf>,
     want: Option<&OciManifest>,
 ) -> ImageResult<Option<(Algorithm, String)>> {
     let stated = want.map(expected).transpose()?.unwrap_or_default();
     let made = |a: Algorithm| {
-        crate::storage_driver::composefs::canonical_image_of(a, tocs, store)
+        crate::storage_driver::composefs::canonical_image_of(a, tocs, objects)
             .map(|(_, id)| id)
             .map_err(|e| ImageError::Storage(format!("cannot make the merged EROFS: {e}")))
     };
@@ -698,7 +699,8 @@ mod tests {
     fn a_mixed_image_has_no_merged_erofs() {
         use Algorithm::{Sha256, Sha512};
         let dir = tempfile::tempdir().unwrap();
-        let store = FileStore::new(dir.path()).unwrap();
+        let store = velarx_storage::FileStore::new(dir.path()).unwrap();
+        let in_store = |d: &str| store.get_path(d);
         let none = Toc {
             version: 1,
             entries: Vec::new(),
@@ -708,11 +710,11 @@ mod tests {
         // a sha512 manifest over a sha256 layer, and the reverse
         for (alg, layers) in [(Sha512, [Sha256]), (Sha256, [Sha512])] {
             assert_eq!(
-                merged_erofs(alg, &layers, &tocs, &store, None).unwrap(),
+                merged_erofs(alg, &layers, &tocs, &in_store, None).unwrap(),
                 None
             );
             assert_eq!(
-                merged_erofs(alg, &layers, &tocs, &store, Some(&manifest(None))).unwrap(),
+                merged_erofs(alg, &layers, &tocs, &in_store, Some(&manifest(None))).unwrap(),
                 None
             );
             // (a digest of the algorithm the manifest has, over layers of
@@ -721,7 +723,7 @@ mod tests {
             stated
                 .annotations
                 .insert(merged_annotation(alg), "ab".repeat(alg.len()));
-            let e = merged_erofs(alg, &layers, &tocs, &store, Some(&stated))
+            let e = merged_erofs(alg, &layers, &tocs, &in_store, Some(&stated))
                 .unwrap_err()
                 .to_string();
             assert!(e.contains("a mixed image states none"), "{e}");
@@ -730,21 +732,21 @@ mod tests {
         }
         // a digest of the layers' algorithm is checked, whatever the
         // manifest's
-        let (_, id) = merged_erofs(Sha256, &[Sha256], &tocs, &store, None)
+        let (_, id) = merged_erofs(Sha256, &[Sha256], &tocs, &in_store, None)
             .unwrap()
             .unwrap();
         let mut stated = manifest(None);
         stated
             .annotations
             .insert(merged_annotation(Sha256), id.clone());
-        assert!(merged_erofs(Sha512, &[Sha256], &tocs, &store, Some(&stated)).is_ok());
+        assert!(merged_erofs(Sha512, &[Sha256], &tocs, &in_store, Some(&stated)).is_ok());
         stated
             .annotations
             .insert(merged_annotation(Sha256), "cd".repeat(32));
-        assert!(merged_erofs(Sha512, &[Sha256], &tocs, &store, Some(&stated)).is_err());
+        assert!(merged_erofs(Sha512, &[Sha256], &tocs, &in_store, Some(&stated)).is_err());
         // an image of one algorithm has one, in that algorithm
         for alg in Algorithm::ALL {
-            let (got_alg, id) = merged_erofs(alg, &[alg], &tocs, &store, None)
+            let (got_alg, id) = merged_erofs(alg, &[alg], &tocs, &in_store, None)
                 .unwrap()
                 .unwrap();
             assert_eq!((got_alg, id.len()), (alg, alg.len() * 2));

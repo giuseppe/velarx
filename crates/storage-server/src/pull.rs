@@ -227,8 +227,18 @@ impl Server {
         let decision = self.config.decision;
         let settled: Settled = {
             let (store, id, tx, wire) = (store.clone(), p.pull.clone(), tx.clone(), wire.clone());
-            Box::new(move |pulled: &mut Vec<PulledLayer>| {
+            Box::new(move |pulled: &mut Vec<PulledLayer>, objects| {
                 let settlement = settle(pulled)?;
+                // (the files are named in the store once the engine commits:
+                // until then the engine reads them where they are)
+                let staged = pulled
+                    .iter()
+                    .flat_map(|l| l.done.toc.entries.iter())
+                    .filter_map(|e| e.verity())
+                    .filter_map(|v| Some((v.clone(), objects(&v)?)))
+                    .collect();
+                store.state().staged.insert(id.clone(), staged);
+                let _unstage = Unstage(&store, &id);
                 // (before the engine reads the layers back by the keys it
                 // knows)
                 for l in pulled.iter() {
@@ -439,9 +449,19 @@ impl Server {
                 offset: r.offset,
                 length: r.length,
             };
+            // (an object of a staged pull is read where it waits for its
+            // name)
+            let staged = store
+                .state()
+                .staged
+                .values()
+                .find_map(|s| s.get(&key).cloned());
             // (the object is there and long enough: a reply is sent for a
             // range that can be read; it tells the size of the object)
-            let size = velarx_graph::objects::range_object_size(NAME, &store.files, &range)?;
+            let size = match &staged {
+                Some(path) => staged_size(path, &range)?,
+                None => velarx_graph::objects::range_object_size(NAME, &store.files, &range)?,
+            };
             let last = i + 1 == p.ranges.len();
             conn.send(
                 &encode_reply(
@@ -454,10 +474,53 @@ impl Server {
                 &[],
             )
             .map_err(failed)?;
-            store.vfs.read_objects(&[range], &mut ToPipe(&pipe))?;
+            match &staged {
+                Some(path) => read_staged(path, &range, &pipe)?,
+                None => store.vfs.read_objects(&[range], &mut ToPipe(&pipe))?,
+            }
         }
         Ok(Vec::new())
     }
+}
+
+/// The objects of a staged pull are read where they are only while the pull
+/// waits for the engine.
+struct Unstage<'a>(&'a Store, &'a str);
+
+impl Drop for Unstage<'_> {
+    fn drop(&mut self) {
+        self.0.state().staged.remove(self.1);
+    }
+}
+
+/// The size of the object at `path` (verified, not named in the store yet)
+/// of which the range `r` is read.
+fn staged_size(path: &std::path::Path, r: &ObjectRange) -> DriverResult<u64> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| DriverError::io(NAME, e))?
+        .len();
+    if r.offset.checked_add(r.length).is_none_or(|end| end > len) {
+        return Err(DriverError::corrupt(
+            NAME,
+            format!(
+                "the object {} has {len} bytes, the range is {} bytes from {}",
+                r.key, r.length, r.offset
+            ),
+            velarx_graph::Remedy::PullAgain,
+        ));
+    }
+    Ok(len)
+}
+
+/// The range `r` of the object at `path`, into `pipe`.
+fn read_staged(path: &std::path::Path, r: &ObjectRange, pipe: &std::fs::File) -> DriverResult<()> {
+    use std::io::{Read, Seek};
+    let io = |e: std::io::Error| DriverError::io(NAME, e);
+    let mut file = std::fs::File::open(path).map_err(io)?;
+    file.seek(std::io::SeekFrom::Start(r.offset)).map_err(io)?;
+    let mut pipe = pipe;
+    std::io::copy(&mut file.take(r.length), &mut pipe).map_err(io)?;
+    Ok(())
 }
 
 struct ToPipe<'a>(&'a std::fs::File);

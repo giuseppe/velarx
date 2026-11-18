@@ -285,6 +285,8 @@ async fn test_the_layer_erofs_digest_the_manifest_states_is_checked() {
                 &sha(&layer.blob).to_string(),
             );
             assert!(!left.exists(), "{}", left.display());
+            // (nor is any file of the layer named in the store)
+            assert!(!e.store.contains(&vid(b"hello\n")), "{value}");
         }
     }
 }
@@ -910,8 +912,10 @@ async fn test_wrong_diff_id_is_refused_and_nothing_is_recorded() {
             build_gzip(&sample())
         };
         layer.diff_id = sha(b"another layer");
-        e.publish(&[&layer], &[if chunked { ZSTD } else { GZIP }]);
+        let manifest = publish_to(&e.reg, &[&layer], &[if chunked { ZSTD } else { GZIP }]);
         assert!(e.pull().await.is_err());
+        // (nor is the pull of the manifest recorded)
+        assert!(e.db.pulled_image(&manifest).await.unwrap().is_empty());
         assert!(e.db.get_layer(&layer.key()).await.is_err());
         assert!(
             !e.store.contains(&vid(b"hello\n")),

@@ -359,10 +359,16 @@ impl ImageService {
         // Only when no one holds the lock of the store (the collection
         // sweeps otherwise), and not the sessions of the pulls that hold
         // their lease: a pull holds the lock of the store only to start and
-        // to commit, not through its download.
+        // to commit, not through its download.  The stagings of the layers
+        // of a process that died with them go too.
         match StorageLock::try_exclusive(&StorageLock::path_of_staging(&staging_dir)) {
             Ok(Some(_alone)) => {
-                velarx_content::pull::session::Session::sweep(&staging_dir, |s| db.lease_is_held(s))
+                velarx_content::pull::session::Session::sweep(&staging_dir, |s| {
+                    db.lease_is_held(s)
+                });
+                if let Err(e) = velarx_content::pull::staged_fetch::sweep(&staging_dir) {
+                    warn!("Cannot remove the staging of a layer: {e}");
+                }
             }
             Ok(None) => debug!("The store is in use: its staging directory is left alone"),
             Err(e) => warn!("Cannot lock the store: {e}"),

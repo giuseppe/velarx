@@ -724,7 +724,7 @@ fn settled_ok(calls: Arc<AtomicUsize>, log: Arc<Script>) -> Settled {
 
 /// The engine's check `check`, which seals its verdict with its id.
 fn settled_by(check: CheckId, calls: Arc<AtomicUsize>, log: Arc<Script>) -> Settled {
-    Box::new(move |pulled: &mut Vec<PulledLayer>| {
+    Box::new(move |pulled: &mut Vec<PulledLayer>, _| {
         calls.fetch_add(1, Ordering::SeqCst);
         log.log.lock().unwrap().push("settled".into());
         let artifacts: HashMap<_, _> = pulled
@@ -1026,7 +1026,8 @@ fn a_pull_that_fails_is_aborted_and_publishes_nothing() {
     let e = env();
     let script = start_script(&e, &b, Behavior::Good);
     let feed = feed_of(&b, &[1]);
-    let refuse: Settled = Box::new(|_| Err(ImageError::Contradicted("the manifest lies".into())));
+    let refuse: Settled =
+        Box::new(|_, _| Err(ImageError::Contradicted("the manifest lies".into())));
     let err = expect_err(
         run_pull(&e, &feed, &[feed_layer(1, &b, false)], refuse).map(|_| ()),
         "refused",

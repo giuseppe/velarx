@@ -307,6 +307,37 @@ pub fn verify_layers(
     })
 }
 
+/// What a verified file is to be named by, and where its bytes are until
+/// then (none: the store has them); or why it is not to be named.
+pub type Ready = Result<(Object, Option<std::path::PathBuf>), Refusal>;
+
+impl Verified {
+    /// What each file of each staging is to be named by, as it was verified,
+    /// and where its bytes are until then (none: the store has them); the
+    /// refusal of a file that is not to be named.
+    pub fn ready(&self, stagings: &[Staging<'_>]) -> Vec<Vec<Ready>> {
+        stagings
+            .iter()
+            .zip(&self.prepared)
+            .map(|(staging, prepared)| {
+                prepared
+                    .iter()
+                    .map(|p| match p {
+                        Prepared::Done(Step::Linked(o) | Step::Present(o)) => Ok((o.clone(), None)),
+                        Prepared::Done(Step::Refused(why)) => Err(why.clone()),
+                        Prepared::Staged { rel, object, .. } => {
+                            Ok((object.clone(), Some(staging.dir.join(rel))))
+                        }
+                        Prepared::Copy { file, object, .. } => {
+                            Ok((object.clone(), Some(velarx_sys::fd::proc_path(file))))
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+}
+
 /// The locked part of a commit: one barrier of the staging file system
 /// (which makes the files verified by [`verify_layers`] durable), the names
 /// (links by inode, and the renames of the staged images), `after_link`, and

@@ -117,7 +117,7 @@ async fn measure(small: usize) {
         )
         .with_staged(staged),
     );
-    let settled: Settled = Box::new(|_| {
+    let settled: Settled = Box::new(|_, _| {
         Ok(Settlement {
             identities: Identities::default(),
             verdict: Verdict::sealed(

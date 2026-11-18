@@ -244,9 +244,9 @@ pub(super) struct Incoming {
     pub states: bool,
     /// A lease that takes the image before it is recorded.
     pub lease: Option<String>,
-    /// How the image was pulled and the signatures found (a lazy pull's:
-    /// the staging area keeps them until the image is committed); an eager
-    /// pull recorded them already.
+    /// How the image was pulled and the signatures found, recorded with the
+    /// image (a lazy pull's: the staging area keeps them until the image is
+    /// committed).
     pub pulled: Vec<(String, Vec<u8>)>,
     /// The credentials and certificates the layers are fetched with (a pull
     /// from a registry)
@@ -1126,14 +1126,8 @@ impl ImageService {
                 &requirements,
             )
             .await?;
-        // (a lazy pull keeps what it found until its image is committed)
-        let signed = self.pull_record(&image_ref, &signatures)?;
-        if !lazy {
-            self.db
-                .set_pulled_image(&manifest_digest, &signed.0, signed.1.clone())
-                .await?;
-        }
-        let signed = vec![signed];
+        // (recorded with the image: a pull that fails records nothing)
+        let signed = vec![self.pull_record(&image_ref, &signatures)?];
         let image_id = self
             .db
             .image_id_for(&manifest_digest, &manifest_digest)
@@ -1227,7 +1221,7 @@ impl ImageService {
             seal: false,
             states: false,
             lease: None,
-            pulled: if lazy { signed } else { Vec::new() },
+            pulled: signed,
             access: Some(velarx_content::pull::access::access_for(
                 client,
                 &image_ref.full_name(),
@@ -1823,7 +1817,8 @@ pub(super) struct Settling<'a> {
 }
 
 impl ImageService {
-    /// What the engine makes of the layers once the driver committed them:
+    /// What the engine makes of the layers once the driver verified them,
+    /// before it names any of them in its store:
     /// the merged EROFS of a complete image to check against the manifest or
     /// to state in it, the identity of each layer, and the digests the
     /// manifest states for them, checked before anything of the layers is
@@ -1836,15 +1831,11 @@ impl ImageService {
             let check = check.clone();
             let (manifest, expected) = (s.manifest.clone(), s.expected.to_vec());
             let (seal, states) = (s.seal, s.states);
-            let (db, store, mode) = (
-                self.db.clone(),
-                self.file_store.clone(),
-                self.composefs_digests(),
-            );
+            let (db, mode) = (self.db.clone(), self.composefs_digests());
             let (progress_tx, handle) = (s.progress.clone(), tokio::runtime::Handle::current());
             let manifest_alg = s.manifest_digest.alg();
             let holds_objects = self.storage.holds_objects();
-            Box::new(move |pulled: &mut Vec<PulledLayer>| {
+            Box::new(move |pulled: &mut Vec<PulledLayer>, objects| {
                 // the key of each layer of the image (a layer whose TOC
                 // could not be used is the layer of its blob)
                 let became: HashMap<(&LayerKey, Digest), &LayerKey> = pulled
@@ -1890,7 +1881,7 @@ impl ImageService {
                         manifest_alg,
                         &algs,
                         &tocs,
-                        &store,
+                        objects,
                         (!seal).then_some(&manifest),
                     )?;
                 }

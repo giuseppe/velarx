@@ -235,9 +235,10 @@ pub fn image<H: FsVerityHashValue>(
     Ok((image, id))
 }
 
-/// The files of a store as the tree of composefs-rs wants them.
+/// The objects of a store as the tree of composefs-rs wants them: where the
+/// bytes of each are, by its fs-verity digest.
 struct StoreFiles<'a> {
-    store: &'a velarx_storage::FileStore,
+    objects: &'a dyn Fn(&str) -> Option<std::path::PathBuf>,
 }
 
 impl<H: FsVerityHashValue> Files<H> for StoreFiles<'_> {
@@ -249,9 +250,7 @@ impl<H: FsVerityHashValue> Files<H> for StoreFiles<'_> {
         let digest = e
             .verity()
             .ok_or_else(|| other(format!("`{}` has no fs-verity digest", e.name)))?;
-        let path = self
-            .store
-            .get_path(&digest)
+        let path = (self.objects)(&digest)
             .ok_or_else(|| other(format!("`{}` is not in the store", e.name)))?;
         let len = std::fs::metadata(&path)?.len();
         if len != e.size {
@@ -282,22 +281,33 @@ pub fn image_of_store(
     tocs: &[&velarx_storage::Toc],
     store: &velarx_storage::FileStore,
 ) -> std::io::Result<(Box<[u8]>, String)> {
+    image_of(alg, tocs, &|d| store.get_path(d))
+}
+
+/// [`image_of_store`] of objects that are where `objects` says (by their
+/// fs-verity digest): the files a pull verified are read before they are
+/// named in the store.
+pub fn image_of(
+    alg: velarx_types::digest::Algorithm,
+    tocs: &[&velarx_storage::Toc],
+    objects: &dyn Fn(&str) -> Option<std::path::PathBuf>,
+) -> std::io::Result<(Box<[u8]>, String)> {
     use composefs::fsverity::{Sha256HashValue, Sha512HashValue};
     fn made<H: FsVerityHashValue>(
         tocs: &[&velarx_storage::Toc],
-        store: &velarx_storage::FileStore,
+        objects: &dyn Fn(&str) -> Option<std::path::PathBuf>,
     ) -> std::io::Result<(Box<[u8]>, String)> {
         let io = |e: String| std::io::Error::other(e);
         let layers: Vec<&[velarx_storage::TocEntry]> =
             tocs.iter().map(|t| t.entries.as_slice()).collect();
-        let mut files = StoreFiles { store };
+        let mut files = StoreFiles { objects };
         let tree = merge::<H>(&layers, &mut files).map_err(io)?;
         let (image, id) = image(tree, Default::default()).map_err(io)?;
         Ok((image, id.to_hex()))
     }
     match alg {
-        velarx_types::digest::Algorithm::Sha256 => made::<Sha256HashValue>(tocs, store),
-        velarx_types::digest::Algorithm::Sha512 => made::<Sha512HashValue>(tocs, store),
+        velarx_types::digest::Algorithm::Sha256 => made::<Sha256HashValue>(tocs, objects),
+        velarx_types::digest::Algorithm::Sha512 => made::<Sha512HashValue>(tocs, objects),
     }
 }
 

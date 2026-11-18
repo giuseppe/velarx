@@ -701,7 +701,7 @@ fn engine_settlement(pulled: &[PulledLayer]) -> ImageResult<Settlement> {
 
 /// The engine's check when it has nothing to say: it makes the identities.
 fn engine_check() -> Settled {
-    Box::new(|pulled| engine_settlement(pulled))
+    Box::new(|pulled, _| engine_settlement(pulled))
 }
 
 fn img_digest() -> Digest {
@@ -1494,7 +1494,7 @@ pub async fn pull_check_sees_the_layers_first(f: &Factory) {
     let pulled = offer1
         .pull(
             &s,
-            Box::new(move |layers| {
+            Box::new(move |layers, _| {
                 *seen2.lock().unwrap() = Some((
                     layers.iter().map(|l| l.done.key).collect::<Vec<_>>(),
                     // (settled: the files have the names of what they hold)
@@ -1531,7 +1531,7 @@ pub async fn pull_check_sees_the_layers_first(f: &Factory) {
         offer2
             .pull(
                 &other,
-                Box::new(|_| {
+                Box::new(|_, _| {
                     Err(ImageError::Contradicted(
                         "the manifest says otherwise".into(),
                     ))
@@ -1570,7 +1570,7 @@ pub async fn a_pull_returns_the_verdict_of_the_check(f: &Factory) {
     let pulled = o
         .pull(
             &s,
-            Box::new(move |layers| {
+            Box::new(move |layers, _| {
                 let identities = engine_identities(layers)?;
                 let mut checked = checked_of(&identities, layers);
                 checked.layer_keys.reverse();
@@ -1631,7 +1631,7 @@ pub async fn a_pull_the_engine_made_no_image_for_is_refused(f: &Factory) {
     let pulled = o
         .pull(
             &s,
-            Box::new(|layers| {
+            Box::new(|layers, _| {
                 // the identity of the layer and no image: the engine makes
                 // the image of every layer it pulled, and a driver never
                 // builds one of its own
@@ -1662,7 +1662,8 @@ pub async fn a_pull_the_engine_made_no_image_for_is_refused(f: &Factory) {
 
 /// `Settled` runs when every layer is staged and proven and before the driver
 /// publishes: a refusal of the engine leaves nothing for `has_layers` to
-/// report and nothing of the artifacts, and the same layers pull afterwards.
+/// report, nothing of the artifacts and none of the files of the layers, and
+/// the same layers pull afterwards.
 pub async fn a_refusal_of_the_engine_leaves_nothing_visible(f: &Factory) {
     let (_tmp, s) = begin!(f, "a_refusal_of_the_engine_leaves_nothing_visible");
     let (a, b) = (base_layer(), top_layer());
@@ -1677,15 +1678,34 @@ pub async fn a_refusal_of_the_engine_leaves_nothing_visible(f: &Factory) {
         })
         .collect();
     let before = s.driver.usage().unwrap().artifacts;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let files = seen.clone();
     let e = expect_err(
         o.pull(
             &s,
-            Box::new(|_| Err(ImageError::Manifest("the manifest says no".into()))),
+            Box::new(move |layers, _| {
+                *files.lock().unwrap() = layers
+                    .iter()
+                    .flat_map(|l| l.done.toc.entries.iter())
+                    .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+                    .filter_map(|e| Some((e.content_key()?, e.size)))
+                    .collect();
+                Err(ImageError::Manifest("the manifest says no".into()))
+            }),
         )
         .await
         .map(|_| ()),
         "a pull the engine refuses",
     );
+    // (nor are the files of the layers in the store: none was named)
+    let files = seen.lock().unwrap().clone();
+    assert!(!files.is_empty());
+    for (key, size) in files {
+        assert!(
+            s.driver.open_object(&key, size).is_err(),
+            "{key} of a refused pull is in the store"
+        );
+    }
     assert!(
         matches!(e.kind, DriverErrorKind::Refused(_)) || e.to_string().contains("says no"),
         "{e:?}"

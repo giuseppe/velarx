@@ -974,7 +974,8 @@ impl ImageService {
             let algs: Vec<Algorithm> = keys.iter().map(|k| k.digest().alg()).collect();
             tokio::task::spawn_blocking(move || {
                 let tocs: Vec<&Toc> = tocs.iter().collect();
-                super::seal::merged_erofs(alg, &algs, &tocs, &store, Some(&want)).map(|_| ())
+                super::seal::merged_erofs(alg, &algs, &tocs, &|d| store.get_path(d), Some(&want))
+                    .map(|_| ())
             })
             .await
             .map_err(|e| ImageError::Storage(e.to_string()))??;

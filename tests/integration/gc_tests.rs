@@ -403,7 +403,8 @@ async fn stale_leases_and_staging_are_swept() {
 
 /// A command that starts while a pull downloads (the pull holds its lease,
 /// not the lock of the store) leaves the session of that pull alone; the
-/// session of a pull that ended goes.
+/// session of a pull that ended goes, and so does the staging of a layer no
+/// process holds the lease of.
 #[tokio::test]
 async fn a_new_service_sweeps_the_sessions_of_dead_pulls_only() {
     let e = env().await;
@@ -411,6 +412,13 @@ async fn a_new_service_sweeps_the_sessions_of_dead_pulls_only() {
     for d in [live, dead] {
         std::fs::create_dir_all(e.staging.join(d).join("sub")).unwrap();
     }
+    let (fetching, left) = ("sha256-0a11", "sha256-0dead");
+    for l in [fetching, left] {
+        std::fs::create_dir_all(e.staging.join("layers").join(l).join("files")).unwrap();
+    }
+    std::fs::create_dir_all(e.staging.join("meta").join(fetching)).unwrap();
+    let lease = std::fs::File::create(e.staging.join("meta").join(fetching).join("lease")).unwrap();
+    rustix::fs::flock(&lease, rustix::fs::FlockOperation::LockExclusive).unwrap();
     let _held = e.db.create_lease(live, vec![]).await.unwrap();
     stale_lease(&e.db, dead, &[]).await;
     // The service sweeps only when nobody holds the lock of the store, and
@@ -434,6 +442,13 @@ async fn a_new_service_sweeps_the_sessions_of_dead_pulls_only() {
     }
     assert!(e.staging.join(live).join("sub").exists());
     assert!(!e.staging.join(dead).exists());
+    assert!(e
+        .staging
+        .join("layers")
+        .join(fetching)
+        .join("files")
+        .exists());
+    assert!(!e.staging.join("layers").join(left).exists());
 }
 
 #[tokio::test]

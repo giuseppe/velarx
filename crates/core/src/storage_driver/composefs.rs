@@ -2417,14 +2417,14 @@ impl StorageDriver for ComposefsDriver {
     }
 }
 
-/// The image of composefs-rs of the layers `tocs`, whose files are all in
-/// `store`, and its id.
+/// The image of composefs-rs of the layers `tocs`, whose files are where
+/// `objects` says (by their fs-verity digest), and its id.
 pub(crate) fn canonical_image_of(
     alg: Algorithm,
     tocs: &[&velarx_storage::Toc],
-    store: &velarx_storage::FileStore,
+    objects: &dyn Fn(&str) -> Option<std::path::PathBuf>,
 ) -> std::io::Result<(Box<[u8]>, String)> {
-    velarx_fuse::canonical::image_of_store(alg, tocs, store)
+    velarx_fuse::canonical::image_of(alg, tocs, objects)
 }
 
 /// Whether the root of the process whose mount table is `mountinfo` is the

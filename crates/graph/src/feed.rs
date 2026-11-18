@@ -27,15 +27,19 @@
 //! 3. the feed ends ([`PullFeed::finish`]: the helpers of the engine that
 //!    handled what the registry sent are gone, and the engine holds the
 //!    store for the commit);
-//! 4. the driver makes what it pulled durable with one barrier and names the
-//!    files by what they hold (the commit of the session, and `settle`);
+//! 4. the driver verifies what it pulled and knows what each file is to be
+//!    named by (`settle`), naming nothing yet;
 //! 5. the engine's check sees the settled layers ([`Settled`]): it computes
 //!    the identity of each (`velarx_fuse::layer_erofs`), checks the manifest
 //!    against it and hands the identities, with the images it made them
-//!    from, back to the driver, which stores them (composefs writes the
-//!    images the engine made: they are not built twice) and records what it
-//!    made ([`Pulled::artifacts`]); what only the engine needs of the check
-//!    ([`Verdict`]) goes back in [`Pulled::verdict`].
+//!    from, back to the driver; a pull it refuses leaves nothing in the
+//!    store;
+//! 6. the driver makes what it pulled durable with one barrier, names the
+//!    files by what they hold (the commit of the session) and stores the
+//!    identities (composefs writes the images the engine made: they are not
+//!    built twice) and records what it made ([`Pulled::artifacts`]); what
+//!    only the engine needs of the check ([`Verdict`]) goes back in
+//!    [`Pulled::verdict`].
 //!
 //! Only the layers the engine does not have are in the pull: which layers
 //! the store has is the engine's question to the driver (a later stage).
@@ -395,8 +399,16 @@ pub struct Identities {
 /// staged and proven and **before it publishes** anything (on a thread that
 /// may block): it sees the layers, may refuse the pull (nothing of it is
 /// visible then: `has_layers` reports none of its layers, a refusal is never
-/// an orphan commit), and hands the driver the identities.
-pub type Settled = Box<dyn FnOnce(&mut Vec<PulledLayer>) -> ImageResult<Settlement> + Send>;
+/// an orphan commit), and hands the driver the identities.  The second
+/// argument says where the bytes of an object of the layers are, by its
+/// fs-verity digest (the files of the pull are not named in the store yet).
+pub type Settled = Box<
+    dyn FnOnce(
+            &mut Vec<PulledLayer>,
+            &dyn Fn(&str) -> Option<std::path::PathBuf>,
+        ) -> ImageResult<Settlement>
+        + Send,
+>;
 
 /// The id of one check of one pull: the engine makes it for the pull, its
 /// check seals the [`Verdict`] with it, and the engine opens only a verdict
@@ -1440,63 +1452,61 @@ async fn pull_session<R: Send + 'static>(
     let driver = name.to_string();
     let done = tokio::task::spawn_blocking(move || {
         let verity = fsverity.manager();
-        let mut state = Some((pulled, settled, write));
-        let mut out: Option<DriverResult<(Vec<PulledLayer>, Settlement, R)>> = None;
-        let mut between = |committed: &[velarx_content::pull::session::Committed]| {
-            let Some((mut pulled, settled, write)) = state.take() else {
-                out = Some(Err(refused(
-                    &driver,
-                    ImageError::Storage("the commit settled the pull twice".to_string()),
-                )));
-                return Err(std::io::Error::other("the pull was refused"));
+        // (a file a fetcher staged that is not what its name says, or that
+        // is gone: the transfer was complete and the file is not valid, the
+        // pull fails)
+        let failed = |e: std::io::Error| match e.kind() {
+            std::io::ErrorKind::InvalidData => {
+                refused(&driver, ImageError::Contradicted(e.to_string()))
+            }
+            _ => refused(
+                &driver,
+                ImageError::Storage(format!("cannot commit the pulled files: {e}")),
+            ),
+        };
+        // Every staged file is verified first, once, and the engine's check
+        // sees what each is to be named by and reads it where it is staged:
+        // a pull it refuses names nothing in the store.  The commit that
+        // follows only links, renames and syncs.
+        let verified = session.verify(verity.as_ref()).map_err(failed)?;
+        let (objects, staged) = verified.objects().map_err(failed)?;
+        let objects: HashMap<String, velarx_storage::Object> =
+            objects.into_iter().map(|c| (c.digest, c.object)).collect();
+        let mut pulled = pulled;
+        for l in &mut pulled {
+            l.done
+                .settle(&objects, &store)
+                .map_err(|e| refused(&driver, e))?;
+        }
+        let at = |d: &str| staged.get(d).cloned().or_else(|| store.get_path(d));
+        let mut settlement = settled(&mut pulled, &at).map_err(|e| refused(&driver, e))?;
+        let mut write = Some(write);
+        let mut written = None;
+        let mut between = |_: &[velarx_content::pull::session::Committed]| {
+            let Some(write) = write.take() else {
+                return Err(std::io::Error::other("the commit wrote the pull twice"));
             };
-            let committed: HashMap<String, velarx_storage::Object> = committed
-                .iter()
-                .map(|c| (c.digest.clone(), c.object.clone()))
-                .collect();
-            let made = pulled
-                .iter_mut()
-                .try_for_each(|l| l.done.settle(&committed, &store))
-                .and_then(|()| settled(&mut pulled))
-                .map_err(|e| refused(&driver, e))
-                .and_then(|mut settlement| {
-                    let (written, wrote) = write(&pulled, &mut settlement)?;
-                    Ok((pulled, settlement, written, wrote))
-                });
-            match made {
-                Ok((pulled, settlement, written, wrote)) => {
-                    out = Some(Ok((pulled, settlement, written)));
+            match write(&pulled, &mut settlement) {
+                Ok((r, wrote)) => {
+                    written = Some(Ok(r));
                     Ok(wrote)
                 }
                 Err(e) => {
-                    out = Some(Err(e));
+                    written = Some(Err(e));
                     Err(std::io::Error::other("the pull was refused"))
                 }
             }
         };
-        // (every staged file is verified first, once; the commit that
-        // follows only links, renames and syncs)
-        let committed = session
-            .verify(verity.as_ref())
-            .and_then(|verified| session.commit_verified(verified, Some(&mut between)));
-        // (a barrier that failed after the settlement ran: nothing is
+        let committed = session.commit_verified(verified, Some(&mut between));
+        // (a barrier that failed after the images were written: nothing is
         // reported as pulled that is not on the disk)
-        match (out.take(), committed) {
+        match (written, committed) {
             (Some(Err(e)), _) => Err(e),
-            (Some(Ok(done)), Ok(_)) => Ok(done),
-            // (a file a fetcher staged that is not what its name says, or
-            // that is gone: the transfer was complete and the file is not
-            // valid, the pull fails)
-            (_, Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
-                Err(refused(&driver, ImageError::Contradicted(e.to_string())))
-            }
-            (_, Err(e)) => Err(refused(
-                &driver,
-                ImageError::Storage(format!("cannot commit the pulled files: {e}")),
-            )),
+            (Some(Ok(r)), Ok(_)) => Ok((pulled, settlement, r)),
+            (_, Err(e)) => Err(failed(e)),
             (None, Ok(_)) => Err(refused(
                 &driver,
-                ImageError::Storage("the commit ran no settlement".to_string()),
+                ImageError::Storage("the commit wrote nothing of the pull".to_string()),
             )),
         }
     })
@@ -1590,7 +1600,7 @@ mod tests {
             }
         };
         let feed: Arc<dyn PullFeed> = Arc::new(Refusing(Default::default()));
-        let settled: Settled = Box::new(|_| unreachable!("a refused pull is not settled"));
+        let settled: Settled = Box::new(|_, _| unreachable!("a refused pull is not settled"));
         // (the runtime lives until the end: it would drop the tasks it still
         // holds when it goes)
         let rt = tokio::runtime::Builder::new_current_thread()

@@ -855,7 +855,7 @@ impl Session {
         verification: Verification,
         after_link: Option<&mut AfterCommit<'_>>,
     ) -> io::Result<Vec<Committed>> {
-        use super::commit::{commit_verified, Refusal, Staging};
+        use super::commit::{commit_verified, Staging};
         let mut after_link = after_link;
         let Some(Verified {
             homes,
@@ -894,21 +894,11 @@ impl Session {
             for (at, (linked, keys)) in done.iter().zip(&keys).enumerate() {
                 if let Some((i, why)) = linked.refused.first() {
                     let (key, rel) = &keys[*i];
-                    let why = match why {
-                        Refusal::Missing => "it is gone".to_string(),
-                        Refusal::Wrong(why) => why.clone(),
-                    };
-                    let name = by_verity.get(key).unwrap_or(rel);
-                    // (a file a fetcher staged: the fetcher is named)
-                    let by = homes[at]
-                        .1
-                        .as_ref()
-                        .and_then(|home| home.staged_by(key))
-                        .map(|f| format!("the fetcher {f} staged it, and "))
-                        .unwrap_or_default();
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("`{name}` is not committed as {key}: {by}{why}"),
+                    return Err(not_committed(
+                        homes[at].1.as_ref(),
+                        &by_verity,
+                        (key, rel),
+                        why,
                     ));
                 }
                 committed.extend(linked.objects.iter().map(|(i, object)| Committed {
@@ -924,6 +914,72 @@ impl Session {
         commit_verified(&staging, verified, &self.store, Some(&mut between))?;
         self.staged.lock().unwrap().clear();
         Ok(committed)
+    }
+}
+
+/// The error of a file of the staging `home` that is not committed as `key`.
+fn not_committed(
+    home: Option<&Arc<LayerStaging>>,
+    by_verity: &HashMap<String, String>,
+    (key, rel): (&str, &str),
+    why: &super::commit::Refusal,
+) -> io::Error {
+    let why = match why {
+        super::commit::Refusal::Missing => "it is gone",
+        super::commit::Refusal::Wrong(why) => why,
+    };
+    let name = by_verity.get(key).map_or(rel, String::as_str);
+    // (a file a fetcher staged: the fetcher is named)
+    let by = home
+        .and_then(|home| home.staged_by(key))
+        .map(|f| format!("the fetcher {f} staged it, and "))
+        .unwrap_or_default();
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("`{name}` is not committed as {key}: {by}{why}"),
+    )
+}
+
+impl Verification {
+    /// What the commit of the verified files will name each key by, before
+    /// anything is named ([`Session::commit_verified`] gives the same), and
+    /// where the bytes of each of those objects are until then, by its
+    /// fs-verity digest (an object the store has is not there).  A file that
+    /// is not to be committed is the error the commit would fail with.
+    pub fn objects(&self) -> io::Result<(Vec<Committed>, HashMap<String, PathBuf>)> {
+        let Some(v) = &self.0 else {
+            return Ok(Default::default());
+        };
+        let stagings: Vec<super::commit::Staging<'_>> = v
+            .homes
+            .iter()
+            .zip(&v.by_home)
+            .map(|((dir, _), wants)| super::commit::Staging {
+                dir,
+                wants: wants.clone(),
+                image: None,
+            })
+            .collect();
+        let (mut committed, mut at) = (Vec::new(), HashMap::new());
+        for (home, (wants, ready)) in v
+            .homes
+            .iter()
+            .zip(v.by_home.iter().zip(v.verified.ready(&stagings)))
+        {
+            for (want, ready) in wants.iter().zip(ready) {
+                let (object, path) = ready.map_err(|why| {
+                    not_committed(home.1.as_ref(), &v.by_verity, (&want.key, &want.rel), &why)
+                })?;
+                if let Some(path) = path {
+                    at.insert(object.verity.clone(), path);
+                }
+                committed.push(Committed {
+                    digest: want.key.clone(),
+                    object,
+                });
+            }
+        }
+        Ok((committed, at))
     }
 }
 
