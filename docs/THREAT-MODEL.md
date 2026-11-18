@@ -51,8 +51,10 @@ of a container, and the other users of the host.
 Everything on the left of the engine is untrusted (a member of the swarm is
 trusted not to misbehave, not for its bytes), and is handled by a
 process that has given up what it does not need before it reads the first
-byte (below).  The engine does not trust what those processes tell it either:
-it bounds lengths before allocating and verifies every digest.
+byte (below).  Those processes are not adversaries: they are confined because
+a hostile image or source may exploit a bug in the code that parses it, and
+what they hand over is checked because they can have bugs.  The engine bounds
+lengths before allocating and verifies every digest.
 
 ## Adversaries
 
@@ -65,7 +67,10 @@ it bounds lengths before allocating and verifies every digest.
   `max_inflate_ratio` times the compressed size and at `max_layer_gib`.
 * **A malicious or compromised registry or content source** is verified:
   the manifest by policy, the configuration and layers by digest and diff id,
-  chunks by their hash, files by fs-verity digest. A source cannot make a pull
+  chunks by their hash, files by fs-verity digest.  A layer with a table of
+  contents (zstd:chunked) is held to that table, which the manifest vouches
+  for, and never to the diff id: the diff id the image gives is recorded as
+  its claim and is checked only if the stream of the layer is made again. A source cannot make a pull
   wrong, only slower, and a circuit breaker skips one that fails.
 * **A node outside the peer-to-peer swarm**: see "The peer-to-peer swarm"
   below.
