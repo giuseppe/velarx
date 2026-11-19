@@ -57,6 +57,7 @@ pub enum Item {
     Symlink(&'static str, &'static str),
 }
 
+#[derive(Clone)]
 pub struct Built {
     pub blob: Vec<u8>,
     pub diff_id: Digest,
@@ -186,7 +187,7 @@ pub fn build_chunked_bloated(
                 tar.extend(h.as_bytes());
                 blob.extend(frame(h.as_bytes()));
                 segment.extend(h.as_bytes());
-                toc.push(serde_json::json!({"type":"symlink","name":name,"linkName":target,"mode":0o644}));
+                toc.push(serde_json::json!({"type":"symlink","name":name,"linkName":target,"mode":0o644,"modtime":"2023-11-14T22:13:20Z"}));
             }
             Item::File { name, data, chunk } => {
                 h.set_entry_type(tar::EntryType::Regular);
@@ -197,7 +198,7 @@ pub fn build_chunked_bloated(
                 blob.extend(frame(h.as_bytes()));
                 segment.extend(h.as_bytes());
                 if data.is_empty() {
-                    toc.push(serde_json::json!({"type":"reg","name":name,"mode":0o644,"size":0,"digest":sha(b"")}));
+                    toc.push(serde_json::json!({"type":"reg","name":name,"mode":0o644,"size":0,"digest":sha(b""),"modtime":"2023-11-14T22:13:20Z"}));
                     continue;
                 }
                 let start = blob.len();
@@ -212,7 +213,7 @@ pub fn build_chunked_bloated(
                 }
                 let end = blob.len();
                 let mut first = serde_json::json!({
-                    "type":"reg","name":name,"mode":0o644,"size":data.len(),"digest":sha(data),
+                    "type":"reg","name":name,"mode":0o644,"size":data.len(),"digest":sha(data),"modtime":"2023-11-14T22:13:20Z",
                     "offset":start,"endOffset":end,"chunkSize":chunks[0].1,"chunkDigest":chunks[0].2
                 });
                 if chunks[0].4 {
@@ -296,6 +297,48 @@ pub fn build_chunked_bloated(
     Built {
         diff_id: sha(&tar),
         blob,
+        annotations,
+    }
+}
+
+/// `layer` with the table of contents `edit` makes of its own (the manifest
+/// vouches for the new one): what the tar stream and the tar-split of the
+/// layer say is not changed.
+pub fn with_toc(layer: &Built, edit: impl FnOnce(&mut serde_json::Value)) -> Built {
+    let p = "io.github.containers.zstd-chunked.";
+    let numbers = |name: &str| -> Vec<usize> {
+        layer.annotations[&format!("{p}{name}")]
+            .split(':')
+            .map(|x| x.parse().unwrap())
+            .collect()
+    };
+    let pos = numbers("manifest-position");
+    let toc = zstd::decode_all(&layer.blob[pos[0]..pos[0] + pos[1]]).unwrap();
+    let mut json: serde_json::Value = serde_json::from_slice(&toc).unwrap();
+    edit(&mut json);
+    let json = serde_json::to_vec(&json).unwrap();
+    let toc_z = frame(&json);
+    let mut blob = layer.blob[..pos[0]].to_vec();
+    let header = skippable(toc_z.len());
+    let at = pos[0] - header.len();
+    blob[at..pos[0]].copy_from_slice(&header);
+    blob.extend(&toc_z);
+    blob.extend(&layer.blob[pos[0] + pos[1]..]);
+    let shift = toc_z.len() as i64 - pos[1] as i64;
+    let ts = numbers("tarsplit-position");
+    let mut annotations = layer.annotations.clone();
+    annotations.insert(
+        format!("{p}tarsplit-position"),
+        format!("{}:{}:{}", ts[0] as i64 + shift, ts[1], ts[2]),
+    );
+    annotations.insert(
+        format!("{p}manifest-position"),
+        format!("{}:{}:{}:1", pos[0], toc_z.len(), json.len()),
+    );
+    annotations.insert(format!("{p}manifest-checksum"), sha(&toc_z).to_string());
+    Built {
+        blob,
+        diff_id: layer.diff_id,
         annotations,
     }
 }
@@ -856,6 +899,31 @@ pub async fn start_registry() -> (String, Arc<Registry>) {
     (host, reg)
 }
 
+/// The files under `dir`, by their paths, sorted.
+fn files_under(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut left = vec![dir.to_path_buf()];
+    while let Some(d) = left.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            match e.file_type().unwrap().is_dir() {
+                true => left.push(e.path()),
+                false => out.push(e.path().strip_prefix(dir).unwrap().display().to_string()),
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// What a store holds ([`Env::stored`]).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Stored {
+    objects: Vec<String>,
+    rows: Vec<i64>,
+    staged: usize,
+    pulls: usize,
+}
+
 pub struct Env {
     pub _tmp: tempfile::TempDir,
     pub host: String,
@@ -1068,6 +1136,30 @@ impl Env {
                 })
                 .sum()
         })
+    }
+
+    /// What is stored: the objects, the rows of the layers, files, images
+    /// and their layers, and what is staged or being pulled.
+    pub async fn stored(&self) -> Stored {
+        let rows = self
+            .db
+            .conn()
+            .call(|c| {
+                ["layers", "files", "images", "image_layers"]
+                    .iter()
+                    .map(|t| {
+                        Ok(c.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))?)
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap();
+        Stored {
+            objects: files_under(&self._tmp.path().join("objects")),
+            rows,
+            staged: self.staged_leftovers(),
+            pulls: self.area().pulls().len(),
+        }
     }
 
     /// The staging area of lazy pulls of the store.

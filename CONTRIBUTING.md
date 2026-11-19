@@ -113,7 +113,12 @@ Rootless needs sub ids in `/etc/subuid` and `/etc/subgid`, `newuidmap` and
 `/dev/fuse`.  `make e2e-root` also runs the files that need root (mounts,
 fs-verity, cgroups of the system manager); `SUDO=` changes how root is
 reached, and it is empty when you already are root.  The files that pull
-images use a registry that has an `alpine:chunked` image: `E2E_REGISTRY`
+images use a registry that has an `alpine:chunked` image whose TOCs give the
+fs-verity digest of every file (what `velarx image push --compression-format
+zstd:chunked` writes; a zstd:chunked layer without those digests, as
+containers/storage writes it, is refused) and, for the tests of that refusal,
+an `alpine-plain:chunked` image made by containers/storage (they skip without
+it): `E2E_REGISTRY`
 (host:port, plain HTTP, default `localhost:5000`; `tests/e2e/bats/helpers.bash`
 reads it once and every file uses the variable, so a registry on another port
 needs no edit; `E2E_IMAGE` defaults to `$E2E_REGISTRY/alpine:chunked`, and

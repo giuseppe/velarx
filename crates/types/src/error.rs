@@ -38,11 +38,11 @@ pub enum ImageError {
     Layer(String),
     #[error("digest mismatch: expected {}, got {}", printable(.expected), printable(.actual))]
     DigestMismatch { expected: String, actual: String },
-    /// The bytes of a zstd:chunked layer are not what the TOC its
-    /// descriptor vouches for says: the registry gave other bytes for the
-    /// ranges of the blob, or the TOC lies about the blob.  The pull is
-    /// refused, not taken whole.
-    #[error("the layer is not what its TOC says: {}", printable(.0))]
+    /// A zstd:chunked layer is refused for its table of contents, which its
+    /// descriptor vouches for: the registry gave other bytes than the
+    /// table says, the table lies about the blob, or it cannot be used.
+    /// Trying again would give the same.
+    #[error("the layer is refused: {}", printable(.0))]
     Contradicted(String),
     #[error("not found: {}", printable(.0))]
     NotFound(String),
@@ -120,7 +120,7 @@ pub enum ImageError {
 }
 
 /// A layer of an image that cannot be pulled lazily, and why: `no_toc`,
-/// `no_file_digests`, `no_ranges`, `unsupported` or `unreachable`.
+/// `no_ranges`, `unsupported` or `unreachable`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NotLazyLayer {
     /// Its position in the manifest, from 0
@@ -135,9 +135,6 @@ pub fn not_lazy_text(image: &str, layers: &[NotLazyLayer]) -> String {
     use velarx_proto::transfer::NotLazy as Why;
     let why = |l: &NotLazyLayer| match l.reason {
         Why::NoToc => format!("{} has no table of contents", l.media_type),
-        Why::NoFileDigests => {
-            "its table of contents has no fs-verity digest for every file".to_string()
-        }
         Why::NoRanges => "its registry does not serve ranges of the blob".to_string(),
         Why::Unsupported => format!("{} is not read lazily", l.media_type),
         Why::Unreachable => "no fetcher of the list reaches it".to_string(),

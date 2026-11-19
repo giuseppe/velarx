@@ -384,17 +384,20 @@ PY
     $SH volume rm e2e-holes > /dev/null
 }
 
-@test "a lazy pull of an image that cannot be lazy is refused before anything exists" {
+@test "an image of a table of contents without fs-verity digests is refused, lazily or not, and nothing is made" {
+    local plain=$REG/alpine-plain:chunked
+    curl -sf -m 5 "http://$REG/v2/alpine-plain/manifests/chunked" -o /dev/null -H 'Accept: application/vnd.oci.image.manifest.v1+json' || skip "no $plain"
     for id in $($SH image list -q); do $SH image remove --force "$id" > /dev/null 2>&1; done
     # (the zstd:chunked layers of containers/storage give no fs-verity
-    # digest of their files: ImageNotLazy, no pull in progress, no image)
-    out=$($SH image pull --lazy --tls-verify=false "$IMG" 2>&1)
-    check "lazy pull refused" 125 $?
-    check_match "...saying why" "cannot be pulled lazily: layer 1 .*no fs-verity digest for every file" "$out"
-    check "no pull is left" "" "$($SH image pulls -q)"
-    check "no image" "" "$($SH image list -q)"
-    $SH image pull --tls-verify=false "$IMG" > /dev/null 2>&1
-    check "an eager pull" 0 $?
+    # digest of their files: a layer with a table is pulled by it or not at
+    # all; no pull in progress, no image)
+    for lazy in --lazy ""; do
+        out=$($SH image pull $lazy --tls-verify=false "$plain" 2>&1)
+        check "pull ($lazy) refused" 125 $?
+        check_match "...saying why" "layer sha256:[0-9a-f]+: its table of contents has no fs-verity digest for" "$out"
+        check "no pull is left" "" "$($SH image pulls -q)"
+        check "no image" "" "$($SH image list -q)"
+    done
 }
 
 @test "a single image of another platform is taken with podman's warning" {

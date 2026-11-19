@@ -50,7 +50,7 @@ EOF
 
     # Only the layers whose TOCs give the fs-verity digests of their files,
     # which the layer writer gives and containers/storage does not, stay lazy
-    # (the others are pulled whole): the image is pushed again by velarx
+    # (the others are refused): the image is pushed again by velarx
     # (gzip, and back as zstd:chunked), then the store starts empty.
     if [ -z "${LAZY_IMAGE_SEALED:-}" ]; then
         local sealed=$E2E_REGISTRY/velarx-e2e/lazy-complete-$$

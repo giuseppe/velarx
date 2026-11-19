@@ -2,9 +2,10 @@
 //! Lazy layers: the metadata of a zstd:chunked layer without its files.
 //!
 //! The TOC and the tar-split are fetched and checked against the digests the
-//! manifest and the TOC give.  The stored TOC is made from the tar headers of
-//! the tar-split (the same data a full pull stores) with, for each file, the
-//! position of its chunks in the blob.  The files are fetched later, one at a
+//! manifest and the TOC give.  The stored TOC is the table the manifest
+//! vouches for (the tar-split is kept to make the layer's tar again, never to
+//! tell what the layer holds), with, for each file, the position of its
+//! chunks in the blob.  The files are fetched later, one at a
 //! time as they are read or all of them when the image is completed, with the
 //! same planner and the same checks as a partial pull.  Each file is proved by
 //! the commit of the completion (its bytes against the TOC, its fs-verity
@@ -12,24 +13,19 @@
 //! stream.
 
 use super::chunked::{self, Info};
-use super::entry::{self, MAX_ENTRIES};
-use super::tar::{normalize_path, Kind, TarReader};
+use super::entry;
+use super::tar::TarReader;
 use super::tarsplit::{self, Contents, Entries, Replay};
 use super::{LayerReport, PullCtx};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::sync::{Arc, Mutex};
-use tracing::debug;
 use velarx_storage::{Toc, TocEntry, TocEntryType, TOC_VERSION};
 use velarx_types::digest::{Algorithm, Digest};
 use velarx_types::{ImageError, ImageResult, OciDescriptor};
 
 fn fail(msg: impl Into<String>) -> ImageError {
     ImageError::Layer(msg.into())
-}
-
-fn io_fail(e: io::Error) -> ImageError {
-    ImageError::Layer(e.to_string())
 }
 
 /// The metadata of a lazy layer.
@@ -39,6 +35,15 @@ pub struct LazyLayer {
     /// The verified, zstd compressed tar-split.
     pub tarsplit: bytes::Bytes,
     pub report: LayerReport,
+}
+
+/// The first regular file with content to which `toc` gives no fs-verity
+/// digest: a layer that has one is refused (a file is known, fetched and
+/// checked by its fs-verity digest, which is not computed here).
+pub fn without_verity(toc: &Toc) -> Option<&TocEntry> {
+    toc.entries
+        .iter()
+        .find(|e| e.entry_type == TocEntryType::Reg && e.size > 0 && e.verity().is_none())
 }
 
 /// File contents made of zeros: the headers of a tar-split are read without
@@ -51,85 +56,48 @@ impl Contents for Zeros {
     }
 }
 
-/// The first regular file with content to which `toc` gives no fs-verity
-/// digest: a layer that has one is not pulled lazily (a lazy file is known,
-/// fetched and checked by its fs-verity digest), but whole, its files
-/// checked by their sha256 (containers/storage writes such TOCs).
-pub fn without_verity(toc: &Toc) -> Option<&TocEntry> {
-    toc.entries
+/// The TOC the layer `layer` pulled by its table of contents is stored by:
+/// the entries of the table the descriptor vouches for.  Each file needs an
+/// fs-verity digest or the digest of its content (see [`without_verity`]).
+/// The tar-split (`tarsplit_z`, verified against the table) makes the tar of
+/// the layer again, so it must describe the same entries in the same order,
+/// contents aside: a table and a tar stream that describe two filesystems
+/// are refused.
+pub fn toc_view(
+    registry: &Toc,
+    alg: Algorithm,
+    tarsplit_z: bytes::Bytes,
+    layer: &Digest,
+) -> ImageResult<Toc> {
+    let refused =
+        |e: &dyn std::fmt::Display| ImageError::Contradicted(format!("layer {layer}: {e}"));
+    let entries = registry
+        .entries
         .iter()
-        .find(|e| e.entry_type == TocEntryType::Reg && e.size > 0 && e.verity().is_none())
-}
-
-/// The TOC of a layer pulled by its table of contents: the entries of the
-/// tar headers of `tarsplit_z`, with the digests and the chunks of each file
-/// from the TOC of the registry, which must give each file an fs-verity
-/// digest or the digest of its content (a lazy layer needs the first: see
-/// [`without_verity`]).
-pub fn merge_toc(registry: &Toc, alg: Algorithm, tarsplit_z: bytes::Bytes) -> ImageResult<Toc> {
-    // The files of the registry TOC by name, with the chunk entries that
-    // follow each.
-    let mut files: HashMap<String, VecDeque<usize>> = HashMap::new();
-    for (i, e) in registry.entries.iter().enumerate() {
-        if e.entry_type == TocEntryType::Reg && e.size > 0 {
-            if let Some(name) = normalize_path(&e.name) {
-                files.entry(name).or_default().push_back(i);
-            }
-        }
-    }
-    let input = tarsplit::decoder(tarsplit_z, tarsplit::MAX_SIZE).map_err(io_fail)?;
+        .map(|e| entry::from_toc(e, alg))
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(|e| refused(&e))?;
+    let input = tarsplit::decoder(tarsplit_z, tarsplit::MAX_SIZE).map_err(|e| refused(&e))?;
     let mut tar = TarReader::new(Replay::new(Entries::new(input), Zeros));
-    let mut entries: Vec<TocEntry> = Vec::new();
-    while let Some(h) = tar.next_entry().map_err(io_fail)? {
-        if entries.len() >= MAX_ENTRIES {
-            return Err(fail("the layer has too many entries"));
-        }
-        let content = match h.kind {
-            Kind::Regular if h.size == 0 => Some(Digest::empty(alg).to_string()),
-            Kind::Regular => {
-                let name = normalize_path(&h.path)
-                    .ok_or_else(|| fail(format!("invalid path `{}` in the layer", h.path)))?;
-                let i = files
-                    .get_mut(&name)
-                    .and_then(|q| q.pop_front())
-                    .ok_or_else(|| fail(format!("no content for `{name}` in the TOC")))?;
-                let reg = &registry.entries[i];
-                if reg.size != h.size {
-                    return Err(fail(format!(
-                        "`{name}` has {} bytes in the TOC and {} in the tar-split",
-                        reg.size, h.size
-                    )));
-                }
-                let id = reg
-                    .verity()
-                    .or_else(|| reg.digest.clone().filter(|d| d.parse::<Digest>().is_ok()))
-                    .ok_or_else(|| {
-                        fail(format!("the TOC of the layer has no digest for `{name}`"))
-                    })?;
-                let mut e = entry::from_header(&h, Some(&id)).map_err(io_fail)?;
-                e.digest = reg.digest.clone().filter(|d| d.parse::<Digest>().is_ok());
-                e.fsverity = reg.fsverity.clone();
-                e.offset = reg.offset;
-                e.end_offset = reg.end_offset;
-                e.chunk_digest = reg.chunk_digest.clone();
-                e.chunk_size = reg.chunk_size;
-                e.chunk_offset = 0;
-                e.chunk_type = reg.chunk_type.clone();
-                entries.push(e);
-                for c in registry.entries[i + 1..]
-                    .iter()
-                    .take_while(|c| c.entry_type == TocEntryType::Chunk)
-                {
-                    entries.push(c.clone());
-                }
-                continue;
+    let mut table = entries
+        .iter()
+        .filter(|e| e.entry_type != TocEntryType::Chunk);
+    loop {
+        let header = tar.next_entry().map_err(|e| refused(&e))?;
+        let header = header
+            .map(|h| entry::header_entry(&h))
+            .transpose()
+            .map_err(|e| refused(&e))?;
+        match (header, table.next()) {
+            (None, None) => break,
+            (Some(h), Some(t)) if entry::same_entry(&h, t) => {}
+            (h, t) => {
+                let name = t.or(h.as_ref()).map_or("", |e| e.name.as_str());
+                return Err(refused(&format!(
+                    "its table of contents and its tar-split differ at `{name}`"
+                )));
             }
-            _ => None,
-        };
-        entries.push(entry::from_header(&h, content.as_deref()).map_err(io_fail)?);
-    }
-    if files.values().any(|q| !q.is_empty()) {
-        return Err(fail("the TOC has files the tar-split does not"));
+        }
     }
     Ok(Toc {
         version: TOC_VERSION,
@@ -138,101 +106,54 @@ pub fn merge_toc(registry: &Toc, alg: Algorithm, tarsplit_z: bytes::Bytes) -> Im
     })
 }
 
-/// Why a layer is not pulled lazily.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NotLazy {
-    /// The descriptor does not state zstd:chunked metadata.
-    NotChunked,
-    /// The descriptor states a table of contents and no tar-split.
-    NoTarSplit,
-    /// The table of contents gives no fs-verity digest for this file.
-    NoVerity(String),
-}
-
-impl std::fmt::Display for NotLazy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotChunked => f.write_str("it is not a zstd:chunked layer"),
-            Self::NoTarSplit => f.write_str("it is a zstd:chunked layer without a tar-split"),
-            Self::NoVerity(name) => write!(
-                f,
-                "its table of contents has no fs-verity digest for `{name}`"
-            ),
-        }
-    }
-}
-
 /// The metadata of a layer that can be pulled lazily, with the zstd:chunked
 /// information of its descriptor.
 pub type Found = (Info, LazyLayer);
 
 /// Fetch and verify the metadata of a zstd:chunked layer, with the
-/// zstd:chunked metadata of its descriptor.  Not lazy (and why) if the layer
-/// is not one with a tar-split, or its TOC does not give the fs-verity
-/// digests of its files: it has to be pulled otherwise.
-pub async fn pull_metadata(
-    ctx: &PullCtx,
-    layer: &OciDescriptor,
-) -> ImageResult<Result<Found, NotLazy>> {
+/// zstd:chunked metadata of its descriptor.  None if the layer is not
+/// zstd:chunked; a table that cannot be used is an error
+/// ([`chunked::verify_metadata`]).
+pub async fn pull_metadata(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<Option<Found>> {
     let Some(info) = chunked::parse_info(layer)? else {
-        return Ok(Err(NotLazy::NotChunked));
+        return Ok(None);
     };
     // (the fetcher finds them: `Probe`; what it gives is verified below)
     let (toc_z, ts_z) = chunked::metadata(ctx, layer).await?;
-    found_of(info, (toc_z, ts_z), layer.digest).await
+    found_of(info, (toc_z, ts_z), layer.digest).await.map(Some)
 }
 
 /// The lazy layer of `layer` from its table of contents and tar-split as
 /// the fetcher gave them (compressed), verified against the descriptor's
-/// `info`; why not, when its table lacks a file's fs-verity digest.
+/// `info`.
 async fn found_of(
     info: Info,
     (toc_z, ts_z): (Vec<u8>, Vec<u8>),
     layer_digest: Digest,
-) -> ImageResult<Result<Found, NotLazy>> {
+) -> ImageResult<Found> {
     let fetched = (toc_z.len() + ts_z.len()) as u64;
     let layer_info: Info = info.clone();
-    let lazy = tokio::task::spawn_blocking(move || -> ImageResult<Result<LazyLayer, NotLazy>> {
-        let Some(meta) = chunked::verify_metadata(&layer_info, &toc_z, ts_z, &layer_digest)? else {
-            return Ok(Err(NotLazy::NoTarSplit));
-        };
-        if let Some(e) = without_verity(&meta.toc) {
-            debug!(
-                "Layer {layer_digest}: pulled whole, its TOC has no fs-verity digest for `{}`",
-                e.name
-            );
-            return Ok(Err(NotLazy::NoVerity(e.name.clone())));
-        }
-        // (the table of a canonical layer is the layer's, as it is)
-        let toc = if meta.toc.is_canonical() {
-            meta.toc.clone()
-        } else {
-            Arc::new(merge_toc(
-                &meta.toc,
-                layer_info.checksum.alg(),
-                meta.tarsplit_z.clone(),
-            )?)
-        };
-        Ok(Ok(LazyLayer {
-            toc,
+    let lazy = tokio::task::spawn_blocking(move || -> ImageResult<LazyLayer> {
+        let meta = chunked::verify_metadata(&layer_info, &toc_z, ts_z, &layer_digest)?;
+        Ok(LazyLayer {
+            toc: meta.stored,
             tarsplit: meta.tarsplit_z,
             report: LayerReport {
                 fetched_bytes: fetched,
                 ..LayerReport::default()
             },
-        }))
+        })
     })
     .await
     .map_err(|e| fail(format!("metadata task: {e}")))??;
-    Ok(lazy.map(|l| (info, l)))
+    Ok((info, lazy))
 }
 
 /// Whether `layer` can be pulled lazily through the fetchers that answered
 /// `reply` to `Probe` (with `metadata`, the table of contents and tar-split
 /// it carried): the layer, verified against its descriptor, or the word of
-/// `ImageNotLazy` that says why not (`no_toc`, `no_file_digests`,
-/// `no_ranges`, `unsupported`, `unreachable`).  A table that is not the
-/// descriptor's is an error, not a reason.
+/// `ImageNotLazy` that says why not (`no_toc`, `no_ranges`, `unsupported`,
+/// `unreachable`).  A table that cannot be used is an error, not a reason.
 pub async fn accept(
     layer: &OciDescriptor,
     reply: &crate::fetcher::fetch::Probed,
@@ -245,12 +166,11 @@ pub async fn accept(
     let (TocSource::Carried, Some(metadata)) = (reply.toc, metadata) else {
         return Ok(Err(reply.reason.unwrap_or(Why::Unreachable)));
     };
-    match found_of(info, metadata, layer.digest).await? {
-        Err(NotLazy::NoVerity(_)) => Ok(Err(Why::NoFileDigests)),
-        Err(_) => Ok(Err(Why::NoToc)),
-        Ok(_) if !reply.on_demand => Ok(Err(reply.reason.unwrap_or(Why::NoRanges))),
-        Ok(found) => Ok(Ok(found)),
-    }
+    let found = found_of(info, metadata, layer.digest).await?;
+    Ok(match reply.on_demand {
+        true => Ok(found),
+        false => Err(reply.reason.unwrap_or(Why::NoRanges)),
+    })
 }
 
 /// The TOCs of lazy layers last parsed, by layer digest: a file read on
@@ -312,59 +232,71 @@ mod tests {
         }
     }
 
-    /// The tar-split of a tar of a directory, a file of 5 bytes and a symlink,
-    /// and the digest of the file.
-    fn sample() -> (Vec<u8>, String) {
+    /// The tar-split of a tar of the root, a directory, a file of 5 bytes
+    /// (mode 04777) and a symbolic link to it.
+    fn tarsplit() -> bytes::Bytes {
         let mut b = tar::Builder::new(Vec::new());
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Directory);
-        h.set_size(0);
-        h.set_mode(0o755);
-        b.append_data(&mut h, "d/", io::empty()).unwrap();
+        h.set_mode(0o644);
+        for dir in ["./", "d/"] {
+            b.append_data(&mut h.clone(), dir, io::empty()).unwrap();
+        }
         let mut h = tar::Header::new_gnu();
         h.set_size(5);
-        h.set_mode(0o600);
-        h.set_uid(7);
+        h.set_mode(0o4777);
         b.append_data(&mut h, "d/f", &b"hello"[..]).unwrap();
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Symlink);
-        h.set_size(0);
+        h.set_mode(0o644);
         b.append_link(&mut h, "d/l", "f").unwrap();
         let tar = b.into_inner().unwrap();
-
-        // The tar-split of it, with the layer writer's recorder.
         let mut r = TarReader::with_sink(&tar[..], tarsplit::Recorder::new().unwrap());
         while r.next_entry().unwrap().is_some() {}
         let (_, rec) = r.finish().unwrap();
-        (
-            rec.finish().unwrap().compressed,
-            crate::verity_text(b"hello"),
-        )
+        rec.finish().unwrap().compressed.into()
     }
 
-    #[test]
-    fn test_merge_takes_metadata_from_the_tar_headers_and_chunks_from_the_toc() {
-        let (ts, hello) = sample();
+    /// The table of contents of [`tarsplit`], as another tool may write it.
+    fn table() -> Toc {
+        let hello = crate::verity_text(b"hello");
         let mut file = entry("d/f", TocEntryType::Reg, 5, Some(&hello));
         file.chunk_digest = Some(hello.clone());
         file.chunk_size = 3;
+        file.mode = 0o104777;
+        file.xattrs
+            .insert("trusted.overlay.redirect".into(), "eA==".into());
         let mut chunk = entry("d/f", TocEntryType::Chunk, 0, None);
         chunk.chunk_digest = Some(hello.clone());
         chunk.chunk_offset = 3;
         chunk.chunk_size = 2;
-        // The registry lies about the mode: the tar header is what counts.
-        file.mode = 0o777;
-        let registry = Toc {
+        let mut link = entry("d/l", TocEntryType::Symlink, 0, None);
+        link.link_name = Some("f".into());
+        Toc {
             version: 1,
             entries: vec![
-                entry("d", TocEntryType::Dir, 0, None),
+                entry("./", TocEntryType::Dir, 0, None),
+                entry("./d/", TocEntryType::Dir, 7, Some(&hello)),
                 file,
                 chunk,
-                entry("d/l", TocEntryType::Symlink, 0, None),
+                link,
             ],
             tar_split_digest: None,
-        };
-        let toc = merge_toc(&registry, Algorithm::Sha256, ts.into()).unwrap();
+        }
+    }
+
+    fn view(table: &Toc) -> ImageResult<Toc> {
+        toc_view(
+            table,
+            Algorithm::Sha256,
+            tarsplit(),
+            &Digest::empty(Algorithm::Sha256),
+        )
+    }
+
+    #[test]
+    fn test_view_is_the_table_kept_to_what_a_layer_is() {
+        let toc = view(&table()).unwrap();
         let names: Vec<_> = toc
             .entries
             .iter()
@@ -373,46 +305,59 @@ mod tests {
         assert_eq!(
             names,
             [
+                ("./", TocEntryType::Dir),
                 ("d", TocEntryType::Dir),
                 ("d/f", TocEntryType::Reg),
                 ("d/f", TocEntryType::Chunk),
                 ("d/l", TocEntryType::Symlink)
             ]
         );
-        let f = &toc.entries[1];
-        assert_eq!((f.mode, f.uid), (0o600, 7));
-        assert_eq!(
-            f.digest.as_deref(),
-            Some(hello.replace("fsverity-sha256-12:", "sha256:").as_str())
-        );
+        let f = &toc.entries[2];
+        assert_eq!(f.mode, 0o4777);
+        assert!(f.xattrs.is_empty());
         assert_eq!((f.offset, f.end_offset, f.chunk_size), (100, 200, 3));
-        assert_eq!(toc.entries[3].link_name.as_deref(), Some("f"));
+        assert_eq!((toc.entries[1].size, &toc.entries[1].digest), (0, &None));
+        assert_eq!(toc.entries[4].link_name.as_deref(), Some("f"));
     }
 
     #[test]
-    fn test_merge_refuses_a_toc_that_does_not_match_the_tar_split() {
-        let (ts, hello) = sample();
-        let good = entry("d/f", TocEntryType::Reg, 5, Some(&hello));
-        // Wrong size, no digest, missing file, an extra file.
-        let mut wrong_size = good.clone();
-        wrong_size.size = 6;
-        let mut no_digest = good.clone();
-        no_digest.fsverity = None;
-        no_digest.digest = None;
-        let extra = entry("d/g", TocEntryType::Reg, 1, Some(&hello));
-        for entries in [
-            vec![wrong_size],
-            vec![no_digest],
-            vec![],
-            vec![good.clone(), extra],
-        ] {
-            let registry = Toc {
-                version: 1,
-                entries,
-                tar_split_digest: None,
-            };
-            assert!(merge_toc(&registry, Algorithm::Sha256, ts.clone().into()).is_err());
+    fn test_view_refuses_a_table_the_tar_split_contradicts() {
+        type Edit = fn(&mut Toc);
+        let edits: [(&str, Edit); 7] = [
+            ("d/f", |t| t.entries[2].mode = 0o755),
+            ("d/f", |t| t.entries[2].uid = 1),
+            ("d/f", |t| {
+                t.entries[2].xattrs.insert("user.k".into(), "eA==".into());
+            }),
+            ("d/g", |t| t.entries[2].name = "d/g".into()),
+            ("d/l", |t| {
+                t.entries[4].link_name = Some("/etc/shadow".into())
+            }),
+            ("d/l", |t| {
+                t.entries.pop();
+            }),
+            ("x", |t| {
+                let mut x = t.entries[0].clone();
+                x.name = "x".into();
+                t.entries.push(x);
+            }),
+        ];
+        for (at, edit) in edits {
+            let mut t = table();
+            edit(&mut t);
+            let e = view(&t).unwrap_err();
+            assert!(matches!(e, ImageError::Contradicted(_)), "{e}");
+            assert!(e.to_string().contains(&format!("differ at `{at}`")), "{e}");
         }
+    }
+
+    #[test]
+    fn test_view_refuses_a_file_without_a_digest() {
+        let mut t = table();
+        t.entries[2].digest = None;
+        t.entries[2].fsverity = None;
+        let e = view(&t).unwrap_err();
+        assert!(e.to_string().contains("no digest for `d/f`"), "{e}");
     }
 
     #[test]

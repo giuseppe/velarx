@@ -272,25 +272,18 @@ async fn test_a_toc_that_lies_about_a_file_is_caught_when_the_file_is_fetched() 
     assert_eq!(e.staged_leftovers(), 0);
 }
 
-/// A table of contents without the fs-verity digest of every file cannot be
-/// served lazily: refused as `no_file_digests`, the engine read it in the
-/// table.
+/// A table of contents without the fs-verity digest of every file is refused,
+/// naming the layer and the file: it is not pulled lazily, nor whole.
 #[tokio::test]
 async fn test_a_lazy_pull_of_a_table_without_file_digests_is_refused() {
     let e = env().await;
     let plain = build_chunked_plain(&sample());
     e.publish(&[&plain], &[ZSTD]);
-    let refused = e.pull_lazy().await;
-    let Err(velarx_types::ImageError::NotLazy { layers, .. }) = refused else {
-        panic!("{refused:?}");
-    };
-    assert_eq!(
-        layers
-            .iter()
-            .map(|l| (l.index, l.reason.word()))
-            .collect::<Vec<_>>(),
-        vec![(0, "no_file_digests")]
-    );
+    let before = e.stored().await;
+    let refused = e.pull_lazy().await.unwrap_err().to_string();
+    assert!(refused.contains(&sha(&plain.blob).to_string()), "{refused}");
+    assert!(refused.contains("no fs-verity digest for `"), "{refused}");
+    assert_eq!(e.stored().await, before);
     assert!(e.area().pulls().is_empty());
     assert_eq!(e.staged_leftovers(), 0);
 }

@@ -5,8 +5,8 @@
 # "varlink"` and `[storage.varlink]`.  What runs on a store made with it (pull,
 # run, exec, restart, commit, diff, cp, a user namespace, build, import, an image
 # mounted in a container, rm, image rm, gc, prune), what `info` says of it, what
-# it refuses (fs-verity enforced while a container runs, a lazy pull of an image
-# with a layer that cannot be served lazily), lazy images (staged and run by the
+# it refuses (fs-verity enforced while a container runs, an image whose tables
+# of contents have no fs-verity digests, `alpine-plain:chunked`), lazy images (staged and run by the
 # engine, completed into the service),
 # the service stopped, a service of another version, the settings that are
 # wrong, and the store the service drops when everything is removed.  Run it
@@ -277,21 +277,23 @@ monitor_log () {
     find "$WORKDIR" -path "*/${id:0:12}*" -name monitor.log 2> /dev/null | head -1 | xargs -r cat
 }
 
-@test "--lazy of an image with a layer that cannot be served lazily is refused before anything is staged, naming the layer" {
-    sh_ image rm -f "$IMAGE" > /dev/null
-    out=$(sh_ image pull --lazy --tls-verify=false "$IMAGE" 2>&1)
-    check "the pull is refused" 125 $?
-    # (ImageNotLazy: the image's tables of contents have no fs-verity
-    # digests, which is refused before the storage service is asked)
-    check_match "the layer is named" 'layer [0-9]+ \(sha256:[0-9a-f]{64}\)' "$out"
-    check_match "and the remedy" 'without --lazy' "$out"
-    check "no pull is in progress" "" "$(sh_ image pulls -q)"
-    check "nothing is staged" 0 "$(find "$(store)/staging/meta" -name layer.json 2> /dev/null | wc -l)"
-    out=$(sh_ container run -d --lazy --network none --name nolazy "$IMAGE" true 2>&1)
+@test "an image whose tables of contents have no fs-verity digests is refused, lazily or not, before anything is staged, naming the layer" {
+    local plain=$E2E_REGISTRY/alpine-plain:chunked
+    curl -sf -m 5 -o /dev/null -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+        "http://$E2E_REGISTRY/v2/alpine-plain/manifests/chunked" || skip "no $plain"
+    for lazy in --lazy ""; do
+        # shellcheck disable=SC2086
+        out=$(sh_ image pull $lazy --tls-verify=false "$plain" 2>&1)
+        check "the pull ($lazy) is refused" 125 $?
+        check_match "the layer is named" 'layer sha256:[0-9a-f]{64}' "$out"
+        check_match "and the missing digest" 'its table of contents has no fs-verity digest for' "$out"
+        check "no pull is in progress" "" "$(sh_ image pulls -q)"
+        check "nothing is staged" 0 "$(find "$(store)/staging/meta" -name layer.json 2> /dev/null | wc -l)"
+        check "no image is made" 0 "$(sh_ image list | grep -c alpine-plain)"
+    done
+    out=$(sh_ container run -d --lazy --network none --name nolazy "$plain" true 2>&1)
     check "a container with --lazy is refused the same way" 125 $?
     check_match "and no container is made" '^$' "$(sh_ container list -a -q)"
-    sh_ image pull --tls-verify=false "$IMAGE" > /dev/null
-    check "the image pulls whole" 0 $?
 }
 
 # what the engine keeps of a lazy image: its objects, the EROFS images of its

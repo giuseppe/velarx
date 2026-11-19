@@ -130,8 +130,6 @@ type NotLazy (
 	no_ranges,
 	# This fetcher cannot reach the layer
 	unreachable,
-	# A regular file of the table has no fs-verity digest
-	no_file_digests,
 	# A compression or media type the fetcher does not read (also what a
 	# value this side does not know is read as)
 	unsupported

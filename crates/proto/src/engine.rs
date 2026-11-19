@@ -806,7 +806,7 @@ pub struct PullSpec {
 }
 
 /// A layer of an image that cannot be pulled lazily, and why: `no_toc`,
-/// `no_file_digests`, `no_ranges`, `unsupported`, `unreachable`.
+/// `no_ranges`, `unsupported`, `unreachable`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::CustomType)]
 pub struct NotLazyLayer {
     /// Its position in the manifest, from 0

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Layers that are fetched whole: gzip, zstd or uncompressed tarballs, and
-//! zstd:chunked layers that cannot be pulled by ranges.
+//! Layers that are fetched whole: gzip, zstd or uncompressed tarballs (a
+//! layer with a zstd:chunked table of contents is never one of them).
 //!
 //! The blob is streamed through three stages that run at the same time:
 //!
@@ -327,6 +327,7 @@ pub async fn ingest(
     expected_diff_id: &Digest,
     progress: impl Fn(u64),
 ) -> ImageResult<Ingested> {
+    super::chunked::no_table(layer)?;
     match source {
         // (a layer a build made was read once, as it was made:
         // `made::from_walk`)

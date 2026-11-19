@@ -1033,12 +1033,11 @@ pub async fn pull_makes_the_artifacts_of_the_layers(f: &Factory) {
     let keys: BTreeSet<&LayerKey> = pulled.layers.iter().map(|l| &l.done.key).collect();
     assert_eq!(keys.len(), 2);
     assert_eq!(pulled.artifacts.keys().collect::<BTreeSet<_>>(), keys);
-    // (what the driver was asked is what it got: each layer once, and the key
-    // each was asked by is the key it came out as)
+    // (what the driver was asked is what it got: each layer once, under
+    // the key it was asked by)
     assert_eq!(offer.fetches(), 2);
-    for l in &pulled.layers {
-        assert_eq!(l.asked, l.done.key);
-    }
+    let asked: BTreeSet<&LayerKey> = offer.layers.iter().map(|l| &l.key).collect();
+    assert_eq!(asked, keys);
     for m in pulled.artifacts.values() {
         assert!(!m.image_digest.is_empty());
         // the owners are `[[uids], [gids]]`
@@ -2159,10 +2158,7 @@ pub async fn a_feed_writes_into_the_files_a_driver_hands_over(f: &Factory) {
             Ok(out)
         }
     }
-    let pulled = PulledLayer {
-        asked: layer.key,
-        done,
-    };
+    let pulled = PulledLayer { done };
     tokio::task::spawn_blocking(move || prove_with("test", Arc::new(Places(places)), &pulled))
         .await
         .unwrap()
@@ -2372,8 +2368,8 @@ fn blob_offer_limited(
 }
 
 /// The compressions a layer the engine reads whole comes in: a tar, gzip, and
-/// zstd:chunked (a commit's own, whose labels the engine does not use for an
-/// archive).
+/// zstd:chunked, which an archive cannot give by its table of contents and is
+/// refused.
 fn compressions() -> [velarx_content::layer::writer::Compression; 3] {
     use velarx_content::layer::writer::Compression;
     [
@@ -2398,7 +2394,7 @@ pub async fn a_layer_read_whole_is_stored_and_read_back(f: &Factory) {
         o.layers
             .iter()
             .map(|offered| {
-                let l = pulled.layers.iter().find(|l| l.asked == offered.key);
+                let l = pulled.layers.iter().find(|l| l.done.key == offered.key);
                 pulled.artifacts[&l.expect("a layer of the offer").done.key].clone()
             })
             .collect::<Vec<_>>()
@@ -2406,6 +2402,19 @@ pub async fn a_layer_read_whole_is_stored_and_read_back(f: &Factory) {
     for (n, compression) in compressions().into_iter().enumerate() {
         let own = second(f, &s, &format!("blobs-{n}")).await;
         let o = blob_offer(&own, &[&base, &top], compression);
+        if compression == velarx_content::layer::writer::Compression::ZstdChunked {
+            // (a layer with a table of contents is never read as a stream)
+            let refused = o.pull(&own, engine_check()).await.err().expect("refused");
+            let digests: Vec<String> = o
+                .layers
+                .iter()
+                .map(|l| l.descriptor.digest.to_string())
+                .collect();
+            let text = refused.to_string();
+            assert!(digests.iter().any(|d| text.contains(d)), "{text}");
+            assert!(text.contains("zstd:chunked"), "{text}");
+            continue;
+        }
         let pulled = o
             .pull(&own, engine_check())
             .await
@@ -2417,7 +2426,7 @@ pub async fn a_layer_read_whole_is_stored_and_read_back(f: &Factory) {
             let l = pulled
                 .layers
                 .iter()
-                .find(|l| l.asked == offered.key)
+                .find(|l| l.done.key == offered.key)
                 .expect("a layer of the offer");
             assert_eq!(
                 l.done.key,
@@ -2977,22 +2986,21 @@ pub async fn pull_reads_back_byte_for_byte(f: &Factory) {
 
 /// A layer whose table of contents names its files by the sha256 of their
 /// content only (no fs-verity digest: what containers/storage writes) is
-/// pulled (a driver in another process answers the proof of the pull by
-/// those keys for the objects it staged), the table the layer is recorded
-/// with has the fs-verity digest of each file measured on the way, and the
-/// stored layer reads back by it byte for byte (the diff id is proved
-/// again, and its stream is the tar).
-pub async fn a_layer_keyed_by_sha256_only_is_pulled_and_read_back(f: &Factory) {
-    let (_tmp, s) = begin!(f, "a_layer_keyed_by_sha256_only_is_pulled_and_read_back");
+/// refused, naming the layer and the file, and nothing of it is stored: the
+/// fs-verity digests are not made here, and the layer is not read as a
+/// stream instead.
+pub async fn a_layer_keyed_by_sha256_only_is_refused(f: &Factory) {
+    let (_tmp, s) = begin!(f, "a_layer_keyed_by_sha256_only_is_refused");
     let reg = Registry::start().await;
     let tar = base_layer();
     let (layer, _) = chunked_layer_made(&reg, &tar, false, |d| d, |b| b.to_vec());
+    let digest = layer.descriptor.digest;
     let mut layers = vec![layer];
     set_chains(&mut layers);
     let offer = Offer {
         feed: Arc::new(ArchiveFeed {
             layers: vec![(
-                layers[0].descriptor.digest,
+                digest,
                 registry_feed(&reg, &s.db, &s.dir, &layers[0].descriptor, false).await,
             )],
             meddle: Arc::default(),
@@ -3000,46 +3008,10 @@ pub async fn a_layer_keyed_by_sha256_only_is_pulled_and_read_back(f: &Factory) {
         layers,
         _registry: Some(reg),
     };
-    let pulled = offer.pull(&s, engine_check()).await.expect("pull");
-    let done = &pulled.layers[0].done;
-    // (the table recorded keeps the sha256 of each file the blob's table
-    // names and has the fs-verity digest of its content, measured in the
-    // pull: what image mounts and later reads name the object by)
-    let files: Vec<_> = done.toc.entries.iter().filter(|e| e.size > 0).collect();
-    assert!(!files.is_empty(), "the layer has files with content");
-    for e in files {
-        assert!(
-            e.digest
-                .as_deref()
-                .is_some_and(|d| d.starts_with("sha256:")),
-            "{}: the sha256 of the blob's table is kept",
-            e.name
-        );
-        assert!(
-            e.verity().is_some(),
-            "{}: the table recorded has the fs-verity digest measured in the pull",
-            e.name
-        );
-    }
-    record(&s, &pulled).await;
-    let l = pulled.layers[0].clone();
-    tokio::task::spawn_blocking({
-        let d = s.driver.clone();
-        move || prove_by_read_back(d, &l)
-    })
-    .await
-    .unwrap()
-    .expect("the layer reads back by the keys of its table of contents");
-    let stored = open_layer_for(&s, &done.key, &done.diff_id)
-        .await
-        .expect("open_layer");
-    let mut out = Vec::new();
-    stored
-        .verified_stream(Arc::new(DriverObjects::new(s.driver.clone())))
-        .unwrap()
-        .read_to_end(&mut out)
-        .unwrap();
-    assert!(out == tar, "the layer is not what was pulled");
+    let refused = offer.pull(&s, engine_check()).await.err().expect("refused");
+    let text = refused.to_string();
+    assert!(text.contains(&digest.to_string()), "{text}");
+    assert!(text.contains("no fs-verity digest for `"), "{text}");
 }
 
 pub async fn a_layer_that_is_not_stored_is_an_error(f: &Factory) {
@@ -4158,11 +4130,11 @@ pub async fn a_staged_file_that_is_not_its_name_is_not_stored(f: &Factory) {
 }
 
 /// A layer whose table of contents does not give the fs-verity digest of its
-/// files cannot be served lazily: the pull is refused before a byte of it is
-/// staged, naming the layer and what to do, and the driver and the staging
-/// area have nothing.
-pub async fn a_lazy_pull_of_a_layer_that_cannot_be_lazy_is_refused(f: &Factory) {
-    let case = "a_lazy_pull_of_a_layer_that_cannot_be_lazy_is_refused";
+/// files is refused, lazily or not: the pull ends before a byte of it is
+/// staged, naming the layer and the file, and the driver and the staging area
+/// have nothing.
+pub async fn a_lazy_pull_of_a_layer_without_file_digests_is_refused(f: &Factory) {
+    let case = "a_lazy_pull_of_a_layer_without_file_digests_is_refused";
     let (_tmp, s) = begin!(f, case);
     if !lazy_phase(&s, case) {
         return;
@@ -4175,12 +4147,11 @@ pub async fn a_lazy_pull_of_a_layer_that_cannot_be_lazy_is_refused(f: &Factory) 
         "a layer without fs-verity digests",
     );
     let text = e.to_string();
-    assert!(text.contains("cannot be pulled lazily"), "{text}");
     assert!(
         text.contains(&lazy.layers[0].descriptor.digest.to_string()),
         "{text}"
     );
-    assert!(text.contains("without --lazy"), "{text}");
+    assert!(text.contains("no fs-verity digest for `"), "{text}");
     assert_eq!(lazy.fetches(), 0, "no layer was fetched");
     let area = velarx_content::pull::staged::Staging::new(&s.staging);
     assert!(area.layer_keys().is_empty(), "nothing is staged");
@@ -6638,7 +6609,7 @@ macro_rules! conformance_suite_with {
             a_feed_writes_a_layer_read_whole_into_the_files_a_driver_hands_over,
             a_layer_read_whole_tells_its_holes_and_frees_its_spool,
             pull_reads_back_byte_for_byte,
-            a_layer_keyed_by_sha256_only_is_pulled_and_read_back,
+            a_layer_keyed_by_sha256_only_is_refused,
             a_layer_that_is_not_stored_is_an_error,
             has_layers_reports_what_a_pull_stored,
             has_layers_does_not_report_what_is_not_committed,
@@ -6653,7 +6624,7 @@ macro_rules! conformance_suite_with {
             a_lazy_layer_waits_and_is_completed,
             a_lazy_pull_is_staged_by_the_engine_and_completed_into_the_driver,
             a_staged_file_that_is_not_its_name_is_not_stored,
-            a_lazy_pull_of_a_layer_that_cannot_be_lazy_is_refused,
+            a_lazy_pull_of_a_layer_without_file_digests_is_refused,
             rootfs_plan_of_a_request,
             the_plan_of_a_create_is_the_plan_of_every_start,
             rootfs_plan_of_a_missing_layer_says_its_remedy,

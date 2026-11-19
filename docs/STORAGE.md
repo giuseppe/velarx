@@ -158,8 +158,8 @@ version is refused with an error.
 What the design gives:
 
 * **Content is checked on entry.**  Every chunk is verified against its
-  sha256 and every file against the fs-verity digest the TOC gives (or, for
-  a layer that gives none, its sha256) before it can get a name; every layer
+  sha256 and every file against the fs-verity digest the TOC gives before it
+  can get a name; every layer
   against its diff id and the configuration; the merged EROFS against the
   digest the manifest states; the manifest by policy.  Sources and peers are
   untrusted: everything they send is verified, and a lazy file is verified
@@ -268,17 +268,19 @@ object name.
   needs 5.10); fs-verity needs a file system that has it (ext4,
   f2fs, btrfs).
 * **Hashing cost.**  The fs-verity digest of a file on a file system without
-  fs-verity is computed by software at commit; for a layer whose TOC
-  gives only sha256 digests that is a second pass after the sha256 taken as
-  the file arrives.  A layer read whole is the exception: the pass that
+  fs-verity is computed by software at commit.  A layer read whole is the exception: the pass that
   hashes each file also measures its fs-verity digest (one more SHA-256 tree
   over the bytes), because the store can only be asked for a file by that
   digest; a file the store has is then not written, and not read again at the
   commit, and a file it lacks is measured once more by the kernel or by the
   commit.
-* **Layers of other tools.**  A zstd:chunked layer whose TOC gives no
-  fs-verity digests (containers/storage writes none) is pulled eagerly
-  through its TOC, by a lazy pull too; nothing is skipped by its sha256 before the download, as
-  nothing maps a sha256 to an object.  Push such an image again with
-  velarx (`push --compression-format zstd:chunked`) to make one whose layers are all lazy.
+* **Layers of other tools.**  A zstd:chunked layer is pulled through its
+  TOC or not at all, lazily or not: one whose TOC gives no fs-verity digest
+  for a file (containers/storage writes none unless asked) is refused with
+  an error that names the layer and the file, and Velarx does not compute
+  the digests itself.  Push such an image again with velarx (`push
+  --compression-format zstd:chunked`) to make one it pulls.  A zstd:chunked
+  layer of an archive or a directory, which have no ranges to read the TOC
+  by, is refused too (`load` of such an image is not supported yet), and so
+  is a layer whose tar-split does not describe the entries of its TOC.
 * Only the main store is written; additional stores are read-only.

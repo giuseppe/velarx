@@ -134,7 +134,11 @@ print("\n".join(",".join(l["Fsverity"]) for l in d["Composefs"]["Layers"]))')
 }
 
 @test "composefs_digests = require refuses an image that states none" {
-    out=$($SHR image pull --tls-verify=false "$IMG" 2>&1)
+    # (an image of another writer that velarx pulls: the layers of velarx
+    # without the digests of their EROFS images)
+    python3 -I "$WORKDIR/edit.py" "$REG" "$REPO" zstd foreign \
+        "[l.get('annotations', {}).pop('$KEY', None) for l in m['layers']]" || exit 1
+    out=$($SHR image pull --tls-verify=false "$REG/$REPO:foreign" 2>&1)
     check "the image of another writer" 125 $?
     check_match "the message names the option" 'composefs_digests is "require"' "$out"
     $SHR image pull --tls-verify=false "$REG/$REPO:zstd" > /dev/null 2>&1

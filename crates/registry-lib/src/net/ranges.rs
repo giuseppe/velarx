@@ -32,9 +32,17 @@ pub async fn fetch_ranges(
         return Err(bad("byte ranges are not ascending and disjoint"));
     }
     let header = range_header(ranges);
-    let resp = client.get_blob(target, digest, Some(&header)).await?;
-    let status = resp.status();
-    if status == StatusCode::BAD_REQUEST || status == StatusCode::RANGE_NOT_SATISFIABLE {
+    let mut resp = client.get_blob(target, digest, Some(&header)).await?;
+    let mut status = resp.status();
+    let rejected =
+        |s: StatusCode| s == StatusCode::BAD_REQUEST || s == StatusCode::RANGE_NOT_SATISFIABLE;
+    // A registry that refuses a range gives the blob whole: it is the
+    // transport of the range, as for one that ignores `Range`.
+    if ranges.len() == 1 && rejected(status) {
+        resp = client.get_blob(target, digest, None).await?;
+        status = resp.status();
+    }
+    if rejected(status) {
         return Err(RangesError::Rejected(status.as_u16()));
     }
     let headers = resp.headers().clone();

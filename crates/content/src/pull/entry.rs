@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Table of contents entries built from the headers of a verified tar stream.
 
-use super::tar::{normalize_path, Header, Kind};
+use super::tar::{normalize_path, Header, Kind, MAX_NAME_LEN, MAX_XATTRS, MAX_XATTR_BYTES};
 use base64::Engine;
 use std::collections::HashMap;
 use std::io;
-use velarx_storage::{Toc, TocEntry, TocEntryType};
+use velarx_storage::{toc_time, Toc, TocEntry, TocEntryType};
+use velarx_types::digest::{Algorithm, Digest};
 
 /// Entries of one layer accepted.
 pub const MAX_ENTRIES: usize = 4 * 1024 * 1024;
@@ -52,19 +53,125 @@ pub fn rfc3339((secs, nanos): (i64, u32)) -> Option<String> {
     chrono::DateTime::from_timestamp(secs, nanos).map(|t| t.to_rfc3339())
 }
 
-/// The TOC entry of a tar header.  `file_digest` is the digest of the
-/// content of a regular file (the callers that know its fs-verity digest
-/// set the digests of the entry after).  The root directory of the layer
-/// is the entry `./`.
-pub fn from_header(h: &Header, file_digest: Option<&str>) -> io::Result<TocEntry> {
-    let name = match normalize_path(&h.path) {
-        Some(n) => n,
-        None if h.kind == Kind::Directory && matches!(h.path.as_str(), "." | "./" | "/") => {
-            "./".to_string()
-        }
-        None => return Err(invalid(format!("invalid path `{}` in the layer", h.path))),
-    };
+/// The name a layer gives the entry at `path` (the root directory of the
+/// layer is `./`).
+pub fn layer_name(path: &str, dir: bool) -> io::Result<String> {
+    match normalize_path(path) {
+        Some(n) => Ok(n),
+        None if dir && matches!(path, "." | "./" | "/") => Ok("./".to_string()),
+        None => Err(invalid(format!("invalid path `{path}` in the layer"))),
+    }
+}
 
+/// What a layer keeps of `e`, an entry that a tar header or a table of
+/// contents gives: one set of rules for both, so that a layer has the same
+/// entries whichever describes it.  The name of the layer and a link target
+/// (no NUL, at most the length a tar name has), the extended attributes that
+/// are not the overlay file system's (an image that carries those could
+/// redirect lookups to other files of the store) within the bounds of a tar
+/// header, the permission bits, the time, a device number for a device only,
+/// and no size or content for what has none.
+fn layer_entry(e: TocEntry) -> io::Result<TocEntry> {
+    use base64::engine::general_purpose::STANDARD;
+    use TocEntryType::*;
+    let bad_text = |s: &str| s.len() > MAX_NAME_LEN || s.contains('\0');
+    if bad_text(&e.name) {
+        return Err(invalid(format!(
+            "invalid path `{}` in the layer",
+            e.name.escape_debug()
+        )));
+    }
+    let name = layer_name(&e.name, e.entry_type == Dir)?;
+    let link_name = match e.entry_type {
+        Symlink | Hardlink => {
+            let what = match e.entry_type {
+                Symlink => "symbolic link",
+                _ => "hard link",
+            };
+            let target = e
+                .link_name
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| invalid(format!("{what} `{name}` has no target")))?;
+            let target = match e.entry_type {
+                Hardlink => normalize_path(target).filter(|t| !bad_text(t)),
+                _ => Some(target.to_string()).filter(|t| !bad_text(t)),
+            };
+            Some(target.ok_or_else(|| invalid(format!("{what} `{name}` has an invalid target")))?)
+        }
+        _ => None,
+    };
+    let mut xattrs = HashMap::new();
+    let mut bytes = 0;
+    for (i, (k, v)) in e.xattrs.iter().enumerate() {
+        let value = STANDARD
+            .decode(v)
+            .ok()
+            .filter(|_| !k.is_empty() && !k.contains('\0'));
+        let Some(value) = value else {
+            return Err(invalid(format!(
+                "`{name}` has an invalid extended attribute `{}`",
+                k.escape_debug()
+            )));
+        };
+        bytes += k.len() + value.len();
+        if i >= MAX_XATTRS || bytes > MAX_XATTR_BYTES {
+            return Err(invalid(format!(
+                "`{name}` has too many extended attributes"
+            )));
+        }
+        if !is_overlay_xattr(k) && value.len() <= MAX_XATTR_VALUE {
+            xattrs.insert(k.clone(), STANDARD.encode(value));
+        }
+    }
+    let device = matches!(e.entry_type, Char | Block);
+    let mut out = TocEntry {
+        name,
+        link_name,
+        xattrs,
+        mode: e.mode & 0o7777,
+        mod_time: toc_time(e.mod_time.as_deref()).and_then(rfc3339),
+        access_time: None,
+        change_time: None,
+        dev_major: device.then_some(e.dev_major.unwrap_or(0)),
+        dev_minor: device.then_some(e.dev_minor.unwrap_or(0)),
+        ..e
+    };
+    if out.entry_type != Reg {
+        out.size = 0;
+        out.digest = None;
+        out.fsverity = None;
+        out.offset = 0;
+        out.end_offset = 0;
+        out.chunk_digest = None;
+        out.chunk_size = 0;
+        out.chunk_offset = 0;
+        out.chunk_type = None;
+    }
+    Ok(out)
+}
+
+/// Whether `a` and `b`, entries [`layer_entry`] made, describe the same
+/// entry of a layer, its content aside.
+pub fn same_entry(a: &TocEntry, b: &TocEntry) -> bool {
+    let key = |e: &TocEntry| {
+        (
+            e.entry_type,
+            e.mode,
+            e.uid,
+            e.gid,
+            e.size,
+            e.mtime(),
+            e.dev_major,
+            e.dev_minor,
+        )
+    };
+    a.name == b.name && key(a) == key(b) && a.link_name == b.link_name && a.xattrs == b.xattrs
+}
+
+/// The entry of a tar header, its content aside (see [`from_header`]).
+pub fn header_entry(h: &Header) -> io::Result<TocEntry> {
+    use base64::engine::general_purpose::STANDARD;
     let entry_type = match h.kind {
         Kind::Regular => TocEntryType::Reg,
         Kind::Directory => TocEntryType::Dir,
@@ -74,76 +181,87 @@ pub fn from_header(h: &Header, file_digest: Option<&str>) -> io::Result<TocEntry
         Kind::Block => TocEntryType::Block,
         Kind::Fifo => TocEntryType::Fifo,
     };
-
-    let link_name = match h.kind {
-        Kind::Symlink => Some(
-            h.link
-                .clone()
-                .ok_or_else(|| invalid(format!("symbolic link `{name}` has no target")))?,
-        ),
-        Kind::Hardlink => {
-            let target = h
-                .link
-                .as_deref()
-                .ok_or_else(|| invalid(format!("hard link `{name}` has no target")))?;
-            Some(normalize_path(target).ok_or_else(|| {
-                invalid(format!(
-                    "hard link `{name}` has an invalid target `{target}`"
-                ))
-            })?)
-        }
-        _ => None,
-    };
-
-    // The attributes the overlay file system acts on are its own: an image
-    // that carries them could redirect lookups to other files of the store.
-    let xattrs: HashMap<String, String> = h
-        .xattrs
-        .iter()
-        .filter(|(k, v)| !is_overlay_xattr(k) && v.len() <= MAX_XATTR_VALUE)
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                base64::engine::general_purpose::STANDARD.encode(v),
-            )
-        })
-        .collect();
-
-    let (size, digest, chunk_digest) = match (h.kind, file_digest) {
-        (Kind::Regular, Some(d)) => (h.size, Some(d.to_string()), Some(d.to_string())),
-        (Kind::Regular, None) => {
-            return Err(invalid(format!("no content digest for `{name}`")));
-        }
-        _ => (0, None, None),
-    };
-    // (the key of a file: the hash of its content, or its fs-verity digest)
-    debug_assert!(digest
-        .as_deref()
-        .is_none_or(|d| velarx_types::digest::Digest::parse_key(d).is_ok()));
-
-    Ok(TocEntry {
-        name,
+    layer_entry(TocEntry {
+        name: h.path.clone(),
         entry_type,
         mode: h.mode,
         uid: h.uid,
         gid: h.gid,
-        size,
-        digest,
+        size: h.size,
+        digest: None,
         fsverity: None,
         offset: 0,
         end_offset: 0,
-        chunk_digest,
-        chunk_size: size,
+        chunk_digest: None,
+        chunk_size: 0,
         chunk_offset: 0,
         chunk_type: None,
-        link_name,
+        link_name: h.link.clone(),
         mod_time: rfc3339(h.mtime),
         access_time: None,
         change_time: None,
-        dev_major: matches!(h.kind, Kind::Char | Kind::Block).then_some(h.dev_major),
-        dev_minor: matches!(h.kind, Kind::Char | Kind::Block).then_some(h.dev_minor),
-        xattrs,
+        dev_major: Some(h.dev_major),
+        dev_minor: Some(h.dev_minor),
+        xattrs: h
+            .xattrs
+            .iter()
+            .map(|(k, v)| (k.clone(), STANDARD.encode(v)))
+            .collect(),
     })
+}
+
+/// The TOC entry of a tar header.  `file_digest` is the digest of the
+/// content of a regular file (the callers that know its fs-verity digest
+/// set the digests of the entry after).  The root directory of the layer
+/// is the entry `./`.
+pub fn from_header(h: &Header, file_digest: Option<&str>) -> io::Result<TocEntry> {
+    let mut e = header_entry(h)?;
+    if e.entry_type == TocEntryType::Reg {
+        let d =
+            file_digest.ok_or_else(|| invalid(format!("no content digest for `{}`", e.name)))?;
+        // (the key of a file: the hash of its content, or its fs-verity digest)
+        debug_assert!(Digest::parse_key(d).is_ok());
+        e.digest = Some(d.to_string());
+        e.chunk_digest = Some(d.to_string());
+        e.chunk_size = e.size;
+    }
+    Ok(e)
+}
+
+/// The entry a layer is stored by for `e`, an entry of the table of
+/// contents the descriptor vouches for: what that table says, kept to what
+/// a layer keeps of any entry ([`layer_entry`]), with the place of the
+/// content of a regular file in the blob.
+pub fn from_toc(e: &TocEntry, alg: Algorithm) -> io::Result<TocEntry> {
+    if e.entry_type == TocEntryType::Chunk {
+        return Ok(e.clone());
+    }
+    let mut entry = layer_entry(e.clone())?;
+    if entry.entry_type != TocEntryType::Reg {
+        return Ok(entry);
+    }
+    entry.chunk_offset = 0;
+    if entry.size == 0 {
+        let empty = Digest::empty(alg).to_string();
+        entry.digest = Some(empty.clone());
+        entry.chunk_digest = Some(empty);
+        entry.fsverity = None;
+        entry.offset = 0;
+        entry.end_offset = 0;
+        entry.chunk_size = 0;
+        entry.chunk_type = None;
+    } else {
+        if e.content_key()
+            .is_none_or(|k| Digest::parse_key(&k).is_err())
+        {
+            return Err(invalid(format!(
+                "the table has no digest for `{}`",
+                entry.name
+            )));
+        }
+        entry.digest = entry.digest.filter(|d| d.parse::<Digest>().is_ok());
+    }
+    Ok(entry)
 }
 
 #[cfg(test)]
@@ -269,6 +387,114 @@ mod tests {
         h.xattrs.insert("security.capability".into(), vec![1, 2, 3]);
         let e = from_header(&h, Some(&crate::sha256_text(b""))).unwrap();
         assert_eq!(e.xattrs["security.capability"], "AQID");
+    }
+
+    /// A table of contents entry is kept to what a layer keeps of a tar
+    /// header with the same fields, by the same rules.
+    #[test]
+    fn test_a_table_entry_is_kept_as_a_tar_header_is() {
+        let alg = Algorithm::Sha256;
+        let mut h = header("./usr//bin/./x", Kind::Regular);
+        h.size = 0;
+        h.mode = 0o4755;
+        h.xattrs
+            .insert("trusted.overlay.redirect".into(), b"x".to_vec());
+        h.xattrs
+            .insert("user.k".into(), vec![0; MAX_XATTR_VALUE + 1]);
+        h.xattrs.insert("security.capability".into(), vec![1, 2]);
+        let of_header = from_header(&h, Some(&Digest::empty(alg).to_string())).unwrap();
+        let mut raw = of_header.clone();
+        raw.name = h.path.clone();
+        raw.mode = 0o104755;
+        raw.mod_time = Some("2023-11-14T22:13:20Z".into());
+        raw.access_time = raw.mod_time.clone();
+        raw.dev_major = Some(8);
+        raw.xattrs = h
+            .xattrs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    base64::engine::general_purpose::STANDARD.encode(v),
+                )
+            })
+            .collect();
+        let of_toc = from_toc(&raw, alg).unwrap();
+        assert!(same_entry(&of_header, &of_toc));
+        assert_eq!(
+            serde_json::to_value(&of_toc).unwrap(),
+            serde_json::to_value(&of_header).unwrap()
+        );
+
+        // no size, digest or place for what has no content, no device
+        // number for what is not a device
+        let mut d = raw.clone();
+        d.entry_type = TocEntryType::Dir;
+        d.size = 9;
+        d.offset = 4;
+        let d = from_toc(&d, alg).unwrap();
+        assert_eq!(
+            (d.size, d.offset, &d.digest, d.dev_major),
+            (0, 0, &None, None)
+        );
+        let mut c = raw.clone();
+        c.entry_type = TocEntryType::Char;
+        c.dev_minor = None;
+        let c = from_toc(&c, alg).unwrap();
+        assert_eq!((c.dev_major, c.dev_minor), (Some(8), Some(0)));
+    }
+
+    #[test]
+    fn test_a_table_entry_a_tar_header_could_not_be_is_refused() {
+        let alg = Algorithm::Sha256;
+        let base = from_header(&header("d", Kind::Directory), None).unwrap();
+        let long = "a".repeat(MAX_NAME_LEN + 1);
+        let refused: [fn(&mut TocEntry); 10] = [
+            |e| e.name = "a\0b".into(),
+            |e| e.name = "../x".into(),
+            |e| e.name = "a/../../x".into(),
+            |e| e.name = String::new(),
+            |e| {
+                e.entry_type = TocEntryType::Symlink;
+                e.link_name = Some(String::new());
+            },
+            |e| {
+                e.entry_type = TocEntryType::Symlink;
+                e.link_name = Some("a\0b".into());
+            },
+            |e| {
+                e.entry_type = TocEntryType::Hardlink;
+                e.link_name = Some("../x".into());
+            },
+            |e| {
+                e.xattrs.insert("user.k".into(), "not base64!".into());
+            },
+            |e| {
+                e.xattrs.insert(String::new(), "eA==".into());
+            },
+            |e| {
+                for i in 0..=MAX_XATTRS {
+                    e.xattrs.insert(format!("user.{i}"), "eA==".into());
+                }
+            },
+        ];
+        for (i, edit) in refused.iter().enumerate() {
+            let mut e = base.clone();
+            edit(&mut e);
+            assert!(from_toc(&e, alg).is_err(), "{i}: {e:?}");
+        }
+        let mut e = base.clone();
+        e.name = long.clone();
+        assert!(from_toc(&e, alg).is_err());
+        e.name = "d".into();
+        e.entry_type = TocEntryType::Symlink;
+        e.link_name = Some(long);
+        assert!(from_toc(&e, alg).is_err());
+        // a regular file with content and no digest of it
+        let mut e = base.clone();
+        e.entry_type = TocEntryType::Reg;
+        e.size = 1;
+        assert!(from_toc(&e, alg).is_err());
     }
 }
 

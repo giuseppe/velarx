@@ -586,16 +586,15 @@ async fn test_a_file_comes_whole_from_a_peer_that_lacks_its_chunks() {
     drop(s);
 }
 
-/// Two nodes with the two views of one zstd:chunked descriptor: A pulled it
-/// whole (its registry serves no range), the layer of its blob; B pulls it
-/// lazily, the layer of its TOC.  Each names the layer by its own key: A
-/// gives no index for the TOC (nor B's pull asks for one: a labelled
-/// descriptor comes by its files), and B never takes A's view for its own:
-/// the files A gives are checked against B's TOC, and B's layer stays the
-/// layer of the TOC, proven by its completion.  The other way round, a node
-/// that pulls the descriptor whole does not take a peer's TOC view for it.
+/// Two nodes pull one zstd:chunked descriptor: A from a registry that serves
+/// no range (it gives the blob whole, as the transport of the table's
+/// ranges), B lazily.  Each has the layer of the table, never one of the
+/// blob: A gives no index for the TOC (nor B's pull asks for one: a labelled
+/// descriptor comes by its files), the files A gives are checked against B's
+/// TOC, and B's layer is proven by its completion.  A node that pulls the
+/// descriptor from a registry with no ranges has the layer of the table too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_the_two_views_of_a_layer_are_not_shared_for_each_other() {
+async fn test_a_layer_is_the_layer_of_its_table_whatever_serves_it() {
     let layer = build_chunked(&sample());
     let s = swarm_with(
         &[&layer],
@@ -615,17 +614,19 @@ async fn test_the_two_views_of_a_layer_are_not_shared_for_each_other() {
             .into_iter()
             .map(|l| l.key)
             .collect();
-    assert_eq!(a_keys, [layer.whole()]);
+    assert_eq!(a_keys, [layer.key()]);
     let peers = NodePeers(s.node_b.clone());
     let a = s.node_a.peer_id();
     let toc = layer.key().to_string();
     // (the view of a TOC has no digest to name it by: it cannot be asked)
     assert!(peers.index(a, &toc, 64 << 20).await.is_err());
-    assert!(peers
-        .index(a, &layer.whole().to_string(), 64 << 20)
-        .await
-        .unwrap()
-        .is_some());
+    assert_eq!(
+        peers
+            .index(a, &layer.whole().to_string(), 64 << 20)
+            .await
+            .unwrap(),
+        None
+    );
 
     let b = env_with_sources(&[&s.b_source]).await;
     b.publish(&[&layer], &[ZSTD]);
@@ -680,7 +681,8 @@ async fn test_the_two_views_of_a_layer_are_not_shared_for_each_other() {
     assert!(b.db.get_layer(&layer.whole()).await.is_err());
     drop(s);
 
-    // A has the layer of the TOC, C pulls the descriptor whole
+    // A has the layer of the TOC, C pulls the descriptor from a registry
+    // with no ranges
     let s = swarm(&[&layer], &[ZSTD]).await;
     let c = env_with_sources(&[&s.b_source]).await;
     c.publish(&[&layer], &[ZSTD]);
@@ -693,10 +695,10 @@ async fn test_the_two_views_of_a_layer_are_not_shared_for_each_other() {
             .into_iter()
             .map(|l| l.key)
             .collect();
-    assert_eq!(keys, [layer.whole()]);
+    assert_eq!(keys, [layer.key()]);
     assert!(
         c.reg.hits.lock().unwrap().get(&sha(&layer.blob)).copied() >= Some(1),
-        "the blob came from the registry, hashed"
+        "the blob came from the registry, as the transport of the ranges"
     );
     let peers = NodePeers(s.node_b.clone());
     let a = s.node_a.peer_id();

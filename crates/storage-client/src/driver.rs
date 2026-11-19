@@ -1593,7 +1593,6 @@ impl VarlinkDriver {
                 ..Default::default()
             };
             pulled.push(PulledLayer {
-                asked: layer.key,
                 done: velarx_content::pull::LayerDone {
                     key: index.key,
                     blob: layer.descriptor.digest,

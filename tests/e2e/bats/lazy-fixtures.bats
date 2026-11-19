@@ -111,15 +111,16 @@ EOF
     [[ "$output" == *"Pulled (lazy)"* ]]
 }
 
-@test "chunked-sha256-only is refused with ImageNotLazy: no fs-verity digests" {
-    run lf image pull --lazy --tls-verify=false "$REPO:chunked-sha256-only"
-    echo "$output"
-    [ "$status" != 0 ]
-    [[ "$output" == *"cannot be pulled lazily"* ]]
-    [[ "$output" == *"no fs-verity digest for every file"* ]]
-    # (refused before anything exists: no image)
-    run lf image exists "$REPO:chunked-sha256-only"
-    [ "$status" != 0 ]
+@test "chunked-sha256-only is refused, lazily or not: no fs-verity digests" {
+    for lazy in --lazy ""; do
+        run lf image pull $lazy --tls-verify=false "$REPO:chunked-sha256-only"
+        echo "$output"
+        [ "$status" != 0 ]
+        [[ "$output" == *"its table of contents has no fs-verity digest for"* ]]
+        # (refused before anything exists: no image)
+        run lf image exists "$REPO:chunked-sha256-only"
+        [ "$status" != 0 ]
+    done
 }
 
 @test "gzip is refused with ImageNotLazy: no table of contents" {

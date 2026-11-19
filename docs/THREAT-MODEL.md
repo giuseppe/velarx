@@ -72,6 +72,21 @@ lengths before allocating and verifies every digest.
   for, and never to the diff id: the diff id the image gives is recorded as
   its claim and is checked only if the stream of the layer is made again. A source cannot make a pull
   wrong, only slower, and a circuit breaker skips one that fails.
+* **A dual view image** has a layer whose table of contents (zstd:chunked),
+  which the manifest vouches for, and whose tar stream describe different
+  filesystems: other names, modes or contents, a file only in one of them.
+  A tool that reads the table and one that reads the stream then see
+  different images.  A layer with zstd:chunked annotations is pulled through
+  its table or not at all: its entries and its EROFS image are the table's,
+  every file is checked against it, and its tar-split, which makes the tar
+  again for a push, must describe the same entries.  Nothing falls back to
+  the stream: a registry that serves no ranges gives the blob as the
+  transport of the table's ranges, and a layer whose table cannot be used
+  (annotations that name no table this reads, no tar-split, no fs-verity
+  digest for a file, a tar-split or bytes that are not the table's, a source
+  without ranges such as an archive) is refused with an error that names it,
+  and nothing of it is stored.  Only a layer without the annotations is read
+  as a stream.
 * **A node outside the peer-to-peer swarm**: see "The peer-to-peer swarm"
   below.
 * **A storage service** (`[storage] driver = "varlink"`) is chosen by the

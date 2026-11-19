@@ -70,9 +70,7 @@ use velarx_types::{ImageError, ImageResult, LayerKey, OciDescriptor};
 #[derive(Debug, Clone)]
 pub struct FeedLayer {
     /// The key the engine looks the layer up by: what its descriptor asks
-    /// for.  The layer comes out under another key when its table of
-    /// contents cannot be used and its blob is pulled whole
-    /// ([`PulledLayer::asked`]).
+    /// for.
     pub key: LayerKey,
     /// The descriptor of its blob in the manifest.
     pub descriptor: OciDescriptor,
@@ -96,9 +94,7 @@ pub struct FeedLayer {
 /// against the digests the descriptor vouches for.
 #[derive(Debug, Clone)]
 pub struct LayerIndex {
-    /// The key the layer is stored under: the one it was asked by, or the
-    /// key of its blob when the engine read it whole (a layer of a
-    /// descriptor with zstd:chunked labels that comes from an archive).
+    /// The key the layer is stored under: the one it was asked by.
     pub key: LayerKey,
     pub toc: Arc<Toc>,
     /// The zstd compressed tar-split.
@@ -307,8 +303,6 @@ pub trait PullFeed: Send + Sync {
 /// under the fs-verity digest of what they hold.
 #[derive(Clone)]
 pub struct PulledLayer {
-    /// The key it was asked by.
-    pub asked: LayerKey,
     pub done: LayerDone,
 }
 
@@ -929,16 +923,15 @@ impl PullFeed for ContentFeed {
             return Ok(None);
         }
         match pull::lazy::pull_metadata(&ctx, &layer.descriptor).await {
-            Ok(Ok(found)) => {
+            Ok(Some(found)) => {
                 self.lazy_found
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(digest, found);
                 Ok(None)
             }
-            Ok(Err(why)) => Ok(Some(why.to_string())),
-            Err(e) if pull::chunked::no_other_route(&e) => Err(e),
-            Err(e) => Ok(Some(e.to_string())),
+            Ok(None) => Ok(Some("it is not a zstd:chunked layer".into())),
+            Err(e) => Err(e),
         }
     }
 
@@ -1390,7 +1383,7 @@ async fn pull_session<R: Send + 'static>(
 
     // The layers to fetch, at most `parallel` at a time.
     let permits = Arc::new(Semaphore::new(feed.parallel().max(1)));
-    let mut tasks: JoinSet<ImageResult<(LayerKey, LayerDone)>> = JoinSet::new();
+    let mut tasks: JoinSet<ImageResult<LayerDone>> = JoinSet::new();
     for layer in to_fetch(layers) {
         let (feed, into, layer, permits) =
             (feed.clone(), into.clone(), layer.clone(), permits.clone());
@@ -1399,32 +1392,23 @@ async fn pull_session<R: Send + 'static>(
                 .acquire_owned()
                 .await
                 .map_err(|_| ImageError::Layer("the pull was cancelled".into()))?;
-            let done = feed.fetch(&layer, &into).await?;
-            Ok((layer.key, done))
+            feed.fetch(&layer, &into).await
         });
     }
     let fetched = async {
         let mut pulled: Vec<PulledLayer> = Vec::with_capacity(layers.len());
         let mut budget = ImageBudget::default();
         while let Some(joined) = tasks.join_next().await {
-            let (asked, done) = joined
+            let done = joined
                 .map_err(|e| refused(name, ImageError::Layer(format!("layer task: {e}"))))?
                 .map_err(|e| refused(name, e))?;
             budget.add(&done).map_err(|e| refused(name, e))?;
             let r = &done.report;
             info!(
-                "Layer {}: fetched {} bytes in {} files, reused {} bytes in {} files{}",
-                done.key,
-                r.fetched_bytes,
-                r.fetched_files,
-                r.reused_bytes,
-                r.reused_files,
-                r.note
-                    .as_deref()
-                    .map(|n| format!(" ({n})"))
-                    .unwrap_or_default()
+                "Layer {}: fetched {} bytes in {} files, reused {} bytes in {} files",
+                done.key, r.fetched_bytes, r.fetched_files, r.reused_bytes, r.reused_files
             );
-            pulled.push(PulledLayer { asked, done });
+            pulled.push(PulledLayer { done });
         }
         Ok::<_, DriverError>(pulled)
     }

@@ -1738,7 +1738,6 @@ impl ImageService {
                         fetched_files: r.fetched_files,
                         deduplicated_files: r.reused_files,
                         cached: false,
-                        note: r.note.clone(),
                     });
                 }
                 None => {
@@ -1836,17 +1835,8 @@ impl ImageService {
             let manifest_alg = s.manifest_digest.alg();
             let holds_objects = self.storage.holds_objects();
             Box::new(move |pulled: &mut Vec<PulledLayer>, objects| {
-                // the key of each layer of the image (a layer whose TOC
-                // could not be used is the layer of its blob)
-                let became: HashMap<(&LayerKey, Digest), &LayerKey> = pulled
-                    .iter()
-                    .map(|p| ((&p.asked, p.done.blob), &p.done.key))
-                    .collect();
-                let layer_keys: Vec<LayerKey> = expected
-                    .iter()
-                    .zip(&manifest.layers)
-                    .map(|(k, l)| *(*became.get(&(k, l.digest)).unwrap_or(&k)))
-                    .collect();
+                // (each layer of the image is under the key it was asked by)
+                let layer_keys = expected;
                 let done: HashMap<&LayerKey, &LayerDone> =
                     pulled.iter().map(|p| (&p.done.key, &p.done)).collect();
                 let stored = |d: &LayerKey| handle.block_on(db.get_layer(d));

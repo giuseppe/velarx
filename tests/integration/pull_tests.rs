@@ -18,7 +18,6 @@ async fn test_chunked_layer_is_pulled_by_ranges_and_bound_to_the_diff_id() {
     let result = e.pull().await.unwrap();
     assert!(e.reg.ranged.load(Ordering::SeqCst) > 0, "no range request");
     assert_eq!(result.stats.layers.len(), 1);
-    assert_eq!(result.stats.layers[0].note, None);
 
     let rec = e.db.get_layer(&layer.key()).await.unwrap();
     assert_eq!(rec.status, "ready");
@@ -501,13 +500,9 @@ async fn test_sparse_files_keep_their_holes() {
 }
 
 /// A layer whose TOC gives only the sha256 of its files (containers/storage
-/// writes them so) is pulled whole, its files checked by their sha256 and
-/// then known by their fs-verity digest, which the stored TOC gives.  A lazy
-/// pull of an image with such a layer is refused (`no_file_digests`), with
-/// nothing of it kept; once the base is in the store, the layers above it
-/// are lazy (an image built here on a base of containers/storage).
+/// writes them so) is refused, eagerly and lazily, naming the layer and the file, and nothing of the image is stored, the layers above it either.
 #[tokio::test]
-async fn test_a_toc_without_fs_verity_digests_is_pulled_whole() {
+async fn test_a_toc_without_fs_verity_digests_is_refused() {
     let base = build_chunked_plain(&sample());
     let top = build_chunked(&[
         Item::Dir("opt/"),
@@ -519,36 +514,13 @@ async fn test_a_toc_without_fs_verity_digests_is_pulled_whole() {
     ]);
     let e = env().await;
     e.publish(&[&base, &top], &[ZSTD, ZSTD]);
-    let refused = e.pull_lazy().await;
-    let Err(velarx_types::ImageError::NotLazy { layers, .. }) = refused else {
-        panic!("{refused:?}");
-    };
-    assert_eq!(
-        layers
-            .iter()
-            .map(|l| (l.index, l.reason.word()))
-            .collect::<Vec<_>>(),
-        vec![(0, "no_file_digests")]
-    );
-    assert!(e.db.get_layer(&base.key()).await.is_err());
-    assert!(e.area().layer(&top.key()).unwrap().is_none());
-    e.publish(&[&base], &[ZSTD]);
-    e.pull().await.unwrap();
-    let rec = e.db.get_layer(&base.key()).await.unwrap();
-    assert_eq!(rec.status, "ready");
-    let toc: velarx_storage::Toc = serde_json::from_str(rec.toc.as_deref().unwrap()).unwrap();
-    let big = toc.find_by_name("usr/big").unwrap();
-    let data = std::fs::read(e.store.get_path(&big.verity().unwrap()).unwrap()).unwrap();
-    assert_eq!(big.verity(), Some(vid(&data)));
-    assert_eq!(big.digest, Some(sha(&data).to_string()));
-    e.publish(&[&base, &top], &[ZSTD, ZSTD]);
-    let lazy = e.pull_lazy().await.unwrap();
-    assert!(e.service.get(&lazy.id).await.is_err(), "being pulled");
-    assert!(e.area().layer(&top.key()).unwrap().is_some());
-    assert!(!e.store.contains(&vid(b"built on top\n")));
-    e.service.complete_image(&lazy.id).await.unwrap();
-    assert!(e.store.contains(&vid(b"built on top\n")));
-    assert!(e.service.get(&lazy.id).await.is_ok());
+    let before = e.stored().await;
+    for refused in [e.pull().await, e.pull_lazy().await] {
+        let refused = refused.unwrap_err().to_string();
+        assert!(refused.contains(&sha(&base.blob).to_string()), "{refused}");
+        assert!(refused.contains("no fs-verity digest for `"), "{refused}");
+        assert_eq!(e.stored().await, before);
+    }
 }
 
 /// The layers pulled whole (gzip) are deduplicated against the store like
@@ -785,8 +757,7 @@ async fn test_registry_that_ignores_ranges() {
     let layer = build_chunked(&sample());
     e.publish(&[&layer], &[ZSTD]);
     *e.reg.mode.lock().unwrap() = RangeMode::Ignore;
-    let result = e.pull().await.unwrap();
-    assert_eq!(result.stats.layers[0].note, None);
+    e.pull().await.unwrap();
     assert!(e.store.contains(&vid(b"hello\n")));
 }
 
@@ -796,8 +767,7 @@ async fn test_registry_that_refuses_multiple_ranges() {
     let layer = build_chunked(&sample());
     e.publish(&[&layer], &[ZSTD]);
     *e.reg.mode.lock().unwrap() = RangeMode::SingleOnly;
-    let result = e.pull().await.unwrap();
-    assert_eq!(result.stats.layers[0].note, None);
+    e.pull().await.unwrap();
     assert!(e.store.contains(&vid(b"hello\n")));
 }
 
@@ -1792,8 +1762,7 @@ async fn test_an_eager_pull_of_a_table_of_contents_goes_through_the_fetcher() {
     let e = env().await;
     let layer = build_chunked(&sample());
     e.publish(&[&layer], &[ZSTD]);
-    let result = e.pull().await.unwrap();
-    assert_eq!(result.stats.layers[0].note, None, "pulled by its table");
+    e.pull().await.unwrap();
     assert!(e.reg.ranged.load(Ordering::SeqCst) > 0, "no range request");
     let rec = e.db.get_layer(&layer.key()).await.unwrap();
     assert_eq!(rec.diff_id, None, "verified by its table");

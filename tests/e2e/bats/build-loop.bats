@@ -10,9 +10,9 @@
 # pulled back is the digest of the manifest pushed, a push of what the
 # registry has uploads nothing, a pushed image that was pulled, and
 # `system check`.  The base is $BASE pushed again by velarx.  An image of
-# containers/storage, whose TOCs give no fs-verity digests, and an image
-# built on it are refused by a lazy pull before anything is stored, and pull
-# eagerly; so are the images pushed with gzip or uncompressed.  skopeo (the
+# containers/storage (`alpine-plain:chunked`), whose TOCs give no
+# fs-verity digests, is refused, lazily or not, before anything is stored; a
+# lazy pull of the images pushed with gzip or uncompressed is refused.  skopeo (the
 # containers image library, no store) reads the images too.  Rootless.
 #
 # The tests share one daemon at a time, on the store the last `use_store`
@@ -242,21 +242,21 @@ print(len(e) > 0 and ok)')
 }
 
 # the base ------------------------------------------------------------------
-# a pulled image (its TOCs, of containers/storage, give no fs-verity digests:
-# a lazy pull of it is refused), pushed again with another compression (it
-# states its merged EROFS) and back as zstd:chunked, which the layer writer
-# makes: the base of the build
+# a pulled image (its TOCs give the fs-verity digests of the layer writer),
+# pushed again with another compression (it states its merged EROFS) and back
+# as zstd:chunked, which the layer writer makes: the base of the build
 
-@test "base: a lazy pull of TOCs without fs-verity digests is refused" {
-    use_store lazy-plain
-    sh_ image pull --lazy --tls-verify=false "$BASE" > "$WORKDIR/pull.out" 2>&1
-    check "a lazy pull of TOCs without fs-verity digests is refused" "125 1" \
-        "$? $(grep -c 'cannot be pulled lazily: .*has no fs-verity digest for every file' "$WORKDIR/pull.out")"
-    check "before anything is in the store" "0 0 " \
-        "$(sqlite3 "file:$STORE/store/db.sqlite?mode=ro" "SELECT count(*) FROM images") $(sqlite3 "file:$STORE/store/db.sqlite?mode=ro" "SELECT count(*) FROM layers") $(sh_ image pulls -q)"
-    sh_ image pull --tls-verify=false "$BASE" > "$WORKDIR/pull.out" 2>&1
-    check "pulled eagerly" "0 1" "$? $(sqlite3 "file:$STORE/store/db.sqlite?mode=ro" "SELECT count(*) FROM images")"
-    check_match "and runs" "^[0-9]+\.[0-9]+" "$(sh_ container run --rm --network none "$BASE" cat /etc/alpine-release 2>&1)"
+@test "base: TOCs without fs-verity digests are refused, lazily or not" {
+    local plain=$E2E_REGISTRY/alpine-plain:chunked
+    curl -sf -m 5 "http://$E2E_REGISTRY/v2/alpine-plain/manifests/chunked" -o /dev/null -H 'Accept: application/vnd.oci.image.manifest.v1+json' || skip "no $plain"
+    use_store plain
+    for lazy in --lazy ""; do
+        sh_ image pull $lazy --tls-verify=false "$plain" > "$WORKDIR/pull.out" 2>&1
+        check "a pull ($lazy) of TOCs without fs-verity digests is refused" "125 1" \
+            "$? $(grep -c 'layer sha256:[0-9a-f]*: its table of contents has no fs-verity digest for' "$WORKDIR/pull.out")"
+        check "before anything is in the store" "0 0 " \
+            "$(sqlite3 "file:$STORE/store/db.sqlite?mode=ro" "SELECT count(*) FROM images") $(sqlite3 "file:$STORE/store/db.sqlite?mode=ro" "SELECT count(*) FROM layers") $(sh_ image pulls -q)"
+    done
 }
 
 @test "base: pushed again with another compression and back as zstd:chunked" {
@@ -271,30 +271,6 @@ print(len(e) > 0 and ok)')
     check_match "and runs" "^[0-9]+\.[0-9]+" "$(sh_ container run --rm --network none "$REPO:base-gzip" cat /etc/alpine-release 2>&1)"
     out=$(sh_ image push --tls-verify=false --compression-format zstd:chunked "$REPO:base-gzip" "$REPO:base" 2>&1)
     check_match "and pushed as zstd:chunked" "Digest: sha256:[0-9a-f]{64}" "$out"
-}
-
-# an image built on the base of containers/storage: its base layer has no
-# fs-verity digests, so the image cannot be lazy; it pulls eagerly
-
-@test "an image built on the base of containers/storage is refused lazily and pulls eagerly" {
-    use_store mixed
-    mkdir -p "$WORKDIR/mixed"
-    printf 'FROM %s\nRUN echo built on top > /on-top\n' "$BASE" > "$WORKDIR/mixed/Containerfile"
-    sh_ image build -q -t localhost/mixed:1 "$WORKDIR/mixed" > "$WORKDIR/build.out" 2>&1
-    check "build on the base of containers/storage" "0 " "$? $(grep -i error "$WORKDIR/build.out")"
-    out=$(sh_ image push --tls-verify=false --compression-format zstd:chunked localhost/mixed:1 "$REPO:mixed" 2>&1)
-    check_match "push it" "Digest: sha256:[0-9a-f]{64}" "$out"
-    use_store pull-mixed
-    sh_ image pull --lazy --tls-verify=false "$REPO:mixed" > "$WORKDIR/pull.out" 2>&1
-    check "its lazy pull names the base layer" "125 1 0" \
-        "$? $(grep -c 'cannot be pulled lazily: layer 1 (sha256:[0-9a-f]*): its table of contents has no fs-verity digest for every file' "$WORKDIR/pull.out") $(grep -c 'layer 2 (' "$WORKDIR/pull.out")"
-    check "nothing in the store" "0 0 0" \
-        "$(sqlite3 "file:$STORE/store/db.sqlite?mode=ro" "SELECT count(*) FROM layers") $(find "$STORE/store/staging" -name layer.json 2>/dev/null | wc -l) $(sqlite3 "file:$STORE/store/db.sqlite?mode=ro" "SELECT count(*) FROM images")"
-    sh_ image pull --tls-verify=false "$REPO:mixed" > "$WORKDIR/pull.out" 2>&1
-    check "both layers and the image are in the store after an eager pull" "0 2 1" \
-        "$? $(sqlite3 "file:$STORE/store/db.sqlite?mode=ro" "SELECT count(*) FROM layers") $(sqlite3 "file:$STORE/store/db.sqlite?mode=ro" "SELECT count(*) FROM images")"
-    check_match "it runs from the store" "^built on top [0-9]+\.[0-9]+" \
-        "$(sh_ container run --rm --network none "$REPO:mixed" sh -c 'echo $(cat /on-top) $(cat /etc/alpine-release)' 2>&1)"
 }
 
 # a RUN writes files of its base: the copy-up of a stub of the image of a

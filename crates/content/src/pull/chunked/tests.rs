@@ -40,9 +40,6 @@ fn test_parse_info() {
     assert_eq!(i.tarsplit, Some((150, 20, 40)));
     assert_eq!(i.checksum, crate::sha256(b""));
 
-    let mut gz = l.clone();
-    gz.media_type = "application/vnd.oci.image.layer.v1.tar+gzip".into();
-    assert!(parse_info(&gz).unwrap().is_none());
     assert!(parse_info(&layer(&[], ZSTD)).unwrap().is_none());
 
     let mut bad = l.clone();
@@ -53,11 +50,32 @@ fn test_parse_info() {
     bad.annotations
         .insert(format!("{prefix}manifest-checksum"), "sha256:zz".into());
     assert!(parse_info(&bad).is_err());
-    let mut other = l;
+    // a table the layer names and this does not know, or half of its
+    // labels, is not "no table": the layer is refused
+    let mut other = l.clone();
     other
         .annotations
         .insert(format!("{prefix}manifest-position"), "1:2:3:2".into());
-    assert!(parse_info(&other).unwrap().is_none());
+    assert!(parse_info(&other).is_err());
+    for half in ["manifest-position", "manifest-checksum"] {
+        let mut half_of = l.clone();
+        half_of.annotations.remove(&format!("{prefix}{half}"));
+        assert!(parse_info(&half_of).is_err(), "{half}");
+    }
+    // any of the annotations says that the layer has a table: on a layer
+    // that is not zstd, or alone
+    let mut gz = l.clone();
+    gz.media_type = "application/vnd.oci.image.layer.v1.tar+gzip".into();
+    assert!(parse_info(&gz).is_err());
+    for name in ["tarsplit-position", "version"] {
+        let alone = layer(&[(&format!("{prefix}{name}"), "2")], ZSTD);
+        assert!(parse_info(&alone).is_err(), "{name}");
+        let alone = layer(
+            &[(&format!("io.containers.zstd-chunked.{name}"), "2")],
+            ZSTD,
+        );
+        assert!(parse_info(&alone).is_err(), "{name}");
+    }
 }
 
 fn reg(
@@ -315,29 +333,44 @@ fn test_batches_merge_adjacent_chunks_and_respect_limits() {
     assert_eq!(ranges, 2);
 }
 
+/// The compressed tar-split of the tar of `entries` (files of zeros).
+fn tarsplit_of(entries: &[TocEntry]) -> Vec<u8> {
+    use crate::pull::tarsplit::Recorder;
+    use std::io::Cursor;
+    let mut tar = Vec::new();
+    velarx_storage::canonical::write(entries, &mut tar, |e, out| {
+        out.write_all(&vec![0; e.size as usize])
+    })
+    .unwrap();
+    let mut r = TarReader::with_sink(Cursor::new(tar), Recorder::new().unwrap());
+    while r.next_entry().unwrap().is_some() {}
+    r.finish().unwrap().1.finish().unwrap().compressed
+}
+
 #[test]
 fn test_metadata_checks() {
+    let ts = tarsplit_of(&[]);
     let toc_json = serde_json::json!({
         "version": 1,
         "entries": [],
-        "tarSplitDigest": crate::sha256(b"ts"),
+        "tarSplitDigest": crate::sha256(&ts),
     })
     .to_string();
     let toc_z = zstd::encode_all(toc_json.as_bytes(), 3).unwrap();
     let info = Info {
         toc: (0, toc_z.len() as u64, toc_json.len() as u64),
         checksum: crate::sha256(&toc_z),
-        tarsplit: Some((0, 2, 0)),
+        tarsplit: Some((0, ts.len() as u64, 0)),
     };
     let layer = crate::sha256(b"layer");
-    assert!(verify_metadata(&info, &toc_z, b"ts".to_vec(), &layer).is_ok());
+    assert!(verify_metadata(&info, &toc_z, ts.clone(), &layer).is_ok());
     let mut bad = info.clone();
     bad.checksum = crate::sha256(b"other");
-    assert!(verify_metadata(&bad, &toc_z, b"ts".to_vec(), &layer).is_err());
+    assert!(verify_metadata(&bad, &toc_z, ts.clone(), &layer).is_err());
     assert!(verify_metadata(&info, &toc_z, b"tx".to_vec(), &layer).is_err());
     let mut bad = info.clone();
     bad.toc.2 += 1;
-    assert!(verify_metadata(&bad, &toc_z, b"ts".to_vec(), &layer).is_err());
+    assert!(verify_metadata(&bad, &toc_z, ts, &layer).is_err());
 }
 
 #[test]
@@ -699,10 +732,8 @@ impl Stage for FullStage {
     }
 }
 
-/// A write that fails on this machine (no space) is its own error, which no
-/// other route of the pull makes right: it is not taken for a layer that
-/// cannot be pulled by ranges, so that the layer is not pulled whole to fail
-/// the same way behind a note.
+/// A write that fails on this machine (no space) is its own error, not the
+/// layer's: it is not one of what the descriptor vouches for.
 #[test]
 fn test_a_chunk_that_cannot_be_written_is_the_error_of_the_pull() {
     let parts = vec![vec![1u8; 100]];
@@ -718,10 +749,10 @@ fn test_a_chunk_that_cannot_be_written_is_the_error_of_the_pull() {
         matches!(&e, ImageError::Io(x) if x.raw_os_error() == Some(libc::ENOSPC)),
         "{e:?}"
     );
-    assert!(local_failure(&e) && no_other_route(&e) && !refuses(&e));
+    assert!(!refuses(&e));
     // the bytes of a layer that are no stream are the layer's
     let bad = decompress_bounded(b"not zstd", 100, 0, "TOC").unwrap_err();
-    assert!(!local_failure(&bad) && !no_other_route(&bad), "{bad:?}");
+    assert!(matches!(bad, ImageError::Layer(_)), "{bad:?}");
 }
 
 #[test]
@@ -1478,9 +1509,7 @@ fn test_a_canonical_layer_needs_no_tar_split() {
     let toc = canonical_layer();
     assert!(toc.is_canonical() && toc.tar_split_digest.is_none());
     let (z, info) = vouched(&toc, None);
-    let meta = verify_metadata(&info, &z, Vec::new(), &layer)
-        .unwrap()
-        .unwrap();
+    let meta = verify_metadata(&info, &z, Vec::new(), &layer).unwrap();
     assert!(meta.tarsplit_z.is_empty());
     assert_eq!(meta.toc.entries.len(), toc.entries.len());
 }
@@ -1525,21 +1554,68 @@ fn test_a_table_of_version_2_that_is_not_canonical_is_an_error_that_names_the_la
 }
 
 #[test]
-fn test_a_table_of_version_1_without_a_tar_split_is_pulled_whole() {
+fn test_a_table_of_version_1_without_a_tar_split_is_an_error_that_names_the_layer() {
     let layer = crate::sha256(b"layer");
     let toc = Toc {
         version: 1,
         entries: Vec::new(),
         tar_split_digest: None,
     };
-    let (z, info) = vouched(&toc, None);
-    assert!(verify_metadata(&info, &z, Vec::new(), &layer)
-        .unwrap()
-        .is_none());
-    // a table of a version this does not know is the same
-    let toc = Toc { version: 3, ..toc };
-    let (z, info) = vouched(&toc, None);
-    assert!(verify_metadata(&info, &z, Vec::new(), &layer)
-        .unwrap()
-        .is_none());
+    for toc in [toc.clone(), Toc { version: 3, ..toc }] {
+        let (z, info) = vouched(&toc, None);
+        let e = verify_metadata(&info, &z, Vec::new(), &layer)
+            .err()
+            .unwrap();
+        let text = e.to_string();
+        assert!(text.contains(&layer.to_string()), "{text}");
+        assert!(
+            text.contains("no tar-split and is not of version 2"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn test_a_table_of_version_1_without_the_fs_verity_digest_of_a_file_is_an_error() {
+    let layer = crate::sha256(b"layer");
+    let mut file = canonical_layer().entries[3].clone();
+    assert!(file.verity().is_some());
+    let ts = tarsplit_of(std::slice::from_ref(&file));
+    let tarsplit = crate::sha256(&ts).to_string();
+    let toc = |file: &TocEntry| Toc {
+        version: 1,
+        entries: vec![file.clone()],
+        tar_split_digest: Some(tarsplit.clone()),
+    };
+    let (z, info) = vouched(&toc(&file), Some((0, ts.len() as u64, 0)));
+    assert!(verify_metadata(&info, &z, ts.clone(), &layer).is_ok());
+    file.fsverity = None;
+    let (z, info) = vouched(&toc(&file), Some((0, ts.len() as u64, 0)));
+    let e = verify_metadata(&info, &z, ts, &layer).err().unwrap();
+    let text = e.to_string();
+    assert!(text.contains(&layer.to_string()), "{text}");
+    assert!(
+        text.contains(&format!("no fs-verity digest for `{}`", file.name)),
+        "{text}"
+    );
+}
+
+#[test]
+fn test_a_layer_with_a_table_is_never_read_as_a_stream() {
+    let prefix = "io.github.containers.zstd-chunked.";
+    let chunked = layer(
+        &[
+            (&format!("{prefix}manifest-position"), "100:50:200:1"),
+            (
+                &format!("{prefix}manifest-checksum"),
+                &crate::sha256_text(b""),
+            ),
+        ],
+        ZSTD,
+    );
+    let e = no_table(&chunked).unwrap_err().to_string();
+    assert!(e.contains(&chunked.digest.to_string()), "{e}");
+    assert!(e.contains("zstd:chunked"), "{e}");
+    // (a layer with no labels, or a gzip layer, is one)
+    no_table(&layer(&[], ZSTD)).unwrap();
 }

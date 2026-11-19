@@ -319,7 +319,8 @@ async fn test_a_pull_gets_everything_from_the_registry_fetcher() {
 }
 
 /// Through the fetcher as in the process: a registry that
-/// refuses the ranges gives the layer whole, the layer of its blob; one that
+/// refuses the ranges gives the blob whole as the transport of the table's
+/// ranges, and the layer is the layer of its table; one that
 /// answers them with other bytes than the TOC says is refused, and nothing
 /// is recorded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -330,9 +331,9 @@ async fn test_the_fetcher_tells_a_contradiction_from_a_refusal() {
     *e.reg.mode.lock().unwrap() = RangeMode::Refuse;
     let (service, _) = pull_service_via_fetcher(&e);
     let result = pulled(&service, &e, false).await;
-    assert!(result.stats.layers[0].note.is_some());
-    let layer = e.db.get_layer(&built.whole()).await.unwrap();
-    assert_eq!(layer.diff_id.as_ref(), Some(&built.diff_id));
+    assert_eq!(result.stats.layers.len(), 1);
+    assert!(e.db.get_layer(&built.key()).await.is_ok());
+    assert!(e.db.get_layer(&built.whole()).await.is_err());
 
     let e = env().await;
     e.publish(&[&built], &[ZSTD]);

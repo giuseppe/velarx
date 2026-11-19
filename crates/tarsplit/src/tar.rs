@@ -35,10 +35,10 @@ const MAX_EXTENSION_SIZE: u64 = 1024 * 1024;
 const MAX_EXTENSION_HEADERS: usize = 16;
 
 /// Extended attributes of one entry.
-const MAX_XATTRS: usize = 1024;
+pub const MAX_XATTRS: usize = 1024;
 
 /// Total size of the names and values of the extended attributes of an entry.
-const MAX_XATTR_BYTES: usize = 1024 * 1024;
+pub const MAX_XATTR_BYTES: usize = 1024 * 1024;
 
 /// The type of an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

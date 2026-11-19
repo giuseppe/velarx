@@ -44,7 +44,6 @@ use sink::Sink;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::debug;
 use velarx_config::PullConfig;
 use velarx_db::{ChunkLocation, Database, FileRecord, LayerCommit, LayerRecord};
 use velarx_registry::target::Target;
@@ -157,8 +156,6 @@ pub struct LayerReport {
     /// What the other sources of the walk gave (compressed bytes, files),
     /// by name.
     pub sources: Vec<velarx_proto::workload::BySource>,
-    /// Why a partial pull was not used, if it was not.
-    pub note: Option<String>,
 }
 
 /// Resources shared by the layers of a pull.
@@ -527,8 +524,9 @@ fn layer_done(layer: &OciDescriptor, key: LayerKey, p: chunked::Pulled, proven: 
 
 /// Pull one layer and check it against `diff_id`.  A layer whose
 /// descriptor has zstd:chunked labels is pulled through the TOC they name
-/// and stored by it; when that cannot be done it is pulled whole and is a
-/// layer of its blob, its TOC ignored ([`LayerKey`]).
+/// and stored by it, or not at all: it is never read as a tar stream, whose
+/// view of the filesystem may not be the table's.  Only a layer without
+/// the labels is pulled whole, and is the layer of its blob ([`LayerKey`]).
 pub async fn pull_layer(
     ctx: &PullCtx,
     source: &Source,
@@ -536,37 +534,28 @@ pub async fn pull_layer(
     diff_id: &Digest,
     progress: Arc<dyn Fn(u64) + Send + Sync>,
 ) -> ImageResult<LayerDone> {
-    let mut note = None;
     let whole = LayerKey::Whole(layer.digest);
-    // Partial pulls need ranges: archives are read whole.
+    // (a source that is not a registry gives no ranges: `unpack_whole` and
+    // `stream::ingest` refuse the layers that have a table)
     if let (Source::Registry(target), Some(info)) = (source, chunked::parse_info(layer)?) {
         let p = progress.clone();
         let key = LayerKey::Toc(info.checksum);
         let toc_ctx = ctx.clone().with_layer(key);
-        match chunked::pull(&toc_ctx, target, layer, diff_id, move |n| p(n)).await? {
-            chunked::Outcome::Done(p) => {
-                // nothing of the store as it was: what the sources gave
-                // hashes to its digest, they had it already
-                let proven = p.from_store == 0;
-                return Ok(layer_done(layer, key, *p, proven));
-            }
-            chunked::Outcome::Fallback(reason) => {
-                debug!("Layer {}: {}, pulling it whole", layer.digest, reason);
-                note = Some(reason);
-            }
-        }
+        let pulled = chunked::pull(&toc_ctx, target, layer, &info, diff_id, move |n| p(n)).await?;
+        // nothing of the store as it was: what the sources gave
+        // hashes to its digest, they had it already
+        let proven = pulled.from_store == 0;
+        return Ok(layer_done(layer, key, pulled, proven));
     }
     // a layer with no table of contents, through the fetchers: one
     // unpacks it, the replay proves it
     if let (Source::Registry(_) | Source::Path, Some(_), true) =
         (source, &ctx.staged, ctx.sink.proves_in_fetch())
     {
-        // (only the registry fetcher, whose workers hash the blob, for a
-        // layer with chunked labels pulled whole, or one the store has by
-        // its blob for another diff id: the blob, hashed, says which is
-        // right)
-        let registry_only = velarx_types::layer::chunked_checksum(layer).is_some()
-            || ctx.db.get_layer(&whole).await.is_ok();
+        // (only the registry fetcher, whose workers hash the blob, for one
+        // the store has by its blob for another diff id: the blob, hashed,
+        // says which is right)
+        let registry_only = ctx.db.get_layer(&whole).await.is_ok();
         let p = progress.clone();
         let (pulled, by_registry) =
             chunked::pull_whole(ctx, registry_only, layer, diff_id, move |n| p(n)).await?;
@@ -576,14 +565,11 @@ pub async fn pull_layer(
         // registry nor of the blob)
         let mut done = layer_done(layer, whole, pulled, by_registry);
         done.blob_checked = by_registry;
-        done.report.note = note;
         return Ok(done);
     }
     let p = progress.clone();
     let ingested = stream::ingest(ctx, Some(source), layer, diff_id, move |n| p(n)).await?;
-    let mut done = whole_done(Some(source), layer, ingested);
-    done.report.note = note;
-    Ok(done)
+    Ok(whole_done(Some(source), layer, ingested))
 }
 
 /// The layer of a blob read whole, as [`stream::ingest`] made it.
@@ -649,38 +635,33 @@ pub async fn pull_layer_lazy(
     found: Option<lazy::Found>,
 ) -> ImageResult<LayerDone> {
     if let Source::Registry(_) = source {
-        let metadata = match found {
-            Some(f) => Ok(Ok(f)),
-            None => lazy::pull_metadata(ctx, layer).await,
+        let found = match found {
+            Some(f) => Some(f),
+            None => lazy::pull_metadata(ctx, layer).await?,
         };
-        match metadata {
-            Ok(Ok((info, l))) => {
-                return Ok(LayerDone {
-                    key: LayerKey::Toc(info.checksum),
-                    blob: layer.digest,
-                    diff_id: *diff_id,
-                    size: layer.size,
-                    toc: l.toc,
-                    files: Vec::new(),
-                    chunks: Vec::new(),
-                    report: l.report,
-                    tarsplit: l.tarsplit,
-                    lazy: true,
-                    proven: false,
-                    blob_checked: false,
-                    checked: Default::default(),
-                });
-            }
-            // (a lazy pull is lazy or nothing: no layer of it is pulled
-            // whole instead)
-            Ok(Err(why)) => {
-                return Err(ImageError::Layer(format!(
-                    "{}: not pulled lazily: {why}",
-                    layer.digest
-                )))
-            }
-            Err(e) => return Err(e),
-        }
+        // (a lazy pull is lazy or nothing: no layer of it is pulled
+        // whole instead)
+        let Some((info, l)) = found else {
+            return Err(ImageError::Layer(format!(
+                "{}: not pulled lazily: it is not a zstd:chunked layer",
+                layer.digest
+            )));
+        };
+        return Ok(LayerDone {
+            key: LayerKey::Toc(info.checksum),
+            blob: layer.digest,
+            diff_id: *diff_id,
+            size: layer.size,
+            toc: l.toc,
+            files: Vec::new(),
+            chunks: Vec::new(),
+            report: l.report,
+            tarsplit: l.tarsplit,
+            lazy: true,
+            proven: false,
+            blob_checked: false,
+            checked: Default::default(),
+        });
     }
     pull_layer(ctx, source, layer, diff_id, progress).await
 }

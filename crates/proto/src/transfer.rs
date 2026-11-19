@@ -72,8 +72,6 @@ pub enum NotLazy {
     NoRanges,
     /// This fetcher cannot reach the layer
     Unreachable,
-    /// A regular file of the table has no fs-verity digest
-    NoFileDigests,
     /// A compression or media type the fetcher does not read (also what a
     /// value this side does not know is read as)
     #[serde(other)]
@@ -87,7 +85,6 @@ impl NotLazy {
             Self::NoToc => "no_toc",
             Self::NoRanges => "no_ranges",
             Self::Unreachable => "unreachable",
-            Self::NoFileDigests => "no_file_digests",
             Self::Unsupported => "unsupported",
         }
     }

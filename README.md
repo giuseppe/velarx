@@ -42,15 +42,17 @@ velarx container exec -it box sh
 
 Pull and run an image lazily. It must be zstd:chunked with the fs-verity
 digest of every file, as `velarx image push --compression-format zstd:chunked`
-writes it:
+writes it (a zstd:chunked layer is only ever pulled through its table of
+contents, lazily or not, and one that cannot be is refused):
 
 ```sh
 velarx image pull --lazy registry.example/app:chunked
 velarx run --lazy registry.example/app:chunked
 ```
 
-The registry must serve range requests. If a layer does not qualify, the
-pull fails and says which layer and why.
+A registry that does not serve range requests gives the blob whole, and the
+files are still those of the table. If a layer does not qualify, the pull
+fails and says which layer and why.
 
 Serve the REST API:
 

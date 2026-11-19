@@ -7,9 +7,10 @@
 //! * `Probe`: for each blob the call carries, whether it has a table of
 //!   contents (zstd:chunked, by the annotations of its descriptor); when it has, the table and
 //!   the tar-split come back in sealed memory files, so that the engine
-//!   verifies and keeps them and nothing is fetched twice.  A layer is
-//!   `on_demand` only when every regular file of its table has an fs-verity
-//!   digest: the kernel can then tie a file fetched alone to the table.
+//!   verifies and keeps them and nothing is fetched twice.  A layer with a
+//!   table is pulled by it or not at all: the engine refuses a table that
+//!   gives a regular file no fs-verity digest, and the files of a layer
+//!   are by their fs-verity digests, which the kernel ties to the table.
 //! * `Fetch`: the files a layer's table names, by the ranges of the blob
 //!   (merged as a pull merges them), decompressed by the confined workers,
 //!   each chunk checked against its sha256 and written by the object
@@ -39,7 +40,7 @@ use velarx_content::serve_fetch::{
 };
 use velarx_content::stager::{content_of, name_of, staged, LayerToc, Name, StageError, Unnamed};
 use velarx_registry::target::MAX_MANIFEST_SIZE;
-use velarx_storage::{Toc, TocEntryType};
+use velarx_storage::Toc;
 use velarx_types::digest::Digest;
 use velarx_types::{ImageError, OciDescriptor};
 
@@ -780,46 +781,17 @@ impl StagingFetcher for RegistryFetch {
                     continue;
                 }
             };
-            let (toc_z, ts_z) = match self.metadata(&pool, layer, &info).await {
-                Ok(m) => m,
-                // (the ranges of the blob cannot be had: the layer is read
-                // whole, and is not one to serve on demand)
-                Err(e) if !chunked::no_other_route(&e) => {
-                    tracing::debug!("{}: no table of contents by ranges: {e}", layer.digest);
-                    let unpack = reply(TocSource::Unpack, false, Some(NotLazy::NoRanges));
-                    out.send(unpack).await.map_err(|_| failed("gone"))?;
-                    continue;
-                }
-                Err(e) => return Err(refused(e)),
-            };
-            // (checked here for this fetcher's own use; the engine checks
-            // what it keeps, and gives the error of a table that is not the
-            // descriptor's)
-            let checked = {
-                let (info, toc_z, ts_z) = (info.clone(), toc_z.clone(), ts_z.clone());
-                let digest = layer.digest;
-                tokio::task::spawn_blocking(move || {
-                    chunked::verify_metadata(&info, &toc_z, ts_z, &digest)
-                })
-                .await
-                .map_err(failed)?
-            };
-            // (no tar-split, and a table that is not a canonical layer's:
-            // the layer is read whole)
-            if matches!(checked, Ok(None)) {
-                let unpack = reply(TocSource::Unpack, false, Some(NotLazy::NoToc));
-                out.send(unpack).await.map_err(|_| failed("gone"))?;
-                continue;
-            }
-            let on_demand = checked.is_ok_and(|meta| {
-                meta.is_some_and(|meta| {
-                    meta.toc
-                        .entries
-                        .iter()
-                        .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
-                        .all(|e| e.verity().is_some())
-                })
-            });
+            // (a layer with a table is pulled by it or not at all: no table
+            // is an error of the layer, which no fetcher after this one
+            // makes right)
+            let (toc_z, ts_z) =
+                self.metadata(&pool, layer, &info)
+                    .await
+                    .map_err(|e| FetcherError::Refused {
+                        reason: format!("layer {}: its table of contents: {e}", layer.digest),
+                    })?;
+            // (the engine checks what it keeps against the descriptor, and
+            // gives the error of a table it cannot use)
             let mut fds = vec![velarx_base::sealed::sealed_memory(&toc_z).map_err(failed)?];
             if info.tarsplit.is_some() {
                 fds.push(velarx_base::sealed::sealed_memory(&ts_z).map_err(failed)?);
@@ -828,11 +800,7 @@ impl StagingFetcher for RegistryFetch {
                 Probed {
                     toc_file: Some(0),
                     tarsplit_file: info.tarsplit.map(|_| 1),
-                    ..reply(
-                        TocSource::Carried,
-                        on_demand,
-                        (!on_demand).then_some(NotLazy::NoFileDigests),
-                    )
+                    ..reply(TocSource::Carried, true, None)
                 },
                 fds,
             )

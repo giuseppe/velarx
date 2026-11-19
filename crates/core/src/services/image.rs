@@ -154,9 +154,6 @@ pub struct LayerStats {
     pub deduplicated_files: u64,
     /// The layer was already stored
     pub cached: bool,
-    /// Why the layer was not pulled by ranges
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
 }
 
 pub use velarx_registry::target::Resolver;

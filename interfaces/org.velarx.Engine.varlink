@@ -529,7 +529,7 @@ type PullSpec (
 )
 
 # A layer of an image that cannot be pulled lazily, and why: `no_toc`,
-# `no_file_digests`, `no_ranges`, `unsupported`, `unreachable`.
+# `no_ranges`, `unsupported`, `unreachable`.
 type NotLazyLayer (
 	# Its position in the manifest, from 0
 	index: int,
@@ -1621,8 +1621,6 @@ type NotLazy (
 	no_ranges,
 	# This fetcher cannot reach the layer
 	unreachable,
-	# A regular file of the table has no fs-verity digest
-	no_file_digests,
 	# A compression or media type the fetcher does not read (also what a
 	# value this side does not know is read as)
 	unsupported

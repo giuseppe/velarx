@@ -7,8 +7,8 @@
 #                               content (`fsverity`, `sha256-12:HEX`) besides
 #                               its sha256 (`digest`): a lazy pull takes it
 #   <DEST>:chunked-sha256-only  zstd:chunked; the table of contents gives only
-#                               the sha256 `digest`: no_file_digests, a lazy
-#                               pull refuses it with ImageNotLazy
+#                               the sha256 `digest`: a pull refuses it,
+#                               lazily or not
 #   <DEST>:gzip                 gzip layers, no table of contents: no_toc,
 #                               refused with ImageNotLazy
 #

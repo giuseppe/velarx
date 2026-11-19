@@ -110,52 +110,46 @@ async fn test_a_lazy_chunked_layer_is_its_toc_until_and_after_its_completion() {
     assert_eq!(keys_of(&e, &eager.id).await, [layer.key()]);
 }
 
-/// A registry that serves no range: the chunked layer is pulled whole and is
-/// the layer of its blob, its diff id proven; its TOC is not used, nor
-/// recorded, lazily or not.
+/// A registry that serves no range gives the blob whole, as the transport of
+/// the ranges the table names: the layer is the layer of its table, eagerly
+/// and lazily, never the layer of its blob.
 #[tokio::test]
-async fn test_a_chunked_layer_that_cannot_be_ranged_is_the_layer_of_its_blob() {
-    for lazy in [false, true] {
-        let e = env().await;
-        let layer = build_chunked(&sample());
-        e.publish(&[&layer], &[ZSTD]);
-        *e.reg.mode.lock().unwrap() = RangeMode::Refuse;
-        let pulled = pull_tag(&e, "latest", lazy).await;
-        // (a lazy pull of a layer that cannot be lazy is refused)
-        if lazy {
-            assert!(
-                matches!(pulled, Err(velarx_types::ImageError::NotLazy { .. })),
-                "{pulled:?}"
-            );
-            continue;
+async fn test_a_chunked_layer_that_cannot_be_ranged_is_still_the_layer_of_its_table() {
+    for mode in [RangeMode::Refuse, RangeMode::Ignore] {
+        for lazy in [false, true] {
+            let e = env().await;
+            let layer = build_chunked(&sample());
+            e.publish(&[&layer], &[ZSTD]);
+            *e.reg.mode.lock().unwrap() = mode;
+            let pulled = pull_tag(&e, "latest", lazy).await.unwrap();
+            if lazy {
+                e.service.complete_image(&pulled.id).await.unwrap();
+            }
+            assert_eq!(keys_of(&e, &pulled.id).await, [layer.key()]);
+            let record = e.db.get_layer(&layer.key()).await.unwrap();
+            assert_eq!(record.status, "ready");
+            assert!(e.db.get_layer(&layer.whole()).await.is_err());
+            assert!(e.store.contains(&vid(b"hello\n")));
         }
-        let pulled = pulled.unwrap();
-        assert_eq!(keys_of(&e, &pulled.id).await, [layer.whole()]);
-        let record = e.db.get_layer(&layer.whole()).await.unwrap();
-        assert_eq!(record.status, "ready");
-        assert_eq!(record.diff_id.as_ref(), Some(&layer.diff_id));
-        assert!(e.db.get_layer(&layer.key()).await.is_err());
-        assert!(e.service.get(&pulled.id).await.is_ok());
     }
 }
 
-/// The TOC route needs the tar-split: a descriptor with the labels of the
-/// TOC and none of the tar-split is pulled whole, the layer of its blob.
+/// The TOC route needs the tar-split (or a table of version 2): a descriptor
+/// with the labels of the TOC and none of the tar-split is refused, naming
+/// the layer, eagerly and lazily, and nothing of it is stored.
 #[tokio::test]
-async fn test_a_chunked_layer_without_its_tar_split_is_the_layer_of_its_blob() {
+async fn test_a_chunked_layer_without_its_tar_split_is_refused_and_stores_nothing() {
     let e = env().await;
     let mut layer = build_chunked(&sample());
     layer.annotations.remove(LABELS[2]);
     e.publish(&[&layer], &[ZSTD]);
-    let refused = e.pull_lazy().await;
-    assert!(
-        matches!(refused, Err(velarx_types::ImageError::NotLazy { .. })),
-        "{refused:?}"
-    );
-    let pulled = e.pull().await.unwrap();
-    assert_eq!(keys_of(&e, &pulled.id).await, [layer.whole()]);
-    let record = e.db.get_layer(&layer.whole()).await.unwrap();
-    assert_eq!(record.diff_id.as_ref(), Some(&layer.diff_id));
+    let before = e.stored().await;
+    for lazy in [true, false] {
+        let refused = pull_tag(&e, "latest", lazy).await.unwrap_err().to_string();
+        assert!(refused.contains(&sha(&layer.blob).to_string()), "{refused}");
+        assert!(refused.contains("no tar-split"), "{refused}");
+        assert_eq!(e.stored().await, before);
+    }
 }
 
 /// The layer of a TOC never stands for a layer of a blob: a gzip image
@@ -201,14 +195,18 @@ async fn test_the_layer_of_a_toc_and_the_layer_of_a_blob_are_never_one_for_the_o
     );
     assert!(e.db.get_layer(&chunked.key()).await.is_ok());
 
-    // the other way: the blob is stored whole (the registry served no
-    // range), then another image names it with its labels
+    // the other way: a gzip layer of the blob is stored, then another image
+    // names the same blob with the labels of its table
     let e = env().await;
-    e.publish(&[&chunked], &[ZSTD]);
-    *e.reg.mode.lock().unwrap() = RangeMode::Refuse;
-    let first = e.pull().await.unwrap();
-    assert_eq!(keys_of(&e, &first.id).await, [chunked.whole()]);
-    *e.reg.mode.lock().unwrap() = RangeMode::Normal;
+    publish_arch(
+        &e.reg,
+        &[&gzip],
+        &[GZIP],
+        velarx_registry::target::host_arch(),
+        "gzip",
+    );
+    let first = pull_tag(&e, "gzip", false).await.unwrap();
+    assert_eq!(keys_of(&e, &first.id).await, [gzip.whole()]);
     publish_annotated(
         &e.reg,
         &[&chunked],
@@ -220,45 +218,54 @@ async fn test_the_layer_of_a_toc_and_the_layer_of_a_blob_are_never_one_for_the_o
     let second = pull_tag(&e, "again", true).await.unwrap();
     assert_ne!(first.id, second.id);
     assert_eq!(keys_of(&e, &second.id).await, [chunked.key()]);
-    // two layers for one descriptor, each of the route that verified it
+    // two layers for one diff id, each of the route that verified it
     assert!(e.db.get_layer(&chunked.key()).await.is_err());
     assert!(e.area().layer(&chunked.key()).unwrap().is_some());
-    assert_eq!(
-        e.db.get_layer(&chunked.whole()).await.unwrap().status,
-        "ready"
-    );
+    assert_eq!(e.db.get_layer(&gzip.whole()).await.unwrap().status, "ready");
     assert!(e.service.get(&second.id).await.is_err(), "being pulled");
 }
 
 /// The descriptor decides, never the blob: a blob with a TOC frame whose
-/// descriptor lost its labels (or has half of them) is a layer of its blob,
-/// pulled whole, and its TOC is not read.
+/// descriptor has none of the labels is a layer of its blob, pulled whole,
+/// and its TOC is not read.  Half of the labels is not none: the layer is
+/// refused, and nothing is stored.
 #[tokio::test]
 async fn test_a_descriptor_without_the_labels_is_the_layer_of_its_blob() {
-    for strip in [&LABELS[..], &LABELS[1..], &LABELS[..1]] {
+    let layer = build_chunked(&sample());
+    let toc = layer.key();
+    let mut bare = layer.clone();
+    for label in LABELS {
+        bare.annotations.remove(label);
+    }
+    let e = env().await;
+    e.publish(&[&bare], &[ZSTD]);
+    let before = e.stored().await;
+    // (a lazy pull of a layer that cannot be lazy is refused)
+    let lazy = pull_tag(&e, "latest", true).await;
+    assert!(
+        matches!(lazy, Err(velarx_types::ImageError::NotLazy { .. })),
+        "{lazy:?}"
+    );
+    assert_eq!(e.stored().await, before);
+    let pulled = e.pull().await.unwrap();
+    assert_eq!(e.reg.ranged.load(Ordering::SeqCst), 0);
+    assert_eq!(keys_of(&e, &pulled.id).await, [bare.whole()]);
+    let record = e.db.get_layer(&bare.whole()).await.unwrap();
+    assert_eq!(record.diff_id.as_ref(), Some(&bare.diff_id));
+    assert!(e.db.get_layer(&toc).await.is_err());
+
+    for strip in [&LABELS[1..], &LABELS[..1]] {
+        let mut half = layer.clone();
+        for label in strip {
+            half.annotations.remove(*label);
+        }
         for lazy in [false, true] {
             let e = env().await;
-            let mut layer = build_chunked(&sample());
-            let toc = layer.key();
-            for label in strip {
-                layer.annotations.remove(*label);
-            }
-            e.publish(&[&layer], &[ZSTD]);
-            let pulled = pull_tag(&e, "latest", lazy).await;
-            // (a lazy pull of a layer that cannot be lazy is refused)
-            if lazy {
-                assert!(
-                    matches!(pulled, Err(velarx_types::ImageError::NotLazy { .. })),
-                    "{pulled:?}"
-                );
-                continue;
-            }
-            let pulled = pulled.unwrap();
-            assert_eq!(e.reg.ranged.load(Ordering::SeqCst), 0, "{strip:?}");
-            assert_eq!(keys_of(&e, &pulled.id).await, [layer.whole()]);
-            let record = e.db.get_layer(&layer.whole()).await.unwrap();
-            assert_eq!(record.diff_id.as_ref(), Some(&layer.diff_id));
-            assert!(e.db.get_layer(&toc).await.is_err());
+            e.publish(&[&half], &[ZSTD]);
+            let before = e.stored().await;
+            let refused = pull_tag(&e, "latest", lazy).await.unwrap_err();
+            assert!(refused.to_string().contains("zstd:chunked"), "{refused}");
+            assert_eq!(e.stored().await, before);
         }
     }
 }
@@ -449,47 +456,41 @@ async fn test_an_image_of_toc_layers_is_pushed_committed_checked_and_removed() {
     assert!(e.db.list_layers().await.unwrap().is_empty());
 }
 
-/// A registry that cannot serve ranges right (it ignores them, refuses
-/// them, answers without the range it sent, or short): the layer is pulled
-/// whole and is the layer of its blob, or by its TOC when the bytes were
-/// the ones asked for; never refused.  One that answers the ranges with
-/// other bytes (an offset off) contradicts the TOC the descriptor vouches
-/// for: the pull is refused, as podman does, and records nothing.
+/// A registry that cannot serve ranges (it ignores them, takes one at a time
+/// or refuses them) still gives the layer through its table: the blob is the
+/// transport.  One whose answers are not what was asked for (no
+/// `Content-Range`, cut short every time) refuses the layer, naming it, and
+/// stores nothing.
 #[tokio::test]
-async fn test_a_registry_that_cannot_serve_ranges_gives_the_blob_whole() {
+async fn test_a_registry_that_cannot_serve_ranges_gives_the_blob_as_transport() {
     let layer = build_chunked(&sample());
-    for (mode, cut) in [
-        (RangeMode::Ignore, 0),
-        (RangeMode::SingleOnly, 0),
-        (RangeMode::Refuse, 0),
-        (RangeMode::NoContentRange, 0),
-        (RangeMode::Normal, 1000),
-    ] {
+    for mode in [RangeMode::Ignore, RangeMode::SingleOnly, RangeMode::Refuse] {
+        for lazy in [false, true] {
+            let e = env().await;
+            e.publish(&[&layer], &[ZSTD]);
+            *e.reg.mode.lock().unwrap() = mode;
+            let pulled = pull_tag(&e, "latest", lazy).await.unwrap();
+            if lazy {
+                e.service.complete_image(&pulled.id).await.unwrap();
+            }
+            assert_eq!(keys_of(&e, &pulled.id).await, [layer.key()]);
+            assert!(e.db.get_layer(&layer.whole()).await.is_err());
+            assert!(e.store.contains(&vid(b"hello\n")));
+        }
+    }
+    for (mode, cut) in [(RangeMode::NoContentRange, 0), (RangeMode::Normal, 1000)] {
         for lazy in [false, true] {
             let e = env().await;
             e.publish(&[&layer], &[ZSTD]);
             *e.reg.mode.lock().unwrap() = mode;
             e.reg.cut.store(cut, Ordering::SeqCst);
-            let pulled = match pull_tag(&e, "latest", lazy).await {
-                // (a layer that would be pulled whole cannot be lazy: refused)
-                Err(velarx_types::ImageError::NotLazy { .. }) if lazy => continue,
-                other => other.unwrap(),
-            };
-            let keys = keys_of(&e, &pulled.id).await;
-            let whole = pulled.stats.layers[0].note.is_some();
-            assert_eq!(
-                keys,
-                [if whole { layer.whole() } else { layer.key() }],
-                "lazy {lazy} cut {cut}"
+            let before = e.stored().await;
+            let refused = pull_tag(&e, "latest", lazy).await.unwrap_err();
+            assert!(
+                refused.to_string().contains(&sha(&layer.blob).to_string()),
+                "{refused}"
             );
-            if matches!(mode, RangeMode::Refuse | RangeMode::NoContentRange) || cut > 0 {
-                assert!(whole, "lazy {lazy} cut {cut}: {:?}", pulled.stats.layers[0]);
-            }
-            if whole {
-                let record = e.db.get_layer(&layer.whole()).await.unwrap();
-                assert_eq!(record.diff_id.as_ref(), Some(&layer.diff_id));
-                assert!(e.db.get_layer(&layer.key()).await.is_err());
-            }
+            assert_eq!(e.stored().await, before);
         }
     }
     let e = env().await;
@@ -600,7 +601,7 @@ async fn test_one_toc_named_by_two_blobs_is_one_layer() {
     e.publish(&[&first, &second], &[ZSTD, ZSTD]);
     *e.reg.mode.lock().unwrap() = RangeMode::Refuse;
     let both = e.pull().await.unwrap();
-    assert_eq!(keys_of(&e, &both.id).await, [first.whole(), second.whole()]);
+    assert_eq!(keys_of(&e, &both.id).await, [first.key(), second.key()]);
 }
 
 /// Pulls of one image, lazily and not, at once and one after the other: one
@@ -659,5 +660,98 @@ async fn test_lazy_and_eager_pulls_of_one_image_make_one_layer() {
             !erofs.exists(),
             "the image of the layer of the TOC is collected"
         );
+    }
+}
+
+/// A pull of `layer`, eagerly or lazily, in a store of its own: its table
+/// of contents (the stored one, or the staged one of a lazy pull), or the
+/// error of a refusal, which leaves the store as it was.
+async fn toc_pulled(
+    layer: &Built,
+    lazy: bool,
+) -> Result<velarx_storage::Toc, velarx_types::ImageError> {
+    let e = env().await;
+    e.publish(&[layer], &[ZSTD]);
+    let before = e.stored().await;
+    let pulled = match pull_tag(&e, "latest", lazy).await {
+        Ok(p) => p,
+        Err(err) => {
+            assert_eq!(e.stored().await, before, "{err}");
+            return Err(err);
+        }
+    };
+    assert_eq!(keys_of(&e, &pulled.id).await, [layer.key()]);
+    let text = match lazy {
+        true => e
+            .area()
+            .layer(&layer.key())
+            .unwrap()
+            .unwrap()
+            .toc_text()
+            .unwrap(),
+        false => e.db.get_layer(&layer.key()).await.unwrap().toc.unwrap(),
+    };
+    Ok(serde_json::from_str(&text).unwrap())
+}
+
+/// `layer` with the entry `name` of its table of contents changed by `edit`.
+fn edited(layer: &Built, name: &str, edit: impl FnOnce(&mut serde_json::Value)) -> Built {
+    with_toc(layer, |j| {
+        let at = j["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|e| e["name"] == name)
+            .unwrap();
+        edit(&mut j["entries"][at]);
+    })
+}
+
+/// A dual view image: the manifest vouches for a table of contents that
+/// describes another filesystem than the tar stream of the layer (the
+/// tar-split and the blob).  Whichever way it is pulled, the layer is
+/// refused with an error that names it and nothing is stored: it is never
+/// the layer of the stream, and a table the tar-split contradicts would make
+/// another tar again than the layer that was stored.
+#[tokio::test]
+async fn test_a_table_that_differs_from_the_tar_stream_is_refused() {
+    let layer = build_chunked(&sample());
+    let dual = [
+        edited(&layer, "etc/small", |e| e["mode"] = 0o4755.into()),
+        edited(&layer, "etc/small", |e| e["uid"] = 1000.into()),
+        edited(&layer, "etc/small", |e| e["name"] = "etc/renamed".into()),
+        edited(&layer, "etc/small", |e| {
+            e["xattrs"] = serde_json::json!({"security.capability": "AQID"})
+        }),
+        with_toc(&layer, |j| {
+            let entries = j["entries"].as_array_mut().unwrap();
+            let at = entries.iter().position(|e| e["name"] == "etc/copy");
+            entries.remove(at.unwrap());
+        }),
+        with_toc(&layer, |j| {
+            j["entries"].as_array_mut().unwrap().push(serde_json::json!(
+                {"type": "symlink", "name": "etc/only-in-the-table", "linkName": "/etc/shadow", "mode": 0o777}
+            ));
+        }),
+    ];
+    // another content: the files are checked against the table, which the
+    // stream cannot make right (a lazy pull fetches no file)
+    let content = edited(&layer, "etc/small", |e| {
+        e["digest"] = sha(b"not hello").to_string().into();
+        e["chunkDigest"] = sha(b"not hello").to_string().into();
+        e["fsverity"] = toc_verity(b"not hello").into();
+    });
+    for lazy in [false, true] {
+        let honest = toc_pulled(&layer, lazy).await.unwrap();
+        let small = honest.find_by_name("etc/small").unwrap();
+        assert_eq!(small.mode & 0o7777, 0o644);
+        let eager_only = (!lazy).then_some(&content);
+        for (i, dual) in dual.iter().chain(eager_only).enumerate() {
+            let refused = toc_pulled(dual, lazy).await.unwrap_err().to_string();
+            assert!(
+                refused.contains(&sha(&dual.blob).to_string()),
+                "{i} (lazy {lazy}): {refused}"
+            );
+        }
     }
 }

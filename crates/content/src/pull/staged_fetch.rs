@@ -674,9 +674,8 @@ impl StagedFetch {
     }
 
     /// [`StagedFetch::open_layer`] for the layer `key`: a layer
-    /// with a table of contents that is pulled whole is the layer of its
-    /// blob, whose staging is not the one of its table (two blobs may have
-    /// one table).
+    /// with no table of contents is the layer of its blob, whose staging is
+    /// not the one of a table (two blobs may have one table).
     pub async fn open_layer_as(
         &self,
         key: velarx_types::LayerKey,

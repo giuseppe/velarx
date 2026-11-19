@@ -152,6 +152,23 @@ without the numbers of issues or pull requests of any tracker.
   it, whatever the order of its table; a hard link to a file of a layer
   below is an error.  These views kept the root and directories of the
   layers below.
+- A zstd:chunked layer is pulled through its table of contents or not at all,
+  eagerly and lazily, so that an image whose table and tar stream describe
+  different filesystems is never taken for the layer of its stream: the
+  entries of the layer and its EROFS image are the table's, and a tar-split
+  that does not describe the same entries is refused.  What was pulled whole
+  instead is now an error that names the layer, and nothing of the image is
+  stored: a table without a tar-split (and not of version 2), a table that
+  gives a file no fs-verity digest (what containers/storage writes by
+  default), zstd:chunked annotations that do not name a table this reads (one
+  of `manifest-position` and `manifest-checksum` without the other, another
+  kind of table, annotations on a layer that is not zstd), and a zstd:chunked
+  layer of an archive or a directory (`load`, `oci-archive:`, `oci:`,
+  `dir:`), which has no ranges to read the table by: loading such an image
+  is not supported yet.  A registry that serves no ranges, or refuses them,
+  gives the blob whole as the transport of the ranges.  The statistics of a
+  pull no longer have `note`, and `ImageNotLazy` no longer says
+  `no_file_digests`.
 - A pull of a layer that has no table of contents (a gzip layer) is faster,
   for the layers of many small files most: the fetcher hands the files it
   unpacks over to the engine as descriptors of the replies of `Unpack` (a

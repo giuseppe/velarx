@@ -77,12 +77,6 @@ const GLOBAL_PENDING_CAP: u64 = 64 * 1024 * 1024;
 /// Times a request is retried after an error.
 pub(crate) const RETRIES: usize = 3;
 
-/// How a layer ends: pulled, or to be pulled whole.
-pub enum Outcome {
-    Done(Box<Pulled>),
-    Fallback(String),
-}
-
 pub struct Pulled {
     /// Files and chunks the store had before the pull
     pub from_store: u64,
@@ -122,18 +116,41 @@ fn parse_numbers<const N: usize>(s: &str) -> Option<[u64; N]> {
     parts.next().is_none().then_some(out)
 }
 
-/// The zstd:chunked metadata of a layer, if it has any.
+/// The zstd:chunked metadata of a layer, if it has any.  A descriptor with
+/// any zstd:chunked annotation says that the layer has a table of contents,
+/// which it is pulled by or not at all: annotations that do not name one
+/// this can read (on a layer that is not zstd, without the position or the
+/// checksum of the table, of another kind of table) are an error, never a
+/// layer to read as a stream.
 pub fn parse_info(layer: &OciDescriptor) -> ImageResult<Option<Info>> {
+    if !layer
+        .annotations
+        .keys()
+        .any(|k| ANNOTATION_PREFIXES.iter().any(|p| k.starts_with(p)))
+    {
+        return Ok(None);
+    }
+    let refused = |why: &str| {
+        ImageError::Manifest(format!(
+            "layer {}: its zstd:chunked annotations {why}",
+            layer.digest
+        ))
+    };
     if crate::layer::writer::Compression::from_media_type(&layer.media_type)
         != Some(crate::layer::writer::Compression::ZstdChunked)
     {
-        return Ok(None);
+        return Err(refused(&format!(
+            "are on a layer of type {}",
+            layer.media_type
+        )));
     }
     let (Some(position), Some(checksum)) = (
         annotation(layer, "manifest-position"),
         annotation(layer, "manifest-checksum"),
     ) else {
-        return Ok(None);
+        return Err(refused(
+            "do not give both the position and the checksum of its table of contents",
+        ));
     };
     let toc = parse_numbers::<4>(position).ok_or_else(|| {
         ImageError::Manifest(format!(
@@ -141,7 +158,10 @@ pub fn parse_info(layer: &OciDescriptor) -> ImageResult<Option<Info>> {
         ))
     })?;
     if toc[3] != 1 {
-        return Ok(None);
+        return Err(ImageError::Manifest(format!(
+            "unknown zstd:chunked manifest type {}",
+            toc[3]
+        )));
     }
     let checksum: Digest = checksum.parse().map_err(|e| {
         ImageError::Manifest(format!(
@@ -168,6 +188,34 @@ fn fail(msg: impl Into<String>) -> ImageError {
     ImageError::Layer(msg.into())
 }
 
+/// `e`, an error of the pull of `layer` by its table of contents, as one
+/// that names the layer.
+pub fn naming(layer: &Digest, e: ImageError) -> ImageError {
+    let named = |m: &str| m.contains(&layer.to_string());
+    match e {
+        ImageError::Layer(m) if !named(&m) => ImageError::Layer(format!("layer {layer}: {m}")),
+        ImageError::Registry(m) if !named(&m) => {
+            ImageError::Registry(format!("layer {layer}: {m}"))
+        }
+        ImageError::Contradicted(m) if !named(&m) => {
+            ImageError::Contradicted(format!("layer {layer}: {m}"))
+        }
+        ImageError::DigestMismatch { expected, actual } => ImageError::Contradicted(format!(
+            "layer {layer}: digest mismatch: expected {expected}, got {actual}"
+        )),
+        ImageError::Transfer {
+            party,
+            object: None,
+            failure,
+        } => ImageError::Transfer {
+            party,
+            object: Some(layer.to_string()),
+            failure,
+        },
+        e => e,
+    }
+}
+
 /// Bytes of the layer (`what`) that are not what the TOC its descriptor
 /// vouches for says ([`ImageError::Contradicted`]).
 pub(crate) fn not_the_tocs(
@@ -180,12 +228,9 @@ pub(crate) fn not_the_tocs(
     ))
 }
 
-/// Whether `e` refuses the pull of a layer by its TOC instead of pulling
-/// it whole: what the descriptor vouches for (the TOC, and the tar-split,
-/// chunks and files it names) is not what the registry gives, or the view
-/// of the TOC is not the diff id of the configuration.  A registry that
-/// cannot serve the ranges (refuses them, answers short, without the
-/// range it sent) is not this: the layer is pulled whole.
+/// Whether `e` says that what the descriptor vouches for (the TOC, and the
+/// tar-split, chunks and files it names) is not what the registry gives, or
+/// that the view of the TOC is not the diff id of the configuration.
 pub fn refuses(e: &ImageError) -> bool {
     match e {
         ImageError::Transfer { failure, .. } => {
@@ -199,9 +244,8 @@ pub fn refuses(e: &ImageError) -> bool {
 }
 
 /// A failure of a file of the stage.  The system failing (no space, an I/O
-/// error: it gave an errno) is this machine's, and pulling the layer another
-/// way fails the same way; what the stage says itself (a file it does not
-/// have) is the layer's.
+/// error: it gave an errno) is this machine's; what the stage says itself (a
+/// file it does not have) is the layer's.
 pub fn io_fail(e: io::Error) -> ImageError {
     match e.raw_os_error() {
         Some(_) => ImageError::Io(e),
@@ -212,19 +256,6 @@ pub fn io_fail(e: io::Error) -> ImageError {
 /// The bytes of a layer that are not a stream of the kind they should be.
 fn data_fail(e: io::Error) -> ImageError {
     ImageError::Layer(e.to_string())
-}
-
-/// Whether `e` is this machine failing ([`io_fail`]).
-pub fn local_failure(e: &ImageError) -> bool {
-    matches!(e, ImageError::Io(_))
-}
-
-/// Whether no other route makes `e` right, so that the pull is not taken
-/// another way (the layer whole, or its metadata alone): what the descriptor
-/// vouches for is not what the registry gave ([`refuses`]), or this machine
-/// cannot write or read ([`local_failure`]).
-pub fn no_other_route(e: &ImageError) -> bool {
-    refuses(e) || local_failure(e)
 }
 
 /// The compressed TOC and tar-split of `layer`: what the fetchers of the
@@ -240,22 +271,27 @@ pub(super) async fn metadata(
     staged
         .probe(layer)
         .await?
-        .ok_or_else(|| fail("the fetcher has no table of contents for the layer"))
+        .ok_or_else(|| fail("no fetcher gave its table of contents"))
 }
 
 /// The verified table of contents and tar-split of a layer pulled by ranges
 /// (what the feed of a pull shows a driver of the layer): fetched now.  None
-/// for a layer that is not zstd:chunked, or has no tar-split and a table of
-/// version 1.
+/// for a layer that is not zstd:chunked.
 pub async fn layer_index(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<Option<Metadata>> {
     let Some(info) = parse_info(layer)? else {
         return Ok(None);
     };
-    let (toc_z, ts_z) = metadata(ctx, layer).await?;
-    let digest = layer.digest;
-    tokio::task::spawn_blocking(move || verify_metadata(&info, &toc_z, ts_z, &digest))
+    let by_table = async {
+        let (toc_z, ts_z) = metadata(ctx, layer).await?;
+        let digest = layer.digest;
+        tokio::task::spawn_blocking(move || verify_metadata(&info, &toc_z, ts_z, &digest))
+            .await
+            .map_err(|e| fail(e.to_string()))?
+    };
+    by_table
         .await
-        .map_err(|e| fail(e.to_string()))?
+        .map(Some)
+        .map_err(|e| naming(&layer.digest, e))
 }
 
 /// Decompress at most `max` bytes, and exactly `expected` if it is known.
@@ -279,6 +315,9 @@ fn decompress_bounded(data: &[u8], max: u64, expected: u64, what: &str) -> Image
 #[derive(Clone)]
 pub struct Metadata {
     pub toc: Arc<Toc>,
+    /// What the layer is stored by: the entries of `toc` as a layer keeps
+    /// them ([`super::lazy::toc_view`]); `toc` itself for a canonical layer.
+    pub stored: Arc<Toc>,
     pub tarsplit_z: bytes::Bytes,
     pub tarsplit_size: u64,
 }
@@ -295,14 +334,15 @@ fn invalid_canonical(layer: &Digest, reason: impl std::fmt::Display) -> ImageErr
 /// version 2 has not) that a descriptor vouches for, checked against what
 /// it says.  The table of a layer is the one of a canonical tar when its
 /// `version` is 2, whatever the annotations say: it must be one, and then
-/// it is all the layer has.  None for a layer that has neither a tar-split
-/// nor such a table: it is pulled whole.
+/// it is all the layer has.  A layer with a table is pulled by it or not at
+/// all: one that has no tar-split and no table of version 2, or whose table
+/// gives a file no fs-verity digest, is an error naming the layer.
 pub fn verify_metadata(
     info: &Info,
     toc_z: &[u8],
     ts_z: Vec<u8>,
     layer: &Digest,
-) -> ImageResult<Option<Metadata>> {
+) -> ImageResult<Metadata> {
     // (what the descriptor vouches for: bytes that are not it are not a
     // layer to pull another way, see `pull`)
     let actual = Digest::of(info.checksum.alg(), toc_z);
@@ -312,6 +352,21 @@ pub fn verify_metadata(
             actual: actual.to_string(),
         });
     }
+    // (the bytes are those the descriptor vouches for: what is wrong with
+    // them is wrong again on every try)
+    vouched_metadata(info, toc_z, ts_z, layer).map_err(|e| match e {
+        ImageError::Layer(m) => ImageError::Contradicted(format!("layer {layer}: {m}")),
+        e => e,
+    })
+}
+
+/// [`verify_metadata`] of a table that is the bytes of its checksum.
+fn vouched_metadata(
+    info: &Info,
+    toc_z: &[u8],
+    ts_z: Vec<u8>,
+    layer: &Digest,
+) -> ImageResult<Metadata> {
     let json = decompress_bounded(toc_z, MAX_TOC_JSON, info.toc.2, "TOC")?;
     let toc: Toc = serde_json::from_slice(&json).map_err(|e| fail(format!("invalid TOC: {e}")))?;
     drop(json);
@@ -323,15 +378,25 @@ pub fn verify_metadata(
             return Err(invalid_canonical(layer, "the layer has a tar-split"));
         }
         canonical::validate(&toc.entries).map_err(|e| invalid_canonical(layer, e))?;
-        return Ok(Some(Metadata {
-            toc: Arc::new(toc),
+        let toc = Arc::new(toc);
+        return Ok(Metadata {
+            stored: toc.clone(),
+            toc,
             tarsplit_z: bytes::Bytes::new(),
             tarsplit_size: 0,
-        }));
+        });
     }
     let Some(tarsplit) = info.tarsplit else {
-        return Ok(None);
+        return Err(ImageError::Contradicted(format!(
+            "layer {layer}: its table of contents has no tar-split and is not of version 2"
+        )));
     };
+    if let Some(e) = super::lazy::without_verity(&toc) {
+        return Err(ImageError::Contradicted(format!(
+            "layer {layer}: its table of contents has no fs-verity digest for `{}`",
+            e.name
+        )));
+    }
     let expected = toc
         .tar_split_digest
         .as_deref()
@@ -348,11 +413,14 @@ pub fn verify_metadata(
             actual: actual.to_string(),
         });
     }
-    Ok(Some(Metadata {
+    let ts_z = bytes::Bytes::from(ts_z);
+    let stored = super::lazy::toc_view(&toc, info.checksum.alg(), ts_z.clone(), layer)?;
+    Ok(Metadata {
         toc: Arc::new(toc),
-        tarsplit_z: ts_z.into(),
+        stored: Arc::new(stored),
+        tarsplit_z: ts_z,
         tarsplit_size: tarsplit.2,
-    }))
+    })
 }
 
 #[derive(Debug)]
@@ -707,8 +775,12 @@ pub(super) async fn plan_blocking(
     limits: &super::Limits,
 ) -> ImageResult<Plan> {
     let (max_chunk, cap) = (limits.max_chunk_bytes, limits.inflate_cap(blob_size));
+    // (a table the plan refuses is refused again on every try)
     tokio::task::spawn_blocking(move || {
-        make_plan(&toc, alg, blob_size, max_chunk, cap, &|d| have(d))
+        make_plan(&toc, alg, blob_size, max_chunk, cap, &|d| have(d)).map_err(|e| match e {
+            ImageError::Layer(m) => ImageError::Contradicted(m),
+            e => e,
+        })
     })
     .await
     .map_err(|e| fail(format!("planning the layer: {e}")))?
@@ -1412,7 +1484,7 @@ fn process_local(sh: &Shared, idx: usize) -> ImageResult<()> {
     let mut data = vec![0u8; c.size as usize];
     f.read_exact_at(&mut data, *off).map_err(io_fail)?;
     // (a file of the store that is not what it was is the store's damage,
-    // not the registry's: the layer can still be pulled whole)
+    // not the registry's)
     write_verified(sh, idx, data).map_err(|e| match refuses(&e) {
         true => fail(format!("a chunk of the store: {e}")),
         false => e,
@@ -1825,32 +1897,28 @@ fn replay_of(
     })
 }
 
-/// Pull a zstd:chunked layer by ranges.  A failure of the partial path is a
-/// `Fallback`: the caller pulls the layer whole, and it is a layer of its
-/// blob.  What the descriptor vouches for that is not what the registry
-/// gives (the TOC is not the bytes of its checksum, the tar-split not the
-/// one of the TOC) or a layer that is not the one of the configuration
-/// (the replay of the TOC's view does not give the diff id) is an error:
-/// the descriptor contradicts itself, and the blob is not taken instead.
+/// Pull a zstd:chunked layer by its table of contents, whose descriptor
+/// vouches for it: the metadata of the layer is the table's, every file is
+/// checked against it, and the layer is never pulled another way.  Whatever
+/// fails is an error that names the layer: bytes that are not what the
+/// descriptor vouches for, a table the layer or the configuration
+/// contradicts, a registry that gives no range of the blob.  (A registry
+/// that cannot serve ranges gives the blob whole, as the transport of
+/// the ranges: the files are still those of the table.)
 pub async fn pull(
     ctx: &PullCtx,
     target: &Target,
     layer: &OciDescriptor,
+    info: &Info,
     expected_diff_id: &Digest,
     progress: impl Fn(u64) + Send + Sync + 'static,
-) -> ImageResult<Outcome> {
-    let Some(info) = parse_info(layer)? else {
-        return Ok(Outcome::Fallback("not zstd:chunked".into()));
-    };
-    match try_pull(ctx, target, layer, &info, expected_diff_id, progress).await {
-        Ok(p) => Ok(Outcome::Done(Box::new(p))),
-        // (nor is a machine that cannot write)
-        Err(e) if no_other_route(&e) => Err(e),
-        Err(e) => Ok(Outcome::Fallback(format!("partial pull failed: {e}"))),
-    }
+) -> ImageResult<Pulled> {
+    pull_by_table(ctx, target, layer, info, expected_diff_id, progress)
+        .await
+        .map_err(|e| naming(&layer.digest, e))
 }
 
-async fn try_pull(
+async fn pull_by_table(
     ctx: &PullCtx,
     target: &Target,
     layer: &OciDescriptor,
@@ -1874,8 +1942,7 @@ async fn try_pull(
         move || verify_metadata(&info, &toc_z, ts_z, &digest)
     })
     .await
-    .map_err(|e| fail(e.to_string()))??
-    .ok_or_else(|| fail("no tar-split annotation"))?;
+    .map_err(|e| fail(e.to_string()))??;
 
     debug!(
         "Layer {}: metadata verified after {:?}",
@@ -2144,6 +2211,19 @@ pub struct Whole {
     pub stored: HashMap<String, String>,
 }
 
+/// An error unless `layer` is one without a table of contents: the only
+/// layers that are read as a tar stream.  The stream of a layer with a table
+/// may describe another filesystem than the table the manifest vouches for.
+pub fn no_table(layer: &OciDescriptor) -> ImageResult<()> {
+    match parse_info(layer)? {
+        Some(_) => Err(ImageError::Contradicted(format!(
+            "layer {}: it is zstd:chunked, which is pulled by its table of contents or not at all, and the source gives none",
+            layer.digest
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Pull `layer`, which has no table of contents, through the fetchers and
 /// check it ([`Unpacked`]).  A fetcher before the
 /// registry fetcher may leave out the files the claim names that it has not
@@ -2158,6 +2238,7 @@ pub async fn unpack_whole(
     registry_only: bool,
     progress: impl Fn(u64) + Send + Sync + 'static,
 ) -> ImageResult<Unpacked> {
+    no_table(layer)?;
     match unpack_from(ctx, layer, expected_diff_id, registry_only, &progress).await {
         Err((e, true)) if !registry_only => {
             debug!("Layer {}: not from its fetchers: {e}", layer.digest);
@@ -2271,7 +2352,6 @@ async fn unpack_from(
             reused_bytes: 0,
             reused_files: stored.len() as u64,
             sources,
-            note: None,
         },
         files: replayed.files,
         diff_id: replayed.diff_id,
@@ -2382,17 +2462,14 @@ async fn verify_layer(
     // diff id is claimed for the stream before a recreation of it checks
     // one.
     let executed = execute(ctx, layer, plan, started).await?;
-    // (the entries are those of the tar headers of the verified tar-split,
-    // with the digests and the chunks of the verified table: what a lazy
-    // layer records; the table of a canonical layer is all there is)
+    // (the entries are those of the verified table, as a lazy layer records
+    // them)
     let toc = if meta.toc.is_canonical() {
-        (*meta.toc).clone()
+        (*meta.stored).clone()
     } else {
-        let merged = super::lazy::merge_toc(&meta.toc, plan_alg, meta.tarsplit_z.clone())?;
         Toc {
-            version: TOC_VERSION,
-            entries: merged.entries,
             tar_split_digest: Some(Digest::of(plan_alg, &meta.tarsplit_z).to_string()),
+            ..(*meta.stored).clone()
         }
     };
     let files = FileUse::of_toc(&toc);
@@ -2427,7 +2504,6 @@ impl Executed {
             reused_bytes: self.skipped_compressed + self.local_bytes,
             reused_files: self.skipped_files,
             sources: Vec::new(),
-            note: None,
         }
     }
 

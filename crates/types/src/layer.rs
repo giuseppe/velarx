@@ -151,9 +151,9 @@ pub fn is_zstd(media_type: &str) -> bool {
 /// The TOC digest of a descriptor with zstd:chunked labels: a zstd layer
 /// with `manifest-checksum` and `manifest-position` (the two that podman
 /// requires), the position of a TOC (its fourth field is 1: another kind
-/// of manifest is no TOC to pull by).  None for any other: a descriptor
-/// with one of the two is a layer pulled whole, and the blob is never
-/// looked at to decide.
+/// of manifest is no TOC to pull by).  None for any other (the pull
+/// refuses a descriptor that has one of the two): the blob is never looked
+/// at to decide.
 pub fn chunked_checksum(desc: &OciDescriptor) -> Option<Digest> {
     if !is_zstd(&desc.media_type) {
         return None;
