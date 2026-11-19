@@ -15,7 +15,9 @@ use crate::pull::tar::{Header, Kind, Sink, TarReader};
 use crate::pull::tarsplit;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
-use velarx_storage::{Toc, TocEntry, TocEntryType, TocVerityHasher, TOC_VERSION};
+use velarx_storage::{
+    canonical, Toc, TocEntry, TocEntryType, TocVerityHasher, TOC_VERSION, TOC_VERSION_CANONICAL,
+};
 use velarx_types::digest::{Algorithm, Digest, DigestWriter, Hashing};
 
 use zstd::stream::raw::{Encoder as RawEncoder, InBuffer, Operation, OutBuffer};
@@ -398,8 +400,45 @@ struct Chunk {
     digest: String,
 }
 
+/// The tar stream without its contents, a digest for each entry: what the
+/// writer of a canonical layer compares with the one of its table of
+/// contents (see [`canonical::skeleton`]).
+struct Skeleton {
+    hasher: DigestWriter,
+    entries: Vec<Digest>,
+}
+
+impl Skeleton {
+    fn new() -> Self {
+        Self {
+            hasher: DigestWriter::new(Algorithm::Sha256),
+            entries: Vec::new(),
+        }
+    }
+
+    fn end_part(&mut self) {
+        let done = std::mem::replace(&mut self.hasher, DigestWriter::new(Algorithm::Sha256));
+        self.entries.push(done.finalize());
+    }
+
+    /// What the table of contents `entries` says the skeleton is.
+    fn of(entries: &[TocEntry]) -> io::Result<Vec<Digest>> {
+        let mut skeleton = Self::new();
+        let mut part = 0;
+        canonical::skeleton(entries, |i, bytes| {
+            while part < i {
+                skeleton.end_part();
+                part += 1;
+            }
+            skeleton.hasher.update(bytes);
+        })?;
+        skeleton.end_part();
+        Ok(skeleton.entries)
+    }
+}
+
 /// Compresses the stream as the tar reader reports it, and builds the TOC and
-/// the tar-split.
+/// the tar-split (none for a canonical layer, whose `skeleton` is kept).
 struct Writer<W: Write> {
     /// The algorithm of every digest the layer has.
     alg: Algorithm,
@@ -407,6 +446,7 @@ struct Writer<W: Write> {
     backend: Option<Backend<W>>,
     toc: Vec<TocEntry>,
     split: Option<tarsplit::Writer<Vec<u8>>>,
+    skeleton: Option<Skeleton>,
 
     /// The entry in progress: its TOC entry if it has one, and whether it is
     /// a regular file with content.
@@ -440,6 +480,7 @@ impl<W: Write> Writer<W> {
         alg: Algorithm,
         sha256_digest: bool,
         fsverity: bool,
+        canonical: bool,
     ) -> io::Result<Self> {
         let chunked = compression == Compression::ZstdChunked;
         Ok(Self {
@@ -447,7 +488,8 @@ impl<W: Write> Writer<W> {
             compression,
             backend: Some(Backend::new(alg, compression, level, out)?),
             toc: Vec::new(),
-            split: chunked.then(|| tarsplit::Writer::new(Vec::new())),
+            split: (chunked && !canonical).then(|| tarsplit::Writer::new(Vec::new())),
+            skeleton: (chunked && canonical).then(Skeleton::new),
             current: None,
             regular: false,
             size: 0,
@@ -706,30 +748,73 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
-    /// Write the TOC, the tar-split and the footer; their annotations.
+    /// The table of contents, as the JSON that goes in the blob.  The
+    /// table of a canonical layer is parsed back and must have the tar that
+    /// was written: the same skeleton.  Anything else is a bug of the writer,
+    /// and no layer is made of it.
+    fn toc_json(&mut self, toc: &Toc) -> io::Result<Vec<u8>> {
+        let json = serde_json::to_vec(toc).map_err(io::Error::other)?;
+        let Some(mut written) = self.skeleton.take() else {
+            return Ok(json);
+        };
+        written.end_part();
+        let back: Toc = serde_json::from_slice(&json).map_err(io::Error::other)?;
+        let fail = |what: String| {
+            io::Error::other(format!(
+                "zstd:chunked version 2 self-check: the tar rebuilt from the table of contents \
+                 differs from the written one: {what}"
+            ))
+        };
+        canonical::validate(&back.entries).map_err(|e| fail(e.to_string()))?;
+        let rebuilt = Skeleton::of(&back.entries)?;
+        let at = (0..written.entries.len().max(rebuilt.len()))
+            .find(|&i| written.entries.get(i) != rebuilt.get(i));
+        if let Some(i) = at {
+            let name = back
+                .entries
+                .iter()
+                .filter(|e| e.entry_type != TocEntryType::Chunk)
+                .nth(i)
+                .map_or("the end of the stream", |e| e.name.as_str());
+            return Err(fail(format!("entry {i} (`{name}`)")));
+        }
+        Ok(json)
+    }
+
+    /// Write the TOC, the tar-split (a canonical layer has none) and the
+    /// footer; their annotations.
     fn write_chunked_metadata(
         &mut self,
         annotations: &mut BTreeMap<String, String>,
     ) -> io::Result<()> {
-        let split = self
-            .split
-            .take()
-            .ok_or_else(|| io::Error::other("no tar-split"))?;
-        let (ts, _) = split.finish()?;
-        let ts_z = zstd::bulk::compress(&ts, ZSTD_LEVEL)?;
-        let toc = Toc {
-            version: TOC_VERSION,
-            entries: std::mem::take(&mut self.toc),
-            tar_split_digest: Some(Digest::of(self.alg, &ts_z).to_string()),
+        let canonical = self.skeleton.is_some();
+        let (ts_z, ts_len) = match self.split.take() {
+            Some(split) => {
+                let (ts, _) = split.finish()?;
+                (zstd::bulk::compress(&ts, ZSTD_LEVEL)?, ts.len())
+            }
+            None if canonical => (Vec::new(), 0),
+            None => return Err(io::Error::other("no tar-split")),
         };
-        let toc_json = serde_json::to_vec(&toc).map_err(io::Error::other)?;
+        let toc = Toc {
+            version: if canonical {
+                TOC_VERSION_CANONICAL
+            } else {
+                TOC_VERSION
+            },
+            entries: std::mem::take(&mut self.toc),
+            tar_split_digest: (!canonical).then(|| Digest::of(self.alg, &ts_z).to_string()),
+        };
+        let toc_json = self.toc_json(&toc)?;
         let toc_z = zstd::bulk::compress(&toc_json, ZSTD_LEVEL)?;
 
         let backend = self.backend()?;
         let toc_offset = backend.size() + 8;
         backend.skippable(&toc_z)?;
-        let ts_offset = backend.size() + 8;
-        backend.skippable(&ts_z)?;
+        let ts_offset = if canonical { 0 } else { backend.size() + 8 };
+        if !canonical {
+            backend.skippable(&ts_z)?;
+        }
 
         let mut footer = Vec::with_capacity(64);
         for v in [
@@ -739,7 +824,7 @@ impl<W: Write> Writer<W> {
             1,
             ts_offset,
             ts_z.len() as u64,
-            ts.len() as u64,
+            ts_len as u64,
         ] {
             footer.extend(v.to_le_bytes());
         }
@@ -754,10 +839,17 @@ impl<W: Write> Writer<W> {
             format!("{ANNOTATION_PREFIX}manifest-position"),
             format!("{toc_offset}:{}:{}:1", toc_z.len(), toc_json.len()),
         );
-        annotations.insert(
-            format!("{ANNOTATION_PREFIX}tarsplit-position"),
-            format!("{ts_offset}:{}:{}", ts_z.len(), ts.len()),
-        );
+        if canonical {
+            annotations.insert(
+                format!("{ANNOTATION_PREFIX}version"),
+                TOC_VERSION_CANONICAL.to_string(),
+            );
+        } else {
+            annotations.insert(
+                format!("{ANNOTATION_PREFIX}tarsplit-position"),
+                format!("{ts_offset}:{}:{ts_len}", ts_z.len()),
+            );
+        }
         Ok(())
     }
 }
@@ -766,6 +858,9 @@ impl<W: Write> Sink for Writer<W> {
     fn segment(&mut self, data: &[u8]) -> io::Result<()> {
         if let Some(s) = &mut self.split {
             s.segment(data)?;
+        }
+        if let Some(s) = &mut self.skeleton {
+            s.hasher.update(data);
         }
         self.backend()?.feed(data)
     }
@@ -827,6 +922,12 @@ impl<W: Write> Sink for Writer<W> {
     fn file_end(&mut self) -> io::Result<()> {
         if let Some(s) = &mut self.split {
             s.file_end()?;
+        }
+        if let Some(s) = &mut self.skeleton {
+            if self.regular && self.size > 0 {
+                s.hasher.update(&self.size.to_le_bytes());
+            }
+            s.end_part();
         }
         if !self.regular {
             return Ok(());
@@ -894,8 +995,37 @@ pub fn write_layer_level<R: Read, W: Write>(
         compression,
         level,
         out,
-        TOC_SHA256_DIGEST,
-        true,
+        Table {
+            sha256_digest: TOC_SHA256_DIGEST,
+            fsverity: true,
+            canonical: false,
+        },
+    )
+}
+
+/// [`write_layer_level`] for a stream that is the canonical tar of a layer
+/// ([`canonical`]): a zstd:chunked blob of it has a table of contents of
+/// version 2 and no tar-split.  The table is checked against what was
+/// written before the blob is complete; a stream that is not canonical is an
+/// error.  The other compressions are the stream compressed.
+pub fn write_canonical_layer<R: Read, W: Write>(
+    tar: R,
+    alg: Algorithm,
+    compression: Compression,
+    level: Option<i32>,
+    out: W,
+) -> io::Result<Written> {
+    write_layer_with(
+        Dense(tar),
+        alg,
+        compression,
+        level,
+        out,
+        Table {
+            sha256_digest: TOC_SHA256_DIGEST,
+            fsverity: true,
+            canonical: true,
+        },
     )
 }
 
@@ -908,7 +1038,18 @@ pub fn write_layer_holes<R: HoleRead, W: Write>(
     compression: Compression,
     out: W,
 ) -> io::Result<Written> {
-    write_layer_with(tar, alg, compression, None, out, TOC_SHA256_DIGEST, true)
+    write_layer_with(
+        tar,
+        alg,
+        compression,
+        None,
+        out,
+        Table {
+            sha256_digest: TOC_SHA256_DIGEST,
+            fsverity: true,
+            canonical: false,
+        },
+    )
 }
 
 /// [`write_layer`] for a TOC that gives the sha256 `digest` of each file and
@@ -920,7 +1061,29 @@ pub fn write_layer_sha256_keyed<R: Read, W: Write>(
     compression: Compression,
     out: W,
 ) -> io::Result<Written> {
-    write_layer_with(Dense(tar), alg, compression, None, out, true, false)
+    write_layer_with(
+        Dense(tar),
+        alg,
+        compression,
+        None,
+        out,
+        Table {
+            sha256_digest: true,
+            fsverity: false,
+            canonical: false,
+        },
+    )
+}
+
+/// What the table of contents of a layer gives.
+#[derive(Clone, Copy)]
+struct Table {
+    /// the sha256 `digest` of each file
+    sha256_digest: bool,
+    /// the `fsverity` digest of each file
+    fsverity: bool,
+    /// the layer is a canonical tar: no tar-split
+    canonical: bool,
 }
 
 fn write_layer_with<R: HoleRead, W: Write>(
@@ -929,13 +1092,25 @@ fn write_layer_with<R: HoleRead, W: Write>(
     compression: Compression,
     level: Option<i32>,
     out: W,
-    sha256_digest: bool,
-    fsverity: bool,
+    table: Table,
 ) -> io::Result<Written> {
+    let Table {
+        sha256_digest,
+        fsverity,
+        canonical,
+    } = table;
     let hashing = HoleHashing(Hashing::new(alg, tar));
     let mut reader = TarReader::with_sink(
         hashing,
-        Writer::new(compression, level, out, alg, sha256_digest, fsverity)?,
+        Writer::new(
+            compression,
+            level,
+            out,
+            alg,
+            sha256_digest,
+            fsverity,
+            canonical,
+        )?,
     );
     let mut buf = vec![0u8; 64 * 1024];
     while reader.next_entry()?.is_some() {
@@ -1340,8 +1515,11 @@ mod tests {
             Compression::ZstdChunked,
             None,
             &mut out,
-            false,
-            true,
+            Table {
+                sha256_digest: false,
+                fsverity: true,
+                canonical: false,
+            },
         )
         .unwrap();
         assert_eq!(w.diff_id, crate::sha256(&tar));
@@ -1645,6 +1823,229 @@ mod tests {
             &mut out
         )
         .is_err());
+    }
+
+    fn canonical_entry(name: &str, kind: TocEntryType, size: u64) -> TocEntry {
+        TocEntry {
+            name: name.to_string(),
+            entry_type: kind,
+            mode: if kind == TocEntryType::Dir {
+                0o755
+            } else {
+                0o644
+            },
+            uid: 0,
+            gid: 0,
+            size,
+            digest: None,
+            fsverity: None,
+            offset: 0,
+            end_offset: 0,
+            chunk_digest: None,
+            chunk_size: 0,
+            chunk_offset: 0,
+            chunk_type: None,
+            link_name: None,
+            mod_time: Some("2024-05-06T07:08:09.5Z".to_string()),
+            access_time: None,
+            change_time: None,
+            dev_major: None,
+            dev_minor: None,
+            xattrs: Default::default(),
+        }
+    }
+
+    /// The canonical tar of a root, a directory, files of all sorts of
+    /// sizes (one with holes), a symbolic link, a hard link and an xattr.
+    fn canonical_tar(extra: impl FnOnce(&mut Vec<TocEntry>)) -> Vec<u8> {
+        use TocEntryType::*;
+        let mut entries = vec![
+            canonical_entry("./", Dir, 0),
+            canonical_entry("./etc/", Dir, 0),
+            canonical_entry("./etc/empty", Reg, 0),
+            canonical_entry("./etc/hard", Hardlink, 0),
+            canonical_entry("./etc/holey", Reg, 30_000),
+            canonical_entry("./etc/link", Symlink, 0),
+            canonical_entry("./etc/random", Reg, 400_000),
+            canonical_entry("./etc/small", Reg, 6),
+        ];
+        entries[3].link_name = Some("./etc/empty".into());
+        // (a hard link has the metadata of its target)
+        entries[3].mode = 0o644;
+        entries[5].link_name = Some("small".into());
+        entries[7].xattrs.insert(
+            "user.k".into(),
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"a\nb"),
+        );
+        extra(&mut entries);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        let mut tar = Vec::new();
+        canonical::write(&entries, &mut tar, |e, out| {
+            let mut data = vec![0u8; e.size as usize];
+            if e.name == "./etc/random" {
+                rng.fill(&mut data[..]);
+            } else if e.name == "./etc/small" {
+                data.copy_from_slice(b"hello\n");
+            } else if e.name == "./etc/holey" {
+                data[..5000].fill(1);
+                data[25_000..].fill(2);
+            }
+            out.write_all(&data)
+        })
+        .unwrap();
+        tar
+    }
+
+    fn toc_of(blob: &[u8], w: &Written) -> (Toc, Vec<u8>) {
+        let a = |k: &str| &w.annotations[&format!("{ANNOTATION_PREFIX}{k}")];
+        let pos: Vec<usize> = a("manifest-position")
+            .split(':')
+            .map(|n| n.parse().unwrap())
+            .collect();
+        let toc_z = &blob[pos[0]..pos[0] + pos[1]];
+        let toc = serde_json::from_slice(&zstd::decode_all(toc_z).unwrap()).unwrap();
+        (toc, blob[blob.len() - 64..].to_vec())
+    }
+
+    #[test]
+    fn test_a_canonical_layer_has_a_version_2_table_and_no_tar_split() {
+        let tar = canonical_tar(|_| {});
+        let mut blob = Vec::new();
+        let w = write_canonical_layer(
+            &tar[..],
+            Algorithm::Sha256,
+            Compression::ZstdChunked,
+            None,
+            &mut blob,
+        )
+        .unwrap();
+        assert_eq!(w.diff_id, crate::sha256(&tar));
+        assert_eq!(w.digest, crate::sha256(&blob));
+        let key = |k: &str| format!("{ANNOTATION_PREFIX}{k}");
+        assert_eq!(w.annotations[&key("version")], "2");
+        assert!(!w.annotations.contains_key(&key("tarsplit-position")));
+        let (toc, footer) = toc_of(&blob, &w);
+        assert!(toc.is_canonical());
+        assert!(toc.tar_split_digest.is_none());
+        // the footer has the type 1 and no tar-split
+        assert_eq!(footer[24..32], 1u64.to_le_bytes());
+        assert!(footer[32..56].iter().all(|&b| b == 0));
+        assert_eq!(&footer[56..], b"GNUlInUx");
+        // the names are the exact ones of the tar and the root is there
+        let names: Vec<_> = toc
+            .entries
+            .iter()
+            .filter(|e| e.entry_type != TocEntryType::Chunk)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(names[..2], ["./", "./etc/"]);
+        canonical::validate(&toc.entries).unwrap();
+        // the blob is the tar for every reader of zstd
+        let mut back = Vec::new();
+        zstd::stream::read::Decoder::new(&blob[..])
+            .unwrap()
+            .read_to_end(&mut back)
+            .unwrap();
+        assert_eq!(back, tar);
+        // the same stream gives the same blob
+        let mut again = Vec::new();
+        write_canonical_layer(
+            &tar[..],
+            Algorithm::Sha256,
+            Compression::ZstdChunked,
+            None,
+            &mut again,
+        )
+        .unwrap();
+        assert_eq!(again, blob);
+        // the tar rebuilt from the table and the contents is the tar
+        let mut contents = std::collections::HashMap::new();
+        for e in tar::Archive::new(&tar[..]).entries().unwrap() {
+            let mut e = e.unwrap();
+            let mut data = Vec::new();
+            e.read_to_end(&mut data).unwrap();
+            let path = e.path().unwrap().to_string_lossy().into_owned();
+            contents.insert(
+                path.trim_start_matches("./")
+                    .trim_end_matches('/')
+                    .to_string(),
+                data,
+            );
+        }
+        let mut rebuilt = Vec::new();
+        canonical::write(&toc.entries, &mut rebuilt, |e, out| {
+            out.write_all(&contents[e.name.trim_start_matches("./")])
+        })
+        .unwrap();
+        assert_eq!(rebuilt, tar);
+    }
+
+    #[test]
+    fn test_the_other_compressions_of_a_canonical_layer_are_its_tar_compressed() {
+        let tar = canonical_tar(|_| {});
+        for c in [Compression::None, Compression::Gzip] {
+            let mut blob = Vec::new();
+            let w = write_canonical_layer(&tar[..], Algorithm::Sha256, c, None, &mut blob).unwrap();
+            assert_eq!(w.diff_id, crate::sha256(&tar));
+            assert!(w.annotations.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_a_stream_that_is_not_canonical_is_not_written_as_version_2() {
+        let err = |tar: &[u8]| {
+            write_canonical_layer(
+                tar,
+                Algorithm::Sha256,
+                Compression::ZstdChunked,
+                None,
+                io::sink(),
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(err(&sample_tar()).contains("self-check"));
+        // an xattr the table cannot keep (the entry of a table that has
+        // more than the tar reader reads, or the tar crate's own extra):
+        // the table would not say what the tar says
+        let tar = canonical_tar(|entries| {
+            entries[0].xattrs.insert(
+                "user.big".into(),
+                base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    vec![1u8; 66_000],
+                ),
+            );
+        });
+        let e = err(&tar);
+        assert!(e.contains("self-check") && e.contains("`./`"), "{e}");
+    }
+
+    #[test]
+    fn test_what_the_canonical_rules_allow_the_writer_reads() {
+        let tar = canonical_tar(|entries| {
+            for i in 0..1024 {
+                entries[0].xattrs.insert(
+                    format!("user.{i:04}"),
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"v"),
+                );
+            }
+            let mut long = canonical_entry(
+                &format!("./etc/zz{}", "z".repeat(4080)),
+                TocEntryType::Symlink,
+                0,
+            );
+            long.link_name = Some("x".repeat(4096));
+            entries.push(long);
+        });
+        write_canonical_layer(
+            &tar[..],
+            Algorithm::Sha256,
+            Compression::ZstdChunked,
+            None,
+            io::sink(),
+        )
+        .unwrap();
     }
 
     #[test]

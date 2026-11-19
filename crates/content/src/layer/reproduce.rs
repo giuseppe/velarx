@@ -136,7 +136,14 @@ impl StoredLayer {
             .get_layer_tarsplit(key)
             .await
             .map_err(|e| other(&e))?
-            .ok_or_else(|| lacks(&"it has no tar-split"))?;
+            .ok_or_else(|| {
+                // (a canonical layer has an empty one once it is complete)
+                lacks(&if toc.is_canonical() {
+                    "it is not complete"
+                } else {
+                    "it has no tar-split"
+                })
+            })?;
         Ok(Self {
             key: *key,
             diff_id,
