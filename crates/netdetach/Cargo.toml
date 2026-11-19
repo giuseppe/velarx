@@ -7,7 +7,6 @@ authors.workspace = true
 description = "The release of the network of a container: the teardown the engine and the monitor of the container both run"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

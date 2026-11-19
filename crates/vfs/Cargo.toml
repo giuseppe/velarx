@@ -7,7 +7,6 @@ authors.workspace = true
 description = "The vfs storage driver of velarx: a full copy of the files of the image for each container, made when it is created"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

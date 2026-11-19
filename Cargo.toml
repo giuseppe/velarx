@@ -19,14 +19,13 @@ members = ["crates/bin", "crates/runtime/bin", "crates/registry-lib/bin", "crate
 default-members = [".", "crates/bin", "crates/runtime/bin", "crates/registry-lib/bin", "crates/dir", "crates/base", "crates/types", "crates/registry", "crates/storage", "crates/fuse", "crates/config", "crates/db", "crates/nsid", "crates/netkernel", "crates/netdetach", "crates/content", "crates/registry-lib", "crates/wire", "crates/core", "crates/graph", "crates/vfs", "crates/storage-client", "crates/storage-server", "crates/runtime", "crates/signature", "crates/kube", "crates/sys", "crates/shape", "crates/tarsplit", "crates/sandbox", "crates/kube/bin"]
 
 # What every package inherits.  The varlink `GetInfo` answers announce
-# `homepage`.  Nothing is published to crates.io (`publish = false`).
+# the `repository`.  Nothing is published to crates.io (`publish = false`).
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 authors = ["The Velarx Authors"]
 license = "Apache-2.0"
 repository = "https://github.com/giuseppe/velarx"
-homepage = "https://github.com/giuseppe/velarx"
 rust-version = "1.99"
 publish = false
 
@@ -124,7 +123,6 @@ authors.workspace = true
 description = "A container engine for Linux that runs OCI images"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 readme = "README.md"

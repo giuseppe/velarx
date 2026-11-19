@@ -7,7 +7,6 @@ authors.workspace = true
 description = "The types the layers of the engine share: errors, image references, OCI documents, digests"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

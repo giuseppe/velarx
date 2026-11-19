@@ -7,7 +7,6 @@ authors.workspace = true
 description = "The few stable helpers the other packages of velarx build on"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

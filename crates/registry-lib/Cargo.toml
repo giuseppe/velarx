@@ -7,7 +7,6 @@ authors.workspace = true
 description = "The fetcher: the process that fetches content for velarx (the registry, the sources) behind org.velarx.Fetcher, its server side and its lifetime"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

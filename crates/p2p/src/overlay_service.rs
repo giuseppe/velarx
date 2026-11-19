@@ -195,7 +195,7 @@ mod network {
         vendor = "org.velarx",
         product = "velarx",
         version = env!("CARGO_PKG_VERSION"),
-        url = env!("CARGO_PKG_HOMEPAGE"),
+        url = env!("CARGO_PKG_REPOSITORY"),
         types = [netprov::Device]
     )]
     impl Network {

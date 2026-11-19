@@ -7,7 +7,6 @@ authors.workspace = true
 description = "tar-split: record a tar stream without its file contents and rebuild it byte for byte, for storage drivers"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

@@ -7,7 +7,6 @@ authors.workspace = true
 description = "Image signature verification: the signature policy of containers/image, OpenPGP and sigstore"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

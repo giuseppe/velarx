@@ -7,7 +7,6 @@ authors.workspace = true
 description = "The client of org.velarx.Storage: the StorageDriver trait over a unix socket, to a storage driver that is a program of its own"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

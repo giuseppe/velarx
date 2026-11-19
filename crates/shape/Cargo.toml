@@ -7,7 +7,6 @@ authors.workspace = true
 description = "podman's and Docker's documents of the engine's typed records, for velarx-api and the command line"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

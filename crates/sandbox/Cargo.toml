@@ -7,7 +7,6 @@ authors.workspace = true
 description = "The confinement of velarx's helpers that parse what the network sends: user namespace, Landlock, seccomp"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

@@ -7,7 +7,6 @@ authors.workspace = true
 description = "The Kubernetes CRI frontend of velarx: runtime.v1 over gRPC, a wrapper over the engine"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 build = "build.rs"

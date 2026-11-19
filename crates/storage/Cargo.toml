@@ -7,7 +7,6 @@ authors.workspace = true
 description = "The content store of velarx: files named by their digest, fs-verity, chunked and sparse files"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

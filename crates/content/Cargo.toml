@@ -7,7 +7,6 @@ authors.workspace = true
 description = "How the content of images gets into the store: pull, fetchers, sources, layers, archives"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

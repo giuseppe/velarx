@@ -18,7 +18,6 @@ license = "Apache-2.0"
 edition = "2021"
 authors = ["The Velarx Authors"]
 repository = "https://github.com/giuseppe/velarx"
-homepage = "https://github.com/giuseppe/velarx"
 rust-version = "1.99"
 
 [package.metadata]

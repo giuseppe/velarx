@@ -3471,7 +3471,7 @@ impl Monitor {
                     vendor: "velarx",
                     product: "velarx-monitor",
                     version: env!("CARGO_PKG_VERSION"),
-                    url: env!("CARGO_PKG_HOMEPAGE"),
+                    url: env!("CARGO_PKG_REPOSITORY"),
                     interfaces: ["org.varlink.service", iface::INTERFACE],
                 },
                 false,

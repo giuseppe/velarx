@@ -7,7 +7,6 @@ authors.workspace = true
 description = "The only code of velarx that is unsafe: small safe wrappers of system calls"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

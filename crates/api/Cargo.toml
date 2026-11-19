@@ -7,7 +7,6 @@ authors.workspace = true
 description = "The REST API of velarx, a frontend of the engine over varlink"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

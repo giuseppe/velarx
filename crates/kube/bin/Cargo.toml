@@ -7,7 +7,6 @@ authors.workspace = true
 description = "The binary velarx-kube: play, down, generate and apply of Kubernetes YAML"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 build = "../../base/build-support/bin.rs"

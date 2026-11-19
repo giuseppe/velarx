@@ -7,7 +7,6 @@ authors.workspace = true
 description = "The kernel and host side of the container networks: netlink, nftables, bridges, DNS records, CNI, the stop of the helper processes"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
