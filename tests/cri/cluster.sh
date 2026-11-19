@@ -19,7 +19,7 @@
 #  * a pod of each QoS class (Guaranteed, Burstable, BestEffort) is in the cgroup the
 #    kubelet makes for its class, with the limits and weight of its resources
 #  * deleting the Deployment and the pods removes the containers, sandboxes,
-#    cgroups, IP leases and network namespaces
+#    cgroups, IP leases and interfaces of the bridge
 #  * under a memory pressure threshold the eviction manager evicts a pod
 #
 # Everything runs in a mount namespace of its own under /var/tmp and ends with what it
@@ -367,13 +367,30 @@ YAML
     echo "limits applied to the pod and container cgroups"
 }
 
+# The cgroups of pods and containers below the cgroup `kubepods` (a Guaranteed
+# pod is directly below it, a Burstable and a BestEffort pod below their class).
+pod_cgroups () {
+    find "$1" -mindepth 1 -maxdepth 3 \( -name 'pod*' -o -name 'cri*' \) 2> /dev/null
+}
+
 cleanup_check () {
+    local t
+    # (the check sees a pod of each class that is left)
+    t=$(mktemp -d "$W/cgcheck.XXXXXX")
+    mkdir -p "$t/kubepods/burstable" "$t/kubepods/besteffort"
+    [ -z "$(pod_cgroups "$t/kubepods")" ] || fail "pod_cgroups finds a cgroup in an empty kubepods"
+    for d in kubepods/pod-g kubepods/burstable/pod-b kubepods/besteffort/pod-e; do
+        mkdir "$t/$d"
+        [ "$(pod_cgroups "$t/kubepods")" = "$t/$d" ] || fail "pod_cgroups does not see $d"
+        rmdir "$t/$d"
+    done
+    rm -rf "$t"
     kubectl delete deployment web --wait --timeout 120s > /dev/null || fail "kubectl delete deployment"
     kubectl delete pod --all --wait --timeout 120s --grace-period 2 > /dev/null || fail "kubectl delete pods"
     none () { [ -z "$(cc ps -aq)" ] && [ -z "$(cc pods -q)" ]; }
     wait_for 120 none || fail "the containers or sandboxes were not removed"
-    nocg () { [ -z "$(find "/sys/fs/cgroup/$CGROOT/kubepods" -mindepth 2 -maxdepth 3 -name 'pod*' -o -mindepth 2 -maxdepth 3 -name 'cri*' 2> /dev/null)" ]; }
-    wait_for 60 nocg || fail "cgroups of the pods are left: $(find "/sys/fs/cgroup/$CGROOT/kubepods" -mindepth 2 -type d)"
+    nocg () { [ -z "$(pod_cgroups "/sys/fs/cgroup/$CGROOT/kubepods")" ]; }
+    wait_for 60 nocg || fail "cgroups of the pods are left: $(pod_cgroups "/sys/fs/cgroup/$CGROOT/kubepods")"
     noleases () { [ "$(leases)" = 0 ]; }
     wait_for 30 noleases || fail "IP leases are left: $(ls "$W/cni/ipam/velarx-cluster")"
     [ -z "$(ip -o link show master "$BRIDGE")" ] || fail "interfaces are left on the bridge: $(ip -o link show master "$BRIDGE")"
