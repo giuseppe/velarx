@@ -562,8 +562,8 @@ impl Database {
     /// stored yet (the manifest's own digest for an image that was pulled;
     /// the configuration's for one that was made here, whose manifest is
     /// only written when it is pushed).  An image keeps the id it was
-    /// recorded with.  A digest never repeats, so two images cannot be given
-    /// one id.
+    /// recorded with.  Two manifests of one configuration made here are given
+    /// one id: the image of that configuration, which has the last one.
     pub async fn image_id_for(&self, manifest_digest: &Digest, new: &Digest) -> DbResult<String> {
         match self.get_image_by_digest(manifest_digest).await {
             Ok(image) => Ok(image.id),
@@ -2178,11 +2178,14 @@ fn write_image(tx: &rusqlite::Transaction, pull: &PullCommit) -> rusqlite::Resul
     let image = &pull.image;
     // (an image pulled again has the layers of this pull: the same
     // descriptor may have taken the other route, whole or by its TOC, and
-    // be another layer)
+    // be another layer; an image made again from the same configuration
+    // has the manifest and the layers of the last one made, the one its
+    // new names ask for)
     tx.execute(
         "INSERT INTO images (id, manifest_digest, config_digest, manifest, config, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(manifest_digest) DO NOTHING",
+         ON CONFLICT(id) DO UPDATE SET
+             manifest_digest = excluded.manifest_digest, manifest = excluded.manifest",
         rusqlite::params![
             image.id,
             image.manifest_digest,

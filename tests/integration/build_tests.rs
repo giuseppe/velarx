@@ -1560,3 +1560,55 @@ async fn test_copy_from_an_image_that_cannot_be_read_fails_the_step() {
         .await;
     assert!(r.is_err(), "the step committed a layer without its files");
 }
+
+/// The stage of a build that was built before, with the same files and the
+/// same time, is the same image: it is not recorded twice.  Built as the
+/// target, its manifest has the annotations of a built image, which the
+/// manifest of the stage did not have.
+#[tokio::test]
+async fn test_a_stage_built_again_is_the_same_image() {
+    use crate::common::env;
+    use velarx_core::services::build::{BuildContext, BuildOptions};
+    use velarx_wire::buildopts::BuildFlags;
+    let e = env().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = build_service(&e, tmp.path());
+    let context = tmp.path().join("context");
+    std::fs::create_dir(&context).unwrap();
+    std::fs::write(context.join("f"), "x").unwrap();
+    std::fs::write(
+        context.join("Containerfile"),
+        "FROM scratch AS a\nCOPY f /f\nFROM a\nCOPY f /h\n",
+    )
+    .unwrap();
+    let ctx = BuildContext::new(&context, None).unwrap();
+    let build = |target: Option<&str>, tag: &str| {
+        let opts = BuildOptions {
+            tls_verify: false,
+            layers: true,
+            tags: vec![tag.to_string()],
+            target: target.map(String::from),
+            flags: BuildFlags {
+                timestamp: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let svc = &svc;
+        let ctx = &ctx;
+        async move {
+            svc.build(ctx, &opts, None, Default::default())
+                .await
+                .unwrap()
+        }
+    };
+    build(None, "localhost/t:1").await;
+    let a = build(Some("a"), "localhost/a:1").await;
+    assert_eq!(a, build(Some("a"), "localhost/a:2").await);
+    let image = e.service.get(&a).await.unwrap();
+    let m: serde_json::Value = serde_json::from_str(&image.manifest).unwrap();
+    assert_eq!(
+        m["annotations"]["org.opencontainers.image.created"],
+        "1970-01-01T00:00:00Z"
+    );
+}
