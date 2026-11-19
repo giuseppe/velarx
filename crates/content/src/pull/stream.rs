@@ -716,6 +716,33 @@ mod tests {
         ctx.sink.clone().session().unwrap()
     }
 
+    /// A layer that has a table of contents is never read as a stream, by
+    /// either of the ways a layer is read whole.
+    #[tokio::test]
+    async fn test_a_layer_with_a_table_is_refused_by_both_routes_of_a_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path()).await;
+        let (_, mut layer, diff) = layer_of(Algorithm::Sha256, Algorithm::Sha256);
+        let prefix = "io.github.containers.zstd-chunked.";
+        layer.annotations = HashMap::from([
+            (format!("{prefix}manifest-position"), "100:50:200:1".into()),
+            (
+                format!("{prefix}manifest-checksum"),
+                crate::sha256_text(b""),
+            ),
+        ]);
+        let refused = |e: Result<(), ImageError>| match e {
+            Err(e) => assert!(e.to_string().contains("zstd:chunked"), "{e}"),
+            Ok(()) => panic!("the layer was taken"),
+        };
+        refused(ingest(&ctx, None, &layer, &diff, |_| {}).await.map(drop));
+        refused(
+            super::super::chunked::unpack_whole(&ctx, &layer, &diff, true, |_| {})
+                .await
+                .map(drop),
+        );
+    }
+
     /// A second pull of a layer read whole stages nothing the store has: the
     /// files are reused, keyed by their fs-verity digest, and the table of
     /// contents they make is settled with no file of the pull's.

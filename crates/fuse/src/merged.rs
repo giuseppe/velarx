@@ -407,6 +407,19 @@ mod tests {
         assert_eq!(t.node(ROOT).unwrap().entry.mode, 0o711);
     }
 
+    /// The attributes of the store (the overlay's and the label's) are not
+    /// the root's: the tree hides them as the image of the layer does.
+    #[test]
+    fn test_the_root_of_a_layer_hides_the_attributes_of_the_store() {
+        let mut root = e("./", TocEntryType::Dir);
+        for name in ["user.keep", "user.overlay.opaque", "trusted.overlay.opaque"] {
+            root.xattrs.insert(name.into(), "eQ==".into());
+        }
+        let t = MergedTree::build(&[&toc(vec![root])]).unwrap();
+        let names: Vec<&String> = t.node(ROOT).unwrap().entry.xattrs.keys().collect();
+        assert_eq!(names, ["user.keep"]);
+    }
+
     #[test]
     fn test_a_directory_a_layer_does_not_list_is_plain() {
         let d1 = format!("sha256:{}", "1".repeat(64));

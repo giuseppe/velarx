@@ -1218,6 +1218,27 @@ fn test_a_table_that_lists_one_digest_with_two_sizes_is_an_error_that_names_the_
 }
 
 #[test]
+fn test_a_table_of_version_1_whose_files_are_more_than_the_limit_is_refused() {
+    let layer = crate::sha256(b"layer");
+    let file = canonical_layer().entries[3].clone();
+    let entries = vec![file.clone()];
+    let ts = tarsplit_of(&entries);
+    let toc = Toc {
+        version: 1,
+        entries,
+        tar_split_digest: Some(crate::sha256(&ts).to_string()),
+    };
+    let (z, info) = vouched(&toc, Some((0, ts.len() as u64, 0)));
+    let check = |max| verify_metadata(&info, &z, ts.clone(), &layer, max);
+    check(file.size).unwrap();
+    let e = check(file.size - 1).err().unwrap();
+    assert!(refuses(&e), "{e}");
+    let text = e.to_string();
+    assert!(text.contains(&layer.to_string()), "{text}");
+    assert!(text.contains("more than"), "{text}");
+}
+
+#[test]
 fn test_a_table_whose_files_do_not_fit_a_layer_is_an_error_that_names_the_layer() {
     let layer = crate::sha256(b"layer");
     let good = canonical_layer();
