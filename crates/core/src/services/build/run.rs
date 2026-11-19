@@ -432,7 +432,7 @@ impl Build<'_> {
         let dir = self.new_dir("mount")?;
         mounts.scratch.push(dir.clone());
         let src = format!("/{source}");
-        let (job, from) = self
+        let (job, from, end) = self
             .image_sources(
                 id,
                 std::slice::from_ref(&src),
@@ -459,6 +459,7 @@ impl Build<'_> {
             .run(job, &dir, from, &self.cancel)
             .await
             .map_err(|e| self.failed(i, e))?;
+        end.check(i)?;
         space.set(disk_usage(&dir)?)?;
         let base = source.rsplit('/').next().unwrap_or_default();
         let file = dir.join(base);

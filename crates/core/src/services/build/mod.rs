@@ -567,6 +567,23 @@ fn admit_to(pending: &Arc<std::sync::atomic::AtomicUsize>, max: usize) -> Option
     Some(Admission(pending.clone()))
 }
 
+/// The end of the thread that archives sources of an image: its error after
+/// the item list was sent.
+struct ArchiveEnd(std::sync::mpsc::Receiver<std::io::Result<Vec<Item>>>);
+
+impl ArchiveEnd {
+    /// Fails the step when the archive stopped on an error: the worker saw
+    /// a tar that ended cleanly, without the sources that were left.  (A
+    /// write the closed pipe refused is not one: the worker stops reading
+    /// at the end of the tar, before the rest of its end block.)
+    fn check(self, i: &Instr) -> BuildResult<()> {
+        match self.0.recv() {
+            Ok(Err(e)) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(step_error(i, e)),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Where the sources taken from an image go, and what they are given.
 struct ImageDest<'a> {
     dst: &'a str,
@@ -3740,6 +3757,7 @@ impl<'a> Build<'a> {
             }
             key = Some(k);
         }
+        let mut archive_end = None;
         if let Some(image) = &from_image {
             match self
                 .image_sources(
@@ -3757,7 +3775,10 @@ impl<'a> Build<'a> {
                 )
                 .await
             {
-                Ok(job) => jobs.push(job),
+                Ok((job, source, end)) => {
+                    jobs.push((job, source));
+                    archive_end = Some(end);
+                }
                 Err(e) => {
                     cleanup_copy(&upper, downloads.as_deref(), &clones);
                     return Err(e);
@@ -3799,6 +3820,9 @@ impl<'a> Build<'a> {
         for d in &clones {
             remove_dir(d);
         }
+        let ran = ran
+            .map_err(|e| self.failed(i, e))
+            .and_then(|()| archive_end.map_or(Ok(()), |end| end.check(i)));
         let r = match ran {
             Ok(()) => {
                 space.set(disk_usage(&upper)?)?;
@@ -3810,7 +3834,7 @@ impl<'a> Build<'a> {
                     (_, r) => r,
                 }
             }
-            Err(e) => Err(self.failed(i, e)),
+            Err(e) => Err(e),
         };
         remove_dir(&upper);
         drop(space);
@@ -3866,13 +3890,16 @@ impl<'a> Build<'a> {
     }
 
     /// The tar stream of the sources in the image `image`, for the worker.
+    /// The error of the archive after its item list is told by the third
+    /// value, which the caller asks once the worker is done: the stream
+    /// alone ends as a clean one.
     async fn image_sources(
         &self,
         image: &str,
         sources: &[String],
         dest: ImageDest<'_>,
         i: &Instr,
-    ) -> BuildResult<(CopyJob, JobSource)> {
+    ) -> BuildResult<(CopyJob, JobSource, ArchiveEnd)> {
         let ImageDest {
             dst,
             dest_dir,
@@ -3983,7 +4010,11 @@ impl<'a> Build<'a> {
             digest: false,
             unchanged_since: None,
         };
-        Ok((job, JobSource::Stream(OwnedFd::from(reader))))
+        Ok((
+            job,
+            JobSource::Stream(OwnedFd::from(reader)),
+            ArchiveEnd(rx_items),
+        ))
     }
 
     async fn cleanup(&mut self, keep: Option<&str>) {

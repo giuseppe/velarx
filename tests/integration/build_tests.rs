@@ -1517,3 +1517,46 @@ async fn test_add_of_xz_and_bzip2_bombs_and_corrupt_archives() {
         );
     }
 }
+
+/// A COPY --from whose archive of the image fails after its list of
+/// sources was sent (a file of the image has lost its object) fails the
+/// step: the worker alone sees a tar that ends where the files stop.
+#[tokio::test]
+async fn test_copy_from_an_image_that_cannot_be_read_fails_the_step() {
+    use velarx_core::services::build::{BuildContext, BuildOptions};
+
+    let (e, id) = crate::check_tests::pulled().await;
+    for l in e.db.get_image_layers(&id).await.unwrap() {
+        let toc: velarx_storage::Toc = serde_json::from_str(l.toc.as_deref().unwrap()).unwrap();
+        for entry in toc.entries.iter().filter(|x| x.name == "usr/big") {
+            if let Some(v) = entry.verity() {
+                std::fs::remove_file(e.store.local_path(&v).unwrap()).unwrap();
+            }
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = build_service(&e, tmp.path());
+    let context = tmp.path().join("context");
+    std::fs::create_dir(&context).unwrap();
+    std::fs::write(
+        context.join("Containerfile"),
+        format!(
+            "FROM scratch\nCOPY --from={0}/test:latest /usr /copy\n",
+            e.host
+        ),
+    )
+    .unwrap();
+    let opts = BuildOptions {
+        tls_verify: false,
+        ..Default::default()
+    };
+    let r = svc
+        .build(
+            &BuildContext::new(&context, None).unwrap(),
+            &opts,
+            None,
+            Default::default(),
+        )
+        .await;
+    assert!(r.is_err(), "the step committed a layer without its files");
+}
