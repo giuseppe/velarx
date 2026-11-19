@@ -22,8 +22,7 @@ use std::time::Instant;
 use velarx_content::pull::LayerDone;
 use velarx_graph::{
     CheckId, Checked, DriverError, DriverErrorKind, DriverResult, FeedLayer, Identities,
-    LayerArtifact, ObjectRange, ObjectSink, PullFeed, PulledLayer, Settled, Settlement,
-    StorageDriver, Verdict,
+    LayerArtifact, ObjectRange, ObjectSink, PullFeed, Settled, Settlement, StorageDriver, Verdict,
 };
 use velarx_storage_client::convert;
 use velarx_storage_client::proto::{self, PullEventKind};
@@ -44,16 +43,13 @@ enum Event {
 /// the vfs driver under the server hands back (the server is not the engine:
 /// its verdict is its own identities, the keys it pulled, no merged image and
 /// no stored ones, and `publish` does not read it).
-fn settle(pulled: &[PulledLayer]) -> ImageResult<Settlement> {
+fn settle(pulled: &[LayerDone]) -> ImageResult<Settlement> {
     let mut ids = Identities::default();
     for l in pulled {
-        let id = velarx_fuse::layer_erofs::layer_identity(
-            l.done.key.digest().alg(),
-            &l.done.toc.entries,
-        )
-        .map_err(ImageError::Layer)?;
+        let id = velarx_fuse::layer_erofs::layer_identity(l.key.digest().alg(), &l.toc.entries)
+            .map_err(ImageError::Layer)?;
         ids.artifacts.insert(
-            l.done.key,
+            l.key,
             LayerArtifact {
                 image_digest: id.erofs,
                 owners: id.owners,
@@ -63,7 +59,7 @@ fn settle(pulled: &[PulledLayer]) -> ImageResult<Settlement> {
     let verdict = Verdict::sealed(
         &CheckId::fresh(),
         Checked {
-            layer_keys: pulled.iter().map(|l| l.done.key).collect(),
+            layer_keys: pulled.iter().map(|l| l.key).collect(),
             merged_id: None,
             stored_erofs: HashMap::new(),
             ours: ids.artifacts.clone(),
@@ -227,13 +223,13 @@ impl Server {
         let decision = self.config.decision;
         let settled: Settled = {
             let (store, id, tx, wire) = (store.clone(), p.pull.clone(), tx.clone(), wire.clone());
-            Box::new(move |pulled: &mut Vec<PulledLayer>, objects| {
+            Box::new(move |pulled: &mut Vec<LayerDone>, objects| {
                 let settlement = settle(pulled)?;
                 // (the files are named in the store once the engine commits:
                 // until then the engine reads them where they are)
                 let staged = pulled
                     .iter()
-                    .flat_map(|l| l.done.toc.entries.iter())
+                    .flat_map(|l| l.toc.entries.iter())
                     .filter_map(|e| e.verity())
                     .filter_map(|v| Some((v.clone(), objects(&v)?)))
                     .collect();
@@ -243,7 +239,7 @@ impl Server {
                 // knows)
                 for l in pulled.iter() {
                     store
-                        .record_aliases(&l.done.toc.entries)
+                        .record_aliases(&l.toc.entries)
                         .map_err(|e| ImageError::Storage(e.message().to_string()))?;
                 }
                 {
@@ -543,12 +539,12 @@ fn staged() -> Out {
 /// a driver of its own process.
 async fn publish(
     store: &Arc<Store>,
-    layers: Vec<PulledLayer>,
+    layers: Vec<LayerDone>,
     artifacts: std::collections::HashMap<LayerKey, LayerArtifact>,
 ) -> Result<(), String> {
     let mut commits = Vec::new();
     for l in layers {
-        let done: LayerDone = l.done;
+        let done: LayerDone = l;
         let mut commit =
             velarx_content::pull::layer_commit(&done, None).map_err(|e| e.to_string())?;
         if let Some(a) = artifacts.get(&done.key) {

@@ -201,7 +201,7 @@ async fn a_pull_hands_every_file_over_and_nothing_is_copied() {
         .pull(&feed, std::slice::from_ref(&s.layer), settled())
         .await
         .unwrap();
-    let files = pulled.layers[0].done.files.len() as u64;
+    let files = pulled.layers[0].files.len() as u64;
     assert!(files > SMALL as u64, "{files} files");
     let driver = s.driver.clone();
     let (handed, copied, copy_events) = tokio::task::spawn_blocking(move || {

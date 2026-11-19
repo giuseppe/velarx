@@ -1872,15 +1872,12 @@ impl StorageDriver for ComposefsDriver {
         // store, which makes them durable: no barrier of their own)
         let write: feed::Written<HashMap<LayerKey, LayerArtifact>> =
             Box::new(move |pulled, settlement| {
-                let staged: std::collections::HashSet<LayerKey> = pulled
-                    .iter()
-                    .filter(|l| l.done.lazy)
-                    .map(|l| l.done.key)
-                    .collect();
+                let staged: std::collections::HashSet<LayerKey> =
+                    pulled.iter().filter(|l| l.lazy).map(|l| l.key).collect();
                 let ids = &mut settlement.identities;
                 if let Some(l) = pulled
                     .iter()
-                    .map(|l| l.done.key)
+                    .map(|l| l.key)
                     .find(|l| !ids.images.contains_key(l))
                 {
                     return Err(DriverError::storage(

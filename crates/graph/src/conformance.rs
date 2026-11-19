@@ -354,7 +354,7 @@ struct Stored {
 async fn store_layer(s: &Subject, tar: Vec<u8>) -> Stored {
     let offer = offer(s, &[&tar]).await;
     let mut pulled = offer.pull(s, engine_check()).await.expect("pull");
-    let done = pulled.layers.remove(0).done;
+    let done = pulled.layers.remove(0);
     let artifact = pulled.artifacts[&done.key].clone();
     let mut commit = layer_commit(&done, None).unwrap();
     commit.record.erofs = Some(artifact.image_digest.clone());
@@ -656,22 +656,22 @@ impl Offer {
 
 /// What the engine makes of the layers a driver pulled: the identity of
 /// each, from its table of contents, and the image it made it from.
-fn engine_identities(pulled: &[PulledLayer]) -> ImageResult<Identities> {
+fn engine_identities(pulled: &[LayerDone]) -> ImageResult<Identities> {
     let mut ids = Identities::default();
     for l in pulled {
-        let image = velarx_fuse::layer_erofs::layer_image(&l.done.toc.entries)
-            .map_err(ImageError::Layer)?;
+        let image =
+            velarx_fuse::layer_erofs::layer_image(&l.toc.entries).map_err(ImageError::Layer)?;
         let id = image
-            .identity(l.done.key.digest().alg())
+            .identity(l.key.digest().alg())
             .map_err(ImageError::Layer)?;
         ids.artifacts.insert(
-            l.done.key,
+            l.key,
             LayerArtifact {
                 image_digest: id.erofs,
                 owners: id.owners,
             },
         );
-        ids.images.insert(l.done.key, image);
+        ids.images.insert(l.key, image);
     }
     Ok(ids)
 }
@@ -679,9 +679,9 @@ fn engine_identities(pulled: &[PulledLayer]) -> ImageResult<Identities> {
 /// What a check that made `ids` of `pulled` concluded: the keys of the
 /// layers, no merged image and none of the images a store had, and the
 /// identities the engine made.
-fn checked_of(ids: &Identities, pulled: &[PulledLayer]) -> Checked {
+fn checked_of(ids: &Identities, pulled: &[LayerDone]) -> Checked {
     Checked {
-        layer_keys: pulled.iter().map(|l| l.done.key).collect(),
+        layer_keys: pulled.iter().map(|l| l.key).collect(),
         merged_id: None,
         stored_erofs: HashMap::new(),
         ours: ids.artifacts.clone(),
@@ -690,7 +690,7 @@ fn checked_of(ids: &Identities, pulled: &[PulledLayer]) -> Checked {
 
 /// What the check of the engine returns for `pulled` (a check nobody asks
 /// the verdict of: its id is its own).
-fn engine_settlement(pulled: &[PulledLayer]) -> ImageResult<Settlement> {
+fn engine_settlement(pulled: &[LayerDone]) -> ImageResult<Settlement> {
     let identities = engine_identities(pulled)?;
     let verdict = Verdict::sealed(&CheckId::fresh(), checked_of(&identities, pulled));
     Ok(Settlement {
@@ -1030,7 +1030,7 @@ pub async fn pull_makes_the_artifacts_of_the_layers(f: &Factory) {
     let (base, top) = (base_layer(), top_layer());
     let offer = offer(&s, &[&base, &top]).await;
     let pulled = offer.pull(&s, engine_check()).await.unwrap();
-    let keys: BTreeSet<&LayerKey> = pulled.layers.iter().map(|l| &l.done.key).collect();
+    let keys: BTreeSet<&LayerKey> = pulled.layers.iter().map(|l| &l.key).collect();
     assert_eq!(keys.len(), 2);
     assert_eq!(pulled.artifacts.keys().collect::<BTreeSet<_>>(), keys);
     // (what the driver was asked is what it got: each layer once, under
@@ -1316,7 +1316,7 @@ pub async fn a_chunked_pull_asks_only_for_what_the_store_lacks(f: &Factory) {
         .await
         .expect("a cold pull");
     let (cold_bytes, cold_requests) = asked_since(&reg, from, sizes[0]);
-    let r = &cold.layers[0].done.report;
+    let r = &cold.layers[0].report;
     assert_eq!((r.fetched_files, r.reused_files), (2, 0), "{r:?}");
     let wanted_cold = cold_offer
         .meddle()
@@ -1343,7 +1343,7 @@ pub async fn a_chunked_pull_asks_only_for_what_the_store_lacks(f: &Factory) {
         .await
         .expect("a warm pull");
     let (warm_bytes, warm_requests) = asked_since(&reg, from, sizes[0]);
-    let r = &warm.layers[0].done.report;
+    let r = &warm.layers[0].report;
     assert_eq!((r.fetched_files, r.reused_files), (1, 1), "{r:?}");
     let wanted = warm_offer.meddle().wanted.lock().unwrap().clone();
     assert_eq!(
@@ -1360,8 +1360,8 @@ pub async fn a_chunked_pull_asks_only_for_what_the_store_lacks(f: &Factory) {
         "{warm_requests} requests, a cold pull makes {cold_requests}"
     );
     assert_eq!(
-        warm.artifacts[&warm.layers[0].done.key],
-        cold.artifacts[&cold.layers[0].done.key]
+        warm.artifacts[&warm.layers[0].key],
+        cold.artifacts[&cold.layers[0].key]
     );
 
     // both layers, which the store has now: no file is asked for, only the
@@ -1373,7 +1373,7 @@ pub async fn a_chunked_pull_asks_only_for_what_the_store_lacks(f: &Factory) {
         .await
         .expect("a pull of what is there");
     for l in &again.layers {
-        let r = &l.done.report;
+        let r = &l.report;
         assert_eq!(r.fetched_files, 0, "{r:?}");
     }
     assert!(all_offer
@@ -1441,10 +1441,10 @@ pub async fn a_chunk_the_driver_holds_is_not_fetched_again(f: &Factory) {
         .await
         .expect("a warm pull");
     let (warm_bytes, _) = asked_since(&reg, from, sizes[0]);
-    let r = &warm.layers[0].done.report;
+    let r = &warm.layers[0].report;
     assert_eq!(r.fetched_files, 1, "{r:?}");
     assert_eq!(
-        warm.artifacts[&warm.layers[0].done.key], cold.artifacts[&cold.layers[0].done.key],
+        warm.artifacts[&warm.layers[0].key], cold.artifacts[&cold.layers[0].key],
         "the layer is the one a cold pull makes"
     );
     // (the registry fetcher is told the chunks the engine's store holds,
@@ -1484,7 +1484,7 @@ pub async fn an_interrupted_chunked_pull_is_pulled_again(f: &Factory) {
     assert!(stale.is_empty(), "a staging area was left: {stale:?}");
     reg.answer_all();
     let pulled = o.pull(&s, engine_check()).await.expect("pulled again");
-    let r = &pulled.layers[0].done.report;
+    let r = &pulled.layers[0].report;
     assert_eq!(r.fetched_files, 3, "{r:?}");
     let other = second(f, &s, "uncut").await;
     let (o2, _) = chunked_offer(&other, &reg, &[&one]).await;
@@ -1509,9 +1509,9 @@ pub async fn pull_check_sees_the_layers_first(f: &Factory) {
             &s,
             Box::new(move |layers, _| {
                 *seen2.lock().unwrap() = Some((
-                    layers.iter().map(|l| l.done.key).collect::<Vec<_>>(),
+                    layers.iter().map(|l| l.key).collect::<Vec<_>>(),
                     // (settled: the files have the names of what they hold)
-                    layers[0].done.toc.entries.iter().all(|e| {
+                    layers[0].toc.entries.iter().all(|e| {
                         e.entry_type != TocEntryType::Reg || e.size == 0 || e.verity().is_some()
                     }),
                     driver.usage().unwrap(),
@@ -1624,7 +1624,7 @@ pub async fn a_pull_returns_the_verdict_of_the_check(f: &Factory) {
         checked
             .ours
             .keys()
-            .all(|k| pulled.layers.iter().any(|l| &l.done.key == k)),
+            .all(|k| pulled.layers.iter().any(|l| &l.key == k)),
         "the verdict is of the layers the pull brought"
     );
     // what the driver recorded is the engine's identity
@@ -1699,7 +1699,7 @@ pub async fn a_refusal_of_the_engine_leaves_nothing_visible(f: &Factory) {
             Box::new(move |layers, _| {
                 *files.lock().unwrap() = layers
                     .iter()
-                    .flat_map(|l| l.done.toc.entries.iter())
+                    .flat_map(|l| l.toc.entries.iter())
                     .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
                     .filter_map(|e| Some((e.content_key()?, e.size)))
                     .collect();
@@ -1791,8 +1791,8 @@ pub async fn concurrent_pulls_of_a_shared_layer_both_complete(f: &Factory) {
     let shared = |p: &Pulled| {
         p.layers
             .iter()
-            .find(|l| l.done.diff_id == one.layers[0].diff_id)
-            .map(|l| l.done.key)
+            .find(|l| l.diff_id == one.layers[0].diff_id)
+            .map(|l| l.key)
             .expect("the shared layer was pulled by it")
     };
     assert_eq!(shared(&a), shared(&b), "one layer");
@@ -1990,11 +1990,11 @@ pub async fn the_diff_id_is_proved_by_reading_back_from_the_driver(f: &Factory) 
     let (base, top) = (base_layer(), top_layer());
     let o = offer(&s, &[&base, &top]).await;
     let pulled = o.pull(&s, engine_check()).await.expect("pull");
-    let prove = |l: &PulledLayer, diff: Option<Digest>| {
+    let prove = |l: &LayerDone, diff: Option<Digest>| {
         let d = s.driver.clone();
         let mut l = l.clone();
         if let Some(diff) = diff {
-            l.done.diff_id = diff;
+            l.diff_id = diff;
         }
         async move {
             tokio::task::spawn_blocking(move || prove_by_read_back(d, &l))
@@ -2019,7 +2019,7 @@ pub async fn the_diff_id_is_proved_by_reading_back_from_the_driver(f: &Factory) 
     of_driver(&s, &e);
     // a lazy layer has no files to read yet
     let mut lazy = pulled.layers[0].clone();
-    lazy.done.lazy = true;
+    lazy.lazy = true;
     let e = expect_err(
         tokio::task::spawn_blocking({
             let d = s.driver.clone();
@@ -2172,7 +2172,7 @@ pub async fn a_feed_writes_into_the_files_a_driver_hands_over(f: &Factory) {
             Ok(out)
         }
     }
-    let pulled = PulledLayer { done };
+    let pulled = done;
     tokio::task::spawn_blocking(move || prove_with("test", Arc::new(Places(places)), &pulled))
         .await
         .unwrap()
@@ -2408,8 +2408,8 @@ pub async fn a_layer_read_whole_is_stored_and_read_back(f: &Factory) {
         o.layers
             .iter()
             .map(|offered| {
-                let l = pulled.layers.iter().find(|l| l.done.key == offered.key);
-                pulled.artifacts[&l.expect("a layer of the offer").done.key].clone()
+                let l = pulled.layers.iter().find(|l| l.key == offered.key);
+                pulled.artifacts[&l.expect("a layer of the offer").key].clone()
             })
             .collect::<Vec<_>>()
     };
@@ -2440,16 +2440,16 @@ pub async fn a_layer_read_whole_is_stored_and_read_back(f: &Factory) {
             let l = pulled
                 .layers
                 .iter()
-                .find(|l| l.done.key == offered.key)
+                .find(|l| l.key == offered.key)
                 .expect("a layer of the offer");
             assert_eq!(
-                l.done.key,
+                l.key,
                 LayerKey::Whole(offered.descriptor.digest),
                 "{compression:?}: a layer read whole is the layer of its blob"
             );
-            assert_eq!(l.done.diff_id, offered.diff_id, "{compression:?}");
+            assert_eq!(l.diff_id, offered.diff_id, "{compression:?}");
             refs.push(LayerRef {
-                key: l.done.key,
+                key: l.key,
                 diff_id: offered.diff_id,
                 chain_id: offered.chain_id,
             });
@@ -2457,7 +2457,7 @@ pub async fn a_layer_read_whole_is_stored_and_read_back(f: &Factory) {
         }
         for (l, want) in stored.iter().zip(&plain) {
             assert_eq!(
-                &pulled.artifacts[&l.done.key], want,
+                &pulled.artifacts[&l.key], want,
                 "{compression:?}: the identity is a property of the layer, not of its compression"
             );
         }
@@ -2468,10 +2468,8 @@ pub async fn a_layer_read_whole_is_stored_and_read_back(f: &Factory) {
             "{compression:?}"
         );
         for (l, tar) in stored.iter().zip([&base, &top]) {
-            let stored = open_layer(&own, &l.done.key, None)
-                .await
-                .expect("open_layer");
-            assert_eq!(stored.diff_id, l.done.diff_id);
+            let stored = open_layer(&own, &l.key, None).await.expect("open_layer");
+            assert_eq!(stored.diff_id, l.diff_id);
             let mut out = Vec::new();
             stored
                 .verified_stream(Arc::new(DriverObjects::new(own.driver.clone())))
@@ -2487,10 +2485,7 @@ pub async fn a_layer_read_whole_is_stored_and_read_back(f: &Factory) {
         let again = blob_offer(&own, &[&base, &top], compression);
         let pulled = again.pull(&own, engine_check()).await.unwrap();
         if own.remote {
-            assert!(pulled
-                .layers
-                .iter()
-                .all(|l| l.done.report.fetched_files == 0));
+            assert!(pulled.layers.iter().all(|l| l.report.fetched_files == 0));
         }
     }
 }
@@ -2513,13 +2508,13 @@ pub async fn a_layer_read_whole_asks_only_for_what_the_store_lacks(f: &Factory) 
             .pull(&s, engine_check())
             .await
             .expect("the first layer");
-        let r = &first.layers[0].done.report;
+        let r = &first.layers[0].report;
         assert_eq!((r.fetched_files, r.reused_files), (3, 0), "{r:?}");
         let sharing = blob_offer(&s, &[&two], Compression::Gzip)
             .pull(&s, engine_check())
             .await
             .expect("a layer that shares a file with it");
-        let r = &sharing.layers[0].done.report;
+        let r = &sharing.layers[0].report;
         assert_eq!((r.fetched_files, r.reused_files), (1, 1), "{r:?}");
         // a store of its own has neither
         let cold_store = second(f, &s, "cold").await;
@@ -2527,7 +2522,7 @@ pub async fn a_layer_read_whole_asks_only_for_what_the_store_lacks(f: &Factory) 
             .pull(&cold_store, engine_check())
             .await
             .expect("a cold pull");
-        let r = &cold.layers[0].done.report;
+        let r = &cold.layers[0].report;
         assert_eq!((r.fetched_files, r.reused_files), (2, 0), "{r:?}");
         return;
     }
@@ -2547,7 +2542,7 @@ pub async fn a_layer_read_whole_asks_only_for_what_the_store_lacks(f: &Factory) 
         .pull(&cold_store, engine_check())
         .await
         .expect("a cold pull");
-    let r = &cold.layers[0].done.report;
+    let r = &cold.layers[0].report;
     assert_eq!((r.fetched_files, r.reused_files), (2, 0), "{r:?}");
     assert_eq!(wanted(&cold_offer), [2], "the driver wants both files");
     // the layers, which the store has now: nothing is asked for
@@ -2561,10 +2556,7 @@ pub async fn a_layer_read_whole_asks_only_for_what_the_store_lacks(f: &Factory) 
         .expect("the second layer");
     let all = blob_offer(&s, &[&one, &two], Compression::Gzip);
     let again = all.pull(&s, engine_check()).await.expect("what is there");
-    assert!(again
-        .layers
-        .iter()
-        .all(|l| l.done.report.fetched_files == 0));
+    assert!(again.layers.iter().all(|l| l.report.fetched_files == 0));
     assert!(wanted(&all).iter().all(|n| *n == 0), "nothing is asked for");
     // a file that a layer has under three names and as a hard link is one
     // object: asked for once, fetched once
@@ -2578,10 +2570,10 @@ pub async fn a_layer_read_whole_asks_only_for_what_the_store_lacks(f: &Factory) 
         .done();
     let o = blob_offer(&s, &[&shared], Compression::Gzip);
     let pulled = o.pull(&s, engine_check()).await.expect("shared files");
-    assert_eq!(pulled.layers[0].done.report.fetched_files, 1);
+    assert_eq!(pulled.layers[0].report.fetched_files, 1);
     assert_eq!(wanted(&o), [1], "the object is asked for once");
     let tar_back = {
-        let stored = pulled.layers[0].done.clone();
+        let stored = pulled.layers[0].clone();
         record(&s, &pulled).await;
         let l = open_layer_for(&s, &stored.key, &stored.diff_id)
             .await
@@ -3082,7 +3074,7 @@ pub async fn a_gzip_layer_of_a_registry_is_pulled_and_read_back(f: &Factory) {
         Vec::<std::path::PathBuf>::new(),
         "copies were left"
     );
-    let done = &pulled.layers[0].done;
+    let done = &pulled.layers[0];
     assert_eq!(done.key, LayerKey::Whole(offer.layers[0].descriptor.digest));
     record(&s, &pulled).await;
     let stored = open_layer_for(&s, &done.key, &done.diff_id)
@@ -3220,7 +3212,7 @@ pub async fn has_layers_does_not_report_what_is_not_committed(f: &Factory) {
     // layer is not complete for the engine until it is
     let o = offer(&s, &[&base]).await;
     let mut pulled = o.pull(&s, engine_check()).await.expect("pull");
-    let done = pulled.layers.remove(0).done;
+    let done = pulled.layers.remove(0);
     let asked = [LayerRef {
         key: done.key,
         diff_id: done.diff_id,
@@ -3248,7 +3240,7 @@ pub async fn has_layers_does_not_report_what_is_not_committed(f: &Factory) {
             .lazy
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let mut pulled = lazy.pull(&s, engine_check()).await.expect("lazy pull");
-        let staged = pulled.layers.remove(0).done;
+        let staged = pulled.layers.remove(0);
         let asked = [LayerRef {
             key: staged.key,
             diff_id: staged.diff_id,
@@ -3332,7 +3324,7 @@ pub async fn has_layers_does_not_report_a_layer_it_cannot_serve(f: &Factory) {
     // that was stored is a repair, not an error)
     let again = offer(&s, &[&base_layer()]).await;
     let mut pulled = again.pull(&s, engine_check()).await.expect("repair");
-    let done = pulled.layers.remove(0).done;
+    let done = pulled.layers.remove(0);
     assert_eq!(done.key, base.key);
     let artifact = pulled.artifacts[&done.key].clone();
     let mut commit = layer_commit(&done, None).unwrap();
@@ -3420,7 +3412,7 @@ pub async fn a_lazy_layer_waits_and_is_completed(f: &Factory) {
         return;
     }
     let mut pulled = pulled.unwrap();
-    let done = pulled.layers.remove(0).done;
+    let done = pulled.layers.remove(0);
     let desc = lazy.layers[0].descriptor.clone();
     let artifact = pulled.artifacts[&done.key].clone();
     // the layer of an image that is being pulled is readable and has a plan
@@ -4083,7 +4075,7 @@ pub async fn a_lazy_pull_is_staged_by_the_engine_and_completed_into_the_driver(f
     let reg = Registry::start_blocking();
     let lazy = lazy_offer(&s, &reg, &tar, true).await;
     let pulled = lazy.pull(&s, engine_check()).await.expect("a lazy pull");
-    let done = pulled.layers[0].done.clone();
+    let done = pulled.layers[0].clone();
     assert!(done.lazy, "the layer is staged, not pulled");
     let artifact = pulled.artifacts[&done.key].clone();
     let refs = vec![LayerRef {
@@ -4124,7 +4116,7 @@ pub async fn a_lazy_pull_is_staged_by_the_engine_and_completed_into_the_driver(f
         .pull(&feed, &layers, engine_check())
         .await
         .expect("the layer is pulled from the pool");
-    assert!(!completed.layers[0].done.lazy);
+    assert!(!completed.layers[0].lazy);
     assert_eq!(s.driver.has_layers(&refs).await.unwrap(), vec![true]);
     // what the driver stored is what the layer holds
     let ranges: Vec<ObjectRange> = done
@@ -4168,7 +4160,7 @@ pub async fn a_staged_file_that_is_not_its_name_is_not_stored(f: &Factory) {
     let reg = Registry::start_blocking();
     let lazy = lazy_offer(&s, &reg, &tar, true).await;
     let pulled = lazy.pull(&s, engine_check()).await.expect("a lazy pull");
-    let done = pulled.layers[0].done.clone();
+    let done = pulled.layers[0].clone();
     let pool = pool_of(&s.dir.join("pool"), &tar);
     // a file of the pool with the bytes of another of the same size
     let big_key = done
@@ -6392,8 +6384,8 @@ forward_storage_driver! {
 async fn record(s: &Subject, pulled: &Pulled) {
     let mut commits = Vec::new();
     for l in &pulled.layers {
-        let artifact = &pulled.artifacts[&l.done.key];
-        let mut commit = layer_commit(&l.done, None).unwrap();
+        let artifact = &pulled.artifacts[&l.key];
+        let mut commit = layer_commit(l, None).unwrap();
         commit.record.erofs = Some(artifact.image_digest.clone());
         commit.record.owners = Some(artifact.owners.clone());
         commits.push(commit);
@@ -6502,7 +6494,7 @@ pub async fn a_pull_gets_the_whole_list_with_the_stored_ones_marked(f: &Factory)
         .expect("the top layer's parent is in the list and held");
     assert_eq!(both.fetches(), 1, "only the missing layer is fetched");
     assert_eq!(pulled.layers.len(), 1);
-    assert_eq!(pulled.layers[0].done.key, list[1].key);
+    assert_eq!(pulled.layers[0].key, list[1].key);
     assert!(chained.holds(&list[1].chain_id));
     // the same with a driver that is content keyed: only what is missing
     let other = second(f, &s, "plain").await;

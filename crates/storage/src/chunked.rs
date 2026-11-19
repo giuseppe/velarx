@@ -63,6 +63,12 @@ pub struct TocEntry {
     pub gid: u32,
     #[serde(default)]
     pub size: u64,
+    /// The digest of the content of a regular file, in the algorithm of the
+    /// layer, which old readers check.  A pull checks it where a fetcher
+    /// writes the file, and as the digest of the one chunk of a file that has
+    /// no chunk entries.  A file made of chunks the store holds is checked by
+    /// the digests of its chunks and by its fs-verity digest, not by this one:
+    /// a file is named and found by its fs-verity digest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     /// The fs-verity digest of a regular file with content

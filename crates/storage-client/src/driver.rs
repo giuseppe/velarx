@@ -26,8 +26,8 @@ use velarx_graph::{
     new_pull_id, prove_with, spool_object_into, to_fetch, Capabilities, Collected, DiffOptions,
     DriverError, DriverErrorKind, DriverResult, FeedLayer, FilesIncoming, Keep, LayerArtifact,
     LayerRef, MountRequest, Mounts, MountsRequest, ObjectRange, ObjectSink, Planned, Problem,
-    PullFeed, Pulled, PulledLayer, Purpose, Remedy, Settled, StoppedView, StoreId, StoreInfo,
-    TreeSource, Usage, Writable, WritableOptions, WritablePaths,
+    PullFeed, Pulled, Purpose, Remedy, Settled, StoppedView, StoreId, StoreInfo, TreeSource, Usage,
+    Writable, WritableOptions, WritablePaths,
 };
 use velarx_storage::{ObjectOpener, Toc};
 use velarx_types::digest::Digest;
@@ -1592,24 +1592,22 @@ impl VarlinkDriver {
                 reused_files: (files.len() as u64).saturating_sub(fetched_files),
                 ..Default::default()
             };
-            pulled.push(PulledLayer {
-                done: velarx_content::pull::LayerDone {
-                    key: index.key,
-                    blob: layer.descriptor.digest,
-                    diff_id: layer.diff_id,
-                    size: layer.descriptor.size,
-                    toc: index.toc,
-                    files,
-                    chunks: Vec::new(),
-                    report,
-                    tarsplit: index.tarsplit,
-                    lazy: false,
-                    // (the engine did not fetch the bytes: nothing of the
-                    // layer is vouched for as coming from the registry)
-                    proven: false,
-                    blob_checked: false,
-                    checked: Default::default(),
-                },
+            pulled.push(velarx_content::pull::LayerDone {
+                key: index.key,
+                blob: layer.descriptor.digest,
+                diff_id: layer.diff_id,
+                size: layer.descriptor.size,
+                toc: index.toc,
+                files,
+                chunks: Vec::new(),
+                report,
+                tarsplit: index.tarsplit,
+                lazy: false,
+                // (the engine did not fetch the bytes: nothing of the
+                // layer is vouched for as coming from the registry)
+                proven: false,
+                blob_checked: false,
+                checked: Default::default(),
             });
         }
         // the proof: what the driver stored, read back from it
@@ -1624,7 +1622,6 @@ impl VarlinkDriver {
                 // them in this pull, by the digest of their content, which
                 // the proof does not change)
                 let sound: std::collections::HashSet<String> = p
-                    .done
                     .toc
                     .entries
                     .iter()
@@ -1634,14 +1631,14 @@ impl VarlinkDriver {
                 let objects = Arc::new(StagedObjects::new(
                     inner.clone(),
                     pull.clone(),
-                    &p.done.toc,
+                    &p.toc,
                     copied.clone(),
                 ));
                 prove_with(&inner.name, objects.clone(), p)?;
                 // (what the proof read tells the fs-verity digest of the
                 // files the table of contents knows by their hash)
-                objects.with_verity(Arc::make_mut(&mut p.done.toc));
-                p.done.files = velarx_content::pull::stream::FileUse::of_toc(&p.done.toc);
+                objects.with_verity(Arc::make_mut(&mut p.toc));
+                p.files = velarx_content::pull::stream::FileUse::of_toc(&p.toc);
                 // (where the chunks of the layer are in the driver's objects,
                 // by the keys it knows them by now: the next pull has the
                 // driver copy a chunk it holds.  Only the objects the engine
@@ -1649,10 +1646,9 @@ impl VarlinkDriver {
                 // chunk for other bytes of an object the driver had, copied
                 // or a job wrote would send every later pull of that chunk to
                 // the wrong bytes)
-                p.done.chunks =
-                    velarx_content::pull::chunked::located_chunks_where(&p.done.toc, |e| {
-                        e.digest.as_ref().is_some_and(|d| sound.contains(d))
-                    });
+                p.chunks = velarx_content::pull::chunked::located_chunks_where(&p.toc, |e| {
+                    e.digest.as_ref().is_some_and(|d| sound.contains(d))
+                });
             }
             Ok::<_, DriverError>(pulled)
         })

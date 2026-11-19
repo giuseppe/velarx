@@ -10,7 +10,7 @@ use velarx_content::pull::{self, layer_commit, LayerDone, Limits, Source};
 use velarx_db::{BlobSource, ImageRecord, ImageTag, LayerKey, LayerReach, Lease, PullCommit};
 use velarx_graph::feed::{
     CheckId, Checked, ContentFeed, FeedLayer, Identities, Incoming as DriverIncoming, LayerIndex,
-    PullFeed, Pulled, PulledLayer, Settled, Settlement, Verdict,
+    PullFeed, Pulled, Settled, Settlement, Verdict,
 };
 use velarx_graph::LayerRef;
 use velarx_proto::workload::{SOURCE_REGISTRY, SOURCE_STORE};
@@ -1526,10 +1526,8 @@ impl ImageService {
             stored_erofs,
             ours: made,
         } = opened(&check, verdict, &driven_layers, &recorded)?;
-        let done_layers: HashMap<LayerKey, LayerDone> = driven_layers
-            .into_iter()
-            .map(|p| (p.done.key, p.done))
-            .collect();
+        let done_layers: HashMap<LayerKey, LayerDone> =
+            driven_layers.into_iter().map(|p| (p.key, p)).collect();
         debug!(
             "Layers pulled and their images made after {:?}",
             start.elapsed()
@@ -1787,13 +1785,13 @@ pub struct RemoteDescriptor {
 pub(super) fn opened(
     check: &CheckId,
     verdict: Verdict,
-    pulled: &[PulledLayer],
+    pulled: &[LayerDone],
     recorded: &HashMap<LayerKey, velarx_graph::LayerArtifact>,
 ) -> ImageResult<Checked> {
     let checked = verdict.open(check).ok_or_else(|| {
         ImageError::Storage("the driver returned the verdict of another check".into())
     })?;
-    let keys: Vec<&LayerKey> = pulled.iter().map(|p| &p.done.key).collect();
+    let keys: Vec<&LayerKey> = pulled.iter().map(|p| &p.key).collect();
     storage::of_these_layers(&checked.ours, &keys)?;
     storage::agree(&checked.ours, recorded)?;
     Ok(checked)
@@ -1832,11 +1830,11 @@ impl ImageService {
             let (progress_tx, handle) = (s.progress.clone(), tokio::runtime::Handle::current());
             let manifest_alg = s.manifest_digest.alg();
             let holds_objects = self.storage.holds_objects();
-            Box::new(move |pulled: &mut Vec<PulledLayer>, objects| {
+            Box::new(move |pulled: &mut Vec<LayerDone>, objects| {
                 // (each layer of the image is under the key it was asked by)
                 let layer_keys = expected;
                 let done: HashMap<&LayerKey, &LayerDone> =
-                    pulled.iter().map(|p| (&p.done.key, &p.done)).collect();
+                    pulled.iter().map(|p| (&p.key, p)).collect();
                 let stored = |d: &LayerKey| handle.block_on(db.get_layer(d));
                 // (the merged EROFS is made of the files of the engine's
                 // own store: a driver that keeps its own has none to make it
@@ -1844,7 +1842,7 @@ impl ImageService {
                 // layers' own digests are)
                 let merged = (seal || !seal::expected(&manifest)?.is_empty())
                     && holds_objects
-                    && !pulled.iter().any(|p| p.done.lazy);
+                    && !pulled.iter().any(|p| p.lazy);
                 let mut merged_id = None;
                 if merged {
                     let mut stored_tocs = HashMap::new();
@@ -1884,7 +1882,7 @@ impl ImageService {
                     }
                 }
                 let tocs: Vec<(&LayerKey, &velarx_storage::Toc)> =
-                    pulled.iter().map(|p| (&p.done.key, &*p.done.toc)).collect();
+                    pulled.iter().map(|p| (&p.key, &*p.toc)).collect();
                 let (ours, images) = storage::identities_of(&tocs)?;
                 if !states {
                     let theirs: Vec<Option<String>> = layer_keys

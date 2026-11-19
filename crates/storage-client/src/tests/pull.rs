@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use velarx_content::pull::tarsplit::tar::TarReader;
 use velarx_content::pull::tarsplit::Recorder;
 use velarx_graph::{
-    CheckId, Checked, FeedLayer, Identities, LayerArtifact, LayerIndex, PullFeed, PulledLayer,
+    CheckId, Checked, FeedLayer, Identities, LayerArtifact, LayerDone, LayerIndex, PullFeed,
     Settled, Settlement, Verdict,
 };
 use velarx_types::{ImageError, ImageResult, OciDescriptor};
@@ -724,14 +724,14 @@ fn settled_ok(calls: Arc<AtomicUsize>, log: Arc<Script>) -> Settled {
 
 /// The engine's check `check`, which seals its verdict with its id.
 fn settled_by(check: CheckId, calls: Arc<AtomicUsize>, log: Arc<Script>) -> Settled {
-    Box::new(move |pulled: &mut Vec<PulledLayer>, _| {
+    Box::new(move |pulled: &mut Vec<LayerDone>, _| {
         calls.fetch_add(1, Ordering::SeqCst);
         log.log.lock().unwrap().push("settled".into());
         let artifacts: HashMap<_, _> = pulled
             .iter()
             .map(|p| {
                 (
-                    p.done.key,
+                    p.key,
                     LayerArtifact {
                         image_digest: "fsverity-sha256-12:aa".into(),
                         owners: "[[0],[0]]".into(),
@@ -743,7 +743,7 @@ fn settled_by(check: CheckId, calls: Arc<AtomicUsize>, log: Arc<Script>) -> Sett
             verdict: Verdict::sealed(
                 &check,
                 Checked {
-                    layer_keys: pulled.iter().map(|p| p.done.key).collect(),
+                    layer_keys: pulled.iter().map(|p| p.key).collect(),
                     merged_id: None,
                     stored_erofs: HashMap::new(),
                     ours: artifacts.clone(),
@@ -799,7 +799,7 @@ fn a_pull_is_driven_by_the_driver_proved_by_reading_back_and_committed() {
     .unwrap();
     // the pull
     assert_eq!(pulled.layers.len(), 1);
-    assert_eq!(pulled.layers[0].done.key, key(1));
+    assert_eq!(pulled.layers[0].key, key(1));
     assert!(pulled.artifacts.contains_key(&key(1)));
     // the verdict of the check in the engine's process is what the pull
     // returns (it never crossed the wire)
@@ -812,7 +812,6 @@ fn a_pull_is_driven_by_the_driver_proved_by_reading_back_and_committed() {
     // the file the table of contents knows by the hash of its content is
     // recorded with the fs-verity digest of the bytes the proof read
     let f = pulled.layers[0]
-        .done
         .toc
         .entries
         .iter()
@@ -827,7 +826,6 @@ fn a_pull_is_driven_by_the_driver_proved_by_reading_back_and_committed() {
     );
     assert!(
         pulled.layers[0]
-            .done
             .files
             .iter()
             .any(|u| u.digest == f.verity().unwrap()),
@@ -1345,7 +1343,7 @@ fn a_driver_that_holds_objects_is_told_to_copy_a_chunk_from_one() {
         if objects.is_none() {
             let pulled = pulled.expect("a pull");
             assert_eq!(
-                pulled.layers[0].done.chunks.len(),
+                pulled.layers[0].chunks.len(),
                 1,
                 "the chunk of an object the engine wrote is recorded"
             );
@@ -1369,9 +1367,9 @@ fn a_driver_that_holds_objects_is_told_to_copy_a_chunk_from_one() {
         }
         let pulled = pulled.expect("a pull");
         assert!(
-            pulled.layers[0].done.chunks.is_empty(),
+            pulled.layers[0].chunks.is_empty(),
             "an object the driver copied into gives no chunk records: {:?}",
-            pulled.layers[0].done.chunks
+            pulled.layers[0].chunks
         );
         assert_eq!(
             p("fetch copies").as_deref(),

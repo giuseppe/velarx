@@ -777,15 +777,12 @@ impl ImageService {
         drop(feed);
         let checked = super::pull::opened(&check, verdict, &driven, &recorded)?;
         for pulled in driven {
-            let layer = layers
-                .iter()
-                .find(|l| l.key == pulled.done.key)
-                .ok_or_else(|| {
-                    ImageError::Storage(format!(
-                        "the storage driver pulled the layer {}, which the image does not stage",
-                        pulled.done.key
-                    ))
-                })?;
+            let layer = layers.iter().find(|l| l.key == pulled.key).ok_or_else(|| {
+                ImageError::Storage(format!(
+                    "the storage driver pulled the layer {}, which the image does not stage",
+                    pulled.key
+                ))
+            })?;
             let _one = self.commit_layer_lock(&layer.key).await?;
             let _store = self.lock_store().await?;
             if let Ok(record) = self.db.get_own_layer(&layer.key).await {
@@ -809,7 +806,7 @@ impl ImageService {
                 )));
             }
             let mut commit = super::storage::with_image(
-                layer_commit(&pulled.done, layer.meta.registry_ref.as_deref())?,
+                layer_commit(&pulled, layer.meta.registry_ref.as_deref())?,
                 &checked.ours,
             );
             (commit.record.blob, commit.record.size) =

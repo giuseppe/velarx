@@ -136,7 +136,7 @@ async fn measure(small: usize) {
     let pull = started.elapsed();
     // the proof again, from the committed layer: one read for each object
     let l = pulled.layers[0].clone();
-    let objects = l.done.files.len();
+    let objects = l.files.len();
     let d = driver.clone();
     let started = Instant::now();
     tokio::task::spawn_blocking(move || prove_by_read_back(d, &l))

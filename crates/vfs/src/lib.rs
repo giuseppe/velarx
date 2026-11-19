@@ -860,16 +860,14 @@ impl StorageDriver for VfsDriver {
             identities,
             verdict,
         } = settlement;
-        if let Some(l) = pulled.iter().find(|l| l.done.lazy) {
+        if let Some(l) = pulled.iter().find(|l| l.lazy) {
             return Err(unsupported(format!(
                 "the layer {} was pulled lazily, and the vfs driver copies whole layers: pull without --lazy",
-                l.done.key
+                l.key
             )));
         }
-        let tocs: Vec<(LayerKey, Arc<Toc>)> = pulled
-            .iter()
-            .map(|l| (l.done.key, Arc::clone(&l.done.toc)))
-            .collect();
+        let tocs: Vec<(LayerKey, Arc<Toc>)> =
+            pulled.iter().map(|l| (l.key, Arc::clone(&l.toc))).collect();
         let (store, verity, root) = (self.store.clone(), self.fsverity, self.root.clone());
         // (the identity is the engine's: nothing is made of the layers
         // here, only their tables of contents are kept)

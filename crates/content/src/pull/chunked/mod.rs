@@ -69,11 +69,6 @@ const MAX_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 pub const METADATA_GAP: u64 = 64 * 1024;
 pub const METADATA_TOGETHER: u64 = 8 * 1024 * 1024;
 
-/// Decompressed chunks that wait for a predecessor of their file, per file
-/// and for the pull.
-const FILE_PENDING_CAP: u64 = 16 * 1024 * 1024;
-const GLOBAL_PENDING_CAP: u64 = 64 * 1024 * 1024;
-
 /// Times a request is retried after an error.
 pub(crate) const RETRIES: usize = 3;
 
@@ -460,10 +455,6 @@ struct FileJob {
     name: String,
     /// What the file is known by (`TocEntry::content_key`).
     digest: String,
-    /// The hash its content must have (in the algorithm of the layer), when
-    /// the TOC gives no fs-verity digest: a file with one is checked by its
-    /// fs-verity digest when it is stored, not hashed whole here.
-    content: Option<String>,
     size: u64,
     /// Zero-filled holes: offset and length.
     holes: Vec<(u64, u64)>,
@@ -659,11 +650,6 @@ fn plan_file(
     let e = &entries[i];
     let digest_str = e.content_key().unwrap_or_default();
     let alg = plan.alg;
-    let content = if e.verity().is_some() {
-        None
-    } else {
-        e.digest.clone()
-    };
     if e.end_offset <= e.offset || (blob_size >= 0 && e.end_offset > blob_size as u64) {
         return Err(fail(format!("invalid offsets for `{}`", e.name)));
     }
@@ -699,12 +685,12 @@ fn plan_file(
             job,
             file_off: 0,
             size: e.size,
-            // the one chunk of a file known by its fs-verity digest is
-            // checked by the hash of the file, when the TOC gives one
-            digest: content
-                .is_none()
-                .then(|| e.digest.as_deref().map(|d| layer_digest(&e.name, d, alg)))
-                .flatten()
+            // (when the TOC gives the hash of the file it is the one of the
+            // chunk)
+            digest: e
+                .digest
+                .as_deref()
+                .map(|d| layer_digest(&e.name, d, alg))
                 .transpose()?,
             comp: e.offset..e.end_offset,
             local: None,
@@ -776,7 +762,6 @@ fn plan_file(
     plan.jobs.push(FileJob {
         name: e.name.clone(),
         digest: digest_str,
-        content,
         size: e.size,
         holes,
         chunks: first..plan.chunks.len(),
@@ -1073,33 +1058,21 @@ pub fn make_batches(
 
 impl Plan {}
 
-enum Pending {
-    Data(Vec<u8>),
-    Zeros(u64),
-}
-
 struct FileState {
     file: Option<Arc<File>>,
     /// Where the content starts in the file: 0 unless the stage put it in
     /// a file it shares
     base: u64,
     temp: Option<std::path::PathBuf>,
-    /// The file is hashed whole (it is known by its sha256).
-    hash: bool,
-    hasher: DigestWriter,
-    /// The file is hashed up to here.
+    /// The file is written in order up to here.
     next: u64,
-    pending: BTreeMap<u64, Pending>,
-    pending_bytes: u64,
+    /// The parts written after `next`: offset and length.
+    pending: BTreeMap<u64, u64>,
     chunks_left: usize,
     /// The progress that was told of
     marked: u64,
-    /// A chunk was not hashed in order: read the file again.
-    rehash: bool,
     done: bool,
     verified: Vec<ChunkLocationRecord>,
-    /// The digest of the whole file, when one chunk covered it.
-    file_digest: Option<String>,
 }
 
 pub(super) struct Shared {
@@ -1109,7 +1082,6 @@ pub(super) struct Shared {
     /// The pull failed: no chunk is written any more
     aborted: AtomicBool,
     error: Mutex<Option<ImageError>>,
-    pending_total: AtomicU64,
     /// The files made with a chunk of the store (as it was, read-only
     /// stores included) or of a local source: the store's, not the pull's
     ///
@@ -1140,23 +1112,17 @@ impl Shared {
         }
         let files = chunks_left
             .iter()
-            .zip(&plan.jobs)
-            .map(|(&n, job)| {
+            .map(|&n| {
                 Mutex::new(FileState {
                     file: None,
                     base: 0,
                     temp: None,
-                    hash: job.content.is_some() && !stage.takes_files(),
-                    hasher: DigestWriter::new(plan.alg),
                     next: 0,
                     pending: BTreeMap::new(),
-                    pending_bytes: 0,
                     chunks_left: n,
                     marked: 0,
-                    rehash: false,
                     done: false,
                     verified: Vec::new(),
-                    file_digest: None,
                 })
             })
             .collect();
@@ -1167,7 +1133,6 @@ impl Shared {
             plan,
             aborted: AtomicBool::new(false),
             error: Mutex::new(None),
-            pending_total: AtomicU64::new(0),
         })
     }
 
@@ -1197,9 +1162,9 @@ impl Shared {
         st.file = Some(file.clone());
         st.base = base;
         st.temp = temp;
-        // Sparse holes are zeros for the hash.
+        // (the holes are where nothing is written: they count as written)
         for &(off, len) in &j.holes {
-            st.pending.insert(off, Pending::Zeros(len));
+            st.pending.insert(off, len);
             self.stage.hole(&j.digest, off, len);
         }
         self.drain(&mut st);
@@ -1218,29 +1183,13 @@ impl Shared {
         }
     }
 
-    /// Hash what is next in line.
+    /// Count what is next in line as written.
     fn drain(&self, st: &mut FileState) {
         while let Some(entry) = st.pending.first_entry() {
             if *entry.key() != st.next {
                 break;
             }
-            match entry.remove() {
-                Pending::Data(d) => {
-                    if st.hash {
-                        st.hasher.update(&d);
-                    }
-                    st.next += d.len() as u64;
-                    st.pending_bytes -= d.len() as u64;
-                    self.pending_total
-                        .fetch_sub(d.len() as u64, Ordering::Relaxed);
-                }
-                Pending::Zeros(n) => {
-                    if st.hash {
-                        hash_zeros(&mut st.hasher, n);
-                    }
-                    st.next += n;
-                }
-            }
+            st.next += entry.remove();
         }
     }
 
@@ -1249,35 +1198,21 @@ impl Shared {
         &self,
         job: usize,
         off: u64,
-        data: Vec<u8>,
+        len: u64,
         loc: Option<ChunkLocationRecord>,
-        file_digest: Option<String>,
     ) -> ImageResult<()> {
         let mut st = self.files[job].lock().unwrap();
         if let Some(loc) = loc {
             st.verified.push(loc);
         }
-        let len = data.len() as u64;
-        if file_digest.is_some() {
-            // The chunk is the whole file and is hashed already.
-            st.file_digest = file_digest;
-        } else if off == st.next {
-            if st.hash {
-                st.hasher.update(&data);
-            }
+        if off == st.next {
             st.next += len;
             self.drain(&mut st);
             if self.plan.jobs[job].size >= FOLLOW_MIN {
                 self.mark(job, &mut st);
             }
-        } else if st.pending_bytes + len <= FILE_PENDING_CAP
-            && self.pending_total.load(Ordering::Relaxed) + len <= GLOBAL_PENDING_CAP
-        {
-            st.pending_bytes += len;
-            self.pending_total.fetch_add(len, Ordering::Relaxed);
-            st.pending.insert(off, Pending::Data(data));
         } else {
-            st.rehash = true;
+            st.pending.insert(off, len);
         }
         st.chunks_left -= 1;
         if st.chunks_left == 0 {
@@ -1294,7 +1229,7 @@ impl Shared {
             st.next += len;
             self.drain(&mut st);
         } else {
-            st.pending.insert(off, Pending::Zeros(len));
+            st.pending.insert(off, len);
         }
         st.chunks_left -= 1;
         if st.chunks_left == 0 {
@@ -1319,30 +1254,7 @@ impl Shared {
 
     fn finish(&self, job: usize, st: &mut FileState) -> ImageResult<()> {
         let j = &self.plan.jobs[job];
-        let digest = match &j.content {
-            None => None,
-            // (the parent checks the files of a job on the bytes it reads)
-            Some(_) if self.stage.takes_files() => None,
-            Some(_) if st.file_digest.is_some() => st.file_digest.take(),
-            Some(_) if st.rehash || st.next != j.size => {
-                let f = st.file.as_ref().expect("a file with chunks is open");
-                Some(rehash(self.plan.alg, f, j.size).map_err(io_fail)?)
-            }
-            Some(_) => Some(st.hasher.clone().finalize().to_string()),
-        };
-        let drop_pending = std::mem::take(&mut st.pending);
-        for (_, p) in drop_pending {
-            if let Pending::Data(d) = p {
-                self.pending_total
-                    .fetch_sub(d.len() as u64, Ordering::Relaxed);
-            }
-        }
-        st.pending_bytes = 0;
-        if let (Some(digest), Some(want)) = (&digest, &j.content) {
-            if digest != want {
-                return Err(not_the_tocs(want, digest, &format!("`{}`", j.name)));
-            }
-        }
+        st.pending.clear();
         // (a stage whose files nothing checks after the fetch, the files of a
         // driver: the content is what its key names before it is told whole)
         if let Some(actual) = self.stage.measure(&j.digest).map_err(io_fail)? {
@@ -1375,29 +1287,12 @@ impl Shared {
                 name: j.name.clone(),
                 size: j.size,
                 copy,
-                verity_keyed: j.content.is_none(),
+                verity_keyed: true,
             })
             .map_err(io_fail)?;
         st.done = true;
         Ok(())
     }
-}
-
-fn hash_zeros(hasher: &mut DigestWriter, mut n: u64) {
-    let zeros = [0u8; 8192];
-    while n > 0 {
-        let k = n.min(zeros.len() as u64) as usize;
-        hasher.update(&zeros[..k]);
-        n -= k as u64;
-    }
-}
-
-fn rehash(alg: Algorithm, file: &File, size: u64) -> io::Result<String> {
-    let (digest, n) = Digest::of_file_at(alg, file, size)?;
-    if n < size {
-        return Err(io::ErrorKind::UnexpectedEof.into());
-    }
-    Ok(digest.to_string())
 }
 
 /// Decompress one chunk and check its length (blocking).
@@ -1435,14 +1330,7 @@ fn process_chunk(sh: &Shared, idx: usize, comp: bytes::Bytes) -> ImageResult<()>
 fn write_verified(sh: &Shared, idx: usize, data: Vec<u8>) -> ImageResult<()> {
     let c = &sh.plan.chunks[idx];
     let job = &sh.plan.jobs[c.job];
-    // A chunk that is the whole file is hashed once: the same digest checks
-    // the chunk and the file.
-    let whole = job.content.is_some()
-        && !sh.stage.takes_files()
-        && job.chunks.len() == 1
-        && c.size == job.size
-        && job.holes.is_empty();
-    let actual = (c.digest.is_some() || whole).then(|| Digest::of(sh.plan.alg, &data));
+    let actual = c.digest.is_some().then(|| Digest::of(sh.plan.alg, &data));
     let loc = match (&c.digest, &actual) {
         (Some(expected), Some(actual)) => {
             if actual != expected {
@@ -1467,13 +1355,7 @@ fn write_verified(sh: &Shared, idx: usize, data: Vec<u8>) -> ImageResult<()> {
     // (the file is complete when its last chunk is written: nothing but
     // its state holds it then)
     drop(file);
-    sh.chunk_written(
-        c.job,
-        c.file_off,
-        data,
-        loc,
-        whole.then_some(actual).flatten().map(|d| d.to_string()),
-    )
+    sh.chunk_written(c.job, c.file_off, data.len() as u64, loc)
 }
 
 /// Read a chunk another file of the store holds (blocking).

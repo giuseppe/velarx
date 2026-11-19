@@ -59,7 +59,8 @@ use tracing::{info, warn};
 use velarx_content::pull::net::Net;
 use velarx_content::pull::session::Session;
 use velarx_content::pull::sink::{FilesSink, Finished, Sink, Spool};
-use velarx_content::pull::{self, Have, ImageBudget, LayerDone, Limits, PullCtx, Source};
+pub use velarx_content::pull::LayerDone;
+use velarx_content::pull::{self, Have, ImageBudget, Limits, PullCtx, Source};
 use velarx_db::Database;
 use velarx_fuse::layer_erofs::LayerImage;
 use velarx_storage::{FileStore, Toc, VerityMode};
@@ -299,13 +300,6 @@ pub trait PullFeed: Send + Sync {
     fn end(&self);
 }
 
-/// A layer a pull brought, verified and settled: its files are in the store
-/// under the fs-verity digest of what they hold.
-#[derive(Clone)]
-pub struct PulledLayer {
-    pub done: LayerDone,
-}
-
 /// Prove the diff id of a pulled layer by reading it back from the driver that
 /// stores it: the tar stream is rebuilt from the layer's table of contents and
 /// tar-split with the bytes of its files that [`StorageDriver::read_objects`]
@@ -318,7 +312,7 @@ pub struct PulledLayer {
 /// proved, and is refused.  Blocks: call it on a thread that may.
 pub fn prove_by_read_back(
     driver: Arc<dyn crate::StorageDriver>,
-    layer: &PulledLayer,
+    layer: &LayerDone,
 ) -> DriverResult<()> {
     let objects = Arc::new(crate::DriverObjects::new(Arc::clone(&driver)));
     prove_with(driver.name(), objects, layer)
@@ -330,10 +324,9 @@ pub fn prove_by_read_back(
 pub fn prove_with(
     name: &str,
     objects: Arc<dyn velarx_storage::ObjectOpener>,
-    layer: &PulledLayer,
+    done: &LayerDone,
 ) -> DriverResult<()> {
     use std::io::Read;
-    let done = &layer.done;
     if done.lazy {
         return Err(DriverError::storage(
             name,
@@ -398,7 +391,7 @@ pub struct Identities {
 /// fs-verity digest (the files of the pull are not named in the store yet).
 pub type Settled = Box<
     dyn FnOnce(
-            &mut Vec<PulledLayer>,
+            &mut Vec<LayerDone>,
             &dyn Fn(&str) -> Option<std::path::PathBuf>,
         ) -> ImageResult<Settlement>
         + Send,
@@ -470,7 +463,7 @@ pub struct Settlement {
 /// What [`StorageDriver::pull`] gives back.
 pub struct Pulled {
     /// The layers pulled, settled, in the order they were completed.
-    pub layers: Vec<PulledLayer>,
+    pub layers: Vec<LayerDone>,
     /// What the driver recorded of each.
     pub artifacts: HashMap<LayerKey, LayerArtifact>,
     /// What the engine's check concluded, handed back as the driver got it.
@@ -1364,7 +1357,7 @@ pub async fn pull_in_process<R: Send + 'static>(
     layers: &[FeedLayer],
     settled: Settled,
     write: Written<R>,
-) -> DriverResult<(Vec<PulledLayer>, Settlement, R)> {
+) -> DriverResult<(Vec<LayerDone>, Settlement, R)> {
     let result = pull_session(parts, feed, layers, settled, write).await;
     feed.end();
     result
@@ -1373,7 +1366,7 @@ pub async fn pull_in_process<R: Send + 'static>(
 /// What a driver writes in its store between the link of the files of a
 /// pull and the barrier that makes them durable ([`pull_in_process`]).
 pub type Written<R> =
-    Box<dyn FnOnce(&[PulledLayer], &mut Settlement) -> DriverResult<(R, bool)> + Send>;
+    Box<dyn FnOnce(&[LayerDone], &mut Settlement) -> DriverResult<(R, bool)> + Send>;
 
 async fn pull_session<R: Send + 'static>(
     parts: &InProcess<'_>,
@@ -1381,7 +1374,7 @@ async fn pull_session<R: Send + 'static>(
     layers: &[FeedLayer],
     settled: Settled,
     write: Written<R>,
-) -> DriverResult<(Vec<PulledLayer>, Settlement, R)> {
+) -> DriverResult<(Vec<LayerDone>, Settlement, R)> {
     let name = parts.driver;
     let session = Session::create(&parts.staging_dir, parts.store.clone())
         .map_err(|e| DriverError::io(name, e))?;
@@ -1403,7 +1396,7 @@ async fn pull_session<R: Send + 'static>(
         });
     }
     let fetched = async {
-        let mut pulled: Vec<PulledLayer> = Vec::with_capacity(layers.len());
+        let mut pulled: Vec<LayerDone> = Vec::with_capacity(layers.len());
         let mut budget = ImageBudget::default();
         while let Some(joined) = tasks.join_next().await {
             let done = joined
@@ -1415,7 +1408,7 @@ async fn pull_session<R: Send + 'static>(
                 "Layer {}: fetched {} bytes in {} files, reused {} bytes in {} files",
                 done.key, r.fetched_bytes, r.fetched_files, r.reused_bytes, r.reused_files
             );
-            pulled.push(PulledLayer { done });
+            pulled.push(done);
         }
         Ok::<_, DriverError>(pulled)
     }
@@ -1465,8 +1458,7 @@ async fn pull_session<R: Send + 'static>(
             objects.into_iter().map(|c| (c.digest, c.object)).collect();
         let mut pulled = pulled;
         for l in &mut pulled {
-            l.done
-                .settle(&objects, &store)
+            l.settle(&objects, &store)
                 .map_err(|e| refused(&driver, e))?;
         }
         let at = |d: &str| staged.get(d).cloned().or_else(|| store.get_path(d));
