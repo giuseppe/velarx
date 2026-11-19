@@ -85,7 +85,7 @@ impl ImageMounts {
     ) -> FuseResult<PathBuf> {
         let key = format!("{image}-mapped");
         let key = match translate {
-            Some(t) => format!("{key}-{}", t.key()),
+            Some(t) => format!("{key}-{t:?}"),
             None => key,
         };
         let mut mounts = self.mounts.lock().unwrap_or_else(|e| e.into_inner());

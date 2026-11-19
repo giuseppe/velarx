@@ -224,19 +224,9 @@ pub fn open_checked_layer_image(
     accepted: &[String],
     strict: bool,
 ) -> std::io::Result<std::fs::File> {
-    open_measured_layer_image(path, accepted, strict).map(|(file, _)| file)
-}
-
-/// [`open_checked_layer_image`], with the digest it measured on the
-/// descriptor (none: not `strict`, the image passed unmeasured).
-pub fn open_measured_layer_image(
-    path: &Path,
-    accepted: &[String],
-    strict: bool,
-) -> std::io::Result<(std::fs::File, Option<String>)> {
     let file = open_layer_image(path)?;
-    let got = measure_layer_image(&file, path, accepted, strict)?;
-    Ok((file, got))
+    measure_layer_image(&file, path, accepted, strict)?;
+    Ok(file)
 }
 
 /// The fs-verity digest of the open image `file` (`sha256:HEX` or

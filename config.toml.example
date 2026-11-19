@@ -218,16 +218,6 @@ composefs = "auto"
 # command without a daemon, or made with another storage driver than this
 # store's, is skipped and the log says why (docs/STORAGE.md)
 # additional_image_stores = ["/usr/lib/velarx-images"]
-# Read-only directories of files that other tools keep, searched for the files
-# a pull would otherwise fetch: a composefs-rs repository (kind
-# "composefs-rs", the directory with meta.json), the graph root of a podman
-# or CRI-O store with `use_composefs` ("containers-storage", image layers
-# only), another velarx store ("velarx").  A file found is checked (fs-verity
-# or hashed) and imported as a reflink, a copy, or, with `link = true`, a hard
-# link when it already has fs-verity and is the user's; nothing in the store
-# is ever written, collected or mounted.  One that cannot be read or is not
-# what its kind says is skipped with a warning (docs/STORAGE.md)
-# foreign_object_stores = [{ path = "/sysroot/composefs", kind = "composefs-rs" }]
 # Garbage collection interval in seconds; skipped while a pull runs.  It
 # also removes the staging directories of pulls whose process is gone
 gc_interval_secs = 3600
@@ -472,14 +462,6 @@ lazy_profile_peers = true
 # ["registry"].  interfaces/org.velarx.Fetcher.varlink is the interface to
 # write one.
 # sources = ["dircache", "peers", "registry"]
-# Chunks asked of a source in one request
-# source_batch = 64
-# Time a source gets: to say what it has, to serve a request (plus its bytes
-# at the minimum rate), and how long it is skipped after it failed
-# source_has_timeout_ms = 3000
-# source_fetch_timeout_secs = 20
-# source_min_rate_kib = 1024
-# source_cooldown_secs = 30
 
 [push]
 # Layers regenerated and uploaded at the same time

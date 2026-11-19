@@ -14,31 +14,14 @@ const PREFIX: &str = "io.github.containers.zstd-chunked.";
 
 fn entry(name: &str, kind: TocEntryType, size: u64) -> TocEntry {
     TocEntry {
-        name: name.to_string(),
-        entry_type: kind,
         mode: if kind == TocEntryType::Dir {
             0o755
         } else {
             0o644
         },
-        uid: 0,
-        gid: 0,
         size,
-        digest: None,
-        fsverity: None,
-        offset: 0,
-        end_offset: 0,
-        chunk_digest: None,
-        chunk_size: 0,
-        chunk_offset: 0,
-        chunk_type: None,
-        link_name: None,
         mod_time: Some("2023-11-14T22:13:20.5Z".to_string()),
-        access_time: None,
-        change_time: None,
-        dev_major: None,
-        dev_minor: None,
-        xattrs: Default::default(),
+        ..TocEntry::new(name.to_string(), kind)
     }
 }
 

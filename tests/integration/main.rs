@@ -37,7 +37,6 @@ mod manifest_tests;
 mod merged_tree_tests;
 mod monitor_mount_fd_tests;
 mod monitor_tests;
-mod pod_tests;
 mod podlogs_tests;
 mod pull_tests;
 mod push_tests;

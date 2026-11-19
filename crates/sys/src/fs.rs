@@ -87,46 +87,6 @@ pub fn open_handle(mount_fd: RawFd, handle: &FileHandle) -> std::io::Result<Owne
 /// root of the namespace file system (`FD_NSFS_ROOT`, Linux 6.18).
 pub const NSFS_ROOT: RawFd = -10003;
 
-/// Take a read lock on the whole file of `fd` for its open file (an OFD
-/// lock of `fcntl`): it is held until that open file is closed, whatever
-/// else the process opens and closes of the file (a lock of the process,
-/// as `rustix::fs::fcntl_lock` takes, goes as the process closes any
-/// descriptor of the file).  Fails with `WouldBlock` when another holds a
-/// write lock.
-pub fn lock_shared(fd: BorrowedFd<'_>) -> std::io::Result<()> {
-    let mut lock = whole_file_lock();
-    lock.l_type = libc::F_RDLCK as libc::c_short;
-    // SAFETY: F_OFD_SETLK reads the flock structure, which outlives the
-    // call.
-    let r = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_OFD_SETLK, &lock) };
-    if r < 0 {
-        let e = std::io::Error::last_os_error();
-        return Err(match e.raw_os_error() {
-            Some(libc::EACCES) => std::io::ErrorKind::WouldBlock.into(),
-            _ => e,
-        });
-    }
-    Ok(())
-}
-
-/// Whether another open file of `fd`'s file holds a lock on it (an OFD lock
-/// of [`lock_shared`], or a lock of a process): asked without taking one
-/// (`F_OFD_GETLK`), so that two that ask do not see each other.
-pub fn locked_by_other(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
-    // SAFETY: flock is a plain C structure of integers: all zeros is a
-    // valid value of it.
-    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
-    lock.l_type = libc::F_WRLCK as libc::c_short;
-    lock.l_whence = libc::SEEK_SET as libc::c_short;
-    // SAFETY: F_OFD_GETLK reads and writes the flock structure, which
-    // outlives the call.
-    let r = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_OFD_GETLK, &mut lock) };
-    if r < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(lock.l_type != libc::F_UNLCK as libc::c_short)
-}
-
 /// A `struct flock` asking for a write lock of the whole file.
 fn whole_file_lock() -> libc::flock {
     // SAFETY: flock is a plain C structure of integers: all zeros is a
@@ -486,54 +446,6 @@ mod tests {
         std::fs::rename(dir.join("file"), dir.join("moved")).unwrap();
         std::fs::write(dir.join("file"), b"replaced").unwrap();
         assert_eq!(std::io::read_to_string(&f).unwrap(), "in");
-    }
-
-    #[test]
-    fn a_lock_is_seen_by_another_open_file_only() {
-        use std::os::fd::AsFd;
-        // (in a process of its own: a process another test forks holds a
-        // copy of the descriptors until its exec, and with it the lock that
-        // must be gone after the drops)
-        const CHILD: &str = "VELARX_SYS_TEST_LOCK";
-        if std::env::var_os(CHILD).is_none() {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "fs::tests::a_lock_is_seen_by_another_open_file_only",
-                    "--exact",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("f");
-        std::fs::write(&path, "").unwrap();
-        let held = std::fs::File::open(&path).unwrap();
-        let other = std::fs::File::open(&path).unwrap();
-        assert!(!super::locked_by_other(other.as_fd()).unwrap());
-        super::lock_shared(held.as_fd()).unwrap();
-        assert!(super::locked_by_other(other.as_fd()).unwrap());
-        // (asking takes nothing: a third one sees the holder only, and
-        // closing it leaves the lock alone)
-        let third = std::fs::File::open(&path).unwrap();
-        assert!(super::locked_by_other(third.as_fd()).unwrap());
-        drop(third);
-        assert!(super::locked_by_other(other.as_fd()).unwrap());
-        // (two holders: the lock stays while one of them does)
-        let second = std::fs::File::open(&path).unwrap();
-        super::lock_shared(second.as_fd()).unwrap();
-        drop(held);
-        assert!(super::locked_by_other(other.as_fd()).unwrap());
-        drop(second);
-        assert!(!super::locked_by_other(other.as_fd()).unwrap());
     }
 
     /// The holder is told by its pid, from another process: a forked child

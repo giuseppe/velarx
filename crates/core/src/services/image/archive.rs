@@ -75,15 +75,6 @@ impl ImageService {
         Ok(named)
     }
 
-    /// A file for what is received from a client.
-    /// A private directory of the staging area, removed when dropped.
-    pub fn spool_dir(&self) -> std::io::Result<tempfile::TempDir> {
-        std::fs::create_dir_all(&self.staging_dir)?;
-        tempfile::Builder::new()
-            .prefix("upload-")
-            .tempdir_in(&self.staging_dir)
-    }
-
     /// A file for a tarball received: it has no name (`O_TMPFILE`), so it
     /// counts against the quota from the first byte and goes with a
     /// failure.

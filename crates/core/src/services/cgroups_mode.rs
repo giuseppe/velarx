@@ -199,15 +199,6 @@ pub fn placement(
     }
 }
 
-/// Whether the OCI runtime `path` has crun's `--cgroup-manager=disabled`
-/// (what its `features` say, `container::has_crun_options`): crun and the
-/// runtimes built on it.  runc and youki have no way to run a container
-/// without making its cgroup, and an empty `cgroupsPath` only makes them
-/// choose one.
-pub fn runtime_can_disable_cgroups(path: &Path) -> bool {
-    crate::container::has_crun_options(path)
-}
-
 /// Why the engine of a command gives a container no cgroup of its own.
 pub const NO_CGROUP: &str = "with no API server the container has no cgroup of its own (no \
      systemd manager answers, or the command runs in a systemd unit, whose cgroup it shares): \
@@ -432,7 +423,7 @@ impl ContainerService {
                 let runtime = self
                     .find_runtime(req.runtime.as_deref().unwrap_or_default())
                     .map_err(|e| e.to_string())?;
-                if !runtime_can_disable_cgroups(&runtime) {
+                if !crate::container::has_crun_options(&runtime) {
                     return Err(format!(
                         "--cgroups=disabled needs an OCI runtime that can run a container \
                          without making its cgroup (crun's --cgroup-manager=disabled, which \
@@ -1133,29 +1124,6 @@ mod tests {
         // a scope of the command is not one of the runtime's (systemd) paths
         assert!(!is_systemd_path(&path));
         assert!(!monitor_needs_scope(CgroupsMode::Unset, Some(&path)));
-    }
-
-    #[test]
-    fn only_a_runtime_with_crun_options_can_run_without_a_cgroup() {
-        use velarx_base::testing::{CRUN_FEATURES, KRUN_FEATURES, RUNC_FEATURES};
-        let dir = tempfile::tempdir().unwrap();
-        // (a name says nothing: crun copied as myruntime can, a runc named
-        // crun cannot; a runtime with no `features` has none of the options)
-        let features_without_run_oci = r#"{"potentiallyUnsafeConfigAnnotations":["bundle"]}"#;
-        for (name, features, ok) in [
-            ("myruntime", Some(CRUN_FEATURES), true),
-            ("krun", Some(KRUN_FEATURES), true),
-            ("crun", Some(RUNC_FEATURES), false),
-            ("runc", Some(RUNC_FEATURES), false),
-            ("custom", Some(features_without_run_oci), false),
-            ("garbage", Some("not json"), false),
-            ("empty", Some(""), false),
-            ("crun-1.30", None, false),
-        ] {
-            let path = runtime(dir.path(), name, features);
-            assert_eq!(runtime_can_disable_cgroups(&path), ok, "{name}");
-        }
-        assert!(!runtime_can_disable_cgroups(&dir.path().join("missing")));
     }
 
     #[test]

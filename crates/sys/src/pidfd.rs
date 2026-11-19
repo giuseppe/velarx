@@ -155,28 +155,6 @@ pub fn reap<Fd: AsFd>(pidfd: Fd) -> io::Result<Option<i32>> {
     }
 }
 
-/// A child that is killed when this is dropped.  It signals through the
-/// pidfd, so it never names a process that is not the child (std's and
-/// tokio's `kill_on_drop` call `kill(2)`, which the filter of a confined
-/// process may refuse while it allows `pidfd_send_signal`).  Dropping it
-/// does not reap the child.
-#[derive(Debug)]
-pub struct KillOnDrop(OwnedFd);
-
-impl KillOnDrop {
-    /// Hold the child `pid` of the caller, which is not reaped yet.
-    pub fn new(pid: i32) -> io::Result<Self> {
-        open_child(pid).map(Self)
-    }
-}
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        // (a child that is gone already is the goal reached)
-        let _ = rustix::process::pidfd_send_signal(&self.0, rustix::process::Signal::KILL);
-    }
-}
-
 /// Kill the process behind the raw descriptor `fd` (negative: none), for a
 /// panic hook that cannot hold a borrowed descriptor.  A descriptor that is
 /// not a pidfd, or one whose process is gone, is an error that is ignored.

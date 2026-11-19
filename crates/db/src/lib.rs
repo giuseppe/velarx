@@ -1488,21 +1488,6 @@ impl Database {
             .map_err(DbError::Sqlite)
     }
 
-    pub async fn delete_network(&self, id: &str) -> DbResult<()> {
-        let owned = id.to_string();
-        self.conn
-            .call(move |conn| {
-                let rows =
-                    conn.execute("DELETE FROM networks WHERE id = ?1 OR name = ?1", [&owned])?;
-                if rows == 0 {
-                    return Err(no_row());
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|e| refusal(e, || format!("network {}", id)))
-    }
-
     pub async fn insert_userns_allocation(&self, alloc: &UsernsAllocation) -> DbResult<()> {
         let alloc = alloc.clone();
         self.conn
@@ -3253,7 +3238,6 @@ mod tests {
         for e in [
             db.delete_container("nope").await.unwrap_err(),
             db.rename_container("nope", "other").await.unwrap_err(),
-            db.delete_network("nope").await.unwrap_err(),
             db.delete_network_unused("nope", false).await.unwrap_err(),
             db.delete_image("nope").await.unwrap_err(),
             db.delete_userns_allocation("nope").await.unwrap_err(),

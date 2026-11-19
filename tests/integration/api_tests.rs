@@ -16,14 +16,3 @@ async fn test_client_request_builder() {
     assert!(json.contains("alpine:latest"));
     assert!(json.contains("echo"));
 }
-
-#[test]
-fn test_id_response_format() {
-    use velarx::client::IdResponse;
-
-    let response = IdResponse {
-        id: "abc123def456".to_string(),
-    };
-
-    assert_eq!(response.id, "abc123def456");
-}

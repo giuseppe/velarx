@@ -72,15 +72,9 @@ use velarx_graph::{
 };
 use velarx_storage::{FileStore, Toc, VerityMode};
 
-pub mod checkout {
-    pub use velarx_graph::directory::*;
-}
-pub mod view {
-    pub use velarx_fuse::MergedView;
-}
-
-use checkout::{Building, Copier, Fault, TocSource};
-use view::MergedView;
+use velarx_fuse::MergedView;
+use velarx_graph::directory as checkout;
+use velarx_graph::directory::{Building, Copier, Fault, TocSource};
 
 /// The name of the driver.
 pub const NAME: &str = "vfs";
@@ -1621,13 +1615,9 @@ mod tests {
                 }
             }
             let mut e: TocEntry = velarx_fuse::dir_entry(name);
-            if let Some(w) = name.rsplit('/').next().filter(|n| n.starts_with(".wh.")) {
-                let _ = w;
-            }
             e.entry_type = TocEntryType::Reg;
             e.mode = 0o644;
             e.size = data.len() as u64;
-            let (uid, gid) = me();
             (e.uid, e.gid) = (uid, gid);
             e.mod_time = Some("2017-07-14T02:40:00+00:00".into());
             if !data.is_empty() {

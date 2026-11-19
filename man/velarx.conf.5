@@ -114,18 +114,7 @@ strictly with
 .RB ( composefs_digests ),
 the read\-only stores of other instances
 .RB ( additional_image_stores ),
-the read\-only directories of other tools whose files a pull may import
-(composefs\-rs repositories, podman stores with
-.BR use_composefs ,
-other instances:
-.BR foreign_object_stores ,
-each
-.B { path, kind, link }
-with
-.B kind
-.BR composefs\-rs ", " containers\-storage " (its graph root) or " velarx ;
-only image data is read, nothing in them is written, and a file is verified
-before it is used), the garbage collection and how a
+the garbage collection and how a
 pull makes its files durable.
 .TP
 .B pull

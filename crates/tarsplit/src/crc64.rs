@@ -57,62 +57,9 @@ pub fn update(crc: u64, data: &[u8]) -> u64 {
     !crc
 }
 
-/// The image of the vector `v` by the matrix `m` (its columns) over GF(2).
-fn apply(m: &[u64; 64], mut v: u64) -> u64 {
-    let mut out = 0;
-    while v != 0 {
-        out ^= m[v.trailing_zeros() as usize];
-        v &= v - 1;
-    }
-    out
-}
-
-/// The same as `update(crc, &[0; n])`, in time that does not depend on `n`:
-/// a byte of zeros is a linear map of the register, which is raised to the
-/// power `n`.
-pub fn update_zeros(crc: u64, mut n: u64) -> u64 {
-    let mut step = [0u64; 64];
-    for (i, column) in step.iter_mut().enumerate() {
-        let c = 1u64 << i;
-        *column = TABLES[0][(c & 0xff) as usize] ^ (c >> 8);
-    }
-    let mut register = !crc;
-    while n > 0 {
-        if n & 1 == 1 {
-            register = apply(&step, register);
-        }
-        let mut squared = [0u64; 64];
-        for (i, column) in squared.iter_mut().enumerate() {
-            *column = apply(&step, step[i]);
-        }
-        step = squared;
-        n >>= 1;
-    }
-    !register
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_zeros_equal_the_bytes() {
-        for start in [0u64, 0x1234_5678_9abc_def0, u64::MAX] {
-            for n in [0usize, 1, 2, 7, 8, 9, 63, 64, 65, 1000, 4096, 100_003] {
-                assert_eq!(
-                    update_zeros(start, n as u64),
-                    update(start, &vec![0u8; n]),
-                    "{start:x} {n}"
-                );
-            }
-        }
-        // a hole of 8 TiB is as one of the halves twice
-        let half = update_zeros(update(0, b"x"), 4 << 40);
-        assert_eq!(
-            update_zeros(half, 4 << 40),
-            update_zeros(update(0, b"x"), 8 << 40)
-        );
-    }
 
     #[test]
     fn test_check_value() {

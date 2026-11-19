@@ -25,8 +25,8 @@ use velarx_proto::workload::{
     PushedImage, SecretRecord, StatsListed, TransferStats, VolumeRecord, VolumeSpec,
 };
 use velarx_proto::workload::{
-    EventListed, ImageHistoryListed, ImageListed, ImagePruneListed, MetricDescriptorListed,
-    NetworkListed, PodMetricsListed, Pulled, PulledImage, Pushed, SecretListed, VolumeListed,
+    EventListed, ImageHistoryListed, ImageListed, ImagePruneListed, NetworkListed, Pulled,
+    PulledImage, Pushed, SecretListed, VolumeListed,
 };
 use velarx_wire::varlink::CallError;
 
@@ -632,21 +632,6 @@ fn pod_log_entry(l: PodLogLine) -> PodLogEntry {
     }
 }
 
-/// The multiplexed frames of a process's output: the stream (1 its output,
-/// 2 its errors) and the data of each.
-fn frames_of(mut frames: &[u8]) -> ClientResult<Vec<(u8, &[u8])>> {
-    let mut out = Vec::new();
-    while !frames.is_empty() {
-        let truncated = || ClientError::Request("the engine cut the output".into());
-        let head = frames.get(..8).ok_or_else(truncated)?;
-        let len = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
-        let data = frames.get(8..8 + len).ok_or_else(truncated)?;
-        out.push((head[0], data));
-        frames = &frames[8 + len..];
-    }
-    Ok(out)
-}
-
 /// What the command of an `ExecStart` with no input writes, its output to
 /// `out` and its errors to `err`, each as it comes.  `replies` are those of
 /// the session (`velarx_proto::stream`): the descriptors of its streams,
@@ -745,27 +730,6 @@ where
         }
     }
     Ok(Err(Err(std::io::ErrorKind::UnexpectedEof.into())))
-}
-
-/// The lines of the multiplexed frames of a log, with the time in front of
-/// each when `timestamps`.
-fn log_entries(frames: &[u8], timestamps: bool) -> ClientResult<Vec<LogEntry>> {
-    let mut entries = Vec::new();
-    for (stream, data) in frames_of(frames)? {
-        let stream = if stream == 2 { "stderr" } else { "stdout" };
-        let text = String::from_utf8_lossy(data);
-        let text = text.strip_suffix('\n').unwrap_or(&text);
-        let (timestamp, message) = match text.split_once(' ') {
-            Some((t, m)) if timestamps => (Some(t.to_string()), m),
-            _ => (None, text),
-        };
-        entries.push(LogEntry {
-            timestamp,
-            stream: stream.to_string(),
-            message: message.to_string(),
-        });
-    }
-    Ok(entries)
 }
 
 /// The descriptor `i` of a reply.
@@ -2189,12 +2153,6 @@ impl EngineClient {
         .map(drop)
     }
 
-    /// Send a signal to the command of an exec session.
-    pub fn kill_exec(&self, id: &str, signal: &str) -> ClientResult<()> {
-        self.typed("ExecKill", |conn| ask(conn.exec_kill(id, signal)))
-            .map(drop)
-    }
-
     /// A TCP connection to `port` on the loopback of the network namespace
     /// of a container or a pod (`kind`), made inside the namespace: the
     /// connected socket.
@@ -2217,44 +2175,6 @@ impl EngineClient {
             ask_fds(conn.port_connect(pod, name, port))
         })?;
         take_pipe(&mut fds, 0)
-    }
-
-    pub fn container_logs(
-        &self,
-        id: &str,
-        _follow: bool,
-        tail: Option<usize>,
-        timestamps: bool,
-        since: Option<&str>,
-        until: Option<&str>,
-    ) -> ClientResult<Vec<LogEntry>> {
-        use std::io::Read;
-        use velarx_wire::monitor::logfmt::{now_ns, parse_log_time, Toward};
-        let now = now_ns();
-        let time = |spec: Option<&str>, toward: Toward| {
-            spec.map(|s| {
-                parse_log_time(s, now, toward)
-                    .ok_or_else(|| ClientError::Request(format!("invalid time: {s}")))
-            })
-            .transpose()
-        };
-        let opts = LogOptions {
-            stdout: true,
-            stderr: true,
-            follow: false,
-            timestamps,
-            tail: tail.map(|t| i64::try_from(t).unwrap_or(i64::MAX)),
-            since_ns: time(since, Toward::Past)?,
-            until_ns: time(until, Toward::Future)?,
-        };
-        let (_, mut fds) = self.typed("ContainerLogs", |conn| {
-            ask_fds(conn.container_logs(id, opts.clone()))
-        })?;
-        let mut frames = Vec::new();
-        std::fs::File::from(take_pipe(&mut fds, 0)?)
-            .read_to_end(&mut frames)
-            .map_err(|e| ClientError::Connection(e.to_string()))?;
-        log_entries(&frames, timestamps)
     }
 
     /// The log of the container `id` to `out` and `err` as it comes (a
@@ -2384,66 +2304,6 @@ impl EngineClient {
                 },
             )
         })
-    }
-
-    /// The descriptors of the metrics `pod_metrics` gives (cAdvisor's).
-    pub fn metric_descriptors(&self) -> ClientResult<Vec<velarx_wire::wire::Descriptor>> {
-        let mut descriptors = Vec::new();
-        self.typed_once("MetricDescriptorList", |conn| {
-            ask_each(
-                conn.metric_descriptor_list(),
-                |listed: MetricDescriptorListed| {
-                    descriptors.extend(listed.descriptor.map(|d| velarx_wire::wire::Descriptor {
-                        name: d.name,
-                        help: d.help,
-                        counter: d.counter,
-                        labels: d.labels,
-                    }));
-                    true
-                },
-            )
-        })?;
-        Ok(descriptors)
-    }
-
-    /// The metrics of the pods that run, or of the pod `name`.
-    pub fn pod_metrics(
-        &self,
-        name: Option<&str>,
-    ) -> ClientResult<Vec<velarx_wire::wire::PodMetrics>> {
-        let sample = |s: velarx_proto::workload::MetricSample| velarx_wire::wire::Sample {
-            name: s.name,
-            labels: s.labels,
-            value: s.value,
-        };
-        let samples = |all: Vec<velarx_proto::workload::MetricSample>| -> Vec<_> {
-            all.into_iter().map(sample).collect()
-        };
-        let mut pods = Vec::new();
-        self.typed_once("PodMetricsList", |conn| {
-            ask_each(conn.pod_metrics_list(name), |listed: PodMetricsListed| {
-                pods.extend(listed.pod.map(|p| {
-                    velarx_wire::wire::PodMetrics {
-                        id: p.id,
-                        name: p.name,
-                        time_ns: p.time_ns,
-                        samples: samples(p.samples),
-                        containers: p
-                            .containers
-                            .into_iter()
-                            .map(|c| velarx_wire::wire::ContainerMetrics {
-                                id: c.id,
-                                name: c.name,
-                                samples: samples(c.samples),
-                            })
-                            .collect(),
-                        usage: p.usage,
-                    }
-                }));
-                true
-            })
-        })?;
-        Ok(pods)
     }
 
     pub fn container_top(&self, id: &str, ps_args: &[String]) -> ClientResult<TopResult> {
@@ -3533,13 +3393,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn frame(stream: u8, data: &str) -> Vec<u8> {
-        let mut f = vec![stream, 0, 0, 0];
-        f.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        f.extend_from_slice(data.as_bytes());
-        f
-    }
-
     /// An engine that goes away during a call (it crashed) is said as
     /// such, not as the end of a file.
     #[test]
@@ -3549,28 +3402,6 @@ mod tests {
             matches!(&gone, ClientError::Connection(m) if m == "the engine closed the connection before it answered"),
             "{gone:?}"
         );
-    }
-
-    #[test]
-    fn the_frames_of_the_logs_are_entries() {
-        let mut frames = frame(1, "2026-10-30T10:00:00.5Z first line\n");
-        frames.extend(frame(2, "2026-10-30T10:00:01Z oops\n"));
-        let got = log_entries(&frames, true).unwrap();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].timestamp.as_deref(), Some("2026-10-30T10:00:00.5Z"));
-        assert_eq!(got[0].stream, "stdout");
-        assert_eq!(got[0].message, "first line");
-        assert_eq!(got[1].stream, "stderr");
-        // (without timestamps a space is part of the line)
-        let got = log_entries(&frame(1, "a b\n"), false).unwrap();
-        assert_eq!(
-            (got[0].timestamp.as_deref(), got[0].message.as_str()),
-            (None, "a b")
-        );
-        // a log that was cut is not taken for a whole one
-        let mut cut = frame(1, "line\n");
-        cut.pop();
-        assert!(log_entries(&cut, false).is_err());
     }
 
     #[test]
@@ -3898,22 +3729,6 @@ mod tests {
         // (a reply of a list without its member is an empty one: the
         // members of its records are the engine's, one by one)
         assert!(client.events(&[], None, None).unwrap().is_empty());
-    }
-
-    /// A record of a metric without one of its members is an error too.
-    #[test]
-    fn a_metric_without_a_member_is_an_error() {
-        let (_dir, client) = mock_engine(|method, _| match method {
-            "MetricDescriptorList" => json!({"parameters": {"descriptor": {"name": "m"}}}),
-            _ => json!({"parameters": {"pod": {"id": "p"}}}),
-        });
-        let descriptors = client.metric_descriptors();
-        assert!(
-            matches!(descriptors, Err(ClientError::Request(_))),
-            "{descriptors:?}"
-        );
-        let pods = client.pod_metrics(None);
-        assert!(matches!(pods, Err(ClientError::Request(_))), "{pods:?}");
     }
 
     /// An engine that goes before it answers is an error of the connection,

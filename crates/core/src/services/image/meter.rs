@@ -8,7 +8,6 @@ use super::{ProgressSink, TransferProgress};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use velarx_content::layer::holes::HoleRead;
 use velarx_types::digest::Digest;
 
 /// The least time between two reports of the bytes of a blob.
@@ -153,14 +152,6 @@ impl<T: Read> Read for Counting<T> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.meter.add(n as u64);
-        Ok(n)
-    }
-}
-
-impl<T: HoleRead> HoleRead for Counting<T> {
-    fn hole(&mut self, max: u64) -> std::io::Result<u64> {
-        let n = self.inner.hole(max)?;
-        self.meter.add(n);
         Ok(n)
     }
 }

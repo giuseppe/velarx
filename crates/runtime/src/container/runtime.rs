@@ -1388,33 +1388,6 @@ fn logged_message(line: &str) -> Option<String> {
     None
 }
 
-/// Whether `stderr` is the runtime's own failure to start a command
-/// (`crun: ...`, or crun's words for an executable it cannot run), not what
-/// the command said.
-pub fn said_by_runtime(stderr: &str) -> bool {
-    let prefix = format!("{}: ", runtime_name());
-    stderr.lines().map(str::trim_start).any(|l| {
-        l.starts_with(&prefix)
-            || (l.starts_with("executable file `") && l.contains("` not found"))
-            // (runc and youki, which name no program: `exec failed: unable
-            // to start container process: exec: "x": executable file not
-            // found in $PATH`, `runc create failed: ...`)
-            || l.starts_with("exec failed: unable to start container process")
-            || (l.contains(" create failed: unable to start container process"))
-            || (l.starts_with("the path `")
-                && (l.contains("` is not a regular file")
-                    || l.contains("` exists but it is not executable")))
-    })
-}
-
-/// What the runtime said when it could not start a container or a command,
-/// in podman's words: `crun: MESSAGE: CAUSE`, the cause being
-/// `OCI permission denied`, `OCI runtime attempted to invoke a command that
-/// was not found` or `OCI runtime error`.
-pub fn oci_error(message: &str) -> String {
-    oci_error_for(&runtime_name(), message)
-}
-
 /// The same for the runtime called `name`: a container made with another
 /// runtime of `[runtimes]` has its own name in the message.
 pub fn oci_error_for(name: &str, message: &str) -> String {
@@ -2064,24 +2037,6 @@ mod tests {
     }
 
     #[test]
-    fn only_the_runtime_s_own_words_are_its_failures() {
-        assert!(said_by_runtime(
-            "crun: executable file `x` not found in $PATH: No such file or directory\n"
-        ));
-        assert!(said_by_runtime(
-            "executable file `/x` not found: No such file or directory"
-        ));
-        assert!(said_by_runtime(
-            "the path `/etc` is not a regular file: Operation not permitted"
-        ));
-        assert!(said_by_runtime(
-            "exec failed: unable to start container process: exec: \"x\": executable file not found in $PATH\n"
-        ));
-        assert!(!said_by_runtime("sh: x: not found\n"));
-        assert!(!said_by_runtime(""));
-    }
-
-    #[test]
     fn the_message_names_the_runtime_of_the_container() {
         assert_eq!(
             oci_error_for("runc", "exec failed: executable file not found in $PATH"),
@@ -2144,15 +2099,15 @@ mod tests {
     #[test]
     fn the_runtime_failures_are_podman_s_words() {
         assert_eq!(
-            oci_error("the path `/etc` is not a regular file: Operation not permitted"),
+            oci_error_for("crun", "the path `/etc` is not a regular file: Operation not permitted"),
             "crun: the path `/etc` is not a regular file: Operation not permitted: OCI permission denied"
         );
         assert_eq!(
-            oci_error("crun: executable file `x` not found in $PATH: No such file or directory"),
+            oci_error_for("crun", "crun: executable file `x` not found in $PATH: No such file or directory"),
             "crun: executable file `x` not found in $PATH: No such file or directory: OCI runtime attempted to invoke a command that was not found"
         );
         assert_eq!(
-            oci_error("OOM: the memory limit could be too low\n"),
+            oci_error_for("crun", "OOM: the memory limit could be too low\n"),
             "crun: OOM: the memory limit could be too low: OCI runtime error"
         );
     }

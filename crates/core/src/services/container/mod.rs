@@ -468,11 +468,6 @@ impl ContainerService {
         }
     }
 
-    /// The OCI runtime of the container `id`.
-    pub async fn runtime_of(&self, id: &str) -> ContainerResult<Arc<OciRuntime>> {
-        self.runtime_for_record(&self.db.get_container(id).await?)
-    }
-
     /// The OCI runtime of the container of a record.
     pub fn runtime_for_record(
         &self,

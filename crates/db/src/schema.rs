@@ -313,14 +313,6 @@ CREATE TABLE IF NOT EXISTS networks (
 
 CREATE INDEX IF NOT EXISTS idx_networks_name ON networks(name);
 
-CREATE TABLE IF NOT EXISTS container_networks (
-    container_id TEXT NOT NULL REFERENCES containers(id) ON DELETE CASCADE,
-    network_id TEXT NOT NULL REFERENCES networks(id) ON DELETE CASCADE,
-    ip_address TEXT,
-    aliases TEXT,
-    PRIMARY KEY (container_id, network_id)
-);
-
 CREATE TABLE IF NOT EXISTS userns_allocations (
     id TEXT PRIMARY KEY,
     label TEXT,
@@ -651,14 +643,6 @@ impl Default for LayerReach {
             creds: false,
             certs: false,
         }
-    }
-}
-
-impl LayerReach {
-    /// The request brought nothing of its own, which a pull would go to
-    /// another process for.
-    pub fn is_plain(&self) -> bool {
-        !self.creds && !self.certs
     }
 }
 

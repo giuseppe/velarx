@@ -68,16 +68,6 @@ impl From<io::Error> for CallError {
     }
 }
 
-impl CallError {
-    /// The peer is not there (a fetcher is skipped at once).
-    pub fn is_unreachable(&self) -> bool {
-        matches!(self, CallError::Io(e) if matches!(
-            e.kind(),
-            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
-        ))
-    }
-}
-
 fn protocol(m: impl Into<String>) -> CallError {
     CallError::Protocol(m.into())
 }

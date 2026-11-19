@@ -24,16 +24,6 @@ pub enum CgroupError {
 
 pub type CgroupResult<T> = Result<T, CgroupError>;
 
-/// Cgroup manager mode
-#[derive(Debug, Clone, PartialEq, Default)]
-pub enum ManagerMode {
-    /// Use systemd to manage the root cgroup, then cgroupfs for containers
-    #[default]
-    SystemdDelegated,
-    /// Disable cgroup management
-    None,
-}
-
 /// The leaf of a container cgroup with the container's processes (the
 /// runtime makes it); its monitor is in [`RUNTIME_CGROUP`] next to it.
 pub const CONTAINER_CGROUP: &str = "container";
@@ -88,8 +78,6 @@ pub const RUNTIME_CGROUP: &str = "runtime";
 pub struct CgroupManager {
     /// Base path for cgroup v2 unified hierarchy (/sys/fs/cgroup)
     base_path: PathBuf,
-    /// Mode of operation
-    mode: ManagerMode,
     /// The parent cgroup path (where daemon, containers, and pods are siblings)
     /// This is the cgroup path we were in when we started, before moving to engine/
     parent_cgroup: PathBuf,
@@ -267,7 +255,6 @@ impl CgroupManager {
 
         Ok(Self {
             base_path,
-            mode: ManagerMode::default(),
             parent_cgroup,
             parent_cgroup_relative,
             starts: Mutex::default(),
@@ -294,11 +281,6 @@ impl CgroupManager {
     /// Creates $CURRENT_CGROUP/engine/ and moves the current process to it.
     /// This ensures the daemon runs in its own cgroup, separate from containers.
     pub fn init_daemon_cgroup(&mut self) -> CgroupResult<()> {
-        if self.mode == ManagerMode::None {
-            info!("Cgroup management disabled");
-            return Ok(());
-        }
-
         let daemon_cgroup = self.parent_cgroup.join(DAEMON_CGROUP);
 
         info!(
@@ -641,36 +623,9 @@ impl CgroupManager {
             .collect()
     }
 
-    /// Get the filesystem path for the processes of a container's cgroup
-    /// (`<id>/container`, in its pod's directory when it is in a pod)
-    pub fn get_container_cgroup_fs_path(&self, container_id: &str) -> CgroupResult<PathBuf> {
-        let leaf = |dir: &Path| dir.join(container_id).join(CONTAINER_CGROUP);
-        let direct = leaf(&self.parent_cgroup);
-        if direct.exists() {
-            return Ok(direct);
-        }
-        fs::read_dir(&self.parent_cgroup)?
-            .flatten()
-            .filter(|e| valid_container_id(&e.file_name().to_string_lossy()))
-            .map(|e| leaf(&e.path()))
-            .find(|p| p.exists())
-            .ok_or_else(|| CgroupError::NotFound(container_id.to_string()))
-    }
-
-    /// Get resource usage for a container
-    pub fn get_stats(&self, container_id: &str) -> CgroupResult<CgroupStats> {
-        let cgroup_path = self.get_container_cgroup_fs_path(container_id)?;
-        self.get_stats_from_path(&cgroup_path)
-    }
-
     /// The directory of the cgroup process `pid` is in.
     pub fn cgroup_dir_of_pid(&self, pid: i32) -> CgroupResult<PathBuf> {
         Ok(self.base_path.join(relative_cgroup_of(pid)?))
-    }
-
-    /// Get stats from a cgroup filesystem path
-    pub fn get_stats_from_path(&self, cgroup_path: &Path) -> CgroupResult<CgroupStats> {
-        stats_at(cgroup_path)
     }
 }
 
@@ -1021,8 +976,8 @@ mod tests {
     #[test]
     fn the_stats_of_a_cgroup_tell_the_working_set_and_the_events() {
         let dir = tempfile::tempdir().unwrap();
-        let cm = manager(dir.path(), "/u");
         let cg = dir.path().join("u");
+        fs::create_dir_all(&cg).unwrap();
         for (f, v) in [
             ("memory.current", "1000\n"),
             ("memory.max", "max\n"),
@@ -1041,7 +996,7 @@ mod tests {
         ] {
             fs::write(cg.join(f), v).unwrap();
         }
-        let s = cm.get_stats_from_path(&cg).unwrap();
+        let s = stats_at(&cg).unwrap();
         assert_eq!(
             (s.memory_usage, s.memory_inactive_file, s.memory_mapped_file),
             (1000, 250, 50)
@@ -1059,7 +1014,6 @@ mod tests {
         fs::create_dir_all(root.join(rel.trim_start_matches('/'))).unwrap();
         CgroupManager {
             base_path: root.to_path_buf(),
-            mode: ManagerMode::default(),
             parent_cgroup: root.join(rel.trim_start_matches('/')),
             parent_cgroup_relative: rel.to_string(),
             starts: Mutex::default(),
@@ -1153,12 +1107,6 @@ mod tests {
             root.join(P).join(A).join("runtime")
         );
         cm.prepare_container(&b).unwrap();
-        // (the runtime makes the container's leaf)
-        fs::create_dir(root.join(P).join(A).join("container")).unwrap();
-        assert_eq!(
-            cm.get_container_cgroup_fs_path(A).unwrap(),
-            root.join(P).join(A).join("container")
-        );
         // preparing twice, as a restart does
         cm.prepare_container(&a).unwrap();
 

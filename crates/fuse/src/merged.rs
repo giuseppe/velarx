@@ -33,27 +33,8 @@ pub const ROOT: usize = 0;
 
 pub fn dir_entry(name: &str) -> TocEntry {
     TocEntry {
-        name: name.to_string(),
-        entry_type: TocEntryType::Dir,
         mode: 0o755,
-        uid: 0,
-        gid: 0,
-        size: 0,
-        digest: None,
-        fsverity: None,
-        offset: 0,
-        end_offset: 0,
-        chunk_digest: None,
-        chunk_size: 0,
-        chunk_offset: 0,
-        chunk_type: None,
-        link_name: None,
-        mod_time: None,
-        access_time: None,
-        change_time: None,
-        dev_major: None,
-        dev_minor: None,
-        xattrs: Default::default(),
+        ..TocEntry::new(name.to_string(), TocEntryType::Dir)
     }
 }
 
@@ -120,50 +101,6 @@ impl MergedTree {
             cur = self.lookup(cur, c)?;
         }
         Some(cur)
-    }
-
-    /// The node at `path`, its symbolic links followed as the kernel
-    /// follows them in the root of the image (`..` stays in it); None if
-    /// it is not there, or if the links loop.
-    pub fn resolve_following(&self, path: &str) -> Option<usize> {
-        let mut todo: Vec<String> = path
-            .split('/')
-            .filter(|c| !c.is_empty() && *c != ".")
-            .rev()
-            .map(str::to_string)
-            .collect();
-        let mut stack: Vec<usize> = vec![ROOT];
-        let mut links = 0;
-        while let Some(c) = todo.pop() {
-            if c == "." {
-                continue;
-            }
-            if c == ".." {
-                if stack.len() > 1 {
-                    stack.pop();
-                }
-                continue;
-            }
-            let cur = *stack.last()?;
-            let next = self.lookup(cur, &c)?;
-            let node = self.nodes.get(next)?;
-            if matches!(node.entry.entry_type, TocEntryType::Symlink) {
-                links += 1;
-                if links > 40 {
-                    return None;
-                }
-                let target = node.entry.link_name.as_deref().unwrap_or_default();
-                if target.starts_with('/') {
-                    stack.truncate(1);
-                }
-                for part in target.split('/').filter(|p| !p.is_empty()).rev() {
-                    todo.push(part.to_string());
-                }
-                continue;
-            }
-            stack.push(next);
-        }
-        stack.last().copied()
     }
 
     /// Apply the layers, the lowest first.
@@ -511,7 +448,8 @@ mod tests {
             up,
             lp,
         ]);
-        let t = MergedTree::build(&[&l]).unwrap();
+        use crate::view::ImageTree;
+        let t = crate::MergedView::new(&[&l]).unwrap();
         let target = t.resolve("usr/lib/os-release").unwrap();
         assert_eq!(t.resolve_following("/etc/os-release"), Some(target));
         assert_eq!(t.resolve_following("/lib/os-release"), Some(target));

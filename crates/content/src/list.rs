@@ -514,11 +514,10 @@ const HELPER_ENVIRONMENT: &[&str] = &[
 /// The registry fetcher of a process that pulls: the process this one
 /// shares with the others of its configuration ([`shared_registry`]),
 /// found or started on first use (a command that pulls nothing, as `velarx
-/// ps`, starts nothing), or a socket that serves one already (tests).
+/// ps`, starts nothing).
 pub struct RegistryOrigin {
     config: Config,
     shared: std::sync::OnceLock<Arc<SharedRegistry>>,
-    socket: Option<PathBuf>,
     /// Each connection is a fetcher of its own ([`private_registry`])
     private: bool,
 }
@@ -531,7 +530,6 @@ impl RegistryOrigin {
         Arc::new(Self {
             config: config.clone(),
             shared: std::sync::OnceLock::new(),
-            socket: None,
             private: false,
         })
     }
@@ -544,18 +542,7 @@ impl RegistryOrigin {
         Arc::new(Self {
             config: config.clone(),
             shared: std::sync::OnceLock::new(),
-            socket: None,
             private: true,
-        })
-    }
-
-    /// The fetcher that serves `socket` already.
-    pub fn at(socket: PathBuf) -> Arc<Self> {
-        Arc::new(Self {
-            config: Config::default(),
-            shared: std::sync::OnceLock::new(),
-            socket: Some(socket),
-            private: false,
         })
     }
 
@@ -565,7 +552,6 @@ impl RegistryOrigin {
         let made = Self {
             config: config.clone(),
             shared: std::sync::OnceLock::new(),
-            socket: None,
             private: false,
         };
         let _ = made.shared.set(shared);
@@ -593,9 +579,6 @@ impl RegistryOrigin {
     /// A new connection to the fetcher, with no scope yet; an error when it
     /// cannot be started, and the call that needs it fails.
     pub async fn connect(&self) -> io::Result<FetchConn> {
-        if let Some(socket) = &self.socket {
-            return FetchConn::connect_checked(socket).await;
-        }
         if self.private {
             let config = self.config.clone();
             return tokio::task::spawn_blocking(move || private_registry(&config)?.connect())

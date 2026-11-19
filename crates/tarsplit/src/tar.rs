@@ -139,21 +139,6 @@ fn utf8(bytes: &[u8], what: &str) -> io::Result<String> {
     String::from_utf8(bytes.to_vec()).map_err(|_| invalid(format!("{what} is not UTF-8")))
 }
 
-/// A reader of a tar stream that can tell of a hole in the content of a
-/// file.
-pub trait HoleRead: Read {
-    /// The length, at most `max`, of the hole the stream is at: it is
-    /// skipped, and 0 when the stream is not at a hole (the next `read` has
-    /// data).  A `read` at a hole gives zeros.
-    fn hole(&mut self, max: u64) -> io::Result<u64>;
-}
-
-impl<R: HoleRead + ?Sized> HoleRead for &mut R {
-    fn hole(&mut self, max: u64) -> io::Result<u64> {
-        (**self).hole(max)
-    }
-}
-
 /// The properties a PAX record or a GNU extension can override.
 #[derive(Default)]
 struct Overrides {
@@ -269,17 +254,6 @@ pub trait Sink {
     fn file_begin(&mut self, header: &Header) -> io::Result<()>;
     /// Bytes of the content of the entry.
     fn file_data(&mut self, data: &[u8]) -> io::Result<()>;
-    /// `len` bytes of zeros of the content of the entry, that were not read
-    /// (a hole of the stream): the same as `file_data` with them.
-    fn file_hole(&mut self, mut len: u64) -> io::Result<()> {
-        let zeros = [0u8; 8192];
-        while len > 0 {
-            let n = len.min(zeros.len() as u64) as usize;
-            self.file_data(&zeros[..n])?;
-            len -= n as u64;
-        }
-        Ok(())
-    }
     /// The content of the entry is over (its padding comes as a segment).
     fn file_end(&mut self) -> io::Result<()>;
 }
@@ -583,23 +557,6 @@ impl<R: Read, S: Sink> TarReader<R, S> {
         self.sink.file_begin(&header)?;
         self.in_entry = true;
         Ok(header)
-    }
-}
-
-impl<R: HoleRead, S: Sink> TarReader<R, S> {
-    /// Skip the hole the content of the current entry is at, if it is at
-    /// one: its length, reported to the sink; 0 when the next bytes are
-    /// data.
-    pub fn skip_hole(&mut self) -> io::Result<u64> {
-        if self.remaining == 0 {
-            return Ok(0);
-        }
-        let n = self.inner.hole(self.remaining)?;
-        if n > 0 {
-            self.sink.file_hole(n)?;
-            self.remaining -= n;
-        }
-        Ok(n)
     }
 }
 

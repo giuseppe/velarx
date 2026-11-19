@@ -1,14 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Functions of the C library that have no safe equivalent.
 
-/// Give the memory the allocator holds free back to the system.
-pub fn malloc_trim() {
-    // SAFETY: malloc_trim only returns free memory to the system.
-    unsafe {
-        libc::malloc_trim(0);
-    }
-}
-
 /// A broken-down local time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalTime {

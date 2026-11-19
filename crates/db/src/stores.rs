@@ -151,9 +151,6 @@ impl Database {
                 ),
             }
         }
-        // the foreign stores are checked now, so that one that cannot be used
-        // is said once at start (nothing is said when there are none)
-        drop(storage.foreign_stores());
         Ok(main.with_additional(more))
     }
 

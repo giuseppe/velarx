@@ -181,21 +181,10 @@ impl<R: BufRead, C: Contents> Replay<R, C> {
         }
     }
 
-    /// Where the files come from.
-    pub fn contents(&self) -> &C {
-        &self.contents
-    }
-
     /// Where the files come from, to ask it what it did while the stream
     /// was read.
     pub fn contents_mut(&mut self) -> &mut C {
         &mut self.contents
-    }
-
-    /// The parts of the stream: the entries it is not done with, and the
-    /// contents.
-    pub fn into_parts(self) -> (Entries<R>, C) {
-        (self.entries, self.contents)
     }
 }
 
@@ -408,17 +397,6 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
-    /// The same as `file_data` with `len` bytes of zeros.
-    pub fn file_hole(&mut self, len: u64) -> io::Result<()> {
-        let f = self
-            .file
-            .as_mut()
-            .ok_or_else(|| invalid("file data outside a file entry"))?;
-        f.crc = crc64::update_zeros(f.crc, len);
-        f.size += len;
-        Ok(())
-    }
-
     /// End the file entry: it is written with its size and CRC-64.
     pub fn file_end(&mut self) -> io::Result<()> {
         let f = self
@@ -469,10 +447,6 @@ impl Sink for Recorder {
 
     fn file_data(&mut self, data: &[u8]) -> io::Result<()> {
         self.writer.file_data(data)
-    }
-
-    fn file_hole(&mut self, len: u64) -> io::Result<()> {
-        self.writer.file_hole(len)
     }
 
     fn file_end(&mut self) -> io::Result<()> {
@@ -547,24 +521,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_a_hole_is_recorded_as_the_zeros() {
-        let record = |hole: bool| {
-            let mut w = Writer::new(Vec::new());
-            w.file_begin("f").unwrap();
-            w.file_data(b"head").unwrap();
-            if hole {
-                w.file_hole(100_000).unwrap();
-            } else {
-                w.file_data(&vec![0u8; 100_000]).unwrap();
-            }
-            w.file_data(b"tail").unwrap();
-            w.file_end().unwrap();
-            w.finish().unwrap().0
-        };
-        assert_eq!(record(true), record(false));
-    }
-
-    #[test]
     fn test_replay_rebuilds_the_stream() {
         let ts = [
             line(0, 2, b"HEADER1", None, 0),
@@ -580,17 +536,6 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, b"HEADER1helloPADEND");
-    }
-
-    #[test]
-    fn test_replay_gives_its_contents_back() {
-        let ts = line(0, 2, b"A", None, 0);
-        let files = Files(HashMap::from([("a".to_string(), b"x".to_vec())]));
-        let mut r = Replay::new(Entries::new(io::Cursor::new(ts.into_bytes())), files);
-        assert_eq!(r.contents().0.len(), 1);
-        r.contents_mut().0.clear();
-        let (_, files) = r.into_parts();
-        assert!(files.0.is_empty());
     }
 
     #[test]

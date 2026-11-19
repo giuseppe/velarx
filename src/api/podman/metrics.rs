@@ -32,7 +32,7 @@ async fn container_of(
     }
     let manager = state.container_service.cgroup_manager.as_ref()?;
     let dir = manager.cgroup_dir_of_pid(pid).ok()?;
-    let stats = manager.get_stats_from_path(&dir).ok()?;
+    let stats = velarx_core::services::stats_at(&dir).ok()?;
     let upper = state.container_service.writable_paths(&rec.id).upper;
     let (used, _) = super::archive::upper_usage(state, &rec.id).await;
     let filesystem: Option<Filesystem> = {
@@ -90,7 +90,7 @@ fn pod_usage(state: &AppState, pod: &Pod, infra_pid: i32) -> Option<velarx_proto
             .and_then(|n| n.to_str())
             .is_some_and(|n| n == pod.id || n.ends_with(&slice))
     })?;
-    let s = manager.get_stats_from_path(pod_dir).ok()?;
+    let s = velarx_core::services::stats_at(pod_dir).ok()?;
     Some(velarx_proto::pod::PodUsage {
         cpu_usage_ns: s.cpu_usage_usec.saturating_mul(1000),
         memory_usage: s.memory_usage,

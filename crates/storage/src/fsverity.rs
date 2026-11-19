@@ -17,7 +17,7 @@ use std::os::fd::AsFd;
 use std::path::Path;
 use thiserror::Error;
 use tracing::debug;
-use velarx_types::digest::{Algorithm, Digest, DigestWriter};
+use velarx_types::digest::{Algorithm, Digest};
 
 /// fs-verity ioctl commands
 /// These are from linux/fsverity.h
@@ -161,8 +161,6 @@ pub struct FsVerityConfig {
     pub hash_algorithm: FsVerityHashAlgorithm,
     /// Block size (must be power of 2, typically 4096)
     pub block_size: u32,
-    /// Optional salt for the Merkle tree
-    pub salt: Option<Vec<u8>>,
     /// Whether to fail if fs-verity is not supported
     pub required: bool,
 }
@@ -172,7 +170,6 @@ impl Default for FsVerityConfig {
         Self {
             hash_algorithm: FsVerityHashAlgorithm::Sha256,
             block_size: 4096,
-            salt: None,
             required: false,
         }
     }
@@ -416,15 +413,13 @@ pub const WRITERS_WAIT: std::time::Duration = std::time::Duration::from_secs(60)
 /// processes that hold the file share one open file, and the release of it
 /// by the last of them is an event (`IN_CLOSE_WRITE`).
 ///
-/// The event must be watched before the writer of the caller is closed
-/// ([`Writers::watching`]): until then the release cannot happen, so it is
-/// not missed.  The kernel announces the release at its start and drops the
-/// write access of the file at its end, in the same close of the same
-/// process: a try between the two still finds a writer, and nothing
-/// announces the end, so once the release was announced the next tries
-/// only yield to the process that ends it.  A watch made after the close
-/// ([`Writers::new`], for a file whose writer is gone) can miss a release
-/// that started before it: the wait ends at the deadline then, an error.
+/// The kernel announces the release at its start and drops the write access
+/// of the file at its end, in the same close of the same process: a try
+/// between the two still finds a writer, and nothing announces the end, so
+/// once the release was announced the next tries only yield to the process
+/// that ends it.  The watch is made after the close of the writer of the
+/// caller ([`Writers::new`]), so it can miss a release that started before
+/// it: the wait ends at the deadline then, an error.
 pub struct Writers {
     watch: Option<velarx_sys::watch::Watch>,
     released: bool,
@@ -440,18 +435,6 @@ impl Writers {
             released: false,
             deadline,
         }
-    }
-
-    /// The writers of the file at `path`, watched now, while the caller
-    /// still has it open for writing (before it closes it).
-    pub fn watching(path: &Path, deadline: std::time::Instant) -> io::Result<Self> {
-        let watch = velarx_sys::watch::Watch::new()?;
-        watch.add(path, rustix::fs::inotify::WatchFlags::CLOSE_WRITE)?;
-        Ok(Self {
-            watch: Some(watch),
-            released: false,
-            deadline,
-        })
     }
 
     /// The kernel refused fs-verity on `file` for a writer: return when it
@@ -575,7 +558,7 @@ impl FsVerityManager {
         // The file is made read-only after: the ioctl needs write access to
         // the inode (EACCES without, unless the caller can override it).
 
-        let mut arg = FsVerityEnableArg {
+        let arg = FsVerityEnableArg {
             version: 1,
             hash_algorithm: self.config.hash_algorithm as u32,
             block_size: merkle_block_size(file, self.config.block_size),
@@ -587,13 +570,6 @@ impl FsVerityManager {
             reserved2: [0; 11],
         };
 
-        if let Some(ref salt) = self.config.salt {
-            arg.salt_size = salt.len() as u32;
-            arg.salt_ptr = salt.as_ptr() as u64;
-        }
-
-        // (the ioctl reads the struct and the salt it points to,
-        // `self.config.salt`, borrowed for the call)
         while let Err(err) = velarx_sys::ioctl::read_arg(file.as_fd(), FS_IOC_ENABLE_VERITY, &arg) {
             match err.raw_os_error() {
                 // (the kernel lacks the hash: the file system has fs-verity)
@@ -881,33 +857,6 @@ pub fn fsverity_digest_file(alg: Algorithm, file: &std::fs::File) -> io::Result<
     Ok(hasher.finish())
 }
 
-/// The fs-verity digest and the content digest, both in `alg`, of the
-/// content of `file`, its holes not read.
-pub fn fsverity_and_content_file(
-    alg: Algorithm,
-    file: &std::fs::File,
-) -> io::Result<(String, Digest)> {
-    // (on the stack: a static of zeros is that many bytes of every binary)
-    let zeros = [0u8; 16 * 1024];
-    let mut verity = VerityHasher::new(alg);
-    let mut content = DigestWriter::new(alg);
-    crate::sparse::read_sparse(file, |piece| match piece {
-        crate::sparse::Piece::Data(d) => {
-            verity.update(d);
-            content.update(d);
-        }
-        crate::sparse::Piece::Zeros(mut n) => {
-            verity.update_zeros(n);
-            while n > 0 {
-                let k = n.min(zeros.len() as u64);
-                content.update(&zeros[..k as usize]);
-                n -= k;
-            }
-        }
-    })?;
-    Ok((verity.finish(), content.finalize()))
-}
-
 /// The fs-verity digest of bytes in memory in `alg`.
 pub fn fsverity_digest_of(alg: Algorithm, data: &[u8]) -> String {
     let mut hasher = VerityHasher::new(alg);
@@ -1007,15 +956,6 @@ mod tests {
         };
         let plain = make("plain", FsVerityConfig::default());
         assert!(canonical_digest(&plain, Algorithm::Sha256));
-        let salted = make(
-            "salted",
-            FsVerityConfig {
-                salt: Some(b"salt".to_vec()),
-                ..FsVerityConfig::default()
-            },
-        );
-        assert_eq!(verity_parameters(&salted).unwrap().salt_size, 4);
-        assert!(!canonical_digest(&salted, Algorithm::Sha256));
         let small = make(
             "small",
             FsVerityConfig {
@@ -1028,7 +968,6 @@ mod tests {
         assert!(require_canonical(&plain, Algorithm::Sha256).is_ok());
         let why = require_canonical(&small, Algorithm::Sha256).unwrap_err();
         assert!(why.contains("blocks of 1024 bytes"), "{why}");
-        assert!(require_canonical(&salted, Algorithm::Sha256).is_err());
         let sha512 = make(
             "sha512",
             FsVerityConfig {
@@ -1295,9 +1234,8 @@ mod tests {
 
     /// A process that holds the file open for writing (a fork of another
     /// thread before it executes) keeps fs-verity from being enabled: it is
-    /// enabled once that process lets go, whether the release was watched
-    /// before the writer of the caller closed or only after; it is an error
-    /// at the deadline while the process keeps it.
+    /// enabled once that process lets go; it is an error at the deadline while
+    /// the process keeps it.
     #[test]
     fn fs_verity_waits_for_the_other_writers_of_the_file() {
         use std::os::fd::OwnedFd;
@@ -1320,28 +1258,23 @@ mod tests {
             (path, writer, holder)
         };
         let later = || Instant::now() + Duration::from_secs(120);
-        for watched_first in [true, false] {
-            let (path, writer, mut holder) = held(&format!("w{watched_first}"));
-            let writers = match watched_first {
-                true => Writers::watching(&path, later()).unwrap(),
-                false => Writers::new(later()),
-            };
-            drop(writer);
-            let ro = File::open(&path).unwrap();
-            let (m2, ro2, p2) = (m.config.clone(), ro.try_clone().unwrap(), path.clone());
-            let done = std::thread::spawn(move || {
-                FsVerityManager::with_config(m2).enable_file_by(&ro2, &p2, writers)
-            });
-            // (the holder lives: the file cannot have fs-verity yet)
-            assert!(matches!(measure_file(&ro), Err(FsVerityError::NotEnabled)));
-            holder.kill().unwrap();
-            holder.wait().unwrap();
-            done.join().unwrap().unwrap();
-            assert_eq!(
-                measure_file(&ro).unwrap().object().unwrap().to_string(),
-                fsverity_digest_of(Algorithm::Sha256, b"content")
-            );
-        }
+        let (path, writer, mut holder) = held("released");
+        let writers = Writers::new(later());
+        drop(writer);
+        let ro = File::open(&path).unwrap();
+        let (m2, ro2, p2) = (m.config.clone(), ro.try_clone().unwrap(), path.clone());
+        let done = std::thread::spawn(move || {
+            FsVerityManager::with_config(m2).enable_file_by(&ro2, &p2, writers)
+        });
+        // (the holder lives: the file cannot have fs-verity yet)
+        assert!(matches!(measure_file(&ro), Err(FsVerityError::NotEnabled)));
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        done.join().unwrap().unwrap();
+        assert_eq!(
+            measure_file(&ro).unwrap().object().unwrap().to_string(),
+            fsverity_digest_of(Algorithm::Sha256, b"content")
+        );
         let (path, writer, mut holder) = held("kept");
         drop(writer);
         let ro = File::open(&path).unwrap();
@@ -1409,12 +1342,6 @@ mod tests {
                 let want = fsverity_digest_of(alg, &data);
                 assert_eq!(want, oracle(alg, &data), "{name}");
                 assert_eq!(fsverity_digest_file(alg, &file).unwrap(), want, "{name}");
-                let content = Digest::of(alg, &data);
-                assert_eq!(
-                    fsverity_and_content_file(alg, &file).unwrap(),
-                    (want.clone(), content),
-                    "{name}"
-                );
             }
             drop(file);
             if std::env::var_os("VELARX_VERITY_DIR").is_some() {
@@ -1433,7 +1360,6 @@ mod tests {
         let config = FsVerityConfig::default();
         assert_eq!(config.hash_algorithm, FsVerityHashAlgorithm::Sha256);
         assert_eq!(config.block_size, 4096);
-        assert!(config.salt.is_none());
         assert!(!config.required);
     }
 

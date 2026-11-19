@@ -251,27 +251,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(FileStore::new(tmp.path().join("files")).unwrap());
         let entry = |name: &str, kind| TocEntry {
-            name: name.to_string(),
-            entry_type: kind,
             mode: 0o644,
-            uid: 0,
-            gid: 0,
-            size: 0,
-            digest: None,
-            fsverity: None,
-            offset: 0,
-            end_offset: 0,
-            chunk_digest: None,
-            chunk_size: 0,
-            chunk_offset: 0,
-            chunk_type: None,
-            link_name: None,
-            mod_time: None,
-            access_time: None,
-            change_time: None,
-            dev_major: None,
-            dev_minor: None,
-            xattrs: Default::default(),
+            ..TocEntry::new(name.to_string(), kind)
         };
         let data = vec![b'q'; 1300];
         let key = store.put(Algorithm::Sha256, &data).unwrap();

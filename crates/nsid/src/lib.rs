@@ -250,13 +250,6 @@ pub fn fd_of(pid: u32, kind: Kind, id: &NamespaceId) -> Option<i32> {
         .and_then(|e| e.file_name().to_str()?.parse().ok())
 }
 
-/// Make `fd` survive the next exec of this process (clear `FD_CLOEXEC`).
-pub fn inherit_on_exec(fd: BorrowedFd<'_>) -> io::Result<()> {
-    let flags = rustix::io::fcntl_getfd(fd)?;
-    rustix::io::fcntl_setfd(fd, flags - rustix::io::FdFlags::CLOEXEC)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,22 +275,6 @@ mod tests {
         // not another kind of namespace, not a process without it
         assert_eq!(fd_of(me, Kind::Mnt, &id), None);
         assert_eq!(fd_of(u32::MAX, Kind::Net, &id), None);
-    }
-
-    #[test]
-    fn a_descriptor_is_inherited_once_asked() {
-        use std::os::fd::AsFd;
-        let fd = open_of("self", Kind::Net).unwrap();
-        let cloexec = |fd: &OwnedFd| {
-            rustix::io::fcntl_getfd(fd)
-                .unwrap()
-                .contains(rustix::io::FdFlags::CLOEXEC)
-        };
-        assert!(cloexec(&fd));
-        let on = rustix::io::fcntl_dupfd_cloexec(fd.as_fd(), 0).unwrap();
-        assert!(cloexec(&on));
-        inherit_on_exec(on.as_fd()).unwrap();
-        assert!(!cloexec(&on));
     }
 
     #[test]

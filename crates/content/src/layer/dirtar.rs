@@ -1212,12 +1212,6 @@ pub fn write<W: HoleWrite>(dir: BorrowedFd<'_>, opts: &Options, out: W) -> io::R
     tar.builder.into_inner()?.flush()
 }
 
-/// Walk the changes in `dir` into `out`, which makes of the entries what it
-/// needs (the layer a build makes: `pull::made`).
-pub fn walk(dir: BorrowedFd<'_>, opts: &Options, out: &mut dyn Out) -> io::Result<()> {
-    walker(out, opts).walk_upper(dir)
-}
-
 /// Walk the changes in `dir` without reading the content of the files: the
 /// entries are given back in order, with what is needed to read the
 /// content later ([`replay`]).

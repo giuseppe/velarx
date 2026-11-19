@@ -7,19 +7,8 @@ use velarx_db::Database;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInfo {
-    pub version: String,
-    pub git_commit: String,
-    pub build_time: String,
-    pub os: String,
-    pub arch: String,
-    pub kernel_version: String,
     pub fuse_passthrough: bool,
     pub userns_support: bool,
-    pub config_path: String,
-    pub root_dir: String,
-    pub state_dir: String,
-    pub oci_runtime: String,
-    pub oci_runtime_version: String,
     /// The user's systemd manager (rootless only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub systemd: Option<SystemdInfo>,
@@ -115,42 +104,10 @@ impl ServerService {
         }
     }
 
-    /// `git_commit` and `build_time` are those of the binary, which only its
-    /// own package knows (its build script).
-    pub async fn info(
-        &self,
-        git_commit: &str,
-        build_time: &str,
-    ) -> Result<ServerInfo, velarx_base::ids::IdsError> {
-        let kernel_version = rustix::system::uname()
-            .release()
-            .to_string_lossy()
-            .into_owned();
-
-        let fuse_passthrough = check_fuse_passthrough()?;
-        let userns_support = check_userns_support().map_err(velarx_base::ids::IdsError)?;
-
-        let (oci_runtime, oci_runtime_version) = get_oci_runtime_info()?;
-
+    pub async fn info(&self) -> Result<ServerInfo, velarx_base::ids::IdsError> {
         Ok(ServerInfo {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            git_commit: git_commit.to_string(),
-            build_time: build_time.to_string(),
-            os: std::env::consts::OS.to_string(),
-            arch: std::env::consts::ARCH.to_string(),
-            kernel_version,
-            fuse_passthrough,
-            userns_support,
-            config_path: match &self.config.source {
-                Some(source) => source.clone(),
-                None => velarx_config::DefaultDirs::current()?.config_file,
-            }
-            .to_string_lossy()
-            .to_string(),
-            root_dir: self.config.server.root_dir.to_string_lossy().to_string(),
-            state_dir: self.config.server.state_dir.to_string_lossy().to_string(),
-            oci_runtime,
-            oci_runtime_version,
+            fuse_passthrough: check_fuse_passthrough()?,
+            userns_support: check_userns_support().map_err(velarx_base::ids::IdsError)?,
             systemd: self.systemd_info()?,
             cdi: crate::cdi::info(&self.config.containers.cdi_spec_dirs),
         })
@@ -271,24 +228,6 @@ fn userns_allowed(clone: Option<&str>, max: Option<&str>) -> std::io::Result<boo
         .map(|v| number("user.max_user_namespaces", v))
         .transpose()?;
     Ok(clone != Some(0) && max.is_some_and(|n| n > 0))
-}
-
-fn get_oci_runtime_info() -> Result<(String, String), velarx_base::ids::IdsError> {
-    let runtime = match crate::container::which_runtime() {
-        Ok(runtime) => runtime,
-        Err(_) => return Ok(("unknown".to_string(), "unknown".to_string())),
-    };
-    let name = crate::container::runtime_name();
-    let mut command = std::process::Command::new(&runtime);
-    velarx_base::ids::scrub_runtime_dir(&mut command)?;
-    match command.arg("--version").output() {
-        Ok(output) if output.status.success() => {
-            let version = String::from_utf8_lossy(&output.stdout);
-            let version_line = version.lines().next().unwrap_or("unknown");
-            Ok((name, version_line.to_string()))
-        }
-        _ => Ok((name, "unknown".to_string())),
-    }
 }
 
 /// The database answers a read of its schema; else the engine cannot do

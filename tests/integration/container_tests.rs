@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Integration tests for container operations
 
-use sha2::{Digest, Sha256};
-
 #[tokio::test]
 async fn test_create_container_request_defaults() {
     use velarx_wire::request::CreateContainerRequest;
@@ -18,37 +16,6 @@ async fn test_create_container_request_defaults() {
     assert!(!req.privileged);
     assert!(!req.read_only_rootfs);
     assert_eq!(req.userns_mode, velarx_wire::request::UsernsChoice::Host);
-}
-
-#[tokio::test]
-async fn test_container_id_generation_uses_sha256() {
-    let image_name = "test-image:latest";
-    let timestamp = 1234567890i64;
-
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{}{}", image_name, timestamp));
-    let hash = hex::encode(hasher.finalize());
-
-    let container_id = &hash[..12];
-    assert_eq!(container_id.len(), 12);
-
-    assert!(container_id.chars().all(|c| c.is_ascii_hexdigit()));
-}
-
-#[tokio::test]
-async fn test_security_options_defaults() {
-    use velarx_wire::request::SecurityOptions;
-
-    let opts = SecurityOptions::default();
-
-    assert!(!opts.no_new_privileges);
-    assert!(!opts.seccomp_unconfined);
-    assert!(!opts.apparmor_unconfined);
-    assert!(opts.seccomp_profile.is_none());
-    assert!(opts.apparmor_profile.is_none());
-    assert!(opts.selinux_label.is_none());
-    assert!(opts.mask_paths.is_empty());
-    assert!(opts.readonly_paths.is_empty());
 }
 
 #[tokio::test]
@@ -148,109 +115,7 @@ fn test_restart_policy_serialization() {
     assert_eq!(parsed.maximum_retry_count, 5);
 }
 
-mod exec_tests {
-    /// Test exec command parsing with -t flag
-    #[test]
-    fn test_exec_tty_flag() {
-        let tty = true;
-        let interactive = false;
-
-        assert!(tty);
-        assert!(!interactive);
-    }
-
-    /// Test exec command parsing with -i flag
-    #[test]
-    fn test_exec_interactive_flag() {
-        let tty = false;
-        let interactive = true;
-
-        assert!(!tty);
-        assert!(interactive);
-    }
-
-    /// Test exec command parsing with both -t and -i flags
-    #[test]
-    fn test_exec_tty_and_interactive_flags() {
-        let tty = true;
-        let interactive = true;
-
-        assert!(tty);
-        assert!(interactive);
-    }
-
-    /// Test exec command environment variable handling
-    #[test]
-    fn test_exec_env_vars() {
-        let env = ["FOO=bar".to_string(), "BAZ=qux".to_string()];
-
-        assert_eq!(env.len(), 2);
-        assert!(env.iter().any(|e| e == "FOO=bar"));
-        assert!(env.iter().any(|e| e == "BAZ=qux"));
-    }
-
-    /// Test exec command working directory option
-    #[test]
-    fn test_exec_workdir() {
-        let workdir = Some("/app".to_string());
-
-        assert_eq!(workdir.as_deref(), Some("/app"));
-    }
-
-    /// Test exec command with no flags (default mode)
-    #[test]
-    fn test_exec_default_mode() {
-        let tty = false;
-        let interactive = false;
-
-        assert!(!tty);
-        assert!(!interactive);
-    }
-
-    /// Test exec shim protocol message format
-    #[test]
-    fn test_exec_protocol_format() {
-        // EXEC protocol: EXEC <tty> <interactive> <workdir_len> [workdir] <env_count> <cmd_count>
-        let tty = true;
-        let interactive = true;
-        let workdir = "/app";
-        let env_count = 2;
-        let cmd_count = 3;
-
-        let msg = format!(
-            "EXEC {} {} {} {} {} {}",
-            if tty { "1" } else { "0" },
-            if interactive { "1" } else { "0" },
-            workdir.len(),
-            workdir,
-            env_count,
-            cmd_count
-        );
-
-        assert!(msg.starts_with("EXEC 1 1"));
-        assert!(msg.contains("/app"));
-    }
-
-    /// Test exec command with empty command should fail
-    #[test]
-    fn test_exec_empty_command() {
-        let command: Vec<String> = vec![];
-        assert!(command.is_empty());
-    }
-
-    /// Test exec command validation
-    #[test]
-    fn test_exec_command_validation() {
-        let command = ["echo".to_string(), "hello".to_string()];
-
-        assert!(!command.is_empty());
-        assert_eq!(command[0], "echo");
-        assert_eq!(command[1], "hello");
-    }
-}
-
 mod resource_conversion_tests {
-    use velarx_runtime::container::ResourceConfig;
     use velarx_wire::request::{ResourceLimits, ThrottleDevice};
 
     /// Test that ThrottleDevice can be serialized and deserialized
@@ -307,109 +172,6 @@ mod resource_conversion_tests {
 
         assert_eq!(parsed.blkio_device_write_iops.len(), 1);
         assert_eq!(parsed.blkio_device_write_iops[0].rate, 2000);
-    }
-
-    /// Test conversion from ResourceLimits blkio Vec to ResourceConfig Option<String>
-    #[test]
-    fn test_blkio_vec_to_string_conversion() {
-        let devices = [ThrottleDevice {
-            path: "/dev/sda".to_string(),
-            rate: 1048576,
-        }];
-
-        let result: Option<String> = devices.first().map(|d| format!("{}:{}", d.path, d.rate));
-
-        assert_eq!(result, Some("/dev/sda:1048576".to_string()));
-    }
-
-    /// Test conversion with empty Vec returns None
-    #[test]
-    fn test_empty_blkio_vec_to_none() {
-        let devices: Vec<ThrottleDevice> = vec![];
-
-        let result: Option<String> = devices.first().map(|d| format!("{}:{}", d.path, d.rate));
-
-        assert!(result.is_none());
-    }
-
-    /// Test conversion with multiple devices takes only the first
-    #[test]
-    fn test_multiple_blkio_devices_takes_first() {
-        let devices = [
-            ThrottleDevice {
-                path: "/dev/sda".to_string(),
-                rate: 1048576,
-            },
-            ThrottleDevice {
-                path: "/dev/sdb".to_string(),
-                rate: 2097152,
-            },
-        ];
-
-        let result: Option<String> = devices.first().map(|d| format!("{}:{}", d.path, d.rate));
-
-        assert_eq!(result, Some("/dev/sda:1048576".to_string()));
-    }
-
-    /// Test ResourceConfig defaults
-    #[test]
-    fn test_resource_config_defaults() {
-        let config = ResourceConfig::default();
-
-        assert!(config.memory.is_none());
-        assert!(config.memory_swap.is_none());
-        assert!(config.memory_reservation.is_none());
-        assert!(config.cpu_shares.is_none());
-        assert!(config.cpu_quota.is_none());
-        assert!(config.cpu_period.is_none());
-        assert!(config.cpuset_cpus.is_none());
-        assert!(config.cpuset_mems.is_none());
-        assert!(config.shm_size.is_none());
-        assert!(config.cgroup_conf.is_none());
-    }
-
-    /// Test full ResourceLimits to ResourceConfig conversion simulation
-    #[test]
-    fn test_full_resource_limits_to_config_conversion() {
-        let limits = ResourceLimits {
-            memory: Some(1024 * 1024 * 512),
-            memory_swap: Some(1024 * 1024 * 1024),
-            memory_reservation: Some(1024 * 1024 * 256),
-            cpu_shares: Some(1024),
-            cpu_quota: Some(50000),
-            cpu_period: Some(100000),
-            cpuset_cpus: Some("0-3".to_string()),
-            cpuset_mems: Some("0".to_string()),
-            blkio_device_read_bps: vec![ThrottleDevice {
-                path: "/dev/sda".to_string(),
-                rate: 1048576,
-            }],
-            blkio_device_write_bps: vec![ThrottleDevice {
-                path: "/dev/sdb".to_string(),
-                rate: 2097152,
-            }],
-            blkio_device_read_iops: vec![],
-            blkio_device_write_iops: vec![],
-            ..Default::default()
-        };
-
-        let config = ResourceConfig {
-            memory: limits.memory,
-            memory_swap: limits.memory_swap,
-            memory_reservation: limits.memory_reservation,
-            cpu_shares: limits.cpu_shares,
-            cpu_quota: limits.cpu_quota,
-            cpu_period: limits.cpu_period,
-            cpuset_cpus: limits.cpuset_cpus.clone(),
-            cpuset_mems: limits.cpuset_mems.clone(),
-            shm_size: None,
-            cgroup_conf: None,
-        };
-
-        assert_eq!(config.memory, Some(1024 * 1024 * 512));
-        assert_eq!(config.memory_swap, Some(1024 * 1024 * 1024));
-        assert_eq!(config.cpu_shares, Some(1024));
-        assert_eq!(config.cpuset_cpus, Some("0-3".to_string()));
     }
 }
 

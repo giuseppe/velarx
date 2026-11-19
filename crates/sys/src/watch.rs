@@ -329,35 +329,6 @@ pub fn wait_removed(path: &Path, limit: Duration) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Return when `path` exists: at once if it does, else when its name is
-/// created or moved into its directory.  The directory must exist.
-#[cfg(feature = "tokio")]
-pub async fn path_exists(path: &Path) -> io::Result<()> {
-    let (Some(dir), Some(_)) = (path.parent(), path.file_name()) else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a path with a directory and a name",
-        ));
-    };
-    let dir = if dir.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        dir
-    };
-    let watch = Watch::new()?;
-    watch.creations_in(dir)?;
-    let woken = super::fd::register(watch.owned_fd()?, tokio::io::Interest::READABLE)?;
-    // (looked at after the watch is armed: no creation falls between)
-    loop {
-        if path.symlink_metadata().is_ok() {
-            return Ok(());
-        }
-        let mut ready = woken.readable().await?;
-        watch.clear();
-        ready.clear_ready();
-    }
-}
-
 #[cfg(test)]
 mod sync_tests {
     use super::*;
@@ -558,49 +529,5 @@ mod limit_tests {
             "watch::limit_tests::the_error_names_the_limit_of_watches",
             "max_inotify_watches",
         );
-    }
-}
-
-#[cfg(all(test, feature = "tokio"))]
-mod tests {
-    use super::*;
-
-    /// A path that is there returns at once, one that appears is seen
-    /// when it does.
-    #[tokio::test]
-    async fn a_path_that_appears_is_seen() {
-        let dir = tempfile::tempdir().unwrap();
-        let there = dir.path().join("there");
-        std::fs::write(&there, "").unwrap();
-        path_exists(&there).await.unwrap();
-
-        let later = dir.path().join("later");
-        let waiting = tokio::spawn({
-            let later = later.clone();
-            async move { path_exists(&later).await }
-        });
-        tokio::task::yield_now().await;
-        assert!(!waiting.is_finished());
-        std::fs::write(dir.path().join("other"), "").unwrap();
-        std::fs::write(&later, "").unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
-            .await
-            .expect("seen")
-            .unwrap()
-            .unwrap();
-        // a name moved into the directory counts
-        let moved = dir.path().join("moved");
-        let waiting = tokio::spawn({
-            let moved = moved.clone();
-            async move { path_exists(&moved).await }
-        });
-        tokio::task::yield_now().await;
-        std::fs::write(dir.path().join(".tmp"), "").unwrap();
-        std::fs::rename(dir.path().join(".tmp"), &moved).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
-            .await
-            .expect("seen")
-            .unwrap()
-            .unwrap();
     }
 }

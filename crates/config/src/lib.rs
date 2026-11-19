@@ -571,23 +571,6 @@ pub struct PullConfig {
     /// content sources (the peers) for theirs, and fetches in that order
     #[serde(default = "default_true")]
     pub lazy_profile_peers: bool,
-    /// Chunks asked of a source in one request
-    #[serde(default = "default_source_batch")]
-    pub source_batch: usize,
-    /// Milliseconds a source gets to say what it has
-    #[serde(default = "default_source_has_ms")]
-    pub source_has_timeout_ms: u64,
-    /// Seconds a source gets to serve a request, plus the time its bytes take
-    /// at `source_min_rate_kib`
-    #[serde(default = "default_source_fetch_secs")]
-    pub source_fetch_timeout_secs: u64,
-    /// KiB per second a source has to keep up with
-    #[serde(default = "default_source_min_rate_kib")]
-    pub source_min_rate_kib: u64,
-    /// Seconds a source that failed is not asked again (doubled each time it
-    /// fails again, up to ten times as long)
-    #[serde(default = "default_source_cooldown_secs")]
-    pub source_cooldown_secs: u64,
 }
 
 fn default_lazy_fetches() -> usize {
@@ -624,26 +607,6 @@ fn default_lazy_profile_secs() -> u64 {
 
 fn default_lazy_profile_files() -> usize {
     4096
-}
-
-fn default_source_batch() -> usize {
-    64
-}
-
-fn default_source_has_ms() -> u64 {
-    3000
-}
-
-fn default_source_fetch_secs() -> u64 {
-    20
-}
-
-fn default_source_min_rate_kib() -> u64 {
-    1024
-}
-
-fn default_source_cooldown_secs() -> u64 {
-    30
 }
 
 fn default_max_workers() -> usize {
@@ -736,11 +699,6 @@ impl Default for PullConfig {
             lazy_profile_secs: default_lazy_profile_secs(),
             lazy_profile_files: default_lazy_profile_files(),
             lazy_profile_peers: true,
-            source_batch: default_source_batch(),
-            source_has_timeout_ms: default_source_has_ms(),
-            source_fetch_timeout_secs: default_source_fetch_secs(),
-            source_min_rate_kib: default_source_min_rate_kib(),
-            source_cooldown_secs: default_source_cooldown_secs(),
         }
     }
 }
@@ -1006,14 +964,6 @@ pub struct StorageConfig {
     /// nothing in them is ever written or collected.
     #[serde(default)]
     pub additional_image_stores: Vec<PathBuf>,
-    /// Read-only directories of files that other tools keep (a composefs-rs
-    /// repository, a podman `use_composefs` store, another velarx store),
-    /// searched for the files a pull would fetch: a file found is verified
-    /// and imported (reflink, hard link, copy), and nothing in them is ever
-    /// written, collected or used as a data directory of a mount.  Only
-    /// image data is read.
-    #[serde(default)]
-    pub foreign_object_stores: Vec<velarx_base::foreign::ForeignStoreSpec>,
     /// `system check` takes a file of the store that nothing accounts for
     /// (a temporary file, an object no row names, the staging directory of a
     /// container that is gone) for a leftover once it has been unchanged for
@@ -1189,35 +1139,6 @@ fn default_fsverity() -> bool {
 }
 
 impl StorageConfig {
-    /// `[storage] foreign_object_stores`: absolute paths, each listed once.
-    /// Whether a store can be used is found when it is opened, not here.
-    pub fn validate_foreign_stores(&self) -> Result<(), ConfigError> {
-        for (i, s) in self.foreign_object_stores.iter().enumerate() {
-            if !s.path.is_absolute() {
-                return Err(ConfigError::Invalid(format!(
-                    "[storage] foreign_object_stores: {} is not an absolute path",
-                    s.path.display()
-                )));
-            }
-            if self.foreign_object_stores[..i]
-                .iter()
-                .any(|o| o.path == s.path)
-            {
-                return Err(ConfigError::Invalid(format!(
-                    "[storage] foreign_object_stores: {} is listed twice",
-                    s.path.display()
-                )));
-            }
-            if s.path == self.root {
-                return Err(ConfigError::Invalid(format!(
-                    "[storage] foreign_object_stores: {} is the store itself",
-                    s.path.display()
-                )));
-            }
-        }
-        Ok(())
-    }
-
     /// `[storage.varlink]` against `[storage] driver`: the table is for the
     /// `varlink` driver alone, which needs it (an absolute `socket`) and
     /// bounds its `timeout_secs` and `name`.  A driver not yet named (the
@@ -1333,18 +1254,6 @@ impl StorageConfig {
 
     pub fn database_path(&self) -> PathBuf {
         self.root.join("db.sqlite")
-    }
-
-    #[cfg(feature = "engine")]
-    /// The foreign stores that can be used (a store that cannot be is
-    /// skipped with a warning), none when none is configured.  Their files
-    /// are never in `additional_objects_dirs`: they are imported, not
-    /// mounted.
-    pub fn foreign_stores(&self) -> velarx_storage::ForeignStores {
-        if self.foreign_object_stores.is_empty() {
-            return velarx_storage::ForeignStores::default();
-        }
-        velarx_storage::ForeignStores::open(&self.foreign_object_stores, Some(&self.root))
     }
 
     /// The objects of the additional image stores, in their order.
@@ -1580,7 +1489,6 @@ impl Default for StorageConfig {
             vfs_ignore_chown_errors: false,
             composefs: default_composefs(),
             additional_image_stores: Vec::new(),
-            foreign_object_stores: Vec::new(),
             check_leftover_age_secs: default_check_leftover_age(),
             sync: SyncMode::default(),
             composefs_digests: ComposefsDigests::default(),
@@ -1750,7 +1658,6 @@ impl Config {
         }
         self.storage.requested_driver()?;
         self.storage.validate_varlink()?;
-        self.storage.validate_foreign_stores()?;
         let c = &self.containers.cgroups;
         if !c.is_empty() && !CGROUPS_MODES.contains(&c.as_str()) {
             return Err(ConfigError::Invalid(format!(
@@ -1990,16 +1897,11 @@ impl Config {
             defined.push(name);
         }
         let pull = &self.pull;
-        if pull.source_batch == 0
-            || pull.lazy_fetches == 0
+        if pull.lazy_fetches == 0
             || pull.lazy_complete_fetches == 0
             || pull.lazy_retry_max_secs == 0
-            || pull.source_has_timeout_ms == 0
-            || pull.source_fetch_timeout_secs == 0
-            || pull.source_min_rate_kib == 0
-            || pull.source_cooldown_secs == 0
         {
-            return invalid("[pull] source_* settings must not be 0".into());
+            return invalid("[pull] lazy_* settings must not be 0".into());
         }
         if let Some(list) = &pull.sources {
             let mut seen: Vec<&str> = Vec::new();
@@ -2298,42 +2200,6 @@ mod tests {
         let config: Config = toml::from_str(text)?;
         config.validate()?;
         Ok(config)
-    }
-
-    #[test]
-    fn foreign_object_stores_are_listed_checked_and_never_data_dirs() {
-        use velarx_base::foreign::ForeignKind;
-        let c = parse("").unwrap();
-        assert!(c.storage.foreign_object_stores.is_empty());
-        #[cfg(feature = "engine")]
-        assert!(c.storage.foreign_stores().is_empty());
-        let c = parse(
-            "[storage]\nroot = \"/s/store\"\nadditional_image_stores = [\"/a\"]\n\
-             foreign_object_stores = [{ path = \"/sysroot/composefs\", kind = \"composefs-rs\" },\
-             { path = \"/p\", kind = \"containers-storage\", link = true },\
-             { path = \"/v\", kind = \"velarx\" }]\n",
-        )
-        .unwrap();
-        let f = &c.storage.foreign_object_stores;
-        assert_eq!(f.len(), 3);
-        assert_eq!(f[0].kind, ForeignKind::ComposefsRs);
-        assert!(!f[0].link && f[1].link);
-        // foreign files are imported: no mount ever gets their directory
-        assert_eq!(
-            c.storage.additional_objects_dirs(),
-            vec![PathBuf::from("/a/objects")]
-        );
-        for bad in [
-            "{ path = \"rel\", kind = \"velarx\" }",
-            "{ path = \"/x\", kind = \"other\" }",
-            "{ path = \"/x\" }",
-            "{ path = \"/x\", kind = \"velarx\", x = 1 }",
-            "{ path = \"/s/store\", kind = \"velarx\" }",
-            "{ path = \"/x\", kind = \"velarx\" }, { path = \"/x\", kind = \"composefs-rs\" }",
-        ] {
-            let text = format!("[storage]\nroot = \"/s/store\"\nforeign_object_stores = [{bad}]\n");
-            assert!(parse(&text).is_err(), "{bad}");
-        }
     }
 
     #[test]
@@ -2667,7 +2533,7 @@ mod tests {
         assert!(e.contains("twice"), "{e}");
         let e = err("[[sources.external]]\nname = \"a\"\nsocket = \"/s\"\nidle_timeout_secs = 0\n");
         assert!(e.contains("idle_timeout"), "{e}");
-        assert!(parse("[pull]\nsource_batch = 0\n").is_err());
+        assert!(parse("[pull]\nlazy_fetches = 0\n").is_err());
     }
 
     #[test]

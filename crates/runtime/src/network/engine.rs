@@ -1494,30 +1494,6 @@ impl ContainerNetworks {
             .copied()
     }
 
-    /// The namespace of the container ID, which another process (its monitor)
-    /// holds, was passed to this one: it is the recorded one, or is not
-    /// kept.
-    pub fn hold_inherited(&self, id: &str, fd: std::os::fd::OwnedFd) {
-        let ns = Netns::from(fd);
-        let recorded = self
-            .records
-            .load(id)
-            .ok()
-            .and_then(|s| s.namespace(velarx_nsid::Kind::Net).cloned());
-        match (ns.id(), recorded) {
-            (Ok(got), Some(rec)) if !got.is_same(&rec) => {
-                warn!("the network namespace passed for {id} is not the recorded one")
-            }
-            (Err(e), _) => warn!("cannot tell which network namespace was passed for {id}: {e}"),
-            _ => {
-                self.held
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(id.to_string(), ns);
-            }
-        }
-    }
-
     /// The network of the container ID is set up already: `setup` has
     /// nothing to do.
     /// Whether the network of the container ID was set up before its

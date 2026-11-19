@@ -64,28 +64,6 @@ pub struct Build {
     pub stdin: bool,
 }
 
-/// The agents of a client of the same process: the sockets it named.
-#[derive(Debug)]
-pub struct PathAgents(pub Vec<(String, std::path::PathBuf)>);
-
-#[async_trait::async_trait]
-impl velarx_core::services::AgentSource for PathAgents {
-    fn ids(&self) -> Vec<String> {
-        self.0.iter().map(|(i, _)| i.clone()).collect()
-    }
-
-    async fn connect(&self, id: &str) -> std::io::Result<std::os::fd::OwnedFd> {
-        let path = self
-            .0
-            .iter()
-            .find(|(i, _)| i == id)
-            .map(|(_, p)| p.clone())
-            .ok_or_else(|| std::io::Error::other(format!("no ssh agent {id}")))?;
-        let conn = tokio::net::UnixStream::connect(path).await?.into_std()?;
-        Ok(conn.into())
-    }
-}
-
 /// The agents of a client at the other end of a broker socket
 /// (`velarx_wire::buildopts`): one ask at a time, the others wait without
 /// a thread (a step that opens many connections holds no blocking thread

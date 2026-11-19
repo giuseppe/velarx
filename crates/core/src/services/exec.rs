@@ -14,7 +14,6 @@ use velarx_wire::monitor::iface::{error, ExecReason};
 use velarx_wire::monitor::proto::ExecRequest;
 
 /// The most output `exec` keeps for each stream.
-const MAX_COLLECTED: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ExecEvent {
@@ -209,72 +208,6 @@ impl ContainerService {
                         ContainerError::NotRunning(id.to_string())
                     },
                 )
-            }
-        }
-    }
-
-    /// Run a command in a container and return (exit_code, stdout, stderr).
-    pub async fn exec(
-        &self,
-        id: &str,
-        command: &[String],
-        env: &[String],
-        working_dir: Option<&str>,
-        tty: bool,
-    ) -> ContainerResult<(i32, Vec<u8>, Vec<u8>)> {
-        self.exec_with(
-            id,
-            &ExecRequest {
-                command: command.to_vec(),
-                env: env.to_vec(),
-                cwd: working_dir.map(str::to_string),
-                tty,
-                ..Default::default()
-            },
-        )
-        .await
-    }
-
-    /// Run a command and collect its output.  A command that times out
-    /// has the exit code 124.
-    pub async fn exec_with(
-        &self,
-        id: &str,
-        req: &ExecRequest,
-    ) -> ContainerResult<(i32, Vec<u8>, Vec<u8>)> {
-        let mut stream = self.exec_stream(id, req).await?;
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let room = |v: &Vec<u8>, n: usize| MAX_COLLECTED.saturating_sub(v.len()).min(n);
-        loop {
-            match stream.next().await.map_err(ContainerError::Io)? {
-                Some(ExecEvent::Stdout(d)) => {
-                    let n = room(&out, d.len());
-                    out.extend_from_slice(&d[..n]);
-                }
-                Some(ExecEvent::Stderr(d)) => {
-                    let n = room(&err, d.len());
-                    err.extend_from_slice(&d[..n]);
-                }
-                Some(ExecEvent::Exit {
-                    code, timed_out, ..
-                }) => {
-                    return Ok((if timed_out { 124 } else { code }, out, err));
-                }
-                None => {
-                    // (the monitor sends the status of every command whose
-                    // client stays: say what came before, to tell why)
-                    tracing::warn!(
-                        "exec {:?} in {id}: the monitor closed the connection without a status \
-                         ({} bytes of output, {} of errors)",
-                        req.command,
-                        out.len(),
-                        err.len()
-                    );
-                    return Err(ContainerError::Io(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "the monitor went away",
-                    )));
-                }
             }
         }
     }

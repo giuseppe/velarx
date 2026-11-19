@@ -2,15 +2,12 @@
 //! Holes in the tar stream of a layer.
 //!
 //! The content of a sparse file is read with `SEEK_DATA` and `SEEK_HOLE`: the
-//! bytes of a hole are not read, and they are not copied from the code that
-//! makes the tar stream to the layer writer either: they travel as a length
-//! ([`HoleWrite::hole`], [`HoleRead::hole`]).  The stream is the same as if
-//! the zeros were written, so is the layer.
+//! bytes of a hole are not read, and they are not copied to the writer
+//! either: they travel as a length ([`HoleWrite::hole`]).
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
-use std::sync::mpsc;
 
 /// A hole shorter than this is read as data: it is not worth a message, and
 /// the holes of a file that has one every few pages stay in the stream.
@@ -122,23 +119,6 @@ impl HoleWrite for SparseFile {
     }
 }
 
-pub use velarx_tarsplit::tar::HoleRead;
-
-/// A reader that has no holes.
-pub struct Dense<R>(pub R);
-
-impl<R: Read> Read for Dense<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-impl<R: Read> HoleRead for Dense<R> {
-    fn hole(&mut self, _: u64) -> io::Result<u64> {
-        Ok(0)
-    }
-}
-
 /// Copy the first `size` bytes of `file` to `out`, the holes of the file as
 /// holes (but the short ones).  A file that has less is an error.
 pub fn copy_file(file: &File, size: u64, out: &mut dyn HoleWrite, path: &str) -> io::Result<()> {
@@ -177,125 +157,6 @@ pub fn copy_file(file: &File, size: u64, out: &mut dyn HoleWrite, path: &str) ->
         }
     }
     Ok(())
-}
-
-/// What goes through the channel: bytes, or a hole.
-enum Message {
-    Data(Vec<u8>),
-    Hole(u64),
-}
-
-/// The writing end of [`channel`]: the bytes are cut in messages of 256 KiB.
-pub struct Sender {
-    tx: mpsc::SyncSender<Message>,
-    buf: Vec<u8>,
-}
-
-/// The reading end of [`channel`].
-pub struct Receiver {
-    rx: mpsc::Receiver<Message>,
-    data: io::Cursor<Vec<u8>>,
-    hole: u64,
-}
-
-/// A pipe between two threads that carries holes.  The reader that is
-/// dropped makes the writer fail with `BrokenPipe`; the writer that is
-/// dropped is the end of the stream.
-pub fn channel() -> (Sender, Receiver) {
-    let (tx, rx) = mpsc::sync_channel(4);
-    (
-        Sender {
-            tx,
-            buf: Vec::with_capacity(BUFFER),
-        },
-        Receiver {
-            rx,
-            data: io::Cursor::new(Vec::new()),
-            hole: 0,
-        },
-    )
-}
-
-fn broken() -> io::Error {
-    io::ErrorKind::BrokenPipe.into()
-}
-
-impl Sender {
-    fn send_data(&mut self) -> io::Result<()> {
-        if self.buf.is_empty() {
-            return Ok(());
-        }
-        let data = std::mem::replace(&mut self.buf, Vec::with_capacity(BUFFER));
-        self.tx.send(Message::Data(data)).map_err(|_| broken())
-    }
-}
-
-impl Write for Sender {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(data);
-        if self.buf.len() >= BUFFER {
-            self.send_data()?;
-        }
-        Ok(data.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.send_data()
-    }
-}
-
-impl HoleWrite for Sender {
-    fn hole(&mut self, len: u64) -> io::Result<()> {
-        if len == 0 {
-            return Ok(());
-        }
-        self.send_data()?;
-        self.tx.send(Message::Hole(len)).map_err(|_| broken())
-    }
-}
-
-impl Receiver {
-    /// The next message, when what was received is used.
-    fn fill(&mut self) {
-        if self.data.position() < self.data.get_ref().len() as u64 || self.hole > 0 {
-            return;
-        }
-        match self.rx.recv() {
-            Ok(Message::Data(d)) => self.data = io::Cursor::new(d),
-            Ok(Message::Hole(n)) => self.hole = n,
-            Err(_) => {}
-        }
-    }
-}
-
-impl Read for Receiver {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            if self.hole > 0 {
-                let n = self.hole.min(buf.len() as u64) as usize;
-                buf[..n].fill(0);
-                self.hole -= n as u64;
-                return Ok(n);
-            }
-            let n = self.data.read(buf)?;
-            if n > 0 || buf.is_empty() {
-                return Ok(n);
-            }
-            self.fill();
-            if self.hole == 0 && self.data.position() == self.data.get_ref().len() as u64 {
-                return Ok(0);
-            }
-        }
-    }
-}
-
-impl HoleRead for Receiver {
-    fn hole(&mut self, max: u64) -> io::Result<u64> {
-        self.fill();
-        let n = self.hole.min(max);
-        self.hole -= n;
-        Ok(n)
-    }
 }
 
 #[cfg(test)]
@@ -490,48 +351,5 @@ mod tests {
         let mut out = Pieces::default();
         let e = copy_file(&f, 2 * M, &mut out, "f").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::ResourceBusy);
-    }
-
-    #[test]
-    fn the_channel_carries_data_and_holes() {
-        let (mut tx, mut rx) = channel();
-        let producer = std::thread::spawn(move || {
-            tx.write_all(b"head").unwrap();
-            tx.hole(1000).unwrap();
-            tx.write_all(b"mid").unwrap();
-            tx.hole(70_000).unwrap();
-            tx.hole(5).unwrap();
-            tx.write_all(&vec![7u8; 600_000]).unwrap();
-            tx.flush().unwrap();
-        });
-        let mut got = [0u8; 4];
-        rx.read_exact(&mut got).unwrap();
-        assert_eq!(&got, b"head");
-        assert_eq!(rx.hole(10).unwrap(), 10);
-        assert_eq!(rx.hole(10_000).unwrap(), 990);
-        assert_eq!(rx.hole(10).unwrap(), 0);
-        let mut got = [0u8; 3];
-        rx.read_exact(&mut got).unwrap();
-        assert_eq!(&got, b"mid");
-        let mut zeros = vec![1u8; 50_000];
-        rx.read_exact(&mut zeros).unwrap();
-        assert!(zeros.iter().all(|&b| b == 0));
-        assert_eq!(rx.hole(u64::MAX).unwrap(), 20_000);
-        assert_eq!(rx.hole(u64::MAX).unwrap(), 5);
-        let mut rest = Vec::new();
-        rx.read_to_end(&mut rest).unwrap();
-        assert_eq!(rest, vec![7u8; 600_000]);
-        assert_eq!(rx.hole(1).unwrap(), 0);
-        producer.join().unwrap();
-    }
-
-    #[test]
-    fn a_reader_that_is_gone_breaks_the_writer() {
-        let (mut tx, rx) = channel();
-        drop(rx);
-        let e = tx.hole(1).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
-        let e = tx.write_all(&vec![0u8; BUFFER]).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
     }
 }

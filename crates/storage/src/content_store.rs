@@ -49,14 +49,6 @@ impl Object {
         })
     }
 
-    /// The object with the fs-verity digest `digest`, if it is one.
-    pub fn of(digest: &Digest, checked: bool) -> Option<Self> {
-        digest.is_fsverity().then(|| Self {
-            verity: digest.to_string(),
-            checked,
-        })
-    }
-
     /// The digest of the object.
     pub fn digest(&self) -> Digest {
         Digest::parse_fsverity(&self.verity).expect("an object has an fs-verity digest")

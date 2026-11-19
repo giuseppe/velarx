@@ -135,11 +135,6 @@ pub fn read(path: &Path, max: usize) -> Vec<String> {
     read_document(&Place::Path(path.to_path_buf()), max).0
 }
 
-/// The bytes of a profile file, if it is one that may be read.
-pub fn read_bytes(path: &Path) -> Option<Vec<u8>> {
-    read_from(&std::fs::File::open(path).ok()?)
-}
-
 /// The bytes of an open profile file, if it is one that may be read.
 pub fn read_from(file: &std::fs::File) -> Option<Vec<u8>> {
     let mut text = Vec::new();

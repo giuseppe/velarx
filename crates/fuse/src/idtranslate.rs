@@ -34,22 +34,6 @@ impl IdTranslate {
         self.map(&self.gid, id)
     }
 
-    /// Identifies the translation, for the name of the mount.
-    pub fn key(&self) -> String {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        for (tag, maps) in [(b'u', &self.uid), (b'g', &self.gid)] {
-            h.update([tag]);
-            for m in maps {
-                h.update(m.container_id.to_le_bytes());
-                h.update(m.host_id.to_le_bytes());
-                h.update(m.size.to_le_bytes());
-            }
-        }
-        h.update([self.squash as u8]);
-        hex::encode(&h.finalize()[..6])
-    }
-
     /// The first of the owners `uids` and `gids` of an image that the
     /// mapping cannot represent, as `("uid", 33)`.
     pub fn first_unmapped_owners(
@@ -115,10 +99,6 @@ mod tests {
         };
         assert_eq!(squash.uid_of(5000), 100000);
         assert_eq!(squash.gid_of(5000), 200000);
-        // Mappings that differ have different keys.
-        assert_ne!(t.key(), squash.key());
-        assert_ne!(t.key(), IdTranslate::default().key());
-        assert_eq!(t.key(), t.clone().key());
     }
 
     #[test]

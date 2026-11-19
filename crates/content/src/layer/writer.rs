@@ -9,7 +9,6 @@
 //! the same blob, so a layer can be regenerated from its tar-split and the
 //! files of the store with the digest it had.
 
-use super::holes::{Dense, HoleRead};
 use crate::pull::entry;
 use crate::pull::tar::{Header, Kind, Sink, TarReader};
 use crate::pull::tarsplit;
@@ -372,15 +371,6 @@ impl FileHashes {
         }
     }
 
-    /// The same as `update` with `len` zeros: the fs-verity digest of a
-    /// hole costs nothing.
-    fn update_zeros(&mut self, len: u64) {
-        self.verity.update_zeros(len);
-        if let Some(h) = &mut self.sha256 {
-            zeros(len).for_each(|z| h.update(z));
-        }
-    }
-
     /// The `fsverity` and `digest` of the entry.
     fn finish(self) -> (String, Option<String>) {
         (
@@ -615,23 +605,6 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
-    /// `len` zeros that were not read, in a chunk: what `chunk_data` does
-    /// with them.
-    fn chunk_hole(&mut self, len: u64) -> io::Result<()> {
-        if self.in_hole {
-            return self.hole_bytes(len);
-        }
-        if (self.pending_zeros as u64) + len < HOLE_THRESHOLD as u64 {
-            self.pending_zeros += len as usize;
-            return Ok(());
-        }
-        self.close_chunk()?;
-        self.start_chunk(true)?;
-        self.in_hole = true;
-        let n = std::mem::take(&mut self.pending_zeros) as u64 + len;
-        self.hole_bytes(n)
-    }
-
     fn chunk_data(&mut self, data: &[u8]) -> io::Result<()> {
         let mut i = 0;
         while i < data.len() {
@@ -721,27 +694,12 @@ impl<W: Write> Writer<W> {
             e.chunk_type = first.zeros.then(|| "zeros".to_string());
             for c in &chunks[1..] {
                 self.toc.push(TocEntry {
-                    name: name.clone(),
-                    entry_type: TocEntryType::Chunk,
-                    mode: 0,
-                    uid: 0,
-                    gid: 0,
-                    size: 0,
-                    digest: None,
-                    fsverity: None,
                     offset: c.blob_offset,
-                    end_offset: 0,
                     chunk_digest: Some(c.digest.clone()),
                     chunk_size: c.size,
                     chunk_offset: c.offset,
                     chunk_type: c.zeros.then(|| "zeros".to_string()),
-                    link_name: None,
-                    mod_time: None,
-                    access_time: None,
-                    change_time: None,
-                    dev_major: None,
-                    dev_minor: None,
-                    xattrs: Default::default(),
+                    ..TocEntry::new(name.clone(), TocEntryType::Chunk)
                 });
             }
         }
@@ -903,22 +861,6 @@ impl<W: Write> Sink for Writer<W> {
         self.chunk_data(data)
     }
 
-    fn file_hole(&mut self, len: u64) -> io::Result<()> {
-        if let Some(s) = &mut self.split {
-            s.file_hole(len)?;
-        }
-        if !self.chunked() {
-            self.file_hashes.update_zeros(len);
-            self.file_offset += len;
-            for z in zeros(len) {
-                self.backend()?.feed(z)?;
-            }
-            return Ok(());
-        }
-        self.file_hashes.verity.update_zeros(len);
-        self.chunk_hole(len)
-    }
-
     fn file_end(&mut self) -> io::Result<()> {
         if let Some(s) = &mut self.split {
             s.file_end()?;
@@ -950,24 +892,6 @@ impl<W: Write> Sink for Writer<W> {
     }
 }
 
-/// The tar stream hashed (the diff id) with its holes: a hole is hashed as
-/// the zeros it reads as.
-struct HoleHashing<R>(Hashing<R>);
-
-impl<R: Read> Read for HoleHashing<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-impl<R: HoleRead> HoleRead for HoleHashing<R> {
-    fn hole(&mut self, max: u64) -> io::Result<u64> {
-        let n = self.0.inner.hole(max)?;
-        zeros(n).for_each(|z| self.0.account(z));
-        Ok(n)
-    }
-}
-
 /// Write the layer blob of the tar stream `tar` to `out`.  Nothing of the
 /// output is valid unless this returns.  Every digest of the layer (blob,
 /// diff id, chunks, TOC) is of the algorithm `alg`.
@@ -977,7 +901,7 @@ pub fn write_layer<R: Read, W: Write>(
     compression: Compression,
     out: W,
 ) -> io::Result<Written> {
-    write_layer_holes(Dense(tar), alg, compression, out)
+    write_layer_level(tar, alg, compression, None, out)
 }
 
 /// [`write_layer`] at a compression level of its own (`None`: the default
@@ -990,7 +914,7 @@ pub fn write_layer_level<R: Read, W: Write>(
     out: W,
 ) -> io::Result<Written> {
     write_layer_with(
-        Dense(tar),
+        tar,
         alg,
         compression,
         level,
@@ -1016,7 +940,7 @@ pub fn write_canonical_layer<R: Read, W: Write>(
     out: W,
 ) -> io::Result<Written> {
     write_layer_with(
-        Dense(tar),
+        tar,
         alg,
         compression,
         level,
@@ -1025,29 +949,6 @@ pub fn write_canonical_layer<R: Read, W: Write>(
             sha256_digest: TOC_SHA256_DIGEST,
             fsverity: true,
             canonical: true,
-        },
-    )
-}
-
-/// The same for a stream that tells of the holes in the files: they are
-/// not read, and cost the digests of the layer (the sha256 sums) and the
-/// compressor the zeros, but not the fs-verity digest and the cut in chunks.
-pub fn write_layer_holes<R: HoleRead, W: Write>(
-    tar: R,
-    alg: Algorithm,
-    compression: Compression,
-    out: W,
-) -> io::Result<Written> {
-    write_layer_with(
-        tar,
-        alg,
-        compression,
-        None,
-        out,
-        Table {
-            sha256_digest: TOC_SHA256_DIGEST,
-            fsverity: true,
-            canonical: false,
         },
     )
 }
@@ -1062,7 +963,7 @@ pub fn write_layer_sha256_keyed<R: Read, W: Write>(
     out: W,
 ) -> io::Result<Written> {
     write_layer_with(
-        Dense(tar),
+        tar,
         alg,
         compression,
         None,
@@ -1086,7 +987,7 @@ struct Table {
     canonical: bool,
 }
 
-fn write_layer_with<R: HoleRead, W: Write>(
+fn write_layer_with<R: Read, W: Write>(
     tar: R,
     alg: Algorithm,
     compression: Compression,
@@ -1099,7 +1000,7 @@ fn write_layer_with<R: HoleRead, W: Write>(
         fsverity,
         canonical,
     } = table;
-    let hashing = HoleHashing(Hashing::new(alg, tar));
+    let hashing = Hashing::new(alg, tar);
     let mut reader = TarReader::with_sink(
         hashing,
         Writer::new(
@@ -1114,11 +1015,7 @@ fn write_layer_with<R: HoleRead, W: Write>(
     );
     let mut buf = vec![0u8; 64 * 1024];
     while reader.next_entry()?.is_some() {
-        loop {
-            if reader.skip_hole()? == 0 && reader.read(&mut buf)? == 0 {
-                break;
-            }
-        }
+        while reader.read(&mut buf)? != 0 {}
     }
     let (hashing, mut writer) = reader.finish()?;
     let mut annotations = BTreeMap::new();
@@ -1131,7 +1028,7 @@ fn write_layer_with<R: HoleRead, W: Write>(
         .take()
         .ok_or_else(|| io::Error::other("the layer was finished"))?
         .finish()?;
-    let diff_id = hashing.0.hasher.finalize();
+    let diff_id = hashing.hasher.finalize();
     Ok(Written {
         // (a layer that is not compressed is its stream)
         digest: out.hasher.map_or_else(|| diff_id, DigestWriter::finalize),
@@ -1510,7 +1407,7 @@ mod tests {
         let tar = sample_tar();
         let mut out = Vec::new();
         let w = write_layer_with(
-            Dense(&tar[..]),
+            &tar[..],
             Algorithm::Sha256,
             Compression::ZstdChunked,
             None,
@@ -1567,77 +1464,19 @@ mod tests {
         assert_eq!(small.digest, Some(crate::sha256(b"hello\n").to_string()));
     }
 
-    /// A tar stream whose holes (ranges of zeros of the stream) are told as
-    /// holes.
-    struct Segments {
-        tar: Vec<u8>,
-        pos: u64,
-        holes: Vec<(u64, u64)>,
-    }
-
-    impl Segments {
-        fn hole_at(&self) -> Option<u64> {
-            self.holes
-                .iter()
-                .find(|(s, l)| (*s..s + l).contains(&self.pos))
-                .map(|(s, l)| s + l - self.pos)
-        }
-    }
-
-    impl Read for Segments {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let left = self.tar.len() as u64 - self.pos;
-            let mut n = (buf.len() as u64).min(left);
-            if let Some(rest) = self.hole_at() {
-                n = n.min(rest);
-            } else if let Some((s, _)) = self.holes.iter().find(|(s, _)| *s > self.pos) {
-                n = n.min(s - self.pos);
-            }
-            let from = self.pos as usize;
-            buf[..n as usize].copy_from_slice(&self.tar[from..from + n as usize]);
-            self.pos += n;
-            Ok(n as usize)
-        }
-    }
-
-    impl HoleRead for Segments {
-        fn hole(&mut self, max: u64) -> io::Result<u64> {
-            let n = self.hole_at().unwrap_or(0).min(max);
-            self.pos += n;
-            Ok(n)
-        }
-    }
-
-    /// The tar of the files, and the ranges of its zeros of at least `min`
-    /// bytes inside the content of a file, each told in two pieces.
-    fn tar_with_holes(files: &[(&str, Vec<u8>)], min: usize) -> (Vec<u8>, Vec<(u64, u64)>) {
+    /// The tar of the files.
+    fn tar_of(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());
-        let mut holes = Vec::new();
         for (name, data) in files {
             let mut h = tar::Header::new_gnu();
             h.set_size(data.len() as u64);
             h.set_mode(0o644);
             h.set_mtime(1_700_000_000);
             b.append_data(&mut h, name, &data[..]).unwrap();
-            let end = b.get_ref().len() as u64 - (512 - data.len() as u64 % 512) % 512;
-            let start = end - data.len() as u64;
-            let mut i = 0;
-            while i < data.len() {
-                let j = data[i..]
-                    .iter()
-                    .position(|&x| x != 0)
-                    .map_or(data.len(), |p| i + p);
-                if j - i >= min {
-                    let (s, l) = (start + i as u64, (j - i) as u64);
-                    holes.push((s, l / 3));
-                    holes.push((s + l / 3, l - l / 3));
-                }
-                i = j.max(i + 1);
-            }
         }
         let mut tar = b.into_inner().unwrap();
         tar.extend(vec![0u8; 1024]);
-        (tar, holes)
+        tar
     }
 
     /// Files of data, of zeros and of both.
@@ -1667,35 +1506,6 @@ mod tests {
             ("a/short-zeros", short_zeros),
             ("a/ends-with-a-hole", ends_with_a_hole),
         ]
-    }
-
-    /// The layer of a stream with holes is the layer of the stream that has
-    /// the zeros: the same blob, the same digests, in every format.
-    #[test]
-    fn test_holes_give_the_layer_the_zeros_give() {
-        let files = files_with_zeros();
-        for min in [1024, 4096, 100_000] {
-            let (tar, holes) = tar_with_holes(&files, min);
-            assert!(!holes.is_empty());
-            for c in [
-                Compression::None,
-                Compression::Gzip,
-                Compression::ZstdChunked,
-            ] {
-                let (blob, w) = write(&tar, c);
-                let mut out = Vec::new();
-                let s = Segments {
-                    tar: tar.clone(),
-                    pos: 0,
-                    holes: holes.clone(),
-                };
-                let sparse = write_layer_holes(s, Algorithm::Sha256, c, &mut out).unwrap();
-                assert_eq!(out, blob, "{c:?} {min}");
-                assert_eq!(sparse.digest, w.digest);
-                assert_eq!(sparse.diff_id, w.diff_id);
-                assert_eq!(sparse.annotations, w.annotations);
-            }
-        }
     }
 
     /// The window of the rolling checksum that is all zeros does not change.
@@ -1769,12 +1579,11 @@ mod tests {
         true
     }
 
-    /// The same for files of zeros, zero runs and holes (chunks of zeros,
-    /// a first chunk that is the whole file, zeros that end a file), read
-    /// with their holes or as zeros.
+    /// The same for files of zeros and zero runs (chunks of zeros, a first
+    /// chunk that is the whole file, zeros that end a file).
     #[test]
     fn test_the_digests_of_a_fixed_stream_of_zeros_do_not_change() {
-        let (tar, holes) = tar_with_holes(&files_with_zeros(), 4096);
+        let tar = tar_of(&files_with_zeros());
         let expected = [
             (
                 Compression::None,
@@ -1794,13 +1603,6 @@ mod tests {
                 continue;
             }
             assert_eq!(write(&tar, c).1.digest.to_string(), digest, "{c:?}");
-            let s = Segments {
-                tar: tar.clone(),
-                pos: 0,
-                holes: holes.clone(),
-            };
-            let sparse = write_layer_holes(s, Algorithm::Sha256, c, &mut Vec::new()).unwrap();
-            assert_eq!(sparse.digest.to_string(), digest, "{c:?}");
         }
     }
 
@@ -1827,31 +1629,14 @@ mod tests {
 
     fn canonical_entry(name: &str, kind: TocEntryType, size: u64) -> TocEntry {
         TocEntry {
-            name: name.to_string(),
-            entry_type: kind,
             mode: if kind == TocEntryType::Dir {
                 0o755
             } else {
                 0o644
             },
-            uid: 0,
-            gid: 0,
             size,
-            digest: None,
-            fsverity: None,
-            offset: 0,
-            end_offset: 0,
-            chunk_digest: None,
-            chunk_size: 0,
-            chunk_offset: 0,
-            chunk_type: None,
-            link_name: None,
             mod_time: Some("2024-05-06T07:08:09.5Z".to_string()),
-            access_time: None,
-            change_time: None,
-            dev_major: None,
-            dev_minor: None,
-            xattrs: Default::default(),
+            ..TocEntry::new(name.to_string(), kind)
         }
     }
 

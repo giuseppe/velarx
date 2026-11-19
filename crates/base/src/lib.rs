@@ -10,7 +10,6 @@ pub mod conf;
 pub mod dirs;
 pub mod docker;
 pub mod entitlement;
-pub mod foreign;
 pub mod hardening;
 pub mod host;
 pub mod idmap;

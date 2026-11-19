@@ -471,13 +471,7 @@ pub(crate) async fn system_record(state: &AppState) -> ApiResult<SystemRecord> {
             });
         }
     }
-    let server = state
-        .server_service
-        .info(
-            velarx_base::buildinfo::commit(),
-            velarx_base::buildinfo::time(),
-        )
-        .await?;
+    let server = state.server_service.info().await?;
     let host = HostRecord {
         hostname: proc.hostname.clone(),
         cpus: cpus() as u64,

@@ -2,7 +2,6 @@
 pub mod canonical;
 mod chunked;
 mod content_store;
-mod foreign;
 mod fsverity;
 mod lock;
 mod served;
@@ -12,7 +11,6 @@ mod unfinished;
 
 pub use chunked::*;
 pub use content_store::*;
-pub use foreign::*;
 pub use fsverity::*;
 pub use lock::{locks, StorageLock};
 pub use served::*;

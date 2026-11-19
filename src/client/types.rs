@@ -101,16 +101,6 @@ pub struct ExecParams {
     pub detach: bool,
 }
 
-#[derive(Debug, Serialize, serde::Deserialize)]
-pub struct LogEntry {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timestamp: Option<String>,
-    /// stdout or stderr
-    #[serde(default)]
-    pub stream: String,
-    pub message: String,
-}
-
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct BuildImageRequest {
@@ -459,9 +449,6 @@ pub struct CommitContainerRequest {
     /// container config, `commit --config`)
     pub override_config: Option<serde_json::Value>,
 }
-
-/// The header that carries the options of a build (base64 JSON).
-pub const BUILD_OPTIONS_HEADER: &str = "X-Velarx-Build-Options";
 
 /// A changed path: `Kind` is 0 (changed), 1 (added) or 2 (deleted).
 #[derive(Debug, Serialize, serde::Deserialize)]

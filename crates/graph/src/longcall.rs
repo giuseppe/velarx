@@ -158,34 +158,6 @@ pub fn wait_for_call_by<T>(
     }
 }
 
-/// The driver's side of the same rule, for a driver written in Rust: tells
-/// when a `progress` reply is due.  A reply is due after a quarter of the
-/// deadline (half of [`progress_interval`]), which leaves the margin for a
-/// scheduling delay.
-#[derive(Debug)]
-pub struct Heartbeat {
-    every: Duration,
-    last: Instant,
-}
-
-impl Heartbeat {
-    pub fn new(timeout: Duration) -> Self {
-        Self {
-            every: progress_interval(timeout) / 2,
-            last: Instant::now(),
-        }
-    }
-
-    /// Whether a reply is due; true starts the next period (the caller sends it).
-    pub fn due(&mut self) -> bool {
-        if self.last.elapsed() < self.every {
-            return false;
-        }
-        self.last = Instant::now();
-        true
-    }
-}
-
 fn readable(pipe: &File, wait: Duration) -> io::Result<bool> {
     let mut fds = [rustix::event::PollFd::new(
         pipe,
@@ -303,13 +275,11 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Step<u32>>();
         let started = Instant::now();
         let driver = std::thread::spawn(move || {
-            let mut beat = Heartbeat::new(T);
-            // five deadlines' worth of work, a progress reply when one is due
+            // five deadlines' worth of work, a progress reply every quarter
+            // of a deadline
             while started.elapsed() < T * 5 {
-                if beat.due() {
-                    tx.send(Step::Progress).unwrap();
-                }
-                std::thread::sleep(Duration::from_millis(10));
+                tx.send(Step::Progress).unwrap();
+                std::thread::sleep(T / 4);
             }
             tx.send(Step::Done(7)).unwrap();
         });
@@ -363,11 +333,6 @@ mod tests {
             progress_interval(Duration::from_secs(30)),
             Duration::from_secs(15)
         );
-        let mut beat = Heartbeat::new(Duration::from_millis(40));
-        assert!(!beat.due());
-        std::thread::sleep(Duration::from_millis(15));
-        assert!(beat.due());
-        assert!(!beat.due());
     }
 
     fn pipe() -> (File, File) {

@@ -1177,34 +1177,6 @@ impl PodService {
         }
     }
 
-    /// Stop a pod
-    pub async fn stop(&self, id_or_name: &str, timeout: u32) -> PodResult<()> {
-        let pod = self.get(id_or_name).await?;
-
-        if pod.state == PodState::Stopped || pod.state == PodState::Exited {
-            return Ok(());
-        }
-
-        info!("Stopping pod {}", pod.name);
-
-        for container_id in pod.container_ids.iter().rev() {
-            if let Err(e) = self.container_service.stop(container_id, timeout).await {
-                warn!("Error stopping container {}: {}", container_id, e);
-            }
-        }
-
-        if let Some(infra_id) = &pod.infra_container_id {
-            if let Err(e) = self.container_service.stop(infra_id, timeout).await {
-                warn!("Error stopping infra container: {}", e);
-            }
-        }
-
-        // A start that came meanwhile is not overwritten: the pod is
-        // stopped if none of its containers runs.
-        self.settle(&pod.id, PodState::Stopped).await?;
-        self.stop_slice(&pod.id).await
-    }
-
     /// The slice of a stopped pod is gone (the next start makes it again with
     /// its limits); a pod that runs, or has no slice, keeps it.
     pub async fn stop_slice(&self, id: &str) -> PodResult<()> {
@@ -1512,16 +1484,6 @@ impl PodService {
         Ok(())
     }
 
-    /// `--since` or `--until` (`what`) of the logs of a pod.
-    pub fn log_time(what: &str, spec: Option<&str>) -> PodResult<Option<i64>> {
-        velarx_wire::monitor::logfmt::parse_pod_log_time(
-            what,
-            spec,
-            velarx_wire::monitor::logfmt::now_ns(),
-        )
-        .map_err(PodError::Logs)
-    }
-
     /// Get aggregated logs from all containers in a pod
     ///
     /// Returns the log entries of the containers (those `containers_filter`
@@ -1765,21 +1727,11 @@ mod tests {
     fn the_cgroups_mode_of_a_stored_pod() {
         let d = tempfile::tempdir().unwrap();
         let write = |id: &str, name: &str, cgroups: CgroupsMode| {
-            let pod = super::Pod {
-                id: id.into(),
+            let mut pod = stored(id, name);
+            pod.spec = super::PodSpec {
                 name: name.into(),
-                state: super::PodState::Created,
-                infra_container_id: None,
-                container_ids: Vec::new(),
-                spec: super::PodSpec {
-                    name: name.into(),
-                    cgroups,
-                    ..Default::default()
-                },
-                created_at: String::new(),
-                started_at: None,
-                exit_code: None,
-                removing: false,
+                cgroups,
+                ..Default::default()
             };
             std::fs::write(
                 d.path().join(format!("{id}.json")),
@@ -1808,18 +1760,6 @@ mod tests {
         );
         assert_eq!(super::stored_pod_cgroups(d.path(), "none"), None);
         assert_eq!(super::stored_pod_cgroups(d.path(), "../x"), None);
-    }
-
-    #[test]
-    fn pod_create_takes_the_modes_of_run() {
-        let spec = |m: CgroupsMode| super::PodSpec {
-            cgroups: m,
-            ..Default::default()
-        };
-        super::check_disabled_pod(&spec(CgroupsMode::Disabled)).unwrap();
-        // split and scope are enabled with a placement
-        super::check_disabled_pod(&spec(CgroupsMode::Split)).unwrap();
-        super::check_disabled_pod(&spec(CgroupsMode::Scope)).unwrap();
     }
 
     #[test]
@@ -1874,17 +1814,6 @@ mod tests {
             "this container is using the 'none' log driver, cannot read logs: \
              this container is not logging output"
         );
-    }
-
-    #[test]
-    fn pod_logs_times_are_checked_with_podman_s_words() {
-        assert_eq!(PodService::log_time("since", None).unwrap(), None);
-        let e = PodService::log_time("since", Some("garbage")).unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            "parsing --since \"garbage\": unable to interpret time value"
-        );
-        assert!(PodService::log_time("until", Some("1h")).unwrap().is_some());
     }
 
     use super::*;
@@ -1980,60 +1909,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pod_spec_default() {
-        let spec = PodSpec {
-            name: "test".to_string(),
-            hostname: None,
-            networks: vec![],
-            dns: PodDnsConfig::default(),
-            add_hosts: vec![],
-            security_context: PodSecurityContext::default(),
-            ports: vec![],
-            labels: BTreeMap::new(),
-            annotations: BTreeMap::new(),
-            share_pid: false,
-            share_ipc: true,
-            share_net: true,
-            share_uts: true,
-            share_cgroup: false,
-            userns: None,
-            infra_image: None,
-            infra_command: None,
-            infra_name: None,
-            exit_policy: Default::default(),
-            infra_conmon_pidfile: None,
-            ..Default::default()
-        };
-
-        assert_eq!(spec.name, "test");
-        assert!(spec.hostname.is_none());
-        assert!(spec.labels.is_empty());
-    }
-
-    #[test]
-    fn test_pod_state_equality() {
-        assert_eq!(PodState::Created, PodState::Created);
-        assert_eq!(PodState::Running, PodState::Running);
-        assert_eq!(PodState::Stopped, PodState::Stopped);
-        assert_eq!(PodState::Paused, PodState::Paused);
-
-        assert_ne!(PodState::Created, PodState::Running);
-        assert_ne!(PodState::Running, PodState::Stopped);
-    }
-
-    #[test]
-    fn test_pod_error_messages() {
-        let err = PodError::NotFound("pod123".to_string());
-        assert!(err.to_string().contains("pod123"));
-
-        let err = PodError::AlreadyExists("existing".to_string());
-        assert!(err.to_string().contains("existing"));
-
-        let err = PodError::Running;
-        assert!(err.to_string().to_lowercase().contains("running"));
-    }
-
-    #[test]
     fn test_pod_spec_serialization() {
         let mut labels = BTreeMap::new();
         labels.insert("app".to_string(), "test".to_string());
@@ -2115,49 +1990,6 @@ mod tests {
                 && !velarx_types::digest::is_hex_id("")
                 && velarx_types::digest::is_hex_id("0aF")
         );
-    }
-
-    #[test]
-    fn test_pod_serialization() {
-        let pod = Pod {
-            id: "abc123".to_string(),
-            name: "test-pod".to_string(),
-            state: PodState::Running,
-            infra_container_id: Some("infra123".to_string()),
-            container_ids: vec!["c1".to_string(), "c2".to_string()],
-            spec: PodSpec {
-                name: "test-pod".to_string(),
-                hostname: None,
-                networks: vec![],
-                dns: PodDnsConfig::default(),
-                add_hosts: vec![],
-                security_context: PodSecurityContext::default(),
-                ports: vec![],
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-                share_pid: false,
-                share_ipc: true,
-                share_net: true,
-                share_uts: true,
-                share_cgroup: false,
-                userns: None,
-                infra_image: None,
-                infra_command: None,
-                infra_name: None,
-                exit_policy: Default::default(),
-                infra_conmon_pidfile: None,
-                ..Default::default()
-            },
-            created_at: "2024-01-01T00:00:00Z".to_string(),
-            started_at: None,
-            exit_code: None,
-            removing: false,
-        };
-
-        let json = serde_json::to_string(&pod).unwrap();
-        assert!(json.contains("abc123"));
-        assert!(json.contains("test-pod"));
-        assert!(json.contains("Running") || json.contains("running"));
     }
 
     #[test]

@@ -22,31 +22,6 @@ pub fn clear_environment() {
     }
 }
 
-/// Make this process yield: the priority of its scheduling lowered by
-/// `nice` and its I/O priority the lowest of the best effort class (the
-/// background work of an engine, which must not take the time of the
-/// containers).  The I/O priority is the best effort of the kernel: its
-/// failure is the caller's to tell.
-pub fn yield_to_others(nice: i32) -> io::Result<()> {
-    const IOPRIO_WHO_PROCESS: libc::c_long = 1;
-    const IOPRIO_CLASS_BE: libc::c_long = 2;
-    rustix::process::nice(nice)?;
-    // SAFETY: ioprio_set takes three integers and no pointer; it changes the
-    // I/O priority of the calling process only.
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_ioprio_set,
-            IOPRIO_WHO_PROCESS,
-            0 as libc::c_long,
-            (IOPRIO_CLASS_BE << 13) | 7,
-        )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 /// Write `title` over the memory `[start, end)` of this process, padded
 /// with NULs and cut to leave the last byte NUL: the area of its arguments
 /// and environment as `/proc/self/stat` reports it.  A range that is not

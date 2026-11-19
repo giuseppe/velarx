@@ -183,27 +183,13 @@ mod tests {
 
     fn entry(name: &str, kind: TocEntryType, size: u64, d: Option<&str>) -> TocEntry {
         TocEntry {
-            name: name.into(),
-            entry_type: kind,
             mode: 0o644,
-            uid: 0,
-            gid: 0,
             size,
             digest: d.map(|d| d.replace("fsverity-sha256-12:", "sha256:")),
             fsverity: d.and_then(velarx_storage::to_toc),
             offset: 100,
             end_offset: 200,
-            chunk_digest: None,
-            chunk_size: 0,
-            chunk_offset: 0,
-            chunk_type: None,
-            link_name: None,
-            mod_time: None,
-            access_time: None,
-            change_time: None,
-            dev_major: None,
-            dev_minor: None,
-            xattrs: Default::default(),
+            ..TocEntry::new(name, kind)
         }
     }
 
