@@ -74,8 +74,9 @@ pub struct Header {
     pub uid: u32,
     /// The group.
     pub gid: u32,
-    /// The modification time, in seconds since the epoch.
-    pub mtime: i64,
+    /// The modification time: seconds since the epoch (before it for a time
+    /// before 1970) and the nanoseconds after them.
+    pub mtime: (i64, u32),
     /// The target of a symbolic or hard link.
     pub link: Option<String>,
     /// The major number of a device.
@@ -161,9 +162,32 @@ struct Overrides {
     size: Option<u64>,
     uid: Option<u64>,
     gid: Option<u64>,
-    mtime: Option<i64>,
+    mtime: Option<(i64, u32)>,
     xattrs: BTreeMap<String, Vec<u8>>,
     xattr_bytes: usize,
+}
+
+/// A PAX time, `[-]seconds[.fraction]`, as seconds (rounded down) and the
+/// nanoseconds after them.  Digits of the fraction beyond the ninth are
+/// dropped; an empty fraction is 0, as Go reads it.
+fn pax_time(value: &[u8]) -> Option<(i64, u32)> {
+    let s = std::str::from_utf8(value).ok()?;
+    let (negative, s) = s.strip_prefix('-').map_or((false, s), |s| (true, s));
+    let (secs, fraction) = s.split_once('.').unwrap_or((s, ""));
+    if !fraction.bytes().all(|b| b.is_ascii_digit()) || !secs.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let secs: i64 = secs.parse().ok()?;
+    let f = &fraction[..fraction.len().min(9)];
+    let nanos = match f {
+        "" => 0,
+        f => f.parse::<u32>().ok()? * 10u32.pow(9 - f.len() as u32),
+    };
+    match (negative, nanos) {
+        (false, n) => Some((secs, n)),
+        (true, 0) => Some((secs.checked_neg()?, 0)),
+        (true, n) => Some((secs.checked_neg()?.checked_sub(1)?, 1_000_000_000 - n)),
+    }
 }
 
 /// Parse `len key=value\n` records.
@@ -212,9 +236,7 @@ fn parse_pax(data: &[u8], out: &mut Overrides) -> io::Result<()> {
                 }
             }
             "mtime" => {
-                let s = std::str::from_utf8(value).map_err(|_| invalid("invalid PAX mtime"))?;
-                let secs = s.split('.').next().unwrap_or("");
-                out.mtime = Some(secs.parse().map_err(|_| invalid("invalid PAX mtime"))?);
+                out.mtime = Some(pax_time(value).ok_or_else(|| invalid("invalid PAX mtime"))?);
             }
             // the formats of GNU tar that store a file with holes as a
             // regular entry of its packed data: as the sparse type, refused
@@ -521,7 +543,10 @@ impl<R: Read, S: Sink> TarReader<R, S> {
         let gid = ov.gid.map_or_else(|| number(&block[116..124], "gid"), Ok)?;
         let mtime = match ov.mtime {
             Some(m) => m,
-            None => i64::try_from(number(&block[136..148], "mtime")?).unwrap_or(0),
+            None => (
+                i64::try_from(number(&block[136..148], "mtime")?).unwrap_or(0),
+                0,
+            ),
         };
         let uid = u32::try_from(uid).map_err(|_| invalid("uid is too large"))?;
         let gid = u32::try_from(gid).map_err(|_| invalid("gid is too large"))?;
@@ -662,6 +687,48 @@ mod tests {
         assert_eq!(entries[1].1, b"hello");
         assert_eq!(entries[2].0.kind, Kind::Symlink);
         assert_eq!(entries[2].0.link.as_deref(), Some("file"));
+    }
+
+    #[test]
+    fn test_pax_times() {
+        let t = |s: &str| pax_time(s.as_bytes());
+        assert_eq!(t("5"), Some((5, 0)));
+        assert_eq!(t("1.5"), Some((1, 500_000_000)));
+        assert_eq!(t("1.000000005"), Some((1, 5)));
+        assert_eq!(t("1.1234567891"), Some((1, 123_456_789)));
+        assert_eq!(t("-1"), Some((-1, 0)));
+        assert_eq!(t("-1.5"), Some((-2, 500_000_000)));
+        assert_eq!(t("-0.25"), Some((-1, 750_000_000)));
+        assert_eq!(t("7."), Some((7, 0)));
+        for bad in [
+            "",
+            "-",
+            ".5",
+            "1.5x",
+            "1e3",
+            "+1",
+            "--1",
+            "1.-5",
+            "99999999999999999999",
+        ] {
+            assert_eq!(t(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_mtime_from_pax() {
+        let mut pax = tar::Builder::new(Vec::new());
+        pax.append_pax_extensions([("mtime", b"1700000000.25".as_slice())])
+            .unwrap();
+        entry(&mut pax, "a", tar::EntryType::Regular, b"");
+        pax.append_pax_extensions([("mtime", b"-1.5".as_slice())])
+            .unwrap();
+        entry(&mut pax, "b", tar::EntryType::Regular, b"");
+        entry(&mut pax, "c", tar::EntryType::Regular, b"");
+        let entries = read_all(pax.into_inner().unwrap()).unwrap();
+        assert_eq!(entries[0].0.mtime, (1_700_000_000, 250_000_000));
+        assert_eq!(entries[1].0.mtime, (-2, 500_000_000));
+        assert_eq!(entries[2].0.mtime, (1_700_000_000, 0));
     }
 
     #[test]

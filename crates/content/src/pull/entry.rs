@@ -39,12 +39,17 @@ fn is_overlay_xattr(name: &str) -> bool {
         })
 }
 
-pub fn rfc3339(secs: i64) -> Option<String> {
+pub fn rfc3339((secs, nanos): (i64, u32)) -> Option<String> {
     // RFC 3339 has four digit years: a time outside of them is clamped
     // (chrono would write `+10000-...`, which the Go parsers refuse)
     const FIRST: i64 = -62_135_596_800; // 0001-01-01T00:00:00Z
     const LAST: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
-    chrono::DateTime::from_timestamp(secs.clamp(FIRST, LAST), 0).map(|t| t.to_rfc3339())
+    let (secs, nanos) = match secs {
+        ..FIRST => (FIRST, 0),
+        LAST.. => (LAST, 0),
+        _ => (secs, nanos),
+    };
+    chrono::DateTime::from_timestamp(secs, nanos).map(|t| t.to_rfc3339())
 }
 
 /// The TOC entry of a tar header.  `file_digest` is the digest of the
@@ -153,7 +158,7 @@ mod tests {
             mode: 0o755,
             uid: 1,
             gid: 2,
-            mtime: 1_700_000_000,
+            mtime: (1_700_000_000, 0),
             link: None,
             dev_major: 0,
             dev_minor: 0,
@@ -177,6 +182,17 @@ mod tests {
     }
 
     #[test]
+    fn test_the_nanoseconds_of_a_time_are_kept() {
+        let mut h = header("f", Kind::Directory);
+        h.mtime = (1_700_000_000, 123_456_789);
+        let e = from_header(&h, None).unwrap().unwrap();
+        assert_eq!(e.mtime(), (1_700_000_000, 123_456_789));
+        h.mtime = (-2, 500_000_000);
+        let e = from_header(&h, None).unwrap().unwrap();
+        assert_eq!(e.mtime(), (-2, 500_000_000));
+    }
+
+    #[test]
     fn test_regular_file() {
         let d = crate::sha256_text(b"abc");
         let e = from_header(&header("./usr/bin/x", Kind::Regular), Some(&d))
@@ -188,11 +204,11 @@ mod tests {
         assert_eq!(e.mode, 0o755);
         assert!(e.mod_time.is_some());
         assert_eq!(
-            rfc3339(i64::MAX).as_deref(),
+            rfc3339((i64::MAX, 7)).as_deref(),
             Some("9999-12-31T23:59:59+00:00")
         );
         assert_eq!(
-            rfc3339(i64::MIN).as_deref(),
+            rfc3339((i64::MIN, 7)).as_deref(),
             Some("0001-01-01T00:00:00+00:00")
         );
     }

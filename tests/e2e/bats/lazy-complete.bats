@@ -214,7 +214,7 @@ lease_held () {
     files=$(files_in_store)
     check_match "the files are in the store" "^[1-9][0-9]*$" "$files"
     check "the staging area is empty" "0 0" "$(files_in_pool) $(( $(staged_layers) + $(find "$PULLS" -mindepth 1 2> /dev/null | wc -l) ))"
-    check_match "the image of the layer is the store's" "^layer-toc-sha256-[0-9a-f]{64}\.v4\.erofs$" "$(ls "$WORKDIR/store/composefs" | grep erofs)"
+    check_match "the image of the layer is the store's" "^layer-toc-sha256-[0-9a-f]{64}\.v5\.erofs$" "$(ls "$WORKDIR/store/composefs" | grep erofs)"
     check "the layer and the image are rows" "1 1" "$(db 'SELECT count(*) FROM layers') $(db 'SELECT count(*) FROM images')"
     check_match "the container goes on" "^[0-9]+\.[0-9]+" "$(sh_ container exec lz cat /etc/alpine-release 2>&1)"
     # every file of the container is content of the store (the objects)

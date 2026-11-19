@@ -1304,6 +1304,10 @@ without the numbers of issues or pull requests of any tracker.
 
 ### Fixed
 
+- The files of a pulled layer keep the nanoseconds of their modification
+  time (a PAX `mtime` record of a fraction of a second, or before 1970); they
+  had whole seconds.  The EROFS images of the layers are made again in the
+  new format version 5.
 - A pull whose peers do not answer (a member whose store hangs) or are slow
   from the first byte goes on from the registry within seconds: a request
   waits for a stream to the peer no longer than the idle time (it waited for

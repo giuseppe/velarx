@@ -25,8 +25,9 @@ pub const DIR: &str = "composefs";
 /// (`OVL_MAX_STACK` of the kernel).
 pub const OVERLAY_MAX_STACK: usize = 500;
 /// The version of the images: a new one makes new names (4: the stubs and
-/// the index are sized by the algorithm of the digests of the layer).
-const FORMAT: u32 = 4;
+/// the index are sized by the algorithm of the digests of the layer; 5: the
+/// nanoseconds of the times of a pulled layer).
+const FORMAT: u32 = 5;
 
 /// The directory of the EROFS images, the indexes and the profiles of the
 /// store whose objects are `objects`.
@@ -316,11 +317,11 @@ mod tests {
         let toc = format!("toc-{whole}");
         assert_eq!(
             layer_image_path(objects, &whole),
-            Path::new(&format!("/s/composefs/layer-{whole}.v4.erofs"))
+            Path::new(&format!("/s/composefs/layer-{whole}.v5.erofs"))
         );
         assert_eq!(
             layer_index_path(objects, &toc),
-            Path::new(&format!("/s/composefs/layer-{toc}.v4.index"))
+            Path::new(&format!("/s/composefs/layer-{toc}.v5.index"))
         );
         assert_ne!(
             layer_image_path(objects, &whole),

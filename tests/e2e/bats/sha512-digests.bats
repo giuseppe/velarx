@@ -152,7 +152,7 @@ objects_of () { # store, digits
     # (the same content under the two algorithms is two objects: the
     # sha256 ones are still all there)
     check "the sha256 objects are untouched" "$sha256_objects" "$(objects_of "$store" 62)"
-    check_match "the EROFS images are of the layers' algorithm" "layer-sha512-[0-9a-f]{128}\\.v4\\.erofs" "$(ls "$store/composefs")"
+    check_match "the EROFS images are of the layers' algorithm" "layer-sha512-[0-9a-f]{128}\\.v5\\.erofs" "$(ls "$store/composefs")"
     out=$(shs "$store" run --rm --network none "$DIST/$REPO@$ALL" echo from-sha512 2>&1)
     check "run" 0 $?
     check_match "ran" "from-sha512" "$out"
@@ -287,7 +287,7 @@ EOT
     check "pull on a file system with fs-verity" 0 $?
     # (the EROFS image of the layer has SHA-512 fs-verity: the digest a
     # manifest states for it, and the objects are of 126 digits)
-    erofs=$(fsverity measure "$store"/composefs/layer-sha512-*.v4.erofs | awk '{print $1}')
+    erofs=$(fsverity measure "$store"/composefs/layer-sha512-*.v5.erofs | awk '{print $1}')
     check_match "the image has a SHA-512 digest" '^sha512:[0-9a-f]{128}$' "$erofs"
     [ "$(objects_of "$store" 126)" -gt 0 ] || exit 1
     # a manifest of the same image that states it (the image is then one the

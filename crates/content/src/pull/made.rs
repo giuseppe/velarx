@@ -120,7 +120,7 @@ impl MadeOut<'_> {
             mode: h.mode()? & 0o7777,
             uid: u32::try_from(h.uid()?).map_err(|_| io::Error::other("uid is too large"))?,
             gid: u32::try_from(h.gid()?).map_err(|_| io::Error::other("gid is too large"))?,
-            mtime: i64::try_from(h.mtime()?).unwrap_or(0),
+            mtime: (i64::try_from(h.mtime()?).unwrap_or(0), 0),
             link,
             dev_major,
             dev_minor,

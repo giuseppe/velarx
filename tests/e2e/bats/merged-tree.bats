@@ -45,7 +45,7 @@ json.dump([(d, zstd.decompress(t).decode()) for d, t in rows], open(sys.argv[3],
 PY
     # (named by the key of the layer: `toc:sha256:<hex>` makes `toc-sha256-<hex>`)
     for i in $(python3 -I -c 'import json,sys; print(" ".join(d.replace("toc:", "toc-").replace(":", "-") for d, _ in json.load(open(sys.argv[1]))))' "$layers"); do
-        if [ ! -f "$WORKDIR/store/composefs/layer-$i.v4.erofs" ]; then
+        if [ ! -f "$WORKDIR/store/composefs/layer-$i.v5.erofs" ]; then
             echo "FAIL $image: the pull made no EROFS image of the layer $i"; exit 1
         fi
     done

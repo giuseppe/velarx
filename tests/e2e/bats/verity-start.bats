@@ -136,7 +136,7 @@ c.commit()' "$(db_of "$store")" || exit 1
     shs "$store" image pull --tls-verify=false "$SEALED" > /dev/null || exit 1
     check_match "it runs" '^[0-9]+\.[0-9]+' "$(run_in "$store" "$SEALED" --security-opt verity=enforce)"
     shs "$store" create --name tampered --network none --security-opt verity=enforce "$SEALED" cat /etc/alpine-release > /dev/null || exit 1
-    for f in "$store"/composefs/layer-*.v4.erofs; do
+    for f in "$store"/composefs/layer-*.v5.erofs; do
         cp "$f" "$f.copy" && rm -f "$f" && mv "$f.copy" "$f"
     done
     out=$(shs "$store" start -a tampered 2>&1)
@@ -152,14 +152,14 @@ c.commit()' "$(db_of "$store")" || exit 1
     store=$VS/linked
     shs "$store" image pull --tls-verify=false "$SEALED" > /dev/null || exit 1
     shs "$store" create --name linked --network none --security-opt verity=enforce "$SEALED" cat /etc/alpine-release > /dev/null || exit 1
-    for f in "$store"/composefs/layer-*.v4.erofs; do
+    for f in "$store"/composefs/layer-*.v5.erofs; do
         mv "$f" "$f.moved" && ln -s "$(basename "$f.moved")" "$f"
     done
     # (the file the link names has the digest the manifest states: the name is
     # what is refused, the image is opened by a name that is no link)
     out=$(shs "$store" start -a linked 2>&1)
-    check_match "refused by the monitor" "layer-(toc-)?sha256-[0-9a-f]{64}\\.v4\\.erofs: .*symbolic links" "$out"
-    for f in "$store"/composefs/layer-*.v4.erofs; do
+    check_match "refused by the monitor" "layer-(toc-)?sha256-[0-9a-f]{64}\\.v5\\.erofs: .*symbolic links" "$out"
+    for f in "$store"/composefs/layer-*.v5.erofs; do
         rm -f "$f" && mv "$f.moved" "$f"
     done
     out=$(shs "$store" start -a linked 2>&1)
@@ -174,7 +174,7 @@ c.commit()' "$(db_of "$store")" || exit 1
     shs "$store" create --name swapped --network none --security-opt verity=enforce "$SEALED" cat /etc/alpine-release > /dev/null || exit 1
     # the image and one byte more (an EROFS that mounts, of another digest),
     # with fs-verity
-    for f in "$store"/composefs/layer-*.v4.erofs; do
+    for f in "$store"/composefs/layer-*.v5.erofs; do
         { cat "$f"; printf x; } > "$f.other" || exit 1
         python3 -I -c '
 import fcntl, os, struct, sys
@@ -185,9 +185,9 @@ fcntl.ioctl(fd, 0x40806685, struct.pack("=IIIIQIIQ88x", 1, 1, 4096, 0, 0, 0, 0, 
         mv "$f" "$f.moved" && mv "$f.other" "$f"
     done
     out=$(shs "$store" start -a swapped 2>&1)
-    check_match "refused at the start" "layer-(toc-)?sha256-[0-9a-f]{64}\\.v4\\.erofs has the fs-verity digest sha256:[0-9a-f]{64}, expected" "$out"
+    check_match "refused at the start" "layer-(toc-)?sha256-[0-9a-f]{64}\\.v5\\.erofs has the fs-verity digest sha256:[0-9a-f]{64}, expected" "$out"
     check "not run" 1 "$([ "$out" != "${out#*Error}" ] && echo 1 || echo 0)"
-    for f in "$store"/composefs/layer-*.v4.erofs; do
+    for f in "$store"/composefs/layer-*.v5.erofs; do
         rm -f "$f" && mv "$f.moved" "$f"
     done
     out=$(shs "$store" start -a swapped 2>&1)
@@ -206,7 +206,7 @@ fcntl.ioctl(fd, 0x40806685, struct.pack("=IIIIQIIQ88x", 1, 1, 4096, 0, 0, 0, 0, 
     shs "$store" image pull --tls-verify=false "$SEALED" > /dev/null || exit 1
     shs "$store" create --name onebyte --network none --security-opt verity=enforce "$SEALED" cat /etc/alpine-release > /dev/null || exit 1
     id=$(shs "$store" inspect --format '{{.Id}}' onebyte)
-    for f in "$store"/composefs/layer-*.v4.erofs; do
+    for f in "$store"/composefs/layer-*.v5.erofs; do
         python3 -I -c '
 import fcntl, os, struct, sys
 src, dst = sys.argv[1], sys.argv[2]
@@ -224,9 +224,9 @@ fcntl.ioctl(fd, 0x40806685, struct.pack("=IIIIQIIQ88x", 1, 1, 4096, 0, 0, 0, 0, 
     done
     out=$(shs "$store" start -a onebyte 2>&1)
     check "not run" 1 "$([ "$out" != "${out#*Error}" ] && echo 1 || echo 0)"
-    check_match "refused by its digest" "layer-(toc-)?sha256-[0-9a-f]{64}\\.v4\\.erofs has the fs-verity digest sha256:[0-9a-f]{64}, expected" "$out"
+    check_match "refused by its digest" "layer-(toc-)?sha256-[0-9a-f]{64}\\.v5\\.erofs has the fs-verity digest sha256:[0-9a-f]{64}, expected" "$out"
     check "no image server serves it" "" "$(image_server_of "$id")"
-    for f in "$store"/composefs/layer-*.v4.erofs; do
+    for f in "$store"/composefs/layer-*.v5.erofs; do
         rm -f "$f" && mv "$f.moved" "$f"
     done
     out=$(shs "$store" start -a onebyte 2>&1)
@@ -244,7 +244,7 @@ fcntl.ioctl(fd, 0x40806685, struct.pack("=IIIIQIIQ88x", 1, 1, 4096, 0, 0, 0, 0, 
     store=$VS/swapped-off
     shs "$store" image pull --tls-verify=false "$SEALED" > /dev/null || exit 1
     shs "$store" create --name swapped-off --network none "$SEALED" cat /etc/alpine-release > /dev/null || exit 1
-    for f in "$store"/composefs/layer-*.v4.erofs; do
+    for f in "$store"/composefs/layer-*.v5.erofs; do
         { cat "$f"; printf x; } > "$f.other" || exit 1
         python3 -I -c '
 import fcntl, os, struct, sys
@@ -255,14 +255,14 @@ fcntl.ioctl(fd, 0x40806685, struct.pack("=IIIIQIIQ88x", 1, 1, 4096, 0, 0, 0, 0, 
         mv "$f" "$f.moved" && mv "$f.other" "$f"
     done
     out=$(shs "$store" start -a swapped-off 2>&1)
-    check_match "refused by its digest" "layer-(toc-)?sha256-[0-9a-f]{64}\\.v4\\.erofs has the fs-verity digest sha256:[0-9a-f]{64}, expected" "$out"
+    check_match "refused by its digest" "layer-(toc-)?sha256-[0-9a-f]{64}\\.v5\\.erofs has the fs-verity digest sha256:[0-9a-f]{64}, expected" "$out"
     check "not run" 1 "$([ "$out" != "${out#*Error}" ] && echo 1 || echo 0)"
-    for f in "$store"/composefs/layer-*.v4.erofs; do
+    for f in "$store"/composefs/layer-*.v5.erofs; do
         rm -f "$f" && ln -s "$(basename "$f.moved")" "$f"
     done
     out=$(shs "$store" start -a swapped-off 2>&1)
-    check_match "a link in its place is refused" "layer-(toc-)?sha256-[0-9a-f]{64}\\.v4\\.erofs: .*symbolic links" "$out"
-    for f in "$store"/composefs/layer-*.v4.erofs; do
+    check_match "a link in its place is refused" "layer-(toc-)?sha256-[0-9a-f]{64}\\.v5\\.erofs: .*symbolic links" "$out"
+    for f in "$store"/composefs/layer-*.v5.erofs; do
         rm -f "$f" && mv "$f.moved" "$f"
     done
     out=$(shs "$store" start -a swapped-off 2>&1)

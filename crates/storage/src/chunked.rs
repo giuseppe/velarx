@@ -104,10 +104,13 @@ pub struct TocEntry {
 
 /// A time of a table of contents (RFC 3339) as seconds since the epoch
 /// (negative before it) and nanoseconds (0 to 999 999 999, after the
-/// seconds); none when there is none or it is not RFC 3339.
+/// seconds); none when there is none or it is not RFC 3339.  A leap second
+/// (`23:59:60`) is the first second of the next minute.
 pub fn toc_time(t: Option<&str>) -> Option<(i64, u32)> {
+    const SECOND: u32 = 1_000_000_000;
     let d = chrono::DateTime::parse_from_rfc3339(t?).ok()?;
-    Some((d.timestamp(), d.timestamp_subsec_nanos()))
+    let nanos = d.timestamp_subsec_nanos();
+    Some((d.timestamp() + i64::from(nanos / SECOND), nanos % SECOND))
 }
 
 impl TocEntry {
@@ -203,6 +206,15 @@ pub fn parse_toc_from_bytes(data: &[u8]) -> ChunkedResult<Toc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_toc_times() {
+        let t = |s: &str| toc_time(Some(s));
+        assert_eq!(t("1970-01-01T00:00:01.5Z"), Some((1, 500_000_000)));
+        assert_eq!(t("1969-12-31T23:59:59.25Z"), Some((-1, 250_000_000)));
+        assert_eq!(t("2016-12-31T23:59:60.5Z"), t("2017-01-01T00:00:00.5Z"));
+        assert_eq!(t("yesterday"), None);
+    }
 
     #[test]
     fn test_toc_entry_type_serialization() {
