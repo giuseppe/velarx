@@ -363,14 +363,14 @@ fn test_metadata_checks() {
         tarsplit: Some((0, ts.len() as u64, 0)),
     };
     let layer = crate::sha256(b"layer");
-    assert!(verify_metadata(&info, &toc_z, ts.clone(), &layer).is_ok());
+    assert!(verify_metadata(&info, &toc_z, ts.clone(), &layer, u64::MAX).is_ok());
     let mut bad = info.clone();
     bad.checksum = crate::sha256(b"other");
-    assert!(verify_metadata(&bad, &toc_z, ts.clone(), &layer).is_err());
-    assert!(verify_metadata(&info, &toc_z, b"tx".to_vec(), &layer).is_err());
+    assert!(verify_metadata(&bad, &toc_z, ts.clone(), &layer, u64::MAX).is_err());
+    assert!(verify_metadata(&info, &toc_z, b"tx".to_vec(), &layer, u64::MAX).is_err());
     let mut bad = info.clone();
     bad.toc.2 += 1;
-    assert!(verify_metadata(&bad, &toc_z, ts, &layer).is_err());
+    assert!(verify_metadata(&bad, &toc_z, ts, &layer, u64::MAX).is_err());
 }
 
 #[test]
@@ -1509,7 +1509,7 @@ fn test_a_canonical_layer_needs_no_tar_split() {
     let toc = canonical_layer();
     assert!(toc.is_canonical() && toc.tar_split_digest.is_none());
     let (z, info) = vouched(&toc, None);
-    let meta = verify_metadata(&info, &z, Vec::new(), &layer).unwrap();
+    let meta = verify_metadata(&info, &z, Vec::new(), &layer, u64::MAX).unwrap();
     assert!(meta.tarsplit_z.is_empty());
     assert_eq!(meta.toc.entries.len(), toc.entries.len());
 }
@@ -1520,7 +1520,7 @@ fn test_a_table_of_version_2_that_is_not_canonical_is_an_error_that_names_the_la
     let good = canonical_layer();
     let refused = |toc: &Toc, tarsplit| {
         let (z, info) = vouched(toc, tarsplit);
-        let e = verify_metadata(&info, &z, b"ts".to_vec(), &layer)
+        let e = verify_metadata(&info, &z, b"ts".to_vec(), &layer, u64::MAX)
             .err()
             .unwrap();
         // (the descriptor vouches for it: the layer is not pulled whole)
@@ -1563,7 +1563,7 @@ fn test_a_table_of_version_1_without_a_tar_split_is_an_error_that_names_the_laye
     };
     for toc in [toc.clone(), Toc { version: 3, ..toc }] {
         let (z, info) = vouched(&toc, None);
-        let e = verify_metadata(&info, &z, Vec::new(), &layer)
+        let e = verify_metadata(&info, &z, Vec::new(), &layer, u64::MAX)
             .err()
             .unwrap();
         let text = e.to_string();
@@ -1588,16 +1588,92 @@ fn test_a_table_of_version_1_without_the_fs_verity_digest_of_a_file_is_an_error(
         tar_split_digest: Some(tarsplit.clone()),
     };
     let (z, info) = vouched(&toc(&file), Some((0, ts.len() as u64, 0)));
-    assert!(verify_metadata(&info, &z, ts.clone(), &layer).is_ok());
+    assert!(verify_metadata(&info, &z, ts.clone(), &layer, u64::MAX).is_ok());
     file.fsverity = None;
     let (z, info) = vouched(&toc(&file), Some((0, ts.len() as u64, 0)));
-    let e = verify_metadata(&info, &z, ts, &layer).err().unwrap();
+    let e = verify_metadata(&info, &z, ts, &layer, u64::MAX)
+        .err()
+        .unwrap();
     let text = e.to_string();
     assert!(text.contains(&layer.to_string()), "{text}");
     assert!(
         text.contains(&format!("no fs-verity digest for `{}`", file.name)),
         "{text}"
     );
+}
+
+/// `file` again under `name`, 4096 bytes larger (the last chunk too).
+fn bigger_copy(file: &TocEntry, name: &str) -> TocEntry {
+    let mut copy = file.clone();
+    copy.name = name.to_string();
+    copy.size += 4096;
+    if copy.chunk_size != 0 {
+        copy.chunk_size += 4096;
+    }
+    copy
+}
+
+#[test]
+fn test_a_table_that_lists_one_digest_with_two_sizes_is_an_error_that_names_the_layer() {
+    let layer = crate::sha256(b"layer");
+    let digest = canonical_layer().entries[3].verity().unwrap();
+    let refused = |toc: Toc, tarsplit: Option<(u64, u64, u64)>, ts: Vec<u8>| {
+        let (z, info) = vouched(&toc, tarsplit);
+        let e = verify_metadata(&info, &z, ts, &layer, u64::MAX)
+            .err()
+            .unwrap();
+        assert!(refuses(&e), "{e}");
+        let text = e.to_string();
+        assert!(text.contains(&layer.to_string()), "{text}");
+        assert!(text.contains(&digest), "{text}");
+        assert!(text.contains("two sizes"), "{text}");
+    };
+    // version 2
+    let mut toc = canonical_layer();
+    let copy = bigger_copy(&toc.entries[3], "./d/c");
+    toc.entries.push(copy);
+    refused(toc, None, Vec::new());
+    // version 1: the tar-split describes the same entries
+    let file = canonical_layer().entries[3].clone();
+    let entries = vec![file.clone(), bigger_copy(&file, "./c")];
+    let ts = tarsplit_of(&entries);
+    let toc = Toc {
+        version: 1,
+        entries,
+        tar_split_digest: Some(crate::sha256(&ts).to_string()),
+    };
+    refused(toc, Some((0, ts.len() as u64, 0)), ts);
+}
+
+#[test]
+fn test_a_table_whose_files_do_not_fit_a_layer_is_an_error_that_names_the_layer() {
+    let layer = crate::sha256(b"layer");
+    let good = canonical_layer();
+    let refused = |toc: &Toc, tarsplit, ts: Vec<u8>, max| {
+        let (z, info) = vouched(toc, tarsplit);
+        let e = verify_metadata(&info, &z, ts, &layer, max).err().unwrap();
+        assert!(refuses(&e), "{e}");
+        assert!(e.to_string().contains(&layer.to_string()), "{e}");
+    };
+    // version 2: a file of 2^64-1 bytes, and a layer larger than the limit
+    let mut toc = good.clone();
+    toc.entries[3].size = u64::MAX;
+    refused(&toc, None, Vec::new(), u64::MAX);
+    refused(&good, None, Vec::new(), 1000);
+    let (z, info) = vouched(&good, None);
+    assert!(verify_metadata(&info, &z, Vec::new(), &layer, 1 << 20).is_ok());
+    // version 1: sizes that add up to more than a u64
+    let mut file = good.entries[3].clone();
+    file.size = u64::MAX / 2 + 1;
+    let mut other = file.clone();
+    other.name = "./c".into();
+    other.fsverity = good.entries[2].fsverity.clone();
+    let toc = Toc {
+        version: 1,
+        entries: vec![file, other],
+        tar_split_digest: Some(crate::sha256(b"ts").to_string()),
+    };
+    refused(&toc, Some((0, 2, 0)), b"ts".to_vec(), u64::MAX);
 }
 
 #[test]

@@ -1203,3 +1203,108 @@ fn a_tar_larger_than_a_u64_has_no_size() {
     assert!(stream_size(&[half("./a")]).is_ok());
     assert!(stream_size(&[half("./a"), half("./b")]).is_err());
 }
+
+fn verified(name: &str, size: u64, offset: u64) -> TocEntry {
+    let mut e = file(name, size);
+    e.fsverity = Some(format!("sha256-12:{}", "ab".repeat(32)));
+    e.offset = offset;
+    e.end_offset = offset + 1;
+    e
+}
+
+#[test]
+fn a_digest_has_one_size() {
+    // the same content under two names, with other modes: a table
+    let mut b = verified("./b", 10, 1);
+    b.mode = 0o755;
+    assert!(validate(&[verified("./a", 10, 1), b]).is_ok());
+    // two sizes for one digest
+    let e = validate(&[verified("./a", 10, 1), verified("./b", 11, 1)]).unwrap_err();
+    assert!(e.to_string().contains("two sizes: 10 and 11"), "{e}");
+    assert_eq!(e.index, 1);
+    // the same size seen through other chunks is fine, the sum is not
+    let mut a = verified("./a", 10, 1);
+    a.chunk_size = 4;
+    let mut chunk = entry("./a", TocEntryType::Chunk);
+    chunk.chunk_offset = 4;
+    chunk.chunk_size = 6;
+    assert!(validate(&[a.clone(), chunk.clone()]).is_ok());
+    chunk.chunk_size = 7;
+    assert!(validate(&[a, chunk]).is_err());
+}
+
+#[test]
+fn a_table_whose_tar_does_not_fit_is_refused() {
+    let big = |name: &str, size: u64| {
+        let mut e = verified(name, size, 1);
+        e.fsverity = Some(format!("sha256-12:{}", name.len().to_string().repeat(64)));
+        e.digest = None;
+        e
+    };
+    // one file of 2^64-1 bytes, or two of 2^63 bytes, or one that only the
+    // padding and the headers make too large
+    for table in [
+        vec![big("./a", u64::MAX)],
+        vec![big("./a", u64::MAX - 1023)],
+        vec![big("./a", 1 << 63), big("./bb", 1 << 63)],
+    ] {
+        let e = validate(&table).unwrap_err();
+        assert!(e.to_string().contains("tar is larger"), "{e}");
+        assert_eq!(e.index, table.len() - 1);
+        assert!(stream_size(&table).is_err());
+    }
+    // a table that fits has a size, and the bound is the size
+    let table = [big("./a", 1 << 40)];
+    validate(&table).unwrap();
+    let size = stream_size(&table).unwrap();
+    validate_within(&table, size).unwrap();
+    assert!(validate_within(&table, size - 1).is_err());
+}
+
+#[test]
+fn what_validate_accepts_has_a_tar() {
+    // sizes near the limits of a u64 and of the fields of a header
+    let sizes = [
+        0,
+        1,
+        511,
+        512,
+        MAX_OCTAL_11,
+        MAX_OCTAL_11 + 1,
+        1 << 40,
+        1 << 62,
+        (1 << 63) - 1,
+        1 << 63,
+        u64::MAX - 1023,
+        u64::MAX - 511,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for _ in 0..3000 {
+        let n = 1 + next() % 4;
+        let table: Vec<TocEntry> = (0..n)
+            .map(|i| {
+                let size = match next() % 3 {
+                    0 => sizes[(next() % sizes.len() as u64) as usize],
+                    1 => u64::MAX - next() % 4096,
+                    _ => next() >> (next() % 64),
+                };
+                let mut e = verified(&format!("./f{i}"), size, 1);
+                e.fsverity = Some(format!("sha256-12:{:064x}", i));
+                e
+            })
+            .collect();
+        let max = [u64::MAX, 1 << 63, 1 << 40][(next() % 3) as usize];
+        if validate_within(&table, max).is_ok() {
+            let size = stream_size(&table).unwrap();
+            assert!(size <= max);
+        }
+    }
+}

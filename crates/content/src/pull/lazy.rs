@@ -115,12 +115,15 @@ pub type Found = (Info, LazyLayer);
 /// zstd:chunked; a table that cannot be used is an error
 /// ([`chunked::verify_metadata`]).
 pub async fn pull_metadata(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<Option<Found>> {
+    let max_tar = ctx.limits.max_layer_bytes;
     let Some(info) = chunked::parse_info(layer)? else {
         return Ok(None);
     };
     // (the fetcher finds them: `Probe`; what it gives is verified below)
     let (toc_z, ts_z) = chunked::metadata(ctx, layer).await?;
-    found_of(info, (toc_z, ts_z), layer.digest).await.map(Some)
+    found_of(info, (toc_z, ts_z), layer.digest, max_tar)
+        .await
+        .map(Some)
 }
 
 /// The lazy layer of `layer` from its table of contents and tar-split as
@@ -130,11 +133,12 @@ async fn found_of(
     info: Info,
     (toc_z, ts_z): (Vec<u8>, Vec<u8>),
     layer_digest: Digest,
+    max_tar: u64,
 ) -> ImageResult<Found> {
     let fetched = (toc_z.len() + ts_z.len()) as u64;
     let layer_info: Info = info.clone();
     let lazy = tokio::task::spawn_blocking(move || -> ImageResult<LazyLayer> {
-        let meta = chunked::verify_metadata(&layer_info, &toc_z, ts_z, &layer_digest)?;
+        let meta = chunked::verify_metadata(&layer_info, &toc_z, ts_z, &layer_digest, max_tar)?;
         Ok(LazyLayer {
             toc: meta.stored,
             tarsplit: meta.tarsplit_z,
@@ -158,6 +162,7 @@ pub async fn accept(
     layer: &OciDescriptor,
     reply: &crate::fetcher::fetch::Probed,
     metadata: Option<(Vec<u8>, Vec<u8>)>,
+    max_tar: u64,
 ) -> ImageResult<Result<Found, crate::fetcher::fetch::NotLazy>> {
     use crate::fetcher::fetch::{NotLazy as Why, TocSource};
     let Some(info) = chunked::parse_info(layer)? else {
@@ -166,7 +171,7 @@ pub async fn accept(
     let (TocSource::Carried, Some(metadata)) = (reply.toc, metadata) else {
         return Ok(Err(reply.reason.unwrap_or(Why::Unreachable)));
     };
-    let found = found_of(info, metadata, layer.digest).await?;
+    let found = found_of(info, metadata, layer.digest, max_tar).await?;
     Ok(match reply.on_demand {
         true => Ok(found),
         false => Err(reply.reason.unwrap_or(Why::NoRanges)),

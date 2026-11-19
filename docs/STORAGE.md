@@ -192,7 +192,8 @@ What the design gives:
   write that finds the file system full (or the quota of the user spent)
   fails with the error of the file system, and the pull removes what it
   wrote.  A layer that the manifest announces larger than
-  `max_layer_gib` is not fetched, and a download (a layer, a blob, a range,
+  `max_layer_gib`, or whose table of contents gives its files more bytes
+  than that, is not fetched, and a download (a layer, a blob, a range,
   a manifest, a URL) that brings less than `min_speed_kib` KiB per second
   over `min_speed_secs` seconds of waiting fails: the read timeout (60 s)
   restarts with every byte.  The pull workers run in a

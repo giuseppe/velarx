@@ -284,7 +284,8 @@ pub async fn layer_index(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<Op
     let by_table = async {
         let (toc_z, ts_z) = metadata(ctx, layer).await?;
         let digest = layer.digest;
-        tokio::task::spawn_blocking(move || verify_metadata(&info, &toc_z, ts_z, &digest))
+        let max_tar = ctx.limits.max_layer_bytes;
+        tokio::task::spawn_blocking(move || verify_metadata(&info, &toc_z, ts_z, &digest, max_tar))
             .await
             .map_err(|e| fail(e.to_string()))?
     };
@@ -332,7 +333,7 @@ fn invalid_canonical(layer: &Digest, reason: impl std::fmt::Display) -> ImageErr
 
 /// The table of contents (and the tar-split, which a layer with a table of
 /// version 2 has not) that a descriptor vouches for, checked against what
-/// it says.  The table of a layer is the one of a canonical tar when its
+/// it says, and for a tar of at most `max_tar` bytes.  The table of a layer is the one of a canonical tar when its
 /// `version` is 2, whatever the annotations say: it must be one, and then
 /// it is all the layer has.  A layer with a table is pulled by it or not at
 /// all: one that has no tar-split and no table of version 2, or whose table
@@ -342,6 +343,7 @@ pub fn verify_metadata(
     toc_z: &[u8],
     ts_z: Vec<u8>,
     layer: &Digest,
+    max_tar: u64,
 ) -> ImageResult<Metadata> {
     // (what the descriptor vouches for: bytes that are not it are not a
     // layer to pull another way, see `pull`)
@@ -354,7 +356,7 @@ pub fn verify_metadata(
     }
     // (the bytes are those the descriptor vouches for: what is wrong with
     // them is wrong again on every try)
-    vouched_metadata(info, toc_z, ts_z, layer).map_err(|e| match e {
+    vouched_metadata(info, toc_z, ts_z, layer, max_tar).map_err(|e| match e {
         ImageError::Layer(m) => ImageError::Contradicted(format!("layer {layer}: {m}")),
         e => e,
     })
@@ -366,6 +368,7 @@ fn vouched_metadata(
     toc_z: &[u8],
     ts_z: Vec<u8>,
     layer: &Digest,
+    max_tar: u64,
 ) -> ImageResult<Metadata> {
     let json = decompress_bounded(toc_z, MAX_TOC_JSON, info.toc.2, "TOC")?;
     let toc: Toc = serde_json::from_slice(&json).map_err(|e| fail(format!("invalid TOC: {e}")))?;
@@ -377,7 +380,8 @@ fn vouched_metadata(
         if info.tarsplit.is_some() || toc.tar_split_digest.is_some() {
             return Err(invalid_canonical(layer, "the layer has a tar-split"));
         }
-        canonical::validate(&toc.entries).map_err(|e| invalid_canonical(layer, e))?;
+        canonical::validate_within(&toc.entries, max_tar)
+            .map_err(|e| invalid_canonical(layer, e))?;
         let toc = Arc::new(toc);
         return Ok(Metadata {
             stored: toc.clone(),
@@ -395,6 +399,21 @@ fn vouched_metadata(
         return Err(ImageError::Contradicted(format!(
             "layer {layer}: its table of contents has no fs-verity digest for `{}`",
             e.name
+        )));
+    }
+    if let Some((_, reason)) = velarx_storage::size_conflict(&toc.entries) {
+        return Err(fail(reason));
+    }
+    let mut files = toc
+        .entries
+        .iter()
+        .filter(|e| e.entry_type == TocEntryType::Reg);
+    if files
+        .try_fold(0u64, |sum, e| sum.checked_add(e.size))
+        .is_none_or(|sum| sum > max_tar)
+    {
+        return Err(fail(format!(
+            "the files of the layer are more than {max_tar} bytes"
         )));
     }
     let expected = toc
@@ -1984,7 +2003,8 @@ async fn pull_by_table(
     let digest = layer.digest;
     let meta = tokio::task::spawn_blocking({
         let info = info.clone();
-        move || verify_metadata(&info, &toc_z, ts_z, &digest)
+        let max_tar = ctx.limits.max_layer_bytes;
+        move || verify_metadata(&info, &toc_z, ts_z, &digest, max_tar)
     })
     .await
     .map_err(|e| fail(e.to_string()))??;

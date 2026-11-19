@@ -84,7 +84,7 @@
 //! The mapping from the entries of a foreign tar to a table of contents
 //! (what it keeps, clamps or refuses) is not part of these rules.
 
-use crate::{toc_time, TocEntry, TocEntryType};
+use crate::{size_conflict, toc_time, TocEntry, TocEntryType};
 use base64::Engine;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
@@ -220,14 +220,26 @@ struct Seen {
 }
 
 /// The rules of the entries one after the other.
-#[derive(Default)]
 struct Checker {
     previous: Option<String>,
     seen: HashMap<String, Seen>,
     names: usize,
+    /// The bytes of the tar so far, and the most it may have.
+    tar: u64,
+    max_tar: u64,
 }
 
 impl Checker {
+    fn new(max_tar: u64) -> Self {
+        Checker {
+            previous: None,
+            seen: HashMap::new(),
+            names: 0,
+            tar: END.len() as u64,
+            max_tar,
+        }
+    }
+
     fn push(&mut self, f: &Fields) -> Result<(), String> {
         let key = f.key()?;
         self.names += f.name.len();
@@ -330,6 +342,16 @@ impl Checker {
                 return Err("a hard link has no xattrs: they are the target's".into());
             }
         }
+        let mut head = Vec::new();
+        headers(f, self.previous.is_none(), &mut head);
+        // (what `stream_size` adds up)
+        self.tar = f
+            .size
+            .checked_next_multiple_of(BLOCK as u64)
+            .and_then(|n| n.checked_add(head.len() as u64))
+            .and_then(|n| n.checked_add(self.tar))
+            .filter(|&n| n <= self.max_tar)
+            .ok_or_else(|| format!("the tar is larger than {} bytes", self.max_tar))?;
         self.seen.insert(
             f.name.clone(),
             Seen {
@@ -357,7 +379,7 @@ struct OpenFile {
 /// alone, for the table of a layer that is not in a blob yet (no place of
 /// the data, no chunks).
 pub fn validate_entries(entries: &[TocEntry]) -> Result<(), Invalid> {
-    let mut checker = Checker::default();
+    let mut checker = Checker::new(u64::MAX);
     for (i, e) in tar_entries(entries).enumerate() {
         let bad = |reason| Invalid {
             index: i,
@@ -373,14 +395,21 @@ pub fn validate_entries(entries: &[TocEntry]) -> Result<(), Invalid> {
 /// Says whether the entries of a table of contents have a canonical tar,
 /// and the table is one a reader can use: the entries of a file with
 /// content have its fs-verity digest and the place of its data in the
-/// blob, and its `chunk` entries follow it and cover it.
+/// blob, and its `chunk` entries follow it and cover it.  The tar is at most
+/// 2^64-1 bytes.
 pub fn validate(entries: &[TocEntry]) -> Result<(), Invalid> {
+    validate_within(entries, u64::MAX)
+}
+
+/// [`validate`] for a table whose tar has at most `max_tar` bytes: a table
+/// that is accepted has a [`stream_size`], and it is at most `max_tar`.
+pub fn validate_within(entries: &[TocEntry], max_tar: u64) -> Result<(), Invalid> {
     let bad = |index: usize, reason: String| Invalid {
         index,
         name: entries[index].name.clone(),
         reason,
     };
-    let mut checker = Checker::default();
+    let mut checker = Checker::new(max_tar);
     let mut open: Option<OpenFile> = None;
     let finish = |open: &mut Option<OpenFile>| match open.take() {
         Some(f) if f.covered != f.size => Err(Invalid {
@@ -433,7 +462,11 @@ pub fn validate(entries: &[TocEntry]) -> Result<(), Invalid> {
             });
         }
     }
-    finish(&mut open)
+    finish(&mut open)?;
+    match size_conflict(entries) {
+        Some((i, reason)) => Err(bad(i, reason)),
+        None => Ok(()),
+    }
 }
 
 struct Block([u8; BLOCK]);
@@ -980,7 +1013,7 @@ fn zeros(r: &mut impl Read, n: u64) -> io::Result<()> {
 /// tar (the rules of [`validate`] that do not need the table of contents).
 /// The content of the files is not read into memory and not checked.
 pub fn validate_tar(mut r: impl Read) -> io::Result<()> {
-    let mut checker = Checker::default();
+    let mut checker = Checker::new(u64::MAX);
     let mut raw = Vec::new();
     let mut expected = Vec::new();
     let mut block = [0u8; BLOCK];

@@ -207,6 +207,26 @@ impl Toc {
     }
 }
 
+/// The first regular file of `entries` whose content (its fs-verity digest)
+/// is listed with a size other than the one before it: the position of the
+/// entry and what is wrong.  A digest names one content, which has one size.
+pub fn size_conflict(entries: &[TocEntry]) -> Option<(usize, String)> {
+    let mut sizes: HashMap<String, u64> = HashMap::new();
+    entries.iter().enumerate().find_map(|(i, e)| {
+        if e.entry_type != TocEntryType::Reg || e.size == 0 {
+            return None;
+        }
+        let key = e.verity()?;
+        let first = *sizes.entry(key.clone()).or_insert(e.size);
+        (first != e.size).then(|| {
+            (
+                i,
+                format!("{key} is listed with two sizes: {first} and {}", e.size),
+            )
+        })
+    })
+}
+
 pub fn parse_toc_from_bytes(data: &[u8]) -> ChunkedResult<Toc> {
     let toc: Toc = serde_json::from_slice(data)?;
     Ok(toc)

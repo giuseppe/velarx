@@ -845,6 +845,7 @@ impl ImageService {
         manifest: &OciManifest,
         stored: &[bool],
         image: &str,
+        max_tar: u64,
     ) -> ImageResult<std::collections::HashMap<String, pull::lazy::Found>> {
         let missing: Vec<u32> = stored
             .iter()
@@ -860,7 +861,7 @@ impl ImageService {
             let answer = match replies.iter().position(|(r, _)| r.layer == at) {
                 Some(i) => {
                     let (reply, metadata) = replies.swap_remove(i);
-                    pull::lazy::accept(layer, &reply, metadata).await?
+                    pull::lazy::accept(layer, &reply, metadata, max_tar).await?
                 }
                 None => Err(velarx_proto::transfer::NotLazy::Unreachable),
             };
@@ -1447,7 +1448,8 @@ impl ImageService {
         let lazy_found = match (&staged, lazy) {
             (Some(staged), true) => {
                 let image = registry_ref.clone().unwrap_or_default();
-                Self::accept_lazy(staged, &manifest, &stored, &image).await?
+                Self::accept_lazy(staged, &manifest, &stored, &image, limits.max_layer_bytes)
+                    .await?
             }
             _ => std::collections::HashMap::new(),
         };

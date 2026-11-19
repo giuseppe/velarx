@@ -755,3 +755,28 @@ async fn test_a_table_that_differs_from_the_tar_stream_is_refused() {
         }
     }
 }
+
+/// A table of version 1 that lists one digest with two sizes is refused
+/// for that, before its tar-split is compared with it.
+#[tokio::test]
+async fn test_a_table_of_version_1_with_one_digest_and_two_sizes_is_refused() {
+    let layer = build_chunked(&sample());
+    let lying = with_toc(&layer, |j| {
+        let entries = j["entries"].as_array_mut().unwrap();
+        let mut copy = entries
+            .iter()
+            .find(|e| e["name"] == "etc/small")
+            .unwrap()
+            .clone();
+        copy["name"] = "zz".into();
+        copy["size"] = 4096.into();
+        entries.push(copy);
+    });
+    for lazy in [false, true] {
+        let refused = toc_pulled(&lying, lazy).await.unwrap_err().to_string();
+        assert!(
+            refused.contains(&sha(&lying.blob).to_string()) && refused.contains("two sizes"),
+            "(lazy {lazy}): {refused}"
+        );
+    }
+}

@@ -175,6 +175,13 @@ without the numbers of issues or pull requests of any tracker.
   gives the blob whole as the transport of the ranges.  The statistics of a
   pull no longer have `note`, and `ImageNotLazy` no longer says
   `no_file_digests`.
+- A table of contents that gives one content (one fs-verity digest) two
+  sizes, or whose files add up to more than a layer may have
+  (`max_layer_gib`), is refused, with an error that names the layer, before
+  anything is fetched or stored.  The first was pulled, and left a file that
+  could not be read and a store that `system check` called damaged; a lazy
+  pull of a table of version 2 whose tar would be 2^64 bytes or more never
+  completed.
 - A pull of a layer that has no table of contents (a gzip layer) is faster,
   for the layers of many small files most: the fetcher hands the files it
   unpacks over to the engine as descriptors of the replies of `Unpack` (a

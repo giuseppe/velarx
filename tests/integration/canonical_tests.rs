@@ -401,3 +401,86 @@ async fn test_a_pulled_layer_of_version_2_whose_tar_is_not_its_diff_id_is_not_pu
         .keys()
         .any(|k| k.starts_with("manifest:")));
 }
+
+/// A table that lists one digest with two sizes, or whose files do not fit
+/// a layer, is refused before anything is fetched or stored, eagerly and
+/// lazily: the store is as it was, nothing is left to complete, and the
+/// error names the layer.
+#[tokio::test]
+async fn test_a_table_whose_sizes_are_not_possible_is_refused_and_stores_nothing() {
+    let good = build_canonical(&sample());
+    // a file at the end of the table, as `./etc/small` is, of `size` bytes
+    let another = |toc: &mut Toc, name: &str, digest: &str, size: u64| {
+        let mut e = toc
+            .entries
+            .iter()
+            .find(|e| e.name == "./etc/small")
+            .unwrap()
+            .clone();
+        e.name = name.into();
+        e.size = size;
+        if e.chunk_size != 0 {
+            e.chunk_size = size;
+        }
+        if !digest.is_empty() {
+            e.fsverity = Some(format!("sha256-12:{}", digest.repeat(32)));
+        }
+        toc.entries.push(e);
+    };
+    let two_sizes = edited(&good, |t| another(t, "./zz", "", 6 + 4096), |_| {});
+    let huge = edited(&good, |t| another(t, "./zz", "ab", u64::MAX), |_| {});
+    let wraps = edited(
+        &good,
+        |t| {
+            another(t, "./zz", "ab", 1 << 63);
+            another(t, "./zzz", "cd", 1 << 63);
+        },
+        |_| {},
+    );
+    let too_big = edited(&good, |t| another(t, "./zz", "ab", 2 << 30), |_| {});
+    let hello = vid(b"hello\n");
+    for (name, layer, says) in [
+        ("two sizes", &two_sizes, "two sizes"),
+        ("2^64-1 bytes", &huge, "tar is larger"),
+        ("2^64 bytes in two files", &wraps, "tar is larger"),
+        ("more than a layer may be", &too_big, "tar is larger"),
+    ] {
+        for lazy in [false, true] {
+            let e = env_with(velarx_config::PullConfig {
+                lazy_window_files: 0,
+                max_layer_gib: 1,
+                ..Default::default()
+            })
+            .await;
+            e.publish(&[layer], &[ZSTD]);
+            let before = e.stored().await;
+            let result = if lazy {
+                e.pull_lazy().await
+            } else {
+                e.pull().await
+            };
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("{name} (lazy: {lazy}) was pulled"))
+                .to_string();
+            assert!(
+                err.contains(&sha(&layer.blob).to_string()) && err.contains(says),
+                "{name} (lazy: {lazy}): {err}"
+            );
+            if says == "two sizes" {
+                assert!(err.contains(&hello), "{err}");
+            }
+            assert_eq!(e.stored().await, before, "{name} (lazy: {lazy})");
+            // there is nothing to complete
+            let image = format!("{}/test:latest", e.host);
+            let done = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                e.service.complete_image(&image),
+            )
+            .await
+            .expect("the completion ends");
+            assert!(done.is_err(), "{name} (lazy: {lazy})");
+            assert_eq!(e.stored().await, before, "{name} (lazy: {lazy})");
+        }
+    }
+}
