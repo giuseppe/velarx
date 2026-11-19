@@ -99,6 +99,53 @@ async fn add_container(e: &Env, image: &str) {
     .unwrap();
 }
 
+/// The EROFS image of a layer is the layer's own, made of its table alone:
+/// pulled over different layers into two stores, it is the same file, the
+/// image of its table.
+#[tokio::test]
+async fn a_layer_image_is_the_same_whatever_is_below_it() {
+    let below = [build_chunked(&sample()), build_chunked(&sample()[..2])];
+    // (it adds to `etc/`, which it does not list)
+    let top = build_chunked(&[Item::File {
+        name: "etc/added",
+        data: b"added\n".to_vec(),
+        chunk: 4096,
+    }]);
+    let mut images = Vec::new();
+    for base in &below {
+        let e = composefs_env().await;
+        publish_arch(&e.reg, &[base, &top], &[ZSTD, ZSTD], "amd64", "latest");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let image = format!("{}/test:latest", e.host);
+        let id = e
+            .service
+            .pull_with_client(&e.client(), &image, tx)
+            .await
+            .unwrap()
+            .id;
+        let layers = e.db.get_image_layers(&id).await.unwrap();
+        assert_eq!(layers.len(), 2);
+        let layer = layers.last().unwrap();
+        let toc: Toc = serde_json::from_str(layer.toc.as_deref().unwrap()).unwrap();
+        let path = cfs::layer_image_path(e.store.root(), &layer.key.file_stem());
+        let image = std::fs::read(&path).unwrap();
+        assert_eq!(
+            image,
+            velarx_fuse::layer_erofs::layer_image(&toc.entries)
+                .unwrap()
+                .image
+        );
+        images.push((layers[0].key, layer.key, image));
+    }
+    assert_ne!(images[0].0, images[1].0, "the layers below differ");
+    assert_eq!(images[0].1, images[1].1);
+    assert!(
+        images[0].2 == images[1].2,
+        "the image of the layer is the same"
+    );
+}
+
 #[tokio::test]
 async fn a_whole_store_has_no_problem() {
     let (e, id) = pulled().await;

@@ -317,18 +317,18 @@ impl Tree {
         let mut links: Vec<(Vec<&str>, &TocEntry)> = Vec::new();
         // (parents before their children: the paths are sorted)
         for (parts, e) in &by_path {
+            if parts.is_empty() {
+                if e.entry_type != TocEntryType::Dir {
+                    return Err("the root of the layer is not a directory".into());
+                }
+                tree.nodes[ROOT] = node_of(e)?;
+                continue;
+            }
             if e.entry_type == TocEntryType::Hardlink {
                 links.push((parts.clone(), e));
                 continue;
             }
             let node = node_of(e)?;
-            if parts.is_empty() {
-                if !matches!(node.kind, Kind::Dir(_)) {
-                    return Err("the root of the layer is not a directory".into());
-                }
-                tree.nodes[ROOT] = node;
-                continue;
-            }
             let parent = tree.parent(parts)?;
             let idx = tree.nodes.len();
             tree.nodes.push(node);
@@ -880,6 +880,21 @@ pub(crate) mod tests {
         );
     }
 
+    /// The root and a directory the layer adds to and does not list are
+    /// plain: 0755, root, no time, no attributes.
+    #[test]
+    fn the_root_and_the_parents_of_a_layer_are_plain() {
+        let list = listing(&layer_image(&[file("a/b/c", 2, 3)]).unwrap().image);
+        for dir in ["", "/a", "/a/b"] {
+            let l = list
+                .iter()
+                .find(|l| l.starts_with(&format!("{dir} ")))
+                .unwrap();
+            assert!(l.starts_with(&format!("{dir} 40755 0:0 0 ")), "{l}");
+            assert!(l.ends_with(" []"), "{l}");
+        }
+    }
+
     #[test]
     fn the_image_is_the_same_whatever_the_order_of_the_entries() {
         let entries = sample();
@@ -1042,6 +1057,10 @@ pub(crate) mod tests {
         let mut f = file("f", 1, 1);
         f.fsverity = None;
         assert!(layer_image(&[f]).is_err());
+        let mut root = entry("./", TocEntryType::Hardlink);
+        root.link_name = Some("f".into());
+        let e = layer_image(&[root, file("f", 1, 1)]).err().unwrap();
+        assert!(e.contains("root of the layer"), "{e}");
     }
 }
 

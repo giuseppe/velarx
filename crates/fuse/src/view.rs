@@ -339,6 +339,7 @@ impl ImageTree for ImageView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical::unix_time;
     use crate::layer_erofs::layer_image;
     use crate::MergedTree;
     use velarx_storage::Toc;
@@ -392,7 +393,7 @@ mod tests {
                     e.fsverity,
                     e.link_name,
                     e.dev_major.zip(e.dev_minor),
-                    e.mod_time,
+                    unix_time(&e.mod_time),
                     e.xattrs
                 ));
                 if e.entry_type == TocEntryType::Dir {
@@ -433,7 +434,7 @@ mod tests {
                         .as_ref()
                         .filter(|_| e.entry_type == TocEntryType::Symlink),
                     e.dev_major.zip(e.dev_minor),
-                    e.mod_time,
+                    unix_time(&e.mod_time),
                     x.xattrs
                 ));
                 if e.entry_type == TocEntryType::Dir {
@@ -520,5 +521,164 @@ mod tests {
             .map(|(n, _)| n)
             .collect();
         assert_eq!(names, ["a", "b"]);
+    }
+
+    /// The layers made into a tree by the tables and through their images
+    /// show one file system: the root, and everything below it.
+    fn agree(layers: &[&[TocEntry]]) -> (ImageView, MergedTree) {
+        let v = view(layers);
+        let tocs: Vec<Toc> = layers
+            .iter()
+            .map(|l| Toc {
+                version: 1,
+                entries: l.to_vec(),
+                tar_split_digest: None,
+            })
+            .collect();
+        let t = MergedTree::build(&tocs.iter().collect::<Vec<_>>()).unwrap();
+        assert_eq!(dump_view(&v), dump_tree(&t));
+        let root = v.node(VIEW_ROOT).unwrap().entry;
+        let r = &t.node(crate::ROOT).unwrap().entry;
+        assert_eq!(
+            (root.mode, root.uid, root.gid, unix_time(&root.mod_time)),
+            (r.mode, r.uid, r.gid, unix_time(&r.mod_time))
+        );
+        (v, t)
+    }
+
+    /// A layer with no root entry has a plain root over a layer with a
+    /// private one, and the one with an entry has its own.
+    #[test]
+    fn the_root_of_a_layer_is_its_own() {
+        let mut root = entry("", TocEntryType::Dir);
+        (root.mode, root.uid) = (0o700, 7);
+        let (v, _) = agree(&[&[root.clone(), file("a", 1, 1)], &[file("b", 2, 1)]]);
+        let n = v.node(VIEW_ROOT).unwrap().entry;
+        assert_eq!((n.mode, n.uid), (0o755, 0));
+        let (v, _) = agree(&[&[file("a", 1, 1)], &[root, file("b", 2, 1)]]);
+        let n = v.node(VIEW_ROOT).unwrap().entry;
+        assert_eq!((n.mode, n.uid), (0o700, 7));
+    }
+
+    /// A layer that adds `a/b` and does not list `a` has a plain `a`
+    /// over the one below, which has the files of the layer below.
+    #[test]
+    fn an_unlisted_parent_is_plain_in_every_view() {
+        let mut a = entry("a", TocEntryType::Dir);
+        (a.mode, a.uid) = (0o750, 1000);
+        let (v, _) = agree(&[&[a, file("a/x", 1, 1)], &[file("a/b", 2, 1)]]);
+        let n = v.node(v.resolve("a").unwrap()).unwrap().entry;
+        assert_eq!((n.mode, n.uid), (0o755, 0));
+        assert!(v.resolve("a/x").is_some() && v.resolve("a/b").is_some());
+    }
+
+    /// A directory a layer removes and makes does not have what was below
+    /// it, wherever the table lists the whiteout.
+    #[test]
+    fn a_layer_does_not_merge_a_directory_it_removes() {
+        let l0 = [
+            entry("d", TocEntryType::Dir),
+            file("d/old", 1, 1),
+            entry("o", TocEntryType::Dir),
+            file("o/old", 1, 1),
+        ];
+        let l1 = [
+            entry("d", TocEntryType::Dir),
+            file("d/new", 2, 1),
+            entry(".wh.d", TocEntryType::Reg),
+            file("o/new", 2, 1),
+            entry("o/.wh..wh..opq", TocEntryType::Reg),
+        ];
+        let (v, _) = agree(&[&l0, &l1]);
+        assert!(v.resolve("d/new").is_some() && v.resolve("d/old").is_none());
+        assert!(v.resolve("o/new").is_some() && v.resolve("o/old").is_none());
+    }
+
+    /// Random layers of whiteouts, opaque markers, directories a layer
+    /// removes and makes, names under files, hard links, devices 0:0, roots
+    /// and names listed twice: the tables merged and the images stacked show
+    /// the same tree, or both are an error.
+    #[test]
+    fn the_tables_merged_are_the_images_stacked() {
+        let mut seed: u64 = 1;
+        let mut next = |n: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % n
+        };
+        let names = ["a", "b", ".wh.a", ".wh.b", ".wh..wh..opq"];
+        for _ in 0..5000 {
+            let mut layers = Vec::new();
+            for _ in 0..1 + next(3) {
+                let mut l = Vec::new();
+                if next(3) == 0 {
+                    let mut root = entry("./", TocEntryType::Dir);
+                    root.mode = [0o700, 0o555][next(2) as usize];
+                    l.push(root);
+                }
+                for _ in 0..next(7) {
+                    let mut parts: Vec<&str> =
+                        (0..next(3)).map(|_| names[next(2) as usize]).collect();
+                    parts.push(names[next(5) as usize]);
+                    let name = parts.join("/");
+                    let mut e = entry(&name, TocEntryType::Reg);
+                    if !parts[parts.len() - 1].starts_with(".wh.") {
+                        match next(6) {
+                            0 | 1 => {
+                                e = entry(&name, TocEntryType::Dir);
+                                (e.mode, e.uid) =
+                                    ([0o755, 0o700][next(2) as usize], next(2) as u32);
+                            }
+                            2 => {
+                                e.entry_type = TocEntryType::Symlink;
+                                e.link_name = Some("a".into());
+                            }
+                            3 => {
+                                e.entry_type = TocEntryType::Hardlink;
+                                e.link_name =
+                                    Some(["a", "b", "a/a", "b/b"][next(4) as usize].into());
+                            }
+                            4 => {
+                                e.entry_type = TocEntryType::Char;
+                                (e.dev_major, e.dev_minor) = (Some(0), Some(0));
+                            }
+                            _ => e = file(&name, 1 + next(3) as u8, 1),
+                        }
+                    }
+                    l.push(e);
+                }
+                layers.push(l);
+            }
+            let images: Result<Vec<_>, _> = layers.iter().map(|l| layer_image(l)).collect();
+            let tocs: Vec<Toc> = layers
+                .iter()
+                .map(|l| Toc {
+                    version: 1,
+                    entries: l.clone(),
+                    tar_split_digest: None,
+                })
+                .collect();
+            let tree = MergedTree::build(&tocs.iter().collect::<Vec<_>>());
+            let shown: Vec<Vec<&str>> = layers
+                .iter()
+                .map(|l| l.iter().map(|e| e.name.as_str()).collect())
+                .collect();
+            let (images, tree) = match (images, tree) {
+                (Ok(i), Ok(t)) => (i, t),
+                (Err(_), Err(_)) => continue,
+                (i, t) => panic!("{shown:?}: images {:?}, tables {:?}", i.err(), t.err()),
+            };
+            let v = ImageView::new(
+                images
+                    .into_iter()
+                    .map(|i| Layer::open(Box::new(i.image)).unwrap())
+                    .collect(),
+            );
+            assert_eq!(dump_view(&v), dump_tree(&tree), "{shown:?}");
+            let root = v.node(VIEW_ROOT).unwrap().entry;
+            let r = &tree.node(crate::ROOT).unwrap().entry;
+            assert_eq!((root.mode, root.uid), (r.mode, r.uid), "{shown:?}");
+        }
     }
 }

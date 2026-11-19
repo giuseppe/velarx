@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use velarx_fuse::composefs as cfs;
 use velarx_fuse::erofs_tree::Layer;
 use velarx_fuse::view::{ImageTree, ImageView, VIEW_ROOT};
+use velarx_fuse::{MergedTree, ROOT};
 use velarx_storage::{Toc, TocEntry, TocEntryType};
 
 /// What a container sees of a path.
@@ -481,6 +482,39 @@ fn images(layers: &[Vec<TocEntry>]) -> (Vec<Vec<TocEntry>>, Vec<TocEntry>) {
     (per_layer, view_entries(&ImageView::new(mapped)))
 }
 
+/// The root file system the tables of the layers make when they are applied
+/// (`MergedTree`: what the copy of a vfs root, a squash and a build read),
+/// as `view_entries` gives it.
+fn tree_entries(tree: &MergedTree) -> Vec<TocEntry> {
+    let mut out = Vec::new();
+    let mut first: HashMap<usize, String> = HashMap::new();
+    let mut todo = vec![(ROOT, String::new())];
+    while let Some((dir, path)) = todo.pop() {
+        for (name, &c) in &tree.node(dir).unwrap().children {
+            let mut e = tree.node(c).unwrap().entry.clone();
+            e.name = if path.is_empty() {
+                name.clone()
+            } else {
+                format!("{path}/{name}")
+            };
+            if e.entry_type != TocEntryType::Dir {
+                if let Some(f) = first.get(&c) {
+                    e.link_name = Some(f.clone());
+                    e.entry_type = TocEntryType::Hardlink;
+                    out.push(e);
+                    continue;
+                }
+                first.insert(c, e.name.clone());
+            }
+            if e.entry_type == TocEntryType::Dir {
+                todo.push((c, e.name.clone()));
+            }
+            out.push(e);
+        }
+    }
+    out
+}
+
 fn report(problems: Vec<String>) {
     assert!(
         problems.is_empty(),
@@ -505,6 +539,15 @@ fn check(layers: &[Vec<TocEntry>]) {
     let stack = stacked(&resolved);
     let (stack, _) = tree_of(&stack.into_values().collect::<Vec<_>>());
     problems.extend(diff("layer images stacked", &want, &stack));
+    let tocs = tocs_of(layers);
+    let tree = MergedTree::build(&tocs.iter().collect::<Vec<_>>()).unwrap();
+    let (tree, tree_links) = tree_of(&tree_entries(&tree));
+    problems.extend(diff("tables merged", &want, &tree));
+    if want_links != tree_links {
+        problems.push(format!(
+            "hard links of the tables: want {want_links:?}, got {tree_links:?}"
+        ));
+    }
     report(problems);
 }
 
@@ -588,6 +631,42 @@ fn layers_make_the_tree_the_oci_spec_says() {
     ]));
     check(&[base.clone(), second.clone()]);
     check(&[base, second, third]);
+}
+
+/// The root of a layer with no entry for it is a plain directory, and so is
+/// a directory it adds files to and does not list, whatever the layers
+/// below have: in the view of the images, stacked as an overlay stacks
+/// them, and in the tables merged.
+#[test]
+fn a_layer_has_its_own_root_and_parents() {
+    let base = make(serde_json::json!([
+        {"name": "./", "type": "dir", "mode": 0o700, "uid": 3, "gid": 4},
+        {"name": "a", "type": "dir", "mode": 0o750, "uid": 1000, "gid": 1000},
+        reg("a/x", 'a', 1),
+    ]));
+    let top = make(serde_json::json!([reg("a/b/c", 'b', 2)]));
+    let layers = [base, top];
+    check(&layers);
+    let (_, view) = images(&layers);
+    let tocs = tocs_of(&layers);
+    let tree = MergedTree::build(&tocs.iter().collect::<Vec<_>>()).unwrap();
+    let mut mapped = Vec::new();
+    for l in &layers {
+        let built = velarx_fuse::layer_erofs::layer_image(l).unwrap();
+        mapped.push(Layer::open(Box::new(built.image)).unwrap());
+    }
+    let view_tree = ImageView::new(mapped);
+    let owner = |e: &TocEntry| (e.mode & 0o7777, e.uid, e.gid);
+    let want = (0o755, 0, 0);
+    assert_eq!(owner(&view_tree.node(VIEW_ROOT).unwrap().entry), want);
+    assert_eq!(owner(&tree.node(ROOT).unwrap().entry), want);
+    for path in ["a", "a/b"] {
+        let n = view_tree.resolve(path).unwrap();
+        assert_eq!(owner(&view_tree.node(n).unwrap().entry), want, "{path}");
+        let n = tree.resolve(path).unwrap();
+        assert_eq!(owner(&tree.node(n).unwrap().entry), want, "{path}");
+    }
+    assert!(view.iter().any(|e| path_of(&e.name) == "a/x"));
 }
 
 #[test]

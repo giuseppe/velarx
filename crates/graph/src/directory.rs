@@ -1518,8 +1518,8 @@ mod tests {
     }
 
     /// The content of an image never makes the copy write outside of its
-    /// destination: a link is made as a link, a name below a link of a lower
-    /// layer replaces it, and one below a link of its own layer is an error.
+    /// destination: a link is made as a link, and a directory a name below a
+    /// link needs replaces it.
     #[test]
     fn a_link_of_the_image_is_never_followed() {
         let t = tempfile::tempdir().unwrap();
@@ -1545,17 +1545,15 @@ mod tests {
             1,
             "nothing was made outside"
         );
-        // in one layer the name below a link is no directory: the tree refuses
-        let same = Toc {
-            version: 1,
-            entries: vec![
-                dir("", 0o755),
-                link("escape", &out),
-                img.file("escape/pwned", b"x", 0o644),
-            ],
-            tar_split_digest: None,
-        };
-        assert!(MergedTree::build(&[&same]).is_err());
+        // in one layer too, as the image of the layer has it
+        let same = Img::new();
+        let tree = same.merged(&[vec![
+            dir("", 0o755),
+            link("escape", &out),
+            same.file("escape/pwned", b"x", 0o644),
+        ]]);
+        same.write(&c, &tree, None).unwrap();
+        assert!(same.dst.join("escape/pwned").is_file() && !same.dst.join("escape").is_symlink());
         // a path that goes up is refused
         let up = Toc {
             version: 1,

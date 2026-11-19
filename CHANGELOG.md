@@ -143,6 +143,15 @@ without the numbers of issues or pull requests of any tracker.
 
 ### Changed
 
+- The copy of an image of the `vfs` driver, `build`, `build --squash` and
+  `commit --squash` show what the overlay of the EROFS images of the layers
+  shows, where each layer is its own: the root of a layer with no entry `./`
+  is a plain directory (0755, root, no time, no attributes) and so is a
+  directory a layer adds files to without listing it, in place of the one
+  below; a directory a layer removes and makes does not have what was below
+  it, whatever the order of its table; a hard link to a file of a layer
+  below is an error.  These views kept the root and directories of the
+  layers below.
 - A pull of a layer that has no table of contents (a gzip layer) is faster,
   for the layers of many small files most: the fetcher hands the files it
   unpacks over to the engine as descriptors of the replies of `Unpack` (a
@@ -1315,6 +1324,8 @@ without the numbers of issues or pull requests of any tracker.
 
 ### Fixed
 
+- The EROFS image of a layer whose entry `./` is a hard link is an error;
+  making it panicked.
 - The files of a pulled layer keep the nanoseconds of their modification
   time (a PAX `mtime` record of a fraction of a second, or before 1970); they
   had whole seconds.  The EROFS images of the layers are made again in the
