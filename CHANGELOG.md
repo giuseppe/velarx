@@ -1363,8 +1363,10 @@ without the numbers of issues or pull requests of any tracker.
   making it panicked.
 - The files of a pulled layer keep the nanoseconds of their modification
   time (a PAX `mtime` record of a fraction of a second, or before 1970); they
-  had whole seconds.  The EROFS images of the layers are made again in the
-  new format version 5.
+  had whole seconds.  A time before 1970 is kept as far as the table of
+  contents holds it (the years 0001 to 9999); the EROFS images of the layers
+  are made again in the new format version 5.  A file of a build context
+  dated before 1970 has the epoch in the layer it goes to.
 - The root directory of a pulled layer has the mode, owner, time and
   extended attributes of the layer's entry `./`, as an extraction gives it;
   it was always a plain directory of mode 0755.  The root directory of a

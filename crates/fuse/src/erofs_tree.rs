@@ -189,8 +189,14 @@ impl Index {
 /// (a time past what the system can say, which only a corrupt image has,
 /// is the epoch: never a panic of the thread that serves the kernel)
 fn epoch(secs: u64, nsec: u32) -> SystemTime {
-    SystemTime::UNIX_EPOCH
-        .checked_add(Duration::new(secs, nsec.min(999_999_999)))
+    // (the seconds are a signed number: a time before 1970 is kept)
+    let secs = secs as i64;
+    let at = if secs < 0 {
+        SystemTime::UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs()))
+    } else {
+        SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs as u64))
+    };
+    at.and_then(|t| t.checked_add(Duration::from_nanos(u64::from(nsec.min(999_999_999)))))
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
@@ -853,6 +859,32 @@ mod tests {
             Layer::open(Box::new(built.image)).unwrap(),
             Index::from_bytes(Box::new(built.index)).unwrap(),
         )
+    }
+
+    /// A time before 1970 is in the image as it is in the table: seconds
+    /// before the epoch and the nanoseconds after them.
+    #[test]
+    fn a_time_before_1970_is_kept_by_the_image() {
+        let mut old = entry("old", TocEntryType::Dir);
+        old.mod_time = Some("1969-12-30T23:59:59.25+00:00".into());
+        let mut recent = entry("recent", TocEntryType::Dir);
+        recent.mod_time = Some("1970-01-01T00:00:01.5+00:00".into());
+        let mut first = entry("first", TocEntryType::Dir);
+        first.mod_time = Some("0001-01-01T00:00:00Z".into());
+        let mut last = entry("last", TocEntryType::Dir);
+        last.mod_time = Some("9999-12-31T23:59:59.999999999Z".into());
+        let (layer, _) = mapped(&[old, recent, first, last]);
+        let at = |name: &str| layer.attr(layer.lookup(layer.root(), name.as_bytes()).unwrap());
+        let since = |t: SystemTime| match t.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(d) => d.as_secs_f64(),
+            Err(e) => -e.duration().as_secs_f64(),
+        };
+        assert_eq!(since(at("old").unwrap().mtime), -86400.75);
+        assert_eq!(since(at("recent").unwrap().mtime), 1.5);
+        let parts = |name: &str| crate::tree::unix_parts(at(name).unwrap().mtime);
+        assert_eq!(parts("old"), (-86401, 250_000_000));
+        assert_eq!(parts("first"), (-62_135_596_800, 0));
+        assert_eq!(parts("last"), (253_402_300_799, 999_999_999));
     }
 
     /// A stub names the file of its redirect only when its metacopy states

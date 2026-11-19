@@ -1477,6 +1477,31 @@ mod tests {
         );
     }
 
+    /// A file dated before 1970 is put in an archive at the epoch (the
+    /// vendored `tar` crate: it wrote the time as an unsigned number).
+    #[test]
+    fn a_file_dated_before_1970_is_archived_at_the_epoch() {
+        let src = tempfile::tempdir().unwrap();
+        let p = src.path().join("f");
+        std::fs::write(&p, b"old").unwrap();
+        let t = rustix::fs::Timespec {
+            tv_sec: -86_400,
+            tv_nsec: 0,
+        };
+        let times = rustix::fs::Timestamps {
+            last_access: t,
+            last_modification: t,
+        };
+        rustix::fs::utimensat(rustix::fs::CWD, &p, &times, rustix::fs::AtFlags::empty()).unwrap();
+        let mut b = tar::Builder::new(Vec::new());
+        b.mode(tar::HeaderMode::Complete);
+        b.append_path_with_name(&p, "f").unwrap();
+        let t = b.into_inner().unwrap();
+        let mut a = tar::Archive::new(&t[..]);
+        let e = a.entries().unwrap().next().unwrap().unwrap();
+        assert_eq!(e.header().mtime().unwrap(), 0);
+    }
+
     #[test]
     fn parent_references_are_refused() {
         let d = tempfile::tempdir().unwrap();

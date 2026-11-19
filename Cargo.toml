@@ -374,7 +374,9 @@ workspace = true
 # drops the holes of such an entry and returns where the data goes, so that
 # the holes are not read as zeros one block at a time; the PAX records are
 # read by their lengths (src/pax.rs), not split at newlines, which the value
-# of an extended attribute may have.
+# of an extended attribute may have; the header of a file dated before 1970
+# has the epoch (src/header.rs), not the time cast to an unsigned number,
+# which the field kept as a date centuries ahead.
 # composefs 0.9.4 hashes with the sha2 crate instead of openssl
 # (vendor/composefs/src/digest.rs): the processes that read layer images and
 # make no request (velarx-monitor, the frontends' closures) link no TLS

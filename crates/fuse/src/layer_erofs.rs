@@ -181,8 +181,10 @@ fn encode_dev(major: u32, minor: u32) -> u32 {
     (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12)
 }
 
+/// The time of an inode: the seconds are the 64 bits of a signed number, as
+/// the kernel reads them (so a time before 1970 is kept).
 fn mtime_of(e: &TocEntry) -> (u64, u32) {
-    let (secs, nsec) = super::canonical::unix_time(&e.mod_time);
+    let (secs, nsec) = e.mtime();
     (secs as u64, nsec)
 }
 

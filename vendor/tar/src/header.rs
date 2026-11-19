@@ -789,7 +789,7 @@ impl Header {
     fn fill_platform_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
         match mode {
             HeaderMode::Complete => {
-                self.set_mtime(meta.mtime() as u64);
+                self.set_mtime(meta.mtime().max(0) as u64);
                 self.set_uid(meta.uid() as u64);
                 self.set_gid(meta.gid() as u64);
                 self.set_mode(meta.mode());

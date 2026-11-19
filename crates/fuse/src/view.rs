@@ -289,9 +289,8 @@ impl ImageTree for ImageView {
         };
         e.mode = u32::from(a.perm);
         (e.uid, e.gid) = (a.uid, a.gid);
-        let since = a.mtime.duration_since(std::time::UNIX_EPOCH).ok()?;
-        e.mod_time = chrono::DateTime::from_timestamp(since.as_secs() as i64, since.subsec_nanos())
-            .map(|t| t.to_rfc3339());
+        let (secs, nsec) = crate::tree::unix_parts(a.mtime);
+        e.mod_time = chrono::DateTime::from_timestamp(secs, nsec).map(|t| t.to_rfc3339());
         match e.entry_type {
             TocEntryType::Reg => {
                 let (digest, size) = layer.content(nid)?;
@@ -339,7 +338,6 @@ impl ImageTree for ImageView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::unix_time;
     use crate::layer_erofs::layer_image;
     use crate::MergedTree;
     use velarx_storage::Toc;
@@ -393,7 +391,7 @@ mod tests {
                     e.fsverity,
                     e.link_name,
                     e.dev_major.zip(e.dev_minor),
-                    unix_time(&e.mod_time),
+                    e.mtime(),
                     e.xattrs
                 ));
                 if e.entry_type == TocEntryType::Dir {
@@ -434,7 +432,7 @@ mod tests {
                         .as_ref()
                         .filter(|_| e.entry_type == TocEntryType::Symlink),
                     e.dev_major.zip(e.dev_minor),
-                    unix_time(&e.mod_time),
+                    e.mtime(),
                     x.xattrs
                 ));
                 if e.entry_type == TocEntryType::Dir {
@@ -540,8 +538,8 @@ mod tests {
         let root = v.node(VIEW_ROOT).unwrap().entry;
         let r = &t.node(crate::ROOT).unwrap().entry;
         assert_eq!(
-            (root.mode, root.uid, root.gid, unix_time(&root.mod_time)),
-            (r.mode, r.uid, r.gid, unix_time(&r.mod_time))
+            (root.mode, root.uid, root.gid, root.mtime()),
+            (r.mode, r.uid, r.gid, r.mtime())
         );
         (v, t)
     }

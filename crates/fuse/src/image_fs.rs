@@ -7,7 +7,7 @@
 //! whose files the store lacks.
 
 use super::idtranslate::IdTranslate;
-use super::tree::{Attr, Tree};
+use super::tree::{unix_parts, Attr, Tree};
 use super::{FuseError, FuseResult, LazyFileFetcher};
 use fuser::{
     consts, FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData, ReplyDirectory,
@@ -23,7 +23,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tracing::{debug, error, warn};
 use velarx_storage::FileStore;
 
@@ -116,6 +116,19 @@ pub struct ImageFs {
 /// takes: a hole in them would be a few blocks at most.
 const SPARSE_MIN: u64 = 64 * 1024;
 
+/// The time as `fuser` gives it to the kernel: the seconds before the epoch
+/// are `-secs` of the distance from it and the nanoseconds are added to
+/// them (a time 1.25 s before the epoch is -2 s and 750 ms), where a
+/// `SystemTime` before the epoch is that distance whole.
+fn kernel_time(t: SystemTime) -> SystemTime {
+    match unix_parts(t) {
+        (secs, nanos) if secs < 0 => SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::new(secs.unsigned_abs(), nanos))
+            .unwrap_or(t),
+        _ => t,
+    }
+}
+
 /// The attributes of a node, with the owners the container sees; `blocks`,
 /// those of the object of a file (which keeps the holes of a sparse one).
 fn file_attr(ino: u64, a: Attr, blocks: Option<u64>, translate: Option<&IdTranslate>) -> FileAttr {
@@ -123,10 +136,10 @@ fn file_attr(ino: u64, a: Attr, blocks: Option<u64>, translate: Option<&IdTransl
         ino,
         size: a.size,
         blocks: blocks.unwrap_or(a.size.div_ceil(512)),
-        atime: a.atime,
-        mtime: a.mtime,
-        ctime: a.ctime,
-        crtime: a.mtime,
+        atime: kernel_time(a.atime),
+        mtime: kernel_time(a.mtime),
+        ctime: kernel_time(a.ctime),
+        crtime: kernel_time(a.mtime),
         kind: a.kind,
         perm: a.perm,
         nlink: a.nlink,
@@ -1184,6 +1197,20 @@ pub fn detach_stale(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use velarx_storage::{Toc, TocEntryType};
+
+    #[test]
+    fn a_time_before_the_epoch_is_given_as_the_kernel_adds_it() {
+        let epoch = SystemTime::UNIX_EPOCH;
+        let before = |s, n| kernel_time(epoch - Duration::new(s, n));
+        // (86400.75 s before the epoch is -86401 s and 250 ms after them)
+        assert_eq!(
+            before(86400, 750_000_000),
+            epoch - Duration::new(86401, 250_000_000)
+        );
+        assert_eq!(before(2, 0), epoch - Duration::new(2, 0));
+        let after = epoch + Duration::new(5, 1);
+        assert_eq!(kernel_time(after), after);
+    }
 
     #[test]
     fn overlay_and_selinux_attributes_are_hidden() {

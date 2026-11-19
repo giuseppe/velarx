@@ -47,7 +47,7 @@ pub fn rfc3339((secs, nanos): (i64, u32)) -> Option<String> {
     const LAST: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
     let (secs, nanos) = match secs {
         ..FIRST => (FIRST, 0),
-        LAST.. => (LAST, 0),
+        _ if secs > LAST => (LAST, 0),
         _ => (secs, nanos),
     };
     chrono::DateTime::from_timestamp(secs, nanos).map(|t| t.to_rfc3339())
@@ -319,6 +319,10 @@ mod tests {
         assert_eq!(
             rfc3339((i64::MAX, 7)).as_deref(),
             Some("9999-12-31T23:59:59+00:00")
+        );
+        assert_eq!(
+            rfc3339((253_402_300_799, 500_000_000)).as_deref(),
+            Some("9999-12-31T23:59:59.500+00:00")
         );
         assert_eq!(
             rfc3339((i64::MIN, 7)).as_deref(),

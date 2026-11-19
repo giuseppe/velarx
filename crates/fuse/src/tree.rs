@@ -21,6 +21,21 @@ pub struct Attr {
     pub ctime: SystemTime,
 }
 
+/// A time as seconds since the epoch (negative before it) and nanoseconds
+/// (0 to 999 999 999, after the seconds).
+pub(crate) fn unix_parts(t: SystemTime) -> (i64, u32) {
+    match t.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+        Err(e) => {
+            let d = e.duration();
+            match d.subsec_nanos() {
+                0 => (-(d.as_secs() as i64), 0),
+                n => (-(d.as_secs() as i64) - 1, 1_000_000_000 - n),
+            }
+        }
+    }
+}
+
 /// The content of a regular file: a file of the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRef {

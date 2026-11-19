@@ -53,18 +53,9 @@ pub trait Files<H: FsVerityHashValue> {
     fn regular(&mut self, entry: &TocEntry) -> io::Result<RegularFile<H>>;
 }
 
-/// The time of a table of contents entry (RFC 3339) as seconds and
-/// nanoseconds; the epoch for none, or before it.
-pub(crate) fn unix_time(s: &Option<String>) -> (i64, u32) {
-    match velarx_storage::toc_time(s.as_deref()) {
-        Some((secs, nsec)) if secs >= 0 => (secs, nsec),
-        _ => (0, 0),
-    }
-}
-
 fn stat_of(e: &TocEntry) -> Stat {
     use base64::Engine;
-    let (sec, nsec) = unix_time(&e.mod_time);
+    let (sec, nsec) = e.mtime();
     let mut xattrs = BTreeMap::new();
     for (k, v) in &e.xattrs {
         if let Ok(value) = base64::engine::general_purpose::STANDARD.decode(v) {
@@ -322,25 +313,6 @@ mod tests {
     use super::*;
     use composefs::erofs::format::FormatVersion;
 
-    /// One reading of the times: the nanoseconds kept, a time before 1970
-    /// (which the image cannot hold) the epoch, as for no time at all.
-    #[test]
-    fn the_times_of_the_table_are_read_once_and_clamped_at_the_epoch() {
-        let t = |s: &str| unix_time(&Some(s.to_string()));
-        assert_eq!(
-            t("2024-01-02T03:04:05.25+00:00"),
-            (1_704_164_645, 250_000_000)
-        );
-        assert_eq!(t("1970-01-01T00:00:00.000000001Z"), (0, 1));
-        assert_eq!(t("1969-12-31T23:59:59.5Z"), (0, 0));
-        assert_eq!(t("not a time"), (0, 0));
-        assert_eq!(unix_time(&None), (0, 0));
-        // (the table itself keeps what was before the epoch)
-        assert_eq!(
-            velarx_storage::toc_time(Some("1969-12-31T23:59:59.5Z")),
-            Some((-1, 500_000_000))
-        );
-    }
     use composefs::fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue};
 
     struct Fake;

@@ -33,6 +33,9 @@ top = tarfile.TarInfo("./")
 top.type, top.mode, top.uid, top.gid, top.mtime = tarfile.DIRTYPE, 0o1750, 1000, 1000, -2
 top.pax_headers = {"SCHILY.xattr.user.rootattr": "dg"}
 t.addfile(top)
+old = tarfile.TarInfo("./old")
+old.mode, old.mtime = 0o644, -86400.75
+t.addfile(old)
 for dir, dirs, files in os.walk(root):
     for name in sorted(dirs + files):
         path = os.path.join(dir, name)
@@ -57,12 +60,13 @@ root_of () {
     local d=$1
     shift
     "$BIN/velarx" --config "$WORKDIR/$d.toml" container run --rm --network none "$@" localhost/root-dir:1 \
-        sh -c 'stat -c "%a %u:%g %Y" /; getfattr --only-values -n user.rootattr /; echo'
+        sh -c 'stat -c "%a %u:%g %Y" /; getfattr --only-values -n user.rootattr /; echo; stat -c %y /old'
 }
 
 @test "composefs: the root of the container is the root of the layer" {
     check "the root" "1750 1000:1000 -2
-dg" "$(root_of composefs)"
+dg
+1969-12-30 23:59:59.250000000 +0000" "$(root_of composefs)"
 }
 
 # (the runtime makes the mount points in the root of a read-only container:
@@ -70,22 +74,25 @@ dg" "$(root_of composefs)"
 @test "composefs: with a read-only root" {
     out=$(root_of composefs --read-only)
     check "the mode and owner" "1750 1000:1000" "$(printf '%s\n' "$out" | head -1 | cut -d' ' -f1,2)"
-    check "the attribute" dg "$(printf '%s\n' "$out" | tail -1)"
+    check "the attribute" dg "$(printf '%s\n' "$out" | sed -n 2p)"
 }
 
 @test "composefs: with a user namespace of its own, the owner is the container's id" {
     check "the root" "1750 1000:1000 -2
-dg" "$(root_of composefs --userns auto)"
+dg
+1969-12-30 23:59:59.250000000 +0000" "$(root_of composefs --userns auto)"
 }
 
 @test "vfs: the root of the container is the root of the layer" {
     check "the root" "1750 1000:1000 -2
-dg" "$(root_of vfs)"
+dg
+1969-12-30 23:59:59.250000000 +0000" "$(root_of vfs)"
 }
 
 @test "vfs: with a user namespace of its own, the owner is the container's id" {
     check "the root" "1750 1000:1000 -2
-dg" "$(root_of vfs --userns auto)"
+dg
+1969-12-30 23:59:59.250000000 +0000" "$(root_of vfs --userns auto)"
 }
 
 # The image a commit or a build step makes of a container keeps its root: the
