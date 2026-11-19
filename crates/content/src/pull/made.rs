@@ -142,16 +142,15 @@ impl MadeOut<'_> {
                 format!("the layer has too many entries (more than {MAX_ENTRIES})"),
             ));
         }
-        if let Some(mut e) = entry::from_header(header, digest)? {
-            // (a layer holds paths of `MAX_PATH_DEPTH` components at most:
-            // what reads it back, and the EROFS image made from its table,
-            // recurse for each)
-            if let Some(problem) = entry::toc_problem(std::slice::from_ref(&e)) {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, problem));
-            }
-            e.fsverity = verity;
-            self.entries.push(e);
+        let mut e = entry::from_header(header, digest)?;
+        // (a layer holds paths of `MAX_PATH_DEPTH` components at most:
+        // what reads it back, and the EROFS image made from its table,
+        // recurse for each)
+        if let Some(problem) = entry::toc_problem(std::slice::from_ref(&e)) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, problem));
         }
+        e.fsverity = verity;
+        self.entries.push(e);
         Ok(())
     }
 }

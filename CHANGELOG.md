@@ -1308,6 +1308,9 @@ without the numbers of issues or pull requests of any tracker.
   time (a PAX `mtime` record of a fraction of a second, or before 1970); they
   had whole seconds.  The EROFS images of the layers are made again in the
   new format version 5.
+- The root directory of a pulled layer has the mode, owner, time and
+  extended attributes of the layer's entry `./`, as an extraction gives it;
+  it was always a plain directory of mode 0755.
 - A pull whose peers do not answer (a member whose store hangs) or are slow
   from the first byte goes on from the registry within seconds: a request
   waits for a stream to the peer no longer than the idle time (it waited for

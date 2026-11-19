@@ -54,12 +54,13 @@ pub fn rfc3339((secs, nanos): (i64, u32)) -> Option<String> {
 
 /// The TOC entry of a tar header.  `file_digest` is the digest of the
 /// content of a regular file (the callers that know its fs-verity digest
-/// set the digests of the entry after).  `None` for the root directory, which has no entry.
-pub fn from_header(h: &Header, file_digest: Option<&str>) -> io::Result<Option<TocEntry>> {
+/// set the digests of the entry after).  The root directory of the layer
+/// is the entry `./`.
+pub fn from_header(h: &Header, file_digest: Option<&str>) -> io::Result<TocEntry> {
     let name = match normalize_path(&h.path) {
         Some(n) => n,
         None if h.kind == Kind::Directory && matches!(h.path.as_str(), "." | "./" | "/") => {
-            return Ok(None)
+            "./".to_string()
         }
         None => return Err(invalid(format!("invalid path `{}` in the layer", h.path))),
     };
@@ -120,7 +121,7 @@ pub fn from_header(h: &Header, file_digest: Option<&str>) -> io::Result<Option<T
         .as_deref()
         .is_none_or(|d| velarx_types::digest::Digest::parse_key(d).is_ok()));
 
-    Ok(Some(TocEntry {
+    Ok(TocEntry {
         name,
         entry_type,
         mode: h.mode,
@@ -142,7 +143,7 @@ pub fn from_header(h: &Header, file_digest: Option<&str>) -> io::Result<Option<T
         dev_major: matches!(h.kind, Kind::Char | Kind::Block).then_some(h.dev_major),
         dev_minor: matches!(h.kind, Kind::Char | Kind::Block).then_some(h.dev_minor),
         xattrs,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -168,11 +169,7 @@ mod tests {
 
     #[test]
     fn test_a_toc_with_a_name_that_is_too_deep() {
-        let entry = |name: &str| {
-            from_header(&header(name, Kind::Directory), None)
-                .unwrap()
-                .unwrap()
-        };
+        let entry = |name: &str| from_header(&header(name, Kind::Directory), None).unwrap();
         let deep = vec!["d"; super::super::tar::MAX_PATH_DEPTH + 1].join("/");
         assert_eq!(toc_problem(&[entry("a/b")]), None);
         assert_eq!(
@@ -185,19 +182,17 @@ mod tests {
     fn test_the_nanoseconds_of_a_time_are_kept() {
         let mut h = header("f", Kind::Directory);
         h.mtime = (1_700_000_000, 123_456_789);
-        let e = from_header(&h, None).unwrap().unwrap();
+        let e = from_header(&h, None).unwrap();
         assert_eq!(e.mtime(), (1_700_000_000, 123_456_789));
         h.mtime = (-2, 500_000_000);
-        let e = from_header(&h, None).unwrap().unwrap();
+        let e = from_header(&h, None).unwrap();
         assert_eq!(e.mtime(), (-2, 500_000_000));
     }
 
     #[test]
     fn test_regular_file() {
         let d = crate::sha256_text(b"abc");
-        let e = from_header(&header("./usr/bin/x", Kind::Regular), Some(&d))
-            .unwrap()
-            .unwrap();
+        let e = from_header(&header("./usr/bin/x", Kind::Regular), Some(&d)).unwrap();
         assert_eq!(e.name, "usr/bin/x");
         assert_eq!(e.digest.as_deref(), Some(d.as_str()));
         assert_eq!(e.size, 3);
@@ -214,10 +209,13 @@ mod tests {
     }
 
     #[test]
-    fn test_root_is_skipped_and_escapes_are_refused() {
-        assert!(from_header(&header("./", Kind::Directory), None)
-            .unwrap()
-            .is_none());
+    fn test_the_root_is_an_entry_and_escapes_are_refused() {
+        for path in [".", "./", "/"] {
+            let e = from_header(&header(path, Kind::Directory), None).unwrap();
+            assert_eq!((e.name.as_str(), e.entry_type), ("./", TocEntryType::Dir));
+            assert_eq!((e.mode, e.uid, e.gid), (0o755, 1, 2));
+        }
+        assert!(from_header(&header("./", Kind::Regular), Some("sha256:x")).is_err());
         assert!(from_header(
             &header("../x", Kind::Regular),
             Some(&crate::sha256_text(b""))
@@ -232,13 +230,13 @@ mod tests {
         assert!(from_header(&h, None).is_err());
         h.link = Some("../target".to_string());
         assert_eq!(
-            from_header(&h, None).unwrap().unwrap().link_name.as_deref(),
+            from_header(&h, None).unwrap().link_name.as_deref(),
             Some("../target")
         );
         let mut h = header("hl", Kind::Hardlink);
         h.link = Some("./a/b".to_string());
         assert_eq!(
-            from_header(&h, None).unwrap().unwrap().link_name.as_deref(),
+            from_header(&h, None).unwrap().link_name.as_deref(),
             Some("a/b")
         );
         h.link = Some("../a".to_string());
@@ -259,9 +257,7 @@ mod tests {
         }
         h.xattrs
             .insert("user.huge".into(), vec![0; MAX_XATTR_VALUE + 1]);
-        let e = from_header(&h, Some(&crate::sha256_text(b"")))
-            .unwrap()
-            .unwrap();
+        let e = from_header(&h, Some(&crate::sha256_text(b""))).unwrap();
         let mut keys: Vec<_> = e.xattrs.keys().cloned().collect();
         keys.sort();
         assert_eq!(keys, ["security.capability", "user.keep"]);
@@ -271,9 +267,7 @@ mod tests {
     fn test_xattrs_are_base64() {
         let mut h = header("f", Kind::Regular);
         h.xattrs.insert("security.capability".into(), vec![1, 2, 3]);
-        let e = from_header(&h, Some(&crate::sha256_text(b"")))
-            .unwrap()
-            .unwrap();
+        let e = from_header(&h, Some(&crate::sha256_text(b""))).unwrap();
         assert_eq!(e.xattrs["security.capability"], "AQID");
     }
 }

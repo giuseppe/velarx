@@ -309,11 +309,10 @@ pub(super) fn parse(
         } else {
             None
         };
-        if let Some(mut e) = entry::from_header(&h, file_digest.as_deref())? {
-            // (a file the store has is named by its object)
-            e.fsverity = verity;
-            entries.push(e);
-        }
+        let mut e = entry::from_header(&h, file_digest.as_deref())?;
+        // (a file the store has is named by its object)
+        e.fsverity = verity;
+        entries.push(e);
     }
     // The rest of the stream (the zero blocks) is part of the tar-split.
     let (_, recorder) = tar.finish()?;

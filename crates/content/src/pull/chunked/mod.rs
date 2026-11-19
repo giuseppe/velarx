@@ -1779,12 +1779,11 @@ fn replay_of(
         } else {
             None
         };
-        if let Some(mut e) = entry::from_header(&h, digest.as_deref()).map_err(data_fail)? {
-            if claimed_object.is_some() {
-                e.fsverity = claimed_object;
-            }
-            entries.push(e);
+        let mut e = entry::from_header(&h, digest.as_deref()).map_err(data_fail)?;
+        if claimed_object.is_some() {
+            e.fsverity = claimed_object;
         }
+        entries.push(e);
     }
     let mut rest = tar.into_inner();
     io::copy(&mut rest, &mut io::sink()).map_err(io_fail)?;

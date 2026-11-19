@@ -133,9 +133,7 @@ pub fn unpack_tar<R: Read>(
             _ => None,
         };
         let digest = digest.map(|d| d.to_string());
-        if let Some(e) = from_header(&h, digest.as_deref()).map_err(io_fail)? {
-            entries.push(e);
-        }
+        entries.push(from_header(&h, digest.as_deref()).map_err(io_fail)?);
     }
     files.send().map_err(io_fail)?;
     let (_, recorder) = tar.finish().map_err(io_fail)?;

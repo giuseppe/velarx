@@ -159,6 +159,10 @@ impl TocEntry {
 /// TOC version
 pub const TOC_VERSION: i32 = 1;
 
+/// The version of a table of contents whose layer is a canonical tar
+/// ([`crate::canonical`]): it needs no tar-split.
+pub const TOC_VERSION_CANONICAL: i32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Toc {
@@ -175,6 +179,11 @@ impl AsRef<[TocEntry]> for Toc {
 }
 
 impl Toc {
+    /// Whether the layer is a canonical tar that the entries describe.
+    pub fn is_canonical(&self) -> bool {
+        self.version == TOC_VERSION_CANONICAL
+    }
+
     pub fn find_by_name(&self, name: &str) -> Option<&TocEntry> {
         self.entries.iter().find(|e| e.name == name)
     }

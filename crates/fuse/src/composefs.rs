@@ -26,7 +26,7 @@ pub const DIR: &str = "composefs";
 pub const OVERLAY_MAX_STACK: usize = 500;
 /// The version of the images: a new one makes new names (4: the stubs and
 /// the index are sized by the algorithm of the digests of the layer; 5: the
-/// nanoseconds of the times of a pulled layer).
+/// nanoseconds of the times and the root directory of a pulled layer).
 const FORMAT: u32 = 5;
 
 /// The directory of the EROFS images, the indexes and the profiles of the

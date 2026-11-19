@@ -641,12 +641,10 @@ impl<W: Write> Writer<W> {
 
     /// The TOC entry of a header.  The names are the ones of the tar
     /// headers: containers/storage checks the TOC against the tar-split.
-    fn toc_entry(alg: Algorithm, h: &Header) -> io::Result<Option<TocEntry>> {
+    fn toc_entry(alg: Algorithm, h: &Header) -> io::Result<TocEntry> {
         let empty = Digest::empty(alg).to_string();
         let placeholder = (h.kind == Kind::Regular).then_some(empty.as_str());
-        let Some(mut e) = entry::from_header(h, placeholder)? else {
-            return Ok(None);
-        };
+        let mut e = entry::from_header(h, placeholder)?;
         e.name = h.path.clone();
         if e.link_name.is_some() {
             e.link_name = h.link.clone();
@@ -654,7 +652,7 @@ impl<W: Write> Writer<W> {
         e.digest = None;
         e.chunk_digest = None;
         e.chunk_size = 0;
-        Ok(Some(e))
+        Ok(e)
     }
 
     fn end_file_chunks(&mut self) -> io::Result<()> {
@@ -776,13 +774,8 @@ impl<W: Write> Sink for Writer<W> {
         if let Some(s) = &mut self.split {
             s.file_begin(&h.path)?;
         }
-        self.current = match Self::toc_entry(self.alg, h)? {
-            Some(e) => {
-                self.toc.push(e);
-                Some(self.toc.len() - 1)
-            }
-            None => None,
-        };
+        self.toc.push(Self::toc_entry(self.alg, h)?);
+        self.current = Some(self.toc.len() - 1);
         self.regular = h.kind == Kind::Regular;
         self.size = h.size;
         self.file_offset = 0;
@@ -1098,6 +1091,38 @@ mod tests {
         let mut out = Vec::new();
         dec.read_to_end(&mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn test_the_root_of_a_layer_is_in_its_toc() {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_mode(0o700);
+        h.set_uid(5);
+        h.set_mtime(1_700_000_000);
+        h.set_size(0);
+        b.append_data(&mut h, "./", &b""[..]).unwrap();
+        let mut h = tar::Header::new_gnu();
+        h.set_mode(0o644);
+        h.set_size(1);
+        b.append_data(&mut h, "./f", &b"x"[..]).unwrap();
+        let tar = b.into_inner().unwrap();
+        let (blob, w) = write(&tar, Compression::ZstdChunked);
+        let a = |k: &str| w.annotations[&format!("{ANNOTATION_PREFIX}{k}")].clone();
+        let pos: Vec<u64> = a("manifest-position")
+            .split(':')
+            .map(|n| n.parse().unwrap())
+            .collect();
+        let toc_z = &blob[pos[0] as usize..(pos[0] + pos[1]) as usize];
+        let toc: Toc = serde_json::from_slice(&zstd::decode_all(toc_z).unwrap()).unwrap();
+        let names: Vec<_> = toc.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["./", "f"]);
+        let root = &toc.entries[0];
+        assert_eq!(
+            (root.mode, root.uid, root.mtime()),
+            (0o700, 5, (1_700_000_000, 0))
+        );
     }
 
     #[test]

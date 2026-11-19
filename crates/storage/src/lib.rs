@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+pub mod canonical;
 mod chunked;
 mod content_store;
 mod foreign;

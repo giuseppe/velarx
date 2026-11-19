@@ -106,9 +106,7 @@ pub fn merge_toc(registry: &Toc, alg: Algorithm, tarsplit_z: bytes::Bytes) -> Im
                     .ok_or_else(|| {
                         fail(format!("the TOC of the layer has no digest for `{name}`"))
                     })?;
-                let Some(mut e) = entry::from_header(&h, Some(&id)).map_err(io_fail)? else {
-                    continue;
-                };
+                let mut e = entry::from_header(&h, Some(&id)).map_err(io_fail)?;
                 e.digest = reg.digest.clone().filter(|d| d.parse::<Digest>().is_ok());
                 e.fsverity = reg.fsverity.clone();
                 e.offset = reg.offset;
@@ -128,9 +126,7 @@ pub fn merge_toc(registry: &Toc, alg: Algorithm, tarsplit_z: bytes::Bytes) -> Im
             }
             _ => None,
         };
-        if let Some(e) = entry::from_header(&h, content.as_deref()).map_err(io_fail)? {
-            entries.push(e);
-        }
+        entries.push(entry::from_header(&h, content.as_deref()).map_err(io_fail)?);
     }
     if files.values().any(|q| !q.is_empty()) {
         return Err(fail("the TOC has files the tar-split does not"));

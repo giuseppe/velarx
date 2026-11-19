@@ -1323,6 +1323,45 @@ mod tests {
         out
     }
 
+    /// The value of a record may have newlines: the records are read by
+    /// their lengths, and the name and the attributes after it are kept.
+    #[test]
+    fn a_record_value_with_newlines_is_read_whole() {
+        let long = format!("{}/file", "d".repeat(120));
+        let mut b = tar::Builder::new(Vec::new());
+        b.append_pax_extensions([
+            ("SCHILY.xattr.user.k", &b"a\n\nb\n"[..]),
+            ("path", long.as_bytes()),
+            ("SCHILY.xattr.user.z", b"\n"),
+        ])
+        .unwrap();
+        let mut h = tar::Header::new_ustar();
+        h.set_mode(0o644);
+        h.set_size(2);
+        b.append_data(&mut h, "short", &b"hi"[..]).unwrap();
+        let tar = b.into_inner().unwrap();
+        let mut ar = tar::Archive::new(&tar[..]);
+        let mut e = ar.entries().unwrap().next().unwrap().unwrap();
+        assert_eq!(path(&mut e).unwrap(), std::path::Path::new(&long));
+        let records: Vec<(String, Vec<u8>)> = e
+            .pax_extensions()
+            .unwrap()
+            .unwrap()
+            .map(|r| {
+                let r = r.unwrap();
+                (r.key().unwrap().to_string(), r.value_bytes().to_vec())
+            })
+            .collect();
+        assert_eq!(
+            records,
+            [
+                ("SCHILY.xattr.user.k".to_string(), b"a\n\nb\n".to_vec()),
+                ("path".to_string(), long.into_bytes()),
+                ("SCHILY.xattr.user.z".to_string(), b"\n".to_vec()),
+            ]
+        );
+    }
+
     /// The tar of an import, its sparse files written whole: the other
     /// entries as they were (long names, links, records).
     #[test]

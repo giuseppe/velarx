@@ -41,6 +41,8 @@ tokio = { workspace = true, features = ["sync", "rt", "time", "fs"] }
 
 [dev-dependencies]
 composefs.workspace = true
+tar.workspace = true
+rand.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 rustix = { workspace = true, features = ["pipe"] }
 

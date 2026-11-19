@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 use std::io;
 use std::io::Write;
-use std::slice;
 use std::str;
 
 use crate::other;
@@ -40,18 +39,13 @@ pub const PAX_GNUSPARSEREALSIZE: &str = "GNU.sparse.realsize";
 /// This iterator yields structures which can themselves be parsed into
 /// key/value pairs.
 pub struct PaxExtensions<'entry> {
-    data: slice::Split<'entry, u8, fn(&u8) -> bool>,
+    data: &'entry [u8],
 }
 
 impl<'entry> PaxExtensions<'entry> {
     /// Create new pax extensions iterator from the given entry data.
     pub fn new(a: &'entry [u8]) -> Self {
-        fn is_newline(a: &u8) -> bool {
-            *a == b'\n'
-        }
-        PaxExtensions {
-            data: a.split(is_newline),
-        }
+        PaxExtensions { data: a }
     }
 }
 
@@ -88,36 +82,41 @@ impl<'entry> Iterator for PaxExtensions<'entry> {
     type Item = io::Result<PaxExtension<'entry>>;
 
     fn next(&mut self) -> Option<io::Result<PaxExtension<'entry>>> {
-        let line = match self.data.next() {
-            Some([]) => return None,
-            Some(line) => line,
-            None => return None,
-        };
-
-        Some(
-            line.iter()
-                .position(|b| *b == b' ')
-                .and_then(|i| {
-                    str::from_utf8(&line[..i])
-                        .ok()
-                        .and_then(|len| len.parse::<usize>().ok().map(|j| (i + 1, j)))
+        if self.data.is_empty() {
+            return None;
+        }
+        // `LEN KEY=VALUE\n`, LEN the length of the whole record: the value
+        // may have newlines of its own
+        let data = self.data;
+        let record = data
+            .iter()
+            .position(|b| *b == b' ')
+            .and_then(|i| {
+                str::from_utf8(&data[..i])
+                    .ok()
+                    .and_then(|len| len.parse::<usize>().ok().map(|len| (i + 1, len)))
+            })
+            .filter(|&(kvstart, len)| len > kvstart && len <= data.len() && data[len - 1] == b'\n')
+            .and_then(|(kvstart, len)| {
+                let kv = &data[kvstart..len - 1];
+                kv.iter().position(|b| *b == b'=').map(|equals| {
+                    let ext = PaxExtension {
+                        key: &kv[..equals],
+                        value: &kv[equals + 1..],
+                    };
+                    (len, ext)
                 })
-                .and_then(|(kvstart, reported_len)| {
-                    if line.len() + 1 == reported_len {
-                        line[kvstart..]
-                            .iter()
-                            .position(|b| *b == b'=')
-                            .map(|equals| (kvstart, equals))
-                    } else {
-                        None
-                    }
-                })
-                .map(|(kvstart, equals)| PaxExtension {
-                    key: &line[kvstart..kvstart + equals],
-                    value: &line[kvstart + equals + 1..],
-                })
-                .ok_or_else(|| other("malformed pax extension")),
-        )
+            });
+        match record {
+            Some((len, ext)) => {
+                self.data = &data[len..];
+                Some(Ok(ext))
+            }
+            None => {
+                self.data = &[];
+                Some(Err(other("malformed pax extension")))
+            }
+        }
     }
 }
 
