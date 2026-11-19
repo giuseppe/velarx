@@ -849,7 +849,7 @@ impl DiffOptions {
             uid_map: self.uid_map.clone(),
             gid_map: self.gid_map.clone(),
             mtime: self.mtime,
-            unowned: None,
+            ..Default::default()
         }
     }
 }
@@ -960,8 +960,10 @@ impl WritableDiff {
         };
         velarx_wire::cp::extract(tar, rustix::fd::AsFd::as_fd(&fd), &ex)?;
         let mut o = walk.clone();
-        // (the tar says what changed: nothing is compared with the image again)
+        // (the tar says what changed: nothing is compared with the image
+        // again; the root of the directory is not the container's)
         o.lower = None;
+        o.root = dirtar::Root::Never;
         Ok(ChangesDir {
             path: dir.path().to_path_buf(),
             walk: o,

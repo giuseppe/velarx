@@ -15,12 +15,13 @@
 //! fs-verity digest of the file) that redirects (`trusted.overlay.redirect`)
 //! to the object of the store, `/ab/cdef...`, in the data-only layers.  A
 //! directory the layer has files in but does not list is a plain one (0755,
-//! root): it takes the place of the one below, as when the layer is
-//! extracted.  The overlay's own attributes and the SELinux labels of the
-//! entries are not kept.  A hard link names a file of its layer: one to a
-//! file of a layer below is an error, as when podman extracts the layer (an
-//! image made with the layers below would depend on the image the layer is
-//! pulled for, when it is the store's for every image that has the layer).
+//! root), and so is its root when it has no `./` entry: they take the place
+//! of the ones below, as when the layer is extracted.  The overlay's own
+//! attributes and the SELinux labels of the entries are not kept.  A hard
+//! link names a file of its layer: one to a file of a layer below is an
+//! error (an image made with the layers below would depend on the image the
+//! layer is pulled for, when it is the store's for every image that has the
+//! layer).
 //!
 //! The format is EROFS with 4096 bytes blocks, extended inodes, the
 //! attributes in the inodes, the directories and symbolic links inline where

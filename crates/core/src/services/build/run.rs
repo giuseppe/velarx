@@ -1084,6 +1084,7 @@ impl Build<'_> {
             Ok(0) => match cs.writable_diff(&id).await {
                 Ok((diff, mut walk)) => {
                     walk.exclude.extend(targets);
+                    walk.root = velarx_content::layer::dirtar::Root::Changed;
                     // (for a driver whose layer is not an upper directory this
                     // extracts the tar of the changes: off the async thread)
                     let squash = match (&diff, &st.squash_dir) {

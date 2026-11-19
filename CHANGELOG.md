@@ -1324,6 +1324,10 @@ without the numbers of issues or pull requests of any tracker.
 
 ### Fixed
 
+- `container commit` keeps the root directory of the container (its mode,
+  owner, time and extended attributes) in the image: the layer has the
+  entry `./`, as does the layer of a build step that changed the mode, owner
+  or attributes of the root.  The root of the image was a plain directory.
 - The EROFS image of a layer whose entry `./` is a hard link is an error;
   making it panicked.
 - The files of a pulled layer keep the nanoseconds of their modification

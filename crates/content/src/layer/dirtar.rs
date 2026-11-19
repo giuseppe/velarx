@@ -138,6 +138,24 @@ pub struct Options {
     /// give its files the owners of the image, so those of this owner (the
     /// host's ids) are the image's, whatever it says.
     pub unowned: Option<(u32, u32)>,
+    /// When the layer has an entry for the directory itself (`./`).
+    pub root: Root,
+}
+
+/// When the layer of the changes in a directory has an entry for its root:
+/// a layer without one has a plain root (0755, root, no time, no
+/// attributes) in place of the one below it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Root {
+    /// Never: the directory is not a root file system (the files of a
+    /// `COPY`, the diff of a container).
+    #[default]
+    Never,
+    /// When its mode, owner or attributes are not those of a plain root
+    /// (the root of a build step's container, which the driver made plain).
+    Changed,
+    /// Always, with its mode, owner, time and attributes (a commit).
+    Always,
 }
 
 /// The time a file of a layer gets.
@@ -1158,6 +1176,15 @@ const WALK: Walk = Walk {
 impl Walker<'_> {
     /// Walk the upper directory `dir`.
     fn walk_upper(&mut self, dir: BorrowedFd<'_>) -> io::Result<()> {
+        if self.opts.root != Root::Never {
+            let st = fstat(dir)?;
+            let mut h = self.header(&st, tar::EntryType::Directory)?;
+            let attrs = read_xattrs(dir, OsStr::new("."), "/", false, true)?;
+            let plain = (h.mode()?, h.uid()?, h.gid()?) == (0o755, 0, 0) && attrs.xattrs.is_empty();
+            if self.opts.root == Root::Always || !plain {
+                self.append(&mut h, "./", &attrs.xattrs, Content::None)?;
+            }
+        }
         let root = UpperDir::root(&self.opts);
         WALK.run(dir.try_clone_to_owned()?, root, &mut UpperWalk(self))?;
         Ok(())
@@ -1208,8 +1235,12 @@ pub fn record(dir: BorrowedFd<'_>, opts: &Options) -> io::Result<Vec<Recorded>> 
 /// that of the file it hides, and what an image below has of a renamed
 /// directory after the rest.
 pub fn sort_canonical(entries: &mut [Recorded]) {
+    // (the root, `./`, has none: it is first)
     fn components(e: &Recorded) -> impl Iterator<Item = &str> {
-        e.path.trim_end_matches('/').split('/')
+        e.path
+            .trim_end_matches('/')
+            .split('/')
+            .filter(|c| *c != ".")
     }
     entries.sort_by(|a, b| components(a).cmp(components(b)));
 }

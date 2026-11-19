@@ -140,7 +140,7 @@ impl ContainerService {
                 uid_map: config.uid_mappings.iter().map(range).collect(),
                 gid_map: config.gid_mappings.iter().map(range).collect(),
                 mtime: dirtar::Mtime::Keep,
-                unowned: None,
+                ..Default::default()
             },
         ))
     }
@@ -228,7 +228,9 @@ impl ContainerService {
         if let Some(o) = &req.override_config {
             edits.extend(override_edits(o));
         }
-        let (changes, walk) = self.writable_diff(&container.id).await?;
+        let (changes, mut walk) = self.writable_diff(&container.id).await?;
+        // (the root of the container stays the root of the image)
+        walk.root = velarx_content::layer::dirtar::Root::Always;
         let opts = CommitOptions {
             edits,
             changes: req.changes.clone(),

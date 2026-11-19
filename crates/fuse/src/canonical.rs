@@ -22,6 +22,12 @@
 //! need `/usr` when the image has none: its image is not one composefs-rs
 //! would make.
 //!
+//! It deliberately does not follow the rule of the views of an image (the
+//! overlay of the images of the layers, `MergedTree`) that a layer has its
+//! own root and its own plain directories for those it adds to without
+//! listing them: here such a directory keeps what the layers below gave it,
+//! as in composefs-rs, so that the digest is the one composefs-rs gives.
+//!
 //! The image is made only for its digest, the merged EROFS of an image that
 //! its manifest states (`composefs.merged.erofs.v1.fsverity-sha256-12`, or
 //! `-sha512-12` for an image whose digests are SHA-512): it

@@ -122,6 +122,8 @@ fn add(
 pub(super) struct Upper {
     /// The directory that was walked.
     root: OwnedFd,
+    /// Its entry (`./`), if the walk gave one: the root of the squash.
+    root_entry: Option<Recorded>,
     /// The entries that are not deletions, in order.
     entries: Vec<Recorded>,
     /// the paths deleted (`.wh.NAME`)
@@ -170,6 +172,7 @@ impl Upper {
         let recorded = dirtar::record(root.as_fd(), walk)?;
         let mut u = Self {
             root,
+            root_entry: None,
             entries: Vec::new(),
             whiteouts: HashSet::new(),
             opaque: HashSet::new(),
@@ -179,6 +182,10 @@ impl Upper {
         };
         for e in recorded {
             u.stream_len += e.stream_len();
+            if e.path == "./" {
+                u.root_entry = Some(e);
+                continue;
+            }
             match mark(&e.path) {
                 Mark::Whiteout(p) => {
                     u.whiteouts.insert(p);
@@ -336,9 +343,10 @@ fn objects_read(tree: &MergedTree, upper: Option<&Upper>) -> Vec<(String, u64)> 
 }
 
 /// Write the tar of `tree` to `out`, parents before their children and
-/// the names in order, starting with the root directory (`./`).  With the
-/// `upper` changes applied: what they delete is not written, what they
-/// replace is theirs, and what they add comes last.
+/// the names in order, starting with the root directory (`./`, the one of
+/// the changes if they have one).  With the `upper` changes applied: what
+/// they delete is not written, what they replace is theirs, and what they
+/// add comes last.
 pub(super) fn write_tree(
     tree: &MergedTree,
     objects: &dyn ObjectOpener,
@@ -351,13 +359,18 @@ pub(super) fn write_tree(
     let objects = ahead.as_deref().unwrap_or(objects);
     let mut links = HashMap::new();
     let mut written: HashSet<usize> = HashSet::new();
-    let root = tree
-        .node(ROOT)
-        .ok_or_else(|| io::Error::other("the image has no root"))?;
-    let mut h = header(root);
-    h.set_entry_type(tar::EntryType::Directory);
-    pax(out, &root.entry)?;
-    out.entry(&mut h, "./", Content::None)?;
+    match upper.and_then(|u| Some((u, u.root_entry.as_ref()?))) {
+        Some((u, e)) => u.write_entry(out, e)?,
+        None => {
+            let root = tree
+                .node(ROOT)
+                .ok_or_else(|| io::Error::other("the image has no root"))?;
+            let mut h = header(root);
+            h.set_entry_type(tar::EntryType::Directory);
+            pax(out, &root.entry)?;
+            out.entry(&mut h, "./", Content::None)?;
+        }
+    }
     // what the changes add that the tree has no place for goes where its
     // path sorts among what the tree has
     walk_tree(tree, upper, |step| {
@@ -727,6 +740,56 @@ mod tests {
         )
         .unwrap();
         Upper::record(root, &dirtar::Options::default()).unwrap()
+    }
+
+    /// The root of the changes, when their walk gives it, is the root of
+    /// the squash: it is not written twice.
+    #[test]
+    fn test_the_root_of_the_changes_is_the_root_of_the_squash() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let store = FileStore::new(d.path().join("s")).unwrap();
+        let mut root = entry("./", TocEntryType::Dir);
+        root.mode = 0o750;
+        let tree = MergedTree::build_entries(&[&[root, file(&store, "a", b"a")][..]]).unwrap();
+        let upper = d.path().join("upper");
+        std::fs::create_dir(&upper).unwrap();
+        std::fs::write(upper.join("b"), b"b").unwrap();
+        std::fs::set_permissions(&upper, std::fs::Permissions::from_mode(0o711)).unwrap();
+        let roots = |walk: &dirtar::Options| {
+            let fd = rustix::fs::openat(
+                rustix::fs::CWD,
+                &upper,
+                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap();
+            let mut tar = Vec::new();
+            let changes = Upper::record(fd, walk).unwrap();
+            write_tree_to(&tree, &store, Some(&changes), &mut tar).unwrap();
+            let mut ar = tar::Archive::new(&tar[..]);
+            ar.entries()
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    let path = e.path().unwrap().to_string_lossy().into_owned();
+                    (path, e.header().mode().unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        let walk = dirtar::Options {
+            root: dirtar::Root::Always,
+            ..Default::default()
+        };
+        assert_eq!(
+            roots(&walk),
+            [
+                ("./".into(), 0o711),
+                ("a".into(), 0o640),
+                ("b".into(), 0o644)
+            ]
+        );
+        assert_eq!(roots(&dirtar::Options::default())[0], ("./".into(), 0o750));
     }
 
     #[test]

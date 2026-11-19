@@ -20,6 +20,15 @@ ends, so that running an image costs the same however big it is. A lazy pull
 demand. Names appear only for whole, checked files and the database is written
 after the names are durable.
 
+The EROFS image of a layer is made from its table of contents alone, so it
+is the same file in every image that has the layer, whatever is below it.
+The root of a layer is its `./` entry, or a plain directory (0755, owned by
+root, no time, no attributes) when it has none, and so is a directory it has
+entries in but does not list: its attributes replace those of the directory
+below, whose entries stay, in every view of the image (the overlay, `vfs`,
+`build`, `commit --squash`, `cp`). A hard link names a file of its own
+layer.
+
 The driver is chosen by `[storage] driver` or `--storage-driver`: `composefs`
 (the default), `vfs` and `varlink` (never chosen for you). A store keeps the
 driver it was made with; opening it with another is an error that names both.
@@ -50,7 +59,8 @@ limits and the ways it can show the ids of a mapping.
 Every call but `GetInfo` and `ListStores` takes the `store` (the id of the
 store the engine keeps in a file of its graph root).  `LayerRef` is `(key, diff_id, chain_id)` (the chain id is the OCI ChainID of
 the layer as the top of its stack, computed by the engine; a driver that is not
-`layer_chain` ignores it); `MountAsk` is
+`layer_chain` ignores it, and one that is keeps a layer for each stack it is
+in, not one for every image that has it); `MountAsk` is
 `(mapping?, idmap_mount, label?, verity?)` with `verity` the digests the engine
 accepts for each layer in order (`VerityAsk::Enforce { accepted }`); `Mounted` is
 `(kind: (directory, mount_fd), fd?, path?, idmap: (none, applied, mount),

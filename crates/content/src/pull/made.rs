@@ -464,4 +464,62 @@ mod tests {
         .unwrap_err();
         assert!(e.to_string().contains("too deep"), "{e}");
     }
+
+    /// The root of the directory is the first entry when the walk is asked
+    /// for it: always, or when it is not the plain root a layer without the
+    /// entry has (0755, root, no attributes).
+    #[test]
+    fn the_root_of_the_directory_is_the_first_entry_when_asked() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        // ('!' sorts before the `.` of the root's name)
+        std::fs::write(root.join("!x"), b"x").unwrap();
+        std::fs::write(root.join("a"), b"a").unwrap();
+        let own = |host| {
+            vec![dirtar::IdRange {
+                container: 0,
+                host,
+                size: 1,
+            }]
+        };
+        let names = |mode: u32, root_entry: dirtar::Root| {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+            let fd = rustix::fs::openat(
+                rustix::fs::CWD,
+                &root,
+                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap();
+            let opts = dirtar::Options {
+                uid_map: own(rustix::process::getuid().as_raw()),
+                gid_map: own(rustix::process::getgid().as_raw()),
+                root: root_entry,
+                ..Default::default()
+            };
+            let sink: Arc<dyn Sink> = session(tmp.path(), "walk");
+            let (made, size) = from_dir(
+                rustix::fd::AsFd::as_fd(&fd),
+                &opts,
+                &sink,
+                Algorithm::Sha256,
+                u64::MAX,
+                Box::new(|_| Ok(())),
+            )
+            .unwrap();
+            assert_eq!(size, canonical::stream_size(&made.toc.entries).unwrap());
+            let e = &made.toc.entries[0];
+            if e.name == "./" {
+                assert_eq!((e.mode, e.uid, e.gid), (mode, 0, 0));
+            }
+            let names: Vec<String> = made.toc.entries.iter().map(|e| e.name.clone()).collect();
+            names
+        };
+        assert_eq!(names(0o755, dirtar::Root::Always), ["./", "./!x", "./a"]);
+        assert_eq!(names(0o700, dirtar::Root::Changed), ["./", "./!x", "./a"]);
+        assert_eq!(names(0o755, dirtar::Root::Changed), ["./!x", "./a"]);
+        assert_eq!(names(0o700, dirtar::Root::Never), ["./!x", "./a"]);
+    }
 }
