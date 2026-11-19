@@ -2279,7 +2279,24 @@ impl StorageDriver for ComposefsDriver {
             Ok(())
         };
         make().map_err(|e| DriverError::io(NAME, e))?;
-        base.map(|b| self.plan(b).map(|r| r.planned())).transpose()
+        let Some(b) = base else {
+            return Ok(None);
+        };
+        let prepared = self.mount_plan(b, false)?;
+        // (the root of the merged tree is the root of the upper directory,
+        // which the overlay shows in place of the root of the layers: it
+        // is the root of the top layer, or a plain one when it has none)
+        if let Some(top) = prepared.m.layers.last() {
+            let root_of_top = || -> std::io::Result<()> {
+                let layer = velarx_fuse::erofs_tree::Layer::of_checked_file(
+                    cfs::open_layer_image(&top.image)?,
+                    &top.image,
+                )?;
+                set_root(&p.upper, &layer, b.translate)
+            };
+            root_of_top().map_err(|e| DriverError::io(NAME, e))?;
+        }
+        Ok(Some(Self::rootfs_of(Self::asked(b), None, None).planned()))
     }
 
     fn writable_paths(&self, w: &Writable) -> WritablePaths {
@@ -2422,6 +2439,45 @@ pub(crate) fn canonical_image_of(
     objects: &dyn Fn(&str) -> Option<std::path::PathBuf>,
 ) -> std::io::Result<(Box<[u8]>, String)> {
     velarx_fuse::canonical::image_of(alg, tocs, objects)
+}
+
+/// Give the directory `upper` the mode, owner, time and attributes of the
+/// root of `layer`, the owner as the container sees it (`ids`).
+fn set_root(
+    upper: &Path,
+    layer: &velarx_fuse::erofs_tree::Layer,
+    ids: Option<&velarx_fuse::IdTranslate>,
+) -> std::io::Result<()> {
+    use rustix::fs::{fchmod, fchown, fsetxattr, futimens, Gid, Mode, Timestamps, Uid, XattrFlags};
+    let root = layer.root();
+    let a = layer
+        .attr(root)
+        .ok_or_else(|| std::io::Error::other("the layer has no root directory"))?;
+    let dir = open_dir(upper)?;
+    let (uid, gid) = ids.map_or((a.uid, a.gid), |t| (t.uid_of(a.uid), t.gid_of(a.gid)));
+    fchown(&dir, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
+    fchmod(&dir, Mode::from_raw_mode(a.perm.into()))?;
+    for (name, value) in layer.raw_xattrs(root) {
+        let name = String::from_utf8(name).map_err(std::io::Error::other)?;
+        if !velarx_fuse::hidden_xattr(&name) {
+            fsetxattr(&dir, name.as_str(), &value, XattrFlags::empty())?;
+        }
+    }
+    let at = |t: std::time::SystemTime| {
+        let t = chrono::DateTime::<chrono::Utc>::from(t);
+        rustix::fs::Timespec {
+            tv_sec: t.timestamp(),
+            tv_nsec: t.timestamp_subsec_nanos().into(),
+        }
+    };
+    futimens(
+        &dir,
+        &Timestamps {
+            last_access: at(a.atime),
+            last_modification: at(a.mtime),
+        },
+    )?;
+    Ok(())
 }
 
 /// Whether the root of the process whose mount table is `mountinfo` is the

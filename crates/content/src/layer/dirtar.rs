@@ -151,8 +151,9 @@ pub enum Root {
     /// `COPY`, the diff of a container).
     #[default]
     Never,
-    /// When its mode, owner or attributes are not those of a plain root
-    /// (the root of a build step's container, which the driver made plain).
+    /// When its mode, owner or attributes are not those of a plain root (the
+    /// root of a build step's container, which has those of the step's base:
+    /// the layer keeps them, as a layer without the entry has a plain root).
     Changed,
     /// Always, with its mode, owner, time and attributes (a commit).
     Always,

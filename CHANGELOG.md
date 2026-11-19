@@ -1356,8 +1356,9 @@ without the numbers of issues or pull requests of any tracker.
 
 - `container commit` keeps the root directory of the container (its mode,
   owner, time and extended attributes) in the image: the layer has the
-  entry `./`, as does the layer of a build step that changed the mode, owner
-  or attributes of the root.  The root of the image was a plain directory.
+  entry `./`, as does the layer of a build step whose root is not a plain
+  directory (mode 0755, owned by root, no attributes).  The root of the
+  image was a plain directory.
 - The EROFS image of a layer whose entry `./` is a hard link is an error;
   making it panicked.
 - The files of a pulled layer keep the nanoseconds of their modification
@@ -1366,7 +1367,10 @@ without the numbers of issues or pull requests of any tracker.
   new format version 5.
 - The root directory of a pulled layer has the mode, owner, time and
   extended attributes of the layer's entry `./`, as an extraction gives it;
-  it was always a plain directory of mode 0755.
+  it was always a plain directory of mode 0755.  The root directory of a
+  container has those of its image's top layer (a plain directory of mode
+  0755 owned by root when the layer has no `./`), with the owner its user
+  namespace maps, on every storage driver, also with a read-only root.
 - A pull whose peers do not answer (a member whose store hangs) or are slow
   from the first byte goes on from the registry within seconds: a request
   waits for a stream to the peer no longer than the idle time (it waited for

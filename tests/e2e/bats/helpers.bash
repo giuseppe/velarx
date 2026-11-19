@@ -175,11 +175,10 @@ e2e_start_daemon () {
     exit 1
 }
 
-# e2e_make_image [NAME]: import an image of host binaries (no registry) as
-# NAME (default localhost/e2e-base:1) and export it as $IMG.  BINARIES
-# (default: sh cat env sleep true false echo ls stat) are copied in.
-e2e_make_image () {
-    local name=${1:-localhost/e2e-base:1} b p l
+# e2e_make_rootfs: $WORKDIR/rootfs, a root file system of host binaries.
+# BINARIES (default: sh cat env sleep true false echo ls stat) are copied in.
+e2e_make_rootfs () {
+    local b p l
     local root=$WORKDIR/rootfs
     mkdir -p "$root"/{bin,lib64,usr/lib64,etc,proc,sys,dev,tmp,run}
     for b in ${BINARIES:-sh cat env sleep true false echo ls stat}; do
@@ -190,7 +189,14 @@ e2e_make_image () {
             cp -L "$l" "$root$l" 2> /dev/null
         done
     done
-    tar -C "$root" -cf "$WORKDIR/rootfs.tar" .
+}
+
+# e2e_make_image [NAME]: import an image of host binaries (no registry) as
+# NAME (default localhost/e2e-base:1) and export it as $IMG.
+e2e_make_image () {
+    local name=${1:-localhost/e2e-base:1}
+    e2e_make_rootfs
+    tar -C "$WORKDIR/rootfs" -cf "$WORKDIR/rootfs.tar" .
     sc image import "$WORKDIR/rootfs.tar" "$name" > /dev/null
     export IMG=$name
 }

@@ -514,16 +514,17 @@ impl VfsDriver {
                 recorded =
                     self.merge_into(&copier, dst.as_fd(), &req.image.id, req.layers, req.mapping)?;
             } else {
+                // (a directory the user gave has no root of an image: the
+                // root of the container owns it; the root of an image is
+                // what its layers give, owned as the mapping says)
                 rustix::fs::fchmod(&dst, rustix::fs::Mode::from_raw_mode(0o755))?;
-            }
-            // The root of the merged tree is the root of the container's
-            // layer: the root of the container owns it.
-            if let Some((uid, gid)) = owner {
-                rustix::fs::fchown(
-                    &dst,
-                    Some(rustix::fs::Uid::from_raw(uid)),
-                    Some(rustix::fs::Gid::from_raw(gid)),
-                )?;
+                if let Some((uid, gid)) = owner {
+                    rustix::fs::fchown(
+                        &dst,
+                        Some(rustix::fs::Uid::from_raw(uid)),
+                        Some(rustix::fs::Gid::from_raw(gid)),
+                    )?;
+                }
             }
             if base.is_some() {
                 let base = Base {
