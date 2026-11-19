@@ -1198,7 +1198,21 @@ fn chunked_layer_made(
     diff_id: impl Fn(Digest) -> Digest,
     bytes: impl Fn(&[u8]) -> Vec<u8>,
 ) -> (FeedLayer, u64) {
-    use velarx_content::layer::writer::{write_layer, write_layer_sha256_keyed, Compression};
+    use velarx_content::layer::writer::Compression;
+    registry_layer(reg, tar, Compression::ZstdChunked, verity, diff_id, bytes)
+}
+
+/// The same in the compression `compression`: a layer that is not
+/// zstd:chunked has no table of contents to fetch by.
+fn registry_layer(
+    reg: &Registry,
+    tar: &[u8],
+    compression: velarx_content::layer::writer::Compression,
+    verity: bool,
+    diff_id: impl Fn(Digest) -> Digest,
+    bytes: impl Fn(&[u8]) -> Vec<u8>,
+) -> (FeedLayer, u64) {
+    use velarx_content::layer::writer::{write_layer, write_layer_sha256_keyed};
     let write = if verity {
         write_layer::<&[u8], &mut Vec<u8>>
     } else {
@@ -1208,10 +1222,10 @@ fn chunked_layer_made(
     let w = write(
         tar,
         velarx_types::digest::Algorithm::Sha256,
-        Compression::ZstdChunked,
+        compression,
         &mut blob,
     )
-    .expect("a chunked layer");
+    .expect("a layer");
     let desc = OciDescriptor {
         media_type: w.media_type.to_string(),
         digest: w.digest,
@@ -3012,6 +3026,75 @@ pub async fn a_layer_keyed_by_sha256_only_is_refused(f: &Factory) {
     let text = refused.to_string();
     assert!(text.contains(&digest.to_string()), "{text}");
     assert!(text.contains("no fs-verity digest for `"), "{text}");
+}
+
+/// A gzip layer of a registry, which has no table of contents to fetch by,
+/// is read whole by the engine and its files are given to the driver as the
+/// driver asks: pulled, it is stored and reads back byte for byte, for a
+/// driver that keeps its files in another process as for one of this.  The
+/// engine's copies of the files go with the pull, and with a pull of a layer
+/// that is not its diff id.
+pub async fn a_gzip_layer_of_a_registry_is_pulled_and_read_back(f: &Factory) {
+    use velarx_content::layer::writer::Compression;
+    let (_tmp, s) = begin!(f, "a_gzip_layer_of_a_registry_is_pulled_and_read_back");
+    let reg = Registry::start().await;
+    let tar = base_layer();
+    let gzip_offer = |diff_id: fn(Digest) -> Digest| {
+        let (layer, _) =
+            registry_layer(&reg, &tar, Compression::Gzip, true, diff_id, |b| b.to_vec());
+        let mut layers = vec![layer];
+        set_chains(&mut layers);
+        async {
+            Offer {
+                feed: Arc::new(ArchiveFeed {
+                    layers: vec![(
+                        layers[0].descriptor.digest,
+                        registry_feed(&reg, &s.db, &s.dir, &layers[0].descriptor, false).await,
+                    )],
+                    meddle: Arc::default(),
+                }),
+                layers,
+                _registry: None,
+            }
+        }
+    };
+    let staged = || {
+        std::fs::read_dir(s.dir.join(velarx_content::pull::staged_fetch::LAYERS))
+            .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let wrong =
+        gzip_offer(|_| Digest::of(velarx_types::digest::Algorithm::Sha256, b"another")).await;
+    let e = expect_err(
+        wrong.pull(&s, engine_check()).await.map(|_| ()),
+        "a layer that is not its diff id",
+    );
+    assert!(e.to_string().contains("mismatch"), "{e}");
+    assert_eq!(
+        staged(),
+        Vec::<std::path::PathBuf>::new(),
+        "copies were left"
+    );
+    let offer = gzip_offer(|d| d).await;
+    let pulled = offer.pull(&s, engine_check()).await.expect("pull");
+    assert_eq!(
+        staged(),
+        Vec::<std::path::PathBuf>::new(),
+        "copies were left"
+    );
+    let done = &pulled.layers[0].done;
+    assert_eq!(done.key, LayerKey::Whole(offer.layers[0].descriptor.digest));
+    record(&s, &pulled).await;
+    let stored = open_layer_for(&s, &done.key, &done.diff_id)
+        .await
+        .expect("open_layer");
+    let mut out = Vec::new();
+    stored
+        .verified_stream(Arc::new(DriverObjects::new(s.driver.clone())))
+        .unwrap()
+        .read_to_end(&mut out)
+        .unwrap();
+    assert!(out == tar, "the layer is not what was pulled");
 }
 
 pub async fn a_layer_that_is_not_stored_is_an_error(f: &Factory) {
@@ -6610,6 +6693,7 @@ macro_rules! conformance_suite_with {
             a_layer_read_whole_tells_its_holes_and_frees_its_spool,
             pull_reads_back_byte_for_byte,
             a_layer_keyed_by_sha256_only_is_refused,
+            a_gzip_layer_of_a_registry_is_pulled_and_read_back,
             a_layer_that_is_not_stored_is_an_error,
             has_layers_reports_what_a_pull_stored,
             has_layers_does_not_report_what_is_not_committed,

@@ -758,7 +758,10 @@ impl ContentFeed {
                         from_local_source: false,
                     };
                     (
-                        Arc::new(HandedContent(w.copies)),
+                        Arc::new(HandedContent {
+                            copies: w.copies,
+                            _staging: unpacked.staging,
+                        }),
                         ingested,
                         unpacked.by_registry,
                     )
@@ -1112,8 +1115,12 @@ impl LocalContent for Spool {
 }
 
 /// The files a fetcher handed over for a layer read whole, as the engine holds
-/// them, by their key: the copy of each, in the session of the pull.
-struct HandedContent(HashMap<String, (std::path::PathBuf, u64, String)>);
+/// them, by their key: the copy of each, in the session of the pull or in the
+/// staging of the layer, which goes with it.
+struct HandedContent {
+    copies: HashMap<String, (std::path::PathBuf, u64, String)>,
+    _staging: Arc<pull::staged_fetch::LayerStaging>,
+}
 
 impl LocalContent for HandedContent {
     fn copy_to(
@@ -1124,7 +1131,7 @@ impl LocalContent for HandedContent {
         step: &mut dyn FnMut() -> std::io::Result<()>,
         hole: &mut dyn FnMut(u64, u64),
     ) -> std::io::Result<()> {
-        let (path, size, _) = self.0.get(key).ok_or_else(|| {
+        let (path, size, _) = self.copies.get(key).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("{key} was not handed over"),

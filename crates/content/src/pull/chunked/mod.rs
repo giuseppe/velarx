@@ -1551,7 +1551,7 @@ impl Merkle {
 /// known by the digest of the bytes the engine read: what the fetcher says of
 /// it is not asked.
 pub struct Intake {
-    sink: Arc<dyn super::sink::Sink>,
+    to: Arc<CopiesTo>,
     alg: Algorithm,
     /// The files in the making: one permit for each thread
     room: Arc<tokio::sync::Semaphore>,
@@ -1567,11 +1567,21 @@ struct Taken {
 
 impl Intake {
     /// The intake of the files of a layer whose blob is named in `alg`, for
-    /// `threads` at a time.
+    /// `threads` at a time, copied to temporary files of `sink`.
     pub fn new(sink: Arc<dyn super::sink::Sink>, alg: Algorithm, threads: usize) -> Self {
+        Self::to(CopiesTo::Sink(sink), alg, threads)
+    }
+
+    /// [`Intake::new`] with the copies made in `dir`, a directory of the
+    /// engine's: for a sink whose files are a storage driver's.
+    pub fn in_dir(dir: PathBuf, alg: Algorithm, threads: usize) -> Self {
+        Self::to(CopiesTo::Dir(dir, AtomicU64::new(0)), alg, threads)
+    }
+
+    fn to(to: CopiesTo, alg: Algorithm, threads: usize) -> Self {
         let threads = u32::try_from(threads.max(1)).unwrap_or(u32::MAX >> 4);
         Self {
-            sink,
+            to: Arc::new(to),
             alg,
             room: Arc::new(tokio::sync::Semaphore::new(threads as usize)),
             threads,
@@ -1591,9 +1601,9 @@ impl Intake {
             .acquire_owned()
             .await
             .map_err(io::Error::other)?;
-        let (sink, alg, taken) = (self.sink.clone(), self.alg, self.taken.clone());
+        let (to, alg, taken) = (self.to.clone(), self.alg, self.taken.clone());
         tokio::task::spawn_blocking(move || {
-            let made = take_in(file, alg, sink.as_ref());
+            let made = take_in(file, alg, &to);
             let mut taken = taken.lock().unwrap_or_else(|e| e.into_inner());
             match made {
                 Ok((key, copy)) => match taken.files.entry(key) {
@@ -1634,15 +1644,56 @@ impl Intake {
     }
 }
 
+/// Where an intake makes its copies.
+enum CopiesTo {
+    /// Temporary files of the sink
+    Sink(Arc<dyn super::sink::Sink>),
+    /// Files of a directory of the engine's, numbered
+    Dir(PathBuf, AtomicU64),
+}
+
+impl CopiesTo {
+    fn create_temp(&self) -> io::Result<(File, PathBuf)> {
+        match self {
+            Self::Sink(sink) => match sink.create_temp()? {
+                (file, Some(path)) => Ok((file, path)),
+                (_, None) => Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "the files of this sink have no names",
+                )),
+            },
+            Self::Dir(dir, n) => {
+                use std::os::unix::fs::OpenOptionsExt;
+                let path = dir.join(n.fetch_add(1, Ordering::Relaxed).to_string());
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&path)?;
+                Ok((file, path))
+            }
+        }
+    }
+
+    fn link_temp(&self, file: &File) -> io::Result<PathBuf> {
+        match self {
+            Self::Sink(sink) => sink.link_temp(file),
+            Self::Dir(dir, n) => {
+                let path = dir.join(n.fetch_add(1, Ordering::Relaxed).to_string());
+                super::session::link_unnamed(file, &path)?;
+                Ok(path)
+            }
+        }
+    }
+}
+
 /// Take in the file `file` a fetcher handed over: the digest of its content in
 /// `alg` and where the engine holds it.  A file the kernel measures cannot
 /// change: it is linked, and read for its digest; any other is copied to a
-/// file of the sink, and the digest is that of the bytes written.
-fn take_in(
-    file: File,
-    alg: Algorithm,
-    sink: &dyn super::sink::Sink,
-) -> io::Result<(String, Copied)> {
+/// file of `to`, and the digest is that of the bytes written.
+fn take_in(file: File, alg: Algorithm, to: &CopiesTo) -> io::Result<(String, Copied)> {
     let size = file.metadata()?.len();
     let mut content = match size >= OFFLOAD_FROM {
         true => Content::Beside(Offloaded::new(DigestWriter::new(alg))),
@@ -1650,20 +1701,14 @@ fn take_in(
     };
     let mut from = Read::take(FromStart { file: &file, at: 0 }, size + 1);
     if let Some(verity) = super::commit::measure(&file, alg) {
-        let path = sink.link_temp(&file)?;
+        let path = to.link_temp(&file)?;
         let size = io::copy(&mut from, &mut content)?;
         return Ok((
             content.finalize().to_string(),
             Copied { path, size, verity },
         ));
     }
-    let (to, path) = sink.create_temp()?;
-    let Some(path) = path else {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the files of this sink have no names",
-        ));
-    };
+    let (to, path) = to.create_temp()?;
     let mut verity = Merkle::new(alg, size);
     let copied = velarx_storage::copy_sparse(from, &to, |piece| {
         verity.update(piece);
@@ -2108,6 +2153,7 @@ pub async fn pull_whole(
     let Unpacked {
         mut ingested,
         by_registry,
+        ..
     } = unpacked;
     let sink = ctx.sink.clone();
     let files: Vec<String> = ingested.files.iter().map(|f| f.digest.clone()).collect();
@@ -2194,6 +2240,9 @@ pub struct Unpacked {
     pub ingested: Whole,
     /// The registry fetcher unpacked it (its workers hashed the blob)
     pub by_registry: bool,
+    /// The staging of the layer: the copies of a sink with no files of the
+    /// engine's are in it, and last as long as it does
+    pub staging: Arc<super::staged_fetch::LayerStaging>,
 }
 
 /// A layer read whole and checked ([`Unpacked`]).
@@ -2268,7 +2317,18 @@ async fn unpack_from(
         .await
         .map_err(|e| (e, false))?;
     let alg = LayerKey::expected(layer).digest().alg();
-    let intake = Intake::new(ctx.sink.clone(), alg, ctx.limits.workers);
+    // (a sink of a storage driver has no file of the engine's for a copy:
+    // the copies are made in the staging of the layer, and go with it)
+    let intake = match ctx.sink.clone().session() {
+        Some(_) => Intake::new(ctx.sink.clone(), alg, ctx.limits.workers),
+        None => {
+            let dir = staging
+                .path()
+                .join(format!("copies-{}", velarx_base::random::token()));
+            std::fs::create_dir(&dir).map_err(|e| (e.into(), false))?;
+            Intake::in_dir(dir, alg, ctx.limits.workers)
+        }
+    };
     let whole = match staged
         .fetch_whole(&staging, layer, registry_only, progress, &intake)
         .await
@@ -2362,6 +2422,7 @@ async fn unpack_from(
     Ok(Unpacked {
         ingested,
         by_registry: whole.by_registry,
+        staging,
     })
 }
 

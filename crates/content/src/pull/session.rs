@@ -360,22 +360,8 @@ impl Session {
     /// A name of the session for `file`, a file that has none: it is linked
     /// there, and the name is the file's.
     pub fn link_temp(&self, file: &File) -> io::Result<PathBuf> {
-        use rustix::fs::{linkat, AtFlags, CWD};
         let to = self.temp_path();
-        // (an unprivileged process may link a file with no name by its
-        // descriptor on newer kernels only: the other way works on all)
-        match linkat(file, "", CWD, &to, AtFlags::EMPTY_PATH) {
-            Err(rustix::io::Errno::NOENT | rustix::io::Errno::PERM | rustix::io::Errno::INVAL) => {
-                linkat(
-                    CWD,
-                    velarx_sys::fd::proc_str(&file),
-                    CWD,
-                    &to,
-                    AtFlags::SYMLINK_FOLLOW,
-                )
-            }
-            r => r,
-        }?;
+        link_unnamed(file, &to)?;
         Ok(to)
     }
 
@@ -1054,6 +1040,26 @@ impl Session {
     pub fn adopt(&self, temp: &Path, digest: &str, size: u64) -> io::Result<bool> {
         self.adopt_as(temp, digest, size, false)
     }
+}
+
+/// Link `file`, which has no name, at `to`.
+pub(crate) fn link_unnamed(file: &File, to: &Path) -> io::Result<()> {
+    use rustix::fs::{linkat, AtFlags, CWD};
+    // (an unprivileged process may link a file with no name by its
+    // descriptor on newer kernels only: the other way works on all)
+    match linkat(file, "", CWD, to, AtFlags::EMPTY_PATH) {
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::PERM | rustix::io::Errno::INVAL) => {
+            linkat(
+                CWD,
+                velarx_sys::fd::proc_str(&file),
+                CWD,
+                to,
+                AtFlags::SYMLINK_FOLLOW,
+            )
+        }
+        r => r,
+    }?;
+    Ok(())
 }
 
 #[cfg(test)]

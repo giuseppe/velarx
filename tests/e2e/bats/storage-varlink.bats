@@ -250,6 +250,28 @@ teardown_file () {
     sh_ image rm -f "$E2E_REGISTRY/e2e/varlink:1" > /dev/null 2>&1 || true
 }
 
+@test "a gzip layer has no table of contents: pulled from a registry, loaded and pulled from an archive, into the service" {
+    sh_ image tag "$IMAGE" localhost/e2e/varlink:gzip
+    sh_ image push --tls-verify=false --compression-format gzip localhost/e2e/varlink:gzip "$E2E_REGISTRY/e2e/varlink:gzip" > "$WORKDIR/push-gzip.log" 2>&1
+    check "push as gzip" 0 $?
+    check_match "the layer of the registry is gzip" 'tar\+gzip' "$(curl -s "http://$E2E_REGISTRY/v2/e2e/varlink/manifests/gzip" -H 'Accept: application/vnd.oci.image.manifest.v1+json')"
+    sh_ image save --format oci-archive -o "$WORKDIR/gzip.tar" localhost/e2e/varlink:gzip
+    check "save" 0 $?
+    sh_ image rm -f localhost/e2e/varlink:gzip > /dev/null
+    out=$(sh_ image pull --tls-verify=false "$E2E_REGISTRY/e2e/varlink:gzip" 2>&1)
+    check "pull from the registry ($out)" 0 $?
+    check "it runs" ok "$(sh_ container run --rm --network none "$E2E_REGISTRY/e2e/varlink:gzip" sh -c 'test -e /etc/os-release && echo ok')"
+    sh_ image rm -f "$E2E_REGISTRY/e2e/varlink:gzip" > /dev/null
+    out=$(sh_ image load -i "$WORKDIR/gzip.tar" 2>&1)
+    check "load ($out)" 0 $?
+    sh_ image rm -f localhost/e2e/varlink:gzip > /dev/null
+    out=$(sh_ image pull "oci-archive:$WORKDIR/gzip.tar" 2>&1)
+    check "pull of the archive ($out)" 0 $?
+    sh_ image rm -f --all > /dev/null 2>&1 || true
+    sh_ image pull --tls-verify=false "$IMAGE" > /dev/null
+    check "the image of the other tests is pulled again" 0 $?
+}
+
 @test "an option the service does not have is refused up front, naming the driver" {
     out=$(sh_ container create --name v7 --network none --security-opt verity=enforce "$IMAGE" true 2>&1)
     check "enforced digests for a container" 125 $?
