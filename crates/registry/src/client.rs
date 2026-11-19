@@ -1721,7 +1721,7 @@ impl RegistryClient {
                         .no_content_range
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                Ok(Patched::Failed(e)) | Err(e) if failures < UPLOAD_RETRIES => {
+                Ok(Patched::Failed(e)) if failures < UPLOAD_RETRIES => {
                     failures += 1;
                     tracing::warn!("An upload piece failed ({e}), sending it again");
                     tokio::time::sleep(upload_backoff(failures)).await;
@@ -1789,7 +1789,8 @@ impl RegistryClient {
         {
             Ok(r) => r,
             // (the connection: worth another try)
-            Err(e) => return Ok(Patched::Failed(e)),
+            Err(e @ ImageError::Http(_)) => return Ok(Patched::Failed(e)),
+            Err(e) => return Err(e),
         };
         let status = resp.status();
         if status.is_success() {
@@ -1874,7 +1875,7 @@ impl RegistryClient {
                     tracing::warn!("The end of an upload failed ({e}), trying again");
                     tokio::time::sleep(upload_backoff(failures)).await;
                     // it may have been taken before the answer was lost
-                    if self.blob_exists(t, digest).await.unwrap_or(false) {
+                    if self.blob_exists(t, digest).await? {
                         return Ok(());
                     }
                     let (have, next) = self.upload_status(t, &session).await.map_err(|s| {
@@ -1927,7 +1928,8 @@ impl RegistryClient {
             .await
         {
             Ok(r) => r,
-            Err(e) => return Ok(Some(e)),
+            Err(e @ ImageError::Http(_)) => return Ok(Some(e)),
+            Err(e) => return Err(e),
         };
         let status = resp.status();
         if status.is_success() {
@@ -3483,6 +3485,9 @@ mod tests {
         lose_patches: AtomicUsize,
         fail_puts: AtomicUsize,
         refuse_ranges: bool,
+        /// every PATCH is sent to a place the client refuses to go to
+        misdirect: bool,
+        patches: AtomicUsize,
         ranged_patches: AtomicUsize,
         done: std::sync::Mutex<Option<String>>,
     }
@@ -3504,6 +3509,11 @@ mod tests {
                 "/up/1",
                 axum::routing::patch(
                     move |State(u): State<Arc<Uploads>>, h: AxHeaders, body: AxBytes| async move {
+                        u.patches.fetch_add(1, Ordering::SeqCst);
+                        if u.misdirect {
+                            return (AxStatus::TEMPORARY_REDIRECT, [(header::LOCATION, "ftp://elsewhere/")])
+                                .into_response();
+                        }
                         let mut data = u.data.lock().unwrap();
                         if let Some(r) = h.get(header::CONTENT_RANGE) {
                             u.ranged_patches.fetch_add(1, Ordering::SeqCst);
@@ -3624,6 +3634,17 @@ mod tests {
         })
         .await;
         assert!(upload_all(&host).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_refused_upload_request_is_not_tried_again() {
+        let (host, u) = start_upload_registry(Uploads {
+            misdirect: true,
+            ..Default::default()
+        })
+        .await;
+        assert!(upload_all(&host).await.is_err());
+        assert_eq!(u.patches.load(Ordering::SeqCst), 1);
     }
 
     #[test]
