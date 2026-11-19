@@ -20,21 +20,18 @@
 use super::entry::{self, MAX_ENTRIES};
 
 use super::ranges::{Learnt, MAX_RANGES_PER_REQUEST, MAX_RANGE_HEADER};
-use super::sink::{Finished, Placement, Stage, FOLLOW_MIN, FOLLOW_STEP};
 use super::stream::FileUse;
 use super::tar::{normalize_path, Kind, TarReader};
 use super::tarsplit::{self, ContentFile, ContentIndex, Contents, Entries, Replay};
-use super::{LayerReport, Pace, PullCtx};
+use super::{LayerReport, PullCtx};
 use crate::fetcher::{BlobRange, ChunkId, ChunkRef};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, Read};
 use std::ops::Range;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
 use tracing::debug;
 use velarx_db::ChunkLocation as ChunkLocationRecord;
 use velarx_proto::transfer::FailureClass;
@@ -42,9 +39,6 @@ use velarx_registry::target::Target;
 use velarx_storage::{canonical, Toc, TocEntry, TocEntryType, TOC_VERSION};
 use velarx_types::digest::{Algorithm, Digest, DigestWriter, Offloaded};
 use velarx_types::{ImageError, ImageResult, LayerKey, OciDescriptor};
-
-mod fetch;
-use fetch::*;
 
 const ANNOTATION_PREFIXES: [&str; 2] = [
     "io.github.containers.zstd-chunked.",
@@ -209,18 +203,6 @@ pub fn naming(layer: &Digest, e: ImageError) -> ImageError {
         },
         e => e,
     }
-}
-
-/// Bytes of the layer (`what`) that are not what the TOC its descriptor
-/// vouches for says ([`ImageError::Contradicted`]).
-pub(crate) fn not_the_tocs(
-    expected: impl std::fmt::Display,
-    actual: impl std::fmt::Display,
-    what: &str,
-) -> ImageError {
-    ImageError::Contradicted(format!(
-        "{what} has the digest {actual}, the TOC says {expected}"
-    ))
 }
 
 /// Whether `e` says that what the descriptor vouches for (the TOC, and the
@@ -446,13 +428,10 @@ struct ChunkPlan {
     /// without a chunk digest, which the file digest covers.
     digest: Option<Digest>,
     comp: Range<u64>,
-    /// Where an identical chunk is in the store: file and offset.
-    local: Option<(String, u64)>,
 }
 
 #[derive(Debug)]
 struct FileJob {
-    name: String,
     /// What the file is known by (`TocEntry::content_key`).
     digest: String,
     size: u64,
@@ -691,7 +670,6 @@ fn plan_file(
                 .map(|d| layer_digest(&e.name, d, alg))
                 .transpose()?,
             comp: e.offset..e.end_offset,
-            local: None,
         });
     } else {
         let mut file_off = 0u64;
@@ -748,7 +726,6 @@ fn plan_file(
                     size,
                     digest: Some(chunk_digest),
                     comp: c.offset..end,
-                    local: None,
                 });
             }
             file_off += size;
@@ -758,7 +735,6 @@ fn plan_file(
         }
     }
     plan.jobs.push(FileJob {
-        name: e.name.clone(),
         digest: digest_str,
         size: e.size,
         holes,
@@ -1052,342 +1028,6 @@ pub fn make_batches(
         batches.push(cur);
     }
     batches
-}
-
-impl Plan {}
-
-struct FileState {
-    file: Option<Arc<File>>,
-    /// Where the content starts in the file: 0 unless the stage put it in
-    /// a file it shares
-    base: u64,
-    temp: Option<std::path::PathBuf>,
-    /// The file is written in order up to here.
-    next: u64,
-    /// The parts written after `next`: offset and length.
-    pending: BTreeMap<u64, u64>,
-    chunks_left: usize,
-    /// The progress that was told of
-    marked: u64,
-    done: bool,
-    verified: Vec<ChunkLocationRecord>,
-}
-
-pub(super) struct Shared {
-    stage: Arc<dyn Stage>,
-    plan: Plan,
-    files: Vec<Mutex<FileState>>,
-    /// The pull failed: no chunk is written any more
-    aborted: AtomicBool,
-    error: Mutex<Option<ImageError>>,
-    /// The files made with a chunk of the store (as it was, read-only
-    /// stores included) or of a local source: the store's, not the pull's
-    ///
-    with_local: Vec<AtomicBool>,
-}
-
-/// For each file job of `plan`, whether a chunk of it is taken from the
-/// store.
-fn jobs_with_local(plan: &Plan) -> Vec<AtomicBool> {
-    let v: Vec<AtomicBool> = (0..plan.jobs.len())
-        .map(|_| AtomicBool::new(false))
-        .collect();
-    for c in &plan.chunks {
-        if c.local.is_some() {
-            if let Some(x) = v.get(c.job) {
-                x.store(true, Ordering::Relaxed);
-            }
-        }
-    }
-    v
-}
-
-impl Shared {
-    fn new(stage: Arc<dyn Stage>, plan: Plan) -> Arc<Self> {
-        let mut chunks_left = vec![0usize; plan.jobs.len()];
-        for c in &plan.chunks {
-            chunks_left[c.job] += 1;
-        }
-        let files = chunks_left
-            .iter()
-            .map(|&n| {
-                Mutex::new(FileState {
-                    file: None,
-                    base: 0,
-                    temp: None,
-                    next: 0,
-                    pending: BTreeMap::new(),
-                    chunks_left: n,
-                    marked: 0,
-                    done: false,
-                    verified: Vec::new(),
-                })
-            })
-            .collect();
-        Arc::new(Shared {
-            with_local: jobs_with_local(&plan),
-            stage,
-            files,
-            plan,
-            aborted: AtomicBool::new(false),
-            error: Mutex::new(None),
-        })
-    }
-
-    fn set_error(&self, e: ImageError) {
-        let mut slot = self.error.lock().unwrap();
-        if slot.is_none() {
-            *slot = Some(e);
-        }
-        drop(slot);
-        self.aborted.store(true, Ordering::SeqCst);
-    }
-
-    fn failed(&self) -> bool {
-        self.aborted.load(Ordering::SeqCst)
-    }
-
-    /// The staged file of a job, created by its first chunk, and where its
-    /// content starts in it.
-    fn handle(&self, job: usize) -> ImageResult<(Arc<File>, u64)> {
-        let mut st = self.files[job].lock().unwrap();
-        if let Some(f) = &st.file {
-            return Ok((f.clone(), st.base));
-        }
-        let j = &self.plan.jobs[job];
-        let Placement { file, base, temp } =
-            self.stage.place(&j.digest, j.size).map_err(io_fail)?;
-        st.file = Some(file.clone());
-        st.base = base;
-        st.temp = temp;
-        // (the holes are where nothing is written: they count as written)
-        for &(off, len) in &j.holes {
-            st.pending.insert(off, len);
-            self.stage.hole(&j.digest, off, len);
-        }
-        self.drain(&mut st);
-        if j.size >= FOLLOW_MIN {
-            self.stage.opened(&j.digest, j.size, &file);
-            self.mark(job, &mut st);
-        }
-        Ok((file, base))
-    }
-
-    /// Tell the stage how far the file is written in order, now and then.
-    fn mark(&self, job: usize, st: &mut FileState) {
-        if st.next >= st.marked + FOLLOW_STEP {
-            st.marked = st.next;
-            self.stage.advanced(&self.plan.jobs[job].digest, st.next);
-        }
-    }
-
-    /// Count what is next in line as written.
-    fn drain(&self, st: &mut FileState) {
-        while let Some(entry) = st.pending.first_entry() {
-            if *entry.key() != st.next {
-                break;
-            }
-            st.next += entry.remove();
-        }
-    }
-
-    /// Record a verified chunk of a file.
-    fn chunk_written(
-        &self,
-        job: usize,
-        off: u64,
-        len: u64,
-        loc: Option<ChunkLocationRecord>,
-    ) -> ImageResult<()> {
-        let mut st = self.files[job].lock().unwrap();
-        if let Some(loc) = loc {
-            st.verified.push(loc);
-        }
-        if off == st.next {
-            st.next += len;
-            self.drain(&mut st);
-            if self.plan.jobs[job].size >= FOLLOW_MIN {
-                self.mark(job, &mut st);
-            }
-        } else {
-            st.pending.insert(off, len);
-        }
-        st.chunks_left -= 1;
-        if st.chunks_left == 0 {
-            return self.finish(job, &mut st);
-        }
-        Ok(())
-    }
-
-    /// A chunk of a file that its stage's owner copies (`Stage::copy_chunk`):
-    /// nothing to write or hash here, it counts as written.
-    fn chunk_copied(&self, job: usize, off: u64, len: u64) -> ImageResult<()> {
-        let mut st = self.files[job].lock().unwrap();
-        if off == st.next {
-            st.next += len;
-            self.drain(&mut st);
-        } else {
-            st.pending.insert(off, len);
-        }
-        st.chunks_left -= 1;
-        if st.chunks_left == 0 {
-            return self.finish(job, &mut st);
-        }
-        Ok(())
-    }
-
-    /// Make the files that have no chunk to write (all zeros): no chunk
-    /// would complete them.
-    fn complete_without_chunks(&self) -> ImageResult<()> {
-        for job in 0..self.plan.jobs.len() {
-            if self.files[job].lock().unwrap().chunks_left != 0 {
-                continue;
-            }
-            self.handle(job)?;
-            let mut st = self.files[job].lock().unwrap();
-            self.finish(job, &mut st)?;
-        }
-        Ok(())
-    }
-
-    fn finish(&self, job: usize, st: &mut FileState) -> ImageResult<()> {
-        let j = &self.plan.jobs[job];
-        st.pending.clear();
-        // (a stage whose files nothing checks after the fetch, the files of a
-        // driver: the content is what its key names before it is told whole)
-        if let Some(actual) = self.stage.measure(&j.digest).map_err(io_fail)? {
-            if actual.to_string() != j.digest {
-                return Err(not_the_tocs(&j.digest, actual, &format!("`{}`", j.name)));
-            }
-        }
-        let takes = self.stage.takes_files();
-        if !takes {
-            if let Some(f) = &st.file {
-                super::session::start_writeback(f);
-            }
-        }
-        // a file made with a chunk the store had is a copy of it: not told
-        // nor given
-        let copy = self
-            .with_local
-            .get(job)
-            .is_none_or(|x| x.load(Ordering::Acquire));
-        let file = if takes {
-            Some(st.file.take().expect("an open file"))
-        } else {
-            None
-        };
-        self.stage
-            .adopt(Finished {
-                file,
-                temp: st.temp.take(),
-                key: j.digest.clone(),
-                name: j.name.clone(),
-                size: j.size,
-                copy,
-                verity_keyed: true,
-            })
-            .map_err(io_fail)?;
-        st.done = true;
-        Ok(())
-    }
-}
-
-/// Decompress one chunk and check its length (blocking).
-#[cfg(test)]
-fn decode_chunk(sh: &Shared, idx: usize, comp: &[u8]) -> ImageResult<Vec<u8>> {
-    let c = &sh.plan.chunks[idx];
-    let data = zstd::bulk::decompress(comp, c.size as usize).map_err(|e| {
-        ImageError::Contradicted(format!(
-            "a chunk of `{}` cannot be decompressed: {e}",
-            sh.plan.jobs[c.job].name
-        ))
-    })?;
-    if data.len() as u64 != c.size {
-        return Err(ImageError::Contradicted(format!(
-            "a chunk of `{}` has {} bytes, the TOC says {}",
-            sh.plan.jobs[c.job].name,
-            data.len(),
-            c.size
-        )));
-    }
-    Ok(data)
-}
-
-/// Decompress, check and write one chunk (blocking).
-#[cfg(test)]
-fn process_chunk(sh: &Shared, idx: usize, comp: bytes::Bytes) -> ImageResult<()> {
-    if sh.failed() {
-        return Ok(());
-    }
-    let data = decode_chunk(sh, idx, &comp)?;
-    drop(comp);
-    write_verified(sh, idx, data)
-}
-
-fn write_verified(sh: &Shared, idx: usize, data: Vec<u8>) -> ImageResult<()> {
-    let c = &sh.plan.chunks[idx];
-    let job = &sh.plan.jobs[c.job];
-    let actual = c.digest.is_some().then(|| Digest::of(sh.plan.alg, &data));
-    let loc = match (&c.digest, &actual) {
-        (Some(expected), Some(actual)) => {
-            if actual != expected {
-                return Err(not_the_tocs(
-                    expected,
-                    actual,
-                    &format!("a chunk of `{}`", job.name),
-                ));
-            }
-            Some(ChunkLocationRecord {
-                chunk_digest: *expected,
-                file_digest: job.digest.clone(),
-                offset: c.file_off,
-                size: c.size,
-            })
-        }
-        _ => None,
-    };
-    let (file, base) = sh.handle(c.job)?;
-    // (the file has its size: the zeros of the chunk stay holes)
-    velarx_storage::write_at_sparse(&file, &data, base + c.file_off).map_err(io_fail)?;
-    // (the file is complete when its last chunk is written: nothing but
-    // its state holds it then)
-    drop(file);
-    sh.chunk_written(c.job, c.file_off, data.len() as u64, loc)
-}
-
-/// Read a chunk another file of the store holds (blocking).
-fn process_local(sh: &Shared, idx: usize) -> ImageResult<()> {
-    if sh.failed() {
-        return Ok(());
-    }
-    let c = &sh.plan.chunks[idx];
-    let (file_digest, off) = c.local.as_ref().expect("a local chunk");
-    // A stage whose owner holds the object has it copy the bytes: the file is
-    // placed (its holes are told) and the chunk counts as written.
-    drop(sh.handle(c.job)?);
-    if sh
-        .stage
-        .copy_chunk(
-            &sh.plan.jobs[c.job].digest,
-            c.file_off,
-            file_digest,
-            *off,
-            c.size,
-        )
-        .map_err(io_fail)?
-    {
-        return sh.chunk_copied(c.job, c.file_off, c.size);
-    }
-    let f = sh.stage.open_object(file_digest).map_err(io_fail)?;
-    let mut data = vec![0u8; c.size as usize];
-    f.read_exact_at(&mut data, *off).map_err(io_fail)?;
-    // (a file of the store that is not what it was is the store's damage,
-    // not the registry's)
-    write_verified(sh, idx, data).map_err(|e| match refuses(&e) {
-        true => fail(format!("a chunk of the store: {e}")),
-        false => e,
-    })
 }
 
 struct Opened {
@@ -2426,8 +2066,25 @@ async fn verify_layer(
     // verified one, each file is checked against its entry by the commit
     // (the kernel's fs-verity measure, or one read of its content), and no
     // diff id is claimed for the stream before a recreation of it checks
-    // one.
-    let executed = execute(ctx, layer, plan, started).await?;
+    // one.  The fetchers staged every file the store lacks before this
+    // plan, which finds them there: a file left is neither staged nor in the
+    // store.
+    if !plan.jobs.is_empty() {
+        return Err(fail(format!(
+            "{} files of the layer are neither staged nor in the store",
+            plan.jobs.len()
+        )));
+    }
+    debug!(
+        "Layer {}: planned after {:?}",
+        layer.digest,
+        started.elapsed()
+    );
+    let from_store = plan
+        .skipped
+        .iter()
+        .filter(|(d, _)| ctx.sink.existed(d))
+        .count() as u64;
     // (the entries are those of the verified table, as a lazy layer records
     // them)
     let toc = if meta.toc.is_canonical() {
@@ -2444,62 +2101,29 @@ async fn verify_layer(
     // from it checks the bytes)
     let located = located_chunks(&toc);
     let diff_id = *expected_diff_id;
-    // (the chunks checked as they came, and those the table gives for the
-    // read, staged or stored: each place once)
-    let mut chunk_records = executed.verified_chunks()?;
-    let mut seen: HashSet<Digest> = chunk_records.iter().map(|c| c.chunk_digest).collect();
-    chunk_records.extend(located.into_iter().filter(|c| seen.insert(c.chunk_digest)));
-    let report = executed.report(metadata_bytes);
+    // (the chunks the table gives for the read, staged or stored: each place
+    // once)
+    let mut seen = HashSet::new();
+    let chunks = located
+        .into_iter()
+        .filter(|c| seen.insert(c.chunk_digest))
+        .collect();
+    let report = LayerReport {
+        fetched_bytes: metadata_bytes,
+        fetched_files: 0,
+        reused_bytes: plan.skipped_compressed,
+        reused_files: plan.skipped_files,
+        sources: Vec::new(),
+    };
     Ok(Pulled {
-        from_store: executed.from_store,
+        from_store,
         toc,
         files,
-        chunks: chunk_records,
+        chunks,
         report,
         diff_id,
         tarsplit: meta.tarsplit_z,
     })
-}
-
-impl Executed {
-    /// What the plan cost, with the `metadata_bytes` fetched before it.
-    pub(super) fn report(&self, metadata_bytes: u64) -> LayerReport {
-        LayerReport {
-            fetched_bytes: metadata_bytes,
-            fetched_files: self.jobs as u64,
-            reused_bytes: self.skipped_compressed + self.local_bytes,
-            reused_files: self.skipped_files,
-            sources: Vec::new(),
-        }
-    }
-
-    /// The chunks that were verified, once every file is complete.
-    pub(super) fn verified_chunks(&self) -> ImageResult<Vec<ChunkLocationRecord>> {
-        let mut records = Vec::new();
-        for (job, st) in self.shared.files.iter().enumerate() {
-            let mut st = st.lock().unwrap();
-            if !st.done {
-                return Err(fail(format!(
-                    "`{}` was not completed",
-                    self.shared.plan.jobs[job].name
-                )));
-            }
-            records.append(&mut st.verified);
-        }
-        Ok(records)
-    }
-}
-
-/// A plan that was carried out.
-pub(super) struct Executed {
-    pub shared: Arc<Shared>,
-    jobs: usize,
-    skipped_files: u64,
-    skipped_compressed: u64,
-    local_bytes: u64,
-    /// Files and chunks taken from the store as it was before this pull
-    /// (not staged by it): nothing proves the registry gives them
-    from_store: u64,
 }
 
 /// The chunks of `plan` that the store (or the storage driver of the sink)
@@ -2593,100 +2217,6 @@ async fn reuse_hints(
     hints.sealed().map_err(ImageError::Io)
 }
 
-/// Fetch the chunks of `plan` from the registry and the store, verify them
-/// and write the files to the session.
-pub(super) async fn execute(
-    ctx: &PullCtx,
-    layer: &OciDescriptor,
-    mut plan: Plan,
-    started: std::time::Instant,
-) -> ImageResult<Executed> {
-    let sink = ctx.sink.clone();
-    // Chunks the store already holds.
-    let mut local_bytes = 0u64;
-    for (i, place) in store_chunks(ctx, &plan).await? {
-        let c = &mut plan.chunks[i];
-        local_bytes += c.comp.end - c.comp.start;
-        c.local = Some(place);
-    }
-
-    debug!(
-        "Layer {}: planned after {:?}",
-        layer.digest,
-        started.elapsed()
-    );
-    let n_chunks = plan.chunks.len();
-    let remote: Vec<usize> = (0..n_chunks)
-        .filter(|&i| plan.chunks[i].local.is_none())
-        .collect();
-    let local: Vec<usize> = (0..n_chunks)
-        .filter(|&i| plan.chunks[i].local.is_some())
-        .collect();
-    let local_count = local.len();
-    let skipped = std::mem::take(&mut plan.skipped);
-    let from_store =
-        local_count as u64 + skipped.iter().filter(|(d, _)| ctx.sink.existed(d)).count() as u64;
-    let skipped_files = plan.skipped_files;
-    let skipped_compressed = plan.skipped_compressed;
-    let n_jobs = plan.jobs.len();
-
-    // (the fetchers staged every file the store lacks before the plan, which
-    // finds them there: what is left is no chunk of the store either.  Before
-    // anything holds the pull's files: the error leaves nothing behind)
-    if !remote.is_empty() {
-        return Err(fail(format!(
-            "{} chunks of the layer are neither staged nor in the store",
-            remote.len()
-        )));
-    }
-    let shared = Shared::new(sink.clone(), plan);
-    {
-        let shared = shared.clone();
-        tokio::task::spawn_blocking(move || shared.complete_without_chunks())
-            .await
-            .map_err(|e| fail(format!("zeros task: {e}")))??;
-    }
-
-    let (handles_tx, mut handles_rx) = mpsc::unbounded_channel::<tokio::task::JoinHandle<()>>();
-
-    let pace = ctx.pace();
-    // Chunks from the store.
-    for idx in local {
-        dispatch_local(&pace, &shared, &handles_tx, idx).await;
-    }
-
-    drop(handles_tx);
-    debug!(
-        "Layer {}: all requests done after {:?}",
-        layer.digest,
-        started.elapsed()
-    );
-    while let Some(h) = handles_rx.recv().await {
-        // (a write that panicked wrote nothing: the pull fails, the replay
-        // that waits for the file stops)
-        if let Err(e) = h.await {
-            shared.set_error(fail(format!("a write of the chunks: {e}")));
-        }
-    }
-    debug!(
-        "Layer {}: all chunks written after {:?}",
-        layer.digest,
-        started.elapsed()
-    );
-
-    if let Some(e) = shared.error.lock().unwrap().take() {
-        return Err(e);
-    }
-    Ok(Executed {
-        shared,
-        jobs: n_jobs,
-        skipped_files,
-        skipped_compressed,
-        local_bytes,
-        from_store,
-    })
-}
-
 /// The chunk `i` of the plan as the fetchers know it: named by its file and
 /// its index in it, with where it is in the blob.  A chunk without a digest
 /// (a file of one chunk, covered by the file digest) has an empty one: only
@@ -2748,11 +2278,6 @@ pub fn file_chunks(
         holes: job.holes.clone(),
     })
 }
-
-/// Bytes of decompressed chunks handed to one blocking task at most.
-pub const DISPATCH_BYTES: usize = 1 << 20;
-/// Chunks handed to one blocking task at most.
-pub const DISPATCH_CHUNKS: usize = 64;
 
 #[cfg(test)]
 mod tests;

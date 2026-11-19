@@ -66,13 +66,6 @@ pub fn read_only_unnamed(dir: &Path, bytes: &[u8]) -> io::Result<OwnedFd> {
     Ok(reopened.into())
 }
 
-/// A file with no name in `dir` holding `bytes`.
-pub fn unnamed_with(dir: &std::path::Path, bytes: &[u8]) -> io::Result<File> {
-    let file = unnamed_file(dir)?;
-    std::os::unix::fs::FileExt::write_all_at(&file, bytes, 0)?;
-    Ok(file)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

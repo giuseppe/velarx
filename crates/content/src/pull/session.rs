@@ -145,11 +145,6 @@ impl Session {
         Ok(s)
     }
 
-    /// Whether this session staged any file.
-    pub fn has_staged_files(&self) -> bool {
-        !self.staged.lock().unwrap().is_empty()
-    }
-
     /// Whether this session staged `digest` (not the store).
     pub fn has_staged(&self, digest: &str) -> bool {
         self.staged.lock().unwrap().contains_key(digest)

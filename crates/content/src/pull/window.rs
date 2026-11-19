@@ -83,22 +83,6 @@ pub fn groups(
     Ok(groups)
 }
 
-/// The position of each of these contents in the table, in the order of the
-/// table; contents it has no file of are left out.
-pub fn positions_of(toc: &Toc, digests: &[&str]) -> Vec<usize> {
-    let wanted: HashSet<&str> = digests.iter().copied().collect();
-    let mut taken: HashSet<String> = HashSet::new();
-    toc.entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| is_file(e))
-        .filter_map(|(i, e)| {
-            let d = e.verity()?;
-            (wanted.contains(d.as_str()) && taken.insert(d)).then_some(i)
-        })
-        .collect()
-}
-
 /// The positions of the files that follow the one at `first`, up to the
 /// limits, that `wanted` accepts (it is asked once for each content, and
 /// may take a claim on it).  A content is taken once, however many names it
@@ -150,29 +134,6 @@ pub fn select(
         out.push(i);
     }
     out
-}
-
-/// The entries of the files at these positions, each with the chunks that
-/// follow it, in the order given.
-pub fn entries_of(toc: &Toc, positions: &[usize]) -> Toc {
-    let mut entries = Vec::new();
-    for &i in positions {
-        let Some(file) = toc.entries.get(i) else {
-            continue;
-        };
-        entries.push(file.clone());
-        entries.extend(
-            toc.entries[i + 1..]
-                .iter()
-                .take_while(|c| c.entry_type == TocEntryType::Chunk)
-                .cloned(),
-        );
-    }
-    Toc {
-        version: toc.version,
-        entries,
-        tar_split_digest: None,
-    }
 }
 
 #[cfg(test)]
@@ -327,29 +288,5 @@ mod tests {
         assert!(select(&t, t.entries.len() - 2, W, |_| true).is_empty());
         assert!(file_index(&t, "fsverity-sha256-12:nope").is_none());
         assert!(select(&t, usize::MAX, W, |_| true).is_empty());
-    }
-
-    #[test]
-    fn the_entries_of_files_come_with_their_chunks() {
-        let t = toc(&[10, 200, 30]);
-        let at = [
-            file_index(&t, &format!("fsverity-sha256-12:{:064x}", 1)).unwrap(),
-            1,
-        ];
-        let mini = entries_of(&t, &at);
-        let kinds: Vec<_> = mini
-            .entries
-            .iter()
-            .map(|e| (e.name.as_str(), e.entry_type))
-            .collect();
-        assert_eq!(
-            kinds,
-            [
-                ("f1", TocEntryType::Reg),
-                ("f1", TocEntryType::Chunk),
-                ("f0", TocEntryType::Reg)
-            ]
-        );
-        assert!(entries_of(&t, &[usize::MAX]).entries.is_empty());
     }
 }

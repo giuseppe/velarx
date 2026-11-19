@@ -470,7 +470,7 @@ async fn test_an_image_without_annotations_is_refused_when_enforced() {
 
 /// A sparse file keeps its holes in the store, whatever the layer: the
 /// zeros chunks of zstd:chunked are not written, nor are the blocks of
-/// zeros of a stream.
+/// zeros of a stream.  A file of zeros chunks only is made whole too.
 #[tokio::test]
 async fn test_sparse_files_keep_their_holes() {
     use std::os::unix::fs::MetadataExt;
@@ -478,12 +478,20 @@ async fn test_sparse_files_keep_their_holes() {
     data.extend(vec![0u8; 1 << 20]);
     data.extend(vec![2u8; 4096]);
     data.extend(vec![0u8; 1 << 20]);
+    let zeros = vec![0u8; 1 << 20];
     let items = || {
-        vec![Item::File {
-            name: "usr/sparse",
-            data: data.clone(),
-            chunk: 4096,
-        }]
+        vec![
+            Item::File {
+                name: "usr/sparse",
+                data: data.clone(),
+                chunk: 4096,
+            },
+            Item::File {
+                name: "usr/zeros",
+                data: zeros.clone(),
+                chunk: 4096,
+            },
+        ]
     };
     for (layer, media) in [
         (build_chunked(&items()), ZSTD),
@@ -492,10 +500,12 @@ async fn test_sparse_files_keep_their_holes() {
         let e = env().await;
         e.publish(&[&layer], &[media]);
         e.pull().await.unwrap();
-        let path = e.store.get_path(&vid(&data)).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), data);
-        let blocks = std::fs::metadata(&path).unwrap().blocks();
-        assert!(blocks <= 64, "{media}: {blocks} blocks of 512 bytes");
+        for content in [&data, &zeros] {
+            let path = e.store.get_path(&vid(content)).unwrap();
+            assert_eq!(&std::fs::read(&path).unwrap(), content);
+            let blocks = std::fs::metadata(&path).unwrap().blocks();
+            assert!(blocks <= 64, "{media}: {blocks} blocks of 512 bytes");
+        }
     }
 }
 

@@ -869,12 +869,11 @@ fn prepare_one(
     if !want.own && meta.nlink() != 1 {
         return wrong("it has another name");
     }
-    let only_name = true;
     // what a producer wrote is not believed: the kernel measures its
     // fs-verity digest (enabled here where the producer did not, on a file
     // with no other name)
     let mut measured = measure(&file, alg);
-    if measured.is_none() && only_name {
+    if measured.is_none() {
         if let Some(m) = &manager {
             match m.enable_file(&file, Path::new(rel)) {
                 Ok(()) => measured = measure(&file, alg),
@@ -906,7 +905,7 @@ fn prepare_one(
     // file system with one name.  Whether the kernel measures it only says
     // how it is verified below (by the measure, or by one read of its
     // bytes), never whether it is linked or copied
-    let links = same_fs && only_name;
+    let links = same_fs;
     let mut content = None;
     match &want.check {
         Check::Verity(v) => {

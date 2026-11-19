@@ -65,8 +65,6 @@ pub struct Placement {
 
 /// Files from this size are read by the replay while they are written.
 pub const FOLLOW_MIN: u64 = 4 << 20;
-/// Bytes written in order between two notices of the progress of a file.
-pub const FOLLOW_STEP: u64 = 8 << 20;
 
 /// Where the files of a layer are written and handed to: the session of the
 /// pull, a job that sends them to it, or the files of a driver.
@@ -91,17 +89,11 @@ pub trait Stage: Send + Sync {
             temp,
         })
     }
-    /// Whether the stage takes the files of the layer: they are not left
-    /// open to be read again, and not hashed here.
-    fn takes_files(&self) -> bool;
     /// Give a complete file its place; whether it was kept.
     fn adopt(&self, finished: Finished) -> io::Result<bool>;
     /// A file of at least [`FOLLOW_MIN`] bytes was created: the stage may
     /// let the replay read it while it is written.
     fn opened(&self, _key: &str, _size: u64, _file: &File) {}
-    /// The file is written in order up to `upto` bytes (at every
-    /// [`FOLLOW_STEP`] or so).
-    fn advanced(&self, _key: &str, _upto: u64) {}
     /// `len` bytes from `at` of the content of `key` are zeros: a hole of
     /// the file, which the stage may leave as it is.
     fn hole(&self, _key: &str, _at: u64, _len: u64) {}
@@ -273,10 +265,6 @@ impl Stage for Session {
 
     fn link_temp(&self, file: &File) -> io::Result<PathBuf> {
         Session::link_temp(self, file)
-    }
-
-    fn takes_files(&self) -> bool {
-        false
     }
 
     fn adopt(&self, finished: Finished) -> io::Result<bool> {
@@ -567,36 +555,6 @@ impl FilesSink {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
-
-    /// The size of the place of `key`.
-    pub fn size_of(&self, key: &str) -> Option<u64> {
-        self.slots.get(key).map(|s| s.size)
-    }
-
-    /// Whether the `len` bytes from `at` of the content of `key`, at its
-    /// place, are zeros.
-    pub fn zeros_at(&self, key: &str, at: u64, len: u64) -> io::Result<bool> {
-        use std::os::unix::fs::FileExt;
-        let slot = self
-            .slots
-            .get(key)
-            .ok_or_else(|| io::Error::other(format!("{key} has no place in the files given")))?;
-        let end = at
-            .checked_add(len)
-            .filter(|e| *e <= slot.size)
-            .ok_or_else(|| io::Error::other(format!("a run of {key} beyond its place")))?;
-        let mut buf = vec![0u8; len.min(1 << 20) as usize];
-        let mut from = at;
-        while from < end {
-            let n = (end - from).min(buf.len() as u64) as usize;
-            slot.file.read_exact_at(&mut buf[..n], slot.base + from)?;
-            if buf[..n].iter().any(|b| *b != 0) {
-                return Ok(false);
-            }
-            from += n as u64;
-        }
-        Ok(true)
-    }
 }
 
 /// A sink that keeps the content of the files of a layer read whole in a
@@ -826,10 +784,6 @@ impl Stage for Spool {
         Err(not_here("a file with no place"))
     }
 
-    fn takes_files(&self) -> bool {
-        false
-    }
-
     fn adopt(&self, _finished: Finished) -> io::Result<bool> {
         Err(not_here("a file with a name"))
     }
@@ -947,10 +901,6 @@ impl Stage for FilesSink {
             base: slot.base,
             temp: None,
         })
-    }
-
-    fn takes_files(&self) -> bool {
-        true
     }
 
     fn adopt(&self, finished: Finished) -> io::Result<bool> {

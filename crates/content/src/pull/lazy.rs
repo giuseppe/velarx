@@ -17,9 +17,8 @@ use super::entry;
 use super::tar::TarReader;
 use super::tarsplit::{self, Contents, Entries, Replay};
 use super::{LayerReport, PullCtx};
-use std::collections::VecDeque;
 use std::io::{self, Read};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use velarx_storage::{Toc, TocEntry, TocEntryType, TOC_VERSION};
 use velarx_types::digest::{Algorithm, Digest};
 use velarx_types::{ImageError, ImageResult, OciDescriptor};
@@ -178,38 +177,9 @@ pub async fn accept(
     })
 }
 
-/// The TOCs of lazy layers last parsed, by layer digest: a file read on
-/// demand needs the TOC of its layer, and the files of a layer are read
-/// one after the other.  A layer's TOC is that of its blob: it does
-/// not change.
-static TOCS: Mutex<VecDeque<(String, Arc<Toc>)>> = Mutex::new(VecDeque::new());
-const KEEP_TOCS: usize = 4;
-
-/// The stored TOC `json` of the layer `digest`, parsed once.
-pub fn parsed_toc(digest: &str, json: &str) -> ImageResult<Arc<Toc>> {
-    let lock = || TOCS.lock().unwrap_or_else(|e| e.into_inner());
-    {
-        let mut tocs = lock();
-        if let Some(i) = tocs.iter().position(|(d, _)| d == digest) {
-            let hit = tocs.remove(i).expect("a position of the list");
-            let toc = hit.1.clone();
-            tocs.push_front(hit);
-            return Ok(toc);
-        }
-    }
-    let toc: Arc<Toc> = Arc::new(serde_json::from_str(json)?);
-    let mut tocs = lock();
-    if !tocs.iter().any(|(d, _)| d == digest) {
-        tocs.push_front((digest.to_string(), toc.clone()));
-        tocs.truncate(KEEP_TOCS);
-    }
-    Ok(toc)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pull::window;
 
     fn entry(name: &str, kind: TocEntryType, size: u64, d: Option<&str>) -> TocEntry {
         TocEntry {
@@ -363,22 +333,5 @@ mod tests {
         t.entries[2].fsverity = None;
         let e = view(&t).unwrap_err();
         assert!(e.to_string().contains("no digest for `d/f`"), "{e}");
-    }
-
-    #[test]
-    fn test_file_entries_slice() {
-        let d = crate::verity_text(b"x");
-        let toc = Toc {
-            version: 1,
-            entries: vec![
-                entry("a", TocEntryType::Reg, 2, Some(&d)),
-                entry("a", TocEntryType::Chunk, 0, None),
-                entry("b", TocEntryType::Reg, 2, Some(&crate::verity_text(b"y"))),
-            ],
-            tar_split_digest: None,
-        };
-        let at = window::file_index(&toc, &d).unwrap();
-        assert_eq!(window::entries_of(&toc, &[at]).entries.len(), 2);
-        assert!(window::file_index(&toc, &crate::verity_text(b"z")).is_none());
     }
 }

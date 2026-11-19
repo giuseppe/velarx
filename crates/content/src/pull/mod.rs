@@ -342,11 +342,6 @@ pub fn is_file_key(text: &str) -> bool {
     key_algorithm(text).is_some()
 }
 
-/// The name of the file or the lock of the file known by `key`.
-pub fn key_name(key: &str) -> String {
-    key.replace(':', "-")
-}
-
 /// Where the blobs of an image come from.
 #[derive(Clone)]
 pub enum Source {
@@ -915,9 +910,6 @@ mod key_tests {
             let verity = velarx_storage::fsverity_digest_of(alg, b"x");
             assert_eq!(key_algorithm(&verity), Some(alg));
             assert!(is_file_key(&content) && is_file_key(&verity));
-            // (never the same name: a lock or a staged file of one kind is
-            // not the other's)
-            assert_ne!(key_name(&content), key_name(&verity));
         }
         for bad in [
             "",

@@ -113,7 +113,6 @@ mod tests {
             "crates/content/src/pull/session.rs",
             "crates/content/src/pull/stream.rs",
             "crates/content/src/pull/chunked/mod.rs",
-            "crates/content/src/pull/chunked/fetch.rs",
             "crates/content/src/pull/staged_fetch.rs",
             "crates/content/src/stager.rs",
             "crates/registry-lib/src/registry_fetch.rs",

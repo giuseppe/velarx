@@ -10,7 +10,7 @@
 //! driver owns the store: it says what it lacks ([`Incoming::wants`], which
 //! for composefs and vfs is [`Session::have`], asked for each file as the
 //! plan of the layer is made) and it receives the bytes in the files of its
-//! own staging session (`Stage`, as before the seam existed).  A driver
+//! own staging session (`Stage`).  A driver
 //! whose store is not the engine's files (the `varlink` driver) implements
 //! [`Incoming`] with files it hands over and answers the same questions
 //! from the other side of a socket.
@@ -41,8 +41,9 @@
 //!    only the engine needs of the check ([`Verdict`]) goes back in
 //!    [`Pulled::verdict`].
 //!
-//! Only the layers the engine does not have are in the pull: which layers
-//! the store has is the engine's question to the driver (a later stage).
+//! All the layers of the image are in the pull, those the driver has marked
+//! ([`FeedLayer::stored`]): which layers the store has is the engine's
+//! question to the driver (`has_layers`).
 //! [`PullFeed::index`] shows a driver the table of contents of a layer when
 //! it wants to plan itself; the in-process drivers do not use it (the plan
 //! is made by the engine from the table of contents it has to fetch anyway).

@@ -4,8 +4,8 @@ fn cap(blob: i64) -> u64 {
 }
 
 use super::*;
-use bytes::Bytes;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 
 fn layer(annotations: &[(&str, &str)], media: &str) -> OciDescriptor {
     OciDescriptor {
@@ -142,7 +142,6 @@ fn test_plan_skips_known_and_duplicate_content() {
     let have = |x: &str, _| x == d(2);
     let plan = make_plan(&t, Algorithm::Sha256, 1000, 1 << 20, cap(1000), &have).unwrap();
     assert_eq!(plan.jobs.len(), 1);
-    assert_eq!(plan.jobs[0].name, "a");
     assert_eq!(plan.skipped_files, 2);
     assert_eq!(plan.skipped_compressed, 200);
     assert_eq!(plan.chunks.len(), 1);
@@ -298,7 +297,6 @@ fn test_batches_merge_adjacent_chunks_and_respect_limits() {
         size: 1,
         digest: None,
         comp: start..start + len,
-        local: None,
     };
     // 200 chunks of 1 KiB with gaps of 2 KiB: the gaps cost less than
     // the requests they save, the ranges are merged
@@ -405,204 +403,6 @@ fn test_decompress_is_bounded() {
     );
 }
 
-fn shared_for(plan: Plan) -> (tempfile::TempDir, Arc<Shared>) {
-    let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(velarx_storage::FileStore::new(tmp.path().join("files")).unwrap());
-    let session =
-        crate::pull::session::Session::create(&tmp.path().join("staging"), store).unwrap();
-    (tmp, Shared::new(session, plan))
-}
-
-/// A file of three chunks and a hole in the middle, whose chunks arrive
-/// in the worst order, is staged under its key.
-#[test]
-fn test_out_of_order_chunks_with_a_hole() {
-    let (a, b) = (vec![1u8; 100], vec![2u8; 50]);
-    let mut content = a.clone();
-    content.extend(vec![0u8; 30]);
-    content.extend(&b);
-    let file_digest = crate::sha256_text(&content);
-    let plan = Plan {
-        jobs: vec![FileJob {
-            name: "f".into(),
-            digest: file_digest.clone(),
-            size: content.len() as u64,
-            holes: vec![(100, 30)],
-            chunks: 0..2,
-        }],
-        chunks: vec![
-            ChunkPlan {
-                job: 0,
-                file_off: 0,
-                size: 100,
-                digest: Some(crate::sha256(&a)),
-                comp: 0..1,
-                local: None,
-            },
-            ChunkPlan {
-                job: 0,
-                file_off: 130,
-                size: 50,
-                digest: Some(crate::sha256(&b)),
-                comp: 1..2,
-                local: None,
-            },
-        ],
-        ..Plan::default()
-    };
-    let (_tmp, sh) = shared_for(plan);
-    let zb = zstd::encode_all(&b[..], 3).unwrap();
-    let za = zstd::encode_all(&a[..], 3).unwrap();
-    process_chunk(&sh, 1, Bytes::from(zb)).unwrap();
-    assert!(!sh.files[0].lock().unwrap().done);
-    process_chunk(&sh, 0, Bytes::from(za)).unwrap();
-    assert!(sh.files[0].lock().unwrap().done);
-    let path = sh.stage.content_path(&file_digest).unwrap();
-    assert_eq!(std::fs::read(path).unwrap(), content);
-    assert_eq!(sh.files[0].lock().unwrap().verified.len(), 2);
-}
-
-/// The files of a driver (`FilesSink`) are not checked by anything after the
-/// fetch: a file is told whole only when what is at its place is what its key
-/// names.  An fs-verity key is tied to no chunk: bytes that are the chunk's
-/// digest but not the key are a contradiction of the table of contents, and
-/// the driver is not told the object is whole.
-#[test]
-fn test_a_driver_file_is_told_whole_only_when_it_is_its_key() {
-    use crate::pull::sink::{FilesSink, Slot, Written};
-    use std::os::unix::fs::FileExt;
-    let content = b"the content of the file".to_vec();
-    let key = velarx_storage::fsverity_digest_of(Algorithm::Sha256, &content);
-    for bytes in [content.clone(), b"other bytes, the same size!".to_vec()] {
-        let bytes = &bytes[..content.len()];
-        let plan = Plan {
-            jobs: vec![FileJob {
-                name: "f".into(),
-                digest: key.clone(),
-                size: content.len() as u64,
-                holes: vec![],
-                chunks: 0..1,
-            }],
-            chunks: vec![ChunkPlan {
-                job: 0,
-                file_off: 0,
-                size: content.len() as u64,
-                // (the bytes are checked against the chunk's digest, which
-                // is the TOC's: here it is made of the bytes, as a table
-                // that lies has it)
-                digest: Some(crate::sha256(bytes)),
-                comp: 0..1,
-                local: None,
-            }],
-            ..Plan::default()
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let pack = tempfile::tempfile().unwrap();
-        let told: Arc<Mutex<Vec<String>>> = Arc::default();
-        let sink = FilesSink::new(
-            "test",
-            tmp.path(),
-            [(
-                key.clone(),
-                Slot {
-                    file: Arc::new(pack.try_clone().unwrap()),
-                    base: 4096,
-                    size: content.len() as u64,
-                },
-            )],
-            {
-                let told = told.clone();
-                move |w| {
-                    if let Written::Whole { key } = w {
-                        told.lock().unwrap().push(key);
-                    }
-                }
-            },
-        )
-        .unwrap();
-        let sh = Shared::new(sink, plan);
-        let z = zstd::encode_all(bytes, 3).unwrap();
-        let r = process_chunk(&sh, 0, Bytes::from(z));
-        if bytes == &content[..] {
-            r.unwrap();
-            assert_eq!(*told.lock().unwrap(), vec![key.clone()]);
-            let mut back = vec![0u8; content.len()];
-            pack.read_exact_at(&mut back, 4096).unwrap();
-            assert_eq!(back, content);
-        } else {
-            let e = r.expect_err("bytes that are not the key");
-            assert!(matches!(e, ImageError::Contradicted(_)), "{key}: {e}");
-            assert!(told.lock().unwrap().is_empty(), "{key}: told whole");
-        }
-    }
-}
-
-/// A file whose chunks are all zeros has nothing to fetch: it is made
-/// and staged at once, not waited for.
-#[test]
-fn test_a_file_of_zeros_chunks_only_is_completed() {
-    let content = vec![0u8; 4096];
-    let mut f = reg(
-        "z",
-        &crate::sha256_text(&content),
-        4096,
-        100,
-        110,
-        Some((&d(1), 4096)),
-    );
-    f.chunk_type = Some("zeros".into());
-    let plan = make_plan(
-        &toc(vec![f]),
-        Algorithm::Sha256,
-        1000,
-        1 << 20,
-        cap(1000),
-        &|_, _| false,
-    )
-    .unwrap();
-    assert!(plan.chunks.is_empty());
-    assert_eq!(plan.jobs.len(), 1);
-    let (_tmp, sh) = shared_for(plan);
-    sh.complete_without_chunks().unwrap();
-    assert!(sh.files[0].lock().unwrap().done);
-    let path = sh
-        .stage
-        .content_path(&crate::sha256_text(&content))
-        .unwrap();
-    assert_eq!(std::fs::read(path).unwrap(), content);
-}
-
-/// A plan of one file made of `parts`, each a chunk (no chunk digest
-/// for a file of one chunk: its digest is the file's).
-fn plan_of(parts: &[Vec<u8>]) -> (Plan, Vec<u8>) {
-    let content: Vec<u8> = parts.concat();
-    let mut chunks = Vec::new();
-    let mut off = 0;
-    for (i, p) in parts.iter().enumerate() {
-        chunks.push(ChunkPlan {
-            job: 0,
-            file_off: off,
-            size: p.len() as u64,
-            digest: (parts.len() > 1).then(|| crate::sha256(p)),
-            comp: i as u64..i as u64 + 1,
-            local: None,
-        });
-        off += p.len() as u64;
-    }
-    let plan = Plan {
-        jobs: vec![FileJob {
-            name: "f".into(),
-            digest: crate::sha256_text(&content),
-            size: content.len() as u64,
-            holes: vec![],
-            chunks: 0..parts.len(),
-        }],
-        chunks,
-        ..Plan::default()
-    };
-    (plan, content)
-}
-
 /// The tries of a range request, which the pull of the client and the
 /// fetcher of the registry share: a server that takes fewer ranges is asked
 /// half of them, and a request that brings nothing is given up after
@@ -701,80 +501,6 @@ async fn test_the_tries_of_a_range_request() {
     .await
     .unwrap();
     assert_eq!(*seen.lock().unwrap(), [4, 3, 2, 1]);
-}
-
-/// A stage with no room: every file it is asked for fails with ENOSPC.
-struct FullStage;
-
-impl Stage for FullStage {
-    fn create_temp(&self) -> io::Result<(File, Option<std::path::PathBuf>)> {
-        Err(io::Error::from_raw_os_error(libc::ENOSPC))
-    }
-    fn takes_files(&self) -> bool {
-        false
-    }
-    fn adopt(&self, _: Finished) -> io::Result<bool> {
-        unreachable!("nothing was written")
-    }
-    fn open_object(&self, _: &str) -> io::Result<File> {
-        Err(io::Error::from_raw_os_error(libc::ENOSPC))
-    }
-    fn content_path(&self, _: &str) -> Option<std::path::PathBuf> {
-        None
-    }
-}
-
-/// A write that fails on this machine (no space) is its own error, not the
-/// layer's: it is not one of what the descriptor vouches for.
-#[test]
-fn test_a_chunk_that_cannot_be_written_is_the_error_of_the_pull() {
-    let parts = vec![vec![1u8; 100]];
-    let (plan, _) = plan_of(&parts);
-    let sh = Shared::new(Arc::new(FullStage), plan);
-    let e = process_chunk(
-        &sh,
-        0,
-        Bytes::from(zstd::encode_all(&parts[0][..], 3).unwrap()),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(&e, ImageError::Io(x) if x.raw_os_error() == Some(libc::ENOSPC)),
-        "{e:?}"
-    );
-    assert!(!refuses(&e));
-    // the bytes of a layer that are no stream are the layer's
-    let bad = decompress_bounded(b"not zstd", 100, 0, "TOC").unwrap_err();
-    assert!(matches!(bad, ImageError::Layer(_)), "{bad:?}");
-}
-
-#[test]
-fn test_bad_chunk_content_is_rejected() {
-    let a = vec![1u8; 100];
-    let plan = Plan {
-        jobs: vec![FileJob {
-            name: "f".into(),
-            digest: crate::sha256_text(&a),
-            size: 100,
-            holes: vec![],
-            chunks: 0..1,
-        }],
-        chunks: vec![ChunkPlan {
-            job: 0,
-            file_off: 0,
-            size: 100,
-            digest: Some(crate::sha256(&a)),
-            comp: 0..1,
-            local: None,
-        }],
-        ..Plan::default()
-    };
-    let (_tmp, sh) = shared_for(plan);
-    let z = zstd::encode_all(&vec![9u8; 100][..], 3).unwrap();
-    assert!(process_chunk(&sh, 0, Bytes::from(z)).is_err());
-    let z = zstd::encode_all(&vec![1u8; 200][..], 3).unwrap();
-    assert!(process_chunk(&sh, 0, Bytes::from(z)).is_err());
-    assert!(process_chunk(&sh, 0, Bytes::from_static(b"garbage")).is_err());
-    assert!(sh.stage.content_path(&crate::sha256_text(&a)).is_none());
 }
 
 /// A file the replay opened and the archive never read is an error at the
@@ -1095,103 +821,6 @@ fn test_located_chunks_follow_the_table() {
         vec![(d(1), d(9), 0, 10), (d(3), d(9), 30, 10),],
         "{got:?}"
     );
-}
-
-/// A stage whose owner holds the object a chunk is in takes the copy: the
-/// chunk is told to the owner, not written, and the file is told whole
-/// without being measured (the owner has not applied the copy yet; the engine
-/// reads the layer back).
-#[test]
-fn test_a_chunk_the_driver_holds_is_copied_not_written() {
-    use crate::pull::sink::{FilesSink, Holds, Sink, Slot, Written};
-    use std::os::unix::fs::FileExt;
-    let head = vec![1u8; 100];
-    let tail = vec![2u8; 60];
-    let key = crate::sha256_text(&[head.clone(), tail.clone()].concat());
-    let held: Holds = Arc::new(|keys: &[String]| Ok(keys.iter().map(|k| k == "held").collect()));
-    let plan = Plan {
-        jobs: vec![FileJob {
-            name: "f".into(),
-            digest: key.clone(),
-            size: 160,
-            holes: vec![],
-            chunks: 0..2,
-        }],
-        chunks: vec![
-            ChunkPlan {
-                job: 0,
-                file_off: 0,
-                size: 100,
-                digest: Some(crate::sha256(&head)),
-                comp: 0..1,
-                local: Some(("held".into(), 7)),
-            },
-            ChunkPlan {
-                job: 0,
-                file_off: 100,
-                size: 60,
-                digest: Some(crate::sha256(&tail)),
-                comp: 1..2,
-                local: None,
-            },
-        ],
-        ..Plan::default()
-    };
-    let tmp = tempfile::tempdir().unwrap();
-    let pack = tempfile::tempfile().unwrap();
-    let told: Arc<Mutex<Vec<String>>> = Arc::default();
-    let sink = FilesSink::holding(
-        "test",
-        tmp.path(),
-        [(
-            key.clone(),
-            Slot {
-                file: Arc::new(pack.try_clone().unwrap()),
-                base: 4096,
-                size: 160,
-            },
-        )],
-        {
-            let told = told.clone();
-            move |w| {
-                told.lock().unwrap().push(match w {
-                    Written::Whole { key } => format!("whole {key}"),
-                    Written::Copy {
-                        at,
-                        from,
-                        from_offset,
-                        len,
-                        ..
-                    } => format!("copy {at} {from} {from_offset} {len}"),
-                    Written::Hole { .. } => "hole".into(),
-                    Written::Staged { key, .. } => format!("staged {key}"),
-                })
-            }
-        },
-        Some(held),
-    )
-    .unwrap();
-    assert_eq!(
-        sink.held(&["held".into(), "other".into()]).unwrap(),
-        [true, false]
-    );
-    let sh = Shared::new(sink, plan);
-    process_local(&sh, 0).unwrap();
-    assert_eq!(*told.lock().unwrap(), vec!["copy 0 held 7 100"]);
-    let z = zstd::encode_all(&tail[..], 3).unwrap();
-    process_chunk(&sh, 1, Bytes::from(z)).unwrap();
-    assert_eq!(
-        *told.lock().unwrap(),
-        vec!["copy 0 held 7 100".to_string(), format!("whole {key}")]
-    );
-    // only the chunk the engine wrote is at the place
-    let mut back = vec![9u8; 160];
-    pack.read_exact_at(&mut back, 4096).unwrap();
-    assert!(
-        back[..100].iter().all(|&b| b == 0),
-        "the copy is not made here"
-    );
-    assert_eq!(&back[100..], &tail[..]);
 }
 
 /// A session with a store, for the files an intake takes in.
