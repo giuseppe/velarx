@@ -315,7 +315,8 @@ share_image_names = false
 parallel_layers = 6
 # Range requests in flight for one zstd:chunked layer
 range_concurrency = 4
-# Memory for the chunks being decompressed and written, for a pull
+# Memory for the chunks being decompressed and written, for a pull; a quarter
+# more for the small files a fetcher holds until they are complete
 memory_budget_mib = 128
 # Threads decompressing and hashing chunks (0 = three per CPU, between 4 and 16)
 workers = 0

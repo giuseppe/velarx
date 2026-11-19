@@ -442,7 +442,9 @@ pub struct PullConfig {
     /// Range requests in flight for one zstd:chunked layer
     #[serde(default = "default_range_concurrency")]
     pub range_concurrency: usize,
-    /// Memory for the chunks being decompressed and written, for a pull
+    /// Memory for the chunks being decompressed and written, for a pull; a
+    /// quarter more for the small files a fetcher holds until they are
+    /// complete
     #[serde(default = "default_pull_memory_mib")]
     pub memory_budget_mib: u64,
     /// Threads decompressing and hashing chunks, and copying the files a

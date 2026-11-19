@@ -153,7 +153,7 @@ impl Unnamed {
     /// system (a layer has tens of thousands of them, and the engine reads
     /// each once).
     pub fn for_handover(staging: BorrowedFd<'_>, size: u64, verity: bool) -> io::Result<Self> {
-        if verity || size > IN_MEMORY {
+        if !in_memory(size, verity) {
             return Self::begin(staging, size);
         }
         // (the flags the filter of the fetchers allows)
@@ -315,6 +315,30 @@ impl Unnamed {
         Ok(file)
     }
 
+    /// The file is complete and is handed over as it is: the engine that
+    /// is given it reads it and knows it by what it read.  The content
+    /// digest the table gives ([`Unnamed::expect_content`]) is checked here,
+    /// as [`Unnamed::sealed`] does: the engine checks the name.
+    pub fn handed(mut self) -> Result<File, StageError> {
+        if self.file.metadata()?.len() != self.size {
+            self.file.set_len(self.size)?;
+        }
+        if let Some((Some(want), order)) = self.content.take() {
+            let order = order.into_inner().unwrap_or_else(|e| e.into_inner());
+            let read = match !order.broken && order.next == self.size {
+                true => order.hasher.finalize(),
+                false => {
+                    io::Seek::rewind(&mut &self.file)?;
+                    Digest::of_reader(want.alg(), &self.file)?
+                }
+            };
+            if read != want {
+                return Err(StageError::Wrong(format!("the content digest {want}")));
+            }
+        }
+        Ok(self.file)
+    }
+
     /// The file, written in order from its start ([`Unnamed::hashed`]), is
     /// complete: sealed ([`Unnamed::sealed`]) as the digest of what was
     /// written.  Returns that digest and the file.
@@ -336,6 +360,12 @@ impl Unnamed {
 
 /// The most bytes of a file that is handed over in memory.
 const IN_MEMORY: u64 = 256 << 10;
+
+/// Whether a file of `size` bytes that is handed over is written in memory
+/// ([`Unnamed::for_handover`]).
+pub fn in_memory(size: u64, verity: bool) -> bool {
+    !verity && size <= IN_MEMORY
+}
 
 /// The size of the blocks of zeros left as holes.
 const HOLE: u64 = 4096;
@@ -578,6 +608,18 @@ mod tests {
         w.write_chunk(3, b"lo", None).unwrap();
         w.write_chunk(0, b"hel", None).unwrap();
         assert!(w.finish(st.as_fd(), &name, false).unwrap());
+        // handed over in memory: the same check
+        let w = Unnamed::for_handover(st.as_fd(), 5, false)
+            .unwrap()
+            .expect_content(sha(b"hellx"));
+        w.write_chunk(0, b"hello", None).unwrap();
+        assert!(matches!(w.handed(), Err(StageError::Wrong(_))));
+        let w = Unnamed::for_handover(st.as_fd(), 5, false)
+            .unwrap()
+            .expect_content(sha(b"hello"));
+        w.write_chunk(3, b"lo", None).unwrap();
+        w.write_chunk(0, b"hel", None).unwrap();
+        w.handed().unwrap();
     }
 
     #[test]

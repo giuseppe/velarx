@@ -429,8 +429,14 @@ async fn test_the_fetcher_refuses_what_it_cannot_serve() {
         }
     }
     let e = refusal(
-        conn.fetch(&s.layer.to_string(), &[], Urgency::Wait, (&[], Vec::new()))
-            .await,
+        conn.fetch(
+            &s.layer.to_string(),
+            &[],
+            Urgency::Wait,
+            (&[], Vec::new()),
+            false,
+        )
+        .await,
     )
     .await;
     assert!(
@@ -452,6 +458,7 @@ async fn test_the_fetcher_refuses_what_it_cannot_serve() {
             &[sha(b"x").to_string()],
             Urgency::Wait,
             (&[], Vec::new()),
+            false,
         )
         .await,
     )

@@ -28,8 +28,8 @@ pub const MAX_ACCESS: u64 = 1 << 20;
 pub const PROFILE_MAX_BYTES: u64 = 512 * 1024;
 
 /// The capability words.
-pub const CAPABILITIES: [&str; 7] = [
-    "objects", "unpack", "metadata", "lazy", "sha512", "reuse", "origin",
+pub const CAPABILITIES: [&str; 8] = [
+    "objects", "unpack", "metadata", "lazy", "sha512", "reuse", "origin", "handover",
 ];
 
 /// How much a request is waited for.  It orders a fetcher's work.
@@ -115,7 +115,8 @@ pub const TARSPLIT: &str = "tarsplit";
 #[serde(rename_all = "snake_case")]
 #[zlink(rename_all = "snake_case")]
 pub enum EventKind {
-    /// `objects` have their names in `files/` of the layer's staging
+    /// `objects` have their names in `files/` of the layer's staging, or,
+    /// with `files`, are the descriptors of the reply
     Staged,
     /// This fetcher does not have `objects`
     Unavailable,
@@ -176,6 +177,10 @@ pub struct FetchEvent {
     pub objects: Vec<u32>,
     pub failure: Option<Failure>,
     pub bytes: Option<u64>,
+    /// With `staged`: the object at each position of `objects` is the
+    /// complete file with no name at this position among the descriptors of
+    /// the reply (a call that asked for `handover`)
+    pub files: Option<Vec<u32>>,
 }
 
 impl FetchEvent {
@@ -185,6 +190,7 @@ impl FetchEvent {
             objects: Vec::new(),
             failure: None,
             bytes: None,
+            files: None,
         }
     }
 
@@ -433,7 +439,7 @@ mod proxy {
         >;
 
         /// Bring files of `layer` into its staging directory.
-        #[zlink(more)]
+        #[zlink(more, return_fds)]
         async fn fetch(
             &mut self,
             #[zlink(fds)] fds: Vec<OwnedFd>,
@@ -441,8 +447,9 @@ mod proxy {
             objects: Vec<String>,
             urgency: Urgency,
             reuse: Option<Vec<Reuse>>,
+            handover: Option<bool>,
         ) -> zlink::Result<
-            impl futures::Stream<Item = zlink::Result<Result<FetchReply, FetcherError>>>,
+            impl futures::Stream<Item = zlink::Result<(Result<FetchReply, FetcherError>, Vec<OwnedFd>)>>,
         >;
     }
 }

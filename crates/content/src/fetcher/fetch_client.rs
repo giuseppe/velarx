@@ -12,7 +12,7 @@
 
 use super::fetch::{
     Blob, FetchEvent, FetchReply, FetcherError, FetcherProxy, ProbeReply, Probed, Reuse,
-    UnpackReply, Urgency, INTERFACE, PROTO,
+    UnpackReply, Urgency, INTERFACE, MAX_FDS, PROTO,
 };
 use super::proto::{
     Downloaded, Found, Hit, RegistryError, RegistryProxy, Remote, Tagged, MAX_ANSWER,
@@ -183,28 +183,41 @@ impl Replies<'_, UnpackReply> {
         let Some(places) = reply.files else {
             return Ok(Some(Unpacking::Bytes(reply.bytes.unwrap_or(0))));
         };
-        let mut fds: Vec<Option<OwnedFd>> = fds.into_iter().map(Some).collect();
-        let files = places
-            .iter()
-            .map(|&at| {
-                let fd = fds
-                    .get_mut(at as usize)
-                    .and_then(Option::take)
-                    .ok_or_else(|| {
-                        CallError::Protocol(format!(
-                            "a file is descriptor {at}, and the reply has {}",
-                            fds.len()
-                        ))
-                    })?;
-                readable_file(fd).ok_or_else(|| {
-                    CallError::Protocol(format!(
-                        "descriptor {at} is not a regular file open for reading"
-                    ))
-                })
-            })
-            .collect::<Result<_, _>>()?;
+        let files = files_at(&places, fds)?;
         Ok(Some(Unpacking::Files(files)))
     }
+}
+
+/// The files at the positions `places` among the descriptors `fds` of a
+/// reply, each a regular file open for reading, and each descriptor named
+/// once; a reply has at most [`MAX_FDS`] descriptors.
+pub fn files_at(places: &[u32], fds: Vec<OwnedFd>) -> Result<Vec<File>, CallError> {
+    if fds.len() > MAX_FDS {
+        return Err(CallError::Protocol(format!(
+            "a reply has {} descriptors, at most {MAX_FDS}",
+            fds.len()
+        )));
+    }
+    let mut fds: Vec<Option<OwnedFd>> = fds.into_iter().map(Some).collect();
+    places
+        .iter()
+        .map(|&at| {
+            let fd = fds
+                .get_mut(at as usize)
+                .and_then(Option::take)
+                .ok_or_else(|| {
+                    CallError::Protocol(format!(
+                        "a file is descriptor {at}, and the reply has {}",
+                        fds.len()
+                    ))
+                })?;
+            readable_file(fd).ok_or_else(|| {
+                CallError::Protocol(format!(
+                    "descriptor {at} is not a regular file open for reading"
+                ))
+            })
+        })
+        .collect()
 }
 
 /// `fd` as a file the engine reads: a regular file open for reading.  A pipe
@@ -513,14 +526,19 @@ impl FetchConn {
     /// Bring the files `objects` of `layer` into its staging directory.
     /// `reuse`: chunks of the store the files may take, in the files of
     /// `sources` (at most [`MAX_FDS`]); a hint names its file by position.
+    /// With `handover`, a fetcher that announces the word may hand over a
+    /// file as a descriptor of its event ([`FetchEvent::files`]) instead of
+    /// naming it.
     ///
     /// [`MAX_FDS`]: super::fetch::MAX_FDS
+    /// [`FetchEvent::files`]: super::fetch::FetchEvent::files
     pub async fn fetch(
         &mut self,
         layer: &str,
         objects: &[String],
         urgency: Urgency,
         (reuse, sources): (&[Reuse], Vec<OwnedFd>),
+        handover: bool,
     ) -> Result<Replies<'_, FetchReply>, CallError> {
         let (conn, busy) = self.begin().await?;
         let reuse = (!reuse.is_empty()).then_some(reuse);
@@ -531,10 +549,11 @@ impl FetchConn {
                 objects.to_vec(),
                 urgency,
                 reuse.map(<[Reuse]>::to_vec),
+                handover.then_some(true),
             )
             .await
         {
-            Ok(stream) => Ok(replies(stream, &busy)),
+            Ok(stream) => Ok(replies_fds(stream, &busy)),
             Err(e) => {
                 busy.store(false, Ordering::Release);
                 Err(zerr(e))

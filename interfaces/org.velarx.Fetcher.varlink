@@ -40,6 +40,12 @@
 # `tarsplit` their names in the staging directory.  A file of two names is handed
 # over once.
 #
+# HANDOVER.  A fetcher that announces the word handover and is called with
+# `handover` may answer for a small file, written in memory, with a `staged`
+# event that has `files`: for each of its `objects` the descriptor of the file, a
+# complete file with no name, instead of a name in the staging directory.  A file
+# that is not small, or that needs fs-verity, is named as before.
+#
 # TRUST.  A fetcher is not trusted.  A name it made is a claim; the engine opens
 # it and takes the kernel's measure.  A file it hands over is a claim too: the
 # engine copies it, or takes the kernel's measure of it, and knows it by the
@@ -167,7 +173,8 @@ type Failure (class: FailureClass, reason: string)
 
 # What an event of a `Fetch` tells.
 type EventKind (
-	# `objects` have their names in `files/` of the layer's staging
+	# `objects` have their names in `files/` of the layer's staging, or,
+	# with `files`, are the descriptors of the reply
 	staged,
 	# This fetcher does not have `objects`
 	unavailable,
@@ -186,7 +193,11 @@ type FetchEvent (
 	# Positions in the call
 	objects: []int,
 	failure: ?Failure,
-	bytes: ?int
+	bytes: ?int,
+	# With `staged`: the object at each position of `objects` is the
+	# complete file with no name at this position among the descriptors of
+	# the reply (a call that asked for `handover`)
+	files: ?[]int
 )
 
 # What this fetcher can do for one layer of a `Probe`.
@@ -285,8 +296,10 @@ method Unpack(layer: string, urgency: Urgency) -> (
 # `unavailable`, `failed`; the last reply has no event.  Descriptors:
 # the file of the chunks of the store `reuse` names, by `fd` (the
 # engine made it of exactly those bytes; only for a fetcher that
-# announces `reuse`).
-method Fetch(layer: string, objects: []string, urgency: Urgency, reuse: ?[]Reuse) -> (event: ?FetchEvent)
+# announces `reuse`).  With `handover`, a fetcher that announces the
+# word hands over the files it keeps in memory as descriptors of
+# its `staged` events, and names the others.
+method Fetch(layer: string, objects: []string, urgency: Urgency, reuse: ?[]Reuse, handover: ?bool) -> (event: ?FetchEvent)
 
 error InvalidArgument (reason: string)
 

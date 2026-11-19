@@ -1798,31 +1798,29 @@ async fn test_an_eager_pull_of_a_table_of_contents_goes_through_the_fetcher() {
 }
 
 /// A pull on a store without fs-verity (the test store is in a file system
-/// with none): each distinct file of the layer is read once to verify it,
-/// before the locks of the commit, and the commit copies none (the names are
-/// links of the inodes the fetcher wrote).
+/// with none): the engine copies and hashes the files a fetcher hands over
+/// (those it keeps in memory) as it takes them in, which is the one read of
+/// each; the commit reads once the file the fetcher named, and copies none
+/// (the name is a link of the inode the fetcher wrote).
 #[tokio::test]
 async fn test_a_pull_without_verity_reads_each_file_once_and_copies_none() {
     let e = env().await;
-    let items = sample();
+    let mut items = sample();
+    items.push(Item::File {
+        name: "usr/huge",
+        data: vec![9u8; 300_000],
+        chunk: 64 * 1024,
+    });
     let layer = build_chunked(&items);
     e.publish(&[&layer], &[ZSTD]);
     e.pull().await.unwrap();
-    let mut distinct = std::collections::HashSet::new();
-    let total: u64 = items
-        .iter()
-        .filter_map(|i| match i {
-            Item::File { data, .. } if distinct.insert(data.clone()) => Some(data.len() as u64),
-            _ => None,
-        })
-        .sum();
     assert!(e.store.contains(&vid(b"hello\n")));
+    assert!(e.store.contains(&vid(&[9u8; 300_000])));
     assert_eq!(e.store.copied(), 0, "no byte copied by the commit");
-    assert!(e.store.hashed() > 0, "the files were verified by a read");
-    assert!(
-        e.store.hashed() <= total,
-        "{} bytes read for {total} bytes of distinct files",
-        e.store.hashed()
+    assert_eq!(
+        e.store.hashed(),
+        300_000,
+        "the commit read the file that was not handed over"
     );
 }
 
@@ -2019,8 +2017,8 @@ async fn test_a_failed_barrier_fails_the_pull_and_records_nothing() {
 /// The content of a layer is hashed once on a store with no fs-verity: a
 /// layer pulled whole is read by the replay, which copies each file as it
 /// reads it, and the commit links the copies (the commit reads nothing); a
-/// layer of a table is read by the commit once, as it copies the files the
-/// kernel does not measure.
+/// layer of a table has its files handed over, which the engine copies and
+/// hashes as it takes them in (the commit reads nothing).
 #[tokio::test]
 async fn test_the_files_of_a_layer_are_read_once_on_a_store_without_fs_verity() {
     let e = env().await;
@@ -2034,9 +2032,11 @@ async fn test_the_files_of_a_layer_are_read_once_on_a_store_without_fs_verity() 
     let layer = build_chunked(&sample());
     e.publish(&[&layer], &[ZSTD]);
     e.pull().await.unwrap();
-    // (the distinct files with content: "hello\n", `usr/big`, `usr/holes`)
-    let sizes = 6 + 100_000 + (4096 + 8192 + 4096);
-    assert_eq!(e.store.hashed(), sizes, "a layer of a table");
+    assert_eq!(
+        e.store.hashed(),
+        0,
+        "a layer of a table, whose files are in memory"
+    );
     assert!(e.store.contains(&vid(b"hello\n")));
 }
 

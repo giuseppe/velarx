@@ -871,6 +871,21 @@ async fn files_handed_over_are_known_by_what_the_engine_copied() {
     assert_eq!(left, 2);
 }
 
+/// The engine failing to store a file a fetcher handed over (the system
+/// refuses it a file) is its own failure, not the fetcher's: an I/O error,
+/// not a file that contradicts its name.
+#[test]
+fn a_store_that_fails_to_take_a_handed_file_is_an_io_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = intake_session(tmp.path());
+    velarx_base::tree::remove_dir_all(tmp.path().join("staging")).unwrap();
+    let sink: Arc<dyn crate::pull::sink::Sink> = session;
+    let content = b"the right bytes";
+    let key = Digest::of(Algorithm::Sha256, content).to_string();
+    let e = take_handed(handed(content).0, (&key, None), &sink).unwrap_err();
+    assert!(matches!(e, ImageError::Io(_)), "{e:?}");
+}
+
 /// A fetcher that keeps a descriptor it can write to changes nothing of what
 /// the engine holds: the copy is the bytes that were read.
 #[tokio::test]

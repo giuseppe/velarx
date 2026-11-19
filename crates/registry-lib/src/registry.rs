@@ -57,6 +57,10 @@ pub struct RegistryService {
     pub(crate) limits: Limits,
     /// KiB of chunks in flight
     pub(crate) memory: Arc<Semaphore>,
+    /// KiB of the small files written in memory until they are complete and
+    /// handed over, for all the calls of the process: a quarter of the
+    /// memory of a pull
+    pub(crate) in_memory: Arc<Semaphore>,
     pools: Mutex<Vec<(String, Arc<Pool>)>>,
     /// What the workers have for the person who pulls, sent with the next
     /// piece of a `Get`
@@ -195,6 +199,7 @@ impl RegistryService {
         let auth_files = velarx_registry::auth::default_auth_files()?;
         Ok(Arc::new(Self {
             memory: Arc::new(Semaphore::new((limits.memory_bytes / 1024) as usize)),
+            in_memory: Arc::new(Semaphore::new((limits.memory_bytes / 4 / 1024) as usize)),
             limits,
             pull,
             push,

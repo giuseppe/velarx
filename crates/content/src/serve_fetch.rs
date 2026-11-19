@@ -114,6 +114,9 @@ pub struct FetchCall {
     /// Chunks of the engine's store the files may take ([`Reuse`]), and the
     /// files they are in, by `Reuse::fd`
     pub reuse: Vec<Reuse>,
+    /// A small file is handed over as a descriptor of its event, with no
+    /// name in the staging (`FetchEvent::files`)
+    pub handover: bool,
     pub sources: Vec<File>,
     /// Cancelled when the client goes away or the layer is cancelled
     pub cancel: Cancel,
@@ -1309,7 +1312,9 @@ mod service {
         /// `unavailable`, `failed`; the last reply has no event.  Descriptors:
         /// the file of the chunks of the store `reuse` names, by `fd` (the
         /// engine made it of exactly those bytes; only for a fetcher that
-        /// announces `reuse`).
+        /// announces `reuse`).  With `handover`, a fetcher that announces the
+        /// word hands over the files it keeps in memory as descriptors of
+        /// its `staged` events, and names the others.
         #[zlink(more, return_fds)]
         pub async fn fetch(
             &self,
@@ -1319,6 +1324,7 @@ mod service {
             objects: Vec<String>,
             urgency: Urgency,
             reuse: Option<Vec<Reuse>>,
+            handover: Option<bool>,
         ) -> impl Stream<Item = (Result<Reply<FetchReply>, FetcherError>, Vec<OwnedFd>)> + Unpin
         {
             let reuse = reuse.unwrap_or_default();
@@ -1383,6 +1389,7 @@ mod service {
                 objects,
                 urgency,
                 reuse,
+                handover: handover.unwrap_or(false),
                 sources: fds.into_iter().map(File::from).collect(),
                 cancel: cancel.clone(),
             };
@@ -2062,6 +2069,12 @@ pub fn definition() -> String {
          # `tarsplit` their names in the staging directory.  A file of two names is handed\n\
          # over once.\n\
          #\n\
+         # HANDOVER.  A fetcher that announces the word handover and is called with\n\
+         # `handover` may answer for a small file, written in memory, with a `staged`\n\
+         # event that has `files`: for each of its `objects` the descriptor of the file, a\n\
+         # complete file with no name, instead of a name in the staging directory.  A file\n\
+         # that is not small, or that needs fs-verity, is named as before.\n\
+         #\n\
          # TRUST.  A fetcher is not trusted.  A name it made is a claim; the engine opens\n\
          # it and takes the kernel's measure.  A file it hands over is a claim too: the\n\
          # engine copies it, or takes the kernel's measure of it, and knows it by the\n\
@@ -2299,6 +2312,7 @@ mod tests {
                 vec![],
                 Urgency::Wait,
                 None,
+                None,
             )
             .await;
         let (first, _) = s.next().await.unwrap();
@@ -2314,6 +2328,7 @@ mod tests {
                 "sha256:aa".into(),
                 objects,
                 Urgency::OnDemand,
+                None,
                 None,
             )
             .await;
@@ -2339,7 +2354,15 @@ mod tests {
         // too many objects
         let many: Vec<String> = (0..5).map(|i| format!("sha256:{i:064}")).collect();
         let mut s = e
-            .fetch(true, vec![], "sha256:aa".into(), many, Urgency::Wait, None)
+            .fetch(
+                true,
+                vec![],
+                "sha256:aa".into(),
+                many,
+                Urgency::Wait,
+                None,
+                None,
+            )
             .await;
         assert!(matches!(
             s.next().await.unwrap().0,

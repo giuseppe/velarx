@@ -1272,6 +1272,35 @@ fn take_in(file: File, alg: Algorithm, to: &CopiesTo) -> io::Result<(String, Cop
     }
 }
 
+/// Take in the file `file`, which a fetcher handed over as the file `key` of
+/// a layer (`name` in the layer, when the table gives it): it is copied to a
+/// file of `sink`, hashed as it is written, and must be what `key` names (its
+/// fs-verity digest, or the hash of its content); the sink then knows it by
+/// the digest it computed.
+pub(crate) fn take_handed(
+    file: File,
+    (key, name): (&str, Option<&str>),
+    sink: &Arc<dyn super::sink::Sink>,
+) -> ImageResult<()> {
+    let want = Digest::parse_key(key)
+        .map_err(|_| ImageError::Layer(format!("{key} is not the digest of a file")))?;
+    let (content, copied) =
+        take_in(file, want.alg(), &CopiesTo::Sink(sink.clone())).map_err(io_fail)?;
+    let (read, kind) = match want.is_fsverity() {
+        true => (&copied.verity, "fs-verity digest"),
+        false => (&content, "content digest"),
+    };
+    if read != key {
+        let _ = std::fs::remove_file(&copied.path);
+        return Err(ImageError::Contradicted(format!(
+            "`{}` is not the {kind} of its name {key}",
+            name.unwrap_or(key)
+        )));
+    }
+    sink.adopt_measured(&copied.path, key, &copied.verity, copied.size, false)?;
+    Ok(())
+}
+
 /// A file a fetcher handed over, read from its start at positions of its own:
 /// the offset of the descriptor is the fetcher's too, which could move it
 /// while the engine reads, and a file of fs-verity, which is linked, would be
@@ -1616,7 +1645,7 @@ pub async fn complete_layer(
                         layer,
                         &meta.toc,
                         (claim.keys().to_vec(), &reuse),
-                        &ctx.sink,
+                        (&ctx.sink, &ctx.workers),
                         &progress,
                     )
                     .await?;
@@ -1636,7 +1665,7 @@ pub async fn complete_layer(
                         layer,
                         &meta.toc,
                         (left, &Default::default()),
-                        &ctx.sink,
+                        (&ctx.sink, &ctx.workers),
                         &progress,
                     )
                     .await?;

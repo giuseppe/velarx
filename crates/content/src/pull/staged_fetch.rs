@@ -12,10 +12,10 @@
 //! commit links them; the staging of a layer a lazy pull staged
 //! (`meta/<stem>/layer.json`) is never removed by an eager pull or the sweep.
 
-use super::chunked::Intake;
+use super::chunked::{self, Intake};
 use super::sink::Sink;
 use crate::fetcher::fetch::{Blob, EventKind, FetchEvent, Probed, Reuse, TocSource, Urgency};
-use crate::fetcher::fetch_client::{CallError, FetchConn, Scoping, Unpacking};
+use crate::fetcher::fetch_client::{files_at, CallError, FetchConn, Scoping, Unpacking};
 use crate::stager::staged_rel;
 use rustix::fs::{FlockOperation, Mode, OFlags, ResolveFlags};
 use std::collections::HashMap;
@@ -124,6 +124,9 @@ struct Fetcher {
     /// It announces `origin`: it reaches the origin of a layer, and is
     /// given its blob
     origin: bool,
+    /// It announces `handover`: it hands the small files it fetches over as
+    /// descriptors when the pull keeps them in the engine
+    handover: bool,
     /// Its connection failed (the peer restarted, the socket went): the
     /// scope it was given is gone with it
     lost: std::sync::atomic::AtomicBool,
@@ -377,6 +380,7 @@ impl StagedFetch {
                     max_objects: info.limit("max_objects").unwrap_or(1).max(1) as usize,
                     reuse: info.can("reuse"),
                     origin: info.can("origin"),
+                    handover: info.can("handover"),
                     lost: Default::default(),
                 }),
                 Err(e) => debug!("The fetcher {name} is left out of the pull: {e}"),
@@ -430,6 +434,7 @@ impl StagedFetch {
             max_objects: info.limit("max_objects").unwrap_or(1).max(1) as usize,
             reuse: info.can("reuse"),
             origin: info.can("origin"),
+            handover: info.can("handover"),
             lost: Default::default(),
         });
         Self::assemble(fetchers, root, verity, manifest)
@@ -456,6 +461,7 @@ impl StagedFetch {
             max_objects: info.limit("max_objects").unwrap_or(1).max(1) as usize,
             reuse: info.can("reuse"),
             origin: info.can("origin"),
+            handover: info.can("handover"),
             lost: Default::default(),
         });
         Self::assemble(fetchers, root, verity, manifest)
@@ -723,7 +729,7 @@ impl StagedFetch {
         layer: &OciDescriptor,
         toc: &Toc,
         (keys, reuse): (Vec<String>, &Reuses),
-        sink: &Arc<dyn Sink>,
+        (sink, taking): (&Arc<dyn Sink>, &Arc<tokio::sync::Semaphore>),
         progress: &(dyn Fn(u64) + Send + Sync),
     ) -> ImageResult<Walked> {
         self.walk(
@@ -731,7 +737,7 @@ impl StagedFetch {
             toc,
             (keys, reuse),
             &staging.dir,
-            Some((sink, staging)),
+            Some((sink, staging, taking)),
             Urgency::Wait,
             (progress, &|_| {}),
         )
@@ -786,7 +792,7 @@ impl StagedFetch {
         toc: &Toc,
         (keys, reuse): (Vec<String>, &Reuses),
         dir: &File,
-        sink: Option<(&Arc<dyn Sink>, &Arc<LayerStaging>)>,
+        sink: Option<Eager<'_>>,
         urgency: Urgency,
         (progress, staged): (&(dyn Fn(u64) + Send + Sync), &(dyn Fn(&str) + Send + Sync)),
     ) -> ImageResult<Walked> {
@@ -1142,7 +1148,7 @@ impl StagedFetch {
         (batch, reuse): (&[String], &Reuses),
         dir: &File,
         names: &std::collections::HashMap<String, String>,
-        sink: Option<(&Arc<dyn Sink>, &Arc<LayerStaging>)>,
+        sink: Option<Eager<'_>>,
         urgency: Urgency,
         counts: Counts<'_>,
     ) -> ImageResult<()> {
@@ -1170,6 +1176,51 @@ impl StagedFetch {
             let asked: Vec<String> = left.iter().map(|i| batch[*i].clone()).collect();
             // (the bytes of each object so far, by its place in `asked`)
             let mut moved: HashMap<u32, u64> = HashMap::new();
+            // (a file is given: the pull knows it, and what a fetcher before
+            // the registry fetcher brought is counted)
+            let mark = |given: &mut [bool], i: usize| {
+                given[i] = true;
+                staged(&batch[i]);
+                if at != last {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    sourced.each[at].1.fetch_add(1, Relaxed);
+                    if fetcher.own {
+                        sourced.own.fetch_add(1, Relaxed);
+                    }
+                }
+            };
+            // (a file handed over was taken in, or not)
+            let landed = |done: Result<(usize, ImageResult<()>), tokio::task::JoinError>,
+                          given: &mut [bool]| {
+                let (i, taken) = match done {
+                    Ok(done) => done,
+                    Err(e) => {
+                        return Some(Said::Failed(ImageError::Layer(format!(
+                            "a handed over file: {e}"
+                        ))))
+                    }
+                };
+                match taken {
+                    Ok(()) => {
+                        if let Some((_, layer, _)) = sink {
+                            layer.placed_by(&batch[i], &fetcher.name);
+                        }
+                        mark(given, i);
+                        None
+                    }
+                    Err(e @ (ImageError::Contradicted(_) | ImageError::Layer(_))) => {
+                        Some(Said::Lied(format!("{}: {e}", batch[i])))
+                    }
+                    Err(e) => Some(Said::Failed(e)),
+                }
+            };
+            // (the copies of the files it hands over are files of the pull's
+            // session; the files of a storage driver are written at the
+            // places it chose)
+            let handover =
+                fetcher.handover && sink.is_some_and(|(sink, ..)| sink.clone().session().is_some());
+            // (the files handed over are taken in beside the call)
+            let mut taken = tokio::task::JoinSet::new();
             let walked = async {
                 let (mut conn, _connected) = fetcher.connection().await?;
                 let (hints, sources) = if fetcher.reuse {
@@ -1179,13 +1230,58 @@ impl StagedFetch {
                 };
                 let mut replies = crate::idle::within(
                     fetcher.idle,
-                    conn.fetch(layer, &asked, urgency, (&hints, sources)),
+                    conn.fetch(layer, &asked, urgency, (&hints, sources), handover),
                 )
                 .await?;
-                while let Some((event, _)) =
+                while let Some((event, fds)) =
                     crate::idle::within(fetcher.idle, replies.event()).await?
                 {
                     match event.kind {
+                        EventKind::Staged if event.files.is_some() => {
+                            let (Some((sink, _, taking)), Some(places), true) =
+                                (sink, &event.files, handover)
+                            else {
+                                return Ok(Said::Lied(
+                                    "a file handed over to a call that did not ask".into(),
+                                ));
+                            };
+                            let files = match files_at(places, fds) {
+                                Ok(files) if files.len() == event.objects.len() => files,
+                                Ok(_) => {
+                                    return Ok(Said::Lied(
+                                        "a file for each object is not what it handed over".into(),
+                                    ))
+                                }
+                                Err(e) => return Ok(Said::Lied(e.to_string())),
+                            };
+                            for (j, file) in event.objects.iter().zip(files) {
+                                let Some(&i) = left.get(*j as usize) else {
+                                    return Ok(Said::Lied(
+                                        "an event for a file that was not asked".into(),
+                                    ));
+                                };
+                                if given[i] {
+                                    continue;
+                                }
+                                let key = batch[i].clone();
+                                let name = names.get(&key).cloned();
+                                let sink = sink.clone();
+                                let permit = taking.clone().acquire_owned().await.map_err(|e| {
+                                    CallError::Protocol(format!("the files taken in: {e}"))
+                                })?;
+                                taken.spawn_blocking(move || {
+                                    let taken =
+                                        chunked::take_handed(file, (&key, name.as_deref()), &sink);
+                                    drop(permit);
+                                    (i, taken)
+                                });
+                            }
+                            while let Some(done) = taken.try_join_next() {
+                                if let Some(said) = landed(done, &mut given) {
+                                    return Ok(said);
+                                }
+                            }
+                        }
                         EventKind::Staged => {
                             for j in event.objects {
                                 let Some(&i) = left.get(j as usize) else {
@@ -1227,7 +1323,7 @@ impl StagedFetch {
                                                 fetcher.name.clone(),
                                             );
                                     }
-                                    Some((sink, layer)) => {
+                                    Some((sink, layer, _)) => {
                                         let key = batch[i].clone();
                                         let (layer, sink) = (layer.clone(), sink.clone());
                                         let name = names.get(&key).cloned();
@@ -1262,17 +1358,7 @@ impl StagedFetch {
                                         }
                                     }
                                 }
-                                given[i] = true;
-                                staged(&batch[i]);
-                                // (what a fetcher before the registry fetcher
-                                // brought)
-                                if at != last {
-                                    use std::sync::atomic::Ordering::Relaxed;
-                                    sourced.each[at].1.fetch_add(1, Relaxed);
-                                    if fetcher.own {
-                                        sourced.own.fetch_add(1, Relaxed);
-                                    }
-                                }
+                                mark(&mut given, i);
                             }
                         }
                         // (what the registry fetcher fetched, and what the
@@ -1316,9 +1402,16 @@ impl StagedFetch {
                         EventKind::Unavailable | EventKind::Unknown => {}
                     }
                 }
+                while let Some(done) = taken.join_next().await {
+                    if let Some(said) = landed(done, &mut given) {
+                        return Ok(said);
+                    }
+                }
                 Ok::<_, CallError>(Said::Fine)
             };
             let walked = walked.await;
+            // (a call that failed leaves no file being taken in)
+            while taken.join_next().await.is_some() {}
             // (what a fetcher before the registry fetcher sent of a file it
             // did not stage is thrown away: not counted as brought by it)
             if at != last {
@@ -1389,6 +1482,14 @@ impl StagedFetch {
         }
     }
 }
+
+/// Where the files of an eager pull go: its sink, the staging of the layer,
+/// and the permits for the files taken in at once.
+type Eager<'a> = (
+    &'a Arc<dyn Sink>,
+    &'a Arc<LayerStaging>,
+    &'a Arc<tokio::sync::Semaphore>,
+);
 
 /// How a fetcher's reply to a request for files ended.
 enum Said {
@@ -1737,10 +1838,11 @@ fn open_beneath(dir: &File, rel: &str, key: &str) -> ImageResult<File> {
 mod tests {
     use super::*;
     use crate::activation::Limits;
-    use crate::fetcher::fetch::{FetchEvent as Event, FetcherError, NotLazy};
+    use crate::fetcher::fetch::{FetchEvent as Event, FetcherError, NotLazy, MAX_FDS};
     use crate::serve_fetch::{Described, LocalFetcher, Out, Scope, StagingFetcher};
     use async_trait::async_trait;
     use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A call whose future is dropped before its replies came (a pull that
     /// ends while one of its layers probes) leaves the connection usable:
@@ -2355,7 +2457,7 @@ mod tests {
                 &desc,
                 &toc,
                 (vec![name.clone()], &Reuses::default()),
-                &sink,
+                (&sink, &Arc::new(tokio::sync::Semaphore::new(2))),
                 &|_| {},
             )
             .await;
@@ -2403,6 +2505,151 @@ mod tests {
         let e = session.commit(None).unwrap_err().to_string();
         assert!(e.contains("first") && e.contains(&name), "{e}");
         assert!(!has_objects(root.path()), "nothing is named in the store");
+    }
+
+    /// A fetcher that hands over the files it is asked for as descriptors of
+    /// one event, the bytes they are named by or, with `wrong`, others, and
+    /// with `short`, one descriptor less than the objects and with `extra`
+    /// that many descriptors more.  With `silent` it does not announce
+    /// `handover`; `asked` is whether it was called with it.
+    #[derive(Default)]
+    struct HandsOver {
+        wrong: bool,
+        short: bool,
+        extra: usize,
+        silent: bool,
+        asked: AtomicBool,
+    }
+
+    #[async_trait]
+    impl StagingFetcher for HandsOver {
+        fn described(&self) -> Described {
+            let mut capabilities = vec!["objects".into(), "metadata".into()];
+            if !self.silent {
+                capabilities.push("handover".into());
+            }
+            Described {
+                capabilities,
+                ..described_for_tests()
+            }
+        }
+
+        async fn fetch(
+            &self,
+            _scope: &Scope,
+            _layer: &crate::serve_fetch::LayerScope,
+            call: crate::serve_fetch::FetchCall,
+            out: &Out<Event>,
+        ) -> Result<(), FetcherError> {
+            self.asked.store(call.handover, Ordering::Relaxed);
+            let mut files: Vec<OwnedFd> = call
+                .objects
+                .iter()
+                .map(|name| {
+                    let body = (0..=255u8)
+                        .map(body_of)
+                        .find(|b| &key_text(b) == name)
+                        .unwrap_or_default();
+                    in_memory(if self.wrong { b"not it" } else { &body })
+                })
+                .collect();
+            let objects: Vec<u32> = (0..files.len() as u32).collect();
+            if self.short {
+                files.pop();
+            }
+            let places = (0..files.len() as u32).collect();
+            files.extend((0..self.extra).map(|_| in_memory(b"more")));
+            let event = Event {
+                files: Some(places),
+                objects,
+                ..Event::of(EventKind::Staged)
+            };
+            out.send_with(event, files)
+                .await
+                .map_err(|_| FetcherError::failed("gone"))
+        }
+    }
+
+    /// The files a fetcher hands over are copied by the engine, known by
+    /// the digest of the bytes it read, and named nowhere in the staging of
+    /// the layer: the commit names them in the store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_files_a_fetcher_hands_over_are_taken_in_and_committed() {
+        let root = tempfile::tempdir().unwrap();
+        let handing = Arc::new(HandsOver::default());
+        let (walked, session, name, _keep) = eager_walk(handing, 5, root.path()).await;
+        walked.unwrap();
+        assert!(session.has_staged(&name));
+        let rel = staged_rel(&name).unwrap();
+        for entry in std::fs::read_dir(root.path().join(LAYERS)).unwrap() {
+            assert!(!entry.unwrap().path().join(&rel).exists());
+        }
+        let committed = session.commit(None).unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].digest, name);
+        assert!(session.store().contains_local(&committed[0].object.verity));
+    }
+
+    /// A fetcher that hands over other bytes than the name says: the pull
+    /// fails naming the fetcher and the file, and nothing is staged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_handed_over_with_wrong_bytes_fails_the_pull_naming_the_fetcher() {
+        let root = tempfile::tempdir().unwrap();
+        let handing = Arc::new(HandsOver {
+            wrong: true,
+            ..Default::default()
+        });
+        let (walked, session, name, _keep) = eager_walk(handing, 6, root.path()).await;
+        let e = walked.unwrap_err().to_string();
+        assert!(e.contains("first") && e.contains(&name), "{e}");
+        assert!(!session.has_staged(&name));
+        assert!(!has_objects(root.path()), "nothing is named in the store");
+    }
+
+    /// An event of files with fewer descriptors than objects is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_event_that_hands_over_fewer_files_than_objects_fails_the_pull() {
+        let root = tempfile::tempdir().unwrap();
+        let handing = Arc::new(HandsOver {
+            short: true,
+            ..Default::default()
+        });
+        let (walked, session, name, _keep) = eager_walk(handing, 7, root.path()).await;
+        let e = walked.unwrap_err().to_string();
+        assert!(e.contains("first"), "{e}");
+        assert!(!session.has_staged(&name));
+    }
+
+    /// A fetcher that does not announce `handover` is not called with it, and
+    /// files it hands over all the same are refused: the engine takes the
+    /// descriptors of the calls that asked for them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn files_handed_over_to_a_call_that_did_not_ask_fail_the_pull() {
+        let root = tempfile::tempdir().unwrap();
+        let handing = Arc::new(HandsOver {
+            silent: true,
+            ..Default::default()
+        });
+        let (walked, session, name, _keep) = eager_walk(handing.clone(), 8, root.path()).await;
+        assert!(!handing.asked.load(Ordering::Relaxed));
+        let e = walked.unwrap_err().to_string();
+        assert!(e.contains("first") && e.contains("did not ask"), "{e}");
+        assert!(!session.has_staged(&name));
+    }
+
+    /// A message has at most 16 descriptors, as the interface says: an event
+    /// with more is refused, though it names only the ones it needs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_event_with_more_descriptors_than_a_message_has_fails_the_pull() {
+        let root = tempfile::tempdir().unwrap();
+        let handing = Arc::new(HandsOver {
+            extra: MAX_FDS,
+            ..Default::default()
+        });
+        let (walked, session, name, _keep) = eager_walk(handing, 9, root.path()).await;
+        let e = walked.unwrap_err().to_string();
+        assert!(e.contains("first"), "{e}");
+        assert!(!session.has_staged(&name));
     }
 
     /// Whether the store under `root` has a file.

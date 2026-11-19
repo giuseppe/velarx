@@ -25,20 +25,24 @@ use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::ops::Range;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use velarx_content::fetcher::fetch::{
     Blob, EventKind, Failure, FetchEvent as Event, FetcherError, NotLazy, Probed, TocSource,
+    MAX_FDS,
 };
 use velarx_content::pull::chunked::{
     self, fetch_with_tries, make_batches, Batch, MAX_METADATA_COMPRESSED,
 };
 use velarx_content::pull::ranges::{self, Piece, RangesError};
 use velarx_content::serve_fetch::{
-    Described, FetchCall, LayerScope, Out, Scope, StagingFetcher, UnpackCall,
+    Described, FetchCall, Gone, LayerScope, Out, Scope, StagingFetcher, UnpackCall,
 };
-use velarx_content::stager::{content_of, name_of, staged, LayerToc, Name, StageError, Unnamed};
+use velarx_content::stager::{
+    content_of, in_memory, name_of, staged, LayerToc, Name, StageError, Unnamed,
+};
 use velarx_registry::target::MAX_MANIFEST_SIZE;
 use velarx_storage::Toc;
 use velarx_types::digest::Digest;
@@ -105,6 +109,8 @@ struct Writing {
     size: u64,
     /// Shared by the writers of its chunks, which write outside the lock
     file: Option<Arc<Unnamed>>,
+    /// Its file is in memory: its share of the budget of the process
+    in_memory: Option<OwnedSemaphorePermit>,
     left: usize,
     /// A chunk of it was refused: it is told failed, its other chunks are
     /// not written
@@ -123,6 +129,64 @@ struct Planned {
     sizes: Vec<u64>,
     owner: Vec<(usize, u64, Option<Digest>)>,
     got: Vec<AtomicBool>,
+    /// The files of the call that are in memory go to the engine as
+    /// descriptors, a few to an event
+    hand: Option<Handing>,
+}
+
+/// The small files of a call that are handed over: the positions of the
+/// objects and the files that wait for an event, and the budget of the
+/// process for the files in memory.  The table of a layer decides in which
+/// order the files come to their last chunk, so that the files that are
+/// begun and not complete are not bounded by anything else.
+struct Handing {
+    waiting: Mutex<(Vec<u32>, Vec<OwnedFd>)>,
+    memory: Arc<Semaphore>,
+}
+
+impl Handing {
+    /// The share of the budget of a file of `size` bytes in memory, when it
+    /// is small and the budget has the room: the other files are begun in
+    /// the staging.
+    fn reserve(&self, size: u64) -> Option<OwnedSemaphorePermit> {
+        let kib = u32::try_from(size.div_ceil(1024)).ok()?;
+        in_memory(size, false)
+            .then(|| self.memory.clone().try_acquire_many_owned(kib).ok())
+            .flatten()
+    }
+
+    /// Hand over `file` as the object `position`: sent with the ones that
+    /// wait for it when they are as many as an event carries.
+    async fn give(&self, position: u32, file: File, out: &Out<Event>) -> Result<(), Gone> {
+        let full = {
+            let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+            waiting.0.push(position);
+            waiting.1.push(file.into());
+            (waiting.1.len() == MAX_FDS).then(|| std::mem::take(&mut *waiting))
+        };
+        match full {
+            Some(full) => Self::send(full, out).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Send the files that wait.
+    async fn flush(&self, out: &Out<Event>) -> Result<(), Gone> {
+        let waiting = std::mem::take(&mut *self.waiting.lock().unwrap_or_else(|e| e.into_inner()));
+        Self::send(waiting, out).await
+    }
+
+    async fn send((objects, fds): (Vec<u32>, Vec<OwnedFd>), out: &Out<Event>) -> Result<(), Gone> {
+        if fds.is_empty() {
+            return Ok(());
+        }
+        let event = Event {
+            files: Some((0..fds.len() as u32).collect()),
+            objects,
+            ..Event::of(EventKind::Staged)
+        };
+        out.send_with(event, fds).await
+    }
 }
 
 impl RegistryFetch {
@@ -358,8 +422,17 @@ impl RegistryFetch {
             Written::Part => Ok(()),
             Written::Complete(done) => {
                 let (file, name, positions, job) = *done;
-                self.finish(staging, file, name, verity, positions, files, job, out)
-                    .await
+                let hand = plan.hand.as_ref();
+                self.finish(
+                    staging,
+                    file,
+                    (name, verity, hand),
+                    positions,
+                    files,
+                    job,
+                    out,
+                )
+                .await
             }
             Written::Refused(job, e) => self.fail(files, job, &e, out).await,
         }
@@ -390,17 +463,35 @@ impl RegistryFetch {
         &self,
         staging: &File,
         file: Unnamed,
-        name: Name,
-        verity: bool,
+        (name, verity, hand): (Name, bool, Option<&Handing>),
         positions: Vec<u32>,
         files: &Files,
         job: usize,
         out: &Out<Event>,
     ) -> Result<(), ()> {
-        let (path, size) = {
-            let w = files[job].lock().unwrap_or_else(|e| e.into_inner());
-            (w.path.clone(), w.size)
+        let (path, size, in_memory) = {
+            let mut w = files[job].lock().unwrap_or_else(|e| e.into_inner());
+            (w.path.clone(), w.size, w.in_memory.take())
         };
+        // (a file in memory, with one place in the call, is not named: the
+        // engine is given it, and knows it by what it reads)
+        if let (Some(hand), [position], Some(_)) = (hand, &positions[..], in_memory) {
+            let handed = file.handed();
+            files[job].lock().unwrap_or_else(|e| e.into_inner()).done = true;
+            return match handed {
+                Ok(file) => {
+                    let _ = out.send(Event::progress(Some(*position), size)).await;
+                    hand.give(*position, file, out).await.map_err(|_| ())
+                }
+                Err(e) => out
+                    .send(Event::failed(
+                        positions,
+                        registry_failure(&stage_error(&path, e)),
+                    ))
+                    .await
+                    .map_err(|_| ()),
+            };
+        }
         let named = match staging.try_clone() {
             Ok(dir) => tokio::task::spawn_blocking(move || file.finish(dir.as_fd(), &name, verity))
                 .await
@@ -609,16 +700,29 @@ fn write_chunk(plan: &Planned, files: &Files, staging: &File, idx: usize, data: 
         }
         let file = match &w.file {
             Some(file) => Ok(file.clone()),
-            None => Unnamed::begin(staging.as_fd(), w.size)
-                .map_err(StageError::Io)
-                .map(|file| {
-                    let file = Arc::new(match w.content {
-                        Some(d) => file.expect_content(d),
-                        None => file,
-                    });
-                    w.file = Some(file.clone());
-                    file
-                }),
+            // (a file in memory has no name to link: one with several
+            // places in the call is named, as `finish` does)
+            None => match plan
+                .hand
+                .as_ref()
+                .filter(|_| w.positions.len() == 1)
+                .and_then(|hand| hand.reserve(w.size))
+            {
+                Some(held) => {
+                    w.in_memory = Some(held);
+                    Unnamed::for_handover(staging.as_fd(), w.size, false)
+                }
+                None => Unnamed::begin(staging.as_fd(), w.size),
+            }
+            .map_err(StageError::Io)
+            .map(|file| {
+                let file = Arc::new(match w.content {
+                    Some(d) => file.expect_content(d),
+                    None => file,
+                });
+                w.file = Some(file.clone());
+                file
+            }),
         };
         (file, w.path.clone())
     };
@@ -633,6 +737,7 @@ fn write_chunk(plan: &Planned, files: &Files, staging: &File, idx: usize, data: 
     if let Err(e) = written {
         w.failed = true;
         w.file = None;
+        w.in_memory = None;
         return Written::Refused(*job, stage_error(&path, e));
     }
     if w.failed {
@@ -646,10 +751,13 @@ fn write_chunk(plan: &Planned, files: &Files, staging: &File, idx: usize, data: 
         Some(Ok(file)) => {
             Written::Complete(Box::new((file, w.name.clone(), w.positions.clone(), *job)))
         }
-        _ => Written::Refused(
-            *job,
-            ImageError::Layer(format!("`{path}`: its file is still written")),
-        ),
+        _ => {
+            w.in_memory = None;
+            Written::Refused(
+                *job,
+                ImageError::Layer(format!("`{path}`: its file is still written")),
+            )
+        }
     }
 }
 
@@ -691,7 +799,7 @@ impl StagingFetcher for RegistryFetch {
         Described {
             name: "registry".into(),
             capabilities: [
-                "objects", "unpack", "metadata", "lazy", "sha512", "reuse", "origin",
+                "objects", "unpack", "metadata", "lazy", "sha512", "reuse", "origin", "handover",
             ]
             .map(String::from)
             .to_vec(),
@@ -880,6 +988,7 @@ impl StagingFetcher for RegistryFetch {
                 name,
                 size: fc.size,
                 file: None,
+                in_memory: None,
                 left: fc.chunks.len(),
                 failed: false,
                 done: false,
@@ -899,6 +1008,10 @@ impl StagingFetcher for RegistryFetch {
             sizes: Vec::new(),
             owner: Vec::new(),
             got: Vec::new(),
+            hand: (call.handover && !scope.verity).then(|| Handing {
+                waiting: Default::default(),
+                memory: self.service.in_memory.clone(),
+            }),
         };
         for (job, chunks) in chunks_of.into_iter().enumerate() {
             for c in chunks {
@@ -938,8 +1051,7 @@ impl StagingFetcher for RegistryFetch {
             self.finish(
                 &layer.staging,
                 file,
-                name,
-                scope.verity,
+                (name, scope.verity, None),
                 positions,
                 &files,
                 job,
@@ -1043,6 +1155,9 @@ impl StagingFetcher for RegistryFetch {
                     }
                 }
             }
+            if let Some(hand) = &plan.hand {
+                hand.flush(out).await.map_err(gone)?;
+            }
             // every file is answered once: those that were not named failed
             let left: Vec<u32> = files
                 .iter()
@@ -1108,5 +1223,79 @@ mod tests {
             chunked::parse_info(&descriptor_of(&blob).unwrap()).unwrap(),
             None
         );
+    }
+
+    /// A layer whose table puts the last chunk of every small file at the
+    /// end of the blob has all its files begun and none complete: the files
+    /// in memory stay in the budget, the files past it are begun in the
+    /// staging, and a file that fails gives its share back.
+    #[test]
+    fn files_that_wait_for_their_last_chunk_stay_in_the_budget() {
+        const FILES: usize = 40;
+        const SIZE: u64 = 100 << 10;
+        let budget = 10 * SIZE / 1024;
+        let staging = tempfile::tempdir().unwrap();
+        let staging = File::open(staging.path()).unwrap();
+        let files: Files = (0..FILES)
+            .map(|i| {
+                Mutex::new(Writing {
+                    positions: vec![i as u32],
+                    content: None,
+                    path: format!("f{i}"),
+                    name: Name::Content(Digest::of(velarx_types::digest::Algorithm::Sha256, b"")),
+                    size: SIZE,
+                    file: None,
+                    in_memory: None,
+                    left: 2,
+                    failed: false,
+                    done: false,
+                })
+            })
+            .collect();
+        let memory = Arc::new(Semaphore::new(budget as usize));
+        let wrong = Digest::of(velarx_types::digest::Algorithm::Sha256, b"other");
+        let plan = Planned {
+            comps: Vec::new(),
+            sizes: Vec::new(),
+            // (the chunks of the first half of each file come first, the
+            // rest of it last; the last chunk of the first file is wrong)
+            owner: (0..2 * FILES)
+                .map(|c| {
+                    let sha = (c == FILES).then_some(wrong);
+                    (c % FILES, (c / FILES) as u64 * SIZE / 2, sha)
+                })
+                .collect(),
+            got: Vec::new(),
+            hand: Some(Handing {
+                waiting: Default::default(),
+                memory: memory.clone(),
+            }),
+        };
+        let half = vec![1u8; (SIZE / 2) as usize];
+        let held = || {
+            files
+                .iter()
+                .filter(|w| w.lock().unwrap().in_memory.is_some())
+                .count()
+        };
+        for c in 0..FILES {
+            assert!(matches!(
+                write_chunk(&plan, &files, &staging, c, &half),
+                Written::Part
+            ));
+        }
+        assert_eq!(held(), 10, "the budget is used, not more");
+        assert_eq!(memory.available_permits(), 0);
+        assert!(matches!(
+            write_chunk(&plan, &files, &staging, FILES, &half),
+            Written::Refused(0, _)
+        ));
+        assert_eq!(memory.available_permits(), (SIZE / 1024) as usize);
+        for c in FILES + 1..2 * FILES {
+            assert!(matches!(
+                write_chunk(&plan, &files, &staging, c, &half),
+                Written::Complete(_)
+            ));
+        }
     }
 }

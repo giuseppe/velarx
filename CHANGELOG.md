@@ -192,6 +192,13 @@ without the numbers of issues or pull requests of any tracker.
   unpacked, starts their write-back as they are made, and knows each by the
   digest of the bytes it read.  Fetchers that serve `org.velarx.Fetcher` hand
   the files of `Unpack` over so (`interfaces/org.velarx.Fetcher.varlink`).
+- A pull of a zstd:chunked layer of many small files is faster in the same
+  way: a fetcher that announces `handover` hands over the small files it
+  fetches as descriptors of its `staged` events when the engine asks for it
+  (`Fetch` with `handover`), instead of naming each in the staging for the
+  commit to read and link, and the engine copies and hashes them with
+  several threads as they come.  The files that are not small, a store with
+  fs-verity and a fetcher without the word keep the names of the staging.
 - Bridge networks: a long range of published ports starts and is removed (the
   rules go as several transactions, and the soft limit of open files is raised
   for a socket per port); a name that several containers have answers all
