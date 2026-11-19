@@ -600,6 +600,12 @@ mod tests {
         // (the size of the tar is kept with the row)
         assert_eq!(db.get_layer(&key(1)).await.unwrap().stream_size, Some(10));
         assert_eq!(db.get_layer(&key(2)).await.unwrap().stream_size, Some(20));
+        // (the table of contents is kept compressed and read back whole)
+        assert_eq!(
+            db.get_layer(&key(1)).await.unwrap().toc.as_deref(),
+            Some("{}")
+        );
+        assert!(db.get_layer(&key(3)).await.unwrap().toc.is_none());
         assert!(db.get_own_layer_states(&[]).await.unwrap().is_empty());
         // a read-only store's layers are not this store's
         let ro_path = dir.path().join("ro.sqlite");

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use rusqlite::{Connection, TransactionBehavior};
+use std::io::Read;
 
 /// The version of the schema.  A database has one rule: it is of this
 /// version (kept in `PRAGMA user_version`) or it is not opened.  The version
@@ -199,7 +200,8 @@ CREATE TABLE IF NOT EXISTS layers (
     -- its page by walking that one's overflow pages (the table of contents of
     -- a big image is megabytes: a read of `created_at` behind it cost ~1 ms).
     tarsplit BLOB,
-    toc TEXT
+    -- the table of contents (JSON), compressed with zstd
+    toc BLOB
 );
 
 CREATE INDEX IF NOT EXISTS idx_layers_diff_id ON layers(diff_id);
@@ -465,6 +467,15 @@ pub struct LayerRecord {
 }
 
 impl LayerRecord {
+    /// The table of contents as the column keeps it: zstd, as the tar-split.
+    pub(super) fn toc_z(&self) -> rusqlite::Result<Option<Vec<u8>>> {
+        self.toc
+            .as_ref()
+            .map(|t| zstd::encode_all(t.as_bytes(), velarx_tarsplit::ZSTD_LEVEL))
+            .transpose()
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+    }
+
     /// The columns `from_row` reads, of the table `layers` as `l`.
     pub const COLUMNS: &'static str =
         "l.id, l.diff_id, l.size, l.toc, l.created_at, l.registry_ref, l.erofs, l.owners, l.blob, l.diff_id_other, l.stream_size";
@@ -498,7 +509,23 @@ impl LayerRecord {
             key: row.get(0)?,
             diff_id: row.get(1)?,
             size: row.get(2)?,
-            toc: row.get(3)?,
+            // (read as the tar-split is: the window and the size capped)
+            toc: row
+                .get::<_, Option<Vec<u8>>>(3)?
+                .map(|z| {
+                    let mut toc = String::new();
+                    velarx_tarsplit::decoder(z, velarx_tarsplit::MAX_SIZE)?
+                        .read_to_string(&mut toc)?;
+                    Ok::<_, std::io::Error>(toc)
+                })
+                .transpose()
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Blob,
+                        Box::new(e),
+                    )
+                })?,
             status: "ready".to_string(),
             created_at: row.get(4)?,
             registry_ref: row.get(5)?,

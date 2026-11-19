@@ -124,6 +124,10 @@ pub use split::{
     Writer, MAX_SIZE,
 };
 
+/// The zstd level of a tar-split (and of the other metadata the store keeps
+/// compressed beside it).
+pub const ZSTD_LEVEL: i32 = 3;
+
 /// The largest zstd window a frame of untrusted content may ask for
 /// (128 MiB, the default limit of libzstd, set where the content is read
 /// so that it does not depend on the library).

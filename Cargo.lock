@@ -4980,7 +4980,9 @@ dependencies = [
  "velarx-config",
  "velarx-storage",
  "velarx-sys",
+ "velarx-tarsplit",
  "velarx-types",
+ "zstd",
 ]
 
 [[package]]

@@ -36,10 +36,12 @@ merged_tree_image () {
     layers=$WORKDIR/layers.json
     python3 -I - "$WORKDIR/store/db.sqlite" "$id" "$layers" <<'PY'
 import json, sqlite3, sys
+from compression import zstd
 db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
 rows = db.execute("SELECT l.id, l.toc FROM layers l JOIN image_layers il ON l.id = il.layer_id "
                   "WHERE il.image_id = ? ORDER BY il.layer_index", (sys.argv[2],)).fetchall()
-json.dump(rows, open(sys.argv[3], "w"))
+# (the column keeps the table of contents compressed with zstd)
+json.dump([(d, zstd.decompress(t).decode()) for d, t in rows], open(sys.argv[3], "w"))
 PY
     # (named by the key of the layer: `toc:sha256:<hex>` makes `toc-sha256-<hex>`)
     for i in $(python3 -I -c 'import json,sys; print(" ".join(d.replace("toc:", "toc-").replace(":", "-") for d, _ in json.load(open(sys.argv[1]))))' "$layers"); do

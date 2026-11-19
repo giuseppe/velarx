@@ -489,7 +489,7 @@ pub struct Recorded {
 impl Recorder {
     /// An empty recording.
     pub fn new() -> io::Result<Self> {
-        let enc = zstd::stream::write::Encoder::new(Vec::new(), 3)?;
+        let enc = zstd::stream::write::Encoder::new(Vec::new(), crate::ZSTD_LEVEL)?;
         Ok(Self {
             writer: Writer::new(enc),
         })
