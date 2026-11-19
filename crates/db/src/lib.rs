@@ -959,6 +959,21 @@ impl Database {
         Ok(())
     }
 
+    /// Whether a layer has its table of contents as text: this build keeps
+    /// it as a compressed blob, so such a row is of a store of another build.
+    pub async fn has_text_toc(&self) -> DbResult<bool> {
+        self.conn
+            .call(|conn| {
+                Ok(conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM layers WHERE typeof(toc) = 'text')",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .map_err(DbError::Sqlite)
+    }
+
     async fn get_image_layers_here(&self, image_id: &str) -> DbResult<Vec<LayerRecord>> {
         self.image_layers_here(image_id, true).await
     }

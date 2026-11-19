@@ -414,6 +414,69 @@ async fn a_repair_removes_an_image_whose_objects_are_damaged() {
     assert_eq!(again.images_total, 0);
 }
 
+/// A store whose layer rows this build cannot read (a store of another build
+/// that kept the table of contents as text) is not repaired by removing its
+/// images: the check stops, says so, and changes nothing.
+#[tokio::test]
+async fn a_layer_row_that_cannot_be_read_stops_a_repair() {
+    let (e, id) = pulled().await;
+    let toc = e.db.get_image_layers(&id).await.unwrap()[0]
+        .toc
+        .clone()
+        .unwrap();
+    e.db.conn()
+        .call(move |c| Ok(c.execute("UPDATE layers SET toc = ?1", [toc])?))
+        .await
+        .unwrap();
+    let err = checker(&e)
+        .check(&request(false, true))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("nothing is repaired"), "{err}");
+    assert!(e.db.get_image(&id).await.is_ok());
+    let text: i64 =
+        e.db.conn()
+            .call(|c| {
+                Ok(c.query_row(
+                    "SELECT count(*) FROM layers WHERE typeof(toc) = 'text'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+    assert_eq!(text, 1, "the row is as it was");
+}
+
+/// A layer row of this build that is damaged (a table of contents that does
+/// not decode) is the damage of its images alone: the check reports them,
+/// goes on with the others, and a repair removes only them.
+#[tokio::test]
+async fn a_damaged_layer_row_is_reported_for_its_image_alone() {
+    let (e, id) = pulled().await;
+    let other = build_chunked(&[Item::File {
+        name: "usr/other",
+        data: b"other\n".to_vec(),
+        chunk: 4096,
+    }]);
+    e.publish(&[&other], &[ZSTD]);
+    let second = e.pull().await.unwrap().id;
+    assert_ne!(id, second);
+    let layer = e.db.get_image_layers(&id).await.unwrap()[0].key.to_string();
+    e.db.conn()
+        .call(move |c| Ok(c.execute("UPDATE layers SET toc = x'00112233' WHERE id = ?1", [layer])?))
+        .await
+        .unwrap();
+    let r = check(&e, false, false).await;
+    assert_eq!(kinds(&r), ["bad_toc"], "{:?}", r.problems);
+    assert_eq!(r.problems[0].image.as_deref(), Some(id.as_str()));
+    let r = check(&e, false, true).await;
+    assert!(r.ok(), "{:?}", r.problems);
+    assert!(e.db.get_image(&id).await.is_err());
+    assert!(e.db.get_image(&second).await.is_ok());
+}
+
 #[tokio::test]
 async fn a_repair_removes_an_image_whose_object_is_gone() {
     let (e, id) = pulled().await;

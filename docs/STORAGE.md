@@ -148,10 +148,12 @@ says `serve_content`, and nothing otherwise).
 
 Nothing is compatible between versions (README).  A database of another
 schema version is not opened (`remove the store, or use the velarx that made
-it`), nor a store whose driver this velarx does not have; a client asks an
-engine service whose interface, version or digest is not its own to
-`Restart` from the installed binary; a monitor or a p2p service of another
-version is refused with an error.
+it`); a store of another build with the same version fails at the first
+statement that needs what changed, and `system check` stops on a table of
+contents of the old form and removes nothing.  A store whose driver this velarx does not have is not
+opened either; a client asks an engine service whose interface, version or
+digest is not its own to `Restart` from the installed binary; a monitor or a
+p2p service of another version is refused with an error.
 
 ## Security properties and limits
 

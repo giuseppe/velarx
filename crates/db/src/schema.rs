@@ -2,15 +2,14 @@
 use rusqlite::{Connection, TransactionBehavior};
 use std::io::Read;
 
-/// The version of the schema.  A database has one rule: it is of this
-/// version (kept in `PRAGMA user_version`) or it is not opened.  The version
-/// stays 1 for now (owner decision, 2026-11-08): a breaking change of the
-/// schema edits `SCHEMA` and the tables of the other modules in place, with
-/// no bump and no upgrade steps, and a store made by another build is
-/// unusable (it is deleted); a future release will start to version the
-/// schema.  A new file (`user_version` 0, no table) is told from a made one.
-/// A store of another build with this version is not told: it fails at the
-/// first statement that needs the new shape.
+/// The version of the schema, kept in `PRAGMA user_version`: a database of
+/// another version is not opened, and a new file (`user_version` 0, no table)
+/// is told from a made one.  It stays 1 until a release starts to version the
+/// schema (owner decision, 2026-11-08): a breaking change edits the schema in
+/// place, with no bump and no upgrade steps, and a store made by another build
+/// must be removed.  Such a store is not told when it is opened: it fails at
+/// the first statement that needs the new shape, and `system check` stops
+/// on a table of contents of the old form and removes nothing.
 pub const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug, thiserror::Error)]

@@ -143,6 +143,12 @@ without the numbers of issues or pull requests of any tracker.
 
 ### Changed
 
+- The table of contents of a layer is kept compressed in the database: a store
+  made by an earlier build is not used (remove it).  `system check` stops with
+  an error on such a store and `--repair` removes nothing, where it removed
+  every image; a layer whose table cannot be read in a store of this build is
+  reported for its images, which `--repair` removes, and the others are
+  checked.
 - The copy of an image of the `vfs` driver, `build`, `build --squash` and
   `commit --squash` show what the overlay of the EROFS images of the layers
   shows, where each layer is its own: the root of a layer with no entry `./`

@@ -188,6 +188,13 @@ impl CheckService {
         let mut run = Run::default();
 
         let shared = StorageLock::shared(&self.lock_path()).await?;
+        // (a table of contents as text is never this build's: the store is
+        // of another build, no image of it is damaged by that)
+        if self.db.has_text_toc().await? {
+            return Err(CheckError::Other(
+                "the layers of this store are not in the form of this build of velarx: nothing is repaired; a store made by another build is not used: remove it".into(),
+            ));
+        }
         let mut images = self.own_images().await?;
         let times = self.db.image_check_times().await?;
         images.sort_by_key(|i| times.get(&i.id).copied().unwrap_or(0));
@@ -323,10 +330,29 @@ impl CheckService {
             );
         }
         let layers = match self.db.get_image_layers(&image.id).await {
-            Ok(l) => l,
+            Ok(layers) => {
+                if let Some(listed) = manifest
+                    .ok()
+                    .and_then(|m| m.get("layers").and_then(|l| l.as_array()).map(|l| l.len()))
+                {
+                    if listed != layers.len() {
+                        add(
+                            "layer_count",
+                            format!(
+                                "the manifest lists {listed} layers, the image has {}",
+                                layers.len()
+                            ),
+                            None,
+                            Fix::None,
+                            true,
+                        );
+                    }
+                }
+                layers
+            }
             Err(e) => {
                 add(
-                    "missing_layer",
+                    "bad_toc",
                     format!("the layers of the image cannot be read: {e}"),
                     None,
                     Fix::None,
@@ -335,23 +361,6 @@ impl CheckService {
                 Vec::new()
             }
         };
-        if let Some(listed) = manifest
-            .ok()
-            .and_then(|m| m.get("layers").and_then(|l| l.as_array()).map(|l| l.len()))
-        {
-            if listed != layers.len() {
-                add(
-                    "layer_count",
-                    format!(
-                        "the manifest lists {listed} layers, the image has {}",
-                        layers.len()
-                    ),
-                    None,
-                    Fix::None,
-                    true,
-                );
-            }
-        }
 
         // each layer is the one of its descriptor, by the route that
         // verified it: its blob pulled whole, or the TOC the descriptor's
