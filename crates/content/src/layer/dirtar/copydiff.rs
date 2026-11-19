@@ -108,7 +108,6 @@ struct CopyDir {
     prefix: String,
     /// the directory of the image it was copied from, when it has one
     below: Option<usize>,
-    st: Stat,
     /// the names it has, and those of the image's directory
     present: HashSet<String>,
     image: Vec<(String, usize)>,
@@ -120,11 +119,10 @@ struct CopyDir {
 }
 
 impl CopyDir {
-    fn new(prefix: String, below: Option<usize>, st: Stat) -> Self {
+    fn new(prefix: String, below: Option<usize>) -> Self {
         CopyDir {
             prefix,
             below,
-            st,
             present: HashSet::new(),
             image: Vec::new(),
             opaque: false,
@@ -170,7 +168,7 @@ impl Visit for CopyWalk<'_, '_> {
             && at.image.iter().all(|(n, _)| !at.present.contains(n));
         if at.opaque {
             self.w.flush_pending()?;
-            self.w.whiteout(&at.prefix, ".wh..opq", &at.st)?;
+            self.w.whiteout(&at.prefix, ".wh..opq")?;
         }
         Ok(())
     }
@@ -237,7 +235,7 @@ impl Visit for CopyWalk<'_, '_> {
                 } else {
                     w.append(&mut h, &child, &attrs.xattrs, Content::None)?;
                 }
-                let mut sub = CopyDir::new(child, lower_dir, st);
+                let mut sub = CopyDir::new(child, lower_dir);
                 sub.deferred = deferred.then_some(mark);
                 return Ok(Some(sub));
             }
@@ -274,7 +272,7 @@ impl Visit for CopyWalk<'_, '_> {
         if !at.opaque {
             for (name, _) in &at.image {
                 if !at.present.contains(name) {
-                    self.w.whiteout(&at.prefix, name, &at.st)?;
+                    self.w.whiteout(&at.prefix, name)?;
                 }
             }
         }
@@ -293,9 +291,8 @@ pub fn write<W: HoleWrite>(dir: BorrowedFd<'_>, opts: &Options, out: W) -> io::R
         builder: tar::Builder::new(out),
     };
     let lower = lower_of(opts)?;
-    let st = fstat(dir).map_err(errno)?;
     let mut w = walker(&mut tar, opts);
-    let root = CopyDir::new(String::new(), Some(VIEW_ROOT), st);
+    let root = CopyDir::new(String::new(), Some(VIEW_ROOT));
     WALK.run(
         dir.try_clone_to_owned()?,
         root,
@@ -387,7 +384,7 @@ impl Visit for CopyChanges<'_> {
         let quiet =
             (lower_dir.is_some() && same) || (lower_dir.is_none() && opts.holds_excluded(&child));
         Ok(Some(ChangedDir {
-            dir: CopyDir::new(child, lower_dir, *st),
+            dir: CopyDir::new(child, lower_dir),
             any: false,
             at,
             quiet,
@@ -430,9 +427,8 @@ pub fn changes(dir: BorrowedFd<'_>, opts: &Options) -> io::Result<Vec<(String, C
         lower: lower_of(opts)?,
         out: Vec::new(),
     };
-    let st = fstat(dir).map_err(errno)?;
     let root = ChangedDir {
-        dir: CopyDir::new(String::new(), Some(VIEW_ROOT), st),
+        dir: CopyDir::new(String::new(), Some(VIEW_ROOT)),
         any: false,
         at: 0,
         quiet: false,

@@ -5633,7 +5633,9 @@ pub async fn diff_applies_the_options_of_ids_and_times(f: &Factory) {
         ..Default::default()
     };
     for (name, entry) in entries(&diff_of(&c, &fixed)) {
-        assert_eq!(entry.mtime, 1234, "{name}");
+        // (a whiteout has no time of its own, in any layer)
+        let time = if name.contains(".wh.") { 0 } else { 1234 };
+        assert_eq!(entry.mtime, time, "{name}");
     }
     let clamp = DiffOptions {
         exclude: engine_files(),

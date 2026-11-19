@@ -219,16 +219,25 @@ impl Upper {
         dirtar::replay(e, self.root.as_fd(), out)
     }
 
-    /// The entries of the changes the walk of the tree did not write: the
-    /// directories (by their position in the entries) it wrote are `written`.
-    fn append_rest(&self, out: &mut dyn Out, written: &HashSet<usize>) -> io::Result<()> {
-        for (i, e) in self.entries.iter().enumerate() {
-            if !written.contains(&i) {
-                self.write_entry(out, e)?;
-            }
-        }
-        Ok(())
+    /// The entries of the changes the walk of the tree does not write (the
+    /// directories, by their position in the entries, it writes are
+    /// `written`), in the order of the tar.
+    fn rest(&self, written: &HashSet<usize>) -> Vec<&Recorded> {
+        let mut rest: Vec<&Recorded> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !written.contains(i))
+            .map(|(_, e)| e)
+            .collect();
+        rest.sort_by(|a, b| components(&a.path).cmp(components(&b.path)));
+        rest
     }
+}
+
+/// The components of a path of the layer, a directory's `/` left out.
+fn components(path: &str) -> impl Iterator<Item = &str> {
+    path.trim_end_matches('/').split('/')
 }
 
 /// What the walk of the tree of a squash meets.
@@ -349,18 +358,46 @@ pub(super) fn write_tree(
     h.set_entry_type(tar::EntryType::Directory);
     pax(out, &root.entry)?;
     out.entry(&mut h, "./", Content::None)?;
+    // what the changes add that the tree has no place for goes where its
+    // path sorts among what the tree has
+    walk_tree(tree, upper, |step| {
+        if let Step::Changed(i) = step {
+            written.insert(i);
+        }
+        Ok(())
+    })?;
+    let mut rest = upper
+        .map_or_else(Vec::new, |u| u.rest(&written))
+        .into_iter();
+    let mut next = rest.next();
+    let mut before = |out: &mut dyn Out, path: &str| -> io::Result<()> {
+        while let (Some(u), Some(e)) = (upper, next) {
+            if components(&e.path).ge(components(path)) {
+                break;
+            }
+            u.write_entry(out, e)?;
+            next = rest.next();
+        }
+        Ok(())
+    };
     walk_tree(tree, upper, |step| match step {
         Step::Changed(i) => {
             if let Some(u) = upper {
+                before(out, &u.entries[i].path)?;
                 u.write_entry(out, &u.entries[i])?;
             }
-            written.insert(i);
             Ok(())
         }
-        Step::Node { node, idx, path } => add(out, objects, node, idx, path, &mut links),
+        Step::Node { node, idx, path } => {
+            before(out, path)?;
+            add(out, objects, node, idx, path, &mut links)
+        }
     })?;
-    if let Some(u) = upper {
-        u.append_rest(out, &written)?;
+    while let Some(e) = next {
+        if let Some(u) = upper {
+            u.write_entry(out, e)?;
+        }
+        next = rest.next();
     }
     Ok(())
 }
@@ -374,7 +411,7 @@ mod tests {
     use velarx_content::layer::writer::{write_layer, Compression};
     use velarx_fuse::dir_entry;
     use velarx_storage::{FileStore, TocEntry};
-    use velarx_types::digest::{Algorithm, Digest};
+    use velarx_types::digest::Algorithm;
 
     /// The tar stream of the tree, written to `out`.
     fn write_tree_to<W: HoleWrite>(
@@ -570,11 +607,16 @@ mod tests {
                 |out| write_tree(&tree, &store, None, out),
             )
             .unwrap();
-            assert_eq!(layer.diff_id, Digest::of(Algorithm::Sha256, &tar));
-            assert_eq!(size, tar.len() as u64);
+            // (the layer is the canonical tar of its table, not the tar
+            // that was written above)
+            assert!(layer.toc.is_canonical() && layer.tarsplit.is_empty());
+            assert_eq!(
+                size,
+                velarx_storage::canonical::stream_size(&layer.toc.entries).unwrap()
+            );
             let names: Vec<&str> = layer.toc.entries.iter().map(|e| e.name.as_str()).collect();
             assert!(
-                names.contains(&"etc/x") && names.contains(&"dev/null"),
+                names.contains(&"./etc/x") && names.contains(&"./dev/null"),
                 "{names:?}"
             );
         }
@@ -745,16 +787,16 @@ mod tests {
             [
                 "./",
                 "becomes_dir/",
-                "dir/",
-                "dir/child",
-                "etc/",
-                "etc/keep",
-                "opq/",
                 "becomes_dir/y",
                 "becomes_file",
                 "brand/",
                 "brand/new",
+                "dir/",
+                "dir/child",
+                "etc/",
+                "etc/keep",
                 "etc/replaced",
+                "opq/",
                 "opq/fresh",
             ]
         );

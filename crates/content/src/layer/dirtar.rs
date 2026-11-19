@@ -672,17 +672,15 @@ impl Walker<'_> {
         self.out.link(h, path, target)
     }
 
-    fn whiteout(&mut self, prefix: &str, name: &str, st: &Stat) -> io::Result<()> {
+    /// A whiteout is a regular file that has the same mode, owner and time
+    /// whatever device or mark it stands for.
+    fn whiteout(&mut self, prefix: &str, name: &str) -> io::Result<()> {
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Regular);
-        h.set_mode(0);
-        // (root's, as the whiteouts of containers-storage's and Docker's
-        // layers: an owner field left blank is not a number to a strict
-        // reader, and the owner of the device is not always one the maps of
-        // the layer have)
+        h.set_mode(0o644);
         h.set_uid(0);
         h.set_gid(0);
-        h.set_mtime(self.opts.mtime.of(st.st_mtime));
+        h.set_mtime(0);
         h.set_size(0);
         self.append(&mut h, &format!("{prefix}.wh.{name}"), &[], Content::None)
     }
@@ -714,7 +712,7 @@ impl Walker<'_> {
         }
         if is_whiteout_device(&st) {
             if !renamed {
-                self.whiteout(prefix, &name_str, &st)?;
+                self.whiteout(prefix, &name_str)?;
             }
             return Ok(None);
         }
@@ -724,7 +722,7 @@ impl Walker<'_> {
         let attrs = read_xattrs(dir, name, &shown, self.opts.lower.is_some(), false)?;
         if attrs.whiteout && kind == FileType::RegularFile && st.st_size == 0 {
             if !renamed {
-                self.whiteout(prefix, &name_str, &st)?;
+                self.whiteout(prefix, &name_str)?;
             }
             return Ok(None);
         }
@@ -777,7 +775,7 @@ impl Walker<'_> {
                 } else {
                     self.append(&mut h, &child, &attrs.xattrs, Content::None)?;
                     if attrs.opaque {
-                        self.whiteout(&child, ".wh..opq", &st)?;
+                        self.whiteout(&child, ".wh..opq")?;
                     }
                 }
                 // a directory the container renamed (the overlay does not copy
@@ -1202,6 +1200,18 @@ pub fn record(dir: BorrowedFd<'_>, opts: &Options) -> io::Result<Vec<Recorded>> 
     };
     walker(&mut recorder, opts).walk_upper(dir)?;
     Ok(recorder.entries)
+}
+
+/// Put the entries of a record in the order of a canonical tar: by the
+/// components of their paths, each compared as bytes.  The walk gives an
+/// entry in the place of the name it has in the directory, a whiteout in
+/// that of the file it hides, and what an image below has of a renamed
+/// directory after the rest.
+pub fn sort_canonical(entries: &mut [Recorded]) {
+    fn components(e: &Recorded) -> impl Iterator<Item = &str> {
+        e.path.trim_end_matches('/').split('/')
+    }
+    entries.sort_by(|a, b| components(a).cmp(components(b)));
 }
 
 /// Give the entry `e` of a record to `out`, its content read now from

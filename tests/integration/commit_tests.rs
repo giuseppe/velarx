@@ -92,11 +92,19 @@ async fn layer_tar(e: &Env, digest: &Digest) -> Vec<u8> {
     out
 }
 
+/// The names of the entries, without the `./` every name of a canonical tar
+/// starts with (the root is `./`).
 fn tar_names(tar: &[u8]) -> Vec<String> {
     tar::Archive::new(tar)
         .entries()
         .unwrap()
-        .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
+        .map(|e| {
+            let name = e.unwrap().path().unwrap().to_string_lossy().to_string();
+            match name.strip_prefix("./") {
+                Some(rest) if !rest.is_empty() => rest.to_string(),
+                _ => name,
+            }
+        })
         .collect()
 }
 
@@ -825,7 +833,7 @@ async fn test_a_sparse_file_is_a_chunk_of_zeros_in_both_commits() {
         let mut found = false;
         for entry in ar.entries().unwrap() {
             let mut entry = entry.unwrap();
-            if entry.path().unwrap().to_string_lossy() != "app/sparse" {
+            if entry.path().unwrap().to_string_lossy() != "./app/sparse" {
                 continue;
             }
             found = true;
@@ -852,10 +860,13 @@ async fn test_a_sparse_file_is_a_chunk_of_zeros_in_both_commits() {
         let toc: Toc =
             serde_json::from_slice(&zstd::decode_all(&blob[offset..offset + length]).unwrap())
                 .unwrap();
-        let chunks = toc.get_file_chunks("app/sparse");
+        let chunks = toc.get_file_chunks("./app/sparse");
         assert_eq!(chunks.iter().filter(|c| c.is_zeros_chunk()).count(), 1);
         assert_eq!(
-            toc.find_by_name("app/sparse").unwrap().verity().as_deref(),
+            toc.find_by_name("./app/sparse")
+                .unwrap()
+                .verity()
+                .as_deref(),
             Some(object.as_str())
         );
     }

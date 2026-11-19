@@ -199,6 +199,8 @@ CREATE TABLE IF NOT EXISTS layers (
     -- The big columns last: SQLite reads a column after one that overflows
     -- its page by walking that one's overflow pages (the table of contents of
     -- a big image is megabytes: a read of `created_at` behind it cost ~1 ms).
+    -- The tar-split: NULL for a layer that is not complete, empty for a
+    -- layer that has none, whose table of contents is of version 2.
     tarsplit BLOB,
     -- the table of contents (JSON), compressed with zstd
     toc BLOB

@@ -353,6 +353,23 @@ struct OpenFile {
     covered: u64,
 }
 
+/// Says whether the entries have a canonical tar: the rules of the tar
+/// alone, for the table of a layer that is not in a blob yet (no place of
+/// the data, no chunks).
+pub fn validate_entries(entries: &[TocEntry]) -> Result<(), Invalid> {
+    let mut checker = Checker::default();
+    for (i, e) in tar_entries(entries).enumerate() {
+        let bad = |reason| Invalid {
+            index: i,
+            name: e.name.clone(),
+            reason,
+        };
+        let f = Fields::of(e).map_err(bad)?;
+        checker.push(&f).map_err(bad)?;
+    }
+    Ok(())
+}
+
 /// Says whether the entries of a table of contents have a canonical tar,
 /// and the table is one a reader can use: the entries of a file with
 /// content have its fs-verity digest and the place of its data in the

@@ -2647,8 +2647,10 @@ impl<'a> Build<'a> {
     /// The key of a step in the build cache: what its commit is made of,
     /// `step` being what the step itself ran or copied.
     fn cache_key(&self, st: &StageState, created_by: &str, step: Value) -> BuildResult<String> {
+        // (version 2: the layers are canonical tars, the images cached
+        // before are not what a build makes now)
         let mut key = json!({
-            "version": 1,
+            "version": 2,
             "created_by": created_by,
             "edits": st.pending(),
             "author": st.author,
