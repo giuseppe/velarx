@@ -193,11 +193,20 @@ mod tests {
     fn a_pasta_is_known_by_its_pid_file_not_by_its_program() {
         let d = tempfile::tempdir().unwrap();
         let pid_file = d.path().join("pasta.pid");
+        // (the shell says it runs: until then its command line is that of
+        // an exec in progress, and the one command it has is not executed
+        // in its place)
         let mut child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30", "pasta", "--pid"])
+            .args(["-c", "echo; sleep 30; :", "pasta", "--pid"])
             .arg(&pid_file)
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut String::new(),
+        )
+        .unwrap();
         let pid = child.id() as i32;
         std::fs::write(&pid_file, pid.to_string()).unwrap();
         assert!(is_pasta_of(pid, &pid_file));
