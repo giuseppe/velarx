@@ -1016,13 +1016,13 @@ impl ImageService {
                     tags,
                     digest_names,
                     sources: super::pull::blob_sources(manifest, pull.registry_ref.as_deref()),
+                    pulled: pull
+                        .pulls
+                        .iter()
+                        .map(|p| (p.reference.clone(), p.signatures.clone()))
+                        .collect(),
                 },
                 started_at: pull.started_at.clone(),
-                pulled: pull
-                    .pulls
-                    .iter()
-                    .map(|p| (p.reference.clone(), p.signatures.clone()))
-                    .collect(),
                 shared,
             })
             .await?;

@@ -675,6 +675,9 @@ pub struct PullCommit {
     pub digest_names: Vec<(String, Digest)>,
     /// Blobs (layers and configuration) and the repository they came from
     pub sources: Vec<BlobSource>,
+    /// The references the image was pulled by and the signatures found
+    /// (JSON), recorded with the image: a stored image has them.
+    pub pulled: Vec<(String, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

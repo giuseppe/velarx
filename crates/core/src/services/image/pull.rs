@@ -1679,13 +1679,9 @@ impl ImageService {
                     sources: blob_sources(&manifest, registry_ref.as_deref()),
                     tags,
                     digest_names,
+                    pulled,
                 })
                 .await?;
-            for (reference, signatures) in &pulled {
-                self.db
-                    .set_pulled_image(&manifest_digest, reference, signatures.clone())
-                    .await?;
-            }
             if let Err(e) = lease.release().await {
                 warn!("Cannot remove the lease of the pull: {e}");
             }

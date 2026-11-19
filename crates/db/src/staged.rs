@@ -28,8 +28,6 @@ pub struct StagedImageCommit {
     /// When the pull started (RFC 3339): a name goes to this image only if
     /// the image that holds it in the store was recorded before.
     pub started_at: String,
-    /// The references the image was pulled by and the signatures found.
-    pub pulled: Vec<(String, Vec<u8>)>,
     /// The names the image may be announced under, when the pull may be
     /// shared.
     pub shared: Option<Vec<(String, String)>>,
@@ -90,25 +88,17 @@ impl Database {
     pub async fn commit_staged_image(&self, commit: StagedImageCommit) -> DbResult<()> {
         self.conn
             .call(move |conn| {
-                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let StagedImageCommit {
                     mut pull,
                     started_at,
-                    pulled,
                     shared,
                 } = commit;
                 pull.tags.retain(|t| !tag_is_newer(&tx, t, &started_at));
                 pull.digest_names
                     .retain(|(r, d)| !digest_name_is_newer(&tx, r, d, &pull.image.id, &started_at));
                 write_image(&tx, &pull)?;
-                let manifest_digest = pull.image.manifest_digest;
-                for (reference, signatures) in &pulled {
-                    tx.execute(
-                        "INSERT OR REPLACE INTO pulled_images (manifest_digest, reference, signatures)
-                         VALUES (?1, ?2, ?3)",
-                        rusqlite::params![manifest_digest, reference, signatures],
-                    )?;
-                }
                 if let Some(names) = shared {
                     for (repository, tag) in
                         std::iter::once((String::new(), String::new())).chain(names)

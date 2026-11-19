@@ -2147,8 +2147,9 @@ impl Database {
     }
 }
 
-/// The image of a pull, its layers, the blobs' repositories and the names it
-/// is given, in the transaction of the pull.
+/// The image of a pull, its layers, the blobs' repositories, the names it
+/// is given and the references it was pulled by, in the transaction of the
+/// pull.
 fn write_image(tx: &rusqlite::Transaction, pull: &PullCommit) -> rusqlite::Result<()> {
     let image = &pull.image;
     // (an image pulled again has the layers of this pull: the same
@@ -2194,6 +2195,13 @@ fn write_image(tx: &rusqlite::Transaction, pull: &PullCommit) -> rusqlite::Resul
             "INSERT OR REPLACE INTO image_digest_names (repository, digest, image_id)
              VALUES (?1, ?2, ?3)",
             rusqlite::params![repository, digest, image.id],
+        )?;
+    }
+    for (reference, signatures) in &pull.pulled {
+        tx.execute(
+            "INSERT OR REPLACE INTO pulled_images (manifest_digest, reference, signatures)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![image.manifest_digest, reference, signatures],
         )?;
     }
     Ok(())

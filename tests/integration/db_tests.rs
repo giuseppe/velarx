@@ -2,7 +2,9 @@
 //! Tests for database operations
 
 use tempfile::tempdir;
-use velarx_db::{ContainerRecord, Database, ImageRecord, LayerKey, LayerRecord, RecordState};
+use velarx_db::{
+    ContainerRecord, Database, ImageRecord, ImageTag, LayerKey, LayerRecord, RecordState,
+};
 use velarx_types::digest::Digest;
 
 #[tokio::test]
@@ -199,6 +201,54 @@ async fn the_big_columns_are_last_and_the_levels_are_an_index() {
         )
         .unwrap();
     assert!(plan.contains("COVERING INDEX"), "{plan}");
+}
+
+/// The references an image was pulled by are recorded in the transaction of
+/// the image: a fault while they are written leaves no image, so no stored
+/// image lacks them.
+#[tokio::test]
+async fn the_pulls_of_an_image_are_recorded_with_it() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let db = Database::open(&path).await.unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER fault BEFORE INSERT ON pulled_images
+         BEGIN SELECT RAISE(ABORT, 'a fault'); END",
+    )
+    .unwrap();
+    let manifest = digest_of(9);
+    let pull = velarx_db::PullCommit {
+        layers: Vec::new(),
+        image: ImageRecord {
+            id: "i".into(),
+            manifest_digest: manifest,
+            config_digest: digest_of(8),
+            manifest: "{}".into(),
+            config: "{}".into(),
+            created_at: "now".into(),
+            is_lazy: false,
+        },
+        image_layers: Vec::new(),
+        tags: vec![ImageTag {
+            repository: "r.io/a".into(),
+            tag: "1".into(),
+            image_id: "i".into(),
+        }],
+        digest_names: Vec::new(),
+        sources: Vec::new(),
+        pulled: vec![("r.io/a:1".into(), b"sigs".to_vec())],
+    };
+    assert!(db.commit_pull(pull.clone()).await.is_err());
+    assert!(db.list_images().await.unwrap().is_empty());
+    assert!(db.pulled_image(&manifest).await.unwrap().is_empty());
+    conn.execute_batch("DROP TRIGGER fault").unwrap();
+    db.commit_pull(pull).await.unwrap();
+    assert_eq!(db.list_images().await.unwrap().len(), 1);
+    assert_eq!(
+        db.pulled_image(&manifest).await.unwrap(),
+        [("r.io/a:1".to_string(), b"sigs".to_vec())]
+    );
 }
 
 #[tokio::test]
@@ -741,6 +791,7 @@ async fn test_a_layer_is_found_by_its_key_only() {
         tags: Vec::new(),
         digest_names: Vec::new(),
         sources: Vec::new(),
+        pulled: Vec::new(),
     };
     let commit = |r: LayerRecord| checked(r, false);
     let (toc, whole) = (LayerKey::Toc(digest_of(2)), LayerKey::Whole(blob));
