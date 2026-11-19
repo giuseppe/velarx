@@ -39,11 +39,9 @@
 //!   (`velarx_graph::prove_with`) before the engine's check and before
 //!   `Commit`.  A `Fetch` is written by the engine's fetching code into the
 //!   files the driver passed (`velarx_content::pull::sink::FilesSink`), and the
-//!   driver is told as the objects become whole; a layer with no table of
-//!   contents is refused before `BeginPull`.
+//!   driver is told as the objects become whole.
 //!
-//! This package depends on no service of the engine (`velarx-core`), and no
-//! engine option selects it yet.
+//! This package depends on no service of the engine (`velarx-core`).
 
 pub mod conn;
 pub mod convert;

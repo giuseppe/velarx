@@ -1374,11 +1374,8 @@ impl ContainerService {
             image_id: image.id.clone(),
             config: serde_json::to_string(&recorded)?,
             state: RecordState::Created,
-            pid: None,
             created_at: now.clone(),
-            started_at: None,
-            finished_at: None,
-            exit_code: None,
+            ..Default::default()
         };
 
         self.db.insert_container(&record).await?;

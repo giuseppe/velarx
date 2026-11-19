@@ -7,10 +7,6 @@ use rustix::io::Errno;
 use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
 
-fn io_err(e: Errno) -> io::Error {
-    io::Error::from_raw_os_error(e.raw_os_error())
-}
-
 /// Open a directory by path, not following a symbolic link in the last
 /// component.
 pub fn open_dir(path: &std::path::Path) -> io::Result<OwnedFd> {
@@ -20,7 +16,7 @@ pub fn open_dir(path: &std::path::Path) -> io::Result<OwnedFd> {
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NOCTTY,
         Mode::empty(),
     )
-    .map_err(io_err)
+    .map_err(io::Error::from)
 }
 
 /// Open `path`, which is relative to the directory `root`, as if `root` was
@@ -38,6 +34,6 @@ pub fn open_dir_in_root(root: BorrowedFd<'_>, path: &str) -> io::Result<Option<O
     ) {
         Ok(fd) => Ok(Some(fd)),
         Err(Errno::NOENT | Errno::NOTDIR) => Ok(None),
-        Err(e) => Err(io_err(e)),
+        Err(e) => Err(io::Error::from(e)),
     }
 }

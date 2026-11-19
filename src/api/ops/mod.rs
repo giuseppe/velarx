@@ -20,8 +20,6 @@ pub mod wait;
 pub struct Error {
     pub status: StatusCode,
     pub message: String,
-    /// The `code` of velarx's error answer.
-    pub code: u32,
     /// A 409 because of the state of the object (running, in use), not of
     /// a name that is taken
     pub state: bool,
@@ -40,7 +38,6 @@ impl Error {
         Self {
             status,
             message: message.into(),
-            code: 10,
             state: false,
             no_such: None,
             condition: None,
@@ -69,11 +66,6 @@ impl Error {
     /// when `state`.
     pub fn with_state(mut self, state: bool) -> Self {
         self.state = state && self.status == StatusCode::CONFLICT;
-        self
-    }
-
-    pub fn with_code(mut self, code: u32) -> Self {
-        self.code = code;
         self
     }
 

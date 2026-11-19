@@ -50,8 +50,8 @@ pub use lifecycle::conn::Input;
 #[doc(hidden)]
 pub use lifecycle::root_fd::start_mounts;
 pub use lifecycle::{
-    parse_signal, pod_digests_refusal, stop_settings, verify_image_digests, AttachEvent,
-    AttachStream, ContainerNotice, MemberImage, StartCheck, Stop, MONITOR_PID_FILE,
+    parse_signal, pod_digests_refusal, signal_name, stop_settings, verify_image_digests,
+    AttachEvent, AttachStream, ContainerNotice, MemberImage, StartCheck, Stop, MONITOR_PID_FILE,
 };
 pub use logs::*;
 pub use network::*;

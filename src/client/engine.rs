@@ -2881,19 +2881,7 @@ impl EngineClient {
                 fds,
             ))
         })?;
-        Ok(found
-            .hits
-            .into_iter()
-            .map(|h| SearchHit {
-                index: h.index,
-                name: h.name,
-                description: h.description,
-                stars: h.stars,
-                official: h.official,
-                automated: h.automated,
-                tag: h.tag,
-            })
-            .collect())
+        Ok(found.hits)
     }
 
     /// Remove a container with podman's options: what was removed.

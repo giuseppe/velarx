@@ -50,11 +50,8 @@ async fn test_container_crud() {
         image_id,
         config: "{}".to_string(),
         state: RecordState::Created,
-        pid: None,
         created_at: "2024-01-01T00:00:00Z".to_string(),
-        started_at: None,
-        finished_at: None,
-        exit_code: None,
+        ..Default::default()
     };
 
     db.insert_container(&record).await.unwrap();
@@ -104,11 +101,8 @@ async fn the_dependents_and_the_levels_are_recorded_with_the_containers() {
         image_id: image_id.clone(),
         config: config.to_string(),
         state: RecordState::Created,
-        pid: None,
         created_at: "2024-01-01T00:00:00Z".to_string(),
-        started_at: None,
-        finished_at: None,
-        exit_code: None,
+        ..Default::default()
     };
     let inserts = [
         record(
@@ -264,11 +258,8 @@ async fn test_container_rename() {
         image_id,
         config: "{}".to_string(),
         state: RecordState::Created,
-        pid: None,
         created_at: "2024-01-01T00:00:00Z".to_string(),
-        started_at: None,
-        finished_at: None,
-        exit_code: None,
+        ..Default::default()
     };
 
     db.insert_container(&record).await.unwrap();
@@ -402,9 +393,7 @@ async fn test_multiple_containers() {
             },
             pid: if i % 2 == 0 { Some(1000 + i) } else { None },
             created_at: "2024-01-01T00:00:00Z".to_string(),
-            started_at: None,
-            finished_at: None,
-            exit_code: None,
+            ..Default::default()
         };
         db.insert_container(&record).await.unwrap();
     }
@@ -671,11 +660,8 @@ async fn test_a_change_of_a_container_wakes_the_watcher_of_another_connection() 
         image_id,
         config: "{}".to_string(),
         state: RecordState::Created,
-        pid: None,
         created_at: "2024-01-01T00:00:00Z".to_string(),
-        started_at: None,
-        finished_at: None,
-        exit_code: None,
+        ..Default::default()
     };
     writer.insert_container(&record).await.unwrap();
     watch.changed().await.unwrap();
@@ -696,7 +682,10 @@ async fn test_a_change_of_a_container_wakes_the_watcher_of_another_connection() 
 
     let mut ext = writer.get_container_ext("c1").await.unwrap();
     ext.health = Some("{}".to_string());
-    writer.set_container_ext("c1", &ext).await.unwrap();
+    writer
+        .update_container_ext("c1", move |e| *e = ext)
+        .await
+        .unwrap();
     watch.changed().await.unwrap();
 
     writer.rename_container("c1", "two").await.unwrap();
@@ -718,11 +707,8 @@ async fn test_a_watch_made_before_a_change_sees_it_whenever_it_is_read() {
         image_id,
         config: "{}".to_string(),
         state: RecordState::Created,
-        pid: None,
         created_at: "2024-01-01T00:00:00Z".to_string(),
-        started_at: None,
-        finished_at: None,
-        exit_code: None,
+        ..Default::default()
     };
     db.insert_container(&record).await.unwrap();
     db.update_container_state("c2", RecordState::Running, None, None, None, None)

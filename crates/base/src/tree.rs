@@ -14,10 +14,6 @@ use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
-fn errno(e: rustix::io::Errno) -> io::Error {
-    io::Error::from_raw_os_error(e.raw_os_error())
-}
-
 /// The deepest directory a whole-tree operation walks into.  A path of a
 /// descriptor has no length limit; this one only stops a tree made to be
 /// endless.
@@ -36,7 +32,7 @@ pub fn open_root(path: &Path) -> io::Result<OwnedFd> {
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOCTTY,
         Mode::empty(),
     )
-    .map_err(errno)
+    .map_err(io::Error::from)
 }
 
 // the space a tree takes
@@ -118,7 +114,7 @@ impl Visit for Measuring<'_> {
 
 /// What the tree of the directory `root` holds.
 pub fn usage_fd(root: OwnedFd, m: &Measure) -> io::Result<Usage> {
-    let dev = fstat(&root).map_err(errno)?.st_dev;
+    let dev = fstat(&root)?.st_dev;
     let mut v = Measuring {
         m,
         dev,
@@ -178,7 +174,7 @@ pub fn mount_of(dir: BorrowedFd<'_>, name: &OsStr, st: &Stat) -> io::Result<Moun
     } else {
         AtFlags::SYMLINK_NOFOLLOW
     };
-    let x = statx(dir, name, flags, StatxFlags::MNT_ID).map_err(errno)?;
+    let x = statx(dir, name, flags, StatxFlags::MNT_ID)?;
     Ok(MountOf {
         dev: st.st_dev,
         mnt_id: (x.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(x.stx_mnt_id),
@@ -190,7 +186,7 @@ pub fn mount_of(dir: BorrowedFd<'_>, name: &OsStr, st: &Stat) -> io::Result<Moun
 fn gone_is_done(r: rustix::io::Result<()>) -> io::Result<()> {
     match r {
         Err(rustix::io::Errno::NOENT) => Ok(()),
-        r => r.map_err(errno),
+        r => r.map_err(io::Error::from),
     }
 }
 
@@ -213,9 +209,8 @@ fn make_accessible(dir: BorrowedFd<'_>, name: &OsStr, st: &Stat) -> io::Result<(
         name,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )
-    .map_err(errno)?;
-    let now = fstat(&fd).map_err(errno)?;
+    )?;
+    let now = fstat(&fd)?;
     if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino) {
         return Err(io::Error::other(format!(
             "the directory `{}` was replaced while it was removed",
@@ -230,14 +225,14 @@ fn make_accessible(dir: BorrowedFd<'_>, name: &OsStr, st: &Stat) -> io::Result<(
         AtFlags::empty(),
     ) {
         Err(rustix::io::Errno::PERM | rustix::io::Errno::ROFS) => Ok(()),
-        r => r.map_err(errno),
+        r => r.map_err(io::Error::from),
     }
 }
 
 /// The error of a directory that is a mount below the tree removed.
 fn a_mount(name: &OsStr) -> io::Error {
     io::Error::new(
-        errno(rustix::io::Errno::XDEV).kind(),
+        io::Error::from(rustix::io::Errno::XDEV).kind(),
         format!(
             "`{}` is a mount in the tree it is removed from",
             name.to_string_lossy()
@@ -285,7 +280,7 @@ impl Visit for Remover {
 /// Remove what the directory `dir` (open for reading) holds, not the
 /// directory.
 pub fn empty(dir: OwnedFd, opts: &Remove) -> io::Result<()> {
-    let st = fstat(&dir).map_err(errno)?;
+    let st = fstat(&dir)?;
     let root = mount_of(dir.as_fd(), OsStr::new(""), &st)?;
     Walk {
         max_depth: MAX_DEPTH,
@@ -300,12 +295,12 @@ pub fn empty(dir: OwnedFd, opts: &Remove) -> io::Result<()> {
 /// Remove `name` of `dir`, and what is below it for a directory, without
 /// following a link.
 pub fn remove_at(dir: BorrowedFd<'_>, name: &OsStr, opts: &Remove) -> io::Result<()> {
-    let st = statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(errno)?;
+    let st = statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
     if kind(&st) != FileType::Directory {
-        return unlinkat(dir, name, AtFlags::empty()).map_err(errno);
+        return unlinkat(dir, name, AtFlags::empty()).map_err(io::Error::from);
     }
     if opts.one_fs {
-        let here = fstat(dir).map_err(errno)?;
+        let here = fstat(dir)?;
         if mount_of(dir, name, &st)? != mount_of(dir, OsStr::new(""), &here)? {
             return Err(a_mount(name));
         }
@@ -314,7 +309,7 @@ pub fn remove_at(dir: BorrowedFd<'_>, name: &OsStr, opts: &Remove) -> io::Result
         make_accessible(dir, name, &st)?;
     }
     let sub = open_dir_at(dir, name)?;
-    let now = fstat(&sub).map_err(errno)?;
+    let now = fstat(&sub)?;
     if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino) {
         return Err(io::Error::other(format!(
             "the directory `{}` was replaced while it was removed",
@@ -322,7 +317,7 @@ pub fn remove_at(dir: BorrowedFd<'_>, name: &OsStr, opts: &Remove) -> io::Result
         )));
     }
     empty(sub, opts)?;
-    unlinkat(dir, name, AtFlags::REMOVEDIR).map_err(errno)
+    unlinkat(dir, name, AtFlags::REMOVEDIR).map_err(io::Error::from)
 }
 
 /// Remove the tree at `path` (a link at its end is removed, not followed; a
@@ -344,8 +339,7 @@ pub fn remove_tree(path: &Path, opts: &Remove) -> io::Result<()> {
         parent,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
-    )
-    .map_err(errno)?;
+    )?;
     remove_at(dir.as_fd(), name, opts)
 }
 
@@ -372,11 +366,11 @@ pub fn remove_dir_all_confined(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 fn remove_dir_all_with(path: &Path, opts: &Remove) -> io::Result<()> {
-    let st = statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW).map_err(errno)?;
+    let st = statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW)?;
     match kind(&st) {
         FileType::Directory => remove_tree(path, opts),
-        FileType::Symlink => unlinkat(CWD, path, AtFlags::empty()).map_err(errno),
-        _ => Err(errno(rustix::io::Errno::NOTDIR)),
+        FileType::Symlink => unlinkat(CWD, path, AtFlags::empty()).map_err(io::Error::from),
+        _ => Err(io::Error::from(rustix::io::Errno::NOTDIR)),
     }
 }
 

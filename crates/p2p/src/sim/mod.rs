@@ -25,7 +25,7 @@ mod transport;
 mod world;
 
 pub use content::{Image, Layer, MemStore};
-pub use net::{Link, Net, REGISTRY};
+pub use net::{Net, REGISTRY};
 pub use node::{Behavior, Dir, Live, Node, NodeConfig};
 pub use pull::{PullReport, Puller};
 pub use transport::SimTransport;

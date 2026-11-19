@@ -63,10 +63,6 @@ pub struct TreeSource<'a> {
     pub translate: &'a IdTranslate,
 }
 
-fn err(e: rustix::io::Errno) -> io::Error {
-    io::Error::from_raw_os_error(e.raw_os_error())
-}
-
 impl TreeSource<'_> {
     /// The node at `path`, links followed inside the image.
     fn resolve(&self, path: &str) -> Option<usize> {
@@ -269,7 +265,7 @@ fn set_times(dir: BorrowedFd<'_>, name: &OsStr, e: &TocEntry) -> io::Result<()> 
         last_access: t,
         last_modification: t,
     };
-    fs::utimensat(dir, name, &ts, AtFlags::SYMLINK_NOFOLLOW).map_err(err)
+    fs::utimensat(dir, name, &ts, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)
 }
 
 /// Set the extended attribute `name` of `file`, the copy of `shown`, after its
@@ -365,7 +361,7 @@ fn chown_at(dir: BorrowedFd<'_>, name: &OsStr, ids: (u32, u32)) -> io::Result<()
         Some(fs::Gid::from_raw(ids.1)),
         AtFlags::SYMLINK_NOFOLLOW,
     )
-    .map_err(err)
+    .map_err(io::Error::from)
 }
 
 struct Walk<'a> {
@@ -404,7 +400,7 @@ impl Walk<'_> {
                     let ids = self.src.ids(e, self.raw)?;
                     let f = File::from(fd);
                     chown_at(cur.fd(), &dname, ids)?;
-                    fs::fchmod(&f, Mode::from_raw_mode(e.mode & 0o7777)).map_err(err)?;
+                    fs::fchmod(&f, Mode::from_raw_mode(e.mode & 0o7777))?;
                     set_xattrs(&f, e, &mut self.refused)?;
                     set_times(cur.fd(), &dname, e)?;
                 }
@@ -423,7 +419,7 @@ impl Walk<'_> {
                     if cur.depth() >= MAX_DEPTH {
                         return Err(velarx_base::walk::too_deep(MAX_DEPTH));
                     }
-                    fs::mkdirat(dst, oname, Mode::from_raw_mode(0o700)).map_err(err)?;
+                    fs::mkdirat(dst, oname, Mode::from_raw_mode(0o700))?;
                     cur.descend(oname, None)?;
                     stack.push(Frame {
                         id: child,
@@ -440,7 +436,7 @@ impl Walk<'_> {
                             let parts: Vec<OsString> =
                                 parent.iter().map(OsStr::to_os_string).collect();
                             let d = open_dir_path(root.as_fd(), &parts)?;
-                            fs::linkat(&d, fname, dst, oname, AtFlags::empty()).map_err(err)?;
+                            fs::linkat(&d, fname, dst, oname, AtFlags::empty())?;
                             continue;
                         }
                     }
@@ -453,8 +449,7 @@ impl Walk<'_> {
                             | OFlags::NOFOLLOW
                             | OFlags::CLOEXEC,
                         Mode::from_raw_mode(0o600),
-                    )
-                    .map_err(err)?;
+                    )?;
                     let to = File::from(to);
                     if e.size > 0 {
                         velarx_storage::copy_file(
@@ -465,7 +460,7 @@ impl Walk<'_> {
                         )?;
                     }
                     chown_at(dst, oname, ids)?;
-                    fs::fchmod(&to, mode).map_err(err)?;
+                    fs::fchmod(&to, mode)?;
                     set_xattrs(&to, e, &mut self.refused)?;
                     set_times(dst, oname, e)?;
                     if c.nlink > 1 {
@@ -476,7 +471,7 @@ impl Walk<'_> {
                 }
                 TocEntryType::Symlink => {
                     let target = e.link_name.as_deref().unwrap_or("");
-                    fs::symlinkat(target, dst, oname).map_err(err)?;
+                    fs::symlinkat(target, dst, oname)?;
                     chown_at(dst, oname, ids)?;
                     set_times(dst, oname, e)?;
                 }
@@ -500,7 +495,7 @@ impl Walk<'_> {
                         // Devices need privileges: they are not data.
                         Err(rustix::io::Errno::PERM | rustix::io::Errno::ACCESS)
                             if kind != FileType::Fifo => {}
-                        Err(x) => return Err(err(x)),
+                        Err(x) => return Err(io::Error::from(x)),
                     }
                 }
             }

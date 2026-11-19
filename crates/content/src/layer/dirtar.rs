@@ -224,10 +224,6 @@ fn map_id(id: u32, ranges: &[IdRange], what: &str) -> io::Result<u32> {
         })
 }
 
-fn errno(e: rustix::io::Errno) -> io::Error {
-    io::Error::from_raw_os_error(e.raw_os_error())
-}
-
 /// What the xattrs of a node say.
 #[derive(Default)]
 struct Attrs {
@@ -266,7 +262,7 @@ fn get_xattr(path: &CString, name: &[u8], shown: &str) -> io::Result<Option<Vec<
             }
             // Removed meanwhile.
             Err(rustix::io::Errno::NODATA) => return Ok(None),
-            Err(e) => return Err(errno(e)),
+            Err(e) => return Err(io::Error::from(e)),
         }
     }
 }
@@ -292,7 +288,7 @@ fn read_xattrs(
                 return Err(io::Error::other(format!("too many xattrs for `{shown}`")))
             }
             Err(rustix::io::Errno::NOTSUP) => return Ok(out),
-            Err(e) => return Err(errno(e)),
+            Err(e) => return Err(io::Error::from(e)),
         }
     };
     let mut names: Vec<&[u8]> = list[..len]
@@ -443,7 +439,7 @@ pub fn open_content(content: &Content<'_>) -> io::Result<Option<(std::fs::File, 
 
 /// Whether a file written while it was read: it has another size or time.
 pub fn check_after(file: &std::fs::File, seen: &Stat, shown: &str) -> io::Result<()> {
-    let after = fstat(file).map_err(errno)?;
+    let after = fstat(file)?;
     if after.st_size != seen.st_size
         || (after.st_mtime, after.st_mtime_nsec) != (seen.st_mtime, seen.st_mtime_nsec)
     {
@@ -812,7 +808,7 @@ impl Walker<'_> {
                 }));
             }
             FileType::Symlink => {
-                let target = readlinkat(dir, name, Vec::new()).map_err(errno)?;
+                let target = readlinkat(dir, name, Vec::new())?;
                 let target = OsString::from_vec(target.into_bytes());
                 let mut h = self.header(&st, tar::EntryType::Symlink)?;
                 self.append_link(&mut h, &shown, &attrs.xattrs, &target)?;
@@ -1044,7 +1040,7 @@ fn same_file(st: &Stat, seen: &Stat) -> bool {
 /// Open the regular file of the `O_PATH` descriptor `pfd` for reading, after
 /// checking that it is the file that was seen.
 fn reopen_checked(pfd: OwnedFd, seen: &Stat, shown: &str) -> io::Result<OwnedFd> {
-    if !same_file(&fstat(&pfd).map_err(errno)?, seen) {
+    if !same_file(&fstat(&pfd)?, seen) {
         return Err(changed(shown));
     }
     let fd = openat(
@@ -1052,9 +1048,8 @@ fn reopen_checked(pfd: OwnedFd, seen: &Stat, shown: &str) -> io::Result<OwnedFd>
         velarx_sys::fd::proc_str(&pfd),
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
         Mode::empty(),
-    )
-    .map_err(errno)?;
-    let st = fstat(&fd).map_err(errno)?;
+    )?;
+    let st = fstat(&fd)?;
     if !same_file(&st, seen) || st.st_size != seen.st_size {
         return Err(changed(shown));
     }
@@ -1075,8 +1070,7 @@ fn open_checked(
         name,
         OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )
-    .map_err(errno)?;
+    )?;
     reopen_checked(pfd, seen, shown)
 }
 

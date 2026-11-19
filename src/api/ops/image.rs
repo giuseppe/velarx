@@ -127,7 +127,7 @@ async fn unpack_upload(
     dir: &std::path::Path,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
-    let bad = |m: String| Error::bad_request(m).with_code(2);
+    let bad = |m: String| Error::bad_request(m);
     let archive = work.path().join("context.tar");
     {
         let mut f = tokio::fs::File::create(&archive)
@@ -145,12 +145,11 @@ async fn unpack_upload(
                 return Err(Error::new(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "the build context is too large",
-                )
-                .with_code(2));
+                ));
             }
-            work.reservation.grow(chunk.len() as u64).map_err(|e| {
-                Error::new(StatusCode::INSUFFICIENT_STORAGE, e.to_string()).with_code(10)
-            })?;
+            work.reservation
+                .grow(chunk.len() as u64)
+                .map_err(|e| Error::new(StatusCode::INSUFFICIENT_STORAGE, e.to_string()))?;
             f.write_all(&chunk).await.map_err(Error::internal)?;
         }
         guard
@@ -180,7 +179,7 @@ pub(crate) async fn prepare_build(
     req: BuildImageRequest,
     input: ByteStream,
 ) -> Result<Build> {
-    let bad = |m: String| Error::bad_request(m).with_code(2);
+    let bad = |m: String| Error::bad_request(m);
     let containerfile = match req.dockerfile.as_deref().filter(|d| !d.is_empty()) {
         None => None,
         Some(d) => {
@@ -308,7 +307,7 @@ async fn named_contexts(
 ) -> Result<std::collections::HashMap<String, velarx_core::services::NamedContext>> {
     use velarx_core::services::NamedContext;
     use velarx_wire::buildopts::ContextSource;
-    let bad = |m: String| Error::bad_request(m).with_code(2);
+    let bad = |m: String| Error::bad_request(m);
     let mut out = std::collections::HashMap::new();
     for (n, c) in requested.into_iter().enumerate() {
         let named = match c.source {

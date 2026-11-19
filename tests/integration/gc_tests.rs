@@ -537,11 +537,8 @@ async fn the_layers_of_a_container_are_never_released() {
         image_id: pulled.id.clone(),
         config: "{}".into(),
         state: RecordState::Created,
-        pid: None,
         created_at: "now".into(),
-        started_at: None,
-        finished_at: None,
-        exit_code: None,
+        ..Default::default()
     })
     .await
     .unwrap();

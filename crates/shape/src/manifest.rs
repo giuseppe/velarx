@@ -32,7 +32,7 @@ fn descriptor(d: &ManifestDescriptor) -> Value {
 }
 
 /// OCI's platform.
-fn platform(p: &ImagePlatform) -> Value {
+pub(crate) fn platform(p: &ImagePlatform) -> Value {
     let mut o = Map::new();
     o.insert("architecture".into(), json!(p.architecture));
     o.insert("os".into(), json!(p.os));

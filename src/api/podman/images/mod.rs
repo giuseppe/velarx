@@ -770,18 +770,7 @@ pub(crate) async fn search_of(
         .search(term, &opts)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(found
-        .into_iter()
-        .map(|r| velarx_proto::engine::SearchHit {
-            index: r.index,
-            name: r.name,
-            description: r.description,
-            stars: r.stars,
-            official: r.official,
-            automated: r.automated,
-            tag: r.tag,
-        })
-        .collect())
+    Ok(found)
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ build = "../base/build-support/bin.rs"
 default = ["engine", "fuse"]
 # The engine: velarx.  The thin client velarx-client is
 # built without it (`make build-client`).
-engine = ["velarx/engine", "dep:velarx-core", "dep:velarx-runtime", "dep:velarx-content"]
+engine = ["velarx/engine", "dep:velarx-core", "dep:velarx-runtime"]
 fuse = ["velarx/fuse"]
 
 [[bin]]
@@ -48,7 +48,6 @@ velarx-wire = { path = "../wire" }
 velarx-sys = { path = "../sys" }
 velarx-core = { path = "../core", optional = true }
 velarx-runtime = { path = "../runtime", default-features = false, optional = true }
-velarx-content = { path = "../content", optional = true }
 anyhow.workspace = true
 
 [lints]

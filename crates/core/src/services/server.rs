@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tracing::info;
 use velarx_config::Config;
 use velarx_db::Database;
+use velarx_proto::system::{ComponentHealth, ComponentStatus, HealthReport};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInfo {
@@ -64,26 +65,6 @@ impl SystemdInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum HealthStatus {
-    Healthy,
-    Unhealthy,
-    Degraded,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComponentHealth {
-    pub name: String,
-    pub status: HealthStatus,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthResponse {
-    pub overall: HealthStatus,
-    pub components: Vec<ComponentHealth>,
-}
-
 pub struct ServerService {
     config: Arc<Config>,
     db: Database,
@@ -132,25 +113,28 @@ impl ServerService {
         )))
     }
 
-    pub async fn health(&self) -> HealthResponse {
+    pub async fn health(&self) -> HealthReport {
         let components = vec![
             check_database_health(&self.db).await,
             check_storage_health(&self.config.storage.root.to_string_lossy()),
             check_runtime_health(),
         ];
 
-        let overall = if components.iter().all(|c| c.status == HealthStatus::Healthy) {
-            HealthStatus::Healthy
+        let overall = if components
+            .iter()
+            .all(|c| c.status == ComponentStatus::Healthy)
+        {
+            ComponentStatus::Healthy
         } else if components
             .iter()
-            .any(|c| c.status == HealthStatus::Unhealthy)
+            .any(|c| c.status == ComponentStatus::Unhealthy)
         {
-            HealthStatus::Unhealthy
+            ComponentStatus::Unhealthy
         } else {
-            HealthStatus::Degraded
+            ComponentStatus::Degraded
         };
 
-        HealthResponse {
+        HealthReport {
             overall,
             components,
         }
@@ -234,8 +218,8 @@ fn userns_allowed(clone: Option<&str>, max: Option<&str>) -> std::io::Result<boo
 /// anything.
 async fn check_database_health(db: &Database) -> ComponentHealth {
     let (status, message) = match db.ping().await {
-        Ok(()) => (HealthStatus::Healthy, None),
-        Err(e) => (HealthStatus::Unhealthy, Some(e.to_string())),
+        Ok(()) => (ComponentStatus::Healthy, None),
+        Err(e) => (ComponentStatus::Unhealthy, Some(e.to_string())),
     };
     ComponentHealth {
         name: "database".to_string(),
@@ -248,13 +232,13 @@ fn check_storage_health(path: &str) -> ComponentHealth {
     if std::path::Path::new(path).exists() {
         ComponentHealth {
             name: "storage".to_string(),
-            status: HealthStatus::Healthy,
+            status: ComponentStatus::Healthy,
             message: None,
         }
     } else {
         ComponentHealth {
             name: "storage".to_string(),
-            status: HealthStatus::Degraded,
+            status: ComponentStatus::Degraded,
             message: Some("Storage directory not found".to_string()),
         }
     }
@@ -264,12 +248,12 @@ fn check_runtime_health() -> ComponentHealth {
     match crate::container::which_runtime() {
         Ok(_) => ComponentHealth {
             name: "oci_runtime".to_string(),
-            status: HealthStatus::Healthy,
+            status: ComponentStatus::Healthy,
             message: Some(format!("Using {}", crate::container::runtime_name())),
         },
         Err(_) => ComponentHealth {
             name: "oci_runtime".to_string(),
-            status: HealthStatus::Unhealthy,
+            status: ComponentStatus::Unhealthy,
             message: Some("No OCI runtime found".to_string()),
         },
     }
@@ -329,10 +313,10 @@ mod health_tests {
     async fn the_database_is_asked() {
         let db = Database::open_in_memory().await.unwrap();
         let h = check_database_health(&db).await;
-        assert_eq!((h.status, h.message), (HealthStatus::Healthy, None));
+        assert_eq!((h.status, h.message), (ComponentStatus::Healthy, None));
         db.stop().await.unwrap();
         let h = check_database_health(&db).await;
-        assert_eq!(h.status, HealthStatus::Unhealthy);
+        assert_eq!(h.status, ComponentStatus::Unhealthy);
         assert!(h.message.is_some());
     }
 }

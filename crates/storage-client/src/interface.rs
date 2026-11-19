@@ -4,8 +4,8 @@
 //! (`interfaces/org.velarx.Storage.varlink` and
 //! `interfaces/org.velarx.StorageFeed.varlink`), with the rules of the
 //! protocol in their headers.  The methods are the signatures only: the
-//! driver is a program of its own (the reference one is a later change), and
-//! the client in this package makes its calls by hand over
+//! driver is a program of its own (`velarx-storage-server` is the reference
+//! one), and the client in this package makes its calls by hand over
 //! `velarx_wire::varlink`, as the monitor's client of the fetchers does.
 //! `VELARX_WRITE_INTERFACES=1 cargo test -p velarx-storage-client --lib
 //! interface` writes the files.
@@ -699,23 +699,7 @@ pub fn feed_definition() -> String {
 mod tests {
     use super::*;
 
-    fn check(name: &str, text: &str) {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../interfaces")
-            .join(name);
-        if std::env::var_os("VELARX_WRITE_INTERFACES").is_some() {
-            std::fs::write(&path, text).unwrap();
-        }
-        let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
-        assert!(
-            on_disk == text,
-            "{} is not what the types make; run VELARX_WRITE_INTERFACES=1 cargo test -p \
-             velarx-storage-client --lib interface and commit it",
-            path.display()
-        );
-        // (no rustdoc of the Rust side in a text for other languages)
-        assert!(!text.contains("[`"), "a rustdoc link in the definition");
-    }
+    use velarx_base::testing::assert_interface_file as check;
 
     /// The files are valid varlink: the parser of zlink takes them, and the
     /// one of systemd (`varlinkctl validate-idl`) where it is installed.

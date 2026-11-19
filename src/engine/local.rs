@@ -294,11 +294,9 @@ mod tests {
                 image_id: "i".into(),
                 config,
                 state,
-                pid: None,
                 created_at: "2026-01-01T00:00:00Z".into(),
                 started_at: Some("2026-01-01T00:00:01Z".into()),
-                finished_at: None,
-                exit_code: None,
+                ..Default::default()
             })
             .await
             .unwrap();

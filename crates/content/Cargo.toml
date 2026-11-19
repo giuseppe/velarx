@@ -55,8 +55,6 @@ base64.workspace = true
 flate2.workspace = true
 tar.workspace = true
 tempfile.workspace = true
-landlock.workspace = true
-seccompiler.workspace = true
 rayon.workspace = true
 async-trait.workspace = true
 sha2.workspace = true
@@ -66,7 +64,6 @@ tokio-stream.workspace = true
 rand.workspace = true
 velarx-storage = { path = "../storage", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util", "net", "rt-multi-thread", "macros"] }
-axum = { workspace = true, features = ["tokio", "http1"] }
 
 [lints]
 workspace = true

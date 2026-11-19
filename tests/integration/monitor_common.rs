@@ -224,11 +224,8 @@ impl StoreFx {
                 image_id: "-rootfs-".into(),
                 config: "{}".into(),
                 state,
-                pid: None,
                 created_at: "2026-01-01T00:00:00Z".into(),
-                started_at: None,
-                finished_at: None,
-                exit_code: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -984,10 +981,6 @@ impl Session {
 
 pub fn status_state(dir: &Path) -> RunState {
     ctl(dir, &Ctl::Status).status.unwrap().state
-}
-
-pub fn path_exists(p: &Path) -> bool {
-    p.exists()
 }
 
 /// A user and mount namespace of this process (the test runs in a child

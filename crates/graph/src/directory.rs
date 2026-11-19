@@ -98,10 +98,6 @@ impl Default for Copier {
 /// The most one `copy_file_range` call is asked for.
 const RANGE_CHUNK: usize = 1 << 30;
 
-fn errno(e: rustix::io::Errno) -> io::Error {
-    io::Error::from_raw_os_error(e.raw_os_error())
-}
-
 fn is_unsupported(e: rustix::io::Errno) -> bool {
     use rustix::io::Errno;
     matches!(e, Errno::OPNOTSUPP | Errno::XDEV | Errno::NOSYS)
@@ -372,7 +368,7 @@ fn set_label(c: &Copier, target: Target<'_>, path: &str) -> io::Result<()> {
         // (a file system without SELinux attributes: nothing to label)
         Err(e) if is_unsupported(e) => Ok(()),
         Err(e) => Err(io::Error::new(
-            errno(e).kind(),
+            io::Error::from(e).kind(),
             LabelRefused(format!(
                 "the SELinux label of {path} cannot be set ({e}): the files of an image mounted in a container are labelled as they are copied"
             )),
@@ -447,7 +443,7 @@ pub fn remove_all(path: &Path) -> io::Result<()> {
     ) {
         Ok(fd) => fd,
         Err(rustix::io::Errno::NOENT) => return Ok(()),
-        Err(e) => return Err(errno(e)),
+        Err(e) => return Err(io::Error::from(e)),
     };
     match velarx_base::tree::remove_at(dir.as_fd(), name, &REMOVE) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -697,7 +693,7 @@ impl Walk<'_> {
                 continue;
             }
             let shown = self.shown(&name);
-            mkdirat(cur.fd(), oname, Mode::from_raw_mode(0o700)).map_err(errno)?;
+            mkdirat(cur.fd(), oname, Mode::from_raw_mode(0o700))?;
             if cur.depth() >= velarx_base::tree::MAX_DEPTH {
                 return Err(velarx_base::walk::too_deep(velarx_base::tree::MAX_DEPTH));
             }
@@ -740,8 +736,7 @@ impl Walk<'_> {
                         | OFlags::NOFOLLOW
                         | OFlags::CLOEXEC,
                     Mode::from_raw_mode(0o600),
-                )
-                .map_err(errno)?;
+                )?;
                 let to = File::from(out);
                 if e.size > 0 {
                     let from = object(self.src, e)?;
@@ -770,7 +765,7 @@ impl Walk<'_> {
                         format!("the link {shown} has no target"),
                     )
                 })?;
-                symlinkat(target, dir, name).map_err(errno)?;
+                symlinkat(target, dir, name)?;
                 let meta = toc_meta(e, &shown, self.translate)?;
                 self.apply_at(dir, name, &meta, &shown)
             }
@@ -793,7 +788,7 @@ impl Walk<'_> {
                         self.copier.skip_node(&shown, er);
                         return Ok(());
                     }
-                    Err(er) => return Err(errno(er)),
+                    Err(er) => return Err(io::Error::from(er)),
                 }
                 let meta = toc_meta(e, &shown, self.translate)?;
                 self.apply_at(dir, name, &meta, &shown)
@@ -811,11 +806,11 @@ impl Walk<'_> {
             return Err(io::Error::other("a link without a name"));
         };
         let dir = if parent.as_os_str().is_empty() {
-            rustix::io::fcntl_dupfd_cloexec(self.root, 0).map_err(errno)?
+            rustix::io::fcntl_dupfd_cloexec(self.root, 0)?
         } else {
             velarx_sys::fs::open_beneath(self.root, parent, velarx_sys::fs::Beneath::DirectoryPath)?
         };
-        linkat(&dir, fname, dst, name, AtFlags::empty()).map_err(errno)
+        linkat(&dir, fname, dst, name, AtFlags::empty()).map_err(io::Error::from)
     }
 
     /// The attributes of an entry held by a descriptor.
@@ -827,10 +822,10 @@ impl Walk<'_> {
             Err(e) if self.copier.chown_failed(e) => {}
             r => r.map_err(|e| chown_error(e, m.uid, m.gid, m.path))?,
         }
-        fchmod(fd, Mode::from_raw_mode(m.mode)).map_err(errno)?;
+        fchmod(fd, Mode::from_raw_mode(m.mode))?;
         set_attrs(self.copier, Target::Fd(fd), &m.xattrs, m.path);
         set_label(self.copier, Target::Fd(fd), m.path)?;
-        rustix::fs::futimens(fd, &timestamps(m.mtime)).map_err(errno)
+        rustix::fs::futimens(fd, &timestamps(m.mtime)).map_err(io::Error::from)
     }
 
     /// The attributes of an entry that is not opened (a link, a device).
@@ -846,14 +841,14 @@ impl Walk<'_> {
             Err(e) if self.copier.chown_failed(e) => {}
             r => r.map_err(|e| chown_error(e, m.uid, m.gid, shown))?,
         }
-        let st = statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(errno)?;
+        let st = statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
         if kind(&st) != FileType::Symlink {
-            rustix::fs::chmodat(dir, name, Mode::from_raw_mode(m.mode), AtFlags::empty())
-                .map_err(errno)?;
+            rustix::fs::chmodat(dir, name, Mode::from_raw_mode(m.mode), AtFlags::empty())?;
         }
         set_attrs(self.copier, Target::At(dir, name), &m.xattrs, shown);
         set_label(self.copier, Target::At(dir, name), shown)?;
-        utimensat(dir, name, &timestamps(m.mtime), AtFlags::SYMLINK_NOFOLLOW).map_err(errno)
+        utimensat(dir, name, &timestamps(m.mtime), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(io::Error::from)
     }
 }
 

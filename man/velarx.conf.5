@@ -89,9 +89,7 @@ at least every half of it, the others whole within it) and
 .B name
 (the name the service must give itself); the engine connects when it starts,
 and a service that is not running or speaks another version is an error that
-says so, as is a setting that the service does not advertise, and
-.B "[pull] job = true"
-with this driver);
+says so, as is a setting that the service does not advertise);
 a store keeps the driver it was made with, and
 opening it with another is an error), the fs\-verity of its files, which
 .B fsverity_require
@@ -122,8 +120,6 @@ The pulls: what is shared with the peers, the layers fetched at the same
 time, the memory and the cgroups of the workers, the limits that stop a
 runaway layer or archive
 .RB ( max_layer_gib ", " max_inflate_ratio ", " min_speed_kib ),
-the confined workers and the pull job
-.RB ( confine ", " job ),
 the signature policy, the lazily pulled images and the background process that
 completes their pull
 .RB ( lazy_complete_fetches ", " lazy_completers ", " lazy_retry_max_secs ),

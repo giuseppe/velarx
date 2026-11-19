@@ -12,15 +12,11 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use rustix::event::{PollFd, PollFlags};
 use rustix::process::{Pid, PidfdFlags, WaitId, WaitIdOptions};
 
-fn io_err(e: rustix::io::Errno) -> io::Error {
-    io::Error::from_raw_os_error(e.raw_os_error())
-}
-
 /// A pidfd (close-on-exec) of the process `pid`.  Nothing here tells that
 /// `pid` is still the process the caller means: see [`open_child`].
 pub fn open(pid: i32) -> io::Result<OwnedFd> {
     let pid = Pid::from_raw(pid).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-    rustix::process::pidfd_open(pid, PidfdFlags::empty()).map_err(io_err)
+    rustix::process::pidfd_open(pid, PidfdFlags::empty()).map_err(io::Error::from)
 }
 
 /// A pidfd (close-on-exec) of the process at the other end of the unix
@@ -62,7 +58,7 @@ pub fn open_child(pid: i32) -> io::Result<OwnedFd> {
         WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
     ) {
         Ok(_) => Ok(fd),
-        Err(e) => Err(io_err(e)),
+        Err(e) => Err(io::Error::from(e)),
     }
 }
 
@@ -90,7 +86,7 @@ pub fn wait_exit<Fd: AsFd>(pidfd: Fd, timeout: std::time::Duration) -> io::Resul
         match rustix::event::poll(&mut fds, Some(&ts)) {
             Ok(n) => return Ok(n > 0),
             Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(io_err(e)),
+            Err(e) => return Err(io::Error::from(e)),
         }
     }
 }
@@ -115,7 +111,7 @@ pub fn pid_of<Fd: AsFd>(fd: Fd) -> io::Result<i32> {
         .and_then(|p| p.trim().parse::<i32>().ok())
     {
         Some(pid) if pid > 0 => Ok(pid),
-        _ => Err(io_err(rustix::io::Errno::SRCH)),
+        _ => Err(io::Error::from(rustix::io::Errno::SRCH)),
     }
 }
 
@@ -127,7 +123,7 @@ pub fn wait_ended<Fd: AsFd>(pidfd: Fd) -> io::Result<()> {
         match rustix::event::poll(&mut fds, None) {
             Ok(n) if n > 0 => return Ok(()),
             Ok(_) | Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(io_err(e)),
+            Err(e) => return Err(io::Error::from(e)),
         }
     }
 }
@@ -151,7 +147,7 @@ pub fn reap<Fd: AsFd>(pidfd: Fd) -> io::Result<Option<i32>> {
             }
         }
         Ok(None) => Ok(None),
-        Err(e) => Err(io_err(e)),
+        Err(e) => Err(io::Error::from(e)),
     }
 }
 

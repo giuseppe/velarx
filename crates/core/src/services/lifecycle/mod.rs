@@ -21,8 +21,10 @@ use std::time::Duration;
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 use velarx_db::{ContainerRecord, RecordState};
+use velarx_runtime::settle::{record::event_details, rfc3339};
 use velarx_wire::monitor::client;
 use velarx_wire::monitor::proto::{self, Event, ExitInfo, RunState};
+pub use velarx_wire::monitor::sys::{parse_signal, signal_name};
 
 mod adopt;
 mod attach;
@@ -335,22 +337,6 @@ fn io_error(e: io::Error) -> ContainerError {
     ContainerError::Io(e)
 }
 
-/// The image of a container as it was asked (its id when that is
-/// unknown) and its labels, sorted: what podman's events of it carry.
-fn event_details(container: &ContainerRecord) -> (String, Vec<(String, String)>) {
-    let Ok(cfg) = serde_json::from_str::<ContainerConfig>(&container.config) else {
-        return (container.image_id.clone(), Vec::new());
-    };
-    let image = if cfg.image.is_empty() {
-        container.image_id.clone()
-    } else {
-        cfg.image
-    };
-    let mut labels: Vec<(String, String)> = cfg.labels.into_iter().collect();
-    labels.sort();
-    (image, labels)
-}
-
 /// The directory the results of the health checks of a container are also
 /// written to (`--health-log-destination`), opened for its monitor: `None`
 /// when they stay with the monitor's own record.  A directory that cannot be
@@ -384,85 +370,6 @@ fn health_config(config: &ContainerConfig) -> Option<velarx_proto::health::Healt
     config.healthcheck.clone().filter(|h| h.command().is_some())
 }
 
-pub(in crate::services) fn rfc3339(ns: i64) -> String {
-    chrono::DateTime::from_timestamp_nanos(ns).to_rfc3339()
-}
-
-/// The time of a start the database has (`rfc3339`'s), in nanoseconds.
-fn started_ns(at: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(at)
-        .ok()?
-        .timestamp_nanos_opt()
-}
-
-/// A signal given by name (`TERM`, `SIGTERM`) or number.
-pub fn parse_signal(s: &str) -> Option<i32> {
-    // (kill -s -1, -INT: a leading dash as podman takes it)
-    let s = s.trim();
-    let s = s.strip_prefix('-').unwrap_or(s);
-    if let Ok(n) = s.parse::<i32>() {
-        return proto_signal(n);
-    }
-    let name = s.to_ascii_uppercase();
-    let name = name.strip_prefix("SIG").unwrap_or(&name);
-    const NAMES: &[(&str, i32)] = &[
-        ("HUP", libc::SIGHUP),
-        ("INT", libc::SIGINT),
-        ("QUIT", libc::SIGQUIT),
-        ("ILL", libc::SIGILL),
-        ("TRAP", libc::SIGTRAP),
-        ("ABRT", libc::SIGABRT),
-        ("BUS", libc::SIGBUS),
-        ("FPE", libc::SIGFPE),
-        ("KILL", libc::SIGKILL),
-        ("USR1", libc::SIGUSR1),
-        ("SEGV", libc::SIGSEGV),
-        ("USR2", libc::SIGUSR2),
-        ("PIPE", libc::SIGPIPE),
-        ("ALRM", libc::SIGALRM),
-        ("TERM", libc::SIGTERM),
-        ("CHLD", libc::SIGCHLD),
-        ("CONT", libc::SIGCONT),
-        ("STOP", libc::SIGSTOP),
-        ("TSTP", libc::SIGTSTP),
-        ("TTIN", libc::SIGTTIN),
-        ("TTOU", libc::SIGTTOU),
-        ("URG", libc::SIGURG),
-        ("XCPU", libc::SIGXCPU),
-        ("XFSZ", libc::SIGXFSZ),
-        ("VTALRM", libc::SIGVTALRM),
-        ("PROF", libc::SIGPROF),
-        ("WINCH", libc::SIGWINCH),
-        ("IO", libc::SIGIO),
-        ("SYS", libc::SIGSYS),
-        ("STKFLT", libc::SIGSTKFLT),
-        ("PWR", libc::SIGPWR),
-        ("POLL", libc::SIGIO),
-        ("IOT", libc::SIGABRT),
-    ];
-    if let Some((_, v)) = NAMES.iter().find(|(n, _)| *n == name) {
-        return Some(*v);
-    }
-    // RTMIN, RTMIN+N, RTMAX, RTMAX-N
-    let (rtmin, rtmax) = (libc::SIGRTMIN(), libc::SIGRTMAX());
-    let rt = if let Some(rest) = name.strip_prefix("RTMIN") {
-        match rest.strip_prefix('+') {
-            None if rest.is_empty() => Some(rtmin),
-            Some(n) => n.parse::<i32>().ok().and_then(|n| rtmin.checked_add(n)),
-            None => None,
-        }
-    } else if let Some(rest) = name.strip_prefix("RTMAX") {
-        match rest.strip_prefix('-') {
-            None if rest.is_empty() => Some(rtmax),
-            Some(n) => n.parse::<i32>().ok().and_then(|n| rtmax.checked_sub(n)),
-            None => None,
-        }
-    } else {
-        None
-    };
-    rt.filter(|n| (rtmin..=rtmax).contains(n))
-}
-
 /// The signal and the timeout (seconds) that stop a container: those of its
 /// config (the create options, else the image's `StopSignal`), else
 /// SIGTERM and 10 s.
@@ -471,10 +378,6 @@ pub fn stop_settings(config: &ContainerConfig) -> (i32, u32) {
         parse_signal(&config.stop_signal).unwrap_or(libc::SIGTERM),
         config.stop_timeout.unwrap_or(10),
     )
-}
-
-fn proto_signal(n: i32) -> Option<i32> {
-    velarx_wire::monitor::sys::valid_signal(n).then_some(n)
 }
 
 /// The SELinux label of the socket a container in `--sdnotify=container`
@@ -781,11 +684,7 @@ mod tests {
             image_id: "6953980e4692".into(),
             config: serde_json::to_string(&cfg).unwrap(),
             state: RecordState::Running,
-            pid: None,
-            created_at: String::new(),
-            started_at: None,
-            finished_at: None,
-            exit_code: None,
+            ..Default::default()
         };
         let (image, labels) = event_details(&rec);
         assert_eq!(image, "quay.io/libpod/testimage:20241011");
@@ -810,32 +709,5 @@ mod tests {
         assert_eq!(stop_settings(&c), (libc::SIGUSR1, 3));
         c.stop_signal = "bogus".into();
         assert_eq!(stop_settings(&c).0, libc::SIGTERM);
-    }
-
-    #[test]
-    fn signal_names() {
-        assert_eq!(parse_signal("TERM"), Some(libc::SIGTERM));
-        assert_eq!(parse_signal("SIGPWR"), Some(libc::SIGPWR));
-        assert_eq!(parse_signal("stkflt"), Some(libc::SIGSTKFLT));
-        assert_eq!(parse_signal("RTMIN"), Some(libc::SIGRTMIN()));
-        assert_eq!(parse_signal("SIGRTMIN+2"), Some(libc::SIGRTMIN() + 2));
-        assert_eq!(parse_signal("RTMAX-1"), Some(libc::SIGRTMAX() - 1));
-        assert_eq!(parse_signal("RTMAX+1"), None);
-        assert_eq!(parse_signal("RTMIN+99"), None);
-        // (the number is the client's: no overflow)
-        assert_eq!(parse_signal("RTMIN+2147483647"), None);
-        assert_eq!(parse_signal("RTMAX--2147483648"), None);
-        assert_eq!(parse_signal("RTMINX"), None);
-        assert_eq!(parse_signal("64"), Some(64));
-        // a leading dash, as podman takes it (kill -s -1)
-        assert_eq!(parse_signal("-1"), Some(libc::SIGHUP));
-        assert_eq!(parse_signal("-INT"), Some(libc::SIGINT));
-        assert_eq!(parse_signal("-SIGUSR1"), Some(libc::SIGUSR1));
-        assert_eq!(parse_signal("--1"), None);
-        assert_eq!(parse_signal("sigusr1"), Some(libc::SIGUSR1));
-        assert_eq!(parse_signal("9"), Some(9));
-        assert_eq!(parse_signal("0"), None);
-        assert_eq!(parse_signal("65"), None);
-        assert_eq!(parse_signal("NOPE"), None);
     }
 }

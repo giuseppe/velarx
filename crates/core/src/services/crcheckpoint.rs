@@ -496,7 +496,7 @@ impl ContainerService {
                 .and_then(Result::ok)
                 .and_then(|s| s.started_ns);
         let now = started_ns
-            .map(super::lifecycle::rfc3339)
+            .map(velarx_runtime::settle::rfc3339)
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
         if let Err(e) = self
             .db

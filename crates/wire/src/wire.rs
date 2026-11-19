@@ -445,41 +445,6 @@ pub struct PodLogEntry {
     pub message: String,
 }
 
-/// A metric (cAdvisor's names, see `services::metrics`): its name, help text, whether it only grows, and the names of its
-/// labels.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Descriptor {
-    pub name: String,
-    pub help: String,
-    pub counter: bool,
-    pub labels: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Sample {
-    pub name: String,
-    /// The values of the labels of the descriptor
-    pub labels: Vec<String>,
-    pub value: f64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ContainerMetrics {
-    pub id: String,
-    pub name: String,
-    pub samples: Vec<Sample>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PodMetrics {
-    pub id: String,
-    pub name: String,
-    /// When the samples were read, in nanoseconds since the epoch
-    pub time_ns: i64,
-    /// Of the pod: the network of its namespace
-    pub samples: Vec<Sample>,
-    pub containers: Vec<ContainerMetrics>,
-    /// Of the cgroup of the pod, when it has one of its own
-    #[serde(default)]
-    pub usage: Option<velarx_proto::pod::PodUsage>,
-}
+pub use velarx_proto::workload::{
+    ContainerMetrics, MetricDescriptor as Descriptor, MetricSample as Sample, PodMetrics,
+};

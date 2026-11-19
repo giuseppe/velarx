@@ -35,7 +35,6 @@ rustix = { workspace = true, features = ["fs", "net", "process", "rand", "thread
 tracing.workspace = true
 hex.workspace = true
 sha2.workspace = true
-tokio-rusqlite.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

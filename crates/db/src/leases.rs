@@ -262,10 +262,7 @@ impl Database {
         let id = id.to_string();
         self.conn
             .call(move |conn| {
-                let tx = conn.transaction()?;
-                tx.execute("DELETE FROM lease_items WHERE lease_id = ?1", [&id])?;
-                tx.execute("DELETE FROM leases WHERE id = ?1", [&id])?;
-                tx.commit()?;
+                conn.execute("DELETE FROM leases WHERE id = ?1", [&id])?;
                 Ok(())
             })
             .await

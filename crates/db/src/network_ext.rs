@@ -48,16 +48,12 @@ CREATE TABLE IF NOT EXISTS host_ports (
     PRIMARY KEY (host_ip, proto, port)
 );
 CREATE INDEX IF NOT EXISTS idx_host_ports_container ON host_ports(container_id);
-";
-
-/// The last address given on a network: the next is the one after it, as in
-/// podman's IPAM (`getFreeIPFromBucket` of netavark's, its `lastIP`), so
-/// that the address of a container that just went is not given again while
-/// the host side of its network may still be there (the kernel takes a
-/// namespace down on its own time) or the neighbours still have its old
-/// link address.  Made with the others (`schema::SCHEMAS`), and again by the
-/// transactions that use it: a store made before it has none.
-pub const IPAM: &str = "
+-- The last address given on a network: the next is the one after it, as in
+-- podman's IPAM (`getFreeIPFromBucket` of netavark's, its `lastIP`), so
+-- that the address of a container that just went is not given again while
+-- the host side of its network may still be there (the kernel takes a
+-- namespace down on its own time) or the neighbours still have its old
+-- link address.
 CREATE TABLE IF NOT EXISTS network_ipam (
     network_id TEXT PRIMARY KEY,
     last_ip TEXT,
@@ -165,7 +161,6 @@ fn last_given<A: std::str::FromStr>(
     network_id: &str,
     column: &'static str,
 ) -> rusqlite::Result<Option<A>> {
-    tx.execute_batch(IPAM)?;
     let value: Option<Option<String>> = tx
         .query_row(
             &format!("SELECT {column} FROM network_ipam WHERE network_id = ?1"),
@@ -505,7 +500,6 @@ impl Database {
                     [&n],
                 )?;
                 tx.execute("DELETE FROM netns_pool WHERE network_id = ?1", [&n])?;
-                tx.execute_batch(IPAM)?;
                 tx.execute("DELETE FROM network_ipam WHERE network_id = ?1", [&n])?;
                 tx.commit()?;
                 Ok(())
@@ -736,11 +730,8 @@ mod tests {
                 image_id: "img".into(),
                 config: "{}".into(),
                 state: RecordState::Created,
-                pid: None,
                 created_at: "now".into(),
-                started_at: None,
-                finished_at: None,
-                exit_code: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -975,35 +966,11 @@ mod tests {
         );
     }
 
-    /// A store made before the table of the last addresses given has none:
-    /// an attach makes it, and a network that goes is forgotten all the
-    /// same.
+    /// A network that goes is forgotten with the last address given on it.
     #[tokio::test]
-    async fn a_store_without_the_table_of_the_last_addresses_works() {
-        let db = db_with(&["a", "b", "c"]).await;
-        let drop_table = || async {
-            db.conn
-                .call(|c| {
-                    c.execute_batch("DROP TABLE network_ipam")?;
-                    Ok(())
-                })
-                .await
-                .unwrap()
-        };
-        drop_table().await;
+    async fn a_network_that_goes_takes_its_last_address_with_it() {
+        let db = db_with(&["c"]).await;
         let r = || range("10.0.0.2", "10.0.0.9", &[]);
-        assert_eq!(
-            db.net_attach("a", "n", 0, &[], r()).await.unwrap().0,
-            Ipv4Addr::new(10, 0, 0, 2)
-        );
-        db.delete_container("a").await.unwrap();
-        assert_eq!(
-            db.net_attach("b", "n", 0, &[], r()).await.unwrap().0,
-            Ipv4Addr::new(10, 0, 0, 3)
-        );
-        db.delete_container("b").await.unwrap();
-        drop_table().await;
-        db.net_forget_network("n").await.unwrap();
         // the network row goes, and the last address given with it, whatever
         // its driver (only a bridge network is forgotten by its engine)
         db.insert_network(&crate::NetworkRecord {

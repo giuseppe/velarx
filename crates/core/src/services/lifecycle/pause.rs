@@ -16,23 +16,13 @@ impl ContainerService {
     /// ended, in the same step as the pause it belongs to.  A lock file next
     /// to the one of the start, taken with `flock`.
     pub async fn pause_lock(&self, id: &str) -> ContainerResult<PauseLock> {
-        let dir = self.state_dir.join("mon");
-        let path = self.pause_lock_file(id);
-        tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&dir)?;
-            super::start::lock_file(&path)
-        })
-        .await
-        .map_err(|e| io_error(io::Error::other(e)))?
-        .map(|_file| PauseLock { _file })
-        .map_err(io_error)
+        let _file = self.mon_lock(self.pause_lock_file(id)).await?;
+        Ok(PauseLock { _file })
     }
 
     /// The file of the lock of the pauses of a container.
     pub(in crate::services) fn pause_lock_file(&self, id: &str) -> PathBuf {
-        self.state_dir
-            .join("mon")
-            .join(format!("{}.pause", &id[..id.len().min(12)]))
+        self.mon_lock_file(id, "pause")
     }
 
     /// When (milliseconds since the epoch) the pause of the container is

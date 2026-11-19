@@ -119,16 +119,8 @@ impl ContainerService {
     /// kill of the container takes it first.  A lock file next to the
     /// one of the start, taken with `flock`.
     pub async fn restart_lock(&self, id: &str) -> ContainerResult<RestartLock> {
-        let dir = self.state_dir.join("mon");
-        let path = self.restart_lock_file(id);
-        tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&dir)?;
-            super::start::lock_file(&path)
-        })
-        .await
-        .map_err(|e| io_error(io::Error::other(e)))?
-        .map(|_file| RestartLock { _file })
-        .map_err(io_error)
+        let _file = self.mon_lock(self.restart_lock_file(id)).await?;
+        Ok(RestartLock { _file })
     }
 
     /// [`Self::restart_lock`] of the container named `key` (an ID, a name or
@@ -142,9 +134,7 @@ impl ContainerService {
 
     /// The file of the lock of the restarts of a container.
     pub(in crate::services) fn restart_lock_file(&self, id: &str) -> PathBuf {
-        self.state_dir
-            .join("mon")
-            .join(format!("{}.restart", &id[..id.len().min(12)]))
+        self.mon_lock_file(id, "restart")
     }
 
     /// Stop a container: its stop signal, then SIGKILL after `timeout`
@@ -275,17 +265,7 @@ impl ContainerService {
                 Ok(Core::Old)
             }
             // (a monitor that ended as it was asked: its connection closes)
-            Err(e)
-                if no_monitor(&e)
-                    || matches!(
-                        e.kind(),
-                        io::ErrorKind::UnexpectedEof
-                            | io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::BrokenPipe
-                    ) =>
-            {
-                Ok(Core::Gone)
-            }
+            Err(e) if no_monitor(&e) => Ok(Core::Gone),
             Err(e) if client::monitor_error(&e).is_some() => Ok(Core::Refused(e)),
             Err(e) => Err(io_error(e)),
         }
@@ -330,7 +310,7 @@ impl ContainerService {
                 let _ = tokio::task::spawn_blocking(move || client::quit(&quit_dir)).await;
                 self.wait_monitor_gone(&dir).await?;
                 if container.state == RecordState::Initialized {
-                    self.release_network(container).await?;
+                    self.release_network(container).await;
                     self.db
                         .update_container_state(
                             &container.id,
@@ -691,7 +671,7 @@ impl ContainerService {
             }
         };
         if config.is_some() {
-            self.release_network(&container).await?;
+            self.release_network(&container).await;
         } else if let Err(e) = self.network_manager.cleanup(&container.id).await {
             warn!("Cannot release the network of {}: {e}", container.id);
         }

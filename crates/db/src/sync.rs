@@ -195,9 +195,7 @@ mod tests {
             state: RecordState::Running,
             pid: Some(4),
             created_at: "2026-01-01T00:00:00Z".into(),
-            started_at: None,
-            finished_at: None,
-            exit_code: None,
+            ..Default::default()
         }
     }
 

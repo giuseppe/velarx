@@ -1119,11 +1119,7 @@ mod tests {
             image_id: "img".into(),
             config: "{}".into(),
             state: RecordState::Created,
-            pid: None,
-            created_at: String::new(),
-            started_at: None,
-            finished_at: None,
-            exit_code: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1308,11 +1304,7 @@ mod engine_copy_tests {
                     image_id: "img".into(),
                     config: "{}".into(),
                     state: RecordState::Created,
-                    pid: None,
-                    created_at: String::new(),
-                    started_at: None,
-                    finished_at: None,
-                    exit_code: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -1996,11 +1988,7 @@ mod chain_tests {
             image_id: kept.id.clone(),
             config: "{}".into(),
             state: RecordState::Created,
-            pid: None,
-            created_at: String::new(),
-            started_at: None,
-            finished_at: None,
-            exit_code: None,
+            ..Default::default()
         })
         .await
         .unwrap();

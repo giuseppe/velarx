@@ -241,7 +241,7 @@ impl Visit for CopyWalk<'_, '_> {
                 return Ok(Some(sub));
             }
             FileType::Symlink => {
-                let target = readlinkat(dir, name, Vec::new()).map_err(errno)?;
+                let target = readlinkat(dir, name, Vec::new())?;
                 let target = OsString::from_vec(target.into_bytes());
                 if !same_as(w, Some(&target))? {
                     let mut h = w.header(&st, tar::EntryType::Symlink)?;
@@ -354,7 +354,7 @@ impl Visit for CopyChanges<'_> {
             None => (None, None),
         };
         let link = (kind == FileType::Symlink)
-            .then(|| readlinkat(dir, name, Vec::new()).map_err(errno))
+            .then(|| readlinkat(dir, name, Vec::new()).map_err(io::Error::from))
             .transpose()?
             .map(|t| OsString::from_vec(t.into_bytes()));
         let same = match &node {

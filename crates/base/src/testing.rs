@@ -15,6 +15,25 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// The interface file `name` of `interfaces/` is `text`, which the types make
+/// (`VELARX_WRITE_INTERFACES=1` writes it).
+pub fn assert_interface_file(name: &str, text: &str) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../interfaces")
+        .join(name);
+    if std::env::var_os("VELARX_WRITE_INTERFACES").is_some() {
+        std::fs::write(&path, text).unwrap();
+    }
+    let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        on_disk == text,
+        "{} is not what the types make; run VELARX_WRITE_INTERFACES=1 cargo test --workspace \
+         interface and commit it",
+        path.display()
+    );
+    assert!(!text.contains("[`"), "a rustdoc link in the definition");
+}
+
 /// Set in the child process of `in_child`.
 const CHILD: &str = "VELARX_TEST_CHILD";
 

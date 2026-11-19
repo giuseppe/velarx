@@ -1459,7 +1459,6 @@ impl Database {
                 }
                 tx.execute("DELETE FROM networks WHERE id = ?1", [&id])?;
                 // (the last address given goes with it, whatever its driver)
-                tx.execute_batch(network_ext::IPAM)?;
                 tx.execute("DELETE FROM network_ipam WHERE network_id = ?1", [&id])?;
                 tx.commit()?;
                 Ok(())
@@ -2136,12 +2135,9 @@ impl Database {
                 {
                     let mut chunks =
                         tx.prepare_cached("DELETE FROM chunk_locations WHERE file_digest = ?1")?;
-                    let mut refs =
-                        tx.prepare_cached("DELETE FROM file_refs WHERE file_digest = ?1")?;
                     let mut files = tx.prepare_cached("DELETE FROM files WHERE digest = ?1")?;
                     for d in &digests {
                         chunks.execute([d])?;
-                        refs.execute([d])?;
                         files.execute([d])?;
                     }
                 }
@@ -3388,11 +3384,8 @@ mod tests {
             image_id: "img".into(),
             config: "{}".into(),
             state: RecordState::Created,
-            pid: None,
             created_at: "now".into(),
-            started_at: None,
-            finished_at: None,
-            exit_code: None,
+            ..Default::default()
         })
         .await
         .unwrap();

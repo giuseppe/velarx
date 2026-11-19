@@ -1362,11 +1362,7 @@ mod tests {
             image_id: "i".into(),
             config: config.into(),
             state: RecordState::Running,
-            pid: None,
-            created_at: String::new(),
-            started_at: None,
-            finished_at: None,
-            exit_code: None,
+            ..Default::default()
         };
         // (not a default one: it would stop the container with the wrong
         // signal and forget its runtime and its restart policy)

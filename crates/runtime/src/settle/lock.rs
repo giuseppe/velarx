@@ -37,3 +37,30 @@ fn is_file_at(file: &std::fs::File, path: &Path) -> io::Result<bool> {
         Err(e) => Err(e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lock on a file that was unlinked while it was waited for is none:
+    /// the one that holds it is not at the path any more, and the next
+    /// `exclusive` is on the file that replaces it.
+    #[test]
+    fn a_lock_on_an_unlinked_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.lock");
+        let holder = exclusive(&path).unwrap();
+        assert!(is_file_at(&holder, &path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+        assert!(!is_file_at(&holder, &path).unwrap());
+        let second = exclusive(&path).unwrap();
+        assert!(!is_file_at(&holder, &path).unwrap());
+        assert!(is_file_at(&second, &path).unwrap());
+        // the lock of the new file excludes a third holder
+        let third = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(
+            rustix::fs::flock(&third, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                .is_err()
+        );
+    }
+}

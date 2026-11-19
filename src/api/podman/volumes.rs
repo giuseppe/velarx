@@ -462,10 +462,6 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-fn errno(e: rustix::io::Errno) -> io::Error {
-    io::Error::from_raw_os_error(e.raw_os_error())
-}
-
 /// Open the directory `name` of `dir`, creating it when it is missing; a
 /// symlink or anything else that is not a directory is refused.
 fn enter_dir(dir: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<OwnedFd> {
@@ -474,8 +470,8 @@ fn enter_dir(dir: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<OwnedFd> {
     match openat(dir, name, flags, Mode::empty()) {
         Ok(fd) => Ok(fd),
         Err(rustix::io::Errno::NOENT) => {
-            mkdirat(dir, name, Mode::from_raw_mode(0o755)).map_err(errno)?;
-            openat(dir, name, flags, Mode::empty()).map_err(errno)
+            mkdirat(dir, name, Mode::from_raw_mode(0o755))?;
+            openat(dir, name, flags, Mode::empty()).map_err(io::Error::from)
         }
         // A symlink (ELOOP) or a file (ENOTDIR) where the archive needs a
         // directory: the archive is refused, not the server at fault.
@@ -483,7 +479,7 @@ fn enter_dir(dir: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<OwnedFd> {
             "{} in the archive is not a directory",
             name.to_string_lossy()
         ))),
-        Err(e) => Err(errno(e)),
+        Err(e) => Err(io::Error::from(e)),
     }
 }
 
@@ -495,10 +491,10 @@ fn clear_leaf(dir: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<()> {
             if FileType::from_raw_mode(st.st_mode) == FileType::Directory {
                 return Err(invalid("a directory is replaced by a file"));
             }
-            unlinkat(dir, name, AtFlags::empty()).map_err(errno)
+            unlinkat(dir, name, AtFlags::empty()).map_err(io::Error::from)
         }
         Err(rustix::io::Errno::NOENT) => Ok(()),
-        Err(e) => Err(errno(e)),
+        Err(e) => Err(io::Error::from(e)),
     }
 }
 
@@ -547,8 +543,7 @@ pub(crate) fn extract_tar(dest: &Path, reader: impl Read) -> io::Result<()> {
         dest,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
-    )
-    .map_err(errno)?;
+    )?;
     let mut ar = velarx_wire::sparse::archive(reader);
     for entry in ar.entries()? {
         let mut e = entry?;
@@ -564,7 +559,7 @@ pub(crate) fn extract_tar(dest: &Path, reader: impl Read) -> io::Result<()> {
         let Some((leaf, parents)) = names.split_last() else {
             continue;
         };
-        let mut dir = rustix::io::dup(&root).map_err(errno)?;
+        let mut dir = rustix::io::dup(&root)?;
         for p in parents {
             dir = enter_dir(&dir, p)?;
         }
@@ -577,7 +572,7 @@ pub(crate) fn extract_tar(dest: &Path, reader: impl Read) -> io::Result<()> {
             EntryType::Directory => {
                 let sub = enter_dir(&dir, leaf)?;
                 give(&sub, owner);
-                fchmod(&sub, Mode::from_raw_mode(mode)).map_err(errno)?;
+                fchmod(&sub, Mode::from_raw_mode(mode))?;
             }
             EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
                 clear_leaf(&dir, leaf)?;
@@ -590,12 +585,11 @@ pub(crate) fn extract_tar(dest: &Path, reader: impl Read) -> io::Result<()> {
                         | OFlags::NOFOLLOW
                         | OFlags::CLOEXEC,
                     Mode::from_raw_mode(0o600),
-                )
-                .map_err(errno)?;
+                )?;
                 let mut f = std::fs::File::from(fd);
                 velarx_wire::sparse::copy(&mut e, &mut f, velarx_wire::sparse::MAX_REAL_SIZE)?;
                 give(&f, owner);
-                fchmod(&f, Mode::from_raw_mode(mode)).map_err(errno)?;
+                fchmod(&f, Mode::from_raw_mode(mode))?;
             }
             EntryType::Symlink => {
                 let target = e
@@ -603,7 +597,7 @@ pub(crate) fn extract_tar(dest: &Path, reader: impl Read) -> io::Result<()> {
                     .ok_or_else(|| invalid("a symlink without a target"))?
                     .into_owned();
                 clear_leaf(&dir, leaf)?;
-                symlinkat(&target, &dir, leaf).map_err(errno)?;
+                symlinkat(&target, &dir, leaf)?;
                 give_link(&dir, leaf, owner);
             }
             EntryType::XGlobalHeader | EntryType::XHeader => {}

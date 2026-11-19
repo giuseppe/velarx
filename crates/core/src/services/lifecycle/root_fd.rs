@@ -542,6 +542,14 @@ mod tests {
     use velarx_fuse::plan::{Directory, MountFd};
     use velarx_graph::IdmapDone;
 
+    fn mfd(fd_index: u32, idmap: bool) -> MountFd {
+        MountFd {
+            server: false,
+            fd_index,
+            idmap,
+        }
+    }
+
     /// A container with no user namespace of its own.
     const PLAIN: Ask = Ask {
         verity: VerityAsk::Off,
@@ -562,17 +570,8 @@ mod tests {
         )
         .unwrap();
         Rootfs {
-            plan: RootfsPlan::MountFd(MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: false,
-            }),
             fd: Some(fd),
-            idmap: IdmapDone::None,
-            label: velarx_graph::LabelDone::None,
-            verity: velarx_graph::VerityDone::None,
-            measured: Vec::new(),
-            server: None,
+            ..Rootfs::from(RootfsPlan::MountFd(mfd(0, false)))
         }
     }
 
@@ -588,11 +587,7 @@ mod tests {
     #[test]
     fn an_image_mount_that_is_not_labelled_is_refused() {
         let planned = |label| velarx_graph::Planned {
-            plan: RootfsPlan::MountFd(MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: false,
-            }),
+            plan: RootfsPlan::MountFd(mfd(0, false)),
             idmap: IdmapDone::None,
             label,
         };
@@ -610,11 +605,7 @@ mod tests {
         }
         // and at a start
         let d = tempfile::tempdir().unwrap();
-        let b = bundle(&RootfsPlan::MountFd(MountFd {
-            server: false,
-            fd_index: 0,
-            idmap: false,
-        }));
+        let b = bundle(&RootfsPlan::MountFd(mfd(0, false)));
         let asked = Ask {
             label: true,
             ..PLAIN
@@ -653,18 +644,10 @@ mod tests {
             path: "r".into(),
         }));
         assert!(!wants_fd(dir.path()).unwrap());
-        let m = bundle(&RootfsPlan::MountFd(MountFd {
-            server: false,
-            fd_index: 0,
-            idmap: false,
-        }));
+        let m = bundle(&RootfsPlan::MountFd(mfd(0, false)));
         assert!(wants_fd(m.path()).unwrap());
         // an index no monitor gets is an error that names it
-        let beyond = bundle(&RootfsPlan::MountFd(MountFd {
-            server: false,
-            fd_index: 99,
-            idmap: false,
-        }));
+        let beyond = bundle(&RootfsPlan::MountFd(mfd(99, false)));
         let e = wants_fd(beyond.path()).unwrap_err().to_string();
         assert!(e.contains("fd_index 99"), "{e}");
     }
@@ -672,11 +655,7 @@ mod tests {
     #[test]
     fn every_start_has_a_descriptor_of_its_own() {
         let root = tempfile::tempdir().unwrap();
-        let b = bundle(&RootfsPlan::MountFd(MountFd {
-            server: false,
-            fd_index: 0,
-            idmap: false,
-        }));
+        let b = bundle(&RootfsPlan::MountFd(mfd(0, false)));
         let mut seen = Vec::new();
         // start, stop, start again, an engine that knows nothing of the
         // earlier ones (only the bundle), a restore: each asks the driver
@@ -712,11 +691,7 @@ mod tests {
         // the plan the monitor reads is the one the driver made now
         assert_eq!(
             velarx_fuse::plan::read(b.path(), "").unwrap(),
-            Some(RootfsPlan::MountFd(MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: false
-            }))
+            Some(RootfsPlan::MountFd(mfd(0, false)))
         );
     }
 
@@ -749,24 +724,12 @@ mod tests {
     /// bundle keeps the plan it has.
     #[test]
     fn a_mount_of_the_driver_cannot_become_another_kind_of_plan() {
-        let was = RootfsPlan::MountFd(MountFd {
-            server: false,
-            fd_index: 0,
-            idmap: false,
-        });
+        let was = RootfsPlan::MountFd(mfd(0, false));
         let b = bundle(&was);
-        let answer = Rootfs {
-            plan: RootfsPlan::Directory(Directory {
-                beneath: "/b".into(),
-                path: "r".into(),
-            }),
-            fd: None,
-            idmap: IdmapDone::None,
-            label: LabelDone::None,
-            verity: velarx_graph::VerityDone::None,
-            measured: Vec::new(),
-            server: None,
-        };
+        let answer = Rootfs::from(RootfsPlan::Directory(Directory {
+            beneath: "/b".into(),
+            path: "r".into(),
+        }));
         let e = accept_root(b.path(), "c", "test", true, &PLAIN, answer)
             .unwrap_err()
             .to_string();
@@ -776,30 +739,14 @@ mod tests {
 
     #[test]
     fn a_driver_that_gives_no_descriptor_is_said() {
-        let b = bundle(&RootfsPlan::MountFd(MountFd {
-            server: false,
-            fd_index: 0,
-            idmap: false,
-        }));
+        let b = bundle(&RootfsPlan::MountFd(mfd(0, false)));
         let e = accept_root(
             b.path(),
             "0123456789abcdef",
             "test",
             true,
             &PLAIN,
-            Rootfs {
-                plan: RootfsPlan::MountFd(MountFd {
-                    server: false,
-                    fd_index: 0,
-                    idmap: false,
-                }),
-                fd: None,
-                idmap: IdmapDone::None,
-                label: velarx_graph::LabelDone::None,
-                verity: velarx_graph::VerityDone::None,
-                measured: Vec::new(),
-                server: None,
-            },
+            Rootfs::from(RootfsPlan::MountFd(mfd(0, false))),
         )
         .unwrap_err()
         .to_string();
@@ -815,11 +762,7 @@ mod tests {
     #[test]
     fn a_descriptor_the_plan_does_not_name_is_refused() {
         let root = tempfile::tempdir().unwrap();
-        let b = bundle(&RootfsPlan::MountFd(MountFd {
-            server: false,
-            fd_index: 0,
-            idmap: false,
-        }));
+        let b = bundle(&RootfsPlan::MountFd(mfd(0, false)));
         let mut r = driver_root(root.path());
         r.plan = RootfsPlan::Directory(Directory {
             beneath: "/b".into(),
@@ -830,11 +773,7 @@ mod tests {
             .to_string();
         assert!(e.contains("does not use one"), "{e}");
         let mut r = driver_root(root.path());
-        r.plan = RootfsPlan::MountFd(MountFd {
-            server: false,
-            fd_index: 1,
-            idmap: false,
-        });
+        r.plan = RootfsPlan::MountFd(mfd(1, false));
         let e = accept_root(b.path(), "c", "test", true, &PLAIN, r)
             .unwrap_err()
             .to_string();
@@ -842,21 +781,13 @@ mod tests {
         // (nothing was written over the plan)
         assert_eq!(
             velarx_fuse::plan::read(b.path(), "").unwrap(),
-            Some(RootfsPlan::MountFd(MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: false
-            }))
+            Some(RootfsPlan::MountFd(mfd(0, false)))
         );
     }
 
     #[test]
     fn a_driver_that_makes_another_kind_of_plan_is_refused() {
-        let b = bundle(&RootfsPlan::MountFd(MountFd {
-            server: false,
-            fd_index: 0,
-            idmap: false,
-        }));
+        let b = bundle(&RootfsPlan::MountFd(mfd(0, false)));
         let dir = RootfsPlan::Directory(Directory {
             beneath: "/b".into(),
             path: "r".into(),
@@ -869,11 +800,7 @@ mod tests {
         // (the plan of the bundle is as it was)
         assert_eq!(
             velarx_fuse::plan::read(b.path(), "").unwrap(),
-            Some(RootfsPlan::MountFd(MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: false
-            }))
+            Some(RootfsPlan::MountFd(mfd(0, false)))
         );
     }
 
@@ -919,28 +846,8 @@ mod tests {
         // (the driver answers in any order, and names any place: the engine
         // numbers them by the list it passes)
         let vols = vec![
-            (
-                2,
-                volume(
-                    MountFd {
-                        server: false,
-                        fd_index: 9,
-                        idmap: true,
-                    },
-                    root.path(),
-                ),
-            ),
-            (
-                0,
-                volume(
-                    MountFd {
-                        server: false,
-                        fd_index: 9,
-                        idmap: false,
-                    },
-                    root.path(),
-                ),
-            ),
+            (2, volume(mfd(9, true), root.path())),
+            (0, volume(mfd(9, false), root.path())),
         ];
         let fds = accept_volumes_t(b.path(), "0123456789abcdef", "test", 1, vols).unwrap();
         assert_eq!(fds.len(), 2);
@@ -949,43 +856,15 @@ mod tests {
                 .unwrap()
                 .unwrap()
         };
-        assert_eq!(
-            read(0),
-            RootfsPlan::MountFd(MountFd {
-                server: false,
-                fd_index: 1,
-                idmap: false
-            })
-        );
-        assert_eq!(
-            read(2),
-            RootfsPlan::MountFd(MountFd {
-                server: false,
-                fd_index: 2,
-                idmap: true
-            })
-        );
+        assert_eq!(read(0), RootfsPlan::MountFd(mfd(1, false)));
+        assert_eq!(read(2), RootfsPlan::MountFd(mfd(2, true)));
         // a root that is not a mount has no descriptor: the first place is 0
         let b2 = tempfile::tempdir().unwrap();
-        let one = vec![(
-            0,
-            volume(
-                MountFd {
-                    server: false,
-                    fd_index: 5,
-                    idmap: false,
-                },
-                root.path(),
-            ),
-        )];
+        let one = vec![(0, volume(mfd(5, false), root.path()))];
         accept_volumes_t(b2.path(), "c", "test", 0, one).unwrap();
         assert_eq!(
             velarx_fuse::plan::read(&b2.path().join("imagevol"), "0.").unwrap(),
-            Some(RootfsPlan::MountFd(MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: false
-            }))
+            Some(RootfsPlan::MountFd(mfd(0, false)))
         );
     }
 
@@ -993,11 +872,7 @@ mod tests {
     fn an_image_mount_that_is_not_a_usable_descriptor_is_refused() {
         let root = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
-        let plain = MountFd {
-            server: false,
-            fd_index: 1,
-            idmap: false,
-        };
+        let plain = mfd(1, false);
         let e = |v: Vec<(usize, Rootfs)>, first: usize| {
             accept_volumes_t(b.path(), "0123456789abcdef", "test", first, v)
                 .unwrap_err()
@@ -1008,15 +883,7 @@ mod tests {
             path: "r".into(),
         }));
         assert!(e(vec![(0, dir)], 1).contains("only a root file system may be one"));
-        let none = Rootfs {
-            plan: RootfsPlan::MountFd(plain),
-            fd: None,
-            idmap: IdmapDone::None,
-            label: velarx_graph::LabelDone::None,
-            verity: velarx_graph::VerityDone::None,
-            measured: Vec::new(),
-            server: None,
-        };
+        let none = Rootfs::from(RootfsPlan::MountFd(plain));
         let msg = e(vec![(0, none)], 1);
         assert!(
             msg.contains("gave none") && msg.contains("create it again"),
@@ -1248,11 +1115,7 @@ mod tests {
     }
 
     fn mount_plan(index: u32, idmap: bool) -> Option<RootfsPlan> {
-        Some(RootfsPlan::MountFd(MountFd {
-            server: false,
-            fd_index: index,
-            idmap,
-        }))
+        Some(RootfsPlan::MountFd(mfd(index, idmap)))
     }
 
     /// Create, start, stop, start again, an engine that was restarted (it knows
@@ -1400,16 +1263,7 @@ mod tests {
         x.create(2, true);
         let dir = x.bundle.join("imagevol");
         for (n, index, idmap) in [("0.", 5, false), ("1.", 7, true)] {
-            velarx_fuse::plan::write(
-                &dir,
-                n,
-                &RootfsPlan::MountFd(MountFd {
-                    server: false,
-                    fd_index: index,
-                    idmap,
-                }),
-            )
-            .unwrap();
+            velarx_fuse::plan::write(&dir, n, &RootfsPlan::MountFd(mfd(index, idmap))).unwrap();
         }
         x.start(2, true, None, false).unwrap();
         assert_eq!(x.plan(Some(0)), mount_plan(0, false));
@@ -1422,11 +1276,7 @@ mod tests {
     #[test]
     fn too_many_descriptor_volumes_are_refused_at_create() {
         let fd = velarx_graph::Planned {
-            plan: RootfsPlan::MountFd(MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: false,
-            }),
+            plan: RootfsPlan::MountFd(mfd(0, false)),
             idmap: IdmapDone::None,
             label: LabelDone::None,
         };
@@ -1456,11 +1306,7 @@ mod tests {
     #[test]
     fn a_label_that_was_not_asked_is_refused() {
         let b = tempfile::tempdir().unwrap();
-        let plan = MountFd {
-            server: false,
-            fd_index: 0,
-            idmap: false,
-        };
+        let plan = mfd(0, false);
         let with = |label: LabelDone| {
             let mut r = volume(plan, std::path::Path::new("/"));
             r.label = label;
@@ -1503,11 +1349,7 @@ mod tests {
     #[test]
     fn a_mount_handed_over_for_enforced_digests_carries_what_it_measured() {
         let b = tempfile::tempdir().unwrap();
-        let plan = MountFd {
-            server: false,
-            fd_index: 0,
-            idmap: false,
-        };
+        let plan = mfd(0, false);
         let lists = vec![
             vec!["sha256:a1".to_string(), "sha256:a2".to_string()],
             vec!["sha256:b1".to_string()],
@@ -1650,74 +1492,32 @@ mod tests {
             label: false,
         };
         // the monitor is left to map when it was not allowed to
-        let mut r = volume(
-            MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: true,
-            },
-            root.path(),
-        );
+        let mut r = volume(mfd(0, true), root.path());
         let msg = e(PLAIN, r);
         assert!(msg.contains("which it was not asked to do"), "{msg}");
         // a mapping asked and none done
-        r = volume(
-            MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: false,
-            },
-            root.path(),
-        );
+        r = volume(mfd(0, false), root.path());
         let msg = e(mapped, r);
         assert!(msg.contains("maps no ids"), "{msg}");
         // `mount` with a plan that puts no idmap on the mount
-        let mut r = volume(
-            MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: false,
-            },
-            root.path(),
-        );
+        let mut r = volume(mfd(0, false), root.path());
         r.idmap = IdmapDone::Mount;
         let msg = e(mapped, r);
         assert!(msg.contains("does not ask the monitor"), "{msg}");
         // a plan that maps and an answer that says the driver did
-        let mut r = volume(
-            MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: true,
-            },
-            root.path(),
-        );
+        let mut r = volume(mfd(0, true), root.path());
         r.idmap = IdmapDone::Applied;
         let msg = e(mapped, r);
         assert!(msg.contains("asks the monitor to map"), "{msg}");
         // a mapping said done when none was asked
-        let mut r = volume(
-            MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: false,
-            },
-            root.path(),
-        );
+        let mut r = volume(mfd(0, false), root.path());
         r.idmap = IdmapDone::Applied;
         let msg = e(PLAIN, r);
         assert!(msg.contains("no mapping was asked"), "{msg}");
         // nothing was written
         assert!(!b.path().join("imagevol").exists());
         // the root has the same rules
-        let r = volume(
-            MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: true,
-            },
-            root.path(),
-        );
+        let r = volume(mfd(0, true), root.path());
         let msg = accept_root(b.path(), ID, "test", true, &PLAIN, r)
             .unwrap_err()
             .to_string();
@@ -1748,13 +1548,8 @@ mod tests {
 
     fn with_fd(plan: RootfsPlan, fd: OwnedFd) -> Rootfs {
         Rootfs {
-            plan,
             fd: Some(fd),
-            idmap: IdmapDone::None,
-            label: velarx_graph::LabelDone::None,
-            verity: velarx_graph::VerityDone::None,
-            measured: Vec::new(),
-            server: None,
+            ..Rootfs::from(plan)
         }
     }
 
@@ -1764,13 +1559,7 @@ mod tests {
     #[test]
     fn a_refused_answer_closes_every_descriptor() {
         let b = tempfile::tempdir().unwrap();
-        let mount = |i| {
-            RootfsPlan::MountFd(MountFd {
-                server: false,
-                fd_index: i,
-                idmap: false,
-            })
-        };
+        let mount = |i| RootfsPlan::MountFd(mfd(i, false));
         // fewer answers than asked
         let (root, root_closed) = tracked();
         let (v0, v0_closed) = tracked();
@@ -1810,14 +1599,7 @@ mod tests {
         // a root refused: the volumes go too
         let (root, root_closed) = tracked();
         let (v0, v0_closed) = tracked();
-        let mut r = with_fd(
-            RootfsPlan::MountFd(MountFd {
-                server: false,
-                fd_index: 0,
-                idmap: true,
-            }),
-            root,
-        );
+        let mut r = with_fd(RootfsPlan::MountFd(mfd(0, true)), root);
         r.idmap = IdmapDone::Mount;
         let answer = Mounts {
             root: Some(r),

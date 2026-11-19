@@ -2174,19 +2174,8 @@ mod tests {
 
     #[test]
     fn the_interface_file_is_current() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../interfaces/org.velarx.Fetcher.varlink");
         let text = definition();
-        if std::env::var_os("VELARX_WRITE_INTERFACES").is_some() {
-            std::fs::write(&path, &text).unwrap();
-        }
-        let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
-        assert!(
-            on_disk == text,
-            "{} is not what the types make; run VELARX_WRITE_INTERFACES=1 cargo test -p \
-             velarx-content --lib serve_fetch and commit it",
-            path.display()
-        );
+        velarx_base::testing::assert_interface_file("org.velarx.Fetcher.varlink", &text);
         for method in [
             "GetInfo",
             "Open",

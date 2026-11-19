@@ -57,7 +57,7 @@ pub(super) fn init(conn: &mut Connection) -> Result<(), SchemaError> {
 /// Every schema `init` makes, in order: `SCHEMA` and the tables of the
 /// other modules.  A table of the store is made here, never by its service
 /// when it starts.
-pub(super) const SCHEMAS: [&str; 10] = [
+pub(super) const SCHEMAS: [&str; 9] = [
     SCHEMA,
     super::container_ext::SCHEMA,
     super::leases::SCHEMA,
@@ -65,7 +65,6 @@ pub(super) const SCHEMAS: [&str; 10] = [
     super::build_cache::SCHEMA,
     super::checks::SCHEMA,
     super::network_ext::SCHEMA,
-    super::network_ext::IPAM,
     SECRETS,
     super::namespaces::SCHEMA,
 ];
@@ -684,10 +683,11 @@ pub struct FileRef {
 /// `stopped`, one that a previous build ended may be `exited`: both mean
 /// ended); the others are podman's, read when a row has them.  A text that is
 /// none of these is `Unknown`, so a row never fails to load.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RecordState {
     Configured,
+    #[default]
     Created,
     Initialized,
     Running,
@@ -763,7 +763,7 @@ impl rusqlite::types::FromSql for RecordState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContainerRecord {
     pub id: String,
     pub name: Option<String>,
@@ -861,11 +861,8 @@ mod tests {
             image_id: "img".into(),
             config: "{}".into(),
             state: Created,
-            pid: None,
             created_at: "now".into(),
-            started_at: None,
-            finished_at: None,
-            exit_code: None,
+            ..Default::default()
         })
         .await
         .unwrap();

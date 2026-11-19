@@ -312,7 +312,7 @@ where
 }
 
 fn share_error(status: StatusCode, e: impl std::fmt::Display) -> Error {
-    Error::new(status, e.to_string()).with_code(125)
+    Error::new(status, e.to_string())
 }
 
 /// Share the checkpoint archive `input` (`checkpoint --export`) with the

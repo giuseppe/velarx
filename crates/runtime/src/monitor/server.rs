@@ -390,12 +390,8 @@ enum Created {
     Failed,
 }
 
-fn io_err(e: rustix::io::Errno) -> io::Error {
-    e.into()
-}
-
 fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
-    rustix::fs::fcntl_setfl(fd, OFlags::NONBLOCK).map_err(io_err)
+    rustix::fs::fcntl_setfl(fd, OFlags::NONBLOCK).map_err(io::Error::from)
 }
 
 pub(super) fn diag(msg: &str) {
@@ -737,14 +733,13 @@ fn run(dir_path: &Path, launch: Launch<'_>) -> io::Result<i32> {
     }
 
     let signals = sys::SignalGuard::new(&signal_set)?;
-    rustix::process::set_child_subreaper(Some(rustix::process::getpid())).map_err(io_err)?;
+    rustix::process::set_child_subreaper(Some(rustix::process::getpid()))?;
 
     let dir = rustix::fs::open(
         dir_path,
         OFlags::DIRECTORY | OFlags::PATH | OFlags::CLOEXEC,
         Mode::empty(),
-    )
-    .map_err(io_err)?;
+    )?;
     // (before the socket: from here on the monitor is known to live)
     let identity = super::hold_identity(dir.as_fd())?;
     let _ = rustix::fs::unlinkat(&dir, proto::EXIT_FILE, rustix::fs::AtFlags::empty());
@@ -754,14 +749,12 @@ fn run(dir_path: &Path, launch: Launch<'_>) -> io::Result<i32> {
         SocketType::STREAM,
         SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
         None,
-    )
-    .map_err(io_err)?;
+    )?;
     net::bind(
         &listener,
         &SocketAddrUnix::new(proto::socket_path(&dir, proto::SOCKET))?,
-    )
-    .map_err(io_err)?;
-    net::listen(&listener, 16).map_err(io_err)?;
+    )?;
+    net::listen(&listener, 16)?;
 
     let logger = open_logger(&cfg)?;
     let cfg_stall_ms = cfg.client_stall_ms;
@@ -847,7 +840,7 @@ fn run(dir_path: &Path, launch: Launch<'_>) -> io::Result<i32> {
     };
     // The first call of the boot connection, which the engine wrote before
     // it started us, is `Create`: the container is made when it is answered.
-    rustix::fs::fcntl_setfl(&boot, OFlags::NONBLOCK).map_err(io_err)?;
+    rustix::fs::fcntl_setfl(&boot, OFlags::NONBLOCK)?;
     let boot = m.add_client(boot);
     m.serve_create(boot)?;
     if m.created == Created::Failed {
@@ -1103,7 +1096,7 @@ fn open_monitor_log(dir: &Path) -> io::Result<File> {
 /// descriptors of the daemon are not kept.
 fn redirect_stdio(dir: &Path) -> io::Result<()> {
     let null = File::options().read(true).write(true).open("/dev/null")?;
-    rustix::stdio::dup2_stdin(&null).map_err(io_err)?;
+    rustix::stdio::dup2_stdin(&null)?;
     let log = open_monitor_log(dir).unwrap_or_else(|e| {
         // (stderr is still the starter's: it is what shows the failure)
         diag(&format!(
@@ -1112,8 +1105,8 @@ fn redirect_stdio(dir: &Path) -> io::Result<()> {
         ));
         null
     });
-    rustix::stdio::dup2_stdout(&log).map_err(io_err)?;
-    rustix::stdio::dup2_stderr(&log).map_err(io_err)?;
+    rustix::stdio::dup2_stdout(&log)?;
+    rustix::stdio::dup2_stderr(&log)?;
     Ok(())
 }
 
@@ -1181,7 +1174,7 @@ fn restore_lsm_args(config: &Path) -> io::Result<Vec<String>> {
 }
 
 fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io_err)
+    rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)
 }
 
 /// A runtime command: its status and what it wrote to its stderr.
@@ -1480,10 +1473,9 @@ impl Monitor {
                     SocketType::STREAM,
                     SocketFlags::CLOEXEC,
                     None,
-                )
-                .map_err(io_err)?;
-                net::bind(&l, &SocketAddrUnix::new(path)?).map_err(io_err)?;
-                net::listen(&l, 1).map_err(io_err)?;
+                )?;
+                net::bind(&l, &SocketAddrUnix::new(path)?)?;
+                net::listen(&l, 1)?;
                 Some((l, path.clone()))
             }
             (None, true) => return Err(io::Error::other("a terminal needs a console socket")),
@@ -3211,11 +3203,11 @@ impl Monitor {
                     | OFlags::NOFOLLOW
                     | OFlags::CLOEXEC,
                 Mode::from_raw_mode(0o600),
-            )
-            .map_err(io_err)?;
+            )?;
             let mut f = File::from(fd);
             f.write_all(&data)?;
-            rustix::fs::renameat(&self.dir, &tmp, &self.dir, proto::EXIT_FILE).map_err(io_err)
+            rustix::fs::renameat(&self.dir, &tmp, &self.dir, proto::EXIT_FILE)
+                .map_err(io::Error::from)
         })();
         if let Err(e) = result {
             diag(&format!("write the exit file: {e}"));

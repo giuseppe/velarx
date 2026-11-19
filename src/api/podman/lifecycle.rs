@@ -269,52 +269,7 @@ pub async fn read_log(loc: &velarx_wire::wire::LogLocation) -> Snapshot {
         .unwrap_or_else(Snapshot::empty)
 }
 
-/// Signal names and numbers of Linux.
-const SIGNALS: [(&str, i32); 31] = [
-    ("HUP", 1),
-    ("INT", 2),
-    ("QUIT", 3),
-    ("ILL", 4),
-    ("TRAP", 5),
-    ("ABRT", 6),
-    ("BUS", 7),
-    ("FPE", 8),
-    ("KILL", 9),
-    ("USR1", 10),
-    ("SEGV", 11),
-    ("USR2", 12),
-    ("PIPE", 13),
-    ("ALRM", 14),
-    ("TERM", 15),
-    ("STKFLT", 16),
-    ("CHLD", 17),
-    ("CONT", 18),
-    ("STOP", 19),
-    ("TSTP", 20),
-    ("TTIN", 21),
-    ("TTOU", 22),
-    ("URG", 23),
-    ("XCPU", 24),
-    ("XFSZ", 25),
-    ("VTALRM", 26),
-    ("PROF", 27),
-    ("WINCH", 28),
-    ("IO", 29),
-    ("PWR", 30),
-    ("SYS", 31),
-];
-
-/// `SIGTERM`, `term`, `15` or `RTMIN+3` to the number.
-pub fn parse_signal(s: &str) -> Option<i32> {
-    velarx_core::services::parse_signal(s)
-}
-
-pub fn signal_name(n: i32) -> String {
-    SIGNALS
-        .iter()
-        .find(|(_, v)| *v == n)
-        .map_or_else(|| n.to_string(), |(name, _)| format!("SIG{name}"))
-}
+pub use velarx_core::services::{parse_signal, signal_name};
 
 pub async fn kill(state: &Arc<AppState>, rec: &ContainerRecord, sig: i32) -> ApiResult<()> {
     let st = status(state, rec).await;
@@ -816,11 +771,7 @@ mod tests {
             image_id: String::new(),
             config: "{not json".into(),
             state: RecordState::Created,
-            pid: None,
-            created_at: String::new(),
-            started_at: None,
-            finished_at: None,
-            exit_code: None,
+            ..Default::default()
         };
         let e = config_of(&rec).unwrap_err();
         assert_eq!(
@@ -856,11 +807,7 @@ mod tests {
             image_id: String::new(),
             config: String::new(),
             state: RecordState::Running,
-            pid: None,
-            created_at: String::new(),
-            started_at: None,
-            finished_at: None,
-            exit_code: None,
+            ..Default::default()
         };
         let killed = Stop::Killed {
             signal: libc::SIGUSR1,

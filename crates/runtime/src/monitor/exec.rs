@@ -159,8 +159,7 @@ fn read_in_root(rootfs: &Path, path: &str) -> io::Result<String> {
         rootfs,
         rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
-    )
-    .map_err(io_err)?;
+    )?;
     let text = velarx_sys::fs::read_in_root(root.as_fd(), path, 1 << 20)?.unwrap_or_default();
     Ok(String::from_utf8_lossy(&text).into_owned())
 }
@@ -325,16 +324,12 @@ fn container_rlimits(spec: &Path) -> Vec<(rustix::process::Resource, u64, u64)> 
         .unwrap_or_default()
 }
 
-fn io_err(e: rustix::io::Errno) -> io::Error {
-    e.into()
-}
-
 fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io_err)
+    rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)
 }
 
 fn nonblocking(fd: &OwnedFd) -> io::Result<()> {
-    rustix::fs::fcntl_setfl(fd, rustix::fs::OFlags::NONBLOCK).map_err(io_err)
+    rustix::fs::fcntl_setfl(fd, rustix::fs::OFlags::NONBLOCK).map_err(io::Error::from)
 }
 
 impl ExecSession {
@@ -374,10 +369,9 @@ impl ExecSession {
                 SocketType::STREAM,
                 SocketFlags::CLOEXEC,
                 None,
-            )
-            .map_err(io_err)?;
-            net::bind(&l, &SocketAddrUnix::new(&path)?).map_err(io_err)?;
-            net::listen(&l, 1).map_err(io_err)?;
+            )?;
+            net::bind(&l, &SocketAddrUnix::new(&path)?)?;
+            net::listen(&l, 1)?;
             cmd.arg("--tty").arg("--console-socket").arg(&path);
             Some((l, path))
         } else {

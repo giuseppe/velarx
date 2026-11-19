@@ -34,10 +34,6 @@ const WALK: Walk = Walk {
     lenient: false,
 };
 
-fn io_err(e: Errno) -> io::Error {
-    io::Error::from_raw_os_error(e.raw_os_error())
-}
-
 fn invalid(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
@@ -126,7 +122,7 @@ fn set_times(dir: BorrowedFd<'_>, name: &OsStr, st: &Stat) -> io::Result<()> {
             tv_nsec: st.st_mtime_nsec as _,
         },
     };
-    fs::utimensat(dir, name, &ts, AtFlags::SYMLINK_NOFOLLOW).map_err(io_err)
+    fs::utimensat(dir, name, &ts, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)
 }
 
 impl Copier {
@@ -150,7 +146,7 @@ impl Copier {
     fn set_owner(&self, dir: BorrowedFd<'_>, name: &OsStr, st: &Stat) -> io::Result<()> {
         let (uid, gid) = self.owner_of(st)?;
         let (u, g) = owner(uid, gid)?;
-        fs::chownat(dir, name, Some(u), Some(g), AtFlags::SYMLINK_NOFOLLOW).map_err(io_err)
+        fs::chownat(dir, name, Some(u), Some(g), AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)
     }
 }
 
@@ -186,7 +182,7 @@ impl Visit for CopyWalk<'_> {
         let mode = Mode::from_raw_mode((st.st_mode as RawMode) & 0o7777);
         match kind {
             FileType::Directory => {
-                fs::mkdirat(dst, name, Mode::from_raw_mode(0o700)).map_err(io_err)?;
+                fs::mkdirat(dst, name, Mode::from_raw_mode(0o700))?;
                 self.dst.descend(name, None)?;
                 return Ok(Some(*st));
             }
@@ -194,7 +190,7 @@ impl Visit for CopyWalk<'_> {
                 if st.st_nlink > 1 {
                     if let Some((path, first)) = self.c.links.get(&(st.st_dev, st.st_ino)) {
                         let dir = open_dir_path(self.root.as_fd(), path)?;
-                        fs::linkat(&dir, first, dst, name, AtFlags::empty()).map_err(io_err)?;
+                        fs::linkat(&dir, first, dst, name, AtFlags::empty())?;
                         return Ok(None);
                     }
                 }
@@ -203,8 +199,7 @@ impl Visit for CopyWalk<'_> {
                     name,
                     OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NOCTTY,
                     Mode::empty(),
-                )
-                .map_err(io_err)?;
+                )?;
                 let to = fs::openat(
                     dst,
                     name,
@@ -214,12 +209,11 @@ impl Visit for CopyWalk<'_> {
                         | OFlags::NOFOLLOW
                         | OFlags::CLOEXEC,
                     Mode::from_raw_mode(0o600),
-                )
-                .map_err(io_err)?;
+                )?;
                 let (from, to) = (File::from(from), File::from(to));
                 velarx_storage::copy_file(&from, &to, u64::MAX, || Ok(()))?;
                 self.c.set_owner(dst, name, st)?;
-                fs::fchmod(&to, mode).map_err(io_err)?;
+                fs::fchmod(&to, mode)?;
                 copy_xattrs(&from, &to, name, &mut self.c.refused)?;
                 set_times(dst, name, st)?;
                 if st.st_nlink > 1 {
@@ -230,8 +224,8 @@ impl Visit for CopyWalk<'_> {
                 }
             }
             FileType::Symlink => {
-                let target = fs::readlinkat(src, name, Vec::new()).map_err(io_err)?;
-                fs::symlinkat(target.as_c_str(), dst, name).map_err(io_err)?;
+                let target = fs::readlinkat(src, name, Vec::new())?;
+                fs::symlinkat(target.as_c_str(), dst, name)?;
                 self.c.set_owner(dst, name, st)?;
                 set_times(dst, name, st)?;
             }
@@ -245,7 +239,7 @@ impl Visit for CopyWalk<'_> {
                     Err(Errno::PERM | Errno::ACCESS) if kind != FileType::Fifo => {
                         debug!("copy-up: device {:?} skipped", name);
                     }
-                    Err(e) => return Err(io_err(e)),
+                    Err(e) => return Err(io::Error::from(e)),
                 }
             }
             // Sockets are not content.
@@ -266,7 +260,7 @@ impl Visit for CopyWalk<'_> {
         let dst = self.dst.fd();
         self.c.set_owner(dst, name, &st)?;
         let mode = Mode::from_raw_mode((st.st_mode as RawMode) & 0o7777);
-        fs::fchmod(&sub_dst, mode).map_err(io_err)?;
+        fs::fchmod(&sub_dst, mode)?;
         copy_xattrs(
             &File::from(src),
             &File::from(sub_dst.try_clone()?),
@@ -287,7 +281,7 @@ pub fn copy_tree_with(
     dst: &OwnedFd,
     undo: Option<(&[IdMapping], &[IdMapping])>,
 ) -> io::Result<()> {
-    let st = fs::fstat(src).map_err(io_err)?;
+    let st = fs::fstat(src)?;
     let mut c = Copier {
         dev: st.st_dev as u64,
         undo: undo.map(|(u, g)| (u.to_vec(), g.to_vec())),
@@ -319,7 +313,7 @@ impl ImageSource for FdSource<'_> {
         let Some(fd) = open_dir_in_root(self.0, target)? else {
             return Ok(None);
         };
-        let st = fs::fstat(&fd).map_err(io_err)?;
+        let st = fs::fstat(&fd)?;
         Ok(Some(DirInfo {
             uid: st.st_uid,
             gid: st.st_gid,
@@ -393,7 +387,7 @@ pub fn first_use(p: &FirstUse<'_>, mut state: VolumeState) -> io::Result<VolumeS
     }
     state.copied_up = false;
     let (u, g) = owner(uid, gid)?;
-    fs::fchown(p.volume, Some(u), Some(g)).map_err(io_err)?;
+    fs::fchown(p.volume, Some(u), Some(g))?;
     if p.follow_image {
         if let Some(dir) = p.source.dir(p.target)? {
             let (mut uid, mut gid) = (dir.uid, dir.gid);
@@ -407,8 +401,8 @@ pub fn first_use(p: &FirstUse<'_>, mut state: VolumeState) -> io::Result<VolumeS
                 }
             }
             let (u, g) = owner(uid, gid)?;
-            fs::fchown(p.volume, Some(u), Some(g)).map_err(io_err)?;
-            fs::fchmod(p.volume, Mode::from_raw_mode(dir.mode)).map_err(io_err)?;
+            fs::fchown(p.volume, Some(u), Some(g))?;
+            fs::fchmod(p.volume, Mode::from_raw_mode(dir.mode))?;
             if uid == 0 && gid == 0 {
                 // Root owns it: nothing left to change.
                 state.needs_chown = false;
@@ -440,7 +434,7 @@ impl Visit for ChownWalk {
             return Ok(None);
         }
         let (u, g) = self.owner;
-        fs::chownat(dir, name, Some(u), Some(g), AtFlags::SYMLINK_NOFOLLOW).map_err(io_err)?;
+        fs::chownat(dir, name, Some(u), Some(g), AtFlags::SYMLINK_NOFOLLOW)?;
         Ok(is_dir.then_some(()))
     }
 }
@@ -448,9 +442,9 @@ impl Visit for ChownWalk {
 /// Change the owner of the directory and of everything below it, links
 /// themselves and not what they point to, staying on the file system.
 pub fn chown_tree(dir: &OwnedFd, uid: u32, gid: u32) -> io::Result<()> {
-    let st = fs::fstat(dir).map_err(io_err)?;
+    let st = fs::fstat(dir)?;
     let (u, g) = owner(uid, gid)?;
-    fs::fchown(dir, Some(u), Some(g)).map_err(io_err)?;
+    fs::fchown(dir, Some(u), Some(g))?;
     let mut chown = ChownWalk {
         dev: st.st_dev as u64,
         owner: (u, g),
@@ -467,12 +461,12 @@ pub fn chown_tree(dir: &OwnedFd, uid: u32, gid: u32) -> io::Result<()> {
 /// Change the owner of a file or, for a directory, of everything below it;
 /// a link itself and not what it points to.
 pub fn chown_path(path: &std::path::Path, uid: u32, gid: u32) -> io::Result<()> {
-    let st = fs::statat(fs::CWD, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io_err)?;
+    let st = fs::statat(fs::CWD, path, AtFlags::SYMLINK_NOFOLLOW)?;
     if FileType::from_raw_mode(st.st_mode as RawMode) == FileType::Directory {
         return chown_tree(&open_dir(path)?, uid, gid);
     }
     let (u, g) = owner(uid, gid)?;
-    fs::chownat(fs::CWD, path, Some(u), Some(g), AtFlags::SYMLINK_NOFOLLOW).map_err(io_err)
+    fs::chownat(fs::CWD, path, Some(u), Some(g), AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)
 }
 
 pub use velarx_runtime::fsdir::{open_dir, open_dir_in_root};

@@ -45,7 +45,7 @@ pub fn go_arch(arch: &str) -> &str {
 
 /// The API `version` (major, minor) of a request is at least `major.minor`
 /// (none: the newest).
-fn at_least(version: Option<(u32, u32)>, major: u32, minor: u32) -> bool {
+pub(crate) fn at_least(version: Option<(u32, u32)>, major: u32, minor: u32) -> bool {
     version.is_none_or(|v| v >= (major, minor))
 }
 

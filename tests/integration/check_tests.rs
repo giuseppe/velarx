@@ -89,11 +89,8 @@ async fn add_container(e: &Env, image: &str) {
         image_id: image.into(),
         config: "{}".into(),
         state: RecordState::Created,
-        pid: None,
         created_at: "2024-01-01T00:00:00Z".into(),
-        started_at: None,
-        finished_at: None,
-        exit_code: None,
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -599,8 +596,8 @@ async fn max_limits_the_images_and_the_oldest_checked_go_first() {
     assert!(e.db.image_check_times().await.unwrap().is_empty());
 
     // some were checked before: the ones never checked come first
-    e.db.set_image_checked(&ids[0], 100, true).await.unwrap();
-    e.db.set_image_checked(&ids[2], 200, true).await.unwrap();
+    e.db.set_image_checked(&ids[0], 100).await.unwrap();
+    e.db.set_image_checked(&ids[2], 200).await.unwrap();
     // damage the one never checked and the oldest checked: with a budget
     // that allows one image, the never checked one is the one looked at
     for id in [&ids[1], &ids[0]] {

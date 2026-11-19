@@ -22,7 +22,7 @@ pub(super) fn row(a: &impl Access, id: &str) -> DbResult<Option<ContainerRecord>
 }
 
 /// The image and labels an event of the container carries.
-pub(super) fn event_details(container: &ContainerRecord) -> (String, Vec<(String, String)>) {
+pub fn event_details(container: &ContainerRecord) -> (String, Vec<(String, String)>) {
     let Ok(cfg) = serde_json::from_str::<ContainerConfig>(&container.config) else {
         return (container.image_id.clone(), Vec::new());
     };

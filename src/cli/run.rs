@@ -105,15 +105,10 @@ pub fn each_named(
 }
 
 /// A signal of `kill -s`, checked as podman checks it before any container
-/// is looked up: a number from 1 to 64, or a name with or without SIG (a
-/// leading dash is taken).  What the server gets: the number, or SIGNAME.
+/// is looked up: a number from 1 to 64, or a name of the table the engine
+/// uses, with or without SIG (a leading dash is taken).  What the server
+/// gets: the number, or SIGNAME.
 pub fn check_signal(signal: &str) -> anyhow::Result<String> {
-    const NAMES: &[&str] = &[
-        "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "IOT", "BUS", "FPE", "KILL", "USR1", "SEGV",
-        "USR2", "PIPE", "ALRM", "TERM", "STKFLT", "CHLD", "CLD", "CONT", "STOP", "TSTP", "TTIN",
-        "TTOU", "URG", "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "IO", "POLL", "PWR", "SYS",
-        "RTMIN", "RTMAX",
-    ];
     let s = signal.strip_prefix('-').unwrap_or(signal);
     if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
         return match s.parse::<u64>() {
@@ -124,13 +119,7 @@ pub fn check_signal(signal: &str) -> anyhow::Result<String> {
     }
     let upper = s.to_ascii_uppercase();
     let name = upper.strip_prefix("SIG").unwrap_or(&upper);
-    let known = NAMES.contains(&name)
-        || ["RTMIN+", "RTMAX-"].iter().any(|p| {
-            name.strip_prefix(p)
-                .and_then(|n| n.parse::<u32>().ok())
-                .is_some_and(|n| (1..=15).contains(&n))
-        });
-    if !known {
+    if velarx_wire::monitor::sys::parse_signal(name).is_none() {
         anyhow::bail!("invalid signal: {s}");
     }
     Ok(format!("SIG{name}"))
@@ -3173,6 +3162,7 @@ mod tests {
         assert_eq!(check_signal("64").unwrap(), "64");
         assert_eq!(check_signal("-INT").unwrap(), "SIGINT");
         assert_eq!(check_signal("fpe").unwrap(), "SIGFPE");
+        assert_eq!(check_signal("CLD").unwrap(), "SIGCLD");
         assert_eq!(check_signal("-SIGUSR1").unwrap(), "SIGUSR1");
         assert_eq!(check_signal("SIGRTMIN+3").unwrap(), "SIGRTMIN+3");
         for (bad, msg) in [

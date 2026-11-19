@@ -149,14 +149,7 @@ impl Database {
         let n = self
             .conn
             .call(move |conn| {
-                let tx = conn.transaction()?;
-                tx.execute(
-                    "DELETE FROM manifest_list_names WHERE list_id = ?1",
-                    [&owned],
-                )?;
-                let n = tx.execute("DELETE FROM manifest_lists WHERE id = ?1", [&owned])?;
-                tx.commit()?;
-                Ok(n)
+                Ok(conn.execute("DELETE FROM manifest_lists WHERE id = ?1", [&owned])?)
             })
             .await
             .map_err(DbError::Sqlite)?;

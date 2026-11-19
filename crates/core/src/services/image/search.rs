@@ -6,6 +6,7 @@
 //! What registries answer is only shown, never used.
 
 use super::*;
+use velarx_proto::engine::SearchHit;
 
 /// The results of a registry when the client does not limit them.
 const DEFAULT_LIMIT: usize = 25;
@@ -44,7 +45,7 @@ impl SearchFilter {
         Ok(out)
     }
 
-    fn matches(&self, r: &SearchResult) -> bool {
+    fn matches(&self, r: &SearchHit) -> bool {
         r.stars >= self.stars
             && self.official.is_none_or(|o| o == r.official)
             && self.automated.is_none_or(|a| a == r.automated)
@@ -61,20 +62,6 @@ pub struct SearchOptions {
     pub tls_verify: Option<bool>,
     pub filter: SearchFilter,
     pub access: velarx_registry::auth::RegistryAccess,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct SearchResult {
-    /// The registry searched.
-    pub index: String,
-    /// The repository, with its registry.
-    pub name: String,
-    pub description: String,
-    pub stars: u64,
-    pub official: bool,
-    pub automated: bool,
-    /// With `list_tags`.
-    pub tag: String,
 }
 
 /// Without the control characters a registry could send to a terminal.
@@ -161,7 +148,7 @@ impl ImageService {
 
     /// Search `term` (podman search).  The results of the registries that
     /// answered; an error if none did.
-    pub async fn search(&self, term: &str, opts: &SearchOptions) -> ImageResult<Vec<SearchResult>> {
+    pub async fn search(&self, term: &str, opts: &SearchOptions) -> ImageResult<Vec<SearchHit>> {
         let registries: Vec<String> = match term.split_once('/') {
             Some((r, _)) => vec![r.to_string()],
             None => self.resolver.registries().search_registries.clone(),
@@ -189,7 +176,7 @@ impl ImageService {
         registry: &str,
         term: &str,
         opts: &SearchOptions,
-    ) -> ImageResult<Vec<SearchResult>> {
+    ) -> ImageResult<Vec<SearchHit>> {
         if !valid_registry(registry) {
             return Err(ImageError::Registry(format!(
                 "invalid registry `{}`",
@@ -222,7 +209,7 @@ impl ImageService {
                 .await?
                 .into_iter()
                 .take(limit)
-                .map(|tag| SearchResult {
+                .map(|tag| SearchHit {
                     index: registry.to_string(),
                     name: name.clone(),
                     tag: shown(&tag),
@@ -235,7 +222,7 @@ impl ImageService {
         let image_ref = ImageReference::parse(&format!("{registry}/search"))?;
         let docker = image_ref.registry == "docker.io";
         let tls_verify = opts.tls_verify.unwrap_or(true);
-        let found: Vec<SearchResult> = self
+        let found: Vec<SearchHit> = self
             .remote_of(
                 &client,
                 &format!("{registry}/search"),
@@ -245,7 +232,7 @@ impl ImageService {
             .search(term, limit)
             .await?
             .into_iter()
-            .map(|hit| SearchResult {
+            .map(|hit| SearchHit {
                 index: registry.to_string(),
                 name: shown(&hit.name),
                 description: shown(&hit.description),
@@ -289,7 +276,7 @@ mod tests {
         assert!(SearchFilter::parse(["stars"]).is_err());
         assert!(SearchFilter::parse(["stars=x"]).is_err());
         assert!(SearchFilter::parse(["label=x"]).is_err());
-        let r = SearchResult {
+        let r = SearchHit {
             stars: 5,
             official: true,
             ..Default::default()

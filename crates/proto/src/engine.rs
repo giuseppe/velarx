@@ -1147,7 +1147,7 @@ pub struct Units {
 }
 
 /// What a registry has for a search.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::CustomType)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, introspect::CustomType)]
 pub struct SearchHit {
     /// The registry searched
     pub index: String,

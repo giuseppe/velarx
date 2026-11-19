@@ -38,7 +38,7 @@ pub(crate) fn logs_failure(pod: &str, e: PodError) -> Error {
         PodError::Logs(m) | PodError::InvalidConfig(m) => (StatusCode::BAD_REQUEST, m),
         e => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    Error::new(status, message).with_code(82)
+    Error::new(status, message)
 }
 
 /// The lines of the logs of a pod, merged from its containers.

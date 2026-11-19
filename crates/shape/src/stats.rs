@@ -2,6 +2,7 @@
 //! The stats of containers: podman's ContainerStats (and its report of
 //! containers), Docker's StatsJSON and podman's PodStatsReport.
 
+use crate::container::human_size;
 use crate::time::rfc3339;
 use serde_json::{json, Map, Value};
 use velarx_proto::workload::{InterfaceStats, StatsRecord};
@@ -193,12 +194,6 @@ pub fn docker(s: &StatsRecord, pre: Option<&StatsRecord>, libpod: bool) -> Value
     })
 }
 
-/// A size as go-units' HumanSize writes it: 4 significant digits, units
-/// of 1000 (`12.18MB`).
-pub fn human_size(n: u64) -> String {
-    crate::units::go_size(n as f64)
-}
-
 /// go-units' BytesSize: units of 1024 (`11.62MiB`).
 fn bytes_size(n: u64) -> String {
     crate::units::go_bytes_size(n as f64)
@@ -212,7 +207,7 @@ fn pair(a: u64, b: u64, f: fn(u64) -> String) -> String {
     }
 }
 
-fn short(id: &str) -> &str {
+pub(crate) fn short(id: &str) -> &str {
     &id[..id.len().min(12)]
 }
 

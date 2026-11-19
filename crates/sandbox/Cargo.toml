@@ -28,7 +28,6 @@ landlock.workspace = true
 seccompiler.workspace = true
 rustix = { workspace = true, features = ["fs", "process", "thread", "net", "mount"] }
 libc.workspace = true
-serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

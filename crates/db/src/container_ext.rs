@@ -111,7 +111,7 @@ impl Database {
     /// The lease of the pause of a container: when (milliseconds since the
     /// epoch) the engine unpauses it unless somebody did before; `None`
     /// when there is none.  It is a column of its own, which
-    /// [`Database::set_container_ext`] does not write, so that the updates
+    /// [`Database::update_container_ext`] does not write, so that the updates
     /// of the other fields never undo it.
     pub async fn pause_lease(&self, id: &str) -> DbResult<Option<i64>> {
         let id = id.to_string();
@@ -177,37 +177,6 @@ impl Database {
         let id = id.to_string();
         self.conn
             .call(move |conn| update_container_ext(conn, &id, f))
-            .await
-            .map_err(DbError::Sqlite)?;
-        Ok(())
-    }
-
-    pub async fn set_container_ext(&self, id: &str, ext: &ContainerExt) -> DbResult<()> {
-        let id = id.to_string();
-        let ext = ext.clone();
-        self.conn
-            .call(move |conn| {
-                // A container that is gone has nothing to keep.
-                conn.execute(
-                    "INSERT INTO container_ext (container_id, oom_killed, restart_count, health, timed_out, stopped_by_user)
-                     SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE EXISTS (SELECT 1 FROM containers WHERE id = ?1)
-                     ON CONFLICT(container_id) DO UPDATE SET
-                         oom_killed = excluded.oom_killed,
-                         restart_count = excluded.restart_count,
-                         health = excluded.health,
-                         timed_out = excluded.timed_out,
-                         stopped_by_user = excluded.stopped_by_user",
-                    rusqlite::params![
-                        id,
-                        ext.oom_killed as i64,
-                        ext.restart_count as i64,
-                        ext.health,
-                        ext.timed_out as i64,
-                        ext.stopped_by_user as i64
-                    ],
-                )?;
-                Ok(())
-            })
             .await
             .map_err(DbError::Sqlite)?;
         Ok(())
@@ -310,19 +279,25 @@ mod tests {
     use super::*;
     use crate::RecordState;
 
+    async fn set_ext(db: &Database, id: &str, ext: ContainerExt) {
+        db.update_container_ext(id, move |e| *e = ext)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn the_extra_state_is_kept_and_cascades() {
         let db = Database::open_in_memory().await.unwrap();
         // No container: nothing is stored, the default is returned.
-        db.set_container_ext(
+        set_ext(
+            &db,
             "nope",
-            &ContainerExt {
+            ContainerExt {
                 oom_killed: true,
                 ..Default::default()
             },
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(
             db.get_container_ext("nope").await.unwrap(),
             ContainerExt::default()
@@ -345,11 +320,9 @@ mod tests {
             timed_out: true,
             stopped_by_user: true,
         };
-        db.set_container_ext("c1", &ext).await.unwrap();
+        set_ext(&db, "c1", ext.clone()).await;
         assert_eq!(db.get_container_ext("c1").await.unwrap(), ext);
-        db.set_container_ext("c1", &ContainerExt::default())
-            .await
-            .unwrap();
+        set_ext(&db, "c1", ContainerExt::default()).await;
         assert_eq!(
             db.get_container_ext("c1").await.unwrap(),
             ContainerExt::default()
@@ -360,17 +333,15 @@ mod tests {
             .unwrap();
         assert_eq!(batch.len(), 1, "a container with no row has none");
         assert_eq!(batch["c1"], ContainerExt::default());
-        db.set_container_ext("c1", &ext).await.unwrap();
+        set_ext(&db, "c1", ext.clone()).await;
         assert_eq!(
             db.get_container_exts(&["c1".into()]).await.unwrap()["c1"],
             ext
         );
-        db.set_container_ext("c1", &ContainerExt::default())
-            .await
-            .unwrap();
+        set_ext(&db, "c1", ContainerExt::default()).await;
         assert_eq!(db.pause_lease("c1").await.unwrap(), None);
         db.set_pause_lease("c1", Some(42)).await.unwrap();
-        db.set_container_ext("c1", &ext).await.unwrap();
+        set_ext(&db, "c1", ext.clone()).await;
         assert_eq!(db.pause_lease("c1").await.unwrap(), Some(42), "kept");
         assert_eq!(db.pause_leases().await.unwrap(), [("c1".to_string(), 42)]);
         db.set_pause_lease("c1", None).await.unwrap();

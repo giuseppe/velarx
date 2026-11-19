@@ -3,21 +3,15 @@
 //! inspect), Docker's ImageSummary and InspectResponse, the entries of
 //! their histories, and Docker's DistributionInspect.
 
+use crate::manifest::platform;
+use crate::stats::short;
 use crate::string_map;
+use crate::system::at_least;
 use crate::time::rfc3339;
 use serde_json::{json, Map, Value};
 use velarx_proto::workload::{
-    ImageConfigRecord, ImageHistoryEntry, ImagePlatform, ImageRecord, ImageTreeRecord, RemoteImage,
+    ImageConfigRecord, ImageHistoryEntry, ImageRecord, ImageTreeRecord, RemoteImage,
 };
-
-/// The version of Docker's API is at least `major.minor` (none: the
-/// newest).
-fn at_least(version: Option<(u32, u32)>, major: u32, minor: u32) -> bool {
-    match version {
-        None => true,
-        Some((a, b)) => a > major || (a == major && b >= minor),
-    }
-}
 
 /// When the image was made, else stored (podman's `Created`).
 fn made_ns(r: &ImageRecord) -> i64 {
@@ -296,11 +290,6 @@ pub fn history(h: &ImageHistoryEntry, docker: bool) -> Value {
     })
 }
 
-/// The first 12 characters of an id.
-fn short(id: &str) -> &str {
-    &id[..id.len().min(12)]
-}
-
 /// podman's text of `image tree`: the layers of the image and the images
 /// they are the top layer of, or with `what_requires` the images built on
 /// it.
@@ -349,28 +338,10 @@ pub fn distribution(d: &RemoteImage) -> Value {
     })
 }
 
-/// An OCI platform: the members that are empty are left out, but the
-/// architecture and the OS.
-fn platform(p: &ImagePlatform) -> Value {
-    let mut o = Map::new();
-    o.insert("architecture".into(), json!(p.architecture));
-    o.insert("os".into(), json!(p.os));
-    for (key, v) in [("os.version", &p.os_version), ("variant", &p.variant)] {
-        if !v.is_empty() {
-            o.insert(key.into(), json!(v));
-        }
-    }
-    for (key, v) in [("os.features", &p.os_features), ("features", &p.features)] {
-        if !v.is_empty() {
-            o.insert(key.into(), json!(v));
-        }
-    }
-    Value::Object(o)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use velarx_proto::workload::ImagePlatform;
 
     fn image() -> ImageRecord {
         ImageRecord {

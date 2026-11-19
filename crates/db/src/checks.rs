@@ -8,8 +8,7 @@ use velarx_types::{DbError, DbResult};
 pub(super) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS image_checks (
     image_id TEXT PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
-    checked_at INTEGER NOT NULL,
-    full INTEGER NOT NULL
+    checked_at INTEGER NOT NULL
 );
 "#;
 
@@ -28,16 +27,15 @@ impl Database {
             .map_err(DbError::Sqlite)
     }
 
-    /// Record that the image was checked at `at`, with the checks of the
-    /// content (`full`) or without.
-    pub async fn set_image_checked(&self, image_id: &str, at: i64, full: bool) -> DbResult<()> {
+    /// Record that the image was checked at `at`.
+    pub async fn set_image_checked(&self, image_id: &str, at: i64) -> DbResult<()> {
         let id = image_id.to_string();
         self.conn
             .call(move |conn| {
                 conn.execute(
-                    "INSERT OR REPLACE INTO image_checks (image_id, checked_at, full)
-                     SELECT id, ?2, ?3 FROM images WHERE id = ?1",
-                    rusqlite::params![id, at, full],
+                    "INSERT OR REPLACE INTO image_checks (image_id, checked_at)
+                     SELECT id, ?2 FROM images WHERE id = ?1",
+                    rusqlite::params![id, at],
                 )?;
                 Ok(())
             })

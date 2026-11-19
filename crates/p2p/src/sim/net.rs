@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The network between the simulated nodes: latency, bandwidth, loss,
-//! partitions.  Nothing is real: a message is a delay, and a message that is
+//! The network between the simulated nodes: latency, bandwidth, partitions.  Nothing is real: a message is a delay, and a message that is
 //! lost is a future that never completes (the sender's own timeout is what
 //! ends the wait, as on a real network).
 
@@ -9,26 +8,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// What a path between two nodes is like.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Link {
-    /// One way
-    pub latency: Duration,
-    /// A random part of the latency, up to this much
-    pub jitter: Duration,
-    /// The part of the messages that never arrive (0 to 1)
-    pub loss: f64,
-}
-
-impl Default for Link {
-    fn default() -> Self {
-        Self {
-            latency: Duration::from_millis(1),
-            jitter: Duration::from_micros(300),
-            loss: 0.0,
-        }
-    }
-}
+/// One way, and a random part of it up to the jitter.
+const LATENCY: Duration = Duration::from_millis(1);
+const JITTER: Duration = Duration::from_micros(300);
 
 /// A line of a node, one way: bytes leave it one after another at `rate`.
 #[derive(Debug, Clone, Copy)]
@@ -64,12 +46,10 @@ struct Node {
 #[derive(Default)]
 struct State {
     nodes: Vec<Node>,
-    links: std::collections::BTreeMap<(usize, usize), Link>,
 }
 
 /// The network.
 pub struct Net {
-    default: Mutex<Link>,
     state: Mutex<State>,
     entropy: Entropy,
 }
@@ -93,7 +73,6 @@ pub struct Lost;
 impl Net {
     pub(super) fn new(entropy: Entropy) -> Self {
         Self {
-            default: Mutex::new(Link::default()),
             state: Mutex::default(),
             entropy,
         }
@@ -101,11 +80,6 @@ impl Net {
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// What the paths are like unless set otherwise.
-    pub fn set_default(&self, link: Link) {
-        *self.default.lock().unwrap_or_else(|e| e.into_inner()) = link;
     }
 
     /// A node: its index is that of the nodes before it plus one; the first
@@ -125,18 +99,6 @@ impl Net {
             alive: true,
         });
         s.nodes.len().saturating_sub(2)
-    }
-
-    /// The path between `a` and `b` (both ways).
-    pub fn set_link(&self, a: usize, b: usize, link: Link) {
-        let mut s = self.state();
-        s.links
-            .insert((line(a).min(line(b)), line(a).max(line(b))), link);
-    }
-
-    /// What the node reads at, bytes a second (0: no limit).
-    pub fn set_down(&self, node: usize, rate: u64) {
-        self.state().nodes[line(node)].down.rate = rate;
     }
 
     /// What the node writes at, bytes a second (0: no limit).
@@ -184,16 +146,8 @@ impl Net {
             if !(s.nodes[a].alive && s.nodes[b].alive && s.nodes[a].side == s.nodes[b].side) {
                 return Err(Lost);
             }
-            let link = s
-                .links
-                .get(&(a.min(b), a.max(b)))
-                .copied()
-                .unwrap_or_else(|| *self.default.lock().unwrap_or_else(|e| e.into_inner()));
-            if link.loss > 0.0 && self.entropy.unit() < link.loss {
-                return Err(Lost);
-            }
             let sent = s.nodes[a].up.through(bytes);
-            let latency = link.latency + link.jitter.mul_f64(self.entropy.unit());
+            let latency = LATENCY + JITTER.mul_f64(self.entropy.unit());
             s.nodes[b].down.through_after(sent + latency, bytes)
         };
         tokio::time::sleep_until(arrive).await;

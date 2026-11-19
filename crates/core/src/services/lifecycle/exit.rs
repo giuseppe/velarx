@@ -2,6 +2,7 @@
 use super::start::PolicyRestart;
 use super::*;
 use velarx_db::RecordState;
+use velarx_runtime::settle::remove::remove_tree;
 
 impl ContainerService {
     /// What a monitor tells a process that observes it: notices, for the
@@ -197,7 +198,10 @@ impl ContainerService {
             self.follow_orphan(
                 container.id.clone(),
                 pidfd,
-                container.started_at.as_deref().and_then(started_ns),
+                container
+                    .started_at
+                    .as_deref()
+                    .and_then(velarx_proto::time::parse_rfc3339),
             );
             return Ok(());
         }
@@ -589,26 +593,14 @@ impl ContainerService {
         self.lifecycle.watch(&key, task.abort_handle());
     }
 
-    /// [`Self::release_network`] on the way out of a failure that is told to
-    /// the caller: a failure to release is told too.
-    pub(super) async fn release_after_failure(&self, container: &velarx_db::ContainerRecord) {
-        if let Err(e) = self.release_network(container).await {
-            warn!("Cannot release the network of {}: {}", container.id, e);
-        }
-    }
-
     /// Undo the network of a container that is not running any more: the
     /// release of `NetworkManager::cleanup` also tells the providers its
     /// networks name.
-    pub(super) async fn release_network(
-        &self,
-        container: &velarx_db::ContainerRecord,
-    ) -> ContainerResult<()> {
+    pub(super) async fn release_network(&self, container: &velarx_db::ContainerRecord) {
         let id = &container.id;
         if let Err(e) = self.network_manager.cleanup(id).await {
             debug!("Network cleanup of {}: {}", id, e);
         }
-        Ok(())
     }
 
     /// `remove_files`, by the holder of the lock of the start `lock`: the
@@ -744,15 +736,6 @@ impl ContainerService {
     }
 }
 
-/// Remove the directory `path` and what is below it; no error when it is not
-/// there.
-fn remove_tree(path: &Path) -> io::Result<()> {
-    match velarx_base::tree::remove_dir_all_confined(path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
-    }
-}
-
 /// Wait the `delay` before a restart that nobody monitors: false when the
 /// container was stopped by a user meanwhile (the stop sets
 /// `stopped_by_user`, and every change of the database wakes this), started
@@ -818,11 +801,9 @@ mod tests {
             image_id: "i".into(),
             config: "{}".into(),
             state: RecordState::Stopped,
-            pid: None,
             created_at: "now".into(),
-            started_at: None,
-            finished_at: None,
             exit_code: Some(1),
+            ..Default::default()
         })
         .await
         .unwrap();

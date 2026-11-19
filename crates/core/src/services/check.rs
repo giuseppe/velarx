@@ -208,7 +208,7 @@ impl CheckService {
             match self.check_image(image, full, deadline, &mut run).await? {
                 Some(c) => {
                     self.db
-                        .set_image_checked(&c.image.id, chrono::Utc::now().timestamp(), full)
+                        .set_image_checked(&c.image.id, chrono::Utc::now().timestamp())
                         .await?;
                     report.images_checked += 1;
                     checked.push(c);

@@ -17,8 +17,7 @@
 //! What it deliberately lacks: lazy images (the engine runs an image that is
 //! being pulled lazily from its own files, and gives the server its layers
 //! complete), a size limit of the writable
-//! layer, layers with no table of contents (the engine refuses them before
-//! `BeginPull`), copies of chunks between objects (`copy` events), and
+//! layer, copies of chunks between objects (`copy` events), and
 //! several users' stores in one process beyond the isolation by the uid of
 //! the peer.
 

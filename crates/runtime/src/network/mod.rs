@@ -1124,11 +1124,8 @@ mod driver_tests {
             image_id: "img".into(),
             config: "{}".into(),
             state: velarx_db::RecordState::Created,
-            pid: None,
             created_at: "now".into(),
-            started_at: None,
-            finished_at: None,
-            exit_code: None,
+            ..Default::default()
         })
         .await
         .unwrap();

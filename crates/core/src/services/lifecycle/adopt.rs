@@ -58,12 +58,8 @@ impl ContainerService {
                     self.db.delete_container(&container.id).await?;
                     let dirs = [dir, self.log_dir(&container.id)];
                     crate::off_thread(move || {
-                        dirs.iter().try_for_each(|d| {
-                            match velarx_base::tree::remove_dir_all_confined(d) {
-                                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-                                _ => Ok(()),
-                            }
-                        })
+                        dirs.iter()
+                            .try_for_each(|d| velarx_runtime::settle::remove::remove_tree(d))
                     })
                     .await?;
                     Ok(())

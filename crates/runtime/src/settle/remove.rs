@@ -139,7 +139,7 @@ pub fn prepare(a: &impl Access, plan: &SettlePlan, with_volumes: bool) -> Settle
 
 /// Remove the directory `path` and what is below it; no error when it is not
 /// there.
-fn remove_tree(path: &Path) -> io::Result<()> {
+pub fn remove_tree(path: &Path) -> io::Result<()> {
     match velarx_base::tree::remove_dir_all_confined(path) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
@@ -445,18 +445,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            d.insert_container(&velarx_db::ContainerRecord {
-                id: "c1".into(),
-                name: Some("c1".into()),
-                image_id: "img".into(),
-                config: CONFIG.into(),
-                state: RecordState::Running,
-                pid: Some(3),
-                created_at: "now".into(),
-                started_at: None,
-                finished_at: None,
-                exit_code: None,
-            })
+            d.insert_container(&velarx_db::ContainerRecord { id: "c1".into(), name: Some("c1".into()), image_id: "img".into(), config: CONFIG.into(), state: RecordState::Running, pid: Some(3), created_at: "now".into(), ..Default::default() })
             .await
             .unwrap();
             d.record_container_exit_announcing("c1", "t".into(), 7, None, true, Box::new(|| {}))

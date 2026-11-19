@@ -77,9 +77,6 @@ const MAX_REFERENCE: usize = 512;
 /// The fewest digits of an id that `ImageInspect` takes for the start of one.
 const MIN_ID_PREFIX: usize = 12;
 
-/// The largest index `Index` hands over.
-pub const MAX_INDEX: u64 = 16 * 1024 * 1024;
-
 /// The changes kept for a subscriber that does not read; one that falls
 /// further behind gets a snapshot again.
 const CHANGES_KEPT: usize = 64;
@@ -909,7 +906,6 @@ impl StoreService {
         let Some(tarsplit) = db.get_layer_tarsplit(layer).await.map_err(unavailable)? else {
             return Ok(None);
         };
-        let max = max.min(MAX_INDEX);
         let objects = self.inner.objects.clone();
         tokio::task::spawn_blocking(move || {
             let index = velarx_content::pull::index::encode(toc.as_bytes(), &tarsplit)?;
@@ -1611,20 +1607,8 @@ mod tests {
     /// `VELARX_WRITE_INTERFACES=1` writes it.
     #[test]
     fn the_interface_file_is_current() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interfaces/org.velarx.Store.varlink");
         let text = definition();
-        if std::env::var_os("VELARX_WRITE_INTERFACES").is_some() {
-            std::fs::write(&path, &text).unwrap();
-        }
-        let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
-        assert!(
-            on_disk == text,
-            "{} is not what the types make; run VELARX_WRITE_INTERFACES=1 cargo test -p \
-             velarx-core --lib store_service and commit it",
-            path.display()
-        );
-        assert!(!text.contains("[`"), "a rustdoc link in the definition");
+        velarx_base::testing::assert_interface_file("org.velarx.Store.varlink", &text);
         assert!(
             text.contains("\tsnapshot,"),
             "the enum values as the wire has them"

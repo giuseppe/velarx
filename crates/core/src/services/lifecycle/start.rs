@@ -81,27 +81,6 @@ pub struct StartLock {
     _file: std::fs::File,
 }
 
-/// Lock the file `path` (created when it is not there) exclusively.  The
-/// removal of a container unlinks the file while it holds the lock: a lock
-/// on a file that is gone is none, the one that waited takes the lock again
-/// on the file that replaces it (else two processes would hold "the" lock).
-pub(super) fn lock_file(path: &Path) -> io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    loop {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(path)?;
-        velarx_sys::flock::flock_retrying(&file, rustix::fs::FlockOperation::LockExclusive)?;
-        if is_file_at(&file, path)? {
-            return Ok(file);
-        }
-    }
-}
-
 /// Point the namespaces of the spec at SPEC_PATH whose kind PATHS names at
 /// the path given there.
 fn set_namespace_paths(spec_path: &Path, paths: &[(&str, String)]) -> io::Result<()> {
@@ -130,16 +109,6 @@ fn bind_shm(spec_path: &Path, dir: &Path) -> io::Result<()> {
     *mount = serde_json::json!({"destination": "/dev/shm", "type": "bind",
         "source": dir, "options": ["rbind", "nosuid", "noexec", "nodev"]});
     crate::container::spec_file::write(spec_path, &spec)
-}
-
-/// Whether `file` is the file at `path` (not one unlinked, or replaced).
-fn is_file_at(file: &std::fs::File, path: &Path) -> io::Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-    match std::fs::symlink_metadata(path) {
-        Ok(m) => Ok(m.ino() == file.metadata()?.ino()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
 }
 
 /// Where each chain of `mc` broke if the configuration of the monitor, which
@@ -1497,7 +1466,7 @@ impl ContainerService {
         {
             let quit_dir = dir.clone();
             let _ = tokio::task::spawn_blocking(move || client::quit(&quit_dir)).await;
-            self.release_after_failure(&container).await;
+            self.release_network(&container).await;
             return Err(e.into());
         }
         self.observe_started(&container.id, events);
@@ -1686,7 +1655,7 @@ impl ContainerService {
         let netns = match network {
             Ok(netns) => netns,
             Err(e) => {
-                self.release_after_failure(container).await;
+                self.release_network(container).await;
                 return Err(e);
             }
         };
@@ -2089,7 +2058,7 @@ impl ContainerService {
         let (events, pid) = match created {
             Ok(v) => v,
             Err(e) => {
-                self.release_after_failure(container).await;
+                self.release_network(container).await;
                 return Err(e);
             }
         };
@@ -2110,7 +2079,7 @@ impl ContainerService {
                 // monitor deletes the created container and exits.
                 let quit_dir = dir.to_path_buf();
                 let _ = tokio::task::spawn_blocking(move || client::quit(&quit_dir)).await;
-                self.release_after_failure(container).await;
+                self.release_network(container).await;
                 return Err(e);
             }
         }
@@ -2166,7 +2135,7 @@ impl ContainerService {
                 )));
             }
             Err(e) => {
-                self.release_after_failure(container).await;
+                self.release_network(container).await;
                 return Err(io_error(e));
             }
         };
@@ -2279,15 +2248,22 @@ impl ContainerService {
     /// while what the monitor says is recorded: a file of the monitors'
     /// directory, locked with `flock` (released when the process ends).
     pub(in crate::services) async fn start_lock(&self, id: &str) -> ContainerResult<StartLock> {
-        let dir = self.state_dir.join("mon");
-        let path = dir.join(format!("{}.lock", &id[..id.len().min(12)]));
-        tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&dir)?;
-            lock_file(&path).map(|_file| StartLock { _file })
-        })
-        .await
-        .map_err(|e| io_error(io::Error::other(e)))?
-        .map_err(io_error)
+        let _file = self.mon_lock(self.start_lock_file(id)).await?;
+        Ok(StartLock { _file })
+    }
+
+    /// The lock file `path` of the monitors' directory, taken with `flock`.
+    pub(super) async fn mon_lock(&self, path: PathBuf) -> ContainerResult<std::fs::File> {
+        crate::off_thread(move || velarx_runtime::settle::lock::exclusive(&path))
+            .await
+            .map_err(io_error)
+    }
+
+    /// The lock file of the container `id` with the extension `ext`.
+    pub(super) fn mon_lock_file(&self, id: &str, ext: &str) -> PathBuf {
+        self.state_dir
+            .join("mon")
+            .join(format!("{}.{ext}", &id[..id.len().min(12)]))
     }
 
     /// The lock of a change of the configuration and the bundle of a
@@ -2300,9 +2276,7 @@ impl ContainerService {
 
     /// The file of the lock of the start of a container.
     pub(in crate::services) fn start_lock_file(&self, id: &str) -> PathBuf {
-        self.state_dir
-            .join("mon")
-            .join(format!("{}.lock", &id[..id.len().min(12)]))
+        self.mon_lock_file(id, "lock")
     }
 
     /// A start while the monitor waits to restart the container: the
@@ -2470,7 +2444,7 @@ pub(in crate::services) fn mount_label(config: &ContainerConfig) -> Option<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_shm, is_file_at, lock_file, set_namespace_paths, StartCheck};
+    use super::{bind_shm, set_namespace_paths, StartCheck};
     use velarx_types::digest::Digest;
 
     /// A spec with the keys sorted, `linux` (with the
@@ -2638,27 +2612,5 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         bind_shm(&path, std::path::Path::new("/run/y/shm")).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
-    }
-
-    /// A lock on a file that was unlinked while it was waited for is none:
-    /// the one that holds it is not at the path any more, and the next
-    /// `lock_file` is on the file that replaces it.
-    #[test]
-    fn a_lock_on_an_unlinked_file_is_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("c.lock");
-        let holder = lock_file(&path).unwrap();
-        assert!(is_file_at(&holder, &path).unwrap());
-        std::fs::remove_file(&path).unwrap();
-        assert!(!is_file_at(&holder, &path).unwrap());
-        let second = lock_file(&path).unwrap();
-        assert!(!is_file_at(&holder, &path).unwrap());
-        assert!(is_file_at(&second, &path).unwrap());
-        // the lock of the new file excludes a third holder
-        let third = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        assert!(
-            rustix::fs::flock(&third, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-                .is_err()
-        );
     }
 }

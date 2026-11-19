@@ -1048,28 +1048,6 @@ type Replies<T> =
 /// The replies of a list: one record each, the last with `continues:
 /// false`; an empty list is one reply without a record.  A list is asked for
 /// with `more`.
-/// The health of the engine as the interface has it.
-fn health_report(h: velarx_core::services::HealthResponse) -> HealthReport {
-    use velarx_core::services::HealthStatus as Level;
-    let status = |s: Level| match s {
-        Level::Healthy => ComponentStatus::Healthy,
-        Level::Degraded => ComponentStatus::Degraded,
-        Level::Unhealthy => ComponentStatus::Unhealthy,
-    };
-    HealthReport {
-        overall: status(h.overall),
-        components: h
-            .components
-            .into_iter()
-            .map(|c| ComponentHealth {
-                status: status(c.status),
-                name: c.name,
-                message: c.message,
-            })
-            .collect(),
-    }
-}
-
 fn list_replies<R: Send + 'static, T: Send + 'static>(
     more: bool,
     method: &str,
@@ -1131,35 +1109,6 @@ fn pod_log_line(e: velarx_wire::wire::PodLogEntry) -> PodLogLine {
             LogStream::Stdout
         },
         message: e.message,
-    }
-}
-
-/// The metrics of a pod, as the interface has them.
-fn pod_metrics_of(p: velarx_wire::wire::PodMetrics) -> PodMetrics {
-    let samples = |s: Vec<velarx_wire::wire::Sample>| {
-        s.into_iter()
-            .map(|s| MetricSample {
-                name: s.name,
-                labels: s.labels,
-                value: s.value,
-            })
-            .collect()
-    };
-    PodMetrics {
-        id: p.id,
-        name: p.name,
-        time_ns: p.time_ns,
-        usage: p.usage,
-        samples: samples(p.samples),
-        containers: p
-            .containers
-            .into_iter()
-            .map(|c| ContainerMetrics {
-                id: c.id,
-                name: c.name,
-                samples: samples(c.samples),
-            })
-            .collect(),
     }
 }
 
@@ -1933,7 +1882,7 @@ mod service {
         /// The health of the engine and of its parts (its database, its
         /// storage, its runtime).
         async fn health(&self) -> Result<HealthReport, EngineError> {
-            self.run(|state| async move { health_report(state.server_service.health().await) })
+            self.run(|state| async move { state.server_service.health().await })
                 .await
         }
 
@@ -3502,15 +3451,7 @@ mod service {
             more: bool,
         ) -> impl futures::Stream<Item = Result<zlink::Reply<MetricDescriptorListed>, EngineError>> + Unpin
         {
-            let listed = Ok(podman::metric_descriptors()
-                .into_iter()
-                .map(|d| MetricDescriptor {
-                    name: d.name,
-                    help: d.help,
-                    counter: d.counter,
-                    labels: d.labels,
-                })
-                .collect());
+            let listed = Ok(podman::metric_descriptors());
             list_replies(more, "MetricDescriptorList", listed, |descriptor| {
                 MetricDescriptorListed { descriptor }
             })
@@ -3529,8 +3470,7 @@ mod service {
                 .api(ErrorKind::Pod, |state| async move {
                     podman::pods_metrics(&state, name.as_deref()).await
                 })
-                .await
-                .map(|pods| pods.into_iter().map(pod_metrics_of).collect());
+                .await;
             list_replies(more, "PodMetricsList", listed, |pod| PodMetricsListed {
                 pod,
             })

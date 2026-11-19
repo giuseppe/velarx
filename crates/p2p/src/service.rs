@@ -765,7 +765,6 @@ mod tests {
     /// `VELARX_WRITE_INTERFACES=1` writes them.
     #[test]
     fn the_interface_files_are_current() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interfaces");
         for (name, text) in [
             ("org.velarx.P2p.varlink", control_definition()),
             (
@@ -773,18 +772,7 @@ mod tests {
                 crate::overlay_service::network_definition(),
             ),
         ] {
-            let path = dir.join(name);
-            if std::env::var_os("VELARX_WRITE_INTERFACES").is_some() {
-                std::fs::write(&path, &text).unwrap();
-            }
-            let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
-            assert!(
-                on_disk == text,
-                "{} is not what the types make; run VELARX_WRITE_INTERFACES=1 cargo test -p \
-                 velarx-p2p --lib service and commit it",
-                path.display()
-            );
-            assert!(!text.contains("[`"), "a rustdoc link in {name}");
+            velarx_base::testing::assert_interface_file(name, &text);
             // (every type a field names is declared in the file)
             let declared: std::collections::HashSet<&str> = text
                 .lines()

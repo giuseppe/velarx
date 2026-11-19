@@ -27,7 +27,6 @@ velarx-registry = { path = "../registry", default-features = false }
 serde_json.workspace = true
 thiserror.workspace = true
 base64.workspace = true
-serde = { workspace = true, features = ["derive"] }
 url.workspace = true
 libc.workspace = true
 rustix = { workspace = true, features = ["fs"] }

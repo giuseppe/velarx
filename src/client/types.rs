@@ -408,21 +408,7 @@ pub struct SearchRequest {
     pub access: RegistryAccess,
 }
 
-/// What a registry has for a search.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
-pub struct SearchHit {
-    /// The registry searched
-    pub index: String,
-    /// The repository, with its registry
-    pub name: String,
-    pub description: String,
-    pub stars: u64,
-    pub official: bool,
-    pub automated: bool,
-    /// The tag, when the tags of a repository are listed
-    #[serde(default)]
-    pub tag: String,
-}
+pub use velarx_proto::engine::SearchHit;
 
 #[derive(Debug, Clone, Default)]
 pub struct CommitContainerRequest {

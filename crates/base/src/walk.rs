@@ -22,10 +22,6 @@ use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 
-fn errno(e: rustix::io::Errno) -> io::Error {
-    io::Error::from_raw_os_error(e.raw_os_error())
-}
-
 /// What tells a directory: its device and inode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Ident {
@@ -50,7 +46,7 @@ pub fn open_dir_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NOCTTY,
         Mode::empty(),
     )
-    .map_err(errno)
+    .map_err(io::Error::from)
 }
 
 /// The directory `path` (names of directories, as [`Cursor::path`] gives
@@ -73,8 +69,8 @@ pub fn names(dir: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
 /// directory of a tree the caller does not trust is not read whole first.
 pub fn names_at_most(dir: BorrowedFd<'_>, max: usize) -> io::Result<Vec<OsString>> {
     let mut out = Vec::new();
-    for entry in Dir::read_from(dir).map_err(errno)? {
-        let entry = entry.map_err(errno)?;
+    for entry in Dir::read_from(dir)? {
+        let entry = entry?;
         let name = entry.file_name().to_bytes();
         if name != b"." && name != b".." {
             if out.len() >= max {
@@ -110,7 +106,7 @@ pub struct Cursor {
 impl Cursor {
     /// At the root of a tree.
     pub fn new(root: OwnedFd) -> io::Result<Self> {
-        let st = fstat(&root).map_err(errno)?;
+        let st = fstat(&root)?;
         Ok(Cursor {
             root: root.try_clone()?,
             fd: root,
@@ -137,7 +133,7 @@ impl Cursor {
     /// (what a stat of `name` showed), it must be that directory.
     pub fn descend(&mut self, name: &OsStr, seen: Option<&Stat>) -> io::Result<()> {
         let fd = open_dir_at(self.fd(), name)?;
-        let st = fstat(&fd).map_err(errno)?;
+        let st = fstat(&fd)?;
         if seen.is_some_and(|s| Ident::of(s) != Ident::of(&st)) {
             return Err(moved(name));
         }
@@ -150,7 +146,7 @@ impl Cursor {
     /// current directory: `fd` is that directory, opened without following a
     /// link.
     pub fn adopt(&mut self, name: &OsStr, fd: OwnedFd) -> io::Result<()> {
-        let st = fstat(&fd).map_err(errno)?;
+        let st = fstat(&fd)?;
         self.path.push((name.to_os_string(), Ident::of(&st)));
         self.fd = fd;
         Ok(())
@@ -165,7 +161,7 @@ impl Cursor {
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => self.parent_from_root()?,
             r => r?,
         };
-        let st = fstat(&parent).map_err(errno)?;
+        let st = fstat(&parent)?;
         let (name, _) = self
             .path
             .pop()
@@ -182,7 +178,7 @@ impl Cursor {
         let mut fd = open_dir_at(self.root.as_fd(), OsStr::new("."))?;
         for (name, id) in &self.path[1..self.path.len() - 1] {
             fd = open_dir_at(fd.as_fd(), name)?;
-            if Ident::of(&fstat(&fd).map_err(errno)?) != *id {
+            if Ident::of(&fstat(&fd)?) != *id {
                 return Err(moved(name));
             }
         }
@@ -306,7 +302,7 @@ impl Walk {
                 Ok(st) => st,
                 Err(rustix::io::Errno::NOENT) if self.skip_gone => continue,
                 Err(_) if self.lenient => continue,
-                Err(e) => return Err(errno(e)),
+                Err(e) => return Err(io::Error::from(e)),
             };
             let Some(state) = v.entry(cur.fd(), &name, &st, cur.depth(), &mut frame.state)? else {
                 continue;

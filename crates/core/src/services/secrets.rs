@@ -784,11 +784,8 @@ mod tests {
             image_id: "i".into(),
             config: "{}".into(),
             state: RecordState::Created,
-            pid: None,
             created_at: "2026-01-01T00:00:00Z".into(),
-            started_at: None,
-            finished_at: None,
-            exit_code: None,
+            ..Default::default()
         })
         .await
         .unwrap();
