@@ -177,12 +177,9 @@ pub async fn pull_metadata(
     let Some(info) = chunked::parse_info(layer)? else {
         return Ok(Err(NotLazy::NotChunked));
     };
-    let Some(tarsplit) = info.tarsplit else {
-        return Ok(Err(NotLazy::NoTarSplit));
-    };
     // (the fetcher finds them: `Probe`; what it gives is verified below)
     let (toc_z, ts_z) = chunked::metadata(ctx, layer).await?;
-    found_of(info, tarsplit, (toc_z, ts_z), layer.digest).await
+    found_of(info, (toc_z, ts_z), layer.digest).await
 }
 
 /// The lazy layer of `layer` from its table of contents and tar-split as
@@ -190,14 +187,15 @@ pub async fn pull_metadata(
 /// `info`; why not, when its table lacks a file's fs-verity digest.
 async fn found_of(
     info: Info,
-    tarsplit: (u64, u64, u64),
     (toc_z, ts_z): (Vec<u8>, Vec<u8>),
     layer_digest: Digest,
 ) -> ImageResult<Result<Found, NotLazy>> {
     let fetched = (toc_z.len() + ts_z.len()) as u64;
     let layer_info: Info = info.clone();
     let lazy = tokio::task::spawn_blocking(move || -> ImageResult<Result<LazyLayer, NotLazy>> {
-        let meta = chunked::verify_metadata(&layer_info, &toc_z, ts_z, tarsplit.2)?;
+        let Some(meta) = chunked::verify_metadata(&layer_info, &toc_z, ts_z, &layer_digest)? else {
+            return Ok(Err(NotLazy::NoTarSplit));
+        };
         if let Some(e) = without_verity(&meta.toc) {
             debug!(
                 "Layer {layer_digest}: pulled whole, its TOC has no fs-verity digest for `{}`",
@@ -205,13 +203,18 @@ async fn found_of(
             );
             return Ok(Err(NotLazy::NoVerity(e.name.clone())));
         }
-        let toc = merge_toc(
-            &meta.toc,
-            layer_info.checksum.alg(),
-            meta.tarsplit_z.clone(),
-        )?;
+        // (the table of a canonical layer is the layer's, as it is)
+        let toc = if meta.toc.is_canonical() {
+            meta.toc.clone()
+        } else {
+            Arc::new(merge_toc(
+                &meta.toc,
+                layer_info.checksum.alg(),
+                meta.tarsplit_z.clone(),
+            )?)
+        };
         Ok(Ok(LazyLayer {
-            toc: Arc::new(toc),
+            toc,
             tarsplit: meta.tarsplit_z,
             report: LayerReport {
                 fetched_bytes: fetched,
@@ -239,13 +242,10 @@ pub async fn accept(
     let Some(info) = chunked::parse_info(layer)? else {
         return Ok(Err(Why::NoToc));
     };
-    let Some(tarsplit) = info.tarsplit else {
-        return Ok(Err(Why::Unsupported));
-    };
     let (TocSource::Carried, Some(metadata)) = (reply.toc, metadata) else {
         return Ok(Err(reply.reason.unwrap_or(Why::Unreachable)));
     };
-    match found_of(info, tarsplit, metadata, layer.digest).await? {
+    match found_of(info, metadata, layer.digest).await? {
         Err(NotLazy::NoVerity(_)) => Ok(Err(Why::NoFileDigests)),
         Err(_) => Ok(Err(Why::NoToc)),
         Ok(_) if !reply.on_demand => Ok(Err(reply.reason.unwrap_or(Why::NoRanges))),

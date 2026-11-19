@@ -39,7 +39,7 @@ db_bytes () {
     sh_ image push --tls-verify=false --compression-format zstd:chunked localhost/rmi-store:many "$ref" > /dev/null 2>&1 || e2e_die "push"
     sh_ image rm localhost/rmi-store:many > /dev/null 2>&1 || e2e_die "rm of the built image"
     sh_ system prune -f > /dev/null 2>&1
-    small=$(layer_images)
+    small=$(layer_images) before=$(db_bytes)
     sh_ image pull --tls-verify=false "$ref" > /dev/null 2>&1
     check "the image is pulled" 0 $?
     check "its layer has an image" 1 "$([ "$(layer_images)" -gt "$small" ] && echo 1)"
@@ -49,6 +49,7 @@ db_bytes () {
     check "rmi leaves no layer image of it in the store" "$small" "$(layer_images)"
     sh_ system prune -f > /dev/null 2>&1
     check "system prune" 0 $?
-    check "the prune gives back the pages of its rows ($pulled bytes after the pull, $(db_bytes) now)" 1 \
-          "$([ "$(db_bytes)" -lt $((pulled / 2)) ] && echo 1)"
+    # (at least half of what the pull added)
+    check "the prune gives back the pages of its rows ($before bytes before the pull, $pulled after, $(db_bytes) now)" 1 \
+          "$([ "$(db_bytes)" -lt $(((before + pulled) / 2)) ] && echo 1)"
 }

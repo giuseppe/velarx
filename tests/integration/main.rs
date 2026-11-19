@@ -14,6 +14,7 @@ mod archive_tests;
 mod auth_tests;
 mod bridge_tests;
 mod build_tests;
+mod canonical_tests;
 mod cdi_tests;
 mod check_tests;
 mod commit_tests;

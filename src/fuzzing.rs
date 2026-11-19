@@ -185,7 +185,13 @@ pub fn toc(data: &[u8]) {
         checksum: velarx_types::digest::Digest::of(velarx_types::digest::Algorithm::Sha256, data),
         tarsplit: None,
     };
-    let _ = velarx_content::pull::chunked::verify_metadata(&info, data, Vec::new(), 0);
+    let _ = velarx_content::pull::chunked::verify_metadata(
+        &info,
+        data,
+        Vec::new(),
+        &velarx_types::digest::Digest::of(velarx_types::digest::Algorithm::Sha256, b""),
+        u64::MAX,
+    );
     // and as JSON, as the store reads it
     let _ = velarx_storage::parse_toc_from_bytes(data);
 }

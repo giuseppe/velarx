@@ -633,7 +633,10 @@ impl StagedFetch {
                 at.and_then(|at| files.get_mut(at as usize)?.take())
                     .map(File::from)
             };
-            let (Some(toc), Some(ts)) = (take(reply.toc_file), take(reply.tarsplit_file)) else {
+            // (a canonical layer has no tar-split)
+            let toc = take(reply.toc_file);
+            let ts = take(reply.tarsplit_file);
+            let (Some(toc), true) = (toc, ts.is_some() == reply.tarsplit_file.is_some()) else {
                 return Ok(Err(ImageError::transfer(
                     &fetcher.name,
                     FailureClass::Invalid,
@@ -650,7 +653,7 @@ impl StagedFetch {
                     )
                 })
             };
-            let metadata = match (read(toc), read(ts)) {
+            let metadata = match (read(toc), ts.map_or(Ok(Vec::new()), read)) {
                 (Ok(t), Ok(m)) => (t, m),
                 (Err(e), _) | (_, Err(e)) => return Ok(Err(e)),
             };

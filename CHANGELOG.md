@@ -129,6 +129,17 @@ without the numbers of issues or pull requests of any tracker.
 - `Remove` in the interface `org.velarx.Monitor`: the monitor removes its
   container (stopped first with `force`), as it does when an `--rm`
   container exits, and answers once it is gone; `velarx rm` uses it.
+- A layer that a build, a commit or a squash makes is the canonical tar of
+  its table of contents: its diff id is the digest of that tar, and no
+  tar-split is kept for it.  Pushed as `zstd:chunked` it is a layer of
+  version 2 (`io.github.containers.zstd-chunked.version`, `"version": 2` in
+  its table of contents, no tar-split), which any reader of tar and zstd
+  reads, and which a pull, lazy or not, takes by its table alone.  Pulled
+  layers keep their diff ids and their tar-split, and are pushed as they
+  were.  A whiteout has the mode 0644, the owner 0:0 and the time 0 in
+  every layer.  A table of version 2 that is not canonical is an error that
+  names the layer.  The steps that the build cache of an earlier release
+  has are built again.
 
 ### Changed
 

@@ -39,7 +39,7 @@ use tracing::debug;
 use velarx_db::ChunkLocation as ChunkLocationRecord;
 use velarx_proto::transfer::FailureClass;
 use velarx_registry::target::Target;
-use velarx_storage::{Toc, TocEntry, TocEntryType, TOC_VERSION};
+use velarx_storage::{canonical, Toc, TocEntry, TocEntryType, TOC_VERSION};
 use velarx_types::digest::{Algorithm, Digest, DigestWriter, Offloaded};
 use velarx_types::{ImageError, ImageResult, LayerKey, OciDescriptor};
 
@@ -244,19 +244,18 @@ pub(super) async fn metadata(
 }
 
 /// The verified table of contents and tar-split of a layer pulled by ranges
-/// (what the feed of a pull shows a driver of the layer): fetched now.  None for a layer that is not zstd:chunked.
+/// (what the feed of a pull shows a driver of the layer): fetched now.  None
+/// for a layer that is not zstd:chunked, or has no tar-split and a table of
+/// version 1.
 pub async fn layer_index(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<Option<Metadata>> {
     let Some(info) = parse_info(layer)? else {
         return Ok(None);
     };
-    let Some(tarsplit) = info.tarsplit else {
-        return Ok(None);
-    };
     let (toc_z, ts_z) = metadata(ctx, layer).await?;
-    tokio::task::spawn_blocking(move || verify_metadata(&info, &toc_z, ts_z, tarsplit.2))
+    let digest = layer.digest;
+    tokio::task::spawn_blocking(move || verify_metadata(&info, &toc_z, ts_z, &digest))
         .await
         .map_err(|e| fail(e.to_string()))?
-        .map(Some)
 }
 
 /// Decompress at most `max` bytes, and exactly `expected` if it is known.
@@ -284,12 +283,26 @@ pub struct Metadata {
     pub tarsplit_size: u64,
 }
 
+/// The error of a table of contents of version 2 that is not one: the
+/// descriptor vouches for it, so the layer is not pulled another way.
+fn invalid_canonical(layer: &Digest, reason: impl std::fmt::Display) -> ImageError {
+    ImageError::Contradicted(format!(
+        "layer {layer}: invalid zstd:chunked version 2 table of contents: {reason}"
+    ))
+}
+
+/// The table of contents (and the tar-split, which a layer with a table of
+/// version 2 has not) that a descriptor vouches for, checked against what
+/// it says.  The table of a layer is the one of a canonical tar when its
+/// `version` is 2, whatever the annotations say: it must be one, and then
+/// it is all the layer has.  None for a layer that has neither a tar-split
+/// nor such a table: it is pulled whole.
 pub fn verify_metadata(
     info: &Info,
     toc_z: &[u8],
     ts_z: Vec<u8>,
-    ts_size: u64,
-) -> ImageResult<Metadata> {
+    layer: &Digest,
+) -> ImageResult<Option<Metadata>> {
     // (what the descriptor vouches for: bytes that are not it are not a
     // layer to pull another way, see `pull`)
     let actual = Digest::of(info.checksum.alg(), toc_z);
@@ -305,6 +318,20 @@ pub fn verify_metadata(
     if let Some(problem) = entry::toc_problem(&toc.entries) {
         return Err(fail(problem));
     }
+    if toc.is_canonical() {
+        if info.tarsplit.is_some() || toc.tar_split_digest.is_some() {
+            return Err(invalid_canonical(layer, "the layer has a tar-split"));
+        }
+        canonical::validate(&toc.entries).map_err(|e| invalid_canonical(layer, e))?;
+        return Ok(Some(Metadata {
+            toc: Arc::new(toc),
+            tarsplit_z: bytes::Bytes::new(),
+            tarsplit_size: 0,
+        }));
+    }
+    let Some(tarsplit) = info.tarsplit else {
+        return Ok(None);
+    };
     let expected = toc
         .tar_split_digest
         .as_deref()
@@ -321,11 +348,11 @@ pub fn verify_metadata(
             actual: actual.to_string(),
         });
     }
-    Ok(Metadata {
+    Ok(Some(Metadata {
         toc: Arc::new(toc),
         tarsplit_z: ts_z.into(),
-        tarsplit_size: ts_size,
-    })
+        tarsplit_size: tarsplit.2,
+    }))
 }
 
 #[derive(Debug)]
@@ -1815,20 +1842,7 @@ pub async fn pull(
     let Some(info) = parse_info(layer)? else {
         return Ok(Outcome::Fallback("not zstd:chunked".into()));
     };
-    let Some(tarsplit) = info.tarsplit else {
-        return Ok(Outcome::Fallback("no tar-split annotation".into()));
-    };
-    match try_pull(
-        ctx,
-        target,
-        layer,
-        &info,
-        tarsplit,
-        expected_diff_id,
-        progress,
-    )
-    .await
-    {
+    match try_pull(ctx, target, layer, &info, expected_diff_id, progress).await {
         Ok(p) => Ok(Outcome::Done(Box::new(p))),
         // (nor is a machine that cannot write)
         Err(e) if no_other_route(&e) => Err(e),
@@ -1841,7 +1855,6 @@ async fn try_pull(
     target: &Target,
     layer: &OciDescriptor,
     info: &Info,
-    tarsplit: (u64, u64, u64),
     expected_diff_id: &Digest,
     progress: impl Fn(u64) + Send + Sync + 'static,
 ) -> ImageResult<Pulled> {
@@ -1855,12 +1868,14 @@ async fn try_pull(
         started.elapsed()
     );
     let metadata_bytes = (toc_z.len() + ts_z.len()) as u64;
+    let digest = layer.digest;
     let meta = tokio::task::spawn_blocking({
         let info = info.clone();
-        move || verify_metadata(&info, &toc_z, ts_z, tarsplit.2)
+        move || verify_metadata(&info, &toc_z, ts_z, &digest)
     })
     .await
-    .map_err(|e| fail(e.to_string()))??;
+    .map_err(|e| fail(e.to_string()))??
+    .ok_or_else(|| fail("no tar-split annotation"))?;
 
     debug!(
         "Layer {}: metadata verified after {:?}",
@@ -2173,10 +2188,17 @@ async fn unpack_from(
         .map_err(|e| (e, false))?;
     let alg = LayerKey::expected(layer).digest().alg();
     let intake = Intake::new(ctx.sink.clone(), alg, ctx.limits.workers);
-    let whole = staged
+    let whole = match staged
         .fetch_whole(&staging, layer, registry_only, progress, &intake)
         .await
-        .map_err(|e| (e, false))?;
+    {
+        Ok(whole) => whole,
+        Err(e) => {
+            // (the files handed over until then are still being taken in)
+            let _ = intake.finish().await;
+            return Err((e, false));
+        }
+    };
     let sourced = !whole.by_registry;
     let diff_alg = expected_diff_id.alg();
     let tarsplit = bytes::Bytes::from(whole.tarsplit);
@@ -2362,14 +2384,23 @@ async fn verify_layer(
     let executed = execute(ctx, layer, plan, started).await?;
     // (the entries are those of the tar headers of the verified tar-split,
     // with the digests and the chunks of the verified table: what a lazy
-    // layer records)
-    let toc = super::lazy::merge_toc(&meta.toc, plan_alg, meta.tarsplit_z.clone())?;
+    // layer records; the table of a canonical layer is all there is)
+    let toc = if meta.toc.is_canonical() {
+        (*meta.toc).clone()
+    } else {
+        let merged = super::lazy::merge_toc(&meta.toc, plan_alg, meta.tarsplit_z.clone())?;
+        Toc {
+            version: TOC_VERSION,
+            entries: merged.entries,
+            tar_split_digest: Some(Digest::of(plan_alg, &meta.tarsplit_z).to_string()),
+        }
+    };
     let files = FileUse::of_toc(&toc);
     // (the places of the chunks the verified table gives: each file is
     // named by what the commit checks it against, and the fetch of a chunk
     // from it checks the bytes)
     let located = located_chunks(&toc);
-    let (diff_id, entries) = (*expected_diff_id, toc.entries);
+    let diff_id = *expected_diff_id;
     // (the chunks checked as they came, and those the table gives for the
     // read, staged or stored: each place once)
     let mut chunk_records = executed.verified_chunks()?;
@@ -2378,11 +2409,7 @@ async fn verify_layer(
     let report = executed.report(metadata_bytes);
     Ok(Pulled {
         from_store: executed.from_store,
-        toc: Toc {
-            version: TOC_VERSION,
-            entries,
-            tar_split_digest: Some(Digest::of(plan_alg, &meta.tarsplit_z).to_string()),
-        },
+        toc,
         files,
         chunks: chunk_records,
         report,

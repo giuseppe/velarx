@@ -170,7 +170,6 @@ impl RegistryFetch {
         pool: &Arc<Pool>,
         layer: &OciDescriptor,
         info: &chunked::Info,
-        tarsplit: (u64, u64, u64),
     ) -> Result<(Vec<u8>, Vec<u8>), ImageError> {
         let span = |(o, l): (u64, u64)| -> Result<Range<u64>, ImageError> {
             let end = o.checked_add(l).filter(|&e| {
@@ -179,10 +178,30 @@ impl RegistryFetch {
             end.map(|e| o..e)
                 .ok_or_else(|| ImageError::Layer("metadata outside the blob".into()))
         };
-        let (toc, ts) = (
-            span((info.toc.0, info.toc.1))?,
-            span((tarsplit.0, tarsplit.1))?,
-        );
+        let toc = span((info.toc.0, info.toc.1))?;
+        // (a canonical layer has no tar-split: its table of contents alone)
+        let Some(ts) = info.tarsplit.map(|t| span((t.0, t.1))).transpose()? else {
+            let mut got: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+            ranges_into(
+                pool,
+                &layer.digest,
+                std::slice::from_ref(&toc),
+                Some(0),
+                &mut got,
+            )
+            .await
+            .map_err(|e| match e {
+                RangesError::Rejected(s) => {
+                    ImageError::Registry(format!("range request refused: {s}"))
+                }
+                RangesError::Other(e) => e,
+            })?;
+            let [toc_z, _] = got;
+            if toc_z.len() as u64 != toc.end - toc.start {
+                return Err(ImageError::Layer("incomplete zstd:chunked metadata".into()));
+            }
+            return Ok((toc_z, Vec::new()));
+        };
         let mut wanted = vec![toc.clone(), ts.clone()];
         let swapped = ts.start < toc.start;
         if swapped {
@@ -761,12 +780,7 @@ impl StagingFetcher for RegistryFetch {
                     continue;
                 }
             };
-            let Some(tarsplit) = info.tarsplit else {
-                let unpack = reply(TocSource::Unpack, false, Some(NotLazy::NoToc));
-                out.send(unpack).await.map_err(|_| failed("gone"))?;
-                continue;
-            };
-            let (toc_z, ts_z) = match self.metadata(&pool, layer, &info, tarsplit).await {
+            let (toc_z, ts_z) = match self.metadata(&pool, layer, &info).await {
                 Ok(m) => m,
                 // (the ranges of the blob cannot be had: the layer is read
                 // whole, and is not one to serve on demand)
@@ -783,27 +797,37 @@ impl StagingFetcher for RegistryFetch {
             // descriptor's)
             let checked = {
                 let (info, toc_z, ts_z) = (info.clone(), toc_z.clone(), ts_z.clone());
+                let digest = layer.digest;
                 tokio::task::spawn_blocking(move || {
-                    chunked::verify_metadata(&info, &toc_z, ts_z, tarsplit.2)
+                    chunked::verify_metadata(&info, &toc_z, ts_z, &digest)
                 })
                 .await
                 .map_err(failed)?
             };
+            // (no tar-split, and a table that is not a canonical layer's:
+            // the layer is read whole)
+            if matches!(checked, Ok(None)) {
+                let unpack = reply(TocSource::Unpack, false, Some(NotLazy::NoToc));
+                out.send(unpack).await.map_err(|_| failed("gone"))?;
+                continue;
+            }
             let on_demand = checked.is_ok_and(|meta| {
-                meta.toc
-                    .entries
-                    .iter()
-                    .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
-                    .all(|e| e.verity().is_some())
+                meta.is_some_and(|meta| {
+                    meta.toc
+                        .entries
+                        .iter()
+                        .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+                        .all(|e| e.verity().is_some())
+                })
             });
-            let fds = vec![
-                velarx_base::sealed::sealed_memory(&toc_z).map_err(failed)?,
-                velarx_base::sealed::sealed_memory(&ts_z).map_err(failed)?,
-            ];
+            let mut fds = vec![velarx_base::sealed::sealed_memory(&toc_z).map_err(failed)?];
+            if info.tarsplit.is_some() {
+                fds.push(velarx_base::sealed::sealed_memory(&ts_z).map_err(failed)?);
+            }
             out.send_with(
                 Probed {
                     toc_file: Some(0),
-                    tarsplit_file: Some(1),
+                    tarsplit_file: info.tarsplit.map(|_| 1),
                     ..reply(
                         TocSource::Carried,
                         on_demand,

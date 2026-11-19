@@ -500,15 +500,16 @@ impl ImageService {
         ) else {
             return Ok(None);
         };
+        let toc: Toc = serde_json::from_str(toc)?;
+        // (a canonical layer has none: its table of contents has the tar)
         let Some(tarsplit) = self
             .db
             .get_layer_tarsplit(key)
             .await?
-            .filter(|t| !t.is_empty())
+            .filter(|t| t.is_empty() == toc.is_canonical())
         else {
             return Ok(None);
         };
-        let toc: Toc = serde_json::from_str(toc)?;
         let store = self.file_store.clone();
         let files = layer_files(&toc);
         let whole =

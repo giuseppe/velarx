@@ -140,7 +140,8 @@ pub struct Probed {
     /// Why not, when `on_demand` is false
     pub reason: Option<NotLazy>,
     /// With `toc` carried: the table of contents and the tar-split, sealed
-    /// memory files among the descriptors of this reply
+    /// memory files among the descriptors of this reply (a layer whose table
+    /// of contents has `"version": 2` has no tar-split)
     pub toc_file: Option<u32>,
     pub tarsplit_file: Option<u32>,
 }

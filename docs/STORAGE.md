@@ -126,7 +126,9 @@ Every method of `StorageDriver`, and what a varlink client does for it.
 | `list_stores`, `drop_store` | `ListStores`, `DropStore` (a driver of a single store, the engine's own, answers `unsupported`) |
 
 What is not in the trait because it is the engine's own: the stream of a
-layer's diff id (`objects::open_layer`, from the tar-split and `ReadObjects`),
+layer's diff id (`objects::open_layer`, from the tar-split and `ReadObjects`, or
+from the table of contents alone for a layer that is a canonical tar, which has
+no tar-split),
 the owners of the files of the layers (`objects::image_owners`), the digest of
 the merged image a sealed manifest states, the mode of `composefs_digests`, and
 what is served to peers (the store service serves the objects when the driver

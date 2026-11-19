@@ -329,14 +329,15 @@ fn test_metadata_checks() {
         checksum: crate::sha256(&toc_z),
         tarsplit: Some((0, 2, 0)),
     };
-    assert!(verify_metadata(&info, &toc_z, b"ts".to_vec(), 0).is_ok());
+    let layer = crate::sha256(b"layer");
+    assert!(verify_metadata(&info, &toc_z, b"ts".to_vec(), &layer).is_ok());
     let mut bad = info.clone();
     bad.checksum = crate::sha256(b"other");
-    assert!(verify_metadata(&bad, &toc_z, b"ts".to_vec(), 0).is_err());
-    assert!(verify_metadata(&info, &toc_z, b"tx".to_vec(), 0).is_err());
+    assert!(verify_metadata(&bad, &toc_z, b"ts".to_vec(), &layer).is_err());
+    assert!(verify_metadata(&info, &toc_z, b"tx".to_vec(), &layer).is_err());
     let mut bad = info.clone();
     bad.toc.2 += 1;
-    assert!(verify_metadata(&bad, &toc_z, b"ts".to_vec(), 0).is_err());
+    assert!(verify_metadata(&bad, &toc_z, b"ts".to_vec(), &layer).is_err());
 }
 
 #[test]
@@ -1398,4 +1399,147 @@ fn a_file_of_another_size_than_the_claim_says_is_refused() {
         Err(e) => assert!(e.to_string().contains("invalid content"), "{e}"),
         Ok(_) => panic!("a copy of another size was taken"),
     }
+}
+
+/// The table of contents of a layer of the canonical tar of a root, a
+/// directory and two files, as the writer makes it.
+fn canonical_layer() -> Toc {
+    use crate::layer::writer::{write_canonical_layer, Compression, ANNOTATION_PREFIX};
+    let entries = [
+        canonical_entry("./", TocEntryType::Dir, 0),
+        canonical_entry("./d/", TocEntryType::Dir, 0),
+        canonical_entry("./d/a", TocEntryType::Reg, 5),
+        canonical_entry("./d/b", TocEntryType::Reg, 700),
+    ];
+    let mut tar = Vec::new();
+    velarx_storage::canonical::write(&entries, &mut tar, |e, out| {
+        out.write_all(&vec![b'a' + e.size as u8 % 20; e.size as usize])
+    })
+    .unwrap();
+    let mut blob = Vec::new();
+    let w = write_canonical_layer(
+        &tar[..],
+        Algorithm::Sha256,
+        Compression::ZstdChunked,
+        None,
+        &mut blob,
+    )
+    .unwrap();
+    let a = |k: &str| w.annotations[&format!("{ANNOTATION_PREFIX}{k}")].clone();
+    let position: Vec<u64> = a("manifest-position")
+        .split(':')
+        .map(|n| n.parse().unwrap())
+        .collect();
+    let toc_z = &blob[position[0] as usize..(position[0] + position[1]) as usize];
+    serde_json::from_slice(&zstd::decode_all(toc_z).unwrap()).unwrap()
+}
+
+fn canonical_entry(name: &str, kind: TocEntryType, size: u64) -> TocEntry {
+    TocEntry {
+        name: name.to_string(),
+        entry_type: kind,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        size,
+        digest: None,
+        fsverity: None,
+        offset: 0,
+        end_offset: 0,
+        chunk_digest: None,
+        chunk_size: 0,
+        chunk_offset: 0,
+        chunk_type: None,
+        link_name: None,
+        mod_time: None,
+        access_time: None,
+        change_time: None,
+        dev_major: None,
+        dev_minor: None,
+        xattrs: Default::default(),
+    }
+}
+
+/// `toc` as the compressed table a descriptor vouches for.
+fn vouched(toc: &Toc, tarsplit: Option<(u64, u64, u64)>) -> (Vec<u8>, Info) {
+    let json = serde_json::to_vec(toc).unwrap();
+    let z = zstd::encode_all(&json[..], 3).unwrap();
+    let info = Info {
+        toc: (0, z.len() as u64, json.len() as u64),
+        checksum: crate::sha256(&z),
+        tarsplit,
+    };
+    (z, info)
+}
+
+#[test]
+fn test_a_canonical_layer_needs_no_tar_split() {
+    let layer = crate::sha256(b"layer");
+    let toc = canonical_layer();
+    assert!(toc.is_canonical() && toc.tar_split_digest.is_none());
+    let (z, info) = vouched(&toc, None);
+    let meta = verify_metadata(&info, &z, Vec::new(), &layer)
+        .unwrap()
+        .unwrap();
+    assert!(meta.tarsplit_z.is_empty());
+    assert_eq!(meta.toc.entries.len(), toc.entries.len());
+}
+
+#[test]
+fn test_a_table_of_version_2_that_is_not_canonical_is_an_error_that_names_the_layer() {
+    let layer = crate::sha256(b"layer");
+    let good = canonical_layer();
+    let refused = |toc: &Toc, tarsplit| {
+        let (z, info) = vouched(toc, tarsplit);
+        let e = verify_metadata(&info, &z, b"ts".to_vec(), &layer)
+            .err()
+            .unwrap();
+        // (the descriptor vouches for it: the layer is not pulled whole)
+        assert!(refuses(&e), "{e}");
+        let text = e.to_string();
+        assert!(text.contains(&layer.to_string()), "{text}");
+        assert!(text.contains("version 2 table of contents"), "{text}");
+        text
+    };
+    // names not in the order of the tar
+    let mut toc = good.clone();
+    toc.entries.swap(2, 3);
+    assert!(refused(&toc, None).contains("sorts before"));
+    // a name that is not a canonical path
+    let mut toc = good.clone();
+    toc.entries[2].name = "d/a".into();
+    refused(&toc, None);
+    // a file with content and no fs-verity digest
+    let mut toc = good.clone();
+    toc.entries[3].fsverity = None;
+    assert!(refused(&toc, None).contains("fs-verity"));
+    // a table that has a tar-split, or says it has
+    let mut toc = good.clone();
+    toc.tar_split_digest = Some(crate::sha256(b"ts").to_string());
+    assert!(refused(&toc, None).contains("tar-split"));
+    assert!(refused(&good, Some((0, 2, 0))).contains("tar-split"));
+    // an entry the tar cannot say
+    let mut toc = good.clone();
+    toc.entries[1].size = 3;
+    refused(&toc, None);
+}
+
+#[test]
+fn test_a_table_of_version_1_without_a_tar_split_is_pulled_whole() {
+    let layer = crate::sha256(b"layer");
+    let toc = Toc {
+        version: 1,
+        entries: Vec::new(),
+        tar_split_digest: None,
+    };
+    let (z, info) = vouched(&toc, None);
+    assert!(verify_metadata(&info, &z, Vec::new(), &layer)
+        .unwrap()
+        .is_none());
+    // a table of a version this does not know is the same
+    let toc = Toc { version: 3, ..toc };
+    let (z, info) = vouched(&toc, None);
+    assert!(verify_metadata(&info, &z, Vec::new(), &layer)
+        .unwrap()
+        .is_none());
 }
