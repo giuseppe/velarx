@@ -22,7 +22,7 @@ setup_file () {
             "$XDG_CONFIG_HOME/velarx/config.toml" > "$WORKDIR/$d.toml"
     done
     echo 'storage.driver = "vfs"' | cat - "$WORKDIR/vfs.toml" > "$WORKDIR/vfs.new" && mv "$WORKDIR/vfs.new" "$WORKDIR/vfs.toml"
-    BINARIES="sh cat env sleep true false echo ls stat getfattr" e2e_make_rootfs
+    BINARIES="sh cat env sleep true false echo ls stat getfattr chmod" e2e_make_rootfs
     # the files of the image, and a first entry `./` that is not a plain
     # directory: mode 01750, owner 1000:1000, a time before 1970, an attribute
     # (the second has an attribute the engine cannot set, the first a plain
@@ -116,18 +116,30 @@ dg
 }
 
 # The image a commit or a build step makes of a container keeps its root: the
-# layer has the entry `./` (a layer without it has a plain root).
-@test "composefs: a commit and a build step keep the root" {
-    local i
+# layer has the entry `./` (a layer without it has a plain root), whatever the
+# step is (those that run a container and those that copy files or make
+# directories), whatever the driver, and for a build that squashes its layers.
+@test "composefs and vfs: a commit and a build step keep the root" {
+    local d step
     mkdir -p "$WORKDIR/ctx"
-    printf 'FROM localhost/root-dir:1\nRUN true\n' > "$WORKDIR/ctx/Containerfile"
-    v () { "$BIN/velarx" --config "$WORKDIR/composefs.toml" "$@"; }
-    v container create --name c --network none localhost/root-dir:1 true > /dev/null || exit 1
-    v container commit c localhost/root-dir:commit > /dev/null || exit 1
-    v container rm c > /dev/null
-    v build -q -t localhost/root-dir:built "$WORKDIR/ctx" > /dev/null || exit 1
-    for i in commit built; do
-        check "the root of the image of a $i" "1750 1000:1000" \
-            "$(v container run --rm --network none localhost/root-dir:$i stat -c '%a %u:%g' /)"
+    echo f > "$WORKDIR/ctx/f"
+    for d in composefs vfs; do
+        v () { "$BIN/velarx" --config "$WORKDIR/$d.toml" "$@"; }
+        v container create --name c --network none localhost/root-dir:1 true > /dev/null || exit 1
+        v container commit c localhost/root-dir:commit > /dev/null || exit 1
+        v container rm c > /dev/null
+        check "the root of the image of a commit on $d" "1750 1000:1000" \
+            "$(v container run --rm --network none localhost/root-dir:commit stat -c '%a %u:%g' /)"
+        for step in "RUN true" "COPY f /f" "ADD f /g" "WORKDIR /w" "VOLUME /v" "RUN chmod 0711 /"; do
+            printf 'FROM localhost/root-dir:1\n%s\n' "$step" > "$WORKDIR/ctx/Containerfile"
+            want="1750 1000:1000"
+            [ "$step" != "RUN chmod 0711 /" ] || want="711 1000:1000"
+            v build -q --no-cache -t localhost/root-dir:built "$WORKDIR/ctx" > /dev/null || exit 1
+            check "the root of the image of $step on $d" "$want" \
+                "$(v container run --rm --network none localhost/root-dir:built stat -c '%a %u:%g' /)"
+            v build -q --no-cache --squash -t localhost/root-dir:squashed "$WORKDIR/ctx" > /dev/null || exit 1
+            check "the root of the squashed image of $step on $d" "$want" \
+                "$(v container run --rm --network none localhost/root-dir:squashed stat -c '%a %u:%g' /)"
+        done
     done
 }

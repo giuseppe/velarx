@@ -293,6 +293,7 @@ pub fn write<W: HoleWrite>(dir: BorrowedFd<'_>, opts: &Options, out: W) -> io::R
     };
     let lower = lower_of(opts)?;
     let mut w = walker(&mut tar, opts);
+    w.write_root(dir)?;
     let root = CopyDir::new(String::new(), Some(VIEW_ROOT));
     WALK.run(
         dir.try_clone_to_owned()?,

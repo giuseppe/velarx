@@ -484,7 +484,7 @@ mod tests {
                 size: 1,
             }]
         };
-        let names = |mode: u32, root_entry: dirtar::Root| {
+        let names = |mode: u32, root_entry: dirtar::Root, below: Option<u32>| {
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
             let fd = rustix::fs::openat(
                 rustix::fs::CWD,
@@ -497,6 +497,12 @@ mod tests {
                 uid_map: own(rustix::process::getuid().as_raw()),
                 gid_map: own(rustix::process::getgid().as_raw()),
                 root: root_entry,
+                below: below.map(|mode| {
+                    std::sync::Arc::new(velarx_storage::TocEntry {
+                        mode,
+                        ..velarx_storage::TocEntry::new("./", velarx_storage::TocEntryType::Dir)
+                    })
+                }),
                 ..Default::default()
             };
             let sink: Arc<dyn Sink> = session(tmp.path(), "walk");
@@ -511,15 +517,31 @@ mod tests {
             .unwrap();
             assert_eq!(size, canonical::stream_size(&made.toc.entries).unwrap());
             let e = &made.toc.entries[0];
-            if e.name == "./" {
+            if e.name == "./" && below.is_none() {
                 assert_eq!((e.mode, e.uid, e.gid), (mode, 0, 0));
             }
             let names: Vec<String> = made.toc.entries.iter().map(|e| e.name.clone()).collect();
             names
         };
-        assert_eq!(names(0o755, dirtar::Root::Always), ["./", "./!x", "./a"]);
-        assert_eq!(names(0o700, dirtar::Root::Changed), ["./", "./!x", "./a"]);
-        assert_eq!(names(0o755, dirtar::Root::Changed), ["./!x", "./a"]);
-        assert_eq!(names(0o700, dirtar::Root::Never), ["./!x", "./a"]);
+        assert_eq!(
+            names(0o755, dirtar::Root::Always, None),
+            ["./", "./!x", "./a"]
+        );
+        assert_eq!(
+            names(0o700, dirtar::Root::Changed, None),
+            ["./", "./!x", "./a"]
+        );
+        assert_eq!(names(0o755, dirtar::Root::Changed, None), ["./!x", "./a"]);
+        assert_eq!(names(0o700, dirtar::Root::Never, None), ["./!x", "./a"]);
+        // the root of the file system the directory is a copy into is the
+        // entry, whatever the directory has
+        assert_eq!(
+            names(0o755, dirtar::Root::Changed, Some(0o1750)),
+            ["./", "./!x", "./a"]
+        );
+        assert_eq!(
+            names(0o700, dirtar::Root::Changed, Some(0o755)),
+            ["./!x", "./a"]
+        );
     }
 }

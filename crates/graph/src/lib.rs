@@ -809,6 +809,8 @@ pub struct DiffOptions {
     pub gid_map: Vec<IdRange>,
     /// The times of the files of the layer.
     pub mtime: Mtime,
+    /// When the layer has an entry for the root (`./`).
+    pub root: dirtar::Root,
 }
 
 impl From<&dirtar::Options> for DiffOptions {
@@ -819,6 +821,7 @@ impl From<&dirtar::Options> for DiffOptions {
             uid_map: o.uid_map.clone(),
             gid_map: o.gid_map.clone(),
             mtime: o.mtime,
+            root: o.root,
         }
     }
 }
@@ -849,6 +852,7 @@ impl DiffOptions {
             uid_map: self.uid_map.clone(),
             gid_map: self.gid_map.clone(),
             mtime: self.mtime,
+            root: self.root,
             ..Default::default()
         }
     }
@@ -951,6 +955,17 @@ impl WritableDiff {
                 | rustix::fs::OFlags::CLOEXEC,
             rustix::fs::Mode::empty(),
         )?;
+        // (a plain root, the one a container has when the tar has no entry
+        // for it: the entry replaces these; a walk that gives no root has
+        // no use for it)
+        if walk.root != dirtar::Root::Never {
+            rustix::fs::fchmod(&fd, rustix::fs::Mode::from_raw_mode(0o755))?;
+            rustix::fs::fchown(
+                &fd,
+                Some(rustix::fs::Uid::from_raw(root.0)),
+                Some(rustix::fs::Gid::from_raw(root.1)),
+            )?;
+        }
         let ex = velarx_wire::cp::ExtractOptions {
             archive_owners: Some(maps),
             owner: Some(root),
@@ -961,9 +976,8 @@ impl WritableDiff {
         velarx_wire::cp::extract(tar, rustix::fd::AsFd::as_fd(&fd), &ex)?;
         let mut o = walk.clone();
         // (the tar says what changed: nothing is compared with the image
-        // again; the root of the directory is not the container's)
+        // again)
         o.lower = None;
-        o.root = dirtar::Root::Never;
         Ok(ChangesDir {
             path: dir.path().to_path_buf(),
             walk: o,

@@ -140,6 +140,10 @@ pub struct Options {
     pub unowned: Option<(u32, u32)>,
     /// When the layer has an entry for the directory itself (`./`).
     pub root: Root,
+    /// The root of the file system the changes are made on: the directory
+    /// is not one (the files of a `COPY`), and what it has for `./` is this
+    /// entry, the one the layers below leave visible.
+    pub below: Option<Arc<velarx_storage::TocEntry>>,
 }
 
 /// When the layer of the changes in a directory has an entry for its root:
@@ -629,6 +633,34 @@ struct Walker<'o> {
 }
 
 impl Walker<'_> {
+    /// The header and the attributes of the root `e` of a table of contents.
+    fn root_of(&self, e: &velarx_storage::TocEntry) -> (tar::Header, Attrs) {
+        use base64::Engine;
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_mode(e.mode & 0o7777);
+        h.set_uid(e.uid.into());
+        h.set_gid(e.gid.into());
+        h.set_mtime(self.opts.mtime.of(e.mtime().0));
+        h.set_size(0);
+        let xattrs = e
+            .xattrs
+            .iter()
+            .filter(|(k, _)| !velarx_fuse::hidden_xattr(k))
+            .filter_map(|(k, v)| {
+                let v = base64::engine::general_purpose::STANDARD.decode(v).ok()?;
+                Some((k.clone().into_bytes(), v))
+            })
+            .collect();
+        (
+            h,
+            Attrs {
+                xattrs,
+                ..Attrs::default()
+            },
+        )
+    }
+
     fn header(&self, st: &Stat, kind: tar::EntryType) -> io::Result<tar::Header> {
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(kind);
@@ -1169,17 +1201,28 @@ const WALK: Walk = Walk {
 };
 
 impl Walker<'_> {
-    /// Walk the upper directory `dir`.
-    fn walk_upper(&mut self, dir: BorrowedFd<'_>) -> io::Result<()> {
+    /// Write the entry for the root `dir` as `opts.root` says.
+    fn write_root(&mut self, dir: BorrowedFd<'_>) -> io::Result<()> {
         if self.opts.root != Root::Never {
-            let st = fstat(dir)?;
-            let mut h = self.header(&st, tar::EntryType::Directory)?;
-            let attrs = read_xattrs(dir, OsStr::new("."), "/", false, true)?;
+            let (mut h, attrs) = match self.opts.below.clone() {
+                Some(e) => self.root_of(&e),
+                None => {
+                    let st = fstat(dir)?;
+                    let h = self.header(&st, tar::EntryType::Directory)?;
+                    (h, read_xattrs(dir, OsStr::new("."), "/", false, true)?)
+                }
+            };
             let plain = (h.mode()?, h.uid()?, h.gid()?) == (0o755, 0, 0) && attrs.xattrs.is_empty();
             if self.opts.root == Root::Always || !plain {
                 self.append(&mut h, "./", &attrs.xattrs, Content::None)?;
             }
         }
+        Ok(())
+    }
+
+    /// Walk the upper directory `dir`.
+    fn walk_upper(&mut self, dir: BorrowedFd<'_>) -> io::Result<()> {
+        self.write_root(dir)?;
         let root = UpperDir::root(&self.opts);
         WALK.run(dir.try_clone_to_owned()?, root, &mut UpperWalk(self))?;
         Ok(())
@@ -2072,6 +2115,46 @@ mod tests {
         copydiff::write(open(&copy).as_fd(), &opts, &mut tar).unwrap();
         let names: Vec<String> = entries(&tar).into_iter().map(|e| e.0).collect();
         assert_eq!(names, ["new", ".wh.etc", ".wh.opt", ".wh.run"]);
+    }
+
+    /// The tar of a copy has the entry for its root when the options ask for
+    /// it: always, or when the root is not a plain one.
+    #[test]
+    fn test_the_tar_of_a_copy_has_its_root_when_asked() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let copy = d.path().join("copy");
+        std::fs::create_dir_all(&copy).unwrap();
+        let (lower, _) = lower(d.path());
+        let names = |mode: u32, root: Root| {
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(mode)).unwrap();
+            let own = |host| {
+                vec![IdRange {
+                    container: 0,
+                    host,
+                    size: 1,
+                }]
+            };
+            let opts = Options {
+                lower: Some(lower.clone()),
+                uid_map: own(rustix::process::getuid().as_raw()),
+                gid_map: own(rustix::process::getgid().as_raw()),
+                root,
+                ..Default::default()
+            };
+            let mut tar = Vec::new();
+            copydiff::write(open(&copy).as_fd(), &opts, &mut tar).unwrap();
+            entries(&tar)
+                .into_iter()
+                .map(|e| e.0)
+                .filter(|n| n.starts_with("./"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(0o755, Root::Never), [] as [&str; 0]);
+        assert_eq!(names(0o711, Root::Never), [] as [&str; 0]);
+        assert_eq!(names(0o755, Root::Changed), [] as [&str; 0]);
+        assert_eq!(names(0o711, Root::Changed), ["./"]);
+        assert_eq!(names(0o755, Root::Always), ["./"]);
     }
 
     /// A tree the container made, deeper than a thread of the blocking pool

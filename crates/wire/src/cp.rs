@@ -760,18 +760,30 @@ fn set_link_times(dir: &OwnedFd, name: &OsStr, stamp: &Timestamps) -> io::Result
 pub fn extract<R: Read>(r: R, base: BorrowedFd<'_>, opts: &ExtractOptions) -> io::Result<()> {
     let mut ar = crate::sparse::archive(r);
     let mut dir_times: Vec<(PathBuf, i64)> = Vec::new();
+    let mut root_time = None;
     for entry in ar.entries()? {
         let mut entry = entry?;
         let raw = crate::sparse::path(&mut entry)?;
         let rel = entry_path(&raw, &opts.rename)?;
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
         let xattrs = if opts.layer {
             layer_xattrs(&mut entry)?
         } else {
             Vec::new()
         };
+        if rel.as_os_str().is_empty() {
+            // (the root of a layer in an upper directory is the base)
+            if opts.overlay_upper && entry.header().entry_type() == tar::EntryType::Directory {
+                chown_fd(base, owner_of(entry.header(), opts))?;
+                let magic = velarx_sys::fd::proc_str(&base);
+                chmod(
+                    magic.as_str(),
+                    Mode::from_raw_mode(entry.header().mode().unwrap_or(0o755) & 0o7777),
+                )?;
+                set_xattrs(Path::new(&magic), true, &xattrs, &rel)?;
+                root_time = Some(entry.header().mtime().unwrap_or(0).min(i64::MAX as u64) as i64);
+            }
+            continue;
+        }
         let (dir, name) = parent_dir(base, &rel, opts.owner)?;
         let mtime = entry.header().mtime().unwrap_or(0).min(i64::MAX as u64) as i64;
         let stamp = Timestamps {
@@ -832,20 +844,7 @@ pub fn extract<R: Read>(r: R, base: BorrowedFd<'_>, opts: &ExtractOptions) -> io
                 continue;
             }
         }
-        let owner = match &opts.archive_owners {
-            Some(maps) => {
-                let h = entry.header();
-                match (h.uid(), h.gid()) {
-                    (Ok(u), Ok(g)) => u32::try_from(u)
-                        .ok()
-                        .zip(u32::try_from(g).ok())
-                        .and_then(|(u, g)| maps.to_host(u, g))
-                        .or(opts.owner),
-                    _ => opts.owner,
-                }
-            }
-            None => opts.owner,
-        };
+        let owner = owner_of(entry.header(), opts);
         let mode = Mode::from_raw_mode(entry.header().mode().unwrap_or(0o644) & 0o7777);
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
@@ -1030,6 +1029,17 @@ pub fn extract<R: Read>(r: R, base: BorrowedFd<'_>, opts: &ExtractOptions) -> io
             other => tracing::warn!("cp: entry {} of type {:?} skipped", rel.display(), other),
         }
     }
+    if let Some(mtime) = root_time {
+        let at = Timespec {
+            tv_sec: mtime,
+            tv_nsec: 0,
+        };
+        let stamp = Timestamps {
+            last_access: at,
+            last_modification: at,
+        };
+        futimens(base, &stamp)?;
+    }
     // (a directory a later entry replaced is not one any more)
     for (rel, mtime) in dir_times.iter().rev() {
         let (dir, name) = parent_dir(base, rel, opts.owner)?;
@@ -1052,6 +1062,22 @@ pub fn extract<R: Read>(r: R, base: BorrowedFd<'_>, opts: &ExtractOptions) -> io
         )?;
     }
     Ok(())
+}
+
+/// The owner the entry with the header `h` is given: its own, translated to
+/// the host, when the options keep the owners of the archive.
+fn owner_of(h: &tar::Header, opts: &ExtractOptions) -> Option<(u32, u32)> {
+    let Some(maps) = &opts.archive_owners else {
+        return opts.owner;
+    };
+    match (h.uid(), h.gid()) {
+        (Ok(u), Ok(g)) => u32::try_from(u)
+            .ok()
+            .zip(u32::try_from(g).ok())
+            .and_then(|(u, g)| maps.to_host(u, g))
+            .or(opts.owner),
+        _ => opts.owner,
+    }
 }
 
 /// The owner of the files copied into a container: its user (`uid[:gid]`
@@ -1253,6 +1279,32 @@ mod tests {
         extract(&t[..], dir_fd(d.path()).as_fd(), &Default::default()).unwrap();
         assert_eq!(std::fs::read(d.path().join("a/b/f")).unwrap(), b"hi");
         assert_eq!(std::fs::read(d.path().join("g")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn the_root_entry_of_a_layer_is_the_upper_directory() {
+        let make = |overlay_upper| {
+            let d = tempfile::tempdir().unwrap();
+            let mut b = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Directory);
+            h.set_mode(0o1750);
+            h.set_size(0);
+            h.set_mtime(1_000_000);
+            b.append_data(&mut h, "./", &[][..]).unwrap();
+            let t = b.into_inner().unwrap();
+            let opts = ExtractOptions {
+                overlay_upper,
+                layer: true,
+                ..Default::default()
+            };
+            extract(&t[..], dir_fd(d.path()).as_fd(), &opts).unwrap();
+            let m = std::fs::metadata(d.path()).unwrap();
+            (m.mode() & 0o7777, m.mtime())
+        };
+        assert_eq!(make(true), (0o1750, 1_000_000));
+        // (any other base is not the root of a layer: it keeps its own)
+        assert_ne!(make(false).0, 0o1750);
     }
 
     #[test]

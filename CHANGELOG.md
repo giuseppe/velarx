@@ -1377,9 +1377,10 @@ without the numbers of issues or pull requests of any tracker.
   noticed.
 - `container commit` keeps the root directory of the container (its mode,
   owner, time and extended attributes) in the image: the layer has the
-  entry `./`, as does the layer of a build step whose root is not a plain
-  directory (mode 0755, owned by root, no attributes).  The root of the
-  image was a plain directory.
+  entry `./`, as does the layer of every build step (`COPY`, `ADD`, `VOLUME`
+  and `WORKDIR` too) over a root that is not a plain directory (mode 0755,
+  owned by root, no attributes), on every storage driver and for `build
+  --squash`.  The root of the image was a plain directory.
 - The EROFS image of a layer whose entry `./` is a hard link is an error;
   making it panicked.
 - The files of a pulled layer keep the nanoseconds of their modification

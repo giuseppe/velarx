@@ -584,6 +584,19 @@ impl ArchiveEnd {
     }
 }
 
+/// The options of a layer of files put on `tree`: it has the root of the
+/// tree when that is not a plain one, as a layer without one would give
+/// the image a plain root.
+fn files_onto(tree: &MergedTree) -> dirtar::Options {
+    dirtar::Options {
+        root: dirtar::Root::Changed,
+        below: tree
+            .node(velarx_fuse::ROOT)
+            .map(|n| Arc::new(n.entry.clone())),
+        ..Default::default()
+    }
+}
+
 /// Where the sources taken from an image go, and what they are given.
 struct ImageDest<'a> {
     dst: &'a str,
@@ -2270,7 +2283,17 @@ impl<'a> Build<'a> {
             ));
         }
         if let Some(dir) = st.squash_dir.clone() {
-            // One layer of all the changes on the base of the stage.
+            // One layer of all the changes on the base of the stage, with
+            // the root the stage has now.
+            let tocs = match &st.image {
+                Some(id) => {
+                    let rec = self.svc.image_service.get(id).await?;
+                    self.svc.image_service.layer_tocs(&rec).await?
+                }
+                None => Vec::new(),
+            };
+            let refs: Vec<&Toc> = tocs.iter().collect();
+            let tree = MergedTree::build(&refs).map_err(BuildError::Parse)?;
             st.image = st.base_image.clone();
             st.layer_added.clear();
             st.committed = 0;
@@ -2278,7 +2301,7 @@ impl<'a> Build<'a> {
                 &mut st,
                 "velarx build --squash",
                 Some(Changes::Dir(dir)),
-                dirtar::Options::default(),
+                files_onto(&tree),
                 None,
             )
             .await?;
@@ -3126,7 +3149,7 @@ impl<'a> Build<'a> {
                 .run(job, &upper, JobSource::Dir(source.clone()), &self.cancel)
                 .await
                 .map_err(|e| self.failed(i, e))?;
-            self.commit_copy(st, i, &upper, None).await?;
+            self.commit_copy(st, i, &upper, None, &tree).await?;
             match st.squash_dir.clone() {
                 Some(sq) => self.merge_squash(&upper, &sq, &dirtar::Options::default()),
                 None => Ok(()),
@@ -3826,7 +3849,7 @@ impl<'a> Build<'a> {
         let r = match ran {
             Ok(()) => {
                 space.set(disk_usage(&upper)?)?;
-                let r = self.commit_copy(st, i, &upper, key).await;
+                let r = self.commit_copy(st, i, &upper, key, &tree).await;
                 match (st.squash_dir.clone(), r) {
                     (Some(sq), Ok(())) => {
                         self.merge_squash(&upper, &sq, &dirtar::Options::default())
@@ -3843,13 +3866,15 @@ impl<'a> Build<'a> {
 
     /// Commit what a COPY or ADD put in `upper`, or take the image of the
     /// build cache for the same files on the same image.  `key`: the key
-    /// of the step, known before the copy.
+    /// of the step, known before the copy; `tree`: the files it was copied
+    /// into.
     async fn commit_copy(
         &mut self,
         st: &mut StageState,
         i: &Instr,
         upper: &Path,
         key: Option<String>,
+        tree: &MergedTree,
     ) -> BuildResult<()> {
         let key = if key.is_some() {
             key
@@ -3870,7 +3895,7 @@ impl<'a> Build<'a> {
             st,
             &i.text(),
             Some(Changes::Dir(upper.to_path_buf())),
-            dirtar::Options::default(),
+            files_onto(tree),
             key.as_deref(),
         )
         .await
