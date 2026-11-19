@@ -46,7 +46,9 @@ pub struct FeedLayer {
     pub diff_id: String,
     /// The bytes of its table of contents (the first file of `Index`)
     pub toc_length: u64,
-    /// The bytes of its compressed tar-split (the second file of `Index`)
+    /// The bytes of its compressed tar-split (the second file of `Index`); 0
+    /// for a layer whose table of contents has `"version": 2`, the canonical
+    /// tar of its entries
     pub tarsplit_length: u64,
     /// The entries of the table of contents
     pub entries: u64,

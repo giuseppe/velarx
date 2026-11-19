@@ -301,17 +301,23 @@ impl WireFeed {
             })?;
             // (sealed memory files, read at their places, of the sizes a
             // verified table of contents and tar-split can have)
-            let read = |fd: OwnedFd, what: &str, max: u64| {
-                let file = File::from(fd);
-                velarx_base::sealed::read_sealed_whole(&file, max).map_err(|e| {
+            let read = |file: &File, what: &str, max: u64| {
+                velarx_base::sealed::read_sealed_whole(file, max).map_err(|e| {
                     ImageError::Storage(format!("the {what} the engine's feed gave {e}"))
                 })
             };
             use velarx_content::pull::chunked::{MAX_METADATA_COMPRESSED, MAX_TOC_JSON};
-            let toc = read(toc_fd, "table of contents", 2 * MAX_TOC_JSON)?;
-            let tarsplit = read(tarsplit_fd, "tar-split", MAX_METADATA_COMPRESSED)?;
+            let toc = read(&File::from(toc_fd), "table of contents", 2 * MAX_TOC_JSON)?;
             let toc: Toc = serde_json::from_slice(&toc)
                 .map_err(|e| ImageError::Storage(format!("the table of contents: {e}")))?;
+            // (a canonical layer has no tar-split: an empty file)
+            let tarsplit_file = File::from(tarsplit_fd);
+            let tarsplit =
+                if toc.is_canonical() && tarsplit_file.metadata().is_ok_and(|m| m.len() == 0) {
+                    Vec::new()
+                } else {
+                    read(&tarsplit_file, "tar-split", MAX_METADATA_COMPRESSED)?
+                };
             let key = velarx_types::LayerKey::parse(key)
                 .ok_or_else(|| ImageError::Storage(format!("{key} is not the key of a layer")))?;
             Ok::<_, ImageError>(LayerIndex {

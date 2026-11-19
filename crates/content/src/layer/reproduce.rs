@@ -5,7 +5,7 @@ use crate::pull::tarsplit::{self, ContentFile, ContentIndex, Contents, Entries, 
 use std::io::{self, Read};
 use std::sync::Arc;
 use velarx_db::{Database, LayerKey};
-use velarx_storage::{ObjectOpener, Toc};
+use velarx_storage::{canonical, ObjectOpener, Toc};
 use velarx_types::digest::{Digest, DigestWriter};
 
 /// The content of the files of a layer, read back through `objects` (the
@@ -23,36 +23,64 @@ impl Contents for StoreContents {
             key: digest,
             ..
         } = self.index.take(name, size)?;
-        let file = self.objects.object_file(&digest, size).map_err(|e| {
-            let what = match e.kind() {
-                io::ErrorKind::InvalidData => {
-                    format!("the stored content of `{norm}` has the wrong size")
-                }
-                _ => format!("{norm} ({digest}): {e}"),
-            };
-            io::Error::new(e.kind(), what)
-        })?;
+        let file = self
+            .objects
+            .object_file(&digest, size)
+            .map_err(|e| content_error(e, &norm, &digest))?;
         Ok(Box::new(file))
     }
 }
 
-/// The tar stream of a layer, from its TOC and its compressed tar-split.
+/// The tar stream of a layer, from its TOC and its compressed tar-split (a
+/// canonical layer has none: its table of contents has the tar).
 pub fn stream(
     toc: &Toc,
     tarsplit_z: impl AsRef<[u8]> + Send + 'static,
     objects: Arc<dyn ObjectOpener>,
-) -> io::Result<impl Read + Send> {
-    let input = tarsplit::decoder(tarsplit_z, tarsplit::MAX_SIZE)?;
+) -> io::Result<Box<dyn Read + Send>> {
     // (the files are read in the order of the table of contents: a driver
     // behind a socket reads the next ones in the same call)
     let objects = objects
         .ordered(&mut || crate::pull::entry::FileUse::objects_of_toc(toc))
         .unwrap_or(objects);
+    if toc.is_canonical() {
+        return Ok(Box::new(canonical::reader(
+            Arc::new(toc.clone()),
+            move |e| {
+                let key = e.content_key().ok_or_else(|| {
+                    io::Error::other(format!("`{}` has no digest of its content", e.name))
+                })?;
+                let file = objects
+                    .object_file(&key, e.size)
+                    .map_err(|err| content_error(err, &e.name, &key))?;
+                Ok(Box::new(file))
+            },
+        )));
+    }
+    let input = tarsplit::decoder(tarsplit_z, tarsplit::MAX_SIZE)?;
     let contents = StoreContents {
         index: tarsplit::content_index(toc),
         objects,
     };
-    Ok(Replay::new(Entries::new(input), contents))
+    Ok(Box::new(Replay::new(Entries::new(input), contents)))
+}
+
+fn content_error(e: io::Error, name: &str, key: &str) -> io::Error {
+    let what = match e.kind() {
+        io::ErrorKind::InvalidData => format!("the stored content of `{name}` has the wrong size"),
+        _ => format!("{name} ({key}): {e}"),
+    };
+    io::Error::new(e.kind(), what)
+}
+
+/// The size of the uncompressed tar stream of a layer: what its table of
+/// contents or its compressed tar-split says.
+pub fn stream_size(toc: &Toc, tarsplit_z: &[u8]) -> io::Result<u64> {
+    if toc.is_canonical() {
+        canonical::stream_size(&toc.entries)
+    } else {
+        tarsplit_stream_size(tarsplit_z.to_vec())
+    }
 }
 
 /// A stored layer, ready to be read as a tar stream.
@@ -152,9 +180,15 @@ impl StoredLayer {
         })
     }
 
-    /// The size of the uncompressed stream, from the tar-split alone.
+    /// The size of the uncompressed stream, from the tar-split alone (from
+    /// the table of contents of a canonical layer).
     pub fn stream_size(&self) -> io::Result<u64> {
-        tarsplit_stream_size(self.tarsplit.clone())
+        stream_size(&self.toc, &self.tarsplit)
+    }
+
+    /// Whether the stream is the canonical tar of the table of contents.
+    pub fn is_canonical(&self) -> bool {
+        self.toc.is_canonical()
     }
 
     /// The uncompressed tar stream.
@@ -208,6 +242,80 @@ impl<R: Read> Read for Verified<R> {
 mod tests {
     use super::*;
     use velarx_types::digest::Algorithm;
+
+    /// A canonical layer has no tar-split: its stream, its size and the check
+    /// of its diff id come from its table of contents and the objects.
+    #[test]
+    fn a_canonical_layer_is_read_back_from_its_table() {
+        use velarx_storage::{FileStore, TocEntry, TocEntryType};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileStore::new(tmp.path().join("files")).unwrap());
+        let entry = |name: &str, kind| TocEntry {
+            name: name.to_string(),
+            entry_type: kind,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            digest: None,
+            fsverity: None,
+            offset: 0,
+            end_offset: 0,
+            chunk_digest: None,
+            chunk_size: 0,
+            chunk_offset: 0,
+            chunk_type: None,
+            link_name: None,
+            mod_time: None,
+            access_time: None,
+            change_time: None,
+            dev_major: None,
+            dev_minor: None,
+            xattrs: Default::default(),
+        };
+        let data = vec![b'q'; 1300];
+        let key = store.put(Algorithm::Sha256, &data).unwrap();
+        let mut file = entry("./a", TocEntryType::Reg);
+        file.size = data.len() as u64;
+        file.fsverity = velarx_storage::to_toc(&key);
+        let toc = Toc {
+            version: velarx_storage::TOC_VERSION_CANONICAL,
+            entries: vec![
+                entry("./", TocEntryType::Dir),
+                file,
+                entry("./b", TocEntryType::Fifo),
+            ],
+            tar_split_digest: None,
+        };
+        let mut tar = Vec::new();
+        canonical::write(&toc.entries, &mut tar, |_, out| out.write_all(&data)).unwrap();
+        let mut got = Vec::new();
+        stream(&toc, Vec::new(), store.clone())
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, tar);
+        assert_eq!(stream_size(&toc, &[]).unwrap(), tar.len() as u64);
+        canonical::validate_tar(&tar[..]).unwrap();
+
+        // a diff id that is not the tar's is found at the end of the stream
+        let mut wrong = Vec::new();
+        let e = Verified {
+            inner: stream(&toc, Vec::new(), store.clone()).unwrap(),
+            hasher: Some(DigestWriter::new(Algorithm::Sha256)),
+            expected: Digest::of(Algorithm::Sha256, b"other"),
+        }
+        .read_to_end(&mut wrong)
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        // and a file the store lost is named
+        let empty = Arc::new(FileStore::new(tmp.path().join("empty")).unwrap());
+        let e = stream(&toc, Vec::new(), empty)
+            .unwrap()
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
+        assert!(e.to_string().contains("./a"), "{e}");
+    }
 
     #[test]
     fn test_verified_reader_checks_the_digest_at_the_end() {

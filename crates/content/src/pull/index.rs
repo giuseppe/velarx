@@ -108,9 +108,6 @@ pub fn decode(data: &[u8], max_json: u64) -> Result<(Toc, Vec<u8>), String> {
         .filter(|&l| l <= rest.len())
         .ok_or_else(|| "a truncated index".to_string())?;
     let (toc_z, tarsplit_z) = rest.split_at(len);
-    if tarsplit_z.is_empty() {
-        return Err("an index without tar-split".into());
-    }
     let mut json = Vec::new();
     super::zstd_decoder(toc_z)
         .map_err(|e| format!("the TOC of the index: {e}"))?
@@ -127,6 +124,10 @@ pub fn decode(data: &[u8], max_json: u64) -> Result<(Toc, Vec<u8>), String> {
         entries: toc.entries,
         tar_split_digest: toc.tar_split_digest,
     };
+    // (a canonical layer has no tar-split: its table has the tar)
+    if toc.is_canonical() != tarsplit_z.is_empty() {
+        return Err("an index with a tar-split that does not match its table".into());
+    }
     Ok((toc, tarsplit_z.to_vec()))
 }
 
@@ -141,6 +142,12 @@ mod tests {
         let (t, ts) = decode(&index, MAX_TOC_JSON).unwrap();
         assert!(t.entries.is_empty());
         assert_eq!(ts, b"tarsplit");
+        // a canonical layer has a table of version 2 and no tar-split, and
+        // only such a table has none
+        let canonical = r#"{"version":2,"entries":[]}"#;
+        let index = encode(canonical.as_bytes(), b"").unwrap();
+        assert!(decode(&index, MAX_TOC_JSON).unwrap().1.is_empty());
+        assert!(decode(&encode(canonical.as_bytes(), b"ts").unwrap(), MAX_TOC_JSON).is_err());
         // not one, cut, lengths that lie, no tar-split, not a TOC
         assert!(decode(b"garbage", MAX_TOC_JSON).is_err());
         assert!(decode(&index[..index.len() - 8 - 9], MAX_TOC_JSON).is_err());

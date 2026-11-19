@@ -14,7 +14,9 @@ mod signing;
 use std::io::BufWriter;
 use tokio::task::JoinSet;
 use velarx_content::layer::reproduce::StoredLayer;
-use velarx_content::layer::writer::{write_layer_level, Compression, Written};
+use velarx_content::layer::writer::{
+    write_canonical_layer, write_layer_level, Compression, Written,
+};
 use velarx_content::push::staged_push::{Destinations, How, StagedPush};
 use velarx_content::pusher::push::{Object, Role};
 use velarx_db::BlobSource;
@@ -740,12 +742,7 @@ impl ImageService {
                     .acquire_owned()
                     .await
                     .map_err(|_| ImageError::Layer("the push was cancelled".into()))?;
-                let layer = this.push_layer(&job).await.map_err(|e| match e {
-                    ImageError::Layer(m) => {
-                        ImageError::Layer(format!("layer {}: {m}", job.desc.digest))
-                    }
-                    other => other,
-                })?;
+                let layer = this.push_layer(&job).await?;
                 Ok((index, layer))
             });
         }
@@ -1382,8 +1379,8 @@ impl PushWorker {
         .map_err(|e| ImageError::Layer(e.to_string()))?;
         if stored.diff_id != *diff_id {
             return Err(ImageError::Layer(format!(
-                "its diff id is {}, the image says {diff_id}",
-                stored.diff_id
+                "layer {}: its diff id is {}, the image says {diff_id}",
+                desc.digest, stored.diff_id
             )));
         }
         let mount = self
@@ -1482,12 +1479,13 @@ impl PushWorker {
     ) -> ImageResult<(File, Written)> {
         let objects = self.objects.clone();
         let staging = self.staging_dir.clone();
+        let layer = *layer;
         // (every digest of the new blob is of the algorithm of the diff id
         // it has to reproduce)
         let alg = stored.diff_id.alg();
         let meter = Meter::new(
             self.progress.clone(),
-            Subject::Digest(*layer),
+            Subject::Digest(layer),
             "compressing",
             0,
         );
@@ -1495,17 +1493,28 @@ impl PushWorker {
             std::fs::create_dir_all(&staging)?;
             let file = tempfile::tempfile_in(&staging)?;
             let out = BufWriter::new(file.try_clone()?);
-            let layer_error = |e: std::io::Error| ImageError::Layer(e.to_string());
+            let layer_error = |e: std::io::Error| ImageError::Layer(format!("layer {layer}: {e}"));
             // (the stream is hashed once, by the layer writer: its diff id is
             // compared with the stored one below)
             let stream = stored.stream(objects).map_err(layer_error)?;
             let mut stream = super::meter::Counting::new(stream, meter);
-            let written = write_layer_level(&mut stream, alg, compression, level, out)
-                .map_err(layer_error)?;
+            // (a canonical layer is written as one: its zstd:chunked blob has
+            // no tar-split)
+            let written = if stored.is_canonical() {
+                write_canonical_layer(&mut stream, alg, compression, level, out)
+            } else {
+                write_layer_level(&mut stream, alg, compression, level, out)
+            }
+            .map_err(layer_error)?;
             stream.finish(false);
             if written.diff_id != stored.diff_id {
+                let why = if stored.is_canonical() {
+                    ": its table of contents does not describe the canonical tar the image claims"
+                } else {
+                    ""
+                };
                 return Err(ImageError::Layer(format!(
-                    "the regenerated layer has the diff id {}, not {}",
+                    "layer {layer}: the regenerated layer has the diff id {}, not {}{why}",
                     written.diff_id, stored.diff_id
                 )));
             }

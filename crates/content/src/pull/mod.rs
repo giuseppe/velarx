@@ -728,7 +728,7 @@ pub fn layer_commit(done: &LayerDone, registry_ref: Option<&str>) -> ImageResult
     let size_error = |e: &dyn std::fmt::Display| {
         ImageError::Layer(format!("layer {}: the size of its tar: {e}", done.key))
     };
-    let stream_size = crate::layer::reproduce::tarsplit_stream_size(done.tarsplit.clone())
+    let stream_size = crate::layer::reproduce::stream_size(&done.toc, &done.tarsplit)
         .map_err(|e| size_error(&e))
         .and_then(|n| i64::try_from(n).map_err(|e| size_error(&e)))?;
     let now = chrono::Utc::now().to_rfc3339();

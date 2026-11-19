@@ -123,7 +123,9 @@ type FeedLayer (
 	diff_id: string,
 	# The bytes of its table of contents (the first file of `Index`)
 	toc_length: int,
-	# The bytes of its compressed tar-split (the second file of `Index`)
+	# The bytes of its compressed tar-split (the second file of `Index`); 0
+	# for a layer whose table of contents has `"version": 2`, the canonical
+	# tar of its entries
 	tarsplit_length: int,
 	# The entries of the table of contents
 	entries: int,
