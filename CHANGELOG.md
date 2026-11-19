@@ -648,7 +648,7 @@ without the numbers of issues or pull requests of any tracker.
   the rootless bridge networks).  The engine makes it and holds its
   descriptor while it sets the network up, the monitor of the container
   inherits one and holds it for as long as the container lives, and the
-  runtime joins it as `/proc/self/fd/N`; the kernel destroys the namespace
+  runtime joins it as `/proc/PID/fd/N` of the monitor; the kernel destroys the namespace
   and its links with the last descriptor and process in it.  What identifies
   the namespaces is in tables of the store's database, one scope per container;
   the rootless network namespace's holder file is a record of the same tables.  The pasta

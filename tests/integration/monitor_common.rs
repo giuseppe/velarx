@@ -75,6 +75,8 @@ case "$cmd" in
             echo "$preserve $(readlink /proc/$$/fd/3)" > "$root/$id.preserved"
         fi
         echo "$createargs" > "$root/$id.createargs"
+        # (what a runtime that closes the descriptors it inherits finds)
+        cp "$bundle/config.json" "$root/$id.spec"
         mkfifo "$root/$id.fifo"
         echo "$NOTIFY_SOCKET" > "$root/$id.notifyenv"
         cp "$bundle/notify_path" "$root/$id.notify" 2> /dev/null || : > "$root/$id.notify"

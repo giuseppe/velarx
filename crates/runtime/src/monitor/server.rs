@@ -349,8 +349,8 @@ pub struct Monitor {
     /// monitor: the descriptor the engine made it with and passed on
     /// (`MonitorConfig::netns_fd`), else the one of the process of the
     /// first run, which the runtime made.  The runtime joins it by
-    /// `/proc/self/fd/N`, and the monitor is given it to take the
-    /// network down.
+    /// the path of this descriptor in the monitor, and the monitor is
+    /// given it to take the network down.
     netns: Option<Arc<OwnedFd>>,
     /// The directory of the file of the health results (`<id>-healthcheck.log`),
     /// when the check writes one: the engine's descriptor, replaced by
@@ -1545,6 +1545,13 @@ impl Monitor {
             ),
             _ => (cfg.bundle.clone(), cfg.bundle.join("config.json")),
         };
+        // The spec joins the namespace by the descriptor of this process, the
+        // parent of the runtime (a descriptor the runtime inherits is not one
+        // it keeps).  A restart spec names its own.
+        if let (Some(netns), None) = (&self.netns, &self.restart_spec) {
+            let path = velarx_nsid::path_in(std::process::id(), netns.as_raw_fd());
+            crate::network::spec_netns::set_spec_netns(&spec, Path::new(&path))?;
+        }
         cmd.arg("--bundle")
             .arg(&bundle)
             .arg("--pid-file")
@@ -1556,24 +1563,13 @@ impl Monitor {
         if let Some((_, path)) = &console {
             cmd.arg("--console-socket").arg(path);
         }
+        // The descriptors the runtime inherits are those for the container
+        // (3, 4, ...), which `--preserve-fds` counts: it closes the others.
         if !self.preserved.is_empty() {
             cmd.arg("--preserve-fds")
                 .arg(self.preserved.len().to_string());
-        }
-        // The descriptors the runtime inherits: those for the container (3,
-        // 4, ...) and the network namespace its spec joins as
-        // `/proc/self/fd/N`, after them (`velarx_nsid::runtime_fd`).
-        if !self.preserved.is_empty() || self.netns.is_some() {
-            let kept = self.preserved.len();
-            let mut fds: Vec<i32> = self.preserved.iter().map(|f| f.as_raw_fd()).collect();
-            fds.extend(self.netns.iter().map(|f| f.as_raw_fd()));
+            let fds: Vec<i32> = self.preserved.iter().map(|f| f.as_raw_fd()).collect();
             let holes = cfg.preserve_holes.clone();
-            // (the spec names the descriptor by the number of those preserved)
-            if self.netns.is_some() && kept != cfg.fds.preserved.len() {
-                return Err(io::Error::other(
-                    "the descriptors for the container were not all passed to the monitor",
-                ));
-            }
             velarx_sys::spawn::pre_exec(&mut cmd, move |child| {
                 child.place_fds(&fds, 3)?;
                 for &hole in &holes {

@@ -1591,8 +1591,8 @@ impl ContainerService {
         // up for is made (a shareable one from the pool or new, or the one of
         // pasta, bridge networks, CNI) before the runtime creates the
         // container in it: this engine holds its descriptor, the monitor
-        // inherits it, and the spec joins it as `/proc/self/fd/N` of the
-        // runtime.  `container:ID` joins what the target has now (its
+        // inherits it, and the spec joins it as `/proc/PID/fd/N` of the
+        // monitor.  `container:ID` joins what the target has now (its
         // descriptor, opened), `ns:PATH` the file.
         // Whatever fails from here until the container exists gives the
         // network set up back (the namespace, the pasta of it).
@@ -1642,13 +1642,6 @@ impl ContainerService {
                 None if own_netns => engine.prepare_netns(&container.id).await?,
                 None => None,
             };
-            if netns.is_some() {
-                let preserved = self.supervision.listen_fds.len() as u32;
-                velarx_runtime::network::spec_netns::set_spec_netns(
-                    &spec_file,
-                    std::path::Path::new(&velarx_nsid::runtime_path(preserved)),
-                )?;
-            }
             Ok(netns)
         }
         .await;

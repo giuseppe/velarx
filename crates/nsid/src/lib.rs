@@ -206,20 +206,11 @@ pub fn open(id: &NamespaceId) -> io::Result<OwnedFd> {
     }
 }
 
-/// Where the runtime process (`crun`, `runc`) of a container that
-/// joins a network namespace finds it: the monitor places the descriptor
-/// right after the `preserved` ones it hands to the container (3, 4, ...),
-/// for the exec of the runtime only.  The spec names it as
-/// [`runtime_path`], which the runtime inherits and opens.
-pub fn runtime_fd(preserved: u32) -> i32 {
-    3 + preserved as i32
-}
-
-/// The path of [`runtime_fd`] in the runtime process, for
-/// `linux.namespaces[].path` of the OCI spec.
-pub fn runtime_path(preserved: u32) -> String {
-    velarx_sys::fd::proc_raw(runtime_fd(preserved))
-}
+/// What the spec of a container that joins a namespace the monitor holds
+/// names until the monitor starts the runtime: it writes the path of its
+/// own descriptor (`path_in`) then.  No runtime can join this path, so a
+/// spec that was not written fails instead of joining another namespace.
+pub const HELD: &str = "/proc/self/fd/-1";
 
 /// The path with which another process opens the descriptor `raw` of
 /// process `pid` (the same user's), for what must outlive the opener: a
@@ -255,10 +246,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_runtime_finds_the_namespace_after_the_preserved_descriptors() {
-        assert_eq!(super::runtime_fd(0), 3);
-        assert_eq!(super::runtime_fd(2), 5);
-        assert_eq!(super::runtime_path(2), "/proc/self/fd/5");
+    fn a_descriptor_is_named_by_the_process_that_holds_it() {
         assert_eq!(super::path_in(7, 9), "/proc/7/fd/9");
     }
 

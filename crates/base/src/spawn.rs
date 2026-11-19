@@ -81,8 +81,9 @@ pub struct InheritedFds {
     #[serde(default)]
     pub rootfs: Vec<i32>,
     /// The network namespace of the container, which the engine made (and
-    /// set the network up in): the spec joins it as `/proc/self/fd/N`.  The
-    /// monitor holds it for as long as it lives.
+    /// set the network up in): the spec joins it as `/proc/PID/fd/N` of the
+    /// monitor, which holds it for as long as it lives and does not pass it
+    /// to the runtime.
     #[serde(default)]
     pub netns: Option<i32>,
     /// The directory of the file the results of the health checks are

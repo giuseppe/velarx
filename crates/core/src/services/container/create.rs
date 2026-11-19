@@ -691,10 +691,10 @@ impl ContainerService {
             None => None,
         };
         // A shareable namespace is made by the network setup before the
-        // runtime creates the container, which joins it (the start writes
+        // runtime creates the container, which joins it (the monitor writes
         // the path the runtime finds it at).
         let network_namespace_path = match (&net_plan, self.network_manager.engine()) {
-            (Some(p), Some(_)) if p.spec.shareable => Some(velarx_nsid::runtime_path(0)),
+            (Some(p), Some(_)) if p.spec.shareable => Some(velarx_nsid::HELD.to_string()),
             _ => network_namespace_path,
         };
 

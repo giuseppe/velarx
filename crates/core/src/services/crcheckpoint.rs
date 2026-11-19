@@ -545,9 +545,10 @@ impl ContainerService {
     /// container for the checkpoint, when it joins one by a path (the engine
     /// made it and set it up, or the container joins another's): the runtime
     /// takes the namespace its spec names as an external one, and the path
-    /// the container was created with, `/proc/self/fd/N` of the runtime that
-    /// created it, is no path of the runtime that dumps.  The path the spec
-    /// had, to put back (`Some(None)`: none), None when it was left alone.
+    /// the container was created with (`/proc/PID/fd/N` of its monitor)
+    /// names a descriptor, not the namespace of the process that is dumped.
+    /// The path the spec had, to put back (`Some(None)`: none), None when it
+    /// was left alone.
     async fn name_netns_for_dump(
         &self,
         container: &velarx_db::ContainerRecord,

@@ -727,6 +727,35 @@ fn stop(fx: &Fixture, mut m: Started) {
     fx.wait_for_exit(&mut m);
 }
 
+/// The runtime closes the descriptors it inherits that it is not told to
+/// keep, so the spec joins the network namespace the engine made by the
+/// descriptor of the monitor, not by one of the runtime's own.
+#[test]
+fn the_spec_joins_the_network_namespace_by_the_descriptor_of_the_monitor() {
+    let mut fx = Fixture::new("sleep 30");
+    std::fs::write(
+        fx.bundle.join("config.json"),
+        r#"{"process": {}, "linux": {"namespaces": [{"type": "network", "path": "/proc/self/ns/net"}]}}"#,
+    )
+    .unwrap();
+    let netns = std::fs::File::open("/proc/self/ns/net").unwrap();
+    fx.config.fds = velarx_base::spawn::InheritedFds::layout(0, 0, true, false, false);
+    let m = fx.start_monitor_with(&[netns.as_fd()]);
+    assert!(m.first.ok, "{:?}", m.first.error);
+    let spec = std::fs::read(fx.root.join("abcdef123456.spec")).unwrap();
+    let spec: serde_json::Value = serde_json::from_slice(&spec).unwrap();
+    let path = spec["linux"]["namespaces"][0]["path"].as_str().unwrap();
+    let pid = m.child.id();
+    let (dir, fd) = path.rsplit_once('/').unwrap();
+    assert_eq!(dir, format!("/proc/{pid}/fd"));
+    let held = std::fs::read_link(path).unwrap();
+    assert_eq!(held, std::fs::read_link("/proc/self/ns/net").unwrap());
+    let args = std::fs::read_to_string(fx.root.join("abcdef123456.createargs")).unwrap();
+    assert!(!args.contains("--preserve-fds"), "{args}");
+    assert!(fd.parse::<i32>().is_ok());
+    stop(&fx, m);
+}
+
 /// `[containers] keyring = false` is `--no-new-keyring` of the runtime's
 /// `create`, and only then.
 #[test]

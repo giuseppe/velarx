@@ -305,12 +305,12 @@ pub enum Shared {
 }
 
 impl Shared {
-    /// The path the spec of the container created now names (the engine
+    /// The path the spec of the container created now names (the monitor
     /// writes the one that is valid when the container starts).
     pub fn spec_path(&self) -> String {
         match self {
             Shared::Path(p) => p.to_string_lossy().into_owned(),
-            Shared::Held(_) => velarx_nsid::runtime_path(0),
+            Shared::Held(_) => velarx_nsid::HELD.to_string(),
         }
     }
 }
@@ -1551,8 +1551,8 @@ impl ContainerNetworks {
     /// Before the runtime creates a container whose network the engine
     /// sets up (pasta, bridge networks, CNI) in a namespace of its own: make
     /// the namespace, hold it, and record it.  The monitor inherits it and
-    /// the runtime joins it (`/proc/self/fd/N`).  None for the other modes
-    /// (a shareable namespace is `prepare`'s).
+    /// the runtime joins it (`/proc/PID/fd/N` of the monitor).  None for the
+    /// other modes (a shareable namespace is `prepare`'s).
     pub async fn prepare_netns(&self, id: &str) -> NetworkResult<Option<Netns>> {
         Self::check_id(id)?;
         let Some(spec) = self.spec(id).await? else {

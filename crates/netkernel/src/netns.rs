@@ -4,8 +4,8 @@
 //! Nothing is pinned for it: not by a mount, not by a file.  The engine
 //! makes the namespace and holds its descriptor while it sets the network
 //! up ([`Netns`]); the monitor of the container inherits one and holds it
-//! as long as the container lives, and the runtime joins it by
-//! `/proc/self/fd/N` (`velarx_nsid::runtime_path`).  When the last
+//! as long as the container lives, and the runtime joins it by the path of
+//! that descriptor in the monitor (`velarx_nsid::path_in`).  When the last
 //! descriptor and the last process in it are gone, the kernel destroys the
 //! namespace and the links in it.  What is recorded is who it is (the
 //! namespaces tables of the store, one scope per container,
