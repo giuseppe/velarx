@@ -295,6 +295,10 @@ impl Tree {
             }
             let parts = components(&e.name)?;
             match parts.last() {
+                // (the overlay never reads the attribute on the root of a
+                // lower layer: a marker in the root hides nothing, and the
+                // root has none)
+                Some(&OPAQUE_MARKER) if parts.len() == 1 => {}
                 Some(&OPAQUE_MARKER) => {
                     opaque.insert(parts[..parts.len() - 1].to_vec());
                 }
@@ -985,6 +989,21 @@ pub(crate) mod tests {
         assert_eq!(list.iter().filter(|l| l.starts_with("/many/")).count(), 600);
         let index = crate::erofs_tree::Index::from_bytes(Box::new(built.index)).unwrap();
         assert_eq!(index.count(), 6);
+    }
+
+    /// The overlay never reads the attribute on the root of a lower layer:
+    /// the image of a layer with a marker in its root has none there.
+    #[test]
+    fn the_root_of_a_layer_is_never_opaque() {
+        let built = layer_image(&[
+            entry(".wh..wh..opq", TocEntryType::Reg),
+            entry("d/.wh..wh..opq", TocEntryType::Reg),
+        ])
+        .unwrap();
+        let layer = crate::erofs_tree::Layer::open(Box::new(built.image)).unwrap();
+        assert!(!layer.is_opaque(layer.root()));
+        let d = layer.lookup(layer.root(), b"d").unwrap();
+        assert!(layer.is_opaque(d));
     }
 
     /// What erofs-utils says of the image, where it is installed (and, with

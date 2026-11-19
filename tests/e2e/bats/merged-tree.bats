@@ -136,6 +136,63 @@ EOT
     echo "$daemon_pid" > "$WORKDIR/daemon.pid"
     [ "$ready" = 0 ] || { echo "the daemon does not start"; cat "$WORKDIR/sh.log"; exit 1; }
     "$BIN/velarx" --socket "$WORKDIR/sh.sock" image list > /dev/null 2>&1 || { echo "the daemon does not answer"; cat "$WORKDIR/sh.log"; exit 1; }
+    # an image whose second layer has an opaque marker in its root, loaded in
+    # the store of this file and in one of the vfs driver
+    cat > "$WORKDIR/vfs.toml" <<EOT
+storage.driver = "vfs"
+storage.root = "$WORKDIR/vfs"
+[engine]
+socket = "$WORKDIR/vfs-engine.sock"
+[server]
+socket = "$WORKDIR/vfs-engine.sock"
+state_dir = "$WORKDIR/vfs-state"
+root_dir = "$WORKDIR/vfs"
+EOT
+    BINARIES="sh cat ls" e2e_make_rootfs
+    python3 -I - "$WORKDIR/rootfs" "$WORKDIR/opaque-root.tar" <<'PY'
+import gzip, hashlib, io, json, os, sys, tarfile
+root, out = sys.argv[1:]
+def layer(add):
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as t:
+        add(t)
+    raw = raw.getvalue()
+    return gzip.compress(raw, mtime=0), "sha256:" + hashlib.sha256(raw).hexdigest()
+def put(t, name, data):
+    i = tarfile.TarInfo(name)
+    i.size = len(data)
+    t.addfile(i, io.BytesIO(data))
+def lower(t):
+    t.add(root, arcname=".")
+    put(t, "a", b"a")
+    d = tarfile.TarInfo("d")
+    d.type = tarfile.DIRTYPE
+    t.addfile(d)
+    put(t, "d/x", b"x")
+def upper(t):
+    put(t, ".wh..wh..opq", b"")
+    put(t, "b", b"b")
+layers = [layer(lower), layer(upper)]
+blobs = {}
+def blob(data):
+    d = "sha256:" + hashlib.sha256(data).hexdigest()
+    blobs[d] = data
+    return {"digest": d, "size": len(data)}
+config = blob(json.dumps({"architecture": "amd64", "os": "linux", "config": {"Cmd": ["sh"]},
+                          "rootfs": {"type": "layers", "diff_ids": [d for _, d in layers]}}).encode())
+manifest = blob(json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "config": {"mediaType": "application/vnd.oci.image.config.v1+json", **config},
+    "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", **blob(g)} for g, _ in layers]}).encode())
+index = json.dumps({"schemaVersion": 2, "manifests": [{"mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "annotations": {"org.opencontainers.image.ref.name": "localhost/opaque-root:latest"}, **manifest}]}).encode()
+with tarfile.open(out, "w") as t:
+    put(t, "oci-layout", b'{"imageLayoutVersion":"1.0.0"}')
+    put(t, "index.json", index)
+    for d, data in blobs.items():
+        put(t, "blobs/sha256/" + d.split(":")[1], data)
+PY
+    "$BIN/velarx" --socket "$WORKDIR/sh.sock" image load < "$WORKDIR/opaque-root.tar" > /dev/null || { echo "the image does not load"; exit 1; }
+    "$BIN/velarx" --config "$WORKDIR/vfs.toml" image load < "$WORKDIR/opaque-root.tar" > /dev/null || { echo "the image does not load"; exit 1; }
 }
 
 teardown_file () {
@@ -152,4 +209,39 @@ teardown_file () {
         podman --root "$WORKDIR/podman/root" --runroot "$WORKDIR/podman/run" unshare rm -rf "$WORKDIR" 2> /dev/null
     fi
     e2e_teardown_file
+}
+
+# An opaque marker in the root of a layer hides nothing, as in the kernel's
+# overlay, whose root is the merge of the roots of its layers: every view of
+# the image has the files of the layers below (the image has `a`, `b` and
+# `d/x`).  As root the composefs driver mounts the layers with the kernel,
+# rootless the image server serves them.
+v_ () { "$BIN/velarx" --config "$WORKDIR/vfs.toml" "$@"; }
+
+@test "an opaque root hides nothing: a container on composefs" {
+    check "the files" abx "$(sh_ container run --rm --network none localhost/opaque-root cat /a /b /d/x)"
+}
+
+@test "an opaque root hides nothing: a container on vfs" {
+    check "the files" abx "$(v_ container run --rm --network none localhost/opaque-root cat /a /b /d/x)"
+}
+
+@test "an opaque root hides nothing: build --squash-all and commit --squash" {
+    local c
+    mkdir -p "$WORKDIR/ctx"
+    printf 'FROM localhost/opaque-root\nRUN true\n' > "$WORKDIR/ctx/Containerfile"
+    sh_ build -q --no-cache --squash-all -t localhost/opaque-root:squashed "$WORKDIR/ctx" > /dev/null || exit 1
+    check "build --squash-all" abx "$(sh_ container run --rm --network none localhost/opaque-root:squashed cat /a /b /d/x)"
+    c=$(sh_ container create --network none localhost/opaque-root true) || exit 1
+    sh_ container commit --squash "$c" localhost/opaque-root:csq > /dev/null || exit 1
+    check "commit --squash" abx "$(sh_ container run --rm --network none localhost/opaque-root:csq cat /a /b /d/x)"
+    sh_ container rm "$c" > /dev/null
+}
+
+@test "an opaque root hides nothing: cp from a stopped container" {
+    local c
+    c=$(sh_ container create --network none localhost/opaque-root true) || exit 1
+    sh_ container cp "$c:/a" "$WORKDIR/a-out" > /dev/null || exit 1
+    sh_ container rm "$c" > /dev/null
+    check "the file" a "$(cat "$WORKDIR/a-out")"
 }

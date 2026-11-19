@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use velarx_config::ComposefsDigests;
 use velarx_content::layer::dirtar::{self, Change};
 use velarx_content::layer::holes::HoleWrite;
@@ -2455,12 +2455,31 @@ fn set_root(
         .ok_or_else(|| std::io::Error::other("the layer has no root directory"))?;
     let dir = open_dir(upper)?;
     let (uid, gid) = ids.map_or((a.uid, a.gid), |t| (t.uid_of(a.uid), t.gid_of(a.gid)));
-    fchown(&dir, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
-    fchmod(&dir, Mode::from_raw_mode(a.perm.into()))?;
+    let context = |what: &str, e: rustix::io::Errno| {
+        std::io::Error::new(
+            e.kind(),
+            format!("the {what} of the root of the container cannot be set ({e})"),
+        )
+    };
+    fchown(&dir, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+        .map_err(|e| context("owner", e))?;
+    fchmod(&dir, Mode::from_raw_mode(a.perm.into())).map_err(|e| context("mode", e))?;
+    // (the other files have their attributes in the image of their layer,
+    // which nothing has to be allowed to write: here the host is asked, and
+    // it may refuse one, as the file system of the copy of the `vfs` driver
+    // does)
+    let mut warned = false;
     for (name, value) in layer.raw_xattrs(root) {
         let name = String::from_utf8(name).map_err(std::io::Error::other)?;
-        if !velarx_fuse::hidden_xattr(&name) {
-            fsetxattr(&dir, name.as_str(), &value, XattrFlags::empty())?;
+        if velarx_fuse::hidden_xattr(&name) {
+            continue;
+        }
+        if let Err(e) = fsetxattr(&dir, name.as_str(), &value, XattrFlags::empty()) {
+            if !std::mem::replace(&mut warned, true) {
+                warn!(
+                    "the attribute {name} of the root of the container is not set ({e}); the other attributes the host refuses are skipped without a message"
+                );
+            }
         }
     }
     let at = |t: std::time::SystemTime| {
@@ -2476,8 +2495,8 @@ fn set_root(
             last_access: at(a.atime),
             last_modification: at(a.mtime),
         },
-    )?;
-    Ok(())
+    )
+    .map_err(|e| context("time", e))
 }
 
 /// Whether the root of the process whose mount table is `mountinfo` is the
@@ -2569,6 +2588,27 @@ mod tests {
         let mut e = velarx_fuse::dir_entry(name);
         e.entry_type = t;
         e
+    }
+
+    /// An attribute of the `./` of the layer the host refuses (the value of
+    /// `security.ima` is no header: `EINVAL` as root, `EPERM` rootless) does
+    /// not stop the container: the mode and the owner are still set.
+    #[test]
+    fn a_root_attribute_the_host_refuses_is_skipped() {
+        let mut root = entry("./", TocEntryType::Dir);
+        root.mode = 0o750;
+        (root.uid, root.gid) = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
+        root.xattrs.insert("security.ima".into(), "dg==".into());
+        let image = velarx_fuse::layer_erofs::layer_image(&[root])
+            .unwrap()
+            .image;
+        let layer = velarx_fuse::erofs_tree::Layer::open(Box::new(image)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        set_root(dir.path(), &layer, None).unwrap();
+        assert_eq!(dir.path().metadata().unwrap().mode() & 0o7777, 0o750);
     }
 
     fn file(name: &str, byte: u8) -> TocEntry {

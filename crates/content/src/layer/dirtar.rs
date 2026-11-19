@@ -2067,6 +2067,25 @@ mod tests {
         assert_eq!(names, [".wh.opt"]);
     }
 
+    /// A copy that kept none of the entries of the image's root, and has
+    /// others: each is a whiteout, as a marker in the root hides nothing.
+    #[test]
+    fn test_a_copy_without_the_entries_of_the_root_whiteouts_each() {
+        let d = tempfile::tempdir().unwrap();
+        let copy = d.path().join("copy");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(copy.join("new"), b"new").unwrap();
+        let (lower, _) = lower(d.path());
+        let opts = Options {
+            lower: Some(lower),
+            ..Default::default()
+        };
+        let mut tar = Vec::new();
+        copydiff::write(open(&copy).as_fd(), &opts, &mut tar).unwrap();
+        let names: Vec<String> = entries(&tar).into_iter().map(|e| e.0).collect();
+        assert_eq!(names, ["new", ".wh.etc", ".wh.opt", ".wh.run"]);
+    }
+
     /// A tree the container made, deeper than a thread of the blocking pool
     /// (2 MiB of stack) would walk by recursion: the walks do not recurse.
     #[test]

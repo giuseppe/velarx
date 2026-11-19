@@ -218,7 +218,8 @@ impl<'a> StoppedView<'a> {
     fn root(&self) -> io::Result<Entry> {
         let fd = rustix::io::fcntl_dupfd_cloexec(&self.upper, 0)?;
         let st = fstat(&fd)?;
-        let lower = (self.overlay_layout() && !opaque(fd.as_fd())).then_some(ROOT);
+        // (the overlay never reads the attribute on its root)
+        let lower = self.overlay_layout().then_some(ROOT);
         Ok(Entry {
             upper: Some((fd, st)),
             lower,
@@ -968,6 +969,24 @@ mod tests {
         assert_eq!(names(&v, "/d"), want);
         // an opaque directory hides the image's
         assert_eq!(names(&v, "/o"), ["t", "t/shown"]);
+    }
+
+    /// The root of the overlay is the merge of the roots of its layers: the
+    /// attribute of an opaque directory on the upper root hides nothing.
+    #[test]
+    fn an_opaque_upper_root_hides_nothing() {
+        let f = fx();
+        if rustix::fs::setxattr(
+            format!("{}", f.upper.display()).as_str(),
+            "user.overlay.opaque",
+            b"y",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .is_err()
+        {
+            return;
+        }
+        assert!(names(&view(&f), "/").contains(&"t/etc/passwd".to_string()));
     }
 
     /// The devices of the image are archived as headers with their numbers

@@ -5799,14 +5799,11 @@ pub async fn changes_list_what_diff_writes(f: &Factory) {
                 } else {
                     format!("{dir}/.wh.{base}")
                 };
-                // (or the directory is opaque: it has none of the image's)
-                let opaque = if dir.is_empty() {
-                    ".wh..wh..opq".to_string()
-                } else {
-                    format!("{dir}/.wh..wh..opq")
-                };
+                // (or the directory is opaque: it has none of the image's;
+                // a marker in the root hides nothing)
+                let opaque = format!("{dir}/.wh..wh..opq");
                 assert!(
-                    tar.contains_key(&wh) || tar.contains_key(&opaque),
+                    tar.contains_key(&wh) || (!dir.is_empty() && tar.contains_key(&opaque)),
                     "{name}: no {wh}"
                 );
             }

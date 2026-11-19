@@ -62,13 +62,14 @@ pub fn layer_image_has_verity(image: &std::path::Path) -> bool {
 impl ImageView {
     /// The layers, the lowest first.
     pub fn new(layers: Vec<Layer>) -> Self {
-        let mut parts = Vec::new();
-        for (i, l) in layers.iter().enumerate().rev() {
-            parts.push((i, l.root()));
-            if l.is_opaque(l.root()) {
-                break;
-            }
-        }
+        // (the root of an overlay is the merge of the roots of all its
+        // layers: the attribute of an opaque directory is not read there)
+        let parts = layers
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, l)| (i, l.root()))
+            .collect();
         Self {
             layers,
             nodes: Mutex::new(Nodes {
@@ -592,6 +593,18 @@ mod tests {
         assert!(v.resolve("o/new").is_some() && v.resolve("o/old").is_none());
     }
 
+    /// An opaque marker in the root of a layer hides nothing, as in the
+    /// overlay, whose root is the merge of the roots of its layers.
+    #[test]
+    fn an_opaque_root_hides_nothing() {
+        let l0 = [file("a", 1, 1), file("d/x", 1, 1)];
+        let l1 = [entry(".wh..wh..opq", TocEntryType::Reg), file("b", 2, 1)];
+        let (v, t) = agree(&[&l0, &l1]);
+        for p in ["a", "b", "d/x"] {
+            assert!(v.resolve(p).is_some() && t.resolve(p).is_some(), "{p}");
+        }
+    }
+
     /// Random layers of whiteouts, opaque markers, directories a layer
     /// removes and makes, names under files, hard links, devices 0:0, roots
     /// and names listed twice: the tables merged and the images stacked show
@@ -674,6 +687,22 @@ mod tests {
                     .collect(),
             );
             assert_eq!(dump_view(&v), dump_tree(&tree), "{shown:?}");
+            // (a marker in the root of a layer hides nothing: the stack
+            // without them is the same)
+            let plain: Vec<Toc> = tocs
+                .iter()
+                .map(|t| Toc {
+                    entries: t
+                        .entries
+                        .iter()
+                        .filter(|e| e.name != ".wh..wh..opq")
+                        .cloned()
+                        .collect(),
+                    ..t.clone()
+                })
+                .collect();
+            let plain = MergedTree::build(&plain.iter().collect::<Vec<_>>()).unwrap();
+            assert_eq!(dump_tree(&plain), dump_tree(&tree), "{shown:?}");
             let root = v.node(VIEW_ROOT).unwrap().entry;
             let r = &tree.node(crate::ROOT).unwrap().entry;
             assert_eq!((root.mode, root.uid), (r.mode, r.uid), "{shown:?}");

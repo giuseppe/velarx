@@ -5,8 +5,8 @@
 //! directory with the image it was copied from.
 //!
 //! There are no marks in such a directory: a file that is not there any more
-//! is a `.wh.` entry (a directory that kept none of the image's entries,
-//! and has others, is opaque), and a file is a change when its kind, mode,
+//! is a `.wh.` entry (a directory other than the root that kept none of the
+//! image's entries, and has others, is opaque), and a file is a change when its kind, mode,
 //! owner, size, time, link target, device, or the extended attributes that
 //! can be set on the copy differ from the image's.  The times of the
 //! directories are not compared: a directory changes its own when something
@@ -162,8 +162,9 @@ impl Visit for CopyWalk<'_, '_> {
         at.list(&self.lower, names)?;
         // a directory none of whose entries of the image is still there, and
         // that has others, hides the image's: one entry says it, not one
-        // whiteout of each
-        at.opaque = !at.image.is_empty()
+        // whiteout of each (not the root: a marker there hides nothing)
+        at.opaque = !at.prefix.is_empty()
+            && !at.image.is_empty()
             && !at.present.is_empty()
             && at.image.iter().all(|(n, _)| !at.present.contains(n));
         if at.opaque {

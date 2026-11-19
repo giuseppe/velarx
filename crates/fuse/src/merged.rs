@@ -259,6 +259,10 @@ impl MergedTree {
             }
             let parts = components(&e.name).map_err(|m| format!("`{}`: {m}", e.name))?;
             match parts.split_last() {
+                // (the root of an overlay is the merge of the roots of all its
+                // layers, whatever the layers say: a marker in the root of a
+                // layer hides nothing)
+                Some((&OPAQUE_MARKER, [])) => {}
                 Some((&OPAQUE_MARKER, dir)) => {
                     opaque_dirs.insert(dir.to_vec());
                 }

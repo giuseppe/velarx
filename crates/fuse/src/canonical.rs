@@ -27,6 +27,8 @@
 //! own root and its own plain directories for those it adds to without
 //! listing them: here such a directory keeps what the layers below gave it,
 //! as in composefs-rs, so that the digest is the one composefs-rs gives.
+//! Nor the rule that an opaque marker in the root of a layer hides nothing:
+//! here it empties the root, as in composefs-rs.
 //!
 //! The image is made only for its digest, the merged EROFS of an image that
 //! its manifest states (`composefs.merged.erofs.v1.fsverity-sha256-12`, or

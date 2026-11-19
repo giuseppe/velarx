@@ -27,7 +27,9 @@ root, no time, no attributes) when it has none, and so is a directory it has
 entries in but does not list: its attributes replace those of the directory
 below, whose entries stay, in every view of the image (the overlay, `vfs`,
 `build`, `commit --squash`, `cp`). A hard link names a file of its own
-layer.
+layer. An opaque marker (`.wh..wh..opq`) in the root of a layer hides
+nothing, as in the kernel's overlay, whose root is the merge of the roots of
+all its layers.
 
 The driver is chosen by `[storage] driver` or `--storage-driver`: `composefs`
 (the default), `vfs` and `varlink` (never chosen for you). A store keeps the

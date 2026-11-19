@@ -25,13 +25,17 @@ setup_file () {
     BINARIES="sh cat env sleep true false echo ls stat getfattr" e2e_make_rootfs
     # the files of the image, and a first entry `./` that is not a plain
     # directory: mode 01750, owner 1000:1000, a time before 1970, an attribute
-    python3 -I - "$WORKDIR/rootfs" "$WORKDIR/root-dir.tar" << 'PY'
+    # (the second has an attribute the engine cannot set, the first a plain
+    # one: user.* are the container's)
+    for variant in "root-dir user.rootattr" "root-dir-refused security.ima"; do
+    # shellcheck disable=SC2086
+    python3 -I - "$WORKDIR/rootfs" "$WORKDIR/${variant% *}.tar" ${variant#* } << 'PY'
 import os, sys, tarfile
-root, out = sys.argv[1:]
+root, out, attr = sys.argv[1:]
 t = tarfile.open(out, "w", format=tarfile.PAX_FORMAT)
 top = tarfile.TarInfo("./")
 top.type, top.mode, top.uid, top.gid, top.mtime = tarfile.DIRTYPE, 0o1750, 1000, 1000, -2
-top.pax_headers = {"SCHILY.xattr.user.rootattr": "dg"}
+top.pax_headers = {"SCHILY.xattr." + attr: "dg"}
 t.addfile(top)
 old = tarfile.TarInfo("./old")
 old.mode, old.mtime = 0o644, -86400.75
@@ -45,8 +49,10 @@ for dir, dirs, files in os.walk(root):
         t.addfile(info, open(path, "rb") if info.isreg() else None)
 t.close()
 PY
+    done
     for d in composefs vfs; do
         "$BIN/velarx" --config "$WORKDIR/$d.toml" image import "$WORKDIR/root-dir.tar" localhost/root-dir:1 > /dev/null
+        "$BIN/velarx" --config "$WORKDIR/$d.toml" image import "$WORKDIR/root-dir-refused.tar" localhost/root-dir:refused > /dev/null
     done
 }
 
@@ -93,6 +99,20 @@ dg
     check "the root" "1750 1000:1000 -2
 dg
 1969-12-30 23:59:59.250000000 +0000" "$(root_of vfs --userns auto)"
+}
+
+# An attribute of the `./` the engine cannot set on the directory of the
+# container (security.ima with a value that is no header: refused by the
+# kernel, and rootless by the permission) is skipped with a warning, as the
+# vfs driver does: the container runs with the mode and owner of the layer.
+@test "composefs and vfs: an attribute of the root the host refuses does not stop the container" {
+    local d
+    for d in composefs vfs; do
+        check "the root on $d" "1750 1000:1000" \
+            "$("$BIN/velarx" --config "$WORKDIR/$d.toml" container run --rm --network none localhost/root-dir:refused stat -c '%a %u:%g' / 2> /dev/null)"
+    done
+    "$BIN/velarx" --config "$WORKDIR/composefs.toml" container run --rm --network none localhost/root-dir:refused true 2>&1 | grep -c "security.ima" | grep -qx 1 || {
+        echo "FAIL: not one warning naming the attribute" >&2; exit 1; }
 }
 
 # The image a commit or a build step makes of a container keeps its root: the

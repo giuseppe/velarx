@@ -157,7 +157,9 @@ without the numbers of issues or pull requests of any tracker.
   below; a directory a layer removes and makes does not have what was below
   it, whatever the order of its table; a hard link to a file of a layer
   below is an error.  These views kept the root and directories of the
-  layers below.
+  layers below.  An opaque marker in the root of a layer hides nothing in
+  any view, as in the kernel's overlay, where these views dropped the files
+  of the layers below.
 - A zstd:chunked layer is pulled through its table of contents or not at all,
   eagerly and lazily, so that an image whose table and tar stream describe
   different filesystems is never taken for the layer of its stream: the
