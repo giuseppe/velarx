@@ -258,14 +258,9 @@ pub async fn fetched_by_another(mut rx: tokio::sync::watch::Receiver<bool>) -> b
 }
 
 /// Whether the store (or an earlier layer of the pull) has the file known by
-/// a key: the driver's answer to what the pull is to fetch.
-pub type Have = Arc<dyn Fn(&str) -> bool + Send + Sync>;
-
-/// What the sink has, as [`Have`].
-pub fn sink_have(sink: &Arc<dyn Sink>) -> Have {
-    let sink = sink.clone();
-    Arc::new(move |key| sink.have(key))
-}
+/// a key, of the size its table gives: the driver's answer to what the pull
+/// is to fetch.
+pub type Have = Arc<dyn Fn(&str, u64) -> bool + Send + Sync>;
 
 impl PullCtx {
     pub fn new(net: Net, sink: Arc<dyn Sink>, db: Database, limits: Limits) -> Self {
@@ -307,7 +302,10 @@ impl PullCtx {
     /// What says whether a file is there: the driver's answer, else the
     /// sink's.
     pub fn have_fn(&self) -> Have {
-        self.have.clone().unwrap_or_else(|| sink_have(&self.sink))
+        self.have.clone().unwrap_or_else(|| {
+            let sink = self.sink.clone();
+            Arc::new(move |key, size| sink.holds(key, size))
+        })
     }
 
     /// The chunks fetched are of the layer `key` (a layer of a TOC, which

@@ -779,7 +779,7 @@ pub(super) async fn plan_blocking(
     let (max_chunk, cap) = (limits.max_chunk_bytes, limits.inflate_cap(blob_size));
     // (a table the plan refuses is refused again on every try)
     tokio::task::spawn_blocking(move || {
-        make_plan(&toc, alg, blob_size, max_chunk, cap, &|d| have(d)).map_err(|e| match e {
+        make_plan(&toc, alg, blob_size, max_chunk, cap, &*have).map_err(|e| match e {
             ImageError::Layer(m) => ImageError::Contradicted(m),
             e => e,
         })
@@ -794,7 +794,7 @@ pub(crate) fn make_plan(
     blob_size: i64,
     max_chunk: u64,
     cap: u64,
-    have: &dyn Fn(&str) -> bool,
+    have: &dyn Fn(&str, u64) -> bool,
 ) -> ImageResult<Plan> {
     let mut plan = Plan::new(alg);
     let mut seen: HashSet<String> = HashSet::new();
@@ -840,7 +840,7 @@ pub(crate) fn make_plan(
         let d = key.as_str();
         // The content of an earlier entry, or already available.
         let first = seen.insert(key.clone());
-        let available = have(d);
+        let available = have(d, e.size);
         if !first || available {
             plan.skipped_files += 1;
             plan.skipped_compressed += e.end_offset.saturating_sub(e.offset);
@@ -2004,9 +2004,14 @@ pub async fn complete_layer(
             }
             metadata_bytes += sourced.bytes;
             // (what was given is there: the plan of the check fetches
-            // nothing more)
+            // nothing more; of a session, only what it holds of the size
+            // this table gives: what another layer fetched under the same
+            // key may be another size)
             let (have, given) = (ctx.have_fn(), keys.into_iter().collect::<HashSet<_>>());
-            let had: super::Have = Arc::new(move |key: &str| given.contains(key) || have(key));
+            let had: super::Have = match ctx.sink.clone().session() {
+                Some(session) => Arc::new(move |key: &str, size| session.holds(key, size)),
+                None => Arc::new(move |key: &str, size| given.contains(key) || have(key, size)),
+            };
             ctx = std::borrow::Cow::Owned(ctx.into_owned().with_have(had));
         }
     }

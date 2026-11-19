@@ -607,7 +607,7 @@ impl WireFeed {
             }
         }
         for f in &files {
-            if seen.remove(&f.digest) && into.wants(&f.digest) {
+            if seen.remove(&f.digest) && into.wants(&f.digest, f.size) {
                 wants.push((f.digest.clone(), f.size));
             }
         }

@@ -139,7 +139,7 @@ fn test_plan_skips_known_and_duplicate_content() {
         reg("c", &d(2), 10, 200, 300, None),
         reg("empty", &crate::sha256_text(b""), 0, 0, 0, None),
     ]);
-    let have = |x: &str| x == d(2);
+    let have = |x: &str, _| x == d(2);
     let plan = make_plan(&t, Algorithm::Sha256, 1000, 1 << 20, cap(1000), &have).unwrap();
     assert_eq!(plan.jobs.len(), 1);
     assert_eq!(plan.jobs[0].name, "a");
@@ -157,7 +157,10 @@ fn test_plan_multi_chunk_file() {
         chunk("f", &d(2), 10, 10, 120),
         chunk("f", &d(3), 10, 20, 140),
     ]);
-    let plan = make_plan(&t, Algorithm::Sha256, 1000, 1 << 20, cap(1000), &|_| false).unwrap();
+    let plan = make_plan(&t, Algorithm::Sha256, 1000, 1 << 20, cap(1000), &|_, _| {
+        false
+    })
+    .unwrap();
     let c = &plan.chunks;
     assert_eq!(c.len(), 3);
     assert_eq!((c[0].comp.clone(), c[0].file_off), (100..120, 0));
@@ -171,7 +174,10 @@ fn test_plan_zeros_chunks_are_holes() {
     let mut z = chunk("f", &d(2), 20, 10, 120);
     z.chunk_type = Some("zeros".into());
     let t = toc(vec![reg("f", &d(9), 30, 100, 135, Some((&d(1), 10))), z]);
-    let plan = make_plan(&t, Algorithm::Sha256, 1000, 1 << 20, cap(1000), &|_| false).unwrap();
+    let plan = make_plan(&t, Algorithm::Sha256, 1000, 1 << 20, cap(1000), &|_, _| {
+        false
+    })
+    .unwrap();
     assert_eq!(plan.chunks.len(), 1);
     assert_eq!(plan.jobs[0].holes, vec![(10, 20)]);
     assert_eq!(plan.zeros, 20);
@@ -187,7 +193,10 @@ fn test_plan_holes_are_not_counted_against_the_inflate_cap() {
         reg("f", &d(9), 1 << 30, 100, 135, Some((&d(1), 10))),
         z,
     ]);
-    let plan = make_plan(&t, Algorithm::Sha256, 1000, 1 << 20, cap(1000), &|_| false).unwrap();
+    let plan = make_plan(&t, Algorithm::Sha256, 1000, 1 << 20, cap(1000), &|_, _| {
+        false
+    })
+    .unwrap();
     assert_eq!(plan.planned, 10);
     assert_eq!(plan.zeros, (1 << 30) - 10);
 }
@@ -215,7 +224,7 @@ fn test_plan_rejects_inconsistent_tocs() {
             1000,
             1 << 20,
             cap(1000),
-            &|_| false
+            &|_, _| false
         )
         .is_err());
     }
@@ -234,7 +243,7 @@ fn test_plan_rejects_inconsistent_tocs() {
             1 << 30,
             1 << 20,
             cap(1 << 30),
-            &|_| false
+            &|_, _| false
         )
         .is_err());
     }
@@ -244,9 +253,14 @@ fn test_plan_rejects_inconsistent_tocs() {
 fn test_plan_limits() {
     let big = toc(vec![reg("f", &d(1), 1 << 30, 0, 10, None)]);
     assert!(matches!(
-        make_plan(&big, Algorithm::Sha256, 1000, 1 << 20, cap(1000), &|_| {
-            false
-        }),
+        make_plan(
+            &big,
+            Algorithm::Sha256,
+            1000,
+            1 << 20,
+            cap(1000),
+            &|_, _| { false }
+        ),
         Err(ImageError::Layer(_))
     ));
     // 1 GiB of files from a blob of 1000 bytes is over the floor of the cap.
@@ -254,14 +268,22 @@ fn test_plan_limits() {
         reg("a", &d(1), 1 << 30, 0, 10, None),
         reg("b", &d(2), 1 << 30, 10, 20, None),
     ]);
-    assert!(make_plan(&t, Algorithm::Sha256, 1000, 2 << 30, cap(1000), &|_| false).is_err());
-    let small = toc(vec![reg("a", &d(1), 1 << 20, 0, 10, None)]);
     assert!(
-        make_plan(&small, Algorithm::Sha256, 1000, 1 << 20, cap(1000), &|_| {
+        make_plan(&t, Algorithm::Sha256, 1000, 2 << 30, cap(1000), &|_, _| {
             false
         })
-        .is_ok()
+        .is_err()
     );
+    let small = toc(vec![reg("a", &d(1), 1 << 20, 0, 10, None)]);
+    assert!(make_plan(
+        &small,
+        Algorithm::Sha256,
+        1000,
+        1 << 20,
+        cap(1000),
+        &|_, _| { false }
+    )
+    .is_ok());
 }
 
 fn comps(c: &[ChunkPlan]) -> Vec<Range<u64>> {
@@ -535,7 +557,7 @@ fn test_a_file_of_zeros_chunks_only_is_completed() {
         1000,
         1 << 20,
         cap(1000),
-        &|_| false,
+        &|_, _| false,
     )
     .unwrap();
     assert!(plan.chunks.is_empty());
@@ -988,7 +1010,7 @@ fn test_plan_refuses_an_fsverity_value_of_the_other_algorithm_by_name() {
         e.fsverity = Some(v.into());
         toc(vec![e])
     };
-    let plan = |t: &Toc, alg| make_plan(t, alg, 1000, 1 << 20, cap(1000), &|_| false);
+    let plan = |t: &Toc, alg| make_plan(t, alg, 1000, 1 << 20, cap(1000), &|_, _| false);
     let sha256 = format!("sha256-12:{}", "ab".repeat(32));
     assert!(plan(&with(&sha256), Algorithm::Sha256).is_ok());
     assert!(plan(&with("sha384-12:00"), Algorithm::Sha256).is_ok());
@@ -1013,7 +1035,7 @@ fn test_plan_refuses_an_fsverity_value_of_the_other_algorithm_by_name() {
 #[test]
 fn test_plan_of_a_sha512_layer_takes_sha512_digests_only() {
     let d512 = |n: u8| format!("sha512:{}", hex::encode([n; 64]));
-    let plan = |t: &Toc, alg| make_plan(t, alg, 1000, 1 << 20, cap(1000), &|_| false);
+    let plan = |t: &Toc, alg| make_plan(t, alg, 1000, 1 << 20, cap(1000), &|_, _| false);
     let file = reg("f", &d512(1), 10, 0, 100, None);
     let t = toc(vec![file.clone()]);
     let p = plan(&t, Algorithm::Sha512).unwrap();

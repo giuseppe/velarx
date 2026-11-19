@@ -511,11 +511,18 @@ impl ImageService {
             return Ok(None);
         };
         let store = self.file_store.clone();
-        let files = layer_files(&toc);
-        let whole =
-            tokio::task::spawn_blocking(move || files.iter().all(|d| store.contains_local(d)))
-                .await
-                .map_err(|e| ImageError::Storage(e.to_string()))?;
+        let toc = Arc::new(toc);
+        let whole = tokio::task::spawn_blocking({
+            let toc = toc.clone();
+            move || {
+                toc.entries
+                    .iter()
+                    .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+                    .all(|e| e.verity().is_none_or(|d| store.holds(&d, e.size)))
+            }
+        })
+        .await
+        .map_err(|e| ImageError::Storage(e.to_string()))?;
         if !whole {
             return Ok(None);
         }
@@ -523,7 +530,7 @@ impl ImageService {
             key: *key,
             desc: desc.clone(),
             diff_id: *diff_id,
-            toc: Arc::new(toc),
+            toc,
             tarsplit: tarsplit.into(),
             meta: velarx_content::pull::staged::StagedLayerMeta {
                 key: key.to_string(),

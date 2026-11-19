@@ -131,7 +131,7 @@ impl PullFeed for TestFeed {
         let mut wanted = Vec::new();
         for e in index.toc.entries.iter().filter(|e| e.size > 0) {
             let key = e.content_key().unwrap();
-            if !into.wants(&key) {
+            if !into.wants(&key, e.size) {
                 continue;
             }
             wanted.push(key.clone());

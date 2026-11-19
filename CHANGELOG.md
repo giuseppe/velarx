@@ -1356,6 +1356,18 @@ without the numbers of issues or pull requests of any tracker.
 
 ### Fixed
 
+- A lazy pull refuses a table of contents that lists a file with another
+  size than the store has recorded for its fs-verity digest, or than
+  another layer of the image gives it, naming the layer; the image was
+  pulled as verified, and `system check` called the store damaged.
+- A pull fetches a file of the store again when the object has another
+  size than the table of contents gives or, in a store that keeps
+  fs-verity, has none (damaged, or replaced by another file), and puts it
+  back, so that "pull it again" repairs the image.  The object was taken
+  for held by its name, and the layer could not be made from it (the
+  merged EROFS failed on every pull).  Only the length of an object
+  without fs-verity is looked at: other bytes of the same length are not
+  noticed.
 - `container commit` keeps the root directory of the container (its mode,
   owner, time and extended attributes) in the image: the layer has the
   entry `./`, as does the layer of a build step whose root is not a plain

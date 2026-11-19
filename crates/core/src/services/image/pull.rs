@@ -1453,6 +1453,35 @@ impl ImageService {
             }
             _ => std::collections::HashMap::new(),
         };
+        // (a lazy layer fetches no file: its table is compared with what the
+        // store has recorded of the files it lists, and with the other
+        // layers of the image)
+        let mut listed: HashMap<String, u64> = HashMap::new();
+        for (layer, (_, found)) in &lazy_found {
+            let files: Vec<(String, u64)> = found
+                .toc
+                .entries
+                .iter()
+                .filter(|e| e.entry_type == velarx_storage::TocEntryType::Reg && e.size > 0)
+                .filter_map(|e| Some((e.verity()?, e.size)))
+                .collect();
+            let mut conflict = None;
+            for (digest, size) in &files {
+                let first = *listed.entry(digest.clone()).or_insert(*size);
+                if first != *size {
+                    conflict = Some((digest.clone(), first, *size));
+                    break;
+                }
+            }
+            if conflict.is_none() {
+                conflict = self.db.file_size_conflict(files).await?;
+            }
+            if let Some((digest, held, size)) = conflict {
+                return Err(ImageError::Contradicted(format!(
+                    "layer {layer}: its table of contents lists {digest} with {size} bytes, another table or the store has it with {held}"
+                )));
+            }
+        }
         let mut content = match source {
             Some(source) => ContentFeed::new(net, source, self.db.clone(), limits),
             None => ContentFeed::made(self.db.clone(), limits, &made),

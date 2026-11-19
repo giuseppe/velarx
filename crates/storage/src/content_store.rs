@@ -104,6 +104,8 @@ pub struct FileStore {
     sync: SyncMode,
     /// What fs-verity the files of the store have (`[storage] fsverity`).
     verity: crate::VerityMode,
+    /// Whether its file system gives files fs-verity, once known.
+    gives_verity: std::sync::OnceLock<bool>,
     #[cfg(any(test, feature = "test-support"))]
     barriers: std::sync::atomic::AtomicUsize,
     /// The number (from 1) of the barrier that fails, 0: none
@@ -132,6 +134,7 @@ impl FileStore {
             more: Vec::new(),
             sync: SyncMode::default(),
             verity: crate::VerityMode::Off,
+            gives_verity: std::sync::OnceLock::new(),
             #[cfg(any(test, feature = "test-support"))]
             barriers: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
@@ -273,6 +276,52 @@ impl FileStore {
     /// Whether this store itself has the file (not a read-only store).
     pub fn contains_local(&self, id: &str) -> bool {
         self.local_path(id).is_some_and(|p| p.exists())
+    }
+
+    /// Whether this store itself has the file `id` whole: `size` bytes
+    /// long and, where the store keeps fs-verity, with fs-verity.  A file of
+    /// that name that is not that is damaged (or was put there by another):
+    /// it is not held, so that what a pull fetches replaces it.  One `statx`:
+    /// a file with fs-verity cannot change, and it got its name after the
+    /// kernel measured it, so it is not opened to be measured again (that
+    /// reads its Merkle tree descriptor).  Of the same length, other bytes
+    /// in a file without fs-verity are not seen.
+    pub fn holds(&self, id: &str, size: u64) -> bool {
+        use rustix::fs::{statx, AtFlags, FileType, StatxAttributes, StatxFlags, CWD};
+        let Some(st) = self.local_path(id).and_then(|p| {
+            statx(
+                CWD,
+                &p,
+                AtFlags::empty(),
+                StatxFlags::TYPE | StatxFlags::SIZE,
+            )
+            .ok()
+        }) else {
+            return false;
+        };
+        FileType::from_raw_mode(st.stx_mode.into()) == FileType::RegularFile
+            && st.stx_size == size
+            && (self.verity == crate::VerityMode::Off
+                || st.stx_attributes.contains(StatxAttributes::VERITY)
+                || !self.gives_verity(id))
+    }
+
+    /// Whether the file system of the store gives files fs-verity: the
+    /// kernel's answer for a file of it that has none, once.
+    fn gives_verity(&self, id: &str) -> bool {
+        if let Some(gives) = self.gives_verity.get() {
+            return *gives;
+        }
+        let measured = self.local_path(id).map(File::open);
+        match measured.map(|f| f.map(|f| crate::measure_file(&f))) {
+            Some(Ok(Err(crate::FsVerityError::NotSupported))) => {
+                *self.gives_verity.get_or_init(|| false)
+            }
+            Some(Ok(Err(crate::FsVerityError::NotEnabled))) => {
+                *self.gives_verity.get_or_init(|| true)
+            }
+            _ => true,
+        }
     }
 
     /// The file in a read-only store, when only one of them has it.
@@ -543,6 +592,36 @@ mod tests {
             .put_with_digest(b"no file system for it", &digest)
             .unwrap();
         assert!(store.contains_local(&digest));
+    }
+
+    #[test]
+    fn a_file_is_held_only_if_it_is_whole() {
+        let dir = tempfile::tempdir_in("/dev/shm").unwrap();
+        let store = FileStore::new(dir.path().join("s"))
+            .unwrap()
+            .with_verity(crate::VerityMode::On);
+        let digest = store.put(Algorithm::Sha256, b"whole").unwrap();
+        assert!(store.holds(&digest, 5));
+        assert!(!store.holds(&digest, 6));
+        assert!(!store.holds(&fsverity_digest_of(Algorithm::Sha256, b"gone"), 4));
+        let path = store.local_path(&digest).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"damaged").unwrap();
+        assert!(!store.holds(&digest, 5));
+        // (a file system that has fs-verity: a file of the right size is
+        // held only if the kernel measures it as its name)
+        if let Some(dir) = std::env::var_os("VELARX_VERITY_DIR") {
+            let dir = tempfile::tempdir_in(dir).unwrap();
+            let store = FileStore::new(dir.path().join("s"))
+                .unwrap()
+                .with_verity(crate::VerityMode::On);
+            let digest = store.put(Algorithm::Sha256, b"sealed").unwrap();
+            assert!(store.holds(&digest, 6));
+            let path = store.local_path(&digest).unwrap();
+            fs::remove_file(&path).unwrap();
+            fs::write(&path, b"unseal").unwrap();
+            assert!(!store.holds(&digest, 6));
+        }
     }
 
     /// The files below `dir`.

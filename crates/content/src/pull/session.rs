@@ -270,6 +270,11 @@ impl Session {
         if self.parent.get().is_some_and(|p| p.has_staged(digest)) {
             return true;
         }
+        self.stage_additional(digest)
+    }
+
+    /// Stage the copy of the file of a read-only store that has it.
+    fn stage_additional(&self, digest: &str) -> bool {
         match self.store.find_additional(digest) {
             Some(src) => match self.stage_copy(&src, digest) {
                 Ok(()) => true,
@@ -280,6 +285,22 @@ impl Session {
             },
             None => false,
         }
+    }
+
+    /// [`Session::have`] of a file of `size` bytes: what is staged or stored
+    /// with another size, or damaged, is not held (what the pull fetches
+    /// replaces it, or is refused for not being what its table says).
+    pub fn holds(&self, digest: &str, size: u64) -> bool {
+        match self.staged_size(digest) {
+            Some(staged) => staged == size,
+            None => self.store.holds(digest, size) || self.stage_additional(digest),
+        }
+    }
+
+    /// The size of what this session, or the one it is next to, staged.
+    fn staged_size(&self, digest: &str) -> Option<u64> {
+        let own = self.staged.lock().unwrap().get(digest).map(|s| s.size);
+        own.or_else(|| self.parent.get()?.staged_size(digest))
     }
 
     /// Stage the copy of a file of a read-only store, whose content must
@@ -390,7 +411,7 @@ impl Session {
         (size, copy): (u64, bool),
         own: bool,
     ) -> io::Result<bool> {
-        if self.staged.lock().unwrap().contains_key(digest) || self.store.contains_local(digest) {
+        if self.staged.lock().unwrap().contains_key(digest) || self.store.holds(digest, size) {
             fs::remove_file(temp)?;
             return Ok(false);
         }
@@ -438,10 +459,10 @@ impl Session {
     /// itself (not in a read-only one: what only that has is staged from
     /// there by [`Session::have`]) or staged here: nothing needs to be
     /// written for it.
-    fn holds_object(&self, verity: &str) -> bool {
+    fn holds_object(&self, verity: &str, size: u64) -> bool {
         self.has_staged(verity)
             || self.parent.get().is_some_and(|p| p.has_staged(verity))
-            || self.store.contains_local(verity)
+            || self.store.holds(verity, size)
     }
 
     /// [`Session::adopt_as`] for a file whose content was measured in both
@@ -459,7 +480,7 @@ impl Session {
         size: u64,
         copy: bool,
     ) -> io::Result<(String, bool)> {
-        if self.holds_object(verity) {
+        if self.holds_object(verity, size) {
             fs::remove_file(temp)?;
             return Ok((verity.to_string(), false));
         }
@@ -484,7 +505,7 @@ impl Session {
         data: &[u8],
         copy: bool,
     ) -> io::Result<(String, bool)> {
-        if self.holds_object(verity) {
+        if self.holds_object(verity, data.len() as u64) {
             return Ok((verity.to_string(), false));
         }
         self.put_as(key, data, copy)
@@ -506,7 +527,7 @@ impl Session {
         verity_keyed: Option<&str>,
     ) -> io::Result<bool> {
         let size = file.metadata()?.len();
-        if self.staged.lock().unwrap().contains_key(digest) || self.store.contains_local(digest) {
+        if self.staged.lock().unwrap().contains_key(digest) || self.store.holds(digest, size) {
             return Ok(false);
         }
         let to = self.link_temp(file)?;
@@ -552,7 +573,7 @@ impl Session {
     pub fn adopt_verified(&self, file: &File, digest: &str, verity: &str) -> io::Result<Adopted> {
         use rustix::fs::{linkat, AtFlags, CWD};
         let size = file.metadata()?.len();
-        if self.staged.lock().unwrap().contains_key(digest) || self.store.contains_local(digest) {
+        if self.staged.lock().unwrap().contains_key(digest) || self.store.holds(digest, size) {
             return Ok(Adopted::default());
         }
         let mut copied = 0;
@@ -647,7 +668,7 @@ impl Session {
         known: Option<Option<&str>>,
     ) -> io::Result<bool> {
         let mut staged = self.staged.lock().unwrap();
-        if staged.contains_key(digest) || self.store.contains_local(digest) {
+        if staged.contains_key(digest) || self.store.holds(digest, size) {
             return Ok(false);
         }
         match known {
@@ -681,7 +702,7 @@ impl Session {
     /// Stage content that is in memory; a `copy` (of what the store or a
     /// local source had) is the store's, not the pull's.
     pub fn put_as(&self, digest: &str, data: &[u8], copy: bool) -> io::Result<bool> {
-        if self.have(digest) {
+        if self.holds(digest, data.len() as u64) {
             return Ok(false);
         }
         let (mut file, temp) = self.create_temp()?;
@@ -1249,7 +1270,11 @@ mod tests {
             return;
         };
         let tmp = tempfile::tempdir_in(dir).unwrap();
-        let store = Arc::new(FileStore::new(tmp.path().join("files")).unwrap());
+        let store = Arc::new(
+            FileStore::new(tmp.path().join("files"))
+                .unwrap()
+                .with_verity(velarx_storage::VerityMode::On),
+        );
         let verity = velarx_storage::VerityMode::On.manager().unwrap();
         let d =
             velarx_storage::fsverity_digest_of(velarx_types::digest::Algorithm::Sha256, b"hello");

@@ -1884,6 +1884,34 @@ impl Database {
             .await?)
     }
 
+    /// The first of the files `(digest, size)` that the store records with
+    /// another size: its digest, the size the store has and the one given.
+    /// A digest names one content, which has one size.
+    pub async fn file_size_conflict(
+        &self,
+        files: Vec<(String, u64)>,
+    ) -> DbResult<Option<(String, u64, u64)>> {
+        Ok(self
+            .conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare_cached("SELECT size FROM files WHERE digest = ?1")?;
+                for (digest, size) in files {
+                    let stored: Option<u64> = stmt
+                        .query_row([&digest], |r| r.get(0))
+                        .map(Some)
+                        .or_else(|e| match e {
+                            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                            e => Err(e),
+                        })?;
+                    if let Some(stored) = stored.filter(|s| *s != size) {
+                        return Ok(Some((digest, stored, size)));
+                    }
+                }
+                Ok(None)
+            })
+            .await?)
+    }
+
     /// The objects of all the files of this store.
     pub async fn all_file_objects(&self) -> DbResult<std::collections::HashMap<String, Object>> {
         Ok(self

@@ -107,11 +107,11 @@ pub struct LayerIndex {
 pub trait Incoming: Send + Sync {
     /// Whether the driver lacks the file known by `key` (the fs-verity digest
     /// of its content as the table of contents gives it, or the hash of its
-    /// content): the feed fetches what is wanted, and only that.  Called on
-    /// a thread that may block, each time the plan of a layer meets a file
-    /// (the driver may need to copy it from a read-only store to say it
-    /// has it).
-    fn wants(&self, key: &str) -> bool;
+    /// content), of `size` bytes: the feed fetches what is wanted, and only
+    /// that.  Called on a thread that may block, each time the plan of a
+    /// layer meets a file (the driver may need to copy it from a read-only
+    /// store to say it has it).
+    fn wants(&self, key: &str, size: u64) -> bool;
 
     /// The id of this pull: what the engine's lease on it is named by, and
     /// what a driver whose store is in another process calls the pull
@@ -148,8 +148,8 @@ pub fn is_pull_id(id: &str) -> bool {
 }
 
 /// The [`Incoming`] of a driver that has its store in this process: it wants
-/// what the session does not have (`Session::have`: the store, or what an
-/// earlier layer of the pull staged), and the bytes go to the session.
+/// what the session does not hold whole (`Session::holds`: the store, or what
+/// an earlier layer of the pull staged), and the bytes go to the session.
 pub struct SessionIncoming(Arc<Session>, Arc<dyn Sink>);
 
 impl SessionIncoming {
@@ -160,8 +160,8 @@ impl SessionIncoming {
 }
 
 impl Incoming for SessionIncoming {
-    fn wants(&self, key: &str) -> bool {
-        !self.0.have(key)
+    fn wants(&self, key: &str, size: u64) -> bool {
+        !self.0.holds(key, size)
     }
 
     fn pull_id(&self) -> String {
@@ -193,7 +193,7 @@ impl FilesIncoming {
 }
 
 impl Incoming for FilesIncoming {
-    fn wants(&self, key: &str) -> bool {
+    fn wants(&self, key: &str, _size: u64) -> bool {
         self.files.wants(key)
     }
 
@@ -228,7 +228,7 @@ impl Wanted {
 }
 
 impl Incoming for Wanted {
-    fn wants(&self, key: &str) -> bool {
+    fn wants(&self, key: &str, _size: u64) -> bool {
         self.keys.contains(key)
     }
 
@@ -977,7 +977,7 @@ impl PullFeed for ContentFeed {
         let ctx = self
             .context()?
             .with_sink(into.sink().clone())
-            .with_have(Arc::new(move |key: &str| !wants.wants(key)) as Have);
+            .with_have(Arc::new(move |key: &str, size| !wants.wants(key, size)) as Have);
         let report = self.reporter(layer);
         let spooled = || {
             self.spooled
@@ -1189,7 +1189,7 @@ async fn copy_wanted(
         let (mut files, mut bytes) = (0u64, 0u64);
         for (key, size) in &keys {
             cancelled()?;
-            if !into.wants(key) {
+            if !into.wants(key, *size) {
                 continue;
             }
             let place = sink.place(key, *size)?;

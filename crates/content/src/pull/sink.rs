@@ -145,9 +145,9 @@ pub trait Sink: Stage {
     /// A directory of the engine's, closed to others, for the files with no
     /// name the pull makes (metadata, the files of a job).
     fn dir(&self) -> &Path;
-    /// Whether the file known by `key` is there already, so that it is not
-    /// fetched.
-    fn have(&self, key: &str) -> bool;
+    /// Whether the file known by `key`, of `size` bytes, is there already
+    /// and whole, so that it is not fetched.
+    fn holds(&self, key: &str, size: u64) -> bool;
     /// Whether the content of `key` came from the store as it was before the
     /// pull (not staged by it, or a copy of what the store had).
     fn existed(&self, key: &str) -> bool;
@@ -315,8 +315,8 @@ impl Sink for Session {
         Session::dir(self)
     }
 
-    fn have(&self, key: &str) -> bool {
-        Session::have(self, key)
+    fn holds(&self, key: &str, size: u64) -> bool {
+        Session::holds(self, key, size)
     }
 
     fn existed(&self, key: &str) -> bool {
@@ -856,7 +856,7 @@ impl Sink for Spool {
         &self.dir
     }
 
-    fn have(&self, _key: &str) -> bool {
+    fn holds(&self, _key: &str, _size: u64) -> bool {
         false
     }
 
@@ -1084,7 +1084,7 @@ impl Sink for FilesSink {
         &self.dir
     }
 
-    fn have(&self, key: &str) -> bool {
+    fn holds(&self, key: &str, _size: u64) -> bool {
         !self.wants(key)
     }
 

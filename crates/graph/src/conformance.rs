@@ -409,8 +409,8 @@ struct Noting {
 }
 
 impl Incoming for Noting {
-    fn wants(&self, key: &str) -> bool {
-        let wants = self.inner.wants(key);
+    fn wants(&self, key: &str, size: u64) -> bool {
+        let wants = self.inner.wants(key, size);
         if wants {
             self.meddle
                 .wanted

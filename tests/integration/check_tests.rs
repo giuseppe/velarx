@@ -973,6 +973,27 @@ async fn a_lost_composefs_image_marks_its_layer_incomplete_and_a_pull_makes_it_a
     assert!(plan(&e, &second).await.is_ok());
 }
 
+/// A pull over an object of the store that is not as long as the table says
+/// (damaged, or replaced) puts the content back, and the image is made
+/// again: the object is not taken for held because it has a name.
+#[tokio::test]
+async fn a_pull_replaces_a_store_object_that_is_not_the_size_of_its_table() {
+    for damage in [&b"x"[..], &b"the content of the file and more bytes"[..]] {
+        let (e, id) = pulled().await;
+        let object = object_of(&e, &id, "etc/small").await;
+        let original = std::fs::read(&object).unwrap();
+        rewrite(&object, |_| damage.to_vec());
+        assert!(kinds(&check(&e, false, false).await).contains(&"wrong_size"));
+        // (the image of the layer is gone, which a pull makes again)
+        std::fs::remove_file(layer_image(&e, &id).await).unwrap();
+        assert!(plan(&e, &id).await.is_err());
+        e.pull().await.unwrap();
+        assert_eq!(std::fs::read(&object).unwrap(), original);
+        assert!(check(&e, false, false).await.ok());
+        assert!(plan(&e, &id).await.is_ok());
+    }
+}
+
 #[tokio::test]
 async fn two_starts_of_an_image_whose_composefs_image_is_lost_say_the_same() {
     let (e, id) = pulled().await;

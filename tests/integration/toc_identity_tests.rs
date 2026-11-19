@@ -780,3 +780,54 @@ async fn test_a_table_of_version_1_with_one_digest_and_two_sizes_is_refused() {
         );
     }
 }
+
+/// A table that gives a content the store holds another size is refused,
+/// and the store is as it was.
+#[tokio::test]
+async fn test_a_digest_of_the_store_listed_with_another_size_is_refused() {
+    let a = build_chunked(&[Item::File {
+        name: "a",
+        data: b"hello\n".to_vec(),
+        chunk: 4096,
+    }]);
+    // (`b` has 4096 bytes in the tar and the tar-split: its table gives it
+    // the digests of the content of `a`)
+    let b = build_chunked(&[Item::File {
+        name: "b",
+        data: vec![9u8; 4096],
+        chunk: 4096,
+    }]);
+    let b = edited(&b, "b", |e| {
+        e["digest"] = sha(b"hello\n").to_string().into();
+        e["chunkDigest"] = sha(b"hello\n").to_string().into();
+        e["fsverity"] = toc_verity(b"hello\n").into();
+    });
+    for lazy in [false, true] {
+        let e = env().await;
+        e.publish(&[&a], &[ZSTD]);
+        e.pull().await.unwrap();
+        e.publish(&[&b], &[ZSTD]);
+        let before = e.stored().await;
+        let refused = pull_tag(&e, "latest", lazy).await.unwrap_err().to_string();
+        assert!(
+            refused.contains(&sha(&b.blob).to_string()),
+            "lazy {lazy}: {refused}"
+        );
+        assert_eq!(e.stored().await, before, "lazy {lazy}");
+        let checker = CheckService::new(
+            e.db.clone(),
+            std::sync::Arc::new((*e.service).clone()),
+            e.store.clone(),
+            e.staging.clone(),
+        );
+        let report = checker.check(&CheckSpec::default()).await.unwrap();
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+
+        // (both in one image, in a store that has neither)
+        let e = env().await;
+        e.publish(&[&a, &b], &[ZSTD, ZSTD]);
+        let before = e.stored().await;
+        assert!(pull_tag(&e, "latest", lazy).await.is_err(), "lazy {lazy}");
+        assert_eq!(e.stored().await, before, "lazy {lazy}");
+    }
+}

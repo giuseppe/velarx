@@ -57,7 +57,7 @@
 //! fails.
 
 use rayon::prelude::*;
-use rustix::fs::{linkat, renameat, unlinkat, AtFlags, Mode, OFlags, ResolveFlags, CWD};
+use rustix::fs::{linkat, renameat, statat, unlinkat, AtFlags, Mode, OFlags, ResolveFlags, CWD};
 use rustix::io::Errno;
 use std::fs::File;
 use std::io;
@@ -529,19 +529,17 @@ fn storage_error(store: &FileStore, what: String) -> io::Error {
     io::Error::other(format!("{}: {what}", store.root().display()))
 }
 
-/// The object the store has under `verity`, `checked` when the kernel
-/// measures it as its name; none when `verify` and it is not (it is replaced
-/// by the file that is).
-fn present(store: &FileStore, verity: &str, verify: bool) -> Option<Object> {
-    let unchecked = Object::new(verity, false)?;
-    let checked = File::open(store.object_path(&unchecked))
+/// The object the store holds under `verity` ([`FileStore::holds`]),
+/// `checked` when the kernel measures it as its name.
+fn present(store: &FileStore, verity: &str, size: u64) -> Option<Object> {
+    if !store.holds(verity, size) {
+        return None;
+    }
+    let checked = File::open(store.local_path(verity)?)
         .ok()
         .and_then(|f| measure_file(&f).ok())
         .and_then(|m| m.object())
         .is_some_and(|o| o.to_string() == verity);
-    if verify && !checked {
-        return None;
-    }
     Object::new(verity, checked)
 }
 
@@ -821,12 +819,16 @@ fn prepare_one(
     // the store's file is never replaced: it may have been optimized since
     // it was put there.  (A name in the store is a complete file: nothing
     // is given its name before its bytes are durable.)
+    // (whole: of the size the table gives, else of the staged file's)
     if let Check::Verity(v) = &want.check {
-        if store.contains_local(v) {
-            if let Some(object) = present(store, v, false) {
-                let _ = unlinkat(dir, rel, AtFlags::empty());
-                return done(Step::Present(object));
-            }
+        let size = want.size.or_else(|| {
+            statat(dir, rel, AtFlags::empty())
+                .ok()
+                .map(|s| s.st_size as u64)
+        });
+        if let Some(object) = size.and_then(|size| present(store, v, size)) {
+            let _ = unlinkat(dir, rel, AtFlags::empty());
+            return done(Step::Present(object));
         }
     }
     let mut file = match open_staged_file(dir, rel) {
@@ -939,8 +941,8 @@ fn prepare_one(
         }
     }
     if let Some(m) = &measured {
-        if !matches!(want.check, Check::Verity(_)) && store.contains_local(m) {
-            if let Some(object) = present(store, m, manager.is_some()) {
+        if !matches!(want.check, Check::Verity(_)) {
+            if let Some(object) = present(store, m, meta.len()) {
                 let _ = unlinkat(dir, rel, AtFlags::empty());
                 return done(Step::Present(object));
             }
@@ -979,11 +981,9 @@ fn prepare_one(
         let Some(object) = Object::new(&computed, false) else {
             return wrong("not an fs-verity digest");
         };
-        if store.contains_local(&object.verity) {
-            if let Some(object) = present(store, &object.verity, false) {
-                let _ = unlinkat(dir, rel, AtFlags::empty());
-                return done(Step::Present(object));
-            }
+        if let Some(object) = present(store, &object.verity, meta.len()) {
+            let _ = unlinkat(dir, rel, AtFlags::empty());
+            return done(Step::Present(object));
         }
         return settle_staged(rel, &file, meta, object, store);
     }
@@ -1058,11 +1058,9 @@ fn prepare_one(
     let Some(object) = kernel.or_else(|| Object::new(&computed, false)) else {
         return wrong("not an fs-verity digest");
     };
-    if store.contains_local(&object.verity) {
-        if let Some(object) = present(store, &object.verity, object.checked) {
-            drop_name(dir, rel, &meta);
-            return done(Step::Present(object));
-        }
+    if let Some(object) = present(store, &object.verity, meta.len()) {
+        drop_name(dir, rel, &meta);
+        return done(Step::Present(object));
     }
     if copies.take() {
         return Ok(Prepared::Copy {
@@ -1173,9 +1171,9 @@ fn place_one(dir: BorrowedFd<'_>, prepared: Prepared, store: &FileStore) -> io::
     }
 }
 /// Give the file at `from` (a name of its own or `/proc/self/fd/N`) the place
-/// of `object`: never over an object that is there, unless that one is
-/// checked and does not have the fs-verity digest it is named by.  Whether
-/// the name was made by this call.
+/// of `object`: never over an object that is there, unless that one is not
+/// as long as `from`, or is checked and does not have the fs-verity digest
+/// it is named by.  Whether the name was made by this call.
 pub fn link_object(from: &str, target: &std::path::Path, object: &Object) -> io::Result<bool> {
     match linkat(CWD, from, CWD, target, AtFlags::SYMLINK_FOLLOW) {
         Ok(()) => Ok(true),
@@ -1187,13 +1185,13 @@ pub fn link_object(from: &str, target: &std::path::Path, object: &Object) -> io:
                     .and_then(|m| m.object())
                     .is_some_and(|o| o.to_string() == object.verity)
             };
-            if !object.checked || measures(target) {
+            let length = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).ok();
+            if length(target) == length(std::path::Path::new(from))
+                && (!object.checked || measures(target))
+            {
                 return Ok(false);
             }
-            warn!(
-                "{} does not have the fs-verity digest of its name: replaced",
-                target.display()
-            );
+            warn!("{} is not what its name says: replaced", target.display());
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let temporary = target.with_file_name(format!(
                 ".link{}-{}",
