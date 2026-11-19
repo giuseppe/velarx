@@ -1202,6 +1202,72 @@ fn chunked_layer_made(
     registry_layer(reg, tar, Compression::ZstdChunked, verity, diff_id, bytes)
 }
 
+/// The zstd:chunked blob of the layer `tar` with the table of contents that
+/// `edit` makes of its own (the descriptor vouches for the new one): what the
+/// tar stream and the tar-split say is not changed.
+fn chunked_layer_edited(
+    reg: &Registry,
+    tar: &[u8],
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> FeedLayer {
+    use velarx_content::layer::writer::{write_layer, Compression};
+    let p = "io.github.containers.zstd-chunked.";
+    let mut blob = Vec::new();
+    let w = write_layer(
+        tar,
+        velarx_types::digest::Algorithm::Sha256,
+        Compression::ZstdChunked,
+        &mut blob,
+    )
+    .expect("a layer");
+    let numbers = |name: &str| -> Vec<usize> {
+        w.annotations[&format!("{p}{name}")]
+            .split(':')
+            .map(|x| x.parse().unwrap())
+            .collect()
+    };
+    let pos = numbers("manifest-position");
+    let ts = numbers("tarsplit-position");
+    let mut toc: serde_json::Value =
+        serde_json::from_slice(&zstd::decode_all(&blob[pos[0]..pos[0] + pos[1]]).unwrap()).unwrap();
+    edit(&mut toc);
+    let json = serde_json::to_vec(&toc).unwrap();
+    let toc_z = zstd::encode_all(&json[..], 3).unwrap();
+    let mut edited = blob[..pos[0]].to_vec();
+    edited[pos[0] - 4..pos[0]].copy_from_slice(&(toc_z.len() as u32).to_le_bytes());
+    edited.extend(&toc_z);
+    edited.extend(&blob[pos[0] + pos[1]..]);
+    let mut annotations = w.annotations.clone();
+    annotations.insert(
+        format!("{p}manifest-position"),
+        format!("{}:{}:{}:1", pos[0], toc_z.len(), json.len()),
+    );
+    annotations.insert(
+        format!("{p}manifest-checksum"),
+        Digest::of(velarx_types::digest::Algorithm::Sha256, &toc_z).to_string(),
+    );
+    annotations.insert(
+        format!("{p}tarsplit-position"),
+        format!("{}:{}:{}", ts[0] + toc_z.len() - pos[1], ts[1], ts[2]),
+    );
+    let digest = Digest::of(velarx_types::digest::Algorithm::Sha256, &edited);
+    reg.put(&digest.to_string(), edited.clone());
+    let desc = OciDescriptor {
+        media_type: w.media_type.to_string(),
+        digest,
+        size: edited.len() as i64,
+        annotations: annotations.into_iter().collect(),
+    };
+    FeedLayer {
+        key: LayerKey::expected(&desc),
+        descriptor: desc,
+        diff_id: w.diff_id,
+        chain_id: w.diff_id,
+        parent: None,
+        stored: false,
+    }
+}
+
 /// The same in the compression `compression`: a layer that is not
 /// zstd:chunked has no table of contents to fetch by.
 fn registry_layer(
@@ -1461,6 +1527,65 @@ pub async fn a_chunk_the_driver_holds_is_not_fetched_again(f: &Factory) {
         warm_bytes * 2 < cold_bytes,
         "the chunks the store holds are not asked for again: {warm_bytes} against {cold_bytes}"
     );
+}
+
+/// A layer is stored by the entries of its table as a layer keeps them: the
+/// name normalised, the permission bits only, none of the attributes of the
+/// overlay file system.  The table of a registry that says otherwise (and
+/// agrees with the tar once cleaned) is not what the driver is handed or
+/// what it records, whatever the driver.
+pub async fn a_driver_is_handed_the_table_a_layer_keeps(f: &Factory) {
+    let (_tmp, s) = begin!(f, "a_driver_is_handed_the_table_a_layer_keeps");
+    if !s.chunked_only {
+        eprintln!("SKIPPED conformance::a_driver_is_handed_the_table_a_layer_keeps: the layers are archives");
+        return;
+    }
+    let reg = Registry::start().await;
+    let (_, tar) = chunked_layers();
+    let layer = chunked_layer_edited(&reg, &tar, |toc| {
+        for e in toc["entries"].as_array_mut().unwrap() {
+            if e["name"] == "usr/f1" {
+                e["name"] = "./usr//f1".into();
+                e["mode"] = 0o100644.into();
+                e["xattrs"] = serde_json::json!({
+                    "trusted.overlay.redirect": "L2V0Yy9zaGFkb3c=",
+                    "user.overlay.opaque": "eQ==",
+                });
+            }
+        }
+    });
+    let mut layers = vec![layer];
+    set_chains(&mut layers);
+    let feed = registry_feed(&reg, &s.db, &s.dir, &layers[0].descriptor, false).await;
+    let offer = Offer {
+        feed: Arc::new(ArchiveFeed {
+            layers: vec![(layers[0].descriptor.digest, feed)],
+            meddle: Arc::default(),
+        }),
+        layers,
+        _registry: None,
+    };
+    let seen = Arc::new(Mutex::new(None));
+    let seen2 = seen.clone();
+    offer
+        .pull(
+            &s,
+            Box::new(move |pulled, _| {
+                *seen2.lock().unwrap() = Some(pulled[0].toc.clone());
+                engine_settlement(pulled)
+            }),
+        )
+        .await
+        .expect("a pull");
+    let toc = seen.lock().unwrap().take().expect("the check ran");
+    let e = toc
+        .entries
+        .iter()
+        .find(|e| e.name.ends_with("f1"))
+        .expect("the file");
+    assert_eq!(e.name, "usr/f1");
+    assert_eq!(e.mode, 0o644);
+    assert!(e.xattrs.is_empty(), "{:?}", e.xattrs);
 }
 
 /// A chunked pull that is cut off in the middle stores nothing and leaves no
@@ -6662,6 +6787,7 @@ macro_rules! conformance_suite_with {
             pull_is_idempotent,
             a_chunked_pull_asks_only_for_what_the_store_lacks,
             a_chunk_the_driver_holds_is_not_fetched_again,
+            a_driver_is_handed_the_table_a_layer_keeps,
             an_interrupted_chunked_pull_is_pulled_again,
             pull_check_sees_the_layers_first,
             a_pull_returns_the_verdict_of_the_check,

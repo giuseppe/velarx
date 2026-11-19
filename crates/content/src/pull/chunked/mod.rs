@@ -539,17 +539,15 @@ pub fn located_chunks(toc: &Toc) -> Vec<ChunkLocationRecord> {
     located_chunks_where(toc, |_| true)
 }
 
-/// [`located_chunks`] of the regular files `keep` takes: those whose bytes
-/// were checked chunk by chunk against the table (a table's word for the
-/// chunks of an object nobody checked them in is no place to copy from).
-pub fn located_chunks_where(
-    toc: &Toc,
-    keep: impl Fn(&TocEntry) -> bool,
-) -> Vec<ChunkLocationRecord> {
+/// [`located_chunks`] of the regular files at the entries `keep` takes: those
+/// whose bytes were checked chunk by chunk against the table (a table's word
+/// for the chunks of an object nobody checked them in is no place to copy
+/// from).
+pub fn located_chunks_where(toc: &Toc, keep: impl Fn(usize) -> bool) -> Vec<ChunkLocationRecord> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for (i, e) in toc.entries.iter().enumerate() {
-        if !keep(e) {
+    for i in 0..toc.entries.len() {
+        if !keep(i) {
             continue;
         }
         let Some(file) = TocChunks::of(&toc.entries, i) else {

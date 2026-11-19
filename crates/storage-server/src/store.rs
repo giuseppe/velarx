@@ -340,10 +340,21 @@ impl Store {
         )
     }
 
-    /// Remember the object of each file of `entries` that is known by the
-    /// hash of its content, before the engine reads the layer back.
-    pub fn record_aliases(&self, entries: &[velarx_storage::TocEntry]) -> DriverResult<()> {
-        for e in entries {
+    /// Remember the object of each file of `entries`, the table of a layer
+    /// the pull settled, that `handed`, the table the engine handed over
+    /// (entry for entry), knows by the hash of its content, before the
+    /// engine reads the layer back.  Those are the files it gives no
+    /// fs-verity digest: their bytes were checked against that hash.  Where
+    /// it gives one, the hash is the table's word.
+    pub fn record_aliases(
+        &self,
+        handed: &[velarx_storage::TocEntry],
+        entries: &[velarx_storage::TocEntry],
+    ) -> DriverResult<()> {
+        for (h, e) in handed.iter().zip(entries) {
+            if h.verity().is_some() {
+                continue;
+            }
             let (Some(path), Some(object)) = (
                 e.digest.as_deref().and_then(|d| self.alias_path(d)),
                 e.verity(),
@@ -606,8 +617,8 @@ mod tests {
         serde_json::from_value(e).unwrap()
     }
 
-    /// A key that is the hash of the content stands for the object the
-    /// layer's table of contents says has it, as long as the store has the
+    /// A key that is the hash of the content stands for the object the pull
+    /// of a layer known by that hash found it is, as long as the store has the
     /// object; an object's own name, and a key nothing is known of, stand for
     /// themselves.
     #[test]
@@ -618,19 +629,34 @@ mod tests {
         let sha = format!("sha256:{}", "ab".repeat(32));
         let object = format!("fsverity-sha256-12:{}", "cd".repeat(32));
         let toc = velarx_storage::to_toc(&object).unwrap();
+        let other = format!("sha256:{}", "ef".repeat(32));
         store
-            .record_aliases(&[
-                entry(&sha, Some(&toc)),
-                // (a file the table gives no fs-verity digest for is not known)
-                entry(&format!("sha256:{}", "ef".repeat(32)), None),
-            ])
+            .record_aliases(
+                &[entry(&sha, None), entry(&other, None)],
+                // (a file the pull found no object for is not known)
+                &[entry(&sha, Some(&toc)), entry(&other, None)],
+            )
             .unwrap();
         assert_eq!(store.resolve(&sha), object);
         assert_eq!(store.resolve(&object), object);
-        let other = format!("sha256:{}", "ef".repeat(32));
         assert_eq!(store.resolve(&other), other);
         // an alias of an object the store lacks goes with the next collection
         store.forget_dangling_aliases();
+        assert_eq!(store.resolve(&sha), sha);
+    }
+
+    /// The content hash a table gives a file next to its fs-verity digest is
+    /// the table's word: it names no object.
+    #[test]
+    fn the_hash_of_a_file_known_by_its_fs_verity_digest_names_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let store = Store::open(dir.path(), rt.handle().clone(), Arc::default()).unwrap();
+        let sha = format!("sha256:{}", "ab".repeat(32));
+        let object = format!("fsverity-sha256-12:{}", "cd".repeat(32));
+        let toc = velarx_storage::to_toc(&object).unwrap();
+        let table = [entry(&sha, Some(&toc))];
+        store.record_aliases(&table, &table).unwrap();
         assert_eq!(store.resolve(&sha), sha);
     }
 }

@@ -24,7 +24,7 @@ doctest = false
 
 [features]
 # the conformance suite (`velarx_graph::conformance`): every driver's tests
-conformance = ["dep:futures", "dep:velarx-registry", "velarx-registry/net", "dep:velarx-registry-lib"]
+conformance = ["dep:futures", "dep:zstd", "dep:velarx-registry", "velarx-registry/net", "dep:velarx-registry-lib"]
 
 [dependencies]
 bytes.workspace = true
@@ -57,12 +57,14 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "net", 
 thiserror.workspace = true
 tracing.workspace = true
 xattr.workspace = true
+zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 # what the suite uses, for the tests of this package (it is compiled there
 # without the feature)
 futures.workspace = true
 velarx-registry = { path = "../registry" }
+zstd.workspace = true
 
 [lints]
 workspace = true

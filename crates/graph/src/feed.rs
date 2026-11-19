@@ -960,7 +960,7 @@ impl PullFeed for ContentFeed {
         };
         let index = LayerIndex {
             key: layer.key,
-            toc: m.toc.clone(),
+            toc: m.stored.clone(),
             tarsplit: m.tarsplit_z.clone(),
         };
         self.metadata

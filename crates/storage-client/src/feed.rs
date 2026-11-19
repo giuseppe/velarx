@@ -103,10 +103,10 @@ pub struct Feed {
     /// them at the fetch, the proof of the layer does when it reads them back.
     copied: Mutex<HashSet<String>>,
     /// The objects the engine wrote whole itself, every chunk of them checked
-    /// against the table of contents as it was written: the chunks of these
-    /// alone are recorded where they are (a later pull has the driver copy
-    /// them).
-    checked: Mutex<HashSet<String>>,
+    /// against the table of contents of the layer as it was written, for
+    /// each layer: the chunks of these alone are recorded where they are (a
+    /// later pull has the driver copy them).
+    checked: Mutex<HashMap<String, HashSet<String>>>,
     layers: Vec<Layer>,
     live: AtomicU32,
     /// The connections served, by a number of their own, to close at the
@@ -252,13 +252,16 @@ impl Feed {
             .clone()
     }
 
-    /// The objects the engine wrote whole itself, each chunk checked as it
-    /// was written (not one the driver copied into).
-    pub fn checked(&self) -> HashSet<String> {
+    /// The objects the engine wrote whole itself for `layer`, each chunk
+    /// checked against its table as it was written (not one the driver copied
+    /// into).
+    pub fn checked(&self, layer: &str) -> HashSet<String> {
         self.checked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .get(layer)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// What a fetch of the engine failed with, once.
@@ -750,6 +753,8 @@ impl Feed {
         self.checked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .entry(call.layer.clone())
+            .or_default()
             .extend(sink.chunks_checked());
         let result = verdict.unwrap_or_else(|| {
             Err(ImageError::Storage(

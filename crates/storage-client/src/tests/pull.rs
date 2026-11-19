@@ -29,30 +29,39 @@ pub(crate) struct Built {
 }
 
 pub(crate) fn built() -> Built {
-    let content = b"hello, storage driver".to_vec();
+    built_of(&[("d/f", b"hello, storage driver")])
+}
+
+/// The same with the regular files `files`: the object and the content are
+/// those of the first.
+pub(crate) fn built_of(files: &[(&str, &[u8])]) -> Built {
     let mut b = tar::Builder::new(Vec::new());
     let mut h = tar::Header::new_gnu();
     h.set_entry_type(tar::EntryType::Directory);
     h.set_mode(0o755);
     h.set_size(0);
     b.append_data(&mut h, "d/", &b""[..]).unwrap();
-    let mut h = tar::Header::new_gnu();
-    h.set_mode(0o644);
-    h.set_size(content.len() as u64);
-    b.append_data(&mut h, "d/f", &content[..]).unwrap();
+    let mut entries = vec![json!({"type": "dir", "name": "d/"})];
+    for (name, content) in files {
+        let mut h = tar::Header::new_gnu();
+        h.set_mode(0o644);
+        h.set_size(content.len() as u64);
+        b.append_data(&mut h, name, &content[..]).unwrap();
+        entries.push(json!({
+            "type": "reg",
+            "name": name,
+            "size": content.len(),
+            "digest": Digest::of(Algorithm::Sha256, content).to_string(),
+        }));
+    }
     let tar = b.into_inner().unwrap();
     let mut r = TarReader::with_sink(&tar[..], Recorder::new().unwrap());
     while r.next_entry().unwrap().is_some() {}
     let (_, rec) = r.finish().unwrap();
+    let content = files[0].1.to_vec();
     let object = Digest::of(Algorithm::Sha256, &content).to_string();
-    let toc: velarx_storage::Toc = serde_json::from_value(json!({
-        "version": 1,
-        "entries": [
-            {"type": "dir", "name": "d/"},
-            {"type": "reg", "name": "d/f", "size": content.len(), "digest": object},
-        ]
-    }))
-    .unwrap();
+    let toc: velarx_storage::Toc =
+        serde_json::from_value(json!({"version": 1, "entries": entries})).unwrap();
     Built {
         diff: Digest::of(Algorithm::Sha256, &tar),
         toc,
@@ -261,6 +270,8 @@ struct Script {
     kept: Mutex<Option<Conn>>,
     object: String,
     content: Vec<u8>,
+    /// The other objects the driver holds, by key.
+    others: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 fn feed_call(
@@ -344,6 +355,7 @@ fn start_script(e: &Env, built: &Built, behavior: Behavior) -> Arc<Script> {
         kept: Mutex::default(),
         object: built.object.clone(),
         content: built.content.clone(),
+        others: Mutex::default(),
     });
     let s = script.clone();
     e.fake.handle(move |c: Call, conn| {
@@ -361,12 +373,19 @@ fn read(s: &Script, mut c: Call, conn: &mut Conn) {
     let pipe = std::fs::File::from(c.fds.remove(0));
     let ranges = c.params["ranges"].as_array().unwrap().clone();
     for (i, r) in ranges.iter().enumerate() {
-        assert_eq!(r["key"], s.object.as_str(), "the only object there is");
+        let key = r["key"].as_str().unwrap();
+        let content = match s.others.lock().unwrap().get(key) {
+            Some(other) => other.clone(),
+            None => {
+                assert_eq!(key, s.object, "no object but the ones there are");
+                s.content.clone()
+            }
+        };
         let (off, len) = (
             r["offset"].as_u64().unwrap() as usize,
             r["length"].as_u64().unwrap() as usize,
         );
-        if off + len > s.content.len() {
+        if off + len > content.len() {
             error(
                 conn,
                 "org.velarx.Storage.Corrupt",
@@ -375,12 +394,10 @@ fn read(s: &Script, mut c: Call, conn: &mut Conn) {
             return;
         }
         reply(conn, &json!({"index": i}), i + 1 < ranges.len(), &[]);
-        let mut bytes = s.content.clone();
+        let mut bytes = content;
         if s.garble.load(Ordering::SeqCst) {
             bytes[0] ^= 0xff;
         }
-        let off = r["offset"].as_u64().unwrap() as usize;
-        let len = r["length"].as_u64().unwrap() as usize;
         (&pipe).write_all(&bytes[off..off + len]).unwrap();
     }
 }
@@ -1280,6 +1297,102 @@ fn the_engine_writes_the_files_a_driver_asks_for() {
         let log = script.log.lock().unwrap().clone();
         assert!(log.contains(&"Commit".to_string()), "{log:?}");
     }
+}
+
+/// The places of chunks the engine records are those of the objects it
+/// checked chunk by chunk in the pull, found by the key of the object and
+/// not by what the table says the content hashes to: an entry of an object
+/// the driver held, that carries the `digest` of one that was checked, is
+/// no place to copy a chunk from.
+#[test]
+fn only_the_chunks_of_the_objects_the_engine_checked_are_recorded() {
+    let held: &[u8] = b"another content that the driver holds";
+    let mut b = built_of(&[
+        ("d/f", b"hello, storage driver"),
+        ("d/g", held),
+        ("d/h", b"hello, storage driver"),
+    ]);
+    let claim = Digest::of(Algorithm::Sha256, b"a chunk of other bytes").to_string();
+    let held_key = velarx_storage::fsverity_digest_of(Algorithm::Sha256, held);
+    let verity = velarx_storage::to_toc(&held_key).unwrap();
+    for e in b.toc.entries.iter_mut().filter(|e| e.size > 0) {
+        e.chunk_digest = Some(if e.name == "d/f" {
+            b.object.clone()
+        } else {
+            // (what the table says of the object the driver holds: its
+            // content hash is the one of the other file; and of a file of
+            // the object the engine wrote, a second time: other chunks)
+            if e.name == "d/g" {
+                e.digest = Some(b.object.clone());
+                e.fsverity = Some(verity.clone());
+            }
+            claim.clone()
+        });
+    }
+    let e = env();
+    let script = start_script(&e, &b, Behavior::Fetches);
+    script
+        .others
+        .lock()
+        .unwrap()
+        .insert(held_key, held.to_vec());
+    let feed = feed_of(&b, &[1]);
+    let checks = Arc::new(AtomicUsize::new(0));
+    let pulled = run_pull(
+        &e,
+        &feed,
+        &[feed_layer(1, &b, false)],
+        settled_ok(checks, script),
+    )
+    .expect("a pull");
+    let recorded: Vec<String> = pulled.layers[0]
+        .chunks
+        .iter()
+        .map(|c| c.chunk_digest.to_string())
+        .collect();
+    assert_eq!(recorded, [b.object.clone()], "{claim} is a claim");
+}
+
+/// An object checked in one layer of the pull says nothing of the chunks
+/// another layer's table claims for it: that layer records none.
+#[test]
+fn a_layer_records_only_the_chunks_it_checked() {
+    let mut b = built();
+    let claim = Digest::of(Algorithm::Sha256, b"a chunk of other bytes").to_string();
+    let mut claimed = b.toc.clone();
+    for (toc, chunk) in [(&mut b.toc, &b.object), (&mut claimed, &claim)] {
+        for e in toc.entries.iter_mut().filter(|e| e.size > 0) {
+            e.chunk_digest = Some(chunk.clone());
+        }
+    }
+    // (the driver fetches in the first layer only)
+    let mut feed = feed_of(&b, &[1, 2]);
+    Arc::get_mut(&mut feed).unwrap().layers[1].1.toc = Arc::new(claimed);
+    let e = env();
+    let script = start_script(&e, &b, Behavior::Fetches);
+    let checks = Arc::new(AtomicUsize::new(0));
+    let pulled = run_pull(
+        &e,
+        &feed,
+        &[feed_layer(1, &b, false), feed_layer(2, &b, false)],
+        settled_ok(checks, script),
+    )
+    .expect("a pull");
+    let recorded: Vec<Vec<String>> = pulled
+        .layers
+        .iter()
+        .map(|l| {
+            l.chunks
+                .iter()
+                .map(|c| c.chunk_digest.to_string())
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        [vec![b.object.clone()], vec![]],
+        "{claim} is a claim"
+    );
 }
 
 /// A driver that says it holds objects is asked which of the objects a chunk

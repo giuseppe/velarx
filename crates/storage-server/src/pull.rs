@@ -238,8 +238,9 @@ impl Server {
                 // (before the engine reads the layers back by the keys it
                 // knows)
                 for l in pulled.iter() {
+                    let handed = wire.index_blocking(&l.key.to_string())?;
                     store
-                        .record_aliases(&l.toc.entries)
+                        .record_aliases(&handed.toc.entries, &l.toc.entries)
                         .map_err(|e| ImageError::Storage(e.message().to_string()))?;
                 }
                 {

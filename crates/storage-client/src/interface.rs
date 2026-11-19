@@ -445,7 +445,10 @@ mod feed {
             (Ok(Ack {}), Vec::new())
         }
 
-        /// The verified table of contents (descriptor 0) and the zstd
+        /// The table of contents the layer is stored by (descriptor 0): the
+        /// entries of the verified table as a layer keeps them (the names
+        /// normalised, the permission bits only, no attribute of the overlay
+        /// file system), which the engine records for the layer; and the zstd
         /// compressed tar-split (descriptor 1) of a `chunked` layer, as sealed
         /// memory files of the lengths `GetInfo` says.
         #[zlink(return_fds)]

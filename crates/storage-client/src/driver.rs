@@ -1614,19 +1614,24 @@ impl VarlinkDriver {
         let inner = self.inner.clone();
         let pull = id.to_string();
         let copied = Arc::new(served.copied());
-        let checked = served.checked();
+        let served = served.clone();
         let pulled = tokio::task::spawn_blocking(move || {
             let mut pulled = pulled;
             for p in &mut pulled {
-                // (the files whose chunks the engine checked as it wrote
-                // them in this pull, by the digest of their content, which
-                // the proof does not change)
-                let sound: std::collections::HashSet<String> = p
+                // (the entries the engine checked the chunks of as it wrote
+                // them in this layer: the first of each object, which is the
+                // one its fetch is planned by, by the key the table gives it
+                // now, which the proof changes for a table that gives none)
+                let checked = served.checked(&p.key.to_string());
+                let mut once = std::collections::HashSet::new();
+                let sound: Vec<bool> = p
                     .toc
                     .entries
                     .iter()
-                    .filter(|e| e.content_key().is_some_and(|k| checked.contains(&k)))
-                    .filter_map(|e| e.digest.clone())
+                    .map(|e| {
+                        e.content_key()
+                            .is_some_and(|k| checked.contains(&k) && once.insert(k))
+                    })
                     .collect();
                 let objects = Arc::new(StagedObjects::new(
                     inner.clone(),
@@ -1646,9 +1651,8 @@ impl VarlinkDriver {
                 // chunk for other bytes of an object the driver had, copied
                 // or a job wrote would send every later pull of that chunk to
                 // the wrong bytes)
-                p.chunks = velarx_content::pull::chunked::located_chunks_where(&p.toc, |e| {
-                    e.digest.as_ref().is_some_and(|d| sound.contains(d))
-                });
+                p.chunks =
+                    velarx_content::pull::chunked::located_chunks_where(&p.toc, |i| sound[i]);
             }
             Ok::<_, DriverError>(pulled)
         })

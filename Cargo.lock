@@ -5056,6 +5056,7 @@ dependencies = [
  "velarx-types",
  "velarx-wire",
  "xattr",
+ "zstd",
 ]
 
 [[package]]

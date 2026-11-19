@@ -280,7 +280,7 @@ impl WireFeed {
             .clone()
     }
 
-    fn index_blocking(&self, key: &str) -> ImageResult<LayerIndex> {
+    pub fn index_blocking(&self, key: &str) -> ImageResult<LayerIndex> {
         if let Some(i) = self
             .indexes
             .lock()
