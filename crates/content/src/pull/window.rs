@@ -9,7 +9,7 @@
 //! bytes, leaving out the ones the store has and the ones somebody else is
 //! fetching.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use velarx_storage::{Toc, TocEntryType};
 
 /// How much is fetched with a missed file.
@@ -36,11 +36,16 @@ impl Window {
 /// for ever when the store has most of what follows.
 const LOOK_FACTOR: usize = 8;
 
-/// The position of the regular file of this fs-verity digest in the table.
-pub fn file_index(toc: &Toc, file_digest: &str) -> Option<usize> {
-    toc.entries
-        .iter()
-        .position(|e| is_file(e) && e.verity().as_deref() == Some(file_digest))
+/// The position of each regular file of the table by its fs-verity digest
+/// (its first entry): a file found at once, not by walking the table.
+pub fn file_positions(toc: &Toc) -> HashMap<String, usize> {
+    let mut at = HashMap::new();
+    for (i, e) in toc.entries.iter().enumerate().filter(|(_, e)| is_file(e)) {
+        if let Some(d) = e.verity() {
+            at.entry(d).or_insert(i);
+        }
+    }
+    at
 }
 
 fn is_file(e: &velarx_storage::TocEntry) -> bool {
@@ -198,7 +203,7 @@ mod tests {
     #[test]
     fn the_window_follows_the_file_in_the_order_of_the_table() {
         let t = toc(&[10, 20, 30, 40, 50]);
-        let first = file_index(&t, &format!("fsverity-sha256-12:{:064x}", 1)).unwrap();
+        let first = file_positions(&t)[&format!("fsverity-sha256-12:{:064x}", 1)];
         let got = select(&t, first, W, |_| true);
         assert_eq!(names(&t, &got), ["f2", "f3", "f4"]);
         let got = select(&t, first, Window { files: 2, ..W }, |_| true);
@@ -286,7 +291,7 @@ mod tests {
     fn the_last_file_has_no_window_and_an_unknown_one_is_none() {
         let t = toc(&[10, 20]);
         assert!(select(&t, t.entries.len() - 2, W, |_| true).is_empty());
-        assert!(file_index(&t, "fsverity-sha256-12:nope").is_none());
+        assert!(!file_positions(&t).contains_key("fsverity-sha256-12:nope"));
         assert!(select(&t, usize::MAX, W, |_| true).is_empty());
     }
 }

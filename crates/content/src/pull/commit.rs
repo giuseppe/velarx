@@ -748,7 +748,8 @@ fn read_digests(
     use std::io::Read;
     let mut hasher = merkle.then(|| VerityHasher::new(alg));
     let mut digest = content.then(|| velarx_types::digest::DigestWriter::new(alg));
-    let mut buf = vec![0u8; 256 << 10];
+    // (not a block of 256 KiB cleared for each of 100,000 small files)
+    let mut buf = vec![0u8; file.metadata()?.len().clamp(1, 256 << 10) as usize];
     let mut reader = file;
     loop {
         let n = reader.read(&mut buf)?;

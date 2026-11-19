@@ -365,7 +365,8 @@ pub enum Piece<'a> {
 pub fn read_sparse(file: &File, mut f: impl FnMut(Piece<'_>)) -> io::Result<u64> {
     use rustix::fs::{seek, SeekFrom};
     let size = file.metadata()?.len();
-    let mut buf = vec![0u8; 1 << 20];
+    // (not a megabyte cleared for each of 100,000 small files)
+    let mut buf = vec![0u8; size.min(1 << 20) as usize];
     let mut pos = 0;
     while pos < size {
         // (one seek for a file that has no hole)

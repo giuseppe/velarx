@@ -48,6 +48,8 @@ struct InFlight {
 struct LayerCtx {
     desc: OciDescriptor,
     toc: Toc,
+    /// The position of each regular file in `toc`, by its fs-verity digest
+    files: HashMap<String, usize>,
     /// The repository, its TLS verification, whether its pull had credentials
     walk: WalkKey,
     shareable: bool,
@@ -465,6 +467,7 @@ impl ImageService {
             let toc: Toc = serde_json::from_str(&layer.toc_text()?)?;
             Ok::<_, ImageError>(LayerCtx {
                 desc,
+                files: velarx_content::pull::window::file_positions(&toc),
                 toc,
                 walk: (
                     repository,
@@ -595,7 +598,7 @@ impl ImageService {
     /// contents of the staged layer `key`.
     pub async fn is_file_of_lazy_layer(&self, key: &LayerKey, digest: &str) -> ImageResult<bool> {
         let ctx = self.lazy_layer_ctx(key).await?;
-        Ok(velarx_content::pull::window::file_index(&ctx.toc, digest).is_some())
+        Ok(ctx.files.contains_key(digest))
     }
 
     /// The files that follow `digest` in the staged layer `key` (the window
@@ -614,7 +617,7 @@ impl ImageService {
         let Ok(ctx) = self.lazy_layer_ctx(key).await else {
             return;
         };
-        let Some(at) = window::file_index(&ctx.toc, digest) else {
+        let Some(&at) = ctx.files.get(digest) else {
             return;
         };
         let staged = velarx_storage::FileStore::new(self.staging_area().layer_files(key)).ok();
@@ -669,6 +672,7 @@ impl ImageService {
                 *key,
                 Arc::new(LayerCtx {
                     desc,
+                    files: velarx_content::pull::window::file_positions(&toc),
                     toc,
                     walk: walk.clone(),
                     shareable: false,

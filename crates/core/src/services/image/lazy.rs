@@ -607,9 +607,14 @@ impl ImageService {
                 w.reused_files,
             );
         }
-        let size_of = |layer: usize, d: &str| -> u64 {
-            velarx_content::pull::window::file_index(&layers[layer].toc, d)
-                .map_or(0, |at| layers[layer].toc.entries[at].size)
+        let files: Vec<_> = layers
+            .iter()
+            .map(|l| velarx_content::pull::window::file_positions(&l.toc))
+            .collect();
+        let size_of = |layer: usize, d: &str| {
+            files[layer]
+                .get(d)
+                .map_or(0, |&at| layers[layer].toc.entries[at].size)
         };
         let mut done = CompletionProgress {
             layers_total: layers.len() as u64,
@@ -1854,10 +1859,10 @@ mod tests {
         assert_eq!(mode & 0o777, 0o444);
     }
 
-    /// A name of the staged file somewhere else (the worker's) would let it
-    /// change the mode of the object: the file is copied, not linked.
+    /// A file with another name than the staging's is not what a fetcher
+    /// was asked to stage: it is refused, and the store takes none of it.
     #[test]
-    fn a_staged_file_with_another_name_is_copied() {
+    fn a_staged_file_with_another_name_is_refused() {
         let Some(tmp) = verity_dir() else { return };
         let staging = FileStore::new(tmp.path().join("staging/files")).unwrap();
         let store = objects_store(tmp.path().join("store/objects"));
@@ -1871,12 +1876,12 @@ mod tests {
         with_verity(&staged);
         let other = tmp.path().join("workers-name");
         std::fs::hard_link(&staged, &other).unwrap();
-        let ino = std::fs::metadata(&staged).unwrap().ino();
-        link_staged(&tmp.path().join("staging/files"), &store, VerityMode::On).unwrap();
-        let committed = store.get_path(&digest).unwrap();
-        assert_ne!(std::fs::metadata(&committed).unwrap().ino(), ino);
+        let objects =
+            link_staged(&tmp.path().join("staging/files"), &store, VerityMode::On).unwrap();
+        assert!(objects.is_empty());
+        assert!(store.get_path(&digest).is_none());
         assert_eq!(
-            std::fs::read(&committed).unwrap(),
+            std::fs::read(&other).unwrap(),
             b"a staged file with two names"
         );
     }
@@ -2098,6 +2103,122 @@ mod tests {
                 "the next fetcher is not asked: removes {removes}"
             );
         }
+    }
+
+    /// A miss of a lazy layer of many files finds the file in a map: the
+    /// misses of a container that reads every file do not walk the table
+    /// each (1,000 misses of a table of 20,000 files took 38 s when they
+    /// did, debug build).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_miss_does_not_walk_the_table_of_its_layer() {
+        use velarx_content::fakes::{Fake, Stages};
+        use velarx_content::fetcher::fetch_client::FetchConn;
+        use velarx_content::pull::staged_fetch::StagedFetch;
+        use velarx_content::serve_fetch::LocalFetcher;
+        const FILES: usize = 20_000;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = velarx_db::Database::open_in_memory().await.unwrap();
+        let store = Arc::new(FileStore::new(tmp.path().join("objects")).unwrap());
+        let service =
+            ImageService::new(db, store, tmp.path().join("pulls"), VerityMode::Off).unwrap();
+        let area = service.staging_area();
+        area.create().unwrap();
+        let key = LayerKey::Whole(Digest::of(Algorithm::Sha256, b"blob"));
+        std::fs::create_dir_all(area.layer_dir(&key)).unwrap();
+        std::fs::write(area.layer_dir(&key).join("layer.json"), b"{}").unwrap();
+        let entries: Vec<serde_json::Value> = (0..FILES)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("f{i}"),
+                    "type": "reg",
+                    "size": 100,
+                    "fsverity": format!("sha256-12:{i:064x}"),
+                })
+            })
+            .collect();
+        let toc: Toc =
+            serde_json::from_value(serde_json::json!({"version": 1, "entries": entries})).unwrap();
+        let desc: OciDescriptor = serde_json::from_value(serde_json::json!({
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "digest": Digest::of(Algorithm::Sha256, b"blob").to_string(),
+            "size": 1,
+        }))
+        .unwrap();
+        let registry = LocalFetcher::start(
+            Arc::new(Fake::new(Stages::Right, "", b"", Default::default())),
+            velarx_content::activation::Limits::default(),
+        )
+        .unwrap();
+        let manifest = br#"{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","size":2},"layers":[]}"#;
+        let walker = StagedFetch::open(
+            Vec::new(),
+            FetchConn::new(registry.connect().unwrap()).unwrap(),
+            &service.staging_dir,
+            false,
+            ("localhost/a", true),
+            Some(b"{}"),
+            manifest,
+        )
+        .await
+        .unwrap();
+        service.with_lazy_walker(&key, (desc, toc), walker).await;
+        let started = std::time::Instant::now();
+        for i in (0..FILES).rev().take(1_000) {
+            let file = format!("fsverity-sha256-12:{i:064x}");
+            assert!(service.is_file_of_lazy_layer(&key, &file).await.unwrap());
+        }
+        let other = format!("fsverity-sha256-12:{:064x}", FILES);
+        assert!(!service.is_file_of_lazy_layer(&key, &other).await.unwrap());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The completion of a layer of many files asks the size of each file
+    /// once and finds it at once: the time does not grow with the square of
+    /// the number of files.  (No fetcher is registered: the completion
+    /// fails at its first fetch, after it has sized every group.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_completion_of_a_layer_of_many_files_is_not_quadratic() {
+        const FILES: usize = 6_000;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = velarx_db::Database::open_in_memory().await.unwrap();
+        let store = Arc::new(FileStore::new(tmp.path().join("objects")).unwrap());
+        let service =
+            ImageService::new(db, store, tmp.path().join("pulls"), VerityMode::Off).unwrap();
+        service.staging_area().create().unwrap();
+        let mut layer = layer_of(&[]);
+        let entries: Vec<serde_json::Value> = (0..FILES)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("f{i}"),
+                    "type": "reg",
+                    "size": 100,
+                    "fsverity": format!("sha256-12:{i:064x}"),
+                })
+            })
+            .collect();
+        layer.toc = Arc::new(
+            serde_json::from_value(serde_json::json!({"version": 1, "entries": entries})).unwrap(),
+        );
+        let layers: Arc<[LazyLayer]> = vec![layer].into();
+        let profile: Vec<String> = (0..FILES)
+            .map(|i| format!("fsverity-sha256-12:{i:064x}"))
+            .collect();
+        let started = std::time::Instant::now();
+        let mut stats = TransferStats::default();
+        let completion = Completion::new(&velarx_config::PullConfig::default());
+        let failed = service
+            .commit_layers(&layers, profile, &mut stats, completion, false)
+            .await;
+        assert!(failed.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

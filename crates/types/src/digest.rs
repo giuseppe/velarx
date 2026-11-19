@@ -282,7 +282,17 @@ impl Digest {
 
     /// The hex digits, with no algorithm.
     pub fn hex(&self) -> String {
-        hex::encode(self.raw())
+        self.hex_in(&mut [0; 128]).to_string()
+    }
+
+    /// The hex digits in `buf`, written at once (`hex::encode` pushes them
+    /// one by one: half the time of a pull that names the files of a big
+    /// table).
+    fn hex_in<'a>(&self, buf: &'a mut [u8; 128]) -> &'a str {
+        let raw = self.raw();
+        let digits = &mut buf[..raw.len() * 2];
+        hex::encode_to_slice(raw, digits).expect("two digits a byte");
+        std::str::from_utf8(digits).expect("hex digits")
     }
 
     /// The first 12 hex digits: what the short image ids show.
@@ -365,11 +375,11 @@ impl FromStr for Digest {
 
 impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut buf = [0; 128];
+        let hex = self.hex_in(&mut buf);
         match self.kind {
-            Kind::Content(alg) => write!(f, "{alg}:{}", self.hex()),
-            Kind::FsVerity { alg, log_block } => {
-                write!(f, "fsverity-{alg}-{log_block}:{}", self.hex())
-            }
+            Kind::Content(alg) => write!(f, "{alg}:{hex}"),
+            Kind::FsVerity { alg, log_block } => write!(f, "fsverity-{alg}-{log_block}:{hex}"),
         }
     }
 }

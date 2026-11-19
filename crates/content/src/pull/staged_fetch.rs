@@ -793,12 +793,18 @@ impl StagedFetch {
         let name = layer.digest.to_string();
         let breaker = Breaker::new(self.fetchers.len());
         self.tell(layer, (dir, Some(toc)), &breaker).await?;
-        let names: std::collections::HashMap<String, String> = toc
-            .entries
-            .iter()
-            .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0 && e.verity().is_some())
-            .filter_map(|e| Some((e.content_key()?, e.name.clone())))
-            .collect();
+        // (the names the files of a session are staged by: a lazy pull's
+        // files stay where they are staged, and a table of 120,000 entries
+        // is not walked for each group of files it asks for)
+        let names: std::collections::HashMap<String, String> = match sink {
+            Some(_) => toc
+                .entries
+                .iter()
+                .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0 && e.verity().is_some())
+                .filter_map(|e| Some((e.content_key()?, e.name.clone())))
+                .collect(),
+            None => Default::default(),
+        };
         let bytes = std::sync::atomic::AtomicU64::new(0);
         let sourced = Sourced {
             each: self.fetchers.iter().map(|_| Default::default()).collect(),
@@ -2174,6 +2180,58 @@ mod tests {
             );
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// Each fetch of files of a lazy layer costs what the files cost, not
+    /// what the table of the layer does: a completion asks for a layer of
+    /// many files in many groups (250 groups of a table of 20,000 entries
+    /// took 24 s when each walked it, debug build).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fetch_of_a_lazy_layer_does_not_walk_its_table() {
+        let registry = LocalFetcher::start(Arc::new(Stages), Limits::default()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let staged = StagedFetch::open(
+            Vec::new(),
+            FetchConn::new(registry.connect().unwrap()).unwrap(),
+            root.path(),
+            false,
+            ("localhost/a", true),
+            Some(b"{}"),
+            &manifest(),
+        )
+        .await
+        .unwrap();
+        let (desc, _) = layer_and_toc();
+        let entries: Vec<serde_json::Value> = (0..20_000)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("f{i}"),
+                    "type": "reg",
+                    "size": 10,
+                    "fsverity": format!("sha256-12:{i:064x}"),
+                })
+            })
+            .collect();
+        let toc: Toc =
+            serde_json::from_value(serde_json::json!({"version": 1, "entries": entries})).unwrap();
+        let started = std::time::Instant::now();
+        for n in 0..250 {
+            staged
+                .stage_files(
+                    "stem",
+                    &desc,
+                    &toc,
+                    vec![key_of(n)],
+                    (Urgency::OnDemand, &|_| {}),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// A fetcher that is gone is left out (its breaker), and the next one
