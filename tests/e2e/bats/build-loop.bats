@@ -404,7 +404,7 @@ EOF
 @test "progress: a commit shows its layer, commit --squash" {
     local out
     use_store build
-    sh_ container run --network none --name progress-c localhost/build-loop:1 'echo changed > /data/changed' > /dev/null 2>&1
+    sh_ container run --network none --user 0 --name progress-c localhost/build-loop:1 'echo changed > /data/changed' > /dev/null 2>&1
     out=$(sh_ image commit progress-c localhost/progress-commit:1 2>&1 > /dev/null)
     check_match "a commit shows its layer" "new layer streaming.*new layer complete" "$(echo "$out" | tr '\n' ' ')"
     check_match "and the layer in the store" "[0-9a-f]{12} complete [0-9.]+ [KB]+" "$out"

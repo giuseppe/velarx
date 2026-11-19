@@ -303,7 +303,7 @@ t = tarfile.open(sys.argv[1])
 last = tarfile.open(fileobj=t.extractfile(layers(t)[-1]))
 names, overlay = [], 0
 for e in last.getmembers():
-    names.append(e.name)
+    names.append(e.name.removeprefix("./"))
     overlay += sum(1 for k in e.pax_headers if "overlay." in k)
 want = ["etc/alpine-release", "etc/apk2/", "etc/.wh.apk", sys.argv[2]]
 print(" ".join(w for w in want if any(n.rstrip("/") == w.rstrip("/") or n.startswith(w) for n in names)), "overlay:", overlay)

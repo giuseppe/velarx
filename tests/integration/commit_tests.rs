@@ -892,6 +892,188 @@ async fn test_a_sparse_file_is_a_chunk_of_zeros_in_both_commits() {
     assert_eq!(layer_of(rewritten).await, plain_layer);
 }
 
+/// A layer made here is the canonical tar of its table of contents: pushed as
+/// zstd:chunked it is a blob of version 2 with no tar-split, whose tar any
+/// reader of zstd has (its diff id is the digest of the tar), and which an
+/// engine pulls, eagerly or lazily, by its table alone, next to the layers of
+/// version 1 of the same image.
+#[tokio::test]
+async fn test_a_layer_built_here_is_a_version_2_layer_to_every_reader() {
+    use velarx_content::layer::writer::Compression;
+    use velarx_core::services::PushOptions;
+    use velarx_storage::{canonical, Toc};
+    const PREFIX: &str = "io.github.containers.zstd-chunked.";
+    let (host_b, b) = start_registry().await;
+    let e = source_trusting(&[&host_b]).await;
+    let dir = tempfile::tempdir().unwrap();
+    changes(dir.path());
+    let parent = e
+        .service
+        .get(&format!("{}/test:latest", e.host))
+        .await
+        .unwrap();
+    e.service
+        .commit_dir(Some(&parent.id), Some(dir.path()), &options(&["v2:v1"]))
+        .await
+        .unwrap();
+    let client = client_for(&[&e.host, &host_b]);
+    let pushed = e
+        .service
+        .push_with_client(
+            &client,
+            "localhost/v2:v1",
+            &PushOptions {
+                destination: Some(format!("{host_b}/v2:v1")),
+                compression: Some(Compression::ZstdChunked),
+                ..PushOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let body = b.blobs.lock().unwrap()[&format!("manifest:{}", pushed.digest)].clone();
+    let manifest: OciManifest = serde_json::from_slice(&body).unwrap();
+    let config: velarx_types::OciConfig =
+        serde_json::from_str(&e.service.get("localhost/v2:v1").await.unwrap().config).unwrap();
+    let layer = manifest.layers.last().unwrap();
+    assert_eq!(layer.annotations[&format!("{PREFIX}version")], "2");
+    assert!(!layer
+        .annotations
+        .contains_key(&format!("{PREFIX}tarsplit-position")));
+    // (the layer under it, made by a v1 writer, has a tar-split and no version)
+    let below = &manifest.layers[1];
+    assert!(below
+        .annotations
+        .contains_key(&format!("{PREFIX}tarsplit-position")));
+    assert!(!below.annotations.contains_key(&format!("{PREFIX}version")));
+
+    // the blob is a zstd stream of the canonical tar, the diff id its digest
+    let blob = b.blobs.lock().unwrap()[&layer.digest.to_string()].clone();
+    let tar = zstd::decode_all(&blob[..]).unwrap();
+    assert_eq!(&sha(&tar), config.rootfs.diff_ids.last().unwrap());
+    canonical::validate_tar(&tar[..]).unwrap();
+    let position: Vec<usize> = layer.annotations[&format!("{PREFIX}manifest-position")]
+        .split(':')
+        .map(|n| n.parse().unwrap())
+        .collect();
+    let toc: Toc = serde_json::from_slice(
+        &zstd::decode_all(&blob[position[0]..position[0] + position[1]]).unwrap(),
+    )
+    .unwrap();
+    assert!(toc.is_canonical() && toc.tar_split_digest.is_none());
+    // GNU tar reads it as it reads any tar
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &blob).unwrap();
+    if let Ok(out) = std::process::Command::new("tar")
+        .args(["--zstd", "-tf"])
+        .arg(file.path())
+        .output()
+    {
+        if out.status.success() {
+            let list = String::from_utf8_lossy(&out.stdout);
+            assert!(list.lines().any(|l| l == "./app/new"), "{list}");
+            assert!(
+                out.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    // the same tar, compressed another way
+    for (compression, media) in [(Compression::Gzip, GZIP), (Compression::None, TAR)] {
+        let result = e
+            .service
+            .push_with_client(
+                &client,
+                "localhost/v2:v1",
+                &PushOptions {
+                    destination: Some(format!("{host_b}/v2:other{}", media.len())),
+                    compression: Some(compression),
+                    ..PushOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let body = b.blobs.lock().unwrap()[&format!("manifest:{}", result.digest)].clone();
+        let m: OciManifest = serde_json::from_slice(&body).unwrap();
+        let blob = b.blobs.lock().unwrap()[&m.layers.last().unwrap().digest.to_string()].clone();
+        let mut back = Vec::new();
+        match compression {
+            Compression::Gzip => {
+                flate2::read::GzDecoder::new(&blob[..])
+                    .read_to_end(&mut back)
+                    .unwrap();
+            }
+            _ => back = blob,
+        }
+        assert_eq!(back, tar);
+    }
+
+    // pulled eagerly and lazily by an engine that has nothing of it: the
+    // layer is a layer of its table of contents, with no tar-split, whose
+    // stream is the tar
+    let reference = format!("{host_b}/v2:v1");
+    let client = client_for(&[&host_b]);
+    for lazy in [false, true] {
+        let other = env_with(velarx_config::PullConfig {
+            lazy_window_files: 0,
+            ..Default::default()
+        })
+        .await;
+        other.trust(&[&host_b]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        if lazy {
+            other
+                .service
+                .pull_lazy_with_client(&client, &reference, tx)
+                .await
+                .unwrap();
+            other.service.complete_image(&reference).await.unwrap();
+        } else {
+            other
+                .service
+                .pull_with_client(&client, &reference, tx)
+                .await
+                .unwrap();
+        }
+        let key = velarx_db::LayerKey::Toc(
+            layer.annotations[&format!("{PREFIX}manifest-checksum")]
+                .parse()
+                .unwrap(),
+        );
+        let record = other.db.get_layer(&key).await.unwrap();
+        assert_eq!(record.status, "ready", "lazy: {lazy}");
+        let stored: Toc = serde_json::from_str(record.toc.as_deref().unwrap()).unwrap();
+        assert!(stored.is_canonical());
+        let rows = other.db.get_layer_tarsplit(&key).await.unwrap();
+        assert_eq!(rows, Some(Vec::new()), "no tar-split, lazy: {lazy}");
+        // its stream is the tar of the image's diff id, the tar-split layer
+        // below is as it was
+        let diff = config.rootfs.diff_ids.last().unwrap();
+        let stored = StoredLayer::load_expecting(&other.db, &key, Some(diff.alg()), Some(diff))
+            .await
+            .unwrap();
+        let mut back = Vec::new();
+        stored
+            .verified_stream(other.store.clone())
+            .unwrap()
+            .read_to_end(&mut back)
+            .unwrap();
+        assert_eq!(back, tar, "lazy: {lazy}");
+        let below = velarx_db::LayerKey::Toc(
+            manifest.layers[1].annotations[&format!("{PREFIX}manifest-checksum")]
+                .parse()
+                .unwrap(),
+        );
+        assert!(other
+            .db
+            .get_layer_tarsplit(&below)
+            .await
+            .unwrap()
+            .is_some_and(|t| !t.is_empty()));
+    }
+}
+
 /// What `--digest sha512` makes: every digest of the image is SHA-512 (the
 /// image id has 128 digits and the merged EROFS is stated with SHA-512), a
 /// commit on top of it follows it, and a sha512 layer on a sha256 parent is
