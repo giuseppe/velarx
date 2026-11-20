@@ -278,6 +278,9 @@ print(s.recv(4096).decode(errors="replace").replace("\n", " "))
 
     sh_ container run --lazy -d --name fz1 --network none "$IMAGE" sh -c 'sleep 2; cat /etc/os-release; cat /bin/busybox | wc -c' > /dev/null
     cpid=$(inspect_of fz1 pid)
+    # (a miss is fetched through the engine, and the completion waits for
+    # the start to be quiet: the image is completed before the engine goes)
+    sh_ image complete "$IMAGE" > /dev/null
     stop_daemon
     e2e_wait_exit "$cpid"
     start_daemon

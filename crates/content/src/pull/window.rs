@@ -4,10 +4,12 @@
 //! A program that starts reads many small files, and the files of a layer
 //! that are neighbours in the tar are neighbours in the blob: asking for them
 //! in one plan makes one batch to a peer, or one merged range to the registry,
-//! instead of one round trip each.  The window is the files that follow the
-//! missed one in the order of the table of contents, bounded in number and in
-//! bytes, leaving out the ones the store has and the ones somebody else is
-//! fetching.
+//! instead of one round trip each.  The window is the files of the directory
+//! of the missed one that follow it in the order of the table of contents,
+//! bounded in number and in bytes, leaving out the ones the store has and the
+//! ones somebody else is fetching.  What a container reads follows what it
+//! has read: the bytes of the window start small and double with each miss of
+//! the layer, up to the setting.
 
 use std::collections::{HashMap, HashSet};
 use velarx_storage::{Toc, TocEntryType};
@@ -27,10 +29,25 @@ impl Window {
         }
     }
 
+    /// The window of the layer after `misses` windows: [`FIRST_KIB`], then
+    /// twice that for each, up to the bytes of the setting.
+    pub fn grown(self, misses: u32) -> Self {
+        let first = FIRST_KIB * 1024;
+        Self {
+            bytes: self
+                .bytes
+                .min(first.saturating_mul(1u64.checked_shl(misses).unwrap_or(u64::MAX))),
+            ..self
+        }
+    }
+
     pub fn is_off(&self) -> bool {
         self.files == 0 || self.bytes == 0
     }
 }
+
+/// The bytes of the first window of a layer.
+const FIRST_KIB: u64 = 256;
 
 /// Entries looked at for each file of the window: the table is not walked
 /// for ever when the store has most of what follows.
@@ -88,9 +105,14 @@ pub fn groups(
     Ok(groups)
 }
 
-/// The positions of the files that follow the one at `first`, up to the
-/// limits, that `wanted` accepts (it is asked once for each content, and
-/// may take a claim on it).  A content is taken once, however many names it
+/// The directory of an entry.
+fn parent(name: &str) -> &str {
+    name.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// The positions of the files of the directory of the one at `first` that
+/// follow it, up to the limits, that `wanted` accepts (it is asked once for
+/// each content, and may take a claim on it).  A content is taken once, however many names it
 /// has.  The file at `first` is not in the answer.
 pub fn select(
     toc: &Toc,
@@ -102,10 +124,11 @@ pub fn select(
     if window.is_off() {
         return out;
     }
-    let mut seen: HashSet<String> = HashSet::new();
-    if let Some(d) = toc.entries.get(first).and_then(|e| e.verity()) {
-        seen.insert(d);
-    }
+    let Some(missed) = toc.entries.get(first) else {
+        return out;
+    };
+    let dir = parent(&missed.name);
+    let mut seen: HashSet<String> = missed.verity().into_iter().collect();
     let mut bytes = 0u64;
     let look = window.files.saturating_mul(LOOK_FACTOR);
     for (i, e) in toc
@@ -118,7 +141,7 @@ pub fn select(
         if out.len() >= window.files {
             break;
         }
-        if !is_file(e) {
+        if !is_file(e) || parent(&e.name) != dir {
             continue;
         }
         let Some(d) = e.verity() else {
@@ -277,5 +300,32 @@ mod tests {
         assert!(select(&t, t.entries.len() - 2, W, |_| true).is_empty());
         assert!(!file_positions(&t).contains_key("fsverity-sha256-12:nope"));
         assert!(select(&t, usize::MAX, W, |_| true).is_empty());
+    }
+
+    #[test]
+    fn the_window_is_the_directory_of_the_file() {
+        let mut t = toc(&[10, 20, 30, 40]);
+        for (i, e) in t.entries.iter_mut().enumerate() {
+            if e.entry_type == TocEntryType::Reg {
+                let dir = if i < 7 { "a" } else { "b" };
+                e.name = format!("{dir}/{}", e.name);
+            }
+        }
+        let got = select(&t, 1, W, |_| true);
+        assert_eq!(names(&t, &got), ["a/f1", "a/f2"]);
+    }
+
+    #[test]
+    fn the_window_grows_with_the_misses_to_the_setting() {
+        let w = Window {
+            files: 64,
+            bytes: 4096 * 1024,
+        };
+        let kib = |misses| w.grown(misses).bytes / 1024;
+        assert_eq!(
+            (kib(0), kib(1), kib(2), kib(4), kib(5), kib(50), kib(1000)),
+            (256, 512, 1024, 4096, 4096, 4096, 4096)
+        );
+        assert_eq!(Window { bytes: 100, ..w }.grown(0).bytes, 100);
     }
 }

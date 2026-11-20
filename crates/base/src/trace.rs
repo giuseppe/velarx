@@ -53,6 +53,13 @@ pub fn point(label: &str) {
     }
 }
 
+/// Record the point whose label `label` builds, when tracing is on.
+pub fn point_with(label: impl FnOnce() -> String) {
+    if enabled() {
+        point(&label());
+    }
+}
+
 /// Whether tracing is on (to skip building a label).
 pub fn enabled() -> bool {
     file().is_some()

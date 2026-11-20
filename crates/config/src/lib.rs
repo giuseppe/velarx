@@ -553,11 +553,13 @@ pub struct PullConfig {
     /// for its life, and one or two more while it fetches.
     #[serde(default = "default_fetcher_connections")]
     pub fetcher_connections: usize,
-    /// Files that follow a file a container missed in its layer, fetched
-    /// with it in the background (0: only the file that was asked for)
+    /// Files of its directory that follow a file a container missed in its
+    /// layer, fetched with it in the background (0: only the file that was
+    /// asked for)
     #[serde(default = "default_lazy_window_files")]
     pub lazy_window_files: usize,
-    /// KiB of the files of that window at most (0: no window)
+    /// KiB of the files of that window at most (0: no window); the window of
+    /// a layer starts at 256 KiB and doubles with each miss of the layer
     #[serde(default = "default_lazy_window_kib")]
     pub lazy_window_kib: u64,
     /// Seconds a container of a lazily pulled image is watched for the files

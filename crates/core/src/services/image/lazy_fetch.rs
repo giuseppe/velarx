@@ -12,6 +12,9 @@
 //!   all its fetches of the layer.  Another engine that fetches the layer
 //!   holds it meanwhile: the kernel gives the lease when that one lets go
 //!   (no polling), and what it staged is not asked for again.
+//! * The fetches a start makes (`Wait`, `OnDemand`) go first: the completion
+//!   of the pull of the layers does not send a fetch while one is in
+//!   flight, nor for [`QUIET`] after the last (`yield_to_starts`).
 //! * The fetch itself is the engine's ordered list of fetchers, walked by
 //!   `StagedFetch` (`Fetch(layer, [digest], urgency)`): the engine routes the
 //!   request; it fetches nothing itself.  The list of a repository is opened
@@ -24,6 +27,11 @@ use std::sync::{Mutex as StdMutex, Weak};
 use velarx_content::fetcher::fetch::Urgency;
 use velarx_content::pull::staged_fetch::StagedFetch;
 use velarx_registry::auth::RegistryAccess;
+
+/// How long after its last fetch a start is left alone by the completion:
+/// a start reads in bursts (the engine, the runtime, the program's loader)
+/// with short gaps between them, which this bridges.
+const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
 
 type Outcome = Result<Walked, Arc<ImageError>>;
 use velarx_content::pull::staged_fetch::Walked;
@@ -41,6 +49,55 @@ struct InFlight {
     /// True once the file is staged or the fetch ended
     staged: tokio::sync::watch::Receiver<bool>,
     fetch: Shared<BoxFuture<'static, Outcome>>,
+}
+
+/// The fetches of a start in a layer: how many are in flight, and when the
+/// last one ended.
+struct Starting {
+    inflight: usize,
+    last: tokio::time::Instant,
+}
+
+/// A fetch of a start in flight (`Wait` or `OnDemand`): the completion of
+/// its layer yields while it is.
+struct StartGuard {
+    funnel: Arc<LazyFunnel>,
+    key: LayerKey,
+}
+
+impl StartGuard {
+    fn new(funnel: &Arc<LazyFunnel>, key: &LayerKey) -> Self {
+        funnel
+            .starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(*key)
+            .or_insert(Starting {
+                inflight: 0,
+                last: tokio::time::Instant::now(),
+            })
+            .inflight += 1;
+        Self {
+            funnel: funnel.clone(),
+            key: *key,
+        }
+    }
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if let Some(s) = self
+            .funnel
+            .starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&self.key)
+        {
+            s.inflight -= 1;
+            s.last = tokio::time::Instant::now();
+        }
+        self.funnel.started.notify_waiters();
+    }
 }
 
 /// What a fetch of a file of a staged layer needs: its descriptor, its
@@ -72,6 +129,12 @@ pub(crate) struct LazyFunnel {
     inflight: StdMutex<HashMap<(LayerKey, String), InFlight>>,
     /// The number of the next fetch in flight
     fetches: std::sync::atomic::AtomicU64,
+    /// The windows fetched after the misses of each layer
+    windows: StdMutex<HashMap<LayerKey, u32>>,
+    /// The fetches of the starts, by layer
+    starting: StdMutex<HashMap<LayerKey, Starting>>,
+    /// Told when a fetch of a start ends
+    started: tokio::sync::Notify,
     /// What a fetch of each staged layer needs, read once
     layers: StdMutex<HashMap<LayerKey, Arc<LayerCtx>>>,
     /// The credentials and certificates of a command that completes a pull:
@@ -237,7 +300,9 @@ impl ImageService {
             (joined, own)
         };
         let (this, key) = (self.clone(), *key);
+        let start = (urgency >= Urgency::Wait).then(|| StartGuard::new(&self.funnel, &key));
         async move {
+            let _start = start;
             let mut walked = Walked::default();
             if let Some(own) = own {
                 walked = own.await.map_err(unshared)?;
@@ -255,6 +320,39 @@ impl ImageService {
             Ok(walked)
         }
         .boxed()
+    }
+
+    /// Wait until no start fetches in `layers` (those of one image) and
+    /// none did for [`QUIET`]: the completion of a pull sends its fetches
+    /// after that, it never competes with the container being started.
+    pub(super) async fn yield_to_starts(&self, layers: &[LayerKey]) {
+        loop {
+            let told = self.funnel.started.notified();
+            tokio::pin!(told);
+            told.as_mut().enable();
+            let (busy, quiet_at) = {
+                let starting = self
+                    .funnel
+                    .starting
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mine = || layers.iter().filter_map(|k| starting.get(k));
+                (
+                    mine().any(|s| s.inflight > 0),
+                    mine().map(|s| s.last + QUIET).max(),
+                )
+            };
+            match quiet_at {
+                _ if busy => told.await,
+                Some(at) if at > tokio::time::Instant::now() => {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(at) => {}
+                        _ = told => {}
+                    }
+                }
+                _ => return,
+            }
+        }
     }
 
     /// One request for the files `files` of `key`, under the lease of the
@@ -356,6 +454,23 @@ impl ImageService {
     /// The staging of the layer `key` went: the fetchers of its list forget
     /// it, and what a fetch of it needs is read again next time.
     pub(crate) async fn forget_lazy(&self, key: &LayerKey) {
+        {
+            // (the fetches of a start in flight keep their count: their
+            // guards end it)
+            let mut starting = self
+                .funnel
+                .starting
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if starting.get(key).is_some_and(|s| s.inflight == 0) {
+                starting.remove(key);
+            }
+        }
+        self.funnel
+            .windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
         let ctx = self
             .funnel
             .layers
@@ -601,8 +716,9 @@ impl ImageService {
         Ok(ctx.files.contains_key(digest))
     }
 
-    /// The files that follow `digest` in the staged layer `key` (the window
-    /// of `[pull] lazy_window_files` and `lazy_window_kib`), staged in the
+    /// The files of its directory that follow `digest` in the staged layer
+    /// `key` (the window of `[pull] lazy_window_files` and `lazy_window_kib`,
+    /// which starts small and grows with each miss of the layer), staged in the
     /// background after a miss (`ahead`): the next reads of the container
     /// find them, or join their fetch.  It never takes the place of a miss,
     /// and what fails is fetched again when it is read.
@@ -614,6 +730,17 @@ impl ImageService {
         if ahead.is_off() {
             return;
         }
+        let misses = {
+            let mut windows = self
+                .funnel
+                .windows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let misses = windows.entry(*key).or_default();
+            *misses += 1;
+            *misses - 1
+        };
+        let ahead = ahead.grown(misses);
         let Ok(ctx) = self.lazy_layer_ctx(key).await else {
             return;
         };
@@ -680,5 +807,85 @@ impl ImageService {
                 }),
             );
         self.funnel.walkers.lock().await.insert(walk, (0, walker));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use velarx_storage::FileStore;
+    use velarx_types::digest::{Algorithm, Digest};
+
+    async fn service(tmp: &std::path::Path) -> ImageService {
+        let db = velarx_db::Database::open_in_memory().await.unwrap();
+        let store = Arc::new(FileStore::new(tmp.join("objects")).unwrap());
+        ImageService::new(
+            db,
+            store,
+            tmp.join("pulls"),
+            velarx_storage::VerityMode::Off,
+        )
+        .unwrap()
+    }
+
+    /// The completion waits while a start fetches in a layer of its image
+    /// and for the quiet time after it, and not for a start of another image.
+    #[tokio::test(start_paused = true)]
+    async fn the_completion_yields_to_a_start_of_its_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service(tmp.path()).await;
+        let key = |t: &str| LayerKey::Whole(Digest::of(Algorithm::Sha256, t.as_bytes()));
+        let (mine, other) = (key("mine"), key("other"));
+        service.yield_to_starts(&[mine]).await;
+        let guard = StartGuard::new(&service.funnel, &other);
+        service.yield_to_starts(&[mine]).await;
+        drop(guard);
+        let guard = StartGuard::new(&service.funnel, &mine);
+        let waiting = tokio::spawn({
+            let service = service.clone();
+            async move { service.yield_to_starts(&[mine, other]).await }
+        });
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!waiting.is_finished());
+        drop(guard);
+        tokio::time::sleep(QUIET - Duration::from_millis(1)).await;
+        assert!(!waiting.is_finished());
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        waiting.await.unwrap();
+    }
+
+    /// A layer forgotten while a fetch of a start is in flight in it keeps
+    /// the count of that fetch: the completion still yields to it, and the
+    /// guards end with nothing left in flight.
+    #[tokio::test(start_paused = true)]
+    async fn a_layer_forgotten_during_a_start_keeps_its_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service(tmp.path()).await;
+        let key = LayerKey::Whole(Digest::of(Algorithm::Sha256, b"layer"));
+        let first = StartGuard::new(&service.funnel, &key);
+        service.forget_lazy(&key).await;
+        let second = StartGuard::new(&service.funnel, &key);
+        drop(first);
+        let waiting = tokio::spawn({
+            let service = service.clone();
+            async move { service.yield_to_starts(&[key]).await }
+        });
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!waiting.is_finished());
+        drop(second);
+        let inflight = |service: &ImageService| {
+            service
+                .funnel
+                .starting
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(|s| s.inflight)
+        };
+        assert_eq!(inflight(&service), Some(0));
+        waiting.await.unwrap();
+        service.forget_lazy(&key).await;
+        assert_eq!(inflight(&service), None);
     }
 }

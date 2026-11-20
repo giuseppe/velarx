@@ -654,8 +654,9 @@ impl ImageService {
             .into_iter()
             .enumerate()
             .flat_map(|(i, w)| w.groups.into_iter().map(move |g| (i, g)));
+        let keys: Arc<[LayerKey]> = layers.iter().map(|l| l.key).collect();
         for (i, group) in first.into_iter().chain(rest) {
-            let (this, permits) = (self.clone(), permits.clone());
+            let (this, permits, keys) = (self.clone(), permits.clone(), keys.clone());
             let key = layers[i].key;
             let bytes: u64 = group.iter().map(|d| size_of(i, d)).sum();
             tasks.spawn(async move {
@@ -663,6 +664,7 @@ impl ImageService {
                     .acquire_owned()
                     .await
                     .map_err(|_| ImageError::Layer("the completion was cancelled".into()))?;
+                this.yield_to_starts(&keys).await;
                 let fetched = this
                     .stage_lazy(&key, group.clone(), Urgency::Background)
                     .await?;

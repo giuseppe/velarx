@@ -854,6 +854,7 @@ impl ImageService {
             .map(|(i, _)| i as u32)
             .collect();
         let mut replies = staged.probe_all(&missing).await?;
+        velarx_base::trace::point("pull probed");
         let mut found = std::collections::HashMap::new();
         let mut refused = Vec::new();
         for at in missing {
@@ -877,6 +878,7 @@ impl ImageService {
                 }),
             }
         }
+        velarx_base::trace::point("pull tocs verified");
         if !refused.is_empty() {
             return Err(ImageError::NotLazy {
                 image: image.to_string(),
@@ -1549,6 +1551,7 @@ impl ImageService {
 
         let driver_feed: Arc<dyn PullFeed> = feed.clone();
         let driven = self.storage.pull(&driver_feed, &to_fetch, settled).await?;
+        velarx_base::trace::point("pull erofs made");
         drop(driver_feed);
         let lease = feed
             .lease
@@ -1658,6 +1661,7 @@ impl ImageService {
                     shared_layers,
                 )
                 .await?;
+            velarx_base::trace::point("pull rows committed");
             let area = self.staging_area();
             for d in done_layers.values().filter(|d| d.lazy) {
                 let m = made.get(&d.key).ok_or_else(|| {
@@ -1709,6 +1713,7 @@ impl ImageService {
             if let Err(e) = lease.release().await {
                 warn!("Cannot remove the lease of the pull: {e}");
             }
+            velarx_base::trace::point("pull layers staged");
             debug!("Pull staged after {:?}", start.elapsed());
         } else {
             let tags_shared = if shareable { tags.clone() } else { Vec::new() };

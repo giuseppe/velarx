@@ -264,6 +264,8 @@ pub fn enter_role_thread(
     settings: &Settings,
     config_paths: &[&Path],
 ) -> Result<(), String> {
+    // (the trace file, when there is one, is opened before the confinement)
+    velarx_base::trace::enabled();
     rustix::thread::set_no_new_privs(true).map_err(|e| format!("PR_SET_NO_NEW_PRIVS: {e}"))?;
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
         .map_err(|e| format!("PR_SET_DUMPABLE: {e}"))?;

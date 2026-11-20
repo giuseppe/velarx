@@ -429,13 +429,14 @@ lazy_retry_max_secs = 600
 # it serves at once: each monitor of a container with lazy layers holds one,
 # and one or two more while it fetches.
 fetcher_connections = 1024
-# A file a container misses is fetched at once; the files that follow it in
-# its layer (the order of the startup profile when it names the file, else
-# that of the tar, where programs keep what they read together) are fetched
-# in the background in one plan, so that their chunks go to a peer in one
-# request or to the registry in one merged range.  At most
-# this many files and KiB (0 for either: only the file that was asked for);
-# files the store has or another fetch holds are left out.
+# A file a container misses is fetched at once; the files of its directory
+# that follow it in its layer (in the order of the tar, where programs keep
+# what they read together) are fetched in the background in one plan, so that
+# their chunks go to a peer in one request or to the registry in one merged
+# range.  The window of a layer starts at 256 KiB and doubles with each miss
+# of the layer, up to lazy_window_kib; at most lazy_window_files files (0 for
+# either setting: only the file that was asked for); files the store has or
+# another fetch holds are left out.
 lazy_window_files = 64
 lazy_window_kib = 4096
 # The first time a lazily pulled image runs, the files its container looks up
