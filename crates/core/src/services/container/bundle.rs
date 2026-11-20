@@ -708,17 +708,6 @@ impl ContainerService {
         .map_err(|e| io_err(e.to_string()))?
     }
 
-    /// The root file system of a container, written down for its monitor:
-    /// the plan of the mount the storage driver makes at each start (the
-    /// kernel's overlay of the layers, or the image server's over a FUSE file
-    /// system of them) and the monitor attaches (see `monitor::image`).  The
-    /// mounts belong to the monitor's mount namespace, so the container outlives
-    /// the daemon, as root and rootless.
-    pub(super) fn setup_rootfs(&self, rootfs_path: &Path) -> ContainerResult<()> {
-        fs::create_dir_all(rootfs_path)?;
-        Ok(())
-    }
-
     /// The /etc files of the container a new one shares its network
     /// namespace with (`--network container:ID`, the members of a pod): it
     /// resolves as the container whose namespace it is in (and can have no DNS

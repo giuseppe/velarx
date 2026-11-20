@@ -1227,9 +1227,8 @@ impl ContainerService {
                 other => other?,
             }
         }
-        match &rootfs_dir {
-            Some(dir) => self.setup_rootfs_dir(&container_id, &bundle_path, dir, id_maps)?,
-            None => self.setup_rootfs(&rootfs_path)?,
+        if let Some(dir) = &rootfs_dir {
+            self.setup_rootfs_dir(&container_id, &bundle_path, dir, id_maps)?;
         }
         velarx_base::trace::point("create rootfs");
 

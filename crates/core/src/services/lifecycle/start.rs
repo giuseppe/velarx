@@ -2309,19 +2309,15 @@ impl ContainerService {
         let reply = tokio::task::spawn_blocking(move || client::start(&start_dir, 0))
             .await
             .map_err(|e| io_error(io::Error::other(e)))?;
-        let status = match reply {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(match client::monitor_error(&e) {
-                    Some(client::MonitorError::Remote { reason, .. }) => ContainerError::Runtime(
-                        crate::container::RuntimeError::Runtime(reason.clone()),
-                    ),
-                    _ => io_error(e),
-                })
-            }
-        };
         // (the monitor records the restart itself)
-        let _ = status;
+        if let Err(e) = reply {
+            return Err(match client::monitor_error(&e) {
+                Some(client::MonitorError::Remote { reason, .. }) => {
+                    ContainerError::Runtime(crate::container::RuntimeError::Runtime(reason.clone()))
+                }
+                _ => io_error(e),
+            });
+        }
         Ok(true)
     }
 }
