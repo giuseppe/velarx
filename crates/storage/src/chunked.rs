@@ -1,17 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum ChunkedError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("JSON parse error: {0}")]
-    Json(#[from] serde_json::Error),
-}
-
-pub type ChunkedResult<T> = Result<T, ChunkedError>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -130,12 +119,6 @@ pub fn toc_time(t: Option<&str>) -> Option<(i64, u32)> {
 }
 
 impl TocEntry {
-    /// The modification time in seconds since the epoch (0 when the entry
-    /// has none or it is not RFC 3339).
-    pub fn mtime_secs(&self) -> i64 {
-        self.mtime().0
-    }
-
     /// The modification time: seconds since the epoch (before it for a
     /// time before 1970) and nanoseconds; `(0, 0)` when the entry has none
     /// or it is not RFC 3339.  The one reading of the times of a table of
@@ -191,6 +174,17 @@ impl Toc {
         self.version == TOC_VERSION_CANONICAL
     }
 
+    /// The files with content, by fs-verity digest, each once.
+    pub fn files(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.entries
+            .iter()
+            .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+            .filter_map(|e| e.verity())
+            .filter(|d| seen.insert(d.clone()))
+            .collect()
+    }
+
     pub fn find_by_name(&self, name: &str) -> Option<&TocEntry> {
         self.entries.iter().find(|e| e.name == name)
     }
@@ -232,11 +226,6 @@ pub fn size_conflict(entries: &[TocEntry]) -> Option<(usize, String)> {
             )
         })
     })
-}
-
-pub fn parse_toc_from_bytes(data: &[u8]) -> ChunkedResult<Toc> {
-    let toc: Toc = serde_json::from_slice(data)?;
-    Ok(toc)
 }
 
 #[cfg(test)]

@@ -986,7 +986,7 @@ impl Walker<'_> {
         h.set_mode(e.mode & 0o7777);
         h.set_uid(u64::from(e.uid));
         h.set_gid(u64::from(e.gid));
-        h.set_mtime(self.opts.mtime.of(e.mtime_secs()));
+        h.set_mtime(self.opts.mtime.of(e.mtime().0));
         h.set_size(0);
         let xattrs = image_xattrs(e);
         let written = match e.entry_type {

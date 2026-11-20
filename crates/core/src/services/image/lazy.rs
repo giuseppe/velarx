@@ -581,7 +581,9 @@ impl ImageService {
             let left: Vec<std::collections::HashSet<String>> = l
                 .iter()
                 .map(|layer| {
-                    layer_files(&layer.toc)
+                    layer
+                        .toc
+                        .files()
                         .into_iter()
                         .filter(|d| !store.contains(d) && !staged(d))
                         .collect()
@@ -743,7 +745,7 @@ impl ImageService {
         let mut seen = std::collections::HashSet::new();
         let files = layers
             .iter()
-            .flat_map(|l| layer_files(&l.toc))
+            .flat_map(|l| l.toc.files())
             .filter(|d| seen.insert(d.clone()))
             .collect();
         self.link_files(layers, files, layers.iter().collect())
@@ -866,7 +868,7 @@ impl ImageService {
         // lock held (the reads and hashes of the commit are all here): the
         // sections that follow only link, rename and sync.
         let verified = self
-            .verify_files(all, layer_files(&layer.toc), vec![layer])
+            .verify_files(all, layer.toc.files(), vec![layer])
             .await?;
         let one = self.commit_layer_lock(&layer.key).await?;
         let store = self.lock_store().await?;
@@ -1229,7 +1231,7 @@ impl ImageService {
 fn wanted_by_staging(layers: &[LazyLayer], digests: Vec<String>) -> Vec<Vec<String>> {
     let owners: Vec<std::collections::HashSet<String>> = layers
         .iter()
-        .map(|l| layer_files(&l.toc).into_iter().collect())
+        .map(|l| l.toc.files().into_iter().collect())
         .collect();
     let mut wanted: Vec<Vec<String>> = vec![Vec::new(); layers.len()];
     for digest in digests {
@@ -1238,17 +1240,6 @@ fn wanted_by_staging(layers: &[LazyLayer], digests: Vec<String>) -> Vec<Vec<Stri
         }
     }
     wanted
-}
-
-/// The files of the table of contents of a layer, by fs-verity digest.
-fn layer_files(toc: &Toc) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    toc.entries
-        .iter()
-        .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
-        .filter_map(|e| e.verity())
-        .filter(|d| seen.insert(d.clone()))
-        .collect()
 }
 
 impl LazyFileFetcher for ImageService {
@@ -1541,7 +1532,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         let all: Vec<String> = layers
             .iter()
-            .flat_map(|l| layer_files(&l.toc))
+            .flat_map(|l| l.toc.files())
             .filter(|d| seen.insert(d.clone()))
             .collect();
         let wanted = wanted_by_staging(&layers, all);

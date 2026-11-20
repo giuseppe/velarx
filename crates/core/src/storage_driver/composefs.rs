@@ -919,13 +919,13 @@ impl ComposefsDriver {
         let mut retained = retain.clone();
         for key in keep {
             if let Some(toc) = self.toc_of(key).await? {
-                retained.extend(toc_files(&toc));
+                retained.extend(toc.files());
             }
         }
         let mut last: std::collections::HashMap<String, usize> = Default::default();
         for (i, key) in dropping.iter().enumerate() {
             if let Some(toc) = self.toc_of(key).await? {
-                last.extend(toc_files(&toc).into_iter().map(|d| (d, i)));
+                last.extend(toc.files().into_iter().map(|d| (d, i)));
             }
         }
         let numbered: Vec<(usize, LayerKey)> = dropping.into_iter().enumerate().collect();
@@ -933,7 +933,7 @@ impl ComposefsDriver {
             let batch = batch?;
             for (_, key) in &batch.in_use {
                 if let Some(toc) = self.toc_of(key).await? {
-                    retained.extend(toc_files(&toc));
+                    retained.extend(toc.files());
                 }
             }
             for &(i, key) in &batch.unused {
@@ -942,7 +942,8 @@ impl ComposefsDriver {
                     // collection's: it names the files of no layer)
                     continue;
                 };
-                let files: Vec<String> = toc_files(&toc)
+                let files: Vec<String> = toc
+                    .files()
                     .into_iter()
                     .filter(|d| !retained.contains(d) && last.get(d) == Some(&i))
                     .collect();
@@ -1696,18 +1697,13 @@ impl ComposefsDriver {
         layers: Vec<(LayerKey, Toc)>,
     ) -> DriverResult<HashMap<LayerKey, LayerArtifact>> {
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || Self::make_images_blocking(layers, &store))
-            .await
-            .map_err(join_error)?
-            .map_err(storage_error)
-    }
-
-    fn make_images_blocking(
-        layers: Vec<(LayerKey, Toc)>,
-        store: &FileStore,
-    ) -> std::io::Result<HashMap<LayerKey, LayerArtifact>> {
-        let refs: Vec<(LayerKey, &Toc)> = layers.iter().map(|(d, t)| (*d, t)).collect();
-        make_layer_images(&refs, store)
+        tokio::task::spawn_blocking(move || {
+            let refs: Vec<(LayerKey, &Toc)> = layers.iter().map(|(d, t)| (*d, t)).collect();
+            make_layer_images(&refs, &store)
+        })
+        .await
+        .map_err(join_error)?
+        .map_err(storage_error)
     }
 }
 
@@ -2411,17 +2407,6 @@ fn root_is_overlay_of(mountinfo: &str, upper: &Path) -> bool {
                     .split(',')
                     .any(|o| velarx_base::mountinfo::unescape(o) == want)
         })
-}
-
-/// The files of a table of contents, by fs-verity digest, each once.
-fn toc_files(toc: &Toc) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    toc.entries
-        .iter()
-        .filter(|e| e.entry_type == velarx_storage::TocEntryType::Reg && e.size > 0)
-        .filter_map(|e| e.verity())
-        .filter(|d| seen.insert(d.clone()))
-        .collect()
 }
 
 /// The temporary files of the composefs directory that are old enough to be
