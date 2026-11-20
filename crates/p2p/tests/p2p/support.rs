@@ -85,20 +85,29 @@ pub async fn fetch(
     fetch_from(a, b.peer_id(), &items).await
 }
 
-/// [`P2PNode::fetch_into`], the chunks collected in the order asked.
+/// [`P2PNode::fetch_into`], as a request that is waited for, the chunks
+/// collected in the order asked.
 pub async fn fetch_from(
     node: &P2PNode,
     peer: libp2p::PeerId,
     digests: &[(String, Option<u64>)],
 ) -> velarx_p2p::P2PResult<Vec<(String, Vec<u8>)>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(velarx_p2p::CHUNKS_IN_FLIGHT);
-    let (done, mut found) = futures::join!(node.fetch_into(peer, digests, tx), async move {
-        let mut found = Vec::new();
-        while let Some(chunk) = rx.recv().await {
-            found.push(chunk);
+    let (done, mut found) = futures::join!(
+        node.fetch_into(
+            peer,
+            digests,
+            velarx_content::fetcher::fetch::Urgency::Wait,
+            tx
+        ),
+        async move {
+            let mut found = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                found.push(chunk);
+            }
+            found
         }
-        found
-    });
+    );
     done?;
     let order: HashMap<&str, usize> = digests
         .iter()

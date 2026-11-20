@@ -158,7 +158,12 @@ async fn test_a_store_that_cannot_be_read_is_an_error_to_the_asker() {
     let (out, _chunks) = tokio::sync::mpsc::channel(1);
     assert!(
         peers
-            .request(peer, &[(d.clone(), None)], out)
+            .request(
+                peer,
+                &[(d.clone(), None)],
+                velarx_content::fetcher::fetch::Urgency::Wait,
+                out,
+            )
             .await
             .is_err(),
         "chunks"

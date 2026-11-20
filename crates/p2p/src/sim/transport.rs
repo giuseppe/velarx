@@ -11,6 +11,7 @@ use std::io;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::time::Instant;
+use velarx_content::fetcher::fetch::Urgency;
 
 /// How long a probe, and a dial, wait: those of the node.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -84,6 +85,7 @@ impl Transport for SimTransport {
         &self,
         peer: PeerId,
         items: &[(String, Option<u64>)],
+        _: Urgency,
         out: crate::ChunkTx,
     ) -> P2PResult<()> {
         let (me, target) = self.path(peer).await?;

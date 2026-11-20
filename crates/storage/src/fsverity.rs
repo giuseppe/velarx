@@ -655,6 +655,15 @@ impl Default for FsVerityManager {
 
 const VERITY_BLOCK: usize = 4096;
 
+/// The pieces a file is read in to be measured: their blocks are hashed at
+/// once ([`VerityHasher::update_wide`]).
+const WIDE_PIECE: u64 = 8 << 20;
+/// The least bytes whose blocks are hashed on several threads (fewer cost
+/// less than the threads).
+const WIDE_MIN: usize = 1 << 20;
+/// The most threads that hash the blocks of a piece.
+const WIDE_THREADS: usize = 8;
+
 /// A hash of the Merkle tree: the digest of the algorithm in the first
 /// bytes (32 for SHA-256, 64 for SHA-512).
 type Hash = [u8; 64];
@@ -748,6 +757,48 @@ impl VerityHasher {
             self.push(0, hash_of(self.alg, block));
         }
         self.partial.extend_from_slice(rest);
+    }
+
+    /// The same as `update`, the blocks of a piece of at least
+    /// [`WIDE_MIN`] bytes hashed on up to [`WIDE_THREADS`] threads at once.
+    pub fn update_wide(&mut self, data: &[u8]) -> io::Result<()> {
+        // (the block in progress is completed first)
+        let at = match self.partial.is_empty() {
+            true => 0,
+            false => data.len().min(VERITY_BLOCK - self.partial.len()),
+        };
+        self.update(&data[..at]);
+        let (blocks, rest) = data[at..].as_chunks::<VERITY_BLOCK>();
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(WIDE_THREADS);
+        if blocks.len() * VERITY_BLOCK < WIDE_MIN || threads == 1 {
+            self.update(&data[at..]);
+            return Ok(());
+        }
+        let alg = self.alg;
+        let hashes = std::thread::scope(|s| {
+            let parts = blocks
+                .chunks(blocks.len().div_ceil(threads))
+                .map(|part| {
+                    std::thread::Builder::new().spawn_scoped(s, move || {
+                        part.iter().map(|b| hash_of(alg, b)).collect::<Vec<_>>()
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            Ok::<_, io::Error>(
+                parts
+                    .into_iter()
+                    .flat_map(|p| p.join().expect("a hash does not panic"))
+                    .collect::<Vec<_>>(),
+            )
+        })?;
+        self.size += (blocks.len() * VERITY_BLOCK) as u64;
+        for hash in hashes {
+            self.push(0, hash);
+        }
+        self.update(rest);
+        Ok(())
     }
 
     /// The same as `update` with `len` bytes of zeros.
@@ -847,13 +898,17 @@ fn object_name(alg: Algorithm, raw: &[u8]) -> String {
 }
 
 /// The fs-verity digest of the content of `file` in `alg`: its holes are
-/// not read, and cost nothing (`VerityHasher::update_zeros`).
+/// not read, and cost nothing (`VerityHasher::update_zeros`); the blocks
+/// of a big file are hashed on several threads ([`VerityHasher::update_wide`]).
 pub fn fsverity_digest_file(alg: Algorithm, file: &std::fs::File) -> io::Result<String> {
     let mut hasher = VerityHasher::new(alg);
-    crate::sparse::read_sparse(file, |piece| match piece {
-        crate::sparse::Piece::Data(d) => hasher.update(d),
+    let mut failed = Ok(());
+    crate::sparse::read_sparse_by(file, WIDE_PIECE, |piece| match piece {
+        _ if failed.is_err() => {}
+        crate::sparse::Piece::Data(d) => failed = hasher.update_wide(d),
         crate::sparse::Piece::Zeros(n) => hasher.update_zeros(n),
     })?;
+    failed?;
     Ok(hasher.finish())
 }
 
@@ -1138,6 +1193,21 @@ mod tests {
                 "{alg} {} bytes",
                 dense.len()
             );
+        }
+    }
+
+    /// Blocks hashed on several threads give the digest of the same bytes
+    /// hashed on one, from a block in progress or not.
+    #[test]
+    fn blocks_hashed_at_once_give_the_same_digest() {
+        let data = pattern(3 * WIDE_MIN + 5000, 7);
+        for alg in Algorithm::ALL {
+            for first in [0, 100, VERITY_BLOCK] {
+                let mut wide = VerityHasher::new(alg);
+                wide.update_wide(&data[..first]).unwrap();
+                wide.update_wide(&data[first..]).unwrap();
+                assert_eq!(wide.finish(), oracle(alg, &data), "{alg} {first}");
+            }
         }
     }
 

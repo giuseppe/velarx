@@ -485,7 +485,14 @@ async fn a_member_with_no_quic_path_is_not_asked_for_data() {
     let peers = NodePeers(a.clone());
     let (out, _chunks) = tokio::sync::mpsc::channel(1);
     assert!(matches!(
-        peers.request(peer, &[(digest, None)], out).await,
+        peers
+            .request(
+                peer,
+                &[(digest, None)],
+                velarx_content::fetcher::fetch::Urgency::Wait,
+                out
+            )
+            .await,
         Err(PeerError::NoQuic(_))
     ));
     assert_eq!(peers.without_quic().await, 1);

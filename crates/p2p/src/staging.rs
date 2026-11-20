@@ -27,7 +27,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsFd;
 use velarx_content::fetcher::fetch::{
-    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, TARSPLIT, TOC_CLAIM,
+    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, Urgency, TARSPLIT,
+    TOC_CLAIM,
 };
 use velarx_content::serve_fetch::{
     Described, FetchCall, LayerScope, Out, Scope, StagingFetcher, UnpackCall,
@@ -334,6 +335,7 @@ impl PeerSource {
     async fn assemble(
         &self,
         layer: Option<&str>,
+        urgency: Urgency,
         files: &mut Files<'_>,
     ) -> Result<(bool, Vec<u32>), FetcherError> {
         // the files with no chunk (zeros only) are complete already
@@ -373,7 +375,7 @@ impl PeerSource {
             if under_way.len() == GROUPS_AT_ONCE {
                 futures::StreamExt::next(&mut under_way).await.transpose()?;
             }
-            under_way.push(self.fetch_shared(group, layer, &shared));
+            under_way.push(self.fetch_shared(group, layer, urgency, &shared));
         }
         while futures::StreamExt::next(&mut under_way)
             .await
@@ -397,9 +399,10 @@ impl PeerSource {
         &self,
         group: &[Item],
         layer: Option<&str>,
+        urgency: Urgency,
         files: &tokio::sync::Mutex<&mut Files<'_>>,
     ) -> Result<(), FetcherError> {
-        self.fetch_group(group, layer, &mut Shared(files))
+        self.fetch_group_as(group, layer, urgency, &mut Shared(files))
             .await
             .map_err(failed)?;
         let kept = {
@@ -441,6 +444,7 @@ impl PeerSource {
         &self,
         scope: &Scope,
         layer: &LayerScope,
+        urgency: Urgency,
         out: &Out<Event>,
     ) -> Result<(), FetcherError> {
         let mut index = One(None);
@@ -522,7 +526,9 @@ impl PeerSource {
         }
         // (the claim is named last; the files no peer had are left out: the
         // claim names them, the engine may have them)
-        let (sound, left) = self.assemble(Some(&layer.layer), &mut files).await?;
+        let (sound, left) = self
+            .assemble(Some(&layer.layer), urgency, &mut files)
+            .await?;
         Self::unavailable(out, left).await?;
         let json = serde_json::to_vec(&toc).map_err(failed)?;
         if !sound {
@@ -747,10 +753,10 @@ impl StagingFetcher for PeerSource {
         &self,
         scope: &Scope,
         layer: &LayerScope,
-        _call: UnpackCall,
+        call: UnpackCall,
         out: &Out<Event>,
     ) -> Result<(), FetcherError> {
-        self.unpack_whole(scope, layer, out).await
+        self.unpack_whole(scope, layer, call.urgency, out).await
     }
 
     async fn fetch(
@@ -760,6 +766,7 @@ impl StagingFetcher for PeerSource {
         call: FetchCall,
         out: &Out<Event>,
     ) -> Result<(), FetcherError> {
+        let urgency = call.urgency;
         let run = async {
             let indexed = LayerToc::kept(layer)?;
             let mut files =
@@ -842,7 +849,9 @@ impl StagingFetcher for PeerSource {
                     .map_err(gone)?;
                 }
             }
-            let (_, mut left) = self.assemble(Some(&layer.layer), &mut files).await?;
+            let (_, mut left) = self
+                .assemble(Some(&layer.layer), urgency, &mut files)
+                .await?;
             // the files whose chunks the peers lack, by their fs-verity
             // digests
             let mut whole_files =
@@ -879,7 +888,7 @@ impl StagingFetcher for PeerSource {
                 left.retain(|p| !again.contains(p));
                 // (no layer: the peers that lacked its chunks may have the
                 // file)
-                let (_, more) = self.assemble(None, &mut whole_files).await?;
+                let (_, more) = self.assemble(None, urgency, &mut whole_files).await?;
                 left.extend(more);
             }
             Self::unavailable(out, left).await
@@ -944,6 +953,7 @@ mod tests {
             &self,
             _: PeerId,
             _: &[(String, Option<u64>)],
+            _: Urgency,
             _: crate::ChunkTx,
         ) -> Result<(), PeerError> {
             Ok(())
@@ -1031,6 +1041,7 @@ mod tests {
             &self,
             _: PeerId,
             items: &[(String, Option<u64>)],
+            _: Urgency,
             out: crate::ChunkTx,
         ) -> Result<(), PeerError> {
             self.0.wait().await;
@@ -1092,7 +1103,7 @@ mod tests {
         }
         let (sound, left) = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            source.assemble(None, &mut files),
+            source.assemble(None, Urgency::Wait, &mut files),
         )
         .await
         .expect("the groups were asked one after the other")

@@ -31,7 +31,8 @@
 //! endpoint is known ([`Quic::warm`]) and kept while both ends live, so a
 //! request is one round trip.
 //!
-//! A request is a bidirectional stream: an operation (u8), a count (u16),
+//! A request is a bidirectional stream: an operation (u8), its urgency (u8:
+//! 0 background, 1 ahead, 2 wait, 3 on demand), a count (u16),
 //! that many algorithm bytes (1 for a sha256, 2 for a sha512) and then the
 //! raw bytes of the digests (32 or 64 each), then for an index its largest
 //! size (u64).  The server answers each digest in order with a
@@ -71,12 +72,13 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
+use velarx_content::fetcher::fetch::Urgency;
 use velarx_storage::ChunkFile;
 use velarx_types::digest::{Algorithm, Digest, Kind};
 
-const ALPN: &[u8] = b"velarx-chunks/4";
+const ALPN: &[u8] = b"velarx-chunks/5";
 const MAGIC: &[u8; 4] = b"SHQ2";
 pub const OP_CHUNKS: u8 = 1;
 pub const OP_INDEX: u8 = 2;
@@ -332,8 +334,7 @@ pub struct Quic {
     /// The bytes of chunks read from the peers so far, as they come
     received: Arc<std::sync::atomic::AtomicU64>,
     /// The requests the server answers at the same time, and its slots
-    slots: Arc<Semaphore>,
-    serving: usize,
+    slots: Arc<Slots>,
     auth: Auth,
     /// The peer a libp2p connection says is at an address: the certificate
     /// there must be its
@@ -498,12 +499,13 @@ async fn read_digests(
 /// ([`crate::fuzzing`]).  Never more is allocated than `data` holds.
 pub fn parse_request(data: &[u8]) -> io::Result<(u8, Vec<String>)> {
     let eof = || io::Error::from(io::ErrorKind::UnexpectedEof);
-    let head: [u8; 3] = data.get(..3).ok_or_else(eof)?.try_into().map_err(other)?;
-    let count = digests_count(head)?;
-    let rest = &data[3..];
+    let (&[op, urgency, c0, c1], rest) = data.split_first_chunk::<4>().ok_or_else(eof)?;
+    Urgency::try_from(urgency)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "an unknown urgency"))?;
+    let count = digests_count([op, c0, c1])?;
     let (kinds, len) = kinds_of(rest.get(..count).ok_or_else(eof)?)?;
     let raw = rest[count..].get(..len).ok_or_else(eof)?;
-    Ok((head[0], digests_of(kinds, raw)?))
+    Ok((op, digests_of(kinds, raw)?))
 }
 
 /// The answer to a request for chunks, read chunk by chunk.
@@ -651,7 +653,20 @@ impl Quic {
             quinn::crypto::rustls::QuicServerConfig::try_from(crypto).map_err(other)?,
         ));
         server.transport_config(Arc::new(server_transport(&limits)));
-        let mut endpoint = Endpoint::server(server, addr)?;
+        // (the socket holds what a burst of the peers brings until the
+        // endpoint reads it: at the default of the kernel, a few hundred KiB,
+        // the datagrams of a fast link are dropped and sent again)
+        let socket = std::net::UdpSocket::bind(addr)?;
+        rustix::net::sockopt::set_socket_recv_buffer_size(
+            &socket,
+            usize::try_from(limits.window).unwrap_or(usize::MAX),
+        )?;
+        let mut endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?;
 
         let client = client_config(client_transport_of(&limits), &auth)?;
         endpoint.set_default_client_config(client);
@@ -665,8 +680,7 @@ impl Quic {
             connections: Mutex::new(HashMap::new()),
             unreachable: Mutex::default(),
             served: Arc::default(),
-            slots: Arc::new(Semaphore::new(limits.serving)),
-            serving: limits.serving,
+            slots: Slots::new(limits.serving),
             auth: auth.clone(),
             expected: Mutex::default(),
             idle: limits.idle,
@@ -713,10 +727,7 @@ impl Quic {
 
     /// The requests being answered, and the most at a time.
     pub fn slots(&self) -> (usize, usize) {
-        (
-            self.serving.saturating_sub(self.slots.available_permits()),
-            self.serving,
-        )
+        self.slots.taken()
     }
 
     /// The chunks served so far.
@@ -746,12 +757,13 @@ impl Quic {
         self: &Arc<Self>,
         addr: SocketAddr,
         digests: &[(String, Option<u64>)],
+        urgency: Urgency,
     ) -> io::Result<Reply> {
         if digests.is_empty() || digests.len() > MAX_REQUEST_DIGESTS {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         let mut head = Vec::with_capacity(3 + digests.len() * 65);
-        head.push(OP_CHUNKS);
+        head.extend_from_slice(&[OP_CHUNKS, urgency as u8]);
         head.extend_from_slice(&(digests.len() as u16).to_be_bytes());
         head.extend_from_slice(&digests_wire(digests.iter().map(|(d, _)| d.as_str()))?);
         let (send, recv) = self.open(addr, &head).await?;
@@ -784,6 +796,7 @@ impl Quic {
         self: &Arc<Self>,
         addr: SocketAddr,
         digests: &[(String, Option<u64>)],
+        urgency: Urgency,
         out: crate::ChunkTx,
     ) -> io::Result<usize> {
         if digests.is_empty() || digests.len() > MAX_REQUEST_DIGESTS {
@@ -795,7 +808,7 @@ impl Quic {
         // an answer that brings nothing ends it
         while !asked.is_empty() {
             let before = found;
-            let mut reply = self.request(addr, &asked).await?;
+            let mut reply = self.request(addr, &asked, urgency).await?;
             while let Some(chunk) = reply.next().await? {
                 out.send(chunk)
                     .await
@@ -817,7 +830,8 @@ impl Quic {
         }
     }
 
-    /// [`Quic::fetch_into`], the chunks collected.
+    /// [`Quic::fetch_into`], as a request that is waited for, the chunks
+    /// collected.
     #[cfg(test)]
     pub async fn fetch(
         self: &Arc<Self>,
@@ -825,13 +839,16 @@ impl Quic {
         digests: &[(String, Option<u64>)],
     ) -> io::Result<Vec<(String, Vec<u8>)>> {
         let (tx, mut rx) = tokio::sync::mpsc::channel(crate::CHUNKS_IN_FLIGHT);
-        let (done, found) = futures::join!(self.fetch_into(addr, digests, tx), async move {
-            let mut found = Vec::new();
-            while let Some(chunk) = rx.recv().await {
-                found.push(chunk);
+        let (done, found) = futures::join!(
+            self.fetch_into(addr, digests, Urgency::Wait, tx),
+            async move {
+                let mut found = Vec::new();
+                while let Some(chunk) = rx.recv().await {
+                    found.push(chunk);
+                }
+                found
             }
-            found
-        });
+        );
         done.map(|_| found)
     }
 
@@ -874,7 +891,7 @@ impl Quic {
         layer: &str,
         max: u64,
     ) -> io::Result<Option<Vec<u8>>> {
-        let mut head = vec![op, 0, 1];
+        let mut head = vec![op, Urgency::Wait as u8, 0, 1];
         head.extend_from_slice(&digests_wire(std::iter::once(layer))?);
         head.extend_from_slice(&max.to_be_bytes());
         let (_send, mut recv) = self.open(addr, &head).await?;
@@ -904,7 +921,7 @@ impl Quic {
     /// Whether the peer at `addr` has the chunk `digest` (it would serve
     /// it): one short stream, one byte back.  A hint, not a proof.
     pub async fn has(self: &Arc<Self>, addr: SocketAddr, digest: &str) -> io::Result<Presence> {
-        let mut head = vec![OP_PROBE, 0, 1];
+        let mut head = vec![OP_PROBE, Urgency::Wait as u8, 0, 1];
         head.extend_from_slice(&digests_wire(std::iter::once(digest))?);
         let (_send, mut recv) = self.open(addr, &head).await?;
         let mut status = [0u8; 1];
@@ -1252,10 +1269,94 @@ async fn write(send: &mut quinn::SendStream, buf: &[u8], idle: Duration) -> io::
         .map_err(other)
 }
 
+/// The places for the requests the server answers at the same time.  A
+/// request that waits for one is given it by its urgency, the most urgent
+/// first, and in the order they came among those of one urgency.
+struct Slots {
+    total: usize,
+    state: Mutex<Waiting>,
+}
+
+#[derive(Default)]
+struct Waiting {
+    free: usize,
+    next: u64,
+    /// The requests that wait, the next to be served first
+    queue: std::collections::BTreeMap<(std::cmp::Reverse<Urgency>, u64), oneshot::Sender<Place>>,
+}
+
+/// A place, given back when it is dropped.
+struct Place(Arc<Slots>);
+
+impl Slots {
+    fn new(total: usize) -> Arc<Self> {
+        Arc::new(Self {
+            total,
+            state: Mutex::new(Waiting {
+                free: total,
+                ..Waiting::default()
+            }),
+        })
+    }
+
+    /// The places taken, and all of them.
+    fn taken(&self) -> (usize, usize) {
+        let free = self.state.lock().unwrap_or_else(|e| e.into_inner()).free;
+        (self.total - free, self.total)
+    }
+
+    /// A place, when it is the turn of a request of this `urgency`.
+    async fn acquire(self: &Arc<Self>, urgency: Urgency) -> Place {
+        let (key, turn) = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.free > 0 {
+                state.free -= 1;
+                return Place(self.clone());
+            }
+            let (give, turn) = oneshot::channel();
+            let key = (std::cmp::Reverse(urgency), state.next);
+            state.next += 1;
+            state.queue.insert(key, give);
+            (key, turn)
+        };
+        // (a request that stops waiting leaves the queue)
+        let _leaving = Leaving(self, key);
+        turn.await
+            .expect("a place is given to the request that waits")
+    }
+}
+
+struct Leaving<'a>(&'a Slots, (std::cmp::Reverse<Urgency>, u64));
+
+impl Drop for Leaving<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.queue.remove(&self.1);
+    }
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        let next = {
+            let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+            match state.queue.pop_first() {
+                Some((_, give)) => give,
+                None => {
+                    state.free += 1;
+                    return;
+                }
+            }
+        };
+        // (a request that has just stopped waiting hands it on in its turn,
+        // as the place is dropped)
+        let _ = next.send(Place(self.0.clone()));
+    }
+}
+
 /// The state of the serving side.
 struct Server {
     provider: SharedProvider,
-    slots: Arc<Semaphore>,
+    slots: Arc<Slots>,
     served: Arc<std::sync::atomic::AtomicU64>,
     auth: Auth,
     limits: Limits,
@@ -1347,8 +1448,14 @@ impl Server {
     ) -> io::Result<()> {
         let idle = self.limits.grace;
         let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_string());
-        let mut head = [0u8; 3];
-        read(&mut recv, &mut head, idle).await?;
+        let mut wire = [0u8; 4];
+        read(&mut recv, &mut wire, idle).await?;
+        let [op, urgency, c0, c1] = wire;
+        let head = [op, c0, c1];
+        let urgency = Urgency::try_from(urgency).map_err(|_| invalid("an unknown urgency"))?;
+        // (what is more urgent has the first of the bytes the connection
+        // sends)
+        send.set_priority(urgency as i32).map_err(other)?;
         let count = digests_count(head)?;
         let digests = read_digests(&mut recv, count, idle).await?;
         let span = tracing::Span::current();
@@ -1371,7 +1478,8 @@ impl Server {
         let mut answer = Answer::new(&mut send, &self.admission, Caller::new(ip), &self.limits);
         match head[0] {
             OP_CHUNKS => {
-                self.chunks(&mut answer, &provider, &digests).await?;
+                self.chunks(&mut answer, &provider, urgency, &digests)
+                    .await?;
             }
             OP_PROBE if count == 1 => self.probe(&mut answer, &provider, &digests[0]).await?,
             OP_INDEX | OP_PROFILE if count == 1 => {
@@ -1382,7 +1490,7 @@ impl Server {
                     _ => u64::from_be_bytes(max)
                         .min(velarx_content::fetcher::fetch::PROFILE_MAX_BYTES),
                 };
-                self.index(&mut answer, &provider, head[0], &digests[0], max)
+                self.index(&mut answer, &provider, urgency, head[0], &digests[0], max)
                     .await?
             }
             _ => return Err(invalid("not a request")),
@@ -1427,6 +1535,7 @@ impl Server {
         &self,
         answer: &mut Answer<'_>,
         provider: &Arc<dyn ChunkProvider>,
+        urgency: Urgency,
         op: u8,
         layer: &str,
         max: u64,
@@ -1439,8 +1548,10 @@ impl Server {
         // until the peer has taken it)
         let _slot;
         let index = {
-            _slot = match tokio::time::timeout_at(answer.due(idle), self.slots.acquire()).await {
-                Ok(slot) => slot.map_err(other)?,
+            _slot = match tokio::time::timeout_at(answer.due(idle), self.slots.acquire(urgency))
+                .await
+            {
+                Ok(slot) => slot,
                 Err(_) => return answer.write(&[NO_ROOM]).await,
             };
             let (p, l) = (provider.clone(), layer.to_string());
@@ -1492,6 +1603,7 @@ impl Server {
         &self,
         answer: &mut Answer<'_>,
         provider: &Arc<dyn ChunkProvider>,
+        urgency: Urgency,
         digests: &[String],
     ) -> io::Result<()> {
         let idle = self.limits.idle;
@@ -1506,8 +1618,10 @@ impl Server {
             // when the next byte is due ([`Answer::due`]) is "no room" for
             // the rest (busy: the asker tries another peer), before the
             // client takes the silence for a failure of QUIC
-            let slot = match tokio::time::timeout_at(answer.due(idle), self.slots.acquire()).await {
-                Ok(slot) => slot.map_err(other)?,
+            let slot = match tokio::time::timeout_at(answer.due(idle), self.slots.acquire(urgency))
+                .await
+            {
+                Ok(slot) => slot,
                 Err(_) => {
                     full = true;
                     answer.write(&vec![NO_ROOM; wave.len()]).await?;
@@ -2272,7 +2386,7 @@ mod tests {
     }
 
     fn chunks_request(asked: &[(String, Option<u64>)]) -> Vec<u8> {
-        let mut head = vec![OP_CHUNKS];
+        let mut head = vec![OP_CHUNKS, Urgency::Wait as u8];
         head.extend_from_slice(&(asked.len() as u16).to_be_bytes());
         head.extend_from_slice(&digests_wire(asked.iter().map(|(d, _)| d.as_str())).unwrap());
         head
@@ -2324,6 +2438,74 @@ mod tests {
             .unwrap_err();
         assert!(no_room(&busy), "{busy}");
         drop(held);
+    }
+
+    /// The requests that wait for a place at the server are answered by
+    /// their urgency, the most urgent first, and in the order they came among
+    /// those of the same urgency.
+    #[tokio::test]
+    async fn the_most_urgent_request_waiting_is_answered_first() {
+        let (provider, digests) = chunks(&[vec![0u8; 4 << 20], b"one".to_vec()]);
+        let limits = Limits {
+            serving: 1,
+            idle: Duration::from_secs(16),
+            grace: Duration::from_secs(60),
+            ..Limits::default()
+        };
+        let (_server, addr) = bind_with(provider, limits);
+        // the only place is taken by an answer nobody reads
+        let held = stalled(addr, &[(digests[0].clone(), None)], 1).await;
+        let client = Quic::bind("127.0.0.1:0".parse().unwrap(), Arc::default(), KEY).unwrap();
+        let answered = Arc::new(Mutex::new(Vec::new()));
+        let mut asking = Vec::new();
+        for urgency in [
+            Urgency::Background,
+            Urgency::Wait,
+            Urgency::OnDemand,
+            Urgency::Wait,
+        ] {
+            let (client, answered, asked) = (client.clone(), answered.clone(), digests[1].clone());
+            asking.push(tokio::spawn(async move {
+                let (tx, _chunks) = tokio::sync::mpsc::channel(1);
+                client
+                    .fetch_into(addr, &[(asked, None)], urgency, tx)
+                    .await
+                    .unwrap();
+                answered.lock().unwrap().push(urgency);
+            }));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        drop(held);
+        for asked in asking {
+            tokio::time::timeout(Duration::from_secs(20), asked)
+                .await
+                .expect("every request is answered")
+                .unwrap();
+        }
+        assert_eq!(
+            *answered.lock().unwrap(),
+            [
+                Urgency::OnDemand,
+                Urgency::Wait,
+                Urgency::Wait,
+                Urgency::Background
+            ]
+        );
+    }
+
+    /// A request of an urgency that does not exist ends its stream, and the
+    /// connection goes on.
+    #[tokio::test]
+    async fn an_urgency_that_does_not_exist_is_no_request() {
+        let (provider, d) = chunks(&[b"one".to_vec()]);
+        let (_server, addr) = bind_with(provider, Limits::default());
+        let client = Quic::bind("127.0.0.1:0".parse().unwrap(), Arc::default(), KEY).unwrap();
+        let connection = client.connection(addr).await.unwrap();
+        let mut head = vec![OP_CHUNKS, 9, 0, 1];
+        head.extend(digests_wire(std::iter::once(d[0].as_str())).unwrap());
+        assert!(answer_to_wire(&connection, &head).await.is_empty());
+        head[1] = Urgency::Wait as u8;
+        assert!(!answer_to_wire(&connection, &head).await.is_empty());
     }
 
     /// A connection that makes the connection and proves nothing is dropped
@@ -2445,7 +2627,7 @@ mod tests {
         let (_server, addr) = bind_with(provider, Limits::default());
         let client = Quic::bind("127.0.0.1:0".parse().unwrap(), Arc::default(), KEY).unwrap();
         let asked: Vec<(String, Option<u64>)> = digests.iter().map(|d| (d.clone(), None)).collect();
-        let mut reply = client.request(addr, &asked).await.unwrap();
+        let mut reply = client.request(addr, &asked, Urgency::Wait).await.unwrap();
         assert!(reply.next().await.unwrap().is_some());
         assert!(reply.next().await.unwrap().is_none());
         assert_eq!(reply.later(), asked[1..].to_vec());
@@ -3191,11 +3373,25 @@ mod tests {
         assert!(start.elapsed() > Duration::from_millis(1300));
     }
 
-    /// One request of `head` on a connection of a member, and the bytes
-    /// the server answers with (none when it ends the stream).
+    /// `head` as it is sent: its operation, the urgency `wait`, the rest.
+    fn waited(head: &[u8]) -> Vec<u8> {
+        match head.split_first() {
+            Some((op, rest)) => [&[*op, Urgency::Wait as u8][..], rest].concat(),
+            None => Vec::new(),
+        }
+    }
+
+    /// One request of `head` on a connection of a member, sent as
+    /// [`waited`], and the bytes the server answers with (none when it ends
+    /// the stream).
     async fn answer_to(connection: &quinn::Connection, head: &[u8]) -> Vec<u8> {
+        answer_to_wire(connection, &waited(head)).await
+    }
+
+    /// [`answer_to`] of the bytes `wire` as they are.
+    async fn answer_to_wire(connection: &quinn::Connection, wire: &[u8]) -> Vec<u8> {
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
-        let _ = send.write_all(head).await;
+        let _ = send.write_all(wire).await;
         let _ = send.finish();
         match tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(1 << 20)).await {
             Ok(Ok(bytes)) => bytes,
@@ -3251,24 +3447,27 @@ mod tests {
         let mut two = vec![OP_CHUNKS, 0, 2];
         two.extend(digests_wire([a.as_str(), b.as_str()].into_iter()).unwrap());
         assert_eq!(
-            parse_request(&two).unwrap(),
+            parse_request(&waited(&two)).unwrap(),
             (OP_CHUNKS, vec![a.clone(), b])
         );
         let mut probe = vec![OP_PROBE, 0, 1];
         probe.extend(digests_wire(std::iter::once(a.as_str())).unwrap());
-        assert_eq!(parse_request(&probe).unwrap(), (OP_PROBE, vec![a]));
+        assert_eq!(parse_request(&waited(&probe)).unwrap(), (OP_PROBE, vec![a]));
         let mut bad = probe.clone();
         bad[3] = 9;
         let too_many = (MAX_REQUEST_DIGESTS as u16 + 1).to_be_bytes();
+        let mut unknown = waited(&probe);
+        unknown[1] = 9;
         for wrong in [
-            &[][..],
-            &[OP_PROBE, 0][..],
-            &[OP_PROBE, 0, 0][..],
-            &[OP_CHUNKS, too_many[0], too_many[1]][..],
-            &two[..two.len() - 1],
-            &bad[..],
+            waited(&[]),
+            waited(&[OP_PROBE, 0]),
+            waited(&[OP_PROBE, 0, 0]),
+            waited(&[OP_CHUNKS, too_many[0], too_many[1]]),
+            waited(&two[..two.len() - 1]),
+            waited(&bad),
+            unknown,
         ] {
-            assert!(parse_request(wrong).is_err(), "{wrong:?}");
+            assert!(parse_request(&wrong).is_err(), "{wrong:?}");
         }
     }
 

@@ -275,8 +275,9 @@ opt-level = 3
 [profile.dev.package.zlib-rs]
 opt-level = 3
 
-# Size first: the crates on the hot paths of a pull (hashing, inflate) keep
-# opt-level 3.  zstd, sqlite and openssl are system libraries.
+# Size first: the crates on the hot paths of a pull (hashing, inflate, the
+# QUIC transport of the peers and its runtime) keep opt-level 3.  zstd,
+# sqlite and openssl are system libraries.
 [profile.release]
 lto = "fat"
 codegen-units = 1
@@ -289,6 +290,21 @@ panic = "abort"
 opt-level = 3
 
 [profile.release.package.zlib-rs]
+opt-level = 3
+
+[profile.release.package.quinn-proto]
+opt-level = 3
+
+[profile.release.package.quinn]
+opt-level = 3
+
+[profile.release.package.quinn-udp]
+opt-level = 3
+
+[profile.release.package.tokio]
+opt-level = 3
+
+[profile.release.package.bytes]
 opt-level = 3
 
 [lints]

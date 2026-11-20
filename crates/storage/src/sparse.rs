@@ -362,11 +362,16 @@ pub enum Piece<'a> {
 
 /// Give all of `file` to `f` in order, its holes (`SEEK_HOLE`) as lengths;
 /// a file system that cannot tell has none.  Returns the size.
-pub fn read_sparse(file: &File, mut f: impl FnMut(Piece<'_>)) -> io::Result<u64> {
+pub fn read_sparse(file: &File, f: impl FnMut(Piece<'_>)) -> io::Result<u64> {
+    read_sparse_by(file, 1 << 20, f)
+}
+
+/// [`read_sparse`], its data given in pieces of at most `most` bytes.
+pub fn read_sparse_by(file: &File, most: u64, mut f: impl FnMut(Piece<'_>)) -> io::Result<u64> {
     use rustix::fs::{seek, SeekFrom};
     let size = file.metadata()?.len();
     // (not a megabyte cleared for each of 100,000 small files)
-    let mut buf = vec![0u8; size.min(1 << 20) as usize];
+    let mut buf = vec![0u8; size.min(most) as usize];
     let mut pos = 0;
     while pos < size {
         // (one seek for a file that has no hole)

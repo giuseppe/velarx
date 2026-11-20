@@ -342,6 +342,7 @@ impl Peers for Noting {
         &self,
         peer: libp2p::PeerId,
         items: &[(String, Option<u64>)],
+        urgency: velarx_content::fetcher::fetch::Urgency,
         out: velarx_p2p::ChunkTx,
     ) -> Result<(), velarx_p2p::provider::PeerError> {
         self.1.lock().unwrap().push(peer);
@@ -363,7 +364,7 @@ impl Peers for Noting {
             ));
         }
         let (inner, mut chunks) = tokio::sync::mpsc::channel(velarx_p2p::CHUNKS_IN_FLIGHT);
-        let (answer, ()) = futures::join!(self.0.request(peer, items, inner), async {
+        let (answer, ()) = futures::join!(self.0.request(peer, items, urgency, inner), async {
             while let Some((digest, mut data)) = chunks.recv().await {
                 if fault.corrupt {
                     if let Some(first) = data.first_mut() {
@@ -1613,7 +1614,7 @@ impl ChunkProvider for Items {
 
 /// Two nodes give each other the content of a layer of SHA-512 digests: a
 /// chunk by its sha512 and a file by its SHA-512 fs-verity digest, over QUIC
-/// (`velarx-chunks/4`); the SHA-256 name of the same bytes is another item the
+/// (`velarx-chunks/5`); the SHA-256 name of the same bytes is another item the
 /// peer has not got, and bytes that are not what their key names are not
 /// given.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1646,13 +1647,21 @@ async fn test_sha512_chunks_and_files_go_from_a_peer() {
         .map(|d| (d.clone(), None))
         .collect();
     let (out, mut chunks) = tokio::sync::mpsc::channel(velarx_p2p::CHUNKS_IN_FLIGHT);
-    let (done, got) = futures::join!(peers.request(a.peer_id(), &asked, out), async move {
-        let mut got = std::collections::HashMap::new();
-        while let Some((digest, data)) = chunks.recv().await {
-            got.insert(digest, data);
+    let (done, got) = futures::join!(
+        peers.request(
+            a.peer_id(),
+            &asked,
+            velarx_content::fetcher::fetch::Urgency::Wait,
+            out,
+        ),
+        async move {
+            let mut got = std::collections::HashMap::new();
+            while let Some((digest, data)) = chunks.recv().await {
+                got.insert(digest, data);
+            }
+            got
         }
-        got
-    });
+    );
     done.unwrap();
     assert_eq!(got.get(&chunk), Some(&data));
     assert_eq!(got.get(&file), Some(&data));

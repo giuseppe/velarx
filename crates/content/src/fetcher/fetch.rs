@@ -49,13 +49,28 @@ pub const CAPABILITIES: [&str; 8] = [
 #[zlink(rename_all = "snake_case")]
 pub enum Urgency {
     /// The rest of an image that already runs
-    Background,
+    Background = 0,
     /// A guess
-    Ahead,
+    Ahead = 1,
     /// A command waits for the image
-    Wait,
+    Wait = 2,
     /// A process of a container is blocked on it
-    OnDemand,
+    OnDemand = 3,
+}
+
+impl TryFrom<u8> for Urgency {
+    type Error = u8;
+
+    /// The urgency of its byte on the wire (`urgency as u8`).
+    fn try_from(byte: u8) -> Result<Self, u8> {
+        Ok(match byte {
+            0 => Self::Background,
+            1 => Self::Ahead,
+            2 => Self::Wait,
+            3 => Self::OnDemand,
+            _ => return Err(byte),
+        })
+    }
 }
 
 /// A blob of the image, as the manifest the engine hashed describes it.

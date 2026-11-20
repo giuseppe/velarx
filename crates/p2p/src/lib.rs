@@ -84,6 +84,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
 use tracing::{debug, info, warn};
+use velarx_content::fetcher::fetch::Urgency;
 use velarx_storage::ChunkFile;
 
 /// What a node serves its peers with.  A digest the provider does not have
@@ -1234,16 +1235,17 @@ impl P2PNode {
     }
 
     /// The chunks `digests` from `peer` over QUIC, unchecked, as they come
-    /// into `out`.  The digests are spread over [`P2PConfig::quic_streams`]
-    /// streams, answered at the same time.  A peer that could not read its
-    /// store for any of them is an error ([`P2PError::StoreFailed`]), a peer
-    /// with no room for any is [`P2PError::Busy`]; with no QUIC path to it
-    /// the error says so ([`P2PError::NoQuicPath`]), and the pull asks
-    /// another peer.
+    /// into `out`, asked as `urgency` says.  The digests are spread over
+    /// [`P2PConfig::quic_streams`] streams, answered at the same time.  A
+    /// peer that could not read its store for any of them is an error
+    /// ([`P2PError::StoreFailed`]), a peer with no room for any is
+    /// [`P2PError::Busy`]; with no QUIC path to it the error says so
+    /// ([`P2PError::NoQuicPath`]), and the pull asks another peer.
     pub async fn fetch_into(
         &self,
         peer: PeerId,
         digests: &[(String, Option<u64>)],
+        urgency: Urgency,
         out: ChunkTx,
     ) -> P2PResult<()> {
         let (quic, addr) = self.quic_path(peer).await?;
@@ -1254,7 +1256,7 @@ impl P2PNode {
         let answers = futures::future::join_all(
             parts
                 .iter()
-                .map(|part| quic.fetch_into(addr, part, out.clone())),
+                .map(|part| quic.fetch_into(addr, part, urgency, out.clone())),
         )
         .await;
         lanes_answer(peer, answers)
