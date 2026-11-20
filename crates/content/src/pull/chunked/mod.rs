@@ -1133,10 +1133,10 @@ impl Intake {
             .map_err(io::Error::other)?;
         let (to, alg, taken) = (self.to.clone(), self.alg, self.taken.clone());
         tokio::task::spawn_blocking(move || {
-            let made = take_in(file, alg, &to);
+            let made = take_in(file, alg, &to, true);
             let mut taken = taken.lock().unwrap_or_else(|e| e.into_inner());
             match made {
-                Ok((key, copy)) => match taken.files.entry(key) {
+                Ok((Some(key), copy)) => match taken.files.entry(key) {
                     std::collections::hash_map::Entry::Vacant(v) => {
                         v.insert(copy);
                     }
@@ -1145,6 +1145,7 @@ impl Intake {
                         let _ = std::fs::remove_file(&copy.path);
                     }
                 },
+                Ok((None, _)) => unreachable!("the content was asked for"),
                 Err(e) => {
                     taken.failed.get_or_insert(e);
                 }
@@ -1219,37 +1220,46 @@ impl CopiesTo {
     }
 }
 
-/// Take in the file `file` a fetcher handed over: the digest of its content in
-/// `alg` and where the engine holds it.  A file the kernel measures cannot
-/// change: it is linked, and read for its digest; any other is copied to a
-/// file of `to`, and the digest is that of the bytes written.
-fn take_in(file: File, alg: Algorithm, to: &CopiesTo) -> io::Result<(String, Copied)> {
+/// Take in the file `file` a fetcher handed over: where the engine holds it
+/// and, when `content` asks for it, the digest of its content in `alg`.  A
+/// file the kernel measures cannot change: it is linked, and read only for
+/// the digest of its content; any other is copied to a file of `to`, and its
+/// digests are those of the bytes written.
+fn take_in(
+    file: File,
+    alg: Algorithm,
+    to: &CopiesTo,
+    content: bool,
+) -> io::Result<(Option<String>, Copied)> {
     let size = file.metadata()?.len();
-    let mut content = match size >= OFFLOAD_FROM {
+    let mut hash = content.then(|| match size >= OFFLOAD_FROM {
         true => Content::Beside(Offloaded::new(DigestWriter::new(alg))),
         false => Content::Here(DigestWriter::new(alg)),
-    };
+    });
     let mut from = Read::take(FromStart { file: &file, at: 0 }, size + 1);
     if let Some(verity) = super::commit::measure(&file, alg) {
         let path = to.link_temp(&file)?;
-        let size = io::copy(&mut from, &mut content)?;
-        return Ok((
-            content.finalize().to_string(),
-            Copied { path, size, verity },
-        ));
+        let size = match &mut hash {
+            Some(h) => io::copy(&mut from, h)?,
+            None => size,
+        };
+        let content = hash.map(|h| h.finalize().to_string());
+        return Ok((content, Copied { path, size, verity }));
     }
     let (to, path) = to.create_temp()?;
     let mut verity = Merkle::new(alg, size);
     let copied = velarx_storage::copy_sparse(from, &to, |piece| {
         verity.update(piece);
-        content.update(piece);
+        if let Some(h) = &mut hash {
+            h.update(piece);
+        }
     });
     // (the disk starts on it now, not on all of them at the barrier of the
     // commit)
     super::session::start_writeback(&to);
     match copied {
         Ok(size) => Ok((
-            content.finalize().to_string(),
+            hash.map(|h| h.finalize().to_string()),
             Copied {
                 path,
                 size,
@@ -1265,9 +1275,9 @@ fn take_in(file: File, alg: Algorithm, to: &CopiesTo) -> io::Result<(String, Cop
 
 /// Take in the file `file`, which a fetcher handed over as the file `key` of
 /// a layer (`name` in the layer, when the table gives it): it is copied to a
-/// file of `sink`, hashed as it is written, and must be what `key` names (its
-/// fs-verity digest, or the hash of its content); the sink then knows it by
-/// the digest it computed.
+/// file of `sink` and must be what `key` names (its fs-verity digest, or the
+/// hash of its content: only the digest that `key` is one of is computed);
+/// the sink then knows it by the digest it computed.
 pub(crate) fn take_handed(
     file: File,
     (key, name): (&str, Option<&str>),
@@ -1275,11 +1285,16 @@ pub(crate) fn take_handed(
 ) -> ImageResult<()> {
     let want = Digest::parse_key(key)
         .map_err(|_| ImageError::Layer(format!("{key} is not the digest of a file")))?;
-    let (content, copied) =
-        take_in(file, want.alg(), &CopiesTo::Sink(sink.clone())).map_err(io_fail)?;
-    let (read, kind) = match want.is_fsverity() {
-        true => (&copied.verity, "fs-verity digest"),
-        false => (&content, "content digest"),
+    let (content, copied) = take_in(
+        file,
+        want.alg(),
+        &CopiesTo::Sink(sink.clone()),
+        !want.is_fsverity(),
+    )
+    .map_err(io_fail)?;
+    let (read, kind) = match &content {
+        Some(content) => (content, "content digest"),
+        None => (&copied.verity, "fs-verity digest"),
     };
     if read != key {
         let _ = std::fs::remove_file(&copied.path);

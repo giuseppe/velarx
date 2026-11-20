@@ -867,6 +867,28 @@ async fn files_handed_over_are_known_by_what_the_engine_copied() {
     assert_eq!(left, 2);
 }
 
+/// The digest of the content of a handed file is computed only when what it
+/// is known by is that digest: a file known by its fs-verity digest is
+/// copied and measured, and its content is not hashed.
+#[test]
+fn the_content_of_a_handed_file_is_hashed_only_when_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let to = CopiesTo::Sink(intake_session(tmp.path()));
+    let content = b"some bytes";
+    let verity = velarx_storage::fsverity_digest_of(Algorithm::Sha256, content);
+    for (asked, hashed) in [
+        (
+            true,
+            Some(Digest::of(Algorithm::Sha256, content).to_string()),
+        ),
+        (false, None),
+    ] {
+        let (read, copied) = take_in(handed(content).0, Algorithm::Sha256, &to, asked).unwrap();
+        assert_eq!(read, hashed);
+        assert_eq!(copied.verity, verity);
+    }
+}
+
 /// The engine failing to store a file a fetcher handed over (the system
 /// refuses it a file) is its own failure, not the fetcher's: an I/O error,
 /// not a file that contradicts its name.
