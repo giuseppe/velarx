@@ -18,7 +18,6 @@
 //! too).  What Velarx writes stays OCI.
 
 pub mod guard;
-pub mod save;
 
 use crate::pull::tar::{Kind, TarReader};
 use bytes::Bytes;
@@ -396,14 +395,6 @@ impl Archive {
                 })
             }
         }
-    }
-
-    /// An archive without blobs, for an image whose layers are all stored.
-    pub fn empty() -> io::Result<Self> {
-        Ok(Self {
-            backing: Backing::Tar(Arc::new(File::open("/dev/null")?)),
-            members: Vec::new(),
-        })
     }
 
     /// An archive of one file: the blob `digest` is the content of `file`.

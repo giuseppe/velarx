@@ -205,7 +205,7 @@ impl Announcement {
         // digest of the table)
         let blobs = db.layer_blobs().await?;
         let mut layers: Vec<String> = Vec::new();
-        for key in db.get_all_layer_digests().await? {
+        for key in db.layer_digests().await? {
             if !shared.contains(&key) {
                 continue;
             }

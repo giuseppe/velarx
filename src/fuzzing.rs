@@ -193,7 +193,7 @@ pub fn toc(data: &[u8]) {
         u64::MAX,
     );
     // and as JSON, as the store reads it
-    let _ = velarx_storage::parse_toc_from_bytes(data);
+    let _ = serde_json::from_slice::<velarx_storage::Toc>(data);
 }
 
 /// A manifest or an index, and the choice of a platform.

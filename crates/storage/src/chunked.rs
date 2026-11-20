@@ -1,17 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum ChunkedError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("JSON parse error: {0}")]
-    Json(#[from] serde_json::Error),
-}
-
-pub type ChunkedResult<T> = Result<T, ChunkedError>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -130,12 +119,6 @@ pub fn toc_time(t: Option<&str>) -> Option<(i64, u32)> {
 }
 
 impl TocEntry {
-    /// The modification time in seconds since the epoch (0 when the entry
-    /// has none or it is not RFC 3339).
-    pub fn mtime_secs(&self) -> i64 {
-        self.mtime().0
-    }
-
     /// The modification time: seconds since the epoch (before it for a
     /// time before 1970) and nanoseconds; `(0, 0)` when the entry has none
     /// or it is not RFC 3339.  The one reading of the times of a table of
@@ -232,11 +215,6 @@ pub fn size_conflict(entries: &[TocEntry]) -> Option<(usize, String)> {
             )
         })
     })
-}
-
-pub fn parse_toc_from_bytes(data: &[u8]) -> ChunkedResult<Toc> {
-    let toc: Toc = serde_json::from_slice(data)?;
-    Ok(toc)
 }
 
 #[cfg(test)]

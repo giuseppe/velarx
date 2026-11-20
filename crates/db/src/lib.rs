@@ -1003,21 +1003,6 @@ impl Database {
             .map_err(DbError::Sqlite)
     }
 
-    /// The layers that are ready (to tell the services that announce them
-    /// at startup)
-    pub async fn get_all_layer_digests(&self) -> DbResult<Vec<LayerKey>> {
-        self.conn
-            .call(move |conn| {
-                let mut stmt = conn.prepare("SELECT id FROM layers")?;
-                let digests = stmt
-                    .query_map([], |row| row.get(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(digests)
-            })
-            .await
-            .map_err(DbError::Sqlite)
-    }
-
     /// The blob of the descriptor each layer of this store was pulled for,
     /// by the layer's key: the key of a layer pulled through its table of
     /// contents is not the digest of its blob, which is what a puller names
