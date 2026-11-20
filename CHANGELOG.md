@@ -143,6 +143,11 @@ without the numbers of issues or pull requests of any tracker.
 
 ### Changed
 
+- The binaries are position independent executables again, with packed
+  relative relocations: the address space of the engine and of its helpers is
+  randomized, at no cost in size.  They need glibc 2.36 or later (the
+  package requires it by itself) and the build a linker that supports
+  `-z pack-relative-relocs` (GNU ld 2.38, lld or mold).
 - The table of contents of a layer is kept compressed in the database: a store
   made by an earlier build is not used (remove it).  `system check` stops with
   an error on such a store and `--repair` removes nothing, where it removed
