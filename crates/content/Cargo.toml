@@ -37,7 +37,7 @@ velarx-tarsplit = { path = "../tarsplit" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process", "net", "signal", "fs", "io-util", "io-std"] }
 zlink = { workspace = true, features = ["tokio", "proxy", "service", "tracing"] }
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 zeroize.workspace = true
 toml.workspace = true
 rustix = { workspace = true, features = ["mount", "fs", "termios", "process", "net", "rand", "event", "pipe", "pty", "stdio", "thread"] }

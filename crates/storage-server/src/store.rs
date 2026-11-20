@@ -628,7 +628,7 @@ mod tests {
         let store = Store::open(dir.path(), rt.handle().clone(), Arc::default()).unwrap();
         let sha = format!("sha256:{}", "ab".repeat(32));
         let object = format!("fsverity-sha256-12:{}", "cd".repeat(32));
-        let toc = velarx_storage::to_toc(&object).unwrap();
+        let toc = velarx_storage::toc_value(&velarx_storage::to_toc(&object).unwrap());
         let other = format!("sha256:{}", "ef".repeat(32));
         store
             .record_aliases(
@@ -654,7 +654,7 @@ mod tests {
         let store = Store::open(dir.path(), rt.handle().clone(), Arc::default()).unwrap();
         let sha = format!("sha256:{}", "ab".repeat(32));
         let object = format!("fsverity-sha256-12:{}", "cd".repeat(32));
-        let toc = velarx_storage::to_toc(&object).unwrap();
+        let toc = velarx_storage::toc_value(&velarx_storage::to_toc(&object).unwrap());
         let table = [entry(&sha, Some(&toc))];
         store.record_aliases(&table, &table).unwrap();
         assert_eq!(store.resolve(&sha), sha);

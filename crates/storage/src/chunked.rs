@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use velarx_types::digest::Digest;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -41,10 +42,14 @@ pub struct TocEntry {
     /// a file is named and found by its fs-verity digest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
-    /// The fs-verity digest of a regular file with content
-    /// (`sha256-12:HEX`, see [`crate::from_toc`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fsverity: Option<String>,
+    /// The fs-verity digest of a regular file with content, read once from
+    /// the `sha256-12:HEX` of the TOC (see [`crate::from_toc`]).
+    #[serde(
+        default,
+        with = "crate::toc_verity::field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fsverity: Option<Digest>,
     #[serde(default)]
     pub offset: u64,
     #[serde(default, rename = "endOffset")]
@@ -130,7 +135,7 @@ impl TocEntry {
     /// The object digest (`sha256:HEX`) the TOC gives for the file, if it
     /// gives one of the kind the store uses.
     pub fn verity(&self) -> Option<String> {
-        self.fsverity.as_deref().and_then(super::from_toc)
+        self.fsverity.map(|d| d.to_string())
     }
 
     /// What a pull knows the content of a regular file by: its fs-verity
@@ -212,13 +217,13 @@ impl Toc {
 /// is listed with a size other than the one before it: the position of the
 /// entry and what is wrong.  A digest names one content, which has one size.
 pub fn size_conflict(entries: &[TocEntry]) -> Option<(usize, String)> {
-    let mut sizes: HashMap<String, u64> = HashMap::new();
+    let mut sizes: HashMap<Digest, u64> = HashMap::new();
     entries.iter().enumerate().find_map(|(i, e)| {
         if e.entry_type != TocEntryType::Reg || e.size == 0 {
             return None;
         }
-        let key = e.verity()?;
-        let first = *sizes.entry(key.clone()).or_insert(e.size);
+        let key = e.fsverity?;
+        let first = *sizes.entry(key).or_insert(e.size);
         (first != e.size).then(|| {
             (
                 i,

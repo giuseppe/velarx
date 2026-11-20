@@ -729,7 +729,7 @@ fn a_big_file_is_hashed_beside_its_read_to_the_same_digests() {
 fn test_plan_refuses_an_fsverity_value_of_the_other_algorithm_by_name() {
     let with = |v: &str| {
         let mut e = reg("f", &d(1), 10, 0, 100, None);
-        e.fsverity = Some(v.into());
+        e.fsverity = velarx_types::digest::parse_toc_fsverity(v);
         toc(vec![e])
     };
     let plan = |t: &Toc, alg| make_plan(t, alg, 1000, 1 << 20, cap(1000), &|_, _| false);
@@ -1221,7 +1221,7 @@ fn test_a_tar_split_the_table_contradicts_is_refused_by_the_pull() {
         tar_split_digest: Some(crate::sha256(&ts).to_string()),
     };
     let (z, info) = vouched(&toc, Some((0, ts.len() as u64, 0)));
-    assert!(verify_table(&info, &z, ts.clone(), &layer, u64::MAX).is_ok());
+    assert!(verified_table(&info, &z, ts.clone(), &layer, (u64::MAX, false)).is_ok());
     let e = verify_metadata(&info, &z, ts, &layer, u64::MAX)
         .err()
         .unwrap();
@@ -1315,7 +1315,7 @@ fn test_a_table_whose_files_do_not_fit_a_layer_is_an_error_that_names_the_layer(
     file.size = u64::MAX / 2 + 1;
     let mut other = file.clone();
     other.name = "./c".into();
-    other.fsverity = good.entries[2].fsverity.clone();
+    other.fsverity = good.entries[2].fsverity;
     let toc = Toc {
         version: 1,
         entries: vec![file, other],
@@ -1342,4 +1342,50 @@ fn test_a_layer_with_a_table_is_never_read_as_a_stream() {
     assert!(e.contains("zstd:chunked"), "{e}");
     // (a layer with no labels, or a gzip layer, is one)
     no_table(&layer(&[], ZSTD)).unwrap();
+}
+
+/// The entries of a table are read apart, on several threads, and are the
+/// ones the whole document has, in its order.
+#[test]
+fn test_a_table_is_parsed_to_the_same_entries_whichever_the_way() {
+    let entries: Vec<TocEntry> = (0..2000u64)
+        .map(|i| {
+            let mut e = reg(
+                &format!("d{}/f{i}", i % 7),
+                &d(i as u8),
+                10 + i,
+                0,
+                100,
+                None,
+            );
+            e.mod_time = Some("2024-01-02T03:04:05+00:00".into());
+            e.xattrs.insert("user.k".into(), "eA==".into());
+            e
+        })
+        .collect();
+    let toc = Toc {
+        version: 1,
+        entries,
+        tar_split_digest: Some(d(9)),
+    };
+    let json = serde_json::to_vec(&toc).unwrap();
+    let parsed = parse_toc(&json).unwrap();
+    assert_eq!(parsed.version, 1);
+    assert_eq!(parsed.tar_split_digest, toc.tar_split_digest);
+    assert_eq!(
+        serde_json::to_value(&parsed).unwrap(),
+        serde_json::to_value(&toc).unwrap()
+    );
+    // a document that is not a table, in any of its parts
+    let text = String::from_utf8(json).unwrap();
+    for bad in [
+        text.replacen("\"mode\"", "\"mode\":\"x\",\"mode\"", 1),
+        text.replacen("\"size\":", "\"size\":-", 1),
+        text.replacen("\"type\":\"reg\"", "\"type\":\"nope\"", 1),
+        text[..text.len() - 2].to_string(),
+        format!("{text} x"),
+        text.replacen("\"version\":1,", "", 1),
+    ] {
+        assert!(parse_toc(bad.as_bytes()).is_err(), "{bad:.200}");
+    }
 }

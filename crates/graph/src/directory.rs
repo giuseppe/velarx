@@ -1067,7 +1067,7 @@ mod tests {
 
         /// An object of `data` (a hole where it is zeros, if `sparse`), and
         /// the value a table of contents gives for it.
-        fn object(&self, data: &[u8], sparse: bool) -> String {
+        fn object(&self, data: &[u8], sparse: bool) -> velarx_types::digest::Digest {
             let id = velarx_storage::fsverity_digest_of(Algorithm::Sha256, data);
             let path = self
                 .store
@@ -1199,10 +1199,7 @@ mod tests {
         // hard links are one file in the copy, and not the object's
         let two = std::fs::metadata(d.join("a/b/two")).unwrap();
         assert_eq!((m.ino(), m.nlink()), (two.ino(), 2));
-        let obj = img
-            .store
-            .get_path(&velarx_storage::from_toc(&tree_obj(&tree, "a/one")).unwrap())
-            .unwrap();
+        let obj = img.store.get_path(&tree_obj(&tree, "a/one")).unwrap();
         assert!(std::fs::metadata(obj).unwrap().ino() != m.ino());
         assert_eq!(
             std::fs::read_link(d.join("a/b/link")).unwrap(),
@@ -1311,7 +1308,7 @@ mod tests {
 
     fn tree_obj(tree: &MergedTree, path: &str) -> String {
         let id = tree.resolve(path).unwrap();
-        tree.node(id).unwrap().entry.fsverity.clone().unwrap()
+        tree.node(id).unwrap().entry.verity().unwrap()
     }
 
     /// The data of the files go by the method the file system allows, and by

@@ -710,9 +710,12 @@ fn edited(layer: &Built, name: &str, edit: impl FnOnce(&mut serde_json::Value)) 
 /// A dual view image: the manifest vouches for a table of contents that
 /// describes another filesystem than the tar stream of the layer (the
 /// tar-split and the blob).  Whichever way it is pulled, the layer is
-/// refused with an error that names it and nothing is stored: it is never
-/// the layer of the stream, and a table the tar-split contradicts would make
-/// another tar again than the layer that was stored.
+/// refused with an error that names it and nothing of it is stored: it is
+/// never the layer of the stream, and a table the tar-split contradicts
+/// would make another tar again than the layer that was stored.  A pull
+/// that is not lazy refuses it at once; a lazy pull checks the table
+/// against its digests only, and its completion, which replays the
+/// tar-split before it commits the layer, refuses it.
 #[tokio::test]
 async fn test_a_table_that_differs_from_the_tar_stream_is_refused() {
     let layer = build_chunked(&sample());
@@ -734,26 +737,51 @@ async fn test_a_table_that_differs_from_the_tar_stream_is_refused() {
             ));
         }),
     ];
+    for lazy in [false, true] {
+        let honest = toc_pulled(&layer, lazy).await.unwrap();
+        let small = honest.find_by_name("etc/small").unwrap();
+        assert_eq!(small.mode & 0o7777, 0o644);
+    }
+    for (i, dual) in dual.iter().enumerate() {
+        let refused = toc_pulled(dual, false).await.unwrap_err();
+        assert!(
+            refused.to_string().contains(&sha(&dual.blob).to_string()),
+            "{i}: {refused}"
+        );
+        let refused = completion_refused(dual).await;
+        assert!(
+            matches!(refused, velarx_types::ImageError::Contradicted(_))
+                && refused.to_string().contains("tar-split differ"),
+            "{i} (lazy): {refused}"
+        );
+    }
     // another content: the files are checked against the table, which the
-    // stream cannot make right (a lazy pull fetches no file)
+    // stream cannot make right
     let content = edited(&layer, "etc/small", |e| {
         e["digest"] = sha(b"not hello").to_string().into();
         e["chunkDigest"] = sha(b"not hello").to_string().into();
         e["fsverity"] = toc_verity(b"not hello").into();
     });
-    for lazy in [false, true] {
-        let honest = toc_pulled(&layer, lazy).await.unwrap();
-        let small = honest.find_by_name("etc/small").unwrap();
-        assert_eq!(small.mode & 0o7777, 0o644);
-        let eager_only = (!lazy).then_some(&content);
-        for (i, dual) in dual.iter().chain(eager_only).enumerate() {
-            let refused = toc_pulled(dual, lazy).await.unwrap_err().to_string();
-            assert!(
-                refused.contains(&sha(&dual.blob).to_string()),
-                "{i} (lazy {lazy}): {refused}"
-            );
-        }
-    }
+    let refused = toc_pulled(&content, false).await.unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains(&sha(&content.blob).to_string()),
+        "{refused}"
+    );
+    completion_refused(&content).await;
+}
+
+/// The error of the completion of a lazy pull of `layer`, which the pull
+/// accepted: the layer is not committed and the pull stays staged.
+async fn completion_refused(layer: &Built) -> velarx_types::ImageError {
+    let e = env().await;
+    e.publish(&[layer], &[ZSTD]);
+    let pulled = pull_tag(&e, "latest", true).await.unwrap();
+    let refused = e.service.complete_image(&pulled.id).await.unwrap_err();
+    assert!(e.db.list_layers().await.unwrap().is_empty(), "{refused}");
+    assert!(e.area().pull(&pulled.id).unwrap().is_some());
+    refused
 }
 
 /// A table of version 1 that lists one digest with two sizes is refused

@@ -1511,7 +1511,7 @@ mod tests {
                     "name": name,
                     "type": "reg",
                     "size": data.len(),
-                    "fsverity": velarx_storage::to_toc(&velarx_storage::fsverity_digest_of(velarx_types::digest::Algorithm::Sha256, data)),
+                    "fsverity": velarx_storage::toc_value(&velarx_storage::to_toc(&velarx_storage::fsverity_digest_of(velarx_types::digest::Algorithm::Sha256, data)).unwrap()),
                     "offset": 10,
                     "endOffset": 30,
                 })
@@ -2019,9 +2019,9 @@ mod tests {
                 "version": 1,
                 "entries": [{
                     "name": "f", "type": "reg", "size": body.len(),
-                    "fsverity": velarx_storage::to_toc(
+                    "fsverity": velarx_storage::toc_value(&velarx_storage::to_toc(
                         &velarx_storage::fsverity_digest_of(Algorithm::Sha256, &body)
-                    ),
+                    ).unwrap()),
                 }],
             }))
             .unwrap();

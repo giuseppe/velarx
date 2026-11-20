@@ -372,7 +372,7 @@ impl FileHashes {
     }
 
     /// The `fsverity` and `digest` of the entry.
-    fn finish(self) -> (String, Option<String>) {
+    fn finish(self) -> (Digest, Option<String>) {
         (
             self.verity.finish(),
             self.sha256.map(|h| h.finalize().to_string()),
@@ -1394,7 +1394,7 @@ mod tests {
                 }
                 if let Some(v) = &e.fsverity {
                     regular += 1;
-                    assert!(v.starts_with("sha512-12:") && v.len() == 10 + 128, "{v}");
+                    assert_eq!(v.alg(), Algorithm::Sha512);
                 }
             }
             assert!(regular > 0);

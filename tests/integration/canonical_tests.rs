@@ -406,7 +406,10 @@ async fn test_a_table_whose_sizes_are_not_possible_is_refused_and_stores_nothing
             e.chunk_size = size;
         }
         if !digest.is_empty() {
-            e.fsverity = Some(format!("sha256-12:{}", digest.repeat(32)));
+            e.fsverity = velarx_types::digest::parse_toc_fsverity(&format!(
+                "sha256-12:{}",
+                digest.repeat(32)
+            ));
         }
         toc.entries.push(e);
     };

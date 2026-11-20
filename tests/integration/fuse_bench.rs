@@ -50,7 +50,7 @@ fn noise(seed: u64, len: usize) -> Vec<u8> {
 }
 
 /// The file in the store, and its fs-verity digest as a TOC has it.
-fn put(store: &FileStore, data: &[u8]) -> Option<String> {
+fn put(store: &FileStore, data: &[u8]) -> Option<velarx_types::digest::Digest> {
     velarx_storage::to_toc(
         &store
             .put(velarx_types::digest::Algorithm::Sha256, data)

@@ -279,9 +279,9 @@ pub async fn layer_index(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<Op
         .map_err(|e| naming(&layer.digest, e))
 }
 
-/// [`verify_metadata`] of what the fetchers found, or [`verify_table`] for
-/// a `lazy` layer, whose completion replays the tar-split before the layer
-/// is committed.
+/// [`verify_metadata`] of what the fetchers found, or [`verified_table`]
+/// for a `lazy` layer (the table is what it is served by), whose completion
+/// replays the tar-split before the layer is committed.
 pub(super) async fn verified(
     info: &Info,
     toc_z: Vec<u8>,
@@ -291,16 +291,18 @@ pub(super) async fn verified(
     lazy: bool,
 ) -> ImageResult<Metadata> {
     let info = info.clone();
-    let verify = if lazy { verify_table } else { verify_metadata };
-    tokio::task::spawn_blocking(move || verify(&info, &toc_z, ts_z, &layer, max_tar))
-        .await
-        .map_err(|e| fail(e.to_string()))?
+    tokio::task::spawn_blocking(move || match lazy {
+        true => verified_table(&info, &toc_z, ts_z, &layer, (max_tar, false)),
+        false => verify_metadata(&info, &toc_z, ts_z, &layer, max_tar),
+    })
+    .await
+    .map_err(|e| fail(e.to_string()))?
 }
 
 /// Decompress at most `max` bytes, and exactly `expected` if it is known.
 fn decompress_bounded(data: &[u8], max: u64, expected: u64, what: &str) -> ImageResult<Vec<u8>> {
     let dec = super::zstd_decoder(data).map_err(data_fail)?;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(expected.min(max) as usize);
     dec.take(max + 1).read_to_end(&mut out).map_err(data_fail)?;
     if out.len() as u64 > max {
         return Err(fail(format!("the {what} is too large")));
@@ -314,12 +316,43 @@ fn decompress_bounded(data: &[u8], max: u64, expected: u64, what: &str) -> Image
     Ok(out)
 }
 
+/// The table of contents `json` is, its entries parsed on all the threads:
+/// the document is scanned once for the extent of each entry (the parser
+/// tells where they are, there is no second reading of the format), and the
+/// entries, which are most of the work, are read apart.
+fn parse_toc(json: &[u8]) -> serde_json::Result<Toc> {
+    use rayon::prelude::*;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Raw<'a> {
+        version: i32,
+        #[serde(borrow)]
+        entries: Vec<&'a serde_json::value::RawValue>,
+        tar_split_digest: Option<String>,
+    }
+    let raw: Raw = serde_json::from_slice(json)?;
+    Ok(Toc {
+        version: raw.version,
+        entries: raw
+            .entries
+            .par_iter()
+            .with_min_len(256)
+            .map(|e| serde_json::from_str(e.get()))
+            .collect::<serde_json::Result<_>>()?,
+        tar_split_digest: raw.tar_split_digest,
+    })
+}
+
 /// The verified TOC and the compressed tar-split of a layer.
 #[derive(Clone)]
 pub struct Metadata {
+    /// The table as the descriptor vouches for it; `stored` itself for a
+    /// layer that is not pulled by [`verify_metadata`] (a lazy layer is
+    /// served by what it is stored by).
     pub toc: Arc<Toc>,
-    /// What the layer is stored by: the entries of `toc` as a layer keeps
-    /// them ([`super::lazy::toc_view`]); `toc` itself for a canonical layer.
+    /// What the layer is stored by: the entries of the table as a layer
+    /// keeps them ([`super::lazy::toc_view`]); the table itself for a
+    /// canonical layer.
     pub stored: Arc<Toc>,
     /// The table as the registry sent it (compressed, the bytes its
     /// descriptor's checksum covers): kept with the layer for the peers,
@@ -353,20 +386,22 @@ pub fn verify_metadata(
     layer: &Digest,
     max_tar: u64,
 ) -> ImageResult<Metadata> {
-    let meta = verify_table(info, toc_z, ts_z, layer, max_tar)?;
+    let meta = verified_table(info, toc_z, ts_z, layer, (max_tar, true))?;
     super::lazy::replay(&meta.stored, meta.tarsplit_z.clone(), layer)?;
     Ok(meta)
 }
 
 /// [`verify_metadata`] but the replay: every byte is checked against the
 /// digests the descriptor vouches for (the tar-split against the one the
-/// table gives), and the table is what a lazy layer is served by.
-pub fn verify_table(
+/// table gives).  The table is kept as it was vouched for beside the one
+/// the layer is stored by when `keep` (the stored one is made in place from
+/// the table otherwise).
+fn verified_table(
     info: &Info,
     toc_z: &[u8],
     ts_z: Vec<u8>,
     layer: &Digest,
-    max_tar: u64,
+    (max_tar, keep): (u64, bool),
 ) -> ImageResult<Metadata> {
     // (what the descriptor vouches for: bytes that are not it are not a
     // layer to pull another way, see `pull`)
@@ -379,7 +414,7 @@ pub fn verify_table(
     }
     // (the bytes are those the descriptor vouches for: what is wrong with
     // them is wrong again on every try)
-    vouched_metadata(info, toc_z, ts_z, layer, max_tar).map_err(|e| match e {
+    vouched_metadata(info, toc_z, ts_z, layer, (max_tar, keep)).map_err(|e| match e {
         ImageError::Layer(m) => ImageError::Contradicted(format!("layer {layer}: {m}")),
         e => e,
     })
@@ -391,10 +426,10 @@ fn vouched_metadata(
     toc_z: &[u8],
     ts_z: Vec<u8>,
     layer: &Digest,
-    max_tar: u64,
+    (max_tar, keep): (u64, bool),
 ) -> ImageResult<Metadata> {
     let json = decompress_bounded(toc_z, MAX_TOC_JSON, info.toc.2, "TOC")?;
-    let toc: Toc = serde_json::from_slice(&json).map_err(|e| fail(format!("invalid TOC: {e}")))?;
+    let toc = parse_toc(&json).map_err(|e| fail(format!("invalid TOC: {e}")))?;
     drop(json);
     if let Some(problem) = entry::toc_problem(&toc.entries) {
         return Err(fail(problem));
@@ -457,10 +492,11 @@ fn vouched_metadata(
         });
     }
     let ts_z = bytes::Bytes::from(ts_z);
-    let stored = super::lazy::toc_view(&toc, info.checksum.alg(), layer)?;
+    let vouched = keep.then(|| Arc::new(toc.clone()));
+    let stored = Arc::new(super::lazy::toc_view(toc, info.checksum.alg(), layer)?);
     Ok(Metadata {
-        toc: Arc::new(toc),
-        stored: Arc::new(stored),
+        toc: vouched.unwrap_or_else(|| stored.clone()),
+        stored,
         toc_z: bytes::Bytes::copy_from_slice(toc_z),
         tarsplit_z: ts_z,
         tarsplit_size: tarsplit.2,
@@ -828,11 +864,7 @@ pub(crate) fn make_plan(
         }
         // (an fs-verity digest of the other algorithm than the layer's is
         // refused by name; a value that is none is another writer's)
-        if let Some(d) = e
-            .fsverity
-            .as_deref()
-            .and_then(velarx_types::digest::parse_toc_fsverity)
-        {
+        if let Some(d) = e.fsverity {
             if d.alg() != alg {
                 return Err(unsupported(format!(
                     "`{}` has the {} fs-verity digest {}-12:{}, and the digests of the layer are {alg} (a layer has the digests of one algorithm)",

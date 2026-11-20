@@ -17,6 +17,7 @@ use super::entry;
 use super::tar::TarReader;
 use super::tarsplit::{self, Contents, Entries, Replay};
 use super::{LayerReport, PullCtx};
+use rayon::prelude::*;
 use std::io::{self, Read};
 use std::sync::Arc;
 use velarx_storage::{Toc, TocEntry, TocEntryType, TOC_VERSION};
@@ -40,7 +41,7 @@ pub struct LazyLayer {
 pub fn without_verity(toc: &Toc) -> Option<&TocEntry> {
     toc.entries
         .iter()
-        .find(|e| e.entry_type == TocEntryType::Reg && e.size > 0 && e.verity().is_none())
+        .find(|e| e.entry_type == TocEntryType::Reg && e.size > 0 && e.fsverity.is_none())
 }
 
 /// File contents made of zeros: the headers of a tar-split are read without
@@ -56,17 +57,18 @@ impl Contents for Zeros {
 /// The TOC the layer `layer` pulled by its table of contents is stored by:
 /// the entries of the table the descriptor vouches for.  Each file needs an
 /// fs-verity digest or the digest of its content (see [`without_verity`]).
-pub fn toc_view(registry: &Toc, alg: Algorithm, layer: &Digest) -> ImageResult<Toc> {
+pub fn toc_view(registry: Toc, alg: Algorithm, layer: &Digest) -> ImageResult<Toc> {
     let entries = registry
         .entries
-        .iter()
+        .into_par_iter()
+        .with_min_len(256)
         .map(|e| entry::from_toc(e, alg))
         .collect::<io::Result<Vec<_>>>()
         .map_err(|e| ImageError::Contradicted(format!("layer {layer}: {e}")))?;
     Ok(Toc {
         version: TOC_VERSION,
         entries,
-        tar_split_digest: registry.tar_split_digest.clone(),
+        tar_split_digest: registry.tar_split_digest,
     })
 }
 
@@ -248,7 +250,7 @@ mod tests {
 
     fn view(table: &Toc) -> ImageResult<Toc> {
         let layer = Digest::empty(Algorithm::Sha256);
-        let toc = toc_view(table, Algorithm::Sha256, &layer)?;
+        let toc = toc_view(table.clone(), Algorithm::Sha256, &layer)?;
         replay(&toc, tarsplit(), &layer)?;
         Ok(toc)
     }

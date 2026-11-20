@@ -230,15 +230,19 @@ impl Digest {
                 want: alg.len() * 2,
             });
         }
-        if !digits
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(DigestError::NotHex(digits.to_string()));
-        }
         let mut buf = [0u8; 64];
-        hex::decode_to_slice(digits, &mut buf[..alg.len()])
-            .map_err(|_| DigestError::NotHex(digits.to_string()))?;
+        let nibble = |b: u8| match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            _ => None,
+        };
+        let (pairs, _) = digits.as_bytes().as_chunks::<2>();
+        for (byte, [hi, lo]) in buf.iter_mut().zip(pairs) {
+            let (Some(hi), Some(lo)) = (nibble(*hi), nibble(*lo)) else {
+                return Err(DigestError::NotHex(digits.to_string()));
+            };
+            *byte = hi << 4 | lo;
+        }
         Ok(Self { kind, raw: buf })
     }
 
@@ -900,6 +904,10 @@ mod tests {
         assert!(!ok("sha256:"));
         assert!(!ok("sha256:abc"));
         assert!(!ok(&EMPTY256.to_uppercase()));
+        // (the digits are read in pairs: a bad digit in either place)
+        assert!(!ok(&format!("{}g{}", &EMPTY256[..20], &EMPTY256[21..])));
+        assert!(!ok(&format!("{}g{}", &EMPTY256[..21], &EMPTY256[22..])));
+        assert!(!ok(&format!("{}é{}", &EMPTY256[..20], &EMPTY256[22..])));
         assert!(!ok(&EMPTY256.replace("e3b0", "E3b0")));
         assert!(!ok(&format!("sha512:{}", &EMPTY256[7..])));
         assert!(!ok(&format!("sha256:{}", &EMPTY512[7..])));

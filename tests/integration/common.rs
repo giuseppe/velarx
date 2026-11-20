@@ -120,11 +120,13 @@ pub fn build_chunked_plain(items: &[Item]) -> Built {
 
 /// The fs-verity digest of `data` as a TOC gives it.
 pub fn toc_verity(data: &[u8]) -> String {
-    velarx_storage::to_toc(&velarx_storage::fsverity_digest_of(
-        velarx_types::digest::Algorithm::Sha256,
-        data,
-    ))
-    .unwrap()
+    velarx_storage::toc_value(
+        &velarx_storage::to_toc(&velarx_storage::fsverity_digest_of(
+            velarx_types::digest::Algorithm::Sha256,
+            data,
+        ))
+        .unwrap(),
+    )
 }
 
 /// [`build_chunked`], the files with the `fsverity` digest `verity` gives

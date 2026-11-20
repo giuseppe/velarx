@@ -4,6 +4,7 @@
 
 use super::*;
 use sha2::{Digest, Sha256};
+use velarx_types::digest::parse_toc_fsverity;
 
 const DIR: TocEntryType = TocEntryType::Dir;
 const REG: TocEntryType = TocEntryType::Reg;
@@ -1187,7 +1188,7 @@ fn a_tar_larger_than_a_u64_has_no_size() {
 
 fn verified(name: &str, size: u64, offset: u64) -> TocEntry {
     let mut e = file(name, size);
-    e.fsverity = Some(format!("sha256-12:{}", "ab".repeat(32)));
+    e.fsverity = parse_toc_fsverity(&format!("sha256-12:{}", "ab".repeat(32)));
     e.offset = offset;
     e.end_offset = offset + 1;
     e
@@ -1218,7 +1219,8 @@ fn a_digest_has_one_size() {
 fn a_table_whose_tar_does_not_fit_is_refused() {
     let big = |name: &str, size: u64| {
         let mut e = verified(name, size, 1);
-        e.fsverity = Some(format!("sha256-12:{}", name.len().to_string().repeat(64)));
+        e.fsverity =
+            parse_toc_fsverity(&format!("sha256-12:{}", name.len().to_string().repeat(64)));
         e.digest = None;
         e
     };
@@ -1278,7 +1280,7 @@ fn what_validate_accepts_has_a_tar() {
                     _ => next() >> (next() % 64),
                 };
                 let mut e = verified(&format!("./f{i}"), size, 1);
-                e.fsverity = Some(format!("sha256-12:{:064x}", i));
+                e.fsverity = parse_toc_fsverity(&format!("sha256-12:{:064x}", i));
                 e
             })
             .collect();

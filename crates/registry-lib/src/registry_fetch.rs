@@ -275,22 +275,6 @@ impl RegistryFetch {
             .map_err(failed)
     }
 
-    /// The parsed table of contents of a layer, as the scope that told it
-    /// gave it: kept with the layer (another scope's table of the same
-    /// layer is its own).
-    fn toc_of(&self, layer: &LayerScope) -> Result<Arc<LayerToc>, FetcherError> {
-        if let Some(t) = layer
-            .kept
-            .get()
-            .and_then(|k| k.clone().downcast::<LayerToc>().ok())
-        {
-            return Ok(t);
-        }
-        let t = Arc::new(LayerToc::of(layer)?);
-        let _ = layer.kept.set(t.clone());
-        Ok(t)
-    }
-
     /// The compressed table of contents and tar-split of a zstd:chunked
     /// layer, as the registry has them.
     async fn metadata(
@@ -1080,7 +1064,7 @@ impl StagingFetcher for RegistryFetch {
             return Err(bad("the blob is not the layer's"));
         }
         let size = i64::try_from(blob.size).map_err(|_| bad("a size"))?;
-        let indexed = self.toc_of(layer)?;
+        let indexed = LayerToc::kept(layer)?;
         // the files of the call, once each, and those that are there
         let mut files: Vec<Writing> = Vec::new();
         let mut by_key: HashMap<&str, usize> = HashMap::new();

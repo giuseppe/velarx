@@ -354,6 +354,7 @@ impl MergedTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use velarx_types::digest::{Algorithm, Digest};
 
     fn e(name: &str, t: TocEntryType) -> TocEntry {
         let mut x = dir_entry(name);
@@ -361,12 +362,15 @@ mod tests {
         x
     }
 
+    /// The fs-verity digest the tests give the content they call `tag`.
+    fn verity(tag: &str) -> Digest {
+        let sha = Digest::of(Algorithm::Sha256, tag.as_bytes());
+        Digest::fsverity(Algorithm::Sha256, sha.raw()).unwrap()
+    }
+
     fn file(name: &str, digest: &str) -> TocEntry {
         let mut x = e(name, TocEntryType::Reg);
-        x.fsverity = Some(format!(
-            "sha256-12:{}",
-            digest.trim_start_matches("sha256:")
-        ));
+        x.fsverity = Some(verity(digest.trim_start_matches("sha256:")));
         x.size = 1;
         x
     }
@@ -483,7 +487,7 @@ mod tests {
         let t = MergedTree::build(&[&l0, &l1]).unwrap();
         assert_eq!(list(&t, "etc"), ["a", "b"]);
         let a = t.node(t.resolve("etc/a").unwrap()).unwrap();
-        assert_eq!(a.entry.fsverity.as_deref(), Some("sha256-12:d3"));
+        assert_eq!(a.entry.fsverity, Some(verity("d3")));
         assert_eq!(list(&t, "usr/bin"), ["x"]);
         assert_eq!(
             t.node(t.resolve("usr").unwrap()).unwrap().entry.entry_type,

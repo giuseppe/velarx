@@ -232,11 +232,11 @@ pub fn from_header(h: &Header, file_digest: Option<&str>) -> io::Result<TocEntry
 /// contents the descriptor vouches for: what that table says, kept to what
 /// a layer keeps of any entry ([`layer_entry`]), with the place of the
 /// content of a regular file in the blob.
-pub fn from_toc(e: &TocEntry, alg: Algorithm) -> io::Result<TocEntry> {
+pub fn from_toc(e: TocEntry, alg: Algorithm) -> io::Result<TocEntry> {
     if e.entry_type == TocEntryType::Chunk {
-        return Ok(e.clone());
+        return Ok(e);
     }
-    let mut entry = layer_entry(e.clone())?;
+    let mut entry = layer_entry(e)?;
     if entry.entry_type != TocEntryType::Reg {
         return Ok(entry);
     }
@@ -251,8 +251,11 @@ pub fn from_toc(e: &TocEntry, alg: Algorithm) -> io::Result<TocEntry> {
         entry.chunk_size = 0;
         entry.chunk_type = None;
     } else {
-        if e.content_key()
-            .is_none_or(|k| Digest::parse_key(&k).is_err())
+        if entry.fsverity.is_none()
+            && entry
+                .digest
+                .as_deref()
+                .is_none_or(|d| Digest::parse_key(d).is_err())
         {
             return Err(invalid(format!(
                 "the table has no digest for `{}`",
@@ -423,7 +426,7 @@ mod tests {
                 )
             })
             .collect();
-        let of_toc = from_toc(&raw, alg).unwrap();
+        let of_toc = from_toc(raw.clone(), alg).unwrap();
         assert!(same_entry(&of_header, &of_toc));
         assert_eq!(
             serde_json::to_value(&of_toc).unwrap(),
@@ -436,7 +439,7 @@ mod tests {
         d.entry_type = TocEntryType::Dir;
         d.size = 9;
         d.offset = 4;
-        let d = from_toc(&d, alg).unwrap();
+        let d = from_toc(d.clone(), alg).unwrap();
         assert_eq!(
             (d.size, d.offset, &d.digest, d.dev_major),
             (0, 0, &None, None)
@@ -444,7 +447,7 @@ mod tests {
         let mut c = raw.clone();
         c.entry_type = TocEntryType::Char;
         c.dev_minor = None;
-        let c = from_toc(&c, alg).unwrap();
+        let c = from_toc(c.clone(), alg).unwrap();
         assert_eq!((c.dev_major, c.dev_minor), (Some(8), Some(0)));
     }
 
@@ -485,20 +488,20 @@ mod tests {
         for (i, edit) in refused.iter().enumerate() {
             let mut e = base.clone();
             edit(&mut e);
-            assert!(from_toc(&e, alg).is_err(), "{i}: {e:?}");
+            assert!(from_toc(e.clone(), alg).is_err(), "{i}: {e:?}");
         }
         let mut e = base.clone();
         e.name = long.clone();
-        assert!(from_toc(&e, alg).is_err());
+        assert!(from_toc(e.clone(), alg).is_err());
         e.name = "d".into();
         e.entry_type = TocEntryType::Symlink;
         e.link_name = Some(long);
-        assert!(from_toc(&e, alg).is_err());
+        assert!(from_toc(e.clone(), alg).is_err());
         // a regular file with content and no digest of it
         let mut e = base.clone();
         e.entry_type = TocEntryType::Reg;
         e.size = 1;
-        assert!(from_toc(&e, alg).is_err());
+        assert!(from_toc(e.clone(), alg).is_err());
     }
 }
 

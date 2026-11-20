@@ -1325,7 +1325,7 @@ fn only_the_chunks_of_the_objects_the_engine_checked_are_recorded() {
             // the object the engine wrote, a second time: other chunks)
             if e.name == "d/g" {
                 e.digest = Some(b.object.clone());
-                e.fsverity = Some(verity.clone());
+                e.fsverity = Some(verity);
             }
             claim.clone()
         });

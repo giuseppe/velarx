@@ -356,7 +356,7 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
             .try_clone()
             .map_err(|e| failed(e.to_string()))?;
         let (items, verity) = (self.items.clone(), scope.verity);
-        let indexed = LayerToc::of(layer)?;
+        let indexed = LayerToc::kept(layer)?;
         let objects = call.objects;
         let events = tokio::task::spawn_blocking(move || {
             let counted = Counted(&*items, Default::default());

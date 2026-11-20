@@ -714,7 +714,7 @@ impl StagingFetcher for PeerSource {
         out: &Out<Event>,
     ) -> Result<(), FetcherError> {
         let run = async {
-            let indexed = LayerToc::of(layer)?;
+            let indexed = LayerToc::kept(layer)?;
             let mut files =
                 Files::new(&layer.staging, scope.verity, out).keeping(&self.staged, &layer.layer);
             // (for each file of `files`: the key and size it is asked whole

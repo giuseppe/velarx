@@ -476,8 +476,26 @@ pub struct LayerToc {
 }
 
 impl LayerToc {
+    /// The table of a layer, as the scope that told it gave it, parsed once
+    /// and kept with the layer (another scope's table of the same layer is
+    /// its own).
+    pub fn kept(
+        layer: &crate::serve_fetch::LayerScope,
+    ) -> Result<std::sync::Arc<Self>, crate::fetcher::fetch::FetcherError> {
+        if let Some(t) = layer
+            .kept
+            .get()
+            .and_then(|k| k.clone().downcast::<Self>().ok())
+        {
+            return Ok(t);
+        }
+        let t = std::sync::Arc::new(Self::of(layer)?);
+        let _ = layer.kept.set(t.clone());
+        Ok(t)
+    }
+
     /// The table the engine told with the layer, parsed.
-    pub fn of(
+    fn of(
         layer: &crate::serve_fetch::LayerScope,
     ) -> Result<Self, crate::fetcher::fetch::FetcherError> {
         use crate::fetcher::fetch::FetcherError;
@@ -693,5 +711,25 @@ mod tests {
         let (dir, st) = staging();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("incoming")).unwrap();
         assert!(Unnamed::begin(st.as_fd(), 1).is_err());
+    }
+
+    /// The table of a layer is parsed once, and the layer keeps it.
+    #[test]
+    fn a_layers_table_is_parsed_once() {
+        let (_tmp, dir) = staging();
+        let toc = velarx_base::sealed::sealed_memory(br#"{"version":1,"entries":[]}"#).unwrap();
+        let layer = crate::serve_fetch::LayerScope {
+            layer: "sha256:aa".into(),
+            staging: dir,
+            toc: Some(toc.into()),
+            blob: None,
+            cancel: Default::default(),
+            kept: Default::default(),
+        };
+        let first = LayerToc::kept(&layer).unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &first,
+            &LayerToc::kept(&layer).unwrap()
+        ));
     }
 }

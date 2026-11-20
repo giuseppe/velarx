@@ -189,8 +189,7 @@ fn mtime_of(e: &TocEntry) -> (u64, u32) {
 }
 
 fn digest_of(e: &TocEntry) -> Result<Digest, String> {
-    e.verity()
-        .and_then(|d| Digest::parse_fsverity(&d).ok())
+    e.fsverity
         .ok_or_else(|| format!("`{}` has no fs-verity digest", e.name))
 }
 
@@ -210,8 +209,8 @@ pub fn metacopy(digest: &Digest) -> Vec<u8> {
 /// in the data-only layer of the store (`ab/cdef...`, the digest named: 62
 /// digits after the directory for SHA-256, 126 for SHA-512).
 pub fn redirect(digest: &Digest) -> Vec<u8> {
-    let raw = digest.raw();
-    format!("/{:02x}/{}", raw[0], hex::encode(&raw[1..])).into_bytes()
+    let hex = digest.hex();
+    format!("/{}/{}", &hex[..2], &hex[2..]).into_bytes()
 }
 
 /// The tree of a layer: what its entries leave, as an overlay layer.
@@ -286,7 +285,7 @@ impl Tree {
     fn build(entries: &[TocEntry]) -> Result<Self, String> {
         // the entries by path (the last of a path wins, as in the archive),
         // the whiteouts and the opaque directories
-        let mut by_path: BTreeMap<Vec<&str>, &TocEntry> = BTreeMap::new();
+        let mut by_path: Vec<(Vec<&str>, &TocEntry)> = Vec::new();
         let mut whiteouts: BTreeSet<Vec<&str>> = BTreeSet::new();
         let mut opaque: BTreeSet<Vec<&str>> = BTreeSet::new();
         for e in entries {
@@ -313,17 +312,21 @@ impl Tree {
                         whiteouts.insert(target);
                     }
                 }
-                _ => {
-                    by_path.insert(parts, e);
-                }
+                _ => by_path.push((parts, e)),
             }
         }
+        // (a stable sort keeps the entries of a path in the order of the
+        // archive, and the last of them is the one it has)
+        by_path.sort_by(|a, b| a.0.cmp(&b.0));
+        let by_path = by_path
+            .chunk_by(|a, b| a.0 == b.0)
+            .filter_map(|same| same.last());
         let mut tree = Tree {
             nodes: vec![Node::plain_dir()],
         };
         let mut links: Vec<(Vec<&str>, &TocEntry)> = Vec::new();
         // (parents before their children: the paths are sorted)
-        for (parts, e) in &by_path {
+        for (parts, e) in by_path {
             if parts.is_empty() {
                 if e.entry_type != TocEntryType::Dir {
                     return Err("the root of the layer is not a directory".into());
@@ -515,7 +518,12 @@ fn xattr_body(xattrs: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<Vec<u8>, String> {
         return Ok(Vec::new());
     }
     // the header: no name filter, no shared attribute
-    let mut out = vec![0u8; 12];
+    let size = xattrs
+        .iter()
+        .map(|(k, v)| 8 + k.len() + v.len())
+        .sum::<usize>();
+    let mut out = Vec::with_capacity(12 + size);
+    out.resize(12, 0);
     for (name, value) in xattrs {
         let (suffix, index) = PREFIXES
             .iter()

@@ -1945,20 +1945,27 @@ impl Database {
         &self,
         files: Vec<(String, u64)>,
     ) -> DbResult<Option<(String, u64, u64)>> {
+        const BATCH: usize = 500;
         Ok(self
             .conn
             .call(move |conn| {
-                let mut stmt = conn.prepare_cached("SELECT size FROM files WHERE digest = ?1")?;
-                for (digest, size) in files {
-                    let stored: Option<u64> = stmt
-                        .query_row([&digest], |r| r.get(0))
-                        .map(Some)
-                        .or_else(|e| match e {
-                            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                            e => Err(e),
-                        })?;
-                    if let Some(stored) = stored.filter(|s| *s != size) {
-                        return Ok(Some((digest, stored, size)));
+                for batch in files.chunks(BATCH) {
+                    let marks = vec!["?"; batch.len()].join(",");
+                    let mut stmt = conn.prepare_cached(&format!(
+                        "SELECT digest, size FROM files WHERE digest IN ({marks})"
+                    ))?;
+                    let stored = stmt
+                        .query_map(
+                            rusqlite::params_from_iter(batch.iter().map(|f| &f.0)),
+                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)),
+                        )?
+                        .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
+                    let conflict = batch.iter().find_map(|(digest, size)| {
+                        let held = *stored.get(digest)?;
+                        (held != *size).then(|| (digest.clone(), held, *size))
+                    });
+                    if conflict.is_some() {
+                        return Ok(conflict);
                     }
                 }
                 Ok(None)
@@ -3034,6 +3041,33 @@ pub fn image_tags(
 mod tests {
     use super::*;
     use velarx_types::digest::Algorithm;
+
+    /// The files of a table are checked against the store many at a time:
+    /// the first that the store has with another size, in whichever query.
+    #[tokio::test]
+    async fn a_file_the_store_has_with_another_size_is_found() {
+        let db = Database::open_in_memory().await.unwrap();
+        let digest = |i: u64| format!("fsverity-sha256-12:{i:064x}");
+        let files: Vec<(String, u64)> = (0..1200).map(|i| (digest(i), i)).collect();
+        assert_eq!(db.file_size_conflict(files.clone()).await.unwrap(), None);
+        let record = |i: u64, size: i64| FileRecord {
+            digest: digest(i),
+            size,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            checked: false,
+        };
+        db.record_files(vec![record(3, 3), record(700, 70), record(1100, 11)])
+            .await
+            .unwrap();
+        assert_eq!(
+            db.file_size_conflict(files.clone()).await.unwrap(),
+            Some((digest(700), 70, 700))
+        );
+        assert_eq!(
+            db.file_size_conflict(files[..700].to_vec()).await.unwrap(),
+            None
+        );
+    }
 
     fn m_digest() -> Digest {
         Digest::of(Algorithm::Sha256, b"m")
