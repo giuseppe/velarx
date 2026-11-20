@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-use super::*;
 
 /// The global options of podman that take a value, and velarx's.
 pub(super) const VALUE_OPTIONS: &[&str] = &[
@@ -434,8 +433,10 @@ pub(super) const COMMAND_AFTER_OPERAND: &[&str] = &["run", "create", "exec"];
 /// velarx (`-c`, `-t`...).  The options before the operand are skipped by
 /// what clap knows of them: those that take a value take the next
 /// argument unless they are given `=VALUE` (or, short, glued).
-pub fn end_options_after_operand(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
-    use clap::CommandFactory;
+pub fn end_options_after_operand(
+    cmd: &clap::Command,
+    mut args: Vec<std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
     let strs: Vec<Option<&str>> = args.iter().map(|a| a.to_str()).collect();
     // `container SUB`, after the global options
     let mut i = 1;
@@ -458,7 +459,6 @@ pub fn end_options_after_operand(mut args: Vec<std::ffi::OsString>) -> Vec<std::
     if !COMMAND_AFTER_OPERAND.contains(&sub) {
         return args;
     }
-    let cmd = Cli::command();
     let Some(sub_cmd) = cmd
         .find_subcommand("container")
         .and_then(|c| c.find_subcommand(sub))
@@ -688,6 +688,7 @@ pub fn podman_layout(mut args: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::
 #[cfg(test)]
 mod podman_layout_tests {
     use super::*;
+    use crate::cli::*;
 
     fn layout(args: &[&str]) -> Result<Vec<String>, String> {
         podman_layout(args.iter().map(std::ffi::OsString::from).collect())
@@ -763,7 +764,7 @@ mod podman_layout_tests {
                     "i",
                     "x",
                 ];
-                end_options_after_operand(argv.iter().map(Into::into).collect())
+                end_options_after_operand(&Cli::command(), argv.iter().map(Into::into).collect())
             })
             .unwrap()
             .join()
