@@ -358,6 +358,18 @@ async fn access_for(
     Ok(access)
 }
 
+/// The stage `name` (or index) among the first `before` of `stages`.
+fn stage_before(stages: &[velarx_wire::parse::Stage], name: &str, before: usize) -> Option<usize> {
+    stages[..before]
+        .iter()
+        .position(|s| {
+            s.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+        .or_else(|| name.parse::<usize>().ok().filter(|i| *i < before))
+}
+
 /// What a client answered for `scopes`, and nothing else: one that sends
 /// more does not widen what the build takes.
 fn only_asked(
@@ -1471,14 +1483,9 @@ impl BuildService {
         }
         let target = match &opts.target {
             None => file.stages.len() - 1,
-            Some(t) => file
-                .stages
-                .iter()
-                .position(|s| s.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(t)))
-                .or_else(|| t.parse::<usize>().ok().filter(|i| *i < file.stages.len()))
-                .ok_or_else(|| {
-                    BuildError::Parse(format!("the target stage `{t}` does not exist"))
-                })?,
+            Some(t) => stage_before(&file.stages, t, file.stages.len()).ok_or_else(|| {
+                BuildError::Parse(format!("the target stage `{t}` does not exist"))
+            })?,
         };
         let platform = opts
             .platform
@@ -1921,15 +1928,7 @@ impl<'a> Build<'a> {
             if r.contains('$') {
                 return (0..i).collect();
             }
-            let stage = stages[..i]
-                .iter()
-                .position(|o| {
-                    o.name
-                        .as_deref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&r))
-                })
-                .or_else(|| r.parse::<usize>().ok().filter(|j| *j < i));
-            found.extend(stage);
+            found.extend(stage_before(stages, &r, i));
         }
         found
     }
@@ -1942,14 +1941,7 @@ impl<'a> Build<'a> {
 
     /// The stage `name` (or index) before `before`.
     fn stage_index(&self, name: &str, before: usize) -> Option<usize> {
-        self.file.stages[..before]
-            .iter()
-            .position(|s| {
-                s.name
-                    .as_deref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
-            })
-            .or_else(|| name.parse::<usize>().ok().filter(|i| *i < before))
+        stage_before(&self.file.stages, name, before)
     }
 
     /// The credentials the build has for the registry of `reference`.
@@ -4135,11 +4127,7 @@ fn base_images(
     let mut out: Vec<String> = Vec::new();
     for (i, stage) in file.stages.iter().enumerate() {
         let base = parse::expand(&stage.base, file.escape, &lookup).map_err(BuildError::Parse)?;
-        let earlier = file.stages[..i].iter().any(|s| {
-            s.name
-                .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(&base))
-        }) || base.parse::<usize>().is_ok_and(|n| n < i);
+        let earlier = stage_before(&file.stages, &base, i).is_some();
         if base != "scratch" && !earlier && !out.contains(&base) {
             out.push(base);
         }
