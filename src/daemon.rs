@@ -1263,6 +1263,7 @@ async fn build_core(
         runtime_args = vec!["--cgroup-manager".into(), "disabled".into()];
     }
     container::set_runtime_args(runtime_args);
+    velarx_runtime::monitor::features::keep_in(config.server.state_dir.clone());
 
     // The networks of the providers (`--network provider:NAME`) need the
     // server: it is told when the container is gone

@@ -592,24 +592,21 @@ struct Features {
 const RUNTIME_FEATURES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The standard output of the runtime at `path` called with `args`, when
-/// it succeeds in time and `valid` accepts it; empty otherwise (it does not
-/// start, fails, prints nothing, or takes longer than
-/// [`RUNTIME_FEATURES_TIMEOUT`]).  It is asked once for the file at `path`
+/// it succeeds in time and `valid` accepts it, else empty; none when it
+/// does not start, fails, or takes longer than [`RUNTIME_FEATURES_TIMEOUT`]
+/// (it is asked again).  It is asked once for the file at `path`
 /// as it is (its device, inode and time: a runtime replaced in place is
 /// asked again; for a wrapper, the wrapper's file).
 fn runtime_output(
     path: &Path,
     args: &[&str],
     valid: impl FnOnce(&str) -> Option<String>,
-) -> std::sync::Arc<str> {
+) -> Option<std::sync::Arc<str>> {
     use std::os::unix::fs::MetadataExt;
     type Key = (PathBuf, Vec<String>, u64, u64, i64, i64);
     static KNOWN: std::sync::Mutex<Vec<(Key, std::sync::Arc<str>)>> =
         std::sync::Mutex::new(Vec::new());
-    let none: std::sync::Arc<str> = "".into();
-    let Ok(meta) = fs::metadata(path) else {
-        return none;
-    };
+    let meta = fs::metadata(path).ok()?;
     let key: Key = (
         path.to_path_buf(),
         args.iter().map(|a| a.to_string()).collect(),
@@ -626,18 +623,16 @@ fn runtime_output(
             .map(|(_, t)| t.clone())
     };
     if let Some(text) = known() {
-        return text;
+        return Some(text);
     }
     // (not under the lock: a slow runtime holds up no other)
-    let Some(out) = runtime_stdout(path, args) else {
-        return none;
-    };
-    let text: std::sync::Arc<str> = valid(&out).map_or(none, Into::into);
+    let out = runtime_stdout(path, args)?;
+    let text: std::sync::Arc<str> = valid(&out).unwrap_or_default().into();
     let mut all = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
     if !all.iter().any(|(k, _)| *k == key) {
         all.push((key, text.clone()));
     }
-    text
+    Some(text)
 }
 
 /// The `features` document (JSON) of the OCI runtime at `path`; empty when
@@ -645,6 +640,10 @@ fn runtime_output(
 /// nothing.  A runtime that does not answer within 5 s has none this time
 /// and is asked again the next time.
 pub fn runtime_features(path: &Path) -> std::sync::Arc<str> {
+    features_output(path).unwrap_or_default()
+}
+
+fn features_output(path: &Path) -> Option<std::sync::Arc<str>> {
     runtime_output(path, &["features"], |out| {
         serde_json::from_str::<serde_json::Value>(out)
             .ok()
@@ -661,12 +660,24 @@ pub fn runtime_features(path: &Path) -> std::sync::Arc<str> {
 /// `potentiallyUnsafeConfigAnnotations`, and runc and youki do not, so that
 /// is what says it.  A runtime with no `features` has none of them.
 pub fn has_crun_options(path: &Path) -> bool {
-    let text = runtime_features(path);
-    serde_json::from_str::<Features>(&text).is_ok_and(|f| {
-        f.potentially_unsafe_config_annotations
-            .iter()
-            .any(|a| a == "run.oci.")
-    })
+    let probe = || {
+        features_output(path).map(|text| {
+            serde_json::from_str::<Features>(&text).is_ok_and(|f| {
+                f.potentially_unsafe_config_annotations
+                    .iter()
+                    .any(|a| a == "run.oci.")
+            })
+        })
+    };
+    // (kept in the run root: a command is a process of its own)
+    let kept = crate::monitor::features::run_root()
+        .zip(crate::monitor::features::file_key(path))
+        .map(|(run, key)| {
+            crate::monitor::features::cached(run, "crun-options", &key, || Ok(probe()))
+        });
+    kept.unwrap_or_else(|| Ok(probe()))
+        .unwrap_or_else(|_| probe())
+        .unwrap_or(false)
 }
 
 /// The standard output of `path ARGS` when it succeeds in time; none when
@@ -683,10 +694,10 @@ fn runtime_stdout(path: &Path, args: &[&str]) -> Option<String> {
 /// too (their `create --help` lists it).
 pub fn has_no_new_keyring(path: &Path) -> bool {
     has_crun_options(path)
-        || !runtime_output(path, &["create", "--help"], |out| {
+        || runtime_output(path, &["create", "--help"], |out| {
             out.contains("--no-new-keyring").then(|| "yes".to_string())
         })
-        .is_empty()
+        .is_some_and(|text| !text.is_empty())
 }
 
 /// The options `args` as the runtime `path` gets them: without crun's

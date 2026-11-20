@@ -7,6 +7,7 @@
 //! dies while the container runs; the teardown stops it and waits until it
 //! is gone, so that a restart of the container can bind the ports again.
 
+use crate::monitor::features;
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -58,8 +59,21 @@ pub fn require_pasta() -> Result<PathBuf, velarx_netkernel::error::NetworkError>
             minimum: PASTA_RELEASE,
         });
     };
+    let recent =
+        |said: &str| release_of(said).is_some_and(|r| Some(r) >= release_of(PASTA_RELEASE));
+    // (a command is a process of its own: the answer is kept in the run
+    // root; one that is not "yes" is asked again, for the error)
+    if let Some((run, key)) = features::run_root().zip(features::file_key(&path)) {
+        let probe = || {
+            let said = version_of(&path);
+            Ok((!said.is_empty()).then(|| recent(&said)))
+        };
+        if features::cached(run, "pasta-recent", &key, probe).is_ok_and(|a| a == Some(true)) {
+            return Ok(path);
+        }
+    }
     let said = version_of(&path);
-    if release_of(&said).is_some_and(|r| Some(r) >= release_of(PASTA_RELEASE)) {
+    if recent(&said) {
         return Ok(path);
     }
     Err(velarx_netkernel::error::NetworkError::OldPasta {
