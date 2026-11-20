@@ -230,12 +230,17 @@ fn adopt_server(pidfd: OwnedFd, what: &str, in_cgroup: bool) -> io::Result<()> {
         _ => io_err(format!("the server: {e}")),
     })?;
     let cgroup = match in_cgroup {
-        true => velarx_base::cgroup::of_process(None)
-            .map(|rel| velarx_base::cgroup::dir(&rel))
-            .map_err(|e| e.to_string()),
+        true => velarx_base::cgroup::of_process(None).map_err(|e| e.to_string()),
         false => Err("the container has no cgroups".to_string()),
     };
-    let placed = cgroup.and_then(|dir| {
+    // (the server of a rootless container starts in the cgroup of its
+    // engine, which is usually the monitor's: the write would change nothing
+    // and costs the kernel a grace period)
+    let placed = cgroup.and_then(|rel| {
+        let dir = velarx_base::cgroup::dir(&rel);
+        if velarx_base::cgroup::of_process(Some(pid)).is_ok_and(|now| now == rel) {
+            return Ok(dir);
+        }
         let procs = dir.join("cgroup.procs");
         std::fs::write(&procs, pid.to_string())
             .map(|()| dir)
