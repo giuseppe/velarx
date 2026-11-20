@@ -567,9 +567,10 @@ impl ContainerService {
         container: &ContainerRecord,
         mut ext: velarx_db::ContainerExt,
     ) -> ContainerResult<velarx_db::ContainerExt> {
-        let checked = serde_json::from_str::<ContainerConfig>(&container.config)
-            .is_ok_and(|c| c.healthcheck.is_some());
-        if checked && container.state.is_alive() {
+        if container.state.is_alive()
+            && serde_json::from_str::<ContainerConfig>(&container.config)
+                .is_ok_and(|c| c.healthcheck.is_some())
+        {
             let dir = self.mon_dir(&container.id);
             let health = tokio::task::spawn_blocking(move || client::status(&dir))
                 .await

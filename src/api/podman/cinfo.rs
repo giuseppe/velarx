@@ -106,6 +106,8 @@ pub struct Shared {
     exts: HashMap<String, velarx_db::ContainerExt>,
     specs: HashMap<String, velarx_runtime::network::engine::SpecRead>,
     interfaces: HashMap<String, Vec<velarx_runtime::network::engine::Interface>>,
+    /// The configurations that could be read
+    configs: HashMap<String, ContainerConfig>,
     /// The images the containers are of or mount (none: gone)
     images: HashMap<String, Option<ImageRecord>>,
     /// The names of the images the containers are of
@@ -134,6 +136,7 @@ impl Shared {
         let mut owners = Vec::new();
         let mut of = std::collections::HashSet::new();
         let mut mounted = Vec::new();
+        let mut configs = HashMap::new();
         for rec in &recs {
             ids.push(rec.id.clone());
             of.insert(rec.image_id.clone());
@@ -149,6 +152,7 @@ impl Shared {
                         .filter_map(|m| m.image.as_ref())
                         .map(|im| im.image.clone()),
                 );
+                configs.insert(rec.id.clone(), cfg);
             }
         }
         let engine = state.network_service.engine();
@@ -193,6 +197,7 @@ impl Shared {
             exts,
             specs,
             interfaces,
+            configs,
             images,
             names,
         })
@@ -205,7 +210,10 @@ async fn load_with(
     status: lifecycle::Status,
     shared: &Shared,
 ) -> ApiResult<Info> {
-    let cfg = lifecycle::config_of(&rec)?;
+    let cfg = match shared.configs.get(&rec.id) {
+        Some(cfg) => cfg.clone(),
+        None => lifecycle::config_of(&rec)?,
+    };
     let api = super::record::load(state, &rec.id).await;
     let image = shared.images.get(&rec.image_id).cloned().flatten();
     let image_names = shared.names.get(&rec.image_id).cloned().unwrap_or_default();
