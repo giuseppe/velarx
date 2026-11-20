@@ -466,12 +466,12 @@ enum Given {
 /// them (`isolation=0`, `rusage=false`...), which are not asks.
 /// `rm`, `forcerm`, `excludes` and `ignorefile` are
 /// not here: they change nothing of the image (no intermediate container
-/// is kept, the client leaves the ignored files out of the tar it sends).
+/// is kept, the client leaves the ignored files out of the tar it sends);
+/// nor `compressionFormat`, `compressionLevel` and `forceCompressionFormat`
+/// (the client sends it true by default): a build stores its
+/// layers uncompressed, the compression is a push's.
 const REFUSED: &[(&str, Given)] = &[
-    ("compressionformat", Given::Any),
-    ("compressionlevel", Given::Any),
     ("cppflags", Given::Any),
-    ("forcecompressionformat", Given::True),
     ("idmappingoptions", Given::IdMapping),
     ("ignore", Given::True),
     // (0 the default, 1 OCI, 3 rootless OCI; 2 is chroot)
@@ -553,6 +553,12 @@ fn spec_of(
     local: bool,
 ) -> ApiResult<(BuildSpec, velarx_registry::auth::RegistryAccess)> {
     refuse_unsupported(call)?;
+    if let Some(c) = call.q("compressionformat").filter(|c| !c.is_empty()) {
+        velarx_proto::engine::LayerCompression::of_word(c)
+            .ok_or_else(|| ApiError::bad_request(format!("invalid compression `{c}`")))?;
+    }
+    q_number::<i32>(call, "compressionlevel")?;
+    call.q_bool("forcecompressionformat", false)?;
     let docker = !call.libpod;
     let quiet = call.q_bool("q", false)?;
     let tags: Vec<String> = call

@@ -82,7 +82,7 @@ EOT
 
 @test "build parameters that ask for what the build lacks are refused" {
     for q in save-stages=true stage-labels=true isolation=2 cppflags=-DX \
-        compressionformat=zstd compressionlevel=3 forcecompressionformat=true ignore=true \
+        ignore=true \
         rusage=true rusagelogfile=x securityopt=x sourcePolicy=x transientRunMounts=x \
         nsoptions=%5B%7B%22Name%22%3A%22pid%22%2C%22Host%22%3Afalse%7D%5D; do
         check "build?$q" 501 "$(req POST "/v5.0.0/libpod/build?$q" "@$WORKDIR/ctx.tar" application/x-tar)"
@@ -113,6 +113,17 @@ EOT
         "nsoptions=%5B%7B%22Name%22%3A%22user%22%2C%22Host%22%3Atrue%2C%22Path%22%3A%22%22%7D%5D"; do
         check "build?$q" 200 "$(req POST "/v5.0.0/libpod/build?$q" "@$WORKDIR/ctx.tar" application/x-tar)"
     done
+}
+
+@test "build: compressionFormat, compressionLevel and forceCompressionFormat are checked and change nothing" {
+    for q in compressionFormat= compressionFormat=gzip compressionFormat=zstd \
+        compressionFormat=zstd:chunked compressionFormat=zstd\&compressionLevel=3 \
+        forceCompressionFormat=0 forceCompressionFormat=1; do
+        check "build?$q" 200 "$(req POST "/v5.0.0/libpod/build?$q" "@$WORKDIR/ctx.tar" application/x-tar)"
+    done
+    check "an unknown format" 400 "$(req POST "/v5.0.0/libpod/build?compressionFormat=lz4" "@$WORKDIR/ctx.tar" application/x-tar)"
+    check_match "...names it" "invalid compression" "$(cat "$WORKDIR/out")"
+    check "a level that is no number" 400 "$(req POST "/v5.0.0/libpod/build?compressionLevel=x" "@$WORKDIR/ctx.tar" application/x-tar)"
 }
 
 @test "parameters of other routes that ask for what is not there are refused" {

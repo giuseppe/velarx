@@ -1377,6 +1377,11 @@ without the numbers of issues or pull requests of any tracker.
 
 ### Fixed
 
+- The REST build accepts `compressionFormat`, `compressionLevel` and
+  `forceCompressionFormat`, which the podman 6 client sends with every
+  build, and refuses a format that is not gzip, zstd, zstd:chunked or none.
+  A build stores its layers uncompressed, so they change nothing of the
+  image; the compression is the push's.
 - A lazy pull refuses a table of contents that lists a file with another
   size than the store has recorded for its fs-verity digest, or than
   another layer of the image gives it, naming the layer; the image was
