@@ -81,8 +81,9 @@ struct Shared {
     /// the digest is here.
     waiting: Mutex<HashMap<String, Vec<Waiter>>>,
     jobs: Mutex<Option<mpsc::Sender<Job>>>,
-    /// The opens and reads, run by the I/O threads (none before the session
-    /// serves: `start_io`).
+    /// The opens and reads, run by the I/O threads (none until the session
+    /// first has more than one request to serve or waits for a fetch:
+    /// `start_io`).
     io: Mutex<Option<mpsc::Sender<Job>>>,
     /// The session's /dev/fuse (a duplicate), to see if requests wait.
     device: std::sync::OnceLock<std::os::fd::OwnedFd>,
@@ -255,14 +256,16 @@ fn errno_of(e: &std::io::Error) -> i32 {
 }
 
 impl Shared {
-    /// Start the I/O threads, from the thread of the session once it is
-    /// confined: they are made by it, with its confinement.
+    /// Start the I/O threads if they are not: from the thread of the
+    /// session, which is confined, so that they have its confinement.
     fn start_io(&self) {
-        let count = std::thread::available_parallelism()
-            .map_or(4, |n| n.get())
-            .clamp(2, MAX_IO_THREADS);
-        *self.io.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(workers("fuse-io", count, || Ok(())));
+        let mut io = self.io.lock().unwrap_or_else(|e| e.into_inner());
+        if io.is_none() {
+            let count = std::thread::available_parallelism()
+                .map_or(4, |n| n.get())
+                .clamp(2, MAX_IO_THREADS);
+            *io = Some(workers("fuse-io", count, || Ok(())));
+        }
     }
 
     /// Run `job` on an I/O thread (here when there is none).
@@ -272,6 +275,7 @@ impl Shared {
         if !self.more_requests() {
             return job();
         }
+        self.start_io();
         self.on_io_thread(job);
     }
 
@@ -385,6 +389,9 @@ impl Shared {
         let Some(fetcher) = self.fetcher.clone() else {
             return waiter(Err(libc::ENOENT));
         };
+        // (the waiters are answered on the I/O threads, never on the
+        // unconfined fetch thread: they are made here, on a confined one)
+        self.start_io();
         {
             let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(list) = waiting.get_mut(digest) {
@@ -1025,8 +1032,6 @@ impl ImageMounts {
                         return session;
                     }
                 }
-                // (the threads made from now on have the confinement)
-                shared.start_io();
                 let _ = ready.send(Ok(()));
                 if let Err(e) = session.run() {
                     warn!("The FUSE session of {name} ended: {e}");
@@ -1981,7 +1986,7 @@ mod tests {
     }
 
     /// Every thread of a session has its confinement: the session's, and
-    /// the I/O threads, which it makes once confined (a thread made before
+    /// the I/O threads, which it makes once confined and busy (a thread made before
     /// would not have it).  Seen by the kernel (`Seccomp`, `NoNewPrivs` of
     /// each task) and by what each I/O thread may read (Landlock).
     #[test]
@@ -2041,13 +2046,40 @@ mod tests {
                 return;
             };
             assert_eq!(std::fs::read(path.join("layer1/f")).unwrap(), data);
+            assert!(
+                shared.io.lock().unwrap().is_none(),
+                "one reader: no threads"
+            );
+            // (the I/O threads are made when requests come together)
+            let readers: Vec<_> = (0..16)
+                .map(|_| {
+                    let (shared, file) = (shared.clone(), path.join("layer1/f"));
+                    std::thread::Builder::new()
+                        .name("reader".into())
+                        .spawn(move || {
+                            while shared.io.lock().unwrap().is_none() {
+                                std::fs::read(&file).unwrap();
+                            }
+                        })
+                        .unwrap()
+                })
+                .collect();
+            for r in readers {
+                r.join().unwrap();
+            }
 
-            // the kernel's view of each task: all but this one confined
+            // the kernel's view of each task: all but this one (and the
+            // readers, which may not be gone yet) confined
             let me = rustix::thread::gettid().as_raw_nonzero().get().to_string();
             let mut io = 0;
             for task in std::fs::read_dir("/proc/self/task").unwrap() {
                 let task = task.unwrap().path();
-                let name = std::fs::read_to_string(task.join("comm")).unwrap();
+                let Ok(name) = std::fs::read_to_string(task.join("comm")) else {
+                    continue;
+                };
+                if name.trim() == "reader" {
+                    continue;
+                }
                 let status = std::fs::read_to_string(task.join("status")).unwrap();
                 let confined = status.lines().any(|l| l == "Seccomp:\t2")
                     && status.lines().any(|l| l == "NoNewPrivs:\t1");
