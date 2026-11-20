@@ -72,19 +72,12 @@ pub fn out_of_system_files(e: &io::Error) -> bool {
 }
 
 /// Whether `e`, the failure of [`mount_erofs`] or [`erofs_of_file`], is the
-/// kernel's refusal of an open file as the source of an EROFS: a kernel
-/// before Linux 7.3 takes no descriptor there (`EINVAL`, `EOPNOTSUPP`), one
-/// before 6.12 mounts only a block device (`ENOTBLK`), and a file system the
-/// kernel cannot read the image through is `EINVAL` or `ENODEV`.  Any other
-/// failure (no memory, no descriptor, no privilege) says nothing of it.
+/// kernel's refusal of an open file as the source of an EROFS: a file system
+/// the kernel cannot read the image through is `EINVAL` or `ENODEV`.  Any
+/// other failure (no memory, no descriptor, no privilege) says nothing of it.
 pub fn refuses_a_file(e: &io::Error) -> bool {
     use rustix::io::Errno;
-    errno(e).is_some_and(|n| {
-        matches!(
-            n,
-            Errno::NOTBLK | Errno::INVAL | Errno::NODEV | Errno::OPNOTSUPP
-        )
-    })
+    errno(e).is_some_and(|n| matches!(n, Errno::INVAL | Errno::NODEV))
 }
 
 /// What a kernel mount is made of: the EROFS images of the layers, each
@@ -156,29 +149,11 @@ pub fn holder_userns(t: &velarx_fuse::IdTranslate) -> io::Result<OwnedFd> {
     crate::userns::create_userns_for_idmap(&tuples(&t.uid), &tuples(&t.gid))
 }
 
-/// How the kernel is told which file is the EROFS image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErofsSource {
-    /// The open file itself is the `source` (`FSCONFIG_SET_FD`, Linux 7.3):
-    /// the kernel keeps that open file for as long as the file system
-    /// exists, so the lock the image holds
-    /// ([`velarx_fuse::composefs::open_layer_image`]) is held by the mount
-    /// and the collection finds the layer in use.
-    Descriptor,
-    /// The name of the open file in `/proc/self/fd` is the `source` (any
-    /// kernel that mounts an EROFS from a file, Linux 6.12): the kernel
-    /// resolves it to the inode of that file and no other, and opens the
-    /// image itself.  That open takes no lock: only the rows of the container
-    /// tell the collection the layer is used.  The mount keeps its own reference to the file,
-    /// so it works until it is unmounted even if the image is removed.
-    ProcPath,
-}
-
 /// The EROFS image `image`, mounted read only and detached; with `share`
 /// the mounts of the same image share one superblock (`erofs_of_file`).
-pub fn mount_erofs(image: &std::fs::File, source: ErofsSource, share: bool) -> io::Result<OwnedFd> {
+pub fn mount_erofs(image: &std::fs::File, share: bool) -> io::Result<OwnedFd> {
     use rustix::mount::{fsmount, FsMountFlags, MountAttrFlags};
-    let erofs = erofs_of_file(image, source, share)?;
+    let erofs = erofs_of_file(image, share)?;
     fsmount(
         erofs.as_fd(),
         FsMountFlags::FSMOUNT_CLOEXEC,
@@ -187,31 +162,22 @@ pub fn mount_erofs(image: &std::fs::File, source: ErofsSource, share: bool) -> i
     .map_err(|e| failed("fsmount(erofs)", e))
 }
 
-/// The EROFS file system of the open image `image`, not yet mounted, with
-/// the source given as `source` says.  A kernel that does not take it
-/// refuses the call ([`refuses_a_file`]).  With `share` (the feature
+/// The EROFS file system of the open image `image`, not yet mounted: the
+/// kernel keeps the open file as its source for as long as the file system
+/// exists, so the lock the image holds
+/// ([`velarx_fuse::composefs::open_layer_image`]) is held by the mount and
+/// the collection finds the layer in use.  The file system may refuse the
+/// call ([`refuses_a_file`]).  With `share` (the feature
 /// `erofs-superblock-share`; a kernel without it refuses the option) the
 /// mounts of the same image with the same options are one superblock, which
 /// keeps the first open file (and its lock) until the last of them is
 /// unmounted.
-pub fn erofs_of_file(
-    image: &std::fs::File,
-    source: ErofsSource,
-    share: bool,
-) -> io::Result<std::os::fd::OwnedFd> {
-    use rustix::mount::{
-        fsconfig_create, fsconfig_set_fd, fsconfig_set_flag, fsconfig_set_string, fsopen,
-        FsOpenFlags,
-    };
+pub fn erofs_of_file(image: &std::fs::File, share: bool) -> io::Result<std::os::fd::OwnedFd> {
+    use rustix::mount::{fsconfig_create, fsconfig_set_fd, fsconfig_set_flag, fsopen, FsOpenFlags};
     let erofs =
         fsopen("erofs", FsOpenFlags::FSOPEN_CLOEXEC).map_err(|e| failed("fsopen(erofs)", e))?;
-    match source {
-        ErofsSource::Descriptor => fsconfig_set_fd(erofs.as_fd(), "source", image.as_fd()),
-        ErofsSource::ProcPath => {
-            fsconfig_set_string(erofs.as_fd(), "source", velarx_sys::fd::proc_str(&image))
-        }
-    }
-    .map_err(|e| failed("fsconfig(source)", e))?;
+    fsconfig_set_fd(erofs.as_fd(), "source", image.as_fd())
+        .map_err(|e| failed("fsconfig(source)", e))?;
     if share {
         fsconfig_set_flag(erofs.as_fd(), "superblock_share")
             .map_err(|e| failed("fsconfig(superblock_share)", e))?;
@@ -537,61 +503,14 @@ mod tests {
         rustix::fs::flock(f, rustix::fs::FlockOperation::NonBlockingLockExclusive)
     }
 
-    /// The kernel mounts the open file, not its name, from the name of the
-    /// descriptor in `/proc/self/fd`: the name is gone (renamed away,
-    /// another file put in its place) when the mount is made.  The mount
-    /// holds no lock of the image (so the collection does not see it), and
-    /// it keeps working after the image is removed, until it is unmounted:
-    /// the kernel has its own reference to the file.  As root only; the mount
-    /// is detached and goes with its descriptor.
+    /// The kernel mounts the open file as the `source` itself: the mount
+    /// holds the lock of the image with every descriptor of ours closed, for
+    /// as long as it exists.  A file system that cannot be read refuses the
+    /// call.
     /// (in a process of its own: a process that another test forks shares
     /// the open files, and their locks, until it runs its program)
     #[test]
-    fn the_kernel_mounts_the_open_image_by_its_descriptor_name_without_a_lock() {
-        velarx_base::testing::in_child(|| {
-            let Some((dir, image)) = image_with_a_file() else {
-                return;
-            };
-            let file = velarx_fuse::composefs::open_layer_image(&image).unwrap();
-            let other = dir.path().join("other.erofs");
-            std::fs::write(&other, b"not an image").unwrap();
-            // (another open of the image, to ask its lock: the name is replaced)
-            std::fs::hard_link(&image, dir.path().join("kept.erofs")).unwrap();
-            let asker = std::fs::File::open(dir.path().join("kept.erofs")).unwrap();
-            std::fs::rename(&other, &image).unwrap();
-            let erofs = match erofs_of_file(&file, ErofsSource::ProcPath, false) {
-                Ok(erofs) => erofs,
-                Err(e) if refuses_a_file(&e) => {
-                    return eprintln!("skipped: no file-backed EROFS: {e}")
-                }
-                Err(e) => panic!("{e}"),
-            };
-            let root = mounted(&erofs);
-            assert_eq!(read_f(&root), "contents");
-            // our own lock (taken by the open) goes with our descriptors; the
-            // mount holds none
-            drop(file);
-            drop(erofs);
-            assert_eq!(
-                exclusive_lock_of(&asker),
-                Ok(()),
-                "a mount by name holds no lock"
-            );
-            // every name of the image is removed, the mount still reads it
-            std::fs::remove_file(dir.path().join("kept.erofs")).unwrap();
-            std::fs::remove_file(&image).unwrap();
-            assert_eq!(read_f(&root), "contents");
-        });
-    }
-
-    /// The kernel mounts the open file as the `source` itself where it takes
-    /// a descriptor (Linux 7.3): the mount holds the lock of the image with
-    /// every descriptor of ours closed, for as long as it exists.  A kernel
-    /// that does not take it refuses the call.
-    /// (in a process of its own: a process that another test forks shares
-    /// the open files, and their locks, until it runs its program)
-    #[test]
-    fn the_kernel_mounts_the_open_image_and_keeps_its_lock_or_refuses() {
+    fn the_kernel_mounts_the_open_image_and_keeps_its_lock() {
         velarx_base::testing::in_child(|| {
             let Some((dir, image)) = image_with_a_file() else {
                 return;
@@ -599,11 +518,11 @@ mod tests {
             let file = velarx_fuse::composefs::open_layer_image(&image).unwrap();
             std::fs::hard_link(&image, dir.path().join("kept.erofs")).unwrap();
             let asker = std::fs::File::open(dir.path().join("kept.erofs")).unwrap();
-            let erofs = match erofs_of_file(&file, ErofsSource::Descriptor, false) {
+            let erofs = match erofs_of_file(&file, false) {
                 Ok(erofs) => erofs,
                 Err(e) => {
                     assert!(refuses_a_file(&e), "{e}");
-                    return eprintln!("this kernel takes no descriptor as the source: {e}");
+                    return eprintln!("skipped: no file-backed EROFS: {e}");
                 }
             };
             let root = mounted(&erofs);
@@ -633,14 +552,14 @@ mod tests {
             let asker = std::fs::File::open(dir.path().join("kept.erofs")).unwrap();
             let file = velarx_fuse::composefs::open_layer_image(&image).unwrap();
             let other = velarx_fuse::composefs::open_layer_image(&image).unwrap();
-            let first = match mount_erofs(&file, ErofsSource::Descriptor, true) {
+            let first = match mount_erofs(&file, true) {
                 Ok(first) => first,
                 Err(e) if refuses_a_file(&e) => {
-                    return eprintln!("skipped: no superblock_share or no descriptor source: {e}")
+                    return eprintln!("skipped: no superblock_share: {e}")
                 }
                 Err(e) => panic!("{e}"),
             };
-            let second = mount_erofs(&other, ErofsSource::Descriptor, true).unwrap();
+            let second = mount_erofs(&other, true).unwrap();
             assert_eq!(
                 rustix::fs::fstat(&first).unwrap().st_dev,
                 rustix::fs::fstat(&second).unwrap().st_dev
@@ -716,7 +635,7 @@ mod tests {
     #[test]
     fn the_refusal_of_a_file_is_told_from_other_failures() {
         use rustix::io::Errno;
-        for no in [Errno::NOTBLK, Errno::INVAL, Errno::NODEV, Errno::OPNOTSUPP] {
+        for no in [Errno::INVAL, Errno::NODEV] {
             assert!(
                 refuses_a_file(&failed("fsconfig_create(erofs)", no)),
                 "{no}"
@@ -732,8 +651,8 @@ mod tests {
             assert!(!refuses_a_file(&failed("fsopen(erofs)", other)), "{other}");
         }
         assert!(!refuses_a_file(&io::Error::other("x")));
-        let e = failed("fsmount(erofs)", Errno::NOTBLK);
-        assert_eq!(errno(&e), Some(Errno::NOTBLK));
+        let e = failed("fsmount(erofs)", Errno::NODEV);
+        assert_eq!(errno(&e), Some(Errno::NODEV));
         assert!(e.to_string().starts_with("fsmount(erofs) failed: "), "{e}");
     }
 

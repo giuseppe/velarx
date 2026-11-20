@@ -122,10 +122,7 @@ teardown_file () {
 # Linux 6.12 and later) is found out when the engine starts, by mounting an
 # empty image written next to the images of the store, and kept for the boot
 # as the feature erofs-file of the run root (the marker erofs-file-yes or
-# erofs-file-no, with the boot and the images it is about).  Where it does,
-# a second answer, the feature erofs-lock, says whether the mount keeps the
-# lock of the image (Linux 7.3 and later: the image is given to the kernel as
-# the source, an open file).
+# erofs-file-no, with the boot and the images it is about).
 @test "the engine finds out at its start whether the kernel mounts an EROFS image from a file" {
     need_daemon
     local features=$WORKDIR/state/features key
@@ -134,19 +131,9 @@ teardown_file () {
         check "the other answer is not kept" 0 "$(ls "$features" | grep -c '^erofs-file-no$')"
         check_match "the kernel mounts the root file systems" "composefs: root file systems from the EROFS images of the layers" "$(cat "$WORKDIR/on.log")"
         check "the probe left no image in the store" 0 "$(ls -A "$MNT/store/composefs" | grep -c '^\.tmp-probe-')"
-        check "one marker of the lock" 1 "$(ls "$features" | grep -c '^erofs-lock-')"
-        # (the kernel keeps the lock from Linux 7.3: FSCONFIG_SET_FD of the
-        # source of an EROFS)
-        if [ "$(printf '7.3\n%s\n' "$(uname -r)" | sort -V | head -1)" = 7.3 ]; then
-            check "this kernel keeps the lock" 1 "$(ls "$features" | grep -c '^erofs-lock-yes$')"
-        else
-            check "an older kernel keeps none" 1 "$(ls "$features" | grep -c '^erofs-lock-no$')"
-        fi
-        check "the lock marker says which boot and which images" "$key" "$(cat "$features"/erofs-lock-* | head -1)"
     else
         check "no answer but no" 1 "$(ls "$features" | grep -c '^erofs-file-no$')"
         check_match "the image server serves them, and the reason says why" "the kernel cannot mount an EROFS image from a file" "$(cat "$WORKDIR/on.log")"
-        check "the lock is not asked where nothing is mounted" 0 "$(ls "$features" | grep -c '^erofs-lock-')"
     fi
     check "the marker says which boot and which images" "$key" "$(cat "$features"/erofs-file-* | head -1)"
     check "one marker" 1 "$(ls "$features" | grep -c '^erofs-file-')"
@@ -157,7 +144,7 @@ teardown_file () {
     local features=$WORKDIR/state/features key
     key="$(cat /proc/sys/kernel/random/boot_id) $MNT/store/objects"
     stop_daemon
-    rm -f "$features"/erofs-file-* "$features"/erofs-lock-*
+    rm -f "$features"/erofs-file-*
     printf '%s\n' "$key" > "$features/erofs-file-no"
     start_daemon on || { echo "the daemon does not start"; cat "$WORKDIR/on.log"; exit 1; }
     check_match "the reason is said" "the kernel cannot mount an EROFS image from a file" "$(cat "$WORKDIR/on.log")"
@@ -471,19 +458,12 @@ EOT
 
 # The lock of an image: what mounts or serves the EROFS image of a layer
 # holds a shared flock of it.  The kernel mount keeps it as long as the file
-# system exists where the image is given to the kernel as an open file (Linux
-# 7.3 and later, the feature erofs-lock); an older kernel mounts the image by
-# the name of its descriptor and holds none, so the collection does not see
-# the mount.  The collection asks for the lock exclusively and keeps the layer
-# it cannot lock.  `flock -n -x` is that question.
+# system exists (the image is given to the kernel as an open file).  The
+# collection asks for the lock exclusively and keeps the layer it cannot
+# lock.  `flock -n -x` is that question.
 image_unused () { flock -n -x "$1" true 2> /dev/null && echo unused || echo in-use; }
 layer_rows () {
     python3 -I -c 'import sqlite3, sys; print(sqlite3.connect(sys.argv[1], timeout=30).execute("SELECT COUNT(*) FROM layers").fetchone()[0])' "$MNT/store/db.sqlite"
-}
-# what a mount of the kernel does to the lock of its image on this host: the
-# answer the engine found (the marker erofs-lock-yes or erofs-lock-no)
-mount_locks () {
-    if [ -f "$WORKDIR/state/features/erofs-lock-yes" ]; then echo in-use; else echo unused; fi
 }
 # the layers no row names any more: what a crash that lost them leaves
 forget_rows () {
@@ -496,20 +476,19 @@ c.commit()
 PY
 }
 
-@test "a mounted image is locked until its mount is gone where the kernel keeps the lock" {
+@test "a mounted image is locked until its mount is gone" {
     start_daemon on || { echo "the daemon does not start"; cat "$WORKDIR/on.log"; exit 1; }
     sh_ image pull --tls-verify=false "$IMAGE" > /dev/null 2>&1 || e2e_die "pull"
-    local img held
+    local img
     img=$(ls "$MNT"/store/composefs/layer-*.erofs | head -1)
-    held=$(mount_locks)
     check "not before" unused "$(image_unused "$img")"
     sh_ container run -d --name c1 --network none "$IMAGE" sleep 300 > /dev/null
-    check "while the container runs ($held where the kernel keeps the lock)" "$held" "$(image_unused "$img")"
+    check "while the container runs" in-use "$(image_unused "$img")"
     # (the engine is not the holder: it goes and the mount stays)
     kill -KILL "$(cat "$WORKDIR/daemon.pid")"
     e2e_wait_exit "$(cat "$WORKDIR/daemon.pid")" 10
     rm -f "$WORKDIR/daemon.pid"
-    check "when the engine is killed" "$held" "$(image_unused "$img")"
+    check "when the engine is killed" in-use "$(image_unused "$img")"
     start_daemon on || { echo "the daemon does not start"; cat "$WORKDIR/on.log"; exit 1; }
     sh_ container rm -t 0 -f c1 > /dev/null
     check "not after" unused "$(image_unused "$img")"
@@ -547,7 +526,7 @@ read_tree () { # container
         check "the second container adds few inodes" 1 "$([ "$second" -lt $((first / 4)) ] && echo 1 || echo 0)"
         sh_ container rm -t 0 -f c1 > /dev/null
         check_match "the other reads its files" "^[0-9]+\\." "$(sh_ container exec c2 cat /etc/alpine-release 2>&1)"
-        check "the layer is still locked" "$(mount_locks)" "$(image_unused "$img")"
+        check "the layer is still locked" in-use "$(image_unused "$img")"
         sh_ container rm -t 0 -f c2 > /dev/null
     else
         check "each container has its own inodes" 1 "$([ "$second" -gt $((first / 2)) ] && echo 1 || echo 0)"
@@ -556,7 +535,7 @@ read_tree () { # container
     check "the layer is free after the last" unused "$(image_unused "$img")"
 }
 
-@test "a layer whose image is mounted is collected where the kernel keeps no lock, and kept where it does" {
+@test "a layer whose image is mounted is kept by the collection" {
     start_daemon on || { echo "the daemon does not start"; cat "$WORKDIR/on.log"; exit 1; }
     sh_ image pull --tls-verify=false "$IMAGE" > /dev/null 2>&1 || e2e_die "pull"
     local img
@@ -564,92 +543,15 @@ read_tree () { # container
     sh_ container run -d --name c1 --network none "$IMAGE" sleep 300 > /dev/null
     forget_rows
     sh_ system gc > /dev/null 2>&1
-    if [ "$(mount_locks)" = in-use ]; then
-        check "the image stays" 1 "$(test -f "$img" && echo 1 || echo 0)"
-        check "and the row of its layer" 1 "$(layer_rows)"
-        check_match "the container reads its files" "^[0-9]+\." "$(sh_ container exec c1 cat /etc/alpine-release 2>&1)"
-        sh_ container rm -t 0 -f c1 > /dev/null
-        # (the layer goes in the second step of a collection, its image in the
-        # first of the next)
-        sh_ system gc > /dev/null 2>&1
-        sh_ system gc > /dev/null 2>&1
-    else
-        sh_ system gc > /dev/null 2>&1
-        check "no lock, the collection removes the image" 0 "$(test -f "$img" && echo 1 || echo 0)"
-        sh_ container rm -t 0 -f c1 > /dev/null
-    fi
+    check "the image stays" 1 "$(test -f "$img" && echo 1 || echo 0)"
+    check "and the row of its layer" 1 "$(layer_rows)"
+    check_match "the container reads its files" "^[0-9]+\." "$(sh_ container exec c1 cat /etc/alpine-release 2>&1)"
+    sh_ container rm -t 0 -f c1 > /dev/null
+    # (the layer goes in the second step of a collection, its image in the
+    # first of the next)
+    sh_ system gc > /dev/null 2>&1
+    sh_ system gc > /dev/null 2>&1
     check "the image goes with the mount" 0 "$(test -f "$img" && echo 1 || echo 0)"
     check "and the row" 0 "$(layer_rows)"
-    stop_daemon
-}
-
-# A kernel that keeps no lock (told so here, whatever this one does): the
-# image is mounted by the name of its descriptor and nothing holds a lock, so
-# only the rows keep the layer.  With the rows lost (deleted here) the
-# collection removes the layer under the mount, and the mount goes on (the
-# kernel has its own open file of the image: the names and directories of the
-# container's root file system are still there; the objects behind the
-# data-only layer are not, so an open of a file fails); a pull makes the layer
-# again.
-@test "a kernel that keeps no lock: mounted without one, the image removed while mounted, the mount goes on" {
-    local features=$WORKDIR/state/features key
-    key="$(cat /proc/sys/kernel/random/boot_id) $MNT/store/objects"
-    stop_daemon
-    rm -f "$features"/erofs-lock-*
-    printf '%s\n' "$key" > "$features/erofs-lock-no"
-    start_daemon on || { echo "the daemon does not start"; cat "$WORKDIR/on.log"; exit 1; }
-    check_match "the kernel mounts the root file systems" "composefs: root file systems from the EROFS images of the layers" "$(cat "$WORKDIR/on.log")"
-    sh_ image pull --tls-verify=false "$IMAGE" > /dev/null 2>&1 || e2e_die "pull"
-    local img
-    img=$(ls "$MNT"/store/composefs/layer-*.erofs | head -1)
-    sh_ container run -d --name c1 --network none "$IMAGE" sleep 300 > /dev/null
-    check "run" 0 $?
-    check "the kernel mounts the root, no image server" 0 "$(monitor_log c1 | grep -c 'image server of the root file system')"
-    check "the mount holds no lock" unused "$(image_unused "$img")"
-    check_match "the container reads its files" "^[0-9]+\." "$(sh_ container exec c1 cat /etc/alpine-release 2>&1)"
-    forget_rows
-    sh_ system gc > /dev/null 2>&1
-    sh_ system gc > /dev/null 2>&1
-    check "the collection removed the image" 0 "$(test -f "$img" && echo 1 || echo 0)"
-    check "and the row" 0 "$(layer_rows)"
-    check "the mount goes on: the directories are there" 0 "$(sh_ container exec c1 ls /etc > /dev/null 2>&1; echo $?)"
-    # (the objects of the files went with the layer)
-    check "a file whose object is gone cannot be opened" 1 "$(sh_ container exec c1 cat /usr/lib/os-release > /dev/null 2>&1; echo $?)"
-    sh_ container rm -t 0 -f c1 > /dev/null
-    sh_ image pull --tls-verify=false "$IMAGE" > /dev/null 2>&1
-    check "a pull makes the layer again" 1 "$(layer_rows)"
-    check "and its image" 1 "$(ls "$MNT"/store/composefs/layer-*.erofs | wc -l)"
-    rm -f "$features"/erofs-lock-no
-    stop_daemon
-}
-
-# A kernel that keeps no lock (told so here, whatever this one does): the
-# rows keep the layers of every kernel mount, the root's and an image
-# mount's.  The image mounted is not removed while a container mounts it, and
-# collections leave its layer and its files: a file not opened before is read.
-@test "a kernel that keeps no lock: the rows of a container keep the layers of its root and of its image mounts" {
-    local features=$WORKDIR/state/features key root=$E2E_REGISTRY/e2e/alpine:gzip
-    key="$(cat /proc/sys/kernel/random/boot_id) $MNT/store/objects"
-    stop_daemon
-    rm -f "$features"/erofs-lock-*
-    printf '%s\n' "$key" > "$features/erofs-lock-no"
-    start_daemon on || { echo "the daemon does not start"; cat "$WORKDIR/on.log"; exit 1; }
-    sh_ image pull --tls-verify=false "$IMAGE" > /dev/null 2>&1 || e2e_die "pull"
-    sh_ image pull --tls-verify=false "$root" > /dev/null 2>&1 || e2e_die "pull $root"
-    sh_ container run -d --name c1 --network none \
-        --mount "type=image,source=$IMAGE,destination=/img" "$root" sleep 300 > /dev/null
-    check "run" 0 $?
-    check "the kernel mounts the root, no image server" 0 "$(monitor_log c1 | grep -c 'image server of the root file system')"
-    local images
-    images=$(ls "$MNT"/store/composefs/layer-*.erofs | wc -l)
-    check_match "the image mounted is not removed" "in use" "$(sh_ image rm "$IMAGE" 2>&1)"
-    check_match "nor the image of the root" "in use" "$(sh_ image rm "$root" 2>&1)"
-    sh_ system gc > /dev/null 2>&1
-    sh_ system gc > /dev/null 2>&1
-    check "the layers stay" "$images" "$(ls "$MNT"/store/composefs/layer-*.erofs | wc -l)"
-    check_match "a file of the image mount not opened before is read" "Alpine" "$(sh_ container exec c1 cat /img/usr/lib/os-release 2>&1)"
-    check_match "and one of the root" "Alpine" "$(sh_ container exec c1 cat /usr/lib/os-release 2>&1)"
-    sh_ container rm -t 0 -f c1 > /dev/null
-    rm -f "$features"/erofs-lock-no
     stop_daemon
 }

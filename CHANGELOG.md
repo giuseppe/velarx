@@ -338,16 +338,11 @@ without the numbers of issues or pull requests of any tracker.
   (`interval_ns`, ...): containers of an earlier development build do not
   carry over.
 - The EROFS image of a layer is locked (a shared `flock`) while it is
-  served by the image server, and, on Linux 7.3 or later, while the kernel has
-  it mounted: the kernel mount is given the open image as the source of the
-  file system (`FSCONFIG_SET_FD`) and keeps the lock for as long as the mount
-  exists.  The garbage collection keeps a layer whose image is locked, even
-  when no image or container names it any more (the feature `erofs-lock` of
-  the run root says whether the kernel mounts keep the lock).  On Linux 6.12
-  to 7.2 the kernel still mounts the images, by the name of the descriptor, and
-  holds no lock: there the rows of the containers (`container_layers`, for
-  the root and the image mounts) keep the layers of every kernel mount, as
-  before.  A collection of many layers holds their images 256 at a time.
+  served by the image server and while the kernel has it mounted: the kernel
+  mount is given the open image as the source of the file system
+  (`FSCONFIG_SET_FD`) and keeps the lock for as long as the mount exists.  The
+  garbage collection keeps a layer whose image is locked, even when no image
+  or container names it any more.  A collection of many layers holds their images 256 at a time.
 - `velarx-kube play` opens the directory of the build of an image itself and
   gives the engine the descriptor of that directory, not its path, and the
   engine builds from the directory in place, nothing is copied: COPY and ADD
