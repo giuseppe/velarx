@@ -889,3 +889,99 @@ async fn test_a_layer_is_found_by_its_key_only() {
         .unwrap();
     assert_eq!(db.get_layer(&toc).await.unwrap().blob, Some(digest_of(7)));
 }
+
+/// The containers of every image are counted by one query, with the same
+/// answer as asking for each image: those of the image, and those that mount
+/// a directory of it, each once.
+#[tokio::test]
+async fn the_container_counts_of_all_images_are_those_of_each() {
+    let db = Database::open_in_memory().await.unwrap();
+    let ids = ["img-a", "img-b", "img-c"];
+    for (n, id) in ids.iter().enumerate() {
+        db.insert_image(&ImageRecord {
+            id: id.to_string(),
+            manifest_digest: digest_of(1 + n as u8),
+            config_digest: digest_of(5 + n as u8),
+            manifest: "{}".to_string(),
+            config: "{}".to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            is_lazy: false,
+        })
+        .await
+        .unwrap();
+    }
+    // (image of the container, image its volumes mount)
+    let containers: &[(&str, &[&str])] = &[
+        ("img-a", &[]),
+        ("img-a", &["img-b"]),
+        ("img-a", &["img-a", "img-a"]),
+        ("img-b", &["img-a", "img-c"]),
+        ("img-b", &[]),
+    ];
+    for (n, (image, mounts)) in containers.iter().enumerate() {
+        let mounts: Vec<_> = mounts
+            .iter()
+            .map(|i| serde_json::json!({"image": {"image": i}}))
+            .collect();
+        db.insert_container(&ContainerRecord {
+            id: format!("c{n}"),
+            image_id: image.to_string(),
+            config: serde_json::json!({"mounts": mounts}).to_string(),
+            state: RecordState::Created,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let counts = db.container_counts_by_image().await.unwrap();
+    for id in ids {
+        let each = db.containers_using_image(id).await.unwrap().len();
+        assert_eq!(counts.get(id).copied().unwrap_or(0), each, "{id}");
+    }
+    assert_eq!(counts["img-a"], 4);
+    assert_eq!(counts["img-b"], 3);
+    assert_eq!(counts["img-c"], 1);
+}
+
+/// The listing of the containers whose processes are there has the running
+/// and the paused, in the order of the full listing, and no other.
+#[tokio::test]
+async fn the_alive_containers_are_the_running_and_the_paused() {
+    let db = Database::open_in_memory().await.unwrap();
+    let image_id = create_test_image(&db).await;
+    let states = [
+        RecordState::Created,
+        RecordState::Running,
+        RecordState::Stopped,
+        RecordState::Paused,
+        RecordState::Exited,
+        RecordState::Initialized,
+    ];
+    for (n, state) in states.into_iter().enumerate() {
+        db.insert_container(&ContainerRecord {
+            id: format!("c{n}"),
+            image_id: image_id.clone(),
+            config: "{}".to_string(),
+            state,
+            created_at: format!("2024-01-01T00:00:0{n}Z"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let alive: Vec<_> = db
+        .list_alive_containers()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(alive, ["c3", "c1"]);
+    let all = db.list_containers(true).await.unwrap();
+    assert!(all
+        .iter()
+        .filter(|c| c.state.is_alive())
+        .map(|c| &c.id)
+        .eq(&alive));
+}

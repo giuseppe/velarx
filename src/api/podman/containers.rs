@@ -559,7 +559,10 @@ pub(crate) async fn list_of(
             }
         }
     }
-    let recs = state.container_service.list_observed(true).await?;
+    let recs = match all {
+        true => state.container_service.list_observed(true).await?,
+        false => state.container_service.list_alive_observed().await?,
+    };
     let shared = cinfo::Shared::read(state, recs.iter().map(|(rec, _)| rec)).await?;
     let shared = &shared;
     // The loads overlap: each may ask the monitor of a container nobody

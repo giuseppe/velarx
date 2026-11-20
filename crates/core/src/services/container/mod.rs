@@ -556,9 +556,30 @@ impl ContainerService {
         self: &Arc<Self>,
         all: bool,
     ) -> ContainerResult<Vec<(ContainerRecord, Option<crate::container::ContainerStatus>)>> {
-        // (all of them, filtered once refreshed: the database may say created
-        // for a container that runs)
-        let listed = self.db.list_containers(true).await?;
+        let mut containers = match all {
+            true => self.observed(self.db.list_containers(true).await?).await,
+            false => self.list_alive_observed().await?,
+        };
+        if !all {
+            containers.retain(|(c, _)| c.state == RecordState::Running);
+        }
+        Ok(containers)
+    }
+
+    /// The containers the record says are alive (running or paused), as
+    /// [`Self::list_observed`] gives them, the paused ones too.  Nothing
+    /// else is looked at: a stopped container cannot run without a write.
+    pub async fn list_alive_observed(
+        self: &Arc<Self>,
+    ) -> ContainerResult<Vec<(ContainerRecord, Option<crate::container::ContainerStatus>)>> {
+        Ok(self.observed(self.db.list_alive_containers().await?).await)
+    }
+
+    /// `listed` with the state each is in refreshed (see [`Self::refresh_state`]).
+    async fn observed(
+        self: &Arc<Self>,
+        listed: Vec<ContainerRecord>,
+    ) -> Vec<(ContainerRecord, Option<crate::container::ContainerStatus>)> {
         // (the runtimes are asked together, each once: the listing takes
         // the time of the slowest, not the sum)
         let refreshed: Vec<_> = futures::stream::iter(listed)
@@ -585,11 +606,7 @@ impl ContainerService {
             }
         }
 
-        if !all {
-            containers.retain(|(c, _)| c.state == RecordState::Running);
-        }
-
-        Ok(containers)
+        containers
     }
 
     /// Prune (remove) all stopped containers

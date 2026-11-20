@@ -481,9 +481,13 @@ mod daemonless_tests {
                     .map(|words| {
                         let line = ["x", "1"].iter().find_map(|v| {
                             let line = line_of(&root, &words, v);
-                            crate::cli::try_parse_args(end_options_after_operand(
-                                line.iter().map(Into::into).collect(),
-                            ))
+                            crate::cli::try_parse_with(
+                                crate::cli::command_line(),
+                                end_options_after_operand(
+                                    &root,
+                                    line.iter().map(Into::into).collect(),
+                                ),
+                            )
                             .ok()
                             .map(|cli| (line, cli.command))
                         });

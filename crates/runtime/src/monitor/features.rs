@@ -46,6 +46,35 @@ fn dir(run: &Path) -> PathBuf {
     run.join(DIR)
 }
 
+/// The run root this process keeps the answers about its tools in.
+static RUN_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Keep the answers about the tools (the OCI runtime, pasta) in the run root
+/// RUN, for the commands that follow in other processes.
+pub fn keep_in(run: PathBuf) {
+    let _ = RUN_ROOT.set(run);
+}
+
+/// The run root of [`keep_in`], if any.
+pub fn run_root() -> Option<&'static Path> {
+    RUN_ROOT.get().map(PathBuf::as_path)
+}
+
+/// The key of the answers about the program at PATH: the file as it is (its
+/// device, inode and time: a program replaced in place is asked again).
+pub fn file_key(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some(format!(
+        "{} {}:{} {}.{}",
+        path.display(),
+        m.dev(),
+        m.ino(),
+        m.mtime(),
+        m.mtime_nsec()
+    ))
+}
+
 /// A new boot (or a new kernel) may do otherwise: forget what was found.
 pub fn forget(run: &Path) -> io::Result<()> {
     match velarx_base::tree::remove_dir_all(dir(run)) {

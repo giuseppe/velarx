@@ -462,12 +462,13 @@ pub(crate) fn command_line() -> clap::Command {
     negative(Cli::command())
 }
 
-/// `Cli::try_parse_from` with [`command_line`].
-pub(crate) fn try_parse_args(
+/// `Cli::try_parse_from` with the command `cmd` ([`command_line`]).
+fn try_parse_with(
+    cmd: clap::Command,
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Result<Cli, clap::Error> {
     use clap::FromArgMatches;
-    let mut matches = command_line().try_get_matches_from(args)?;
+    let mut matches = cmd.try_get_matches_from(args)?;
     Cli::from_arg_matches_mut(&mut matches)
 }
 
@@ -482,9 +483,15 @@ pub fn parse() -> Cli {
     };
     // podman's status for a command line it does not take is 125 (clap's
     // is 2); the help and the version stay a success
-    let mut args = end_options_after_operand(args);
+    // (built once: the retries below build their own)
+    let cmd = command_line();
+    let mut args = end_options_after_operand(&cmd, args);
+    let mut cmd = Some(cmd);
     let mut cli = loop {
-        match try_parse_args(args.iter().cloned()) {
+        match try_parse_with(
+            cmd.take().unwrap_or_else(command_line),
+            args.iter().cloned(),
+        ) {
             Ok(cli) => break cli,
             Err(e) => {
                 // (`--all=true`: a flag that takes no value in clap does in
@@ -831,7 +838,11 @@ where
     let argv: Vec<std::ffi::OsString> = argv.into_iter().map(Into::into).collect();
     std::thread::Builder::new()
         .stack_size(8 << 20)
-        .spawn(move || try_parse_args(end_options_after_operand(argv)))
+        .spawn(move || {
+            let cmd = command_line();
+            let argv = end_options_after_operand(&cmd, argv);
+            try_parse_with(cmd, argv)
+        })
         .expect("a thread for the parse")
         .join()
         .expect("the parse")

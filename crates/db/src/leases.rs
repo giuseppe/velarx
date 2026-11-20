@@ -9,6 +9,7 @@
 //! nothing to renew and no pid to guess.
 
 use super::Database;
+use crate::volatile;
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -193,21 +194,24 @@ impl Database {
         let recorded = self
             .conn
             .call(move |conn| {
-                let tx = conn.transaction()?;
-                tx.execute(
-                    "INSERT INTO leases (id, pid) VALUES (?1, ?2)",
-                    rusqlite::params![id, pid],
-                )?;
-                {
-                    let mut stmt = tx.prepare_cached(
-                        "INSERT OR IGNORE INTO lease_items (lease_id, kind, digest) VALUES (?1, ?2, ?3)",
+                // (the truth of a lease is its lock: no crash keeps it)
+                volatile::run(conn, true, |conn| {
+                    let tx = conn.transaction()?;
+                    tx.execute(
+                        "INSERT INTO leases (id, pid) VALUES (?1, ?2)",
+                        rusqlite::params![id, pid],
                     )?;
-                    for (kind, digest) in &items {
-                        stmt.execute(rusqlite::params![id, kind, digest])?;
+                    {
+                        let mut stmt = tx.prepare_cached(
+                            "INSERT OR IGNORE INTO lease_items (lease_id, kind, digest) VALUES (?1, ?2, ?3)",
+                        )?;
+                        for (kind, digest) in &items {
+                            stmt.execute(rusqlite::params![id, kind, digest])?;
+                        }
                     }
-                }
-                tx.commit()?;
-                Ok(())
+                    tx.commit()?;
+                    Ok(())
+                })
             })
             .await
             .map_err(DbError::Sqlite);
@@ -222,17 +226,19 @@ impl Database {
         let id = id.to_string();
         self.conn
             .call(move |conn| {
-                let tx = conn.transaction()?;
-                {
-                    let mut stmt = tx.prepare_cached(
-                        "INSERT OR IGNORE INTO lease_items (lease_id, kind, digest) VALUES (?1, ?2, ?3)",
-                    )?;
-                    for (kind, digest) in &items {
-                        stmt.execute(rusqlite::params![id, kind, digest])?;
+                volatile::run(conn, true, |conn| {
+                    let tx = conn.transaction()?;
+                    {
+                        let mut stmt = tx.prepare_cached(
+                            "INSERT OR IGNORE INTO lease_items (lease_id, kind, digest) VALUES (?1, ?2, ?3)",
+                        )?;
+                        for (kind, digest) in &items {
+                            stmt.execute(rusqlite::params![id, kind, digest])?;
+                        }
                     }
-                }
-                tx.commit()?;
-                Ok(())
+                    tx.commit()?;
+                    Ok(())
+                })
             })
             .await
             .map_err(DbError::Sqlite)
@@ -262,8 +268,10 @@ impl Database {
         let id = id.to_string();
         self.conn
             .call(move |conn| {
-                conn.execute("DELETE FROM leases WHERE id = ?1", [&id])?;
-                Ok(())
+                volatile::run(conn, true, |conn| {
+                    conn.execute("DELETE FROM leases WHERE id = ?1", [&id])?;
+                    Ok(())
+                })
             })
             .await
             .map_err(DbError::Sqlite)
@@ -442,6 +450,43 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// The rows of a lease are of no use after a crash (its lock is its
+    /// truth): a process that only took and released one writes nothing
+    /// that must survive, and does not sync the store for it.  Run again in
+    /// a process of its own, where nothing else wrote durably.
+    #[tokio::test]
+    async fn the_rows_of_a_lease_are_not_durable() {
+        const IN_CHILD: &str = "VELARX_TEST_LEASE_ROWS_CHILD";
+        if let Some(dir) = std::env::var_os(IN_CHILD) {
+            let db = Database::open(std::path::Path::new(&dir).join("db"))
+                .await
+                .unwrap();
+            volatile::forget_durable_writes();
+            let lease = Lease::take(&db, "pull-c", &[]).await.unwrap();
+            db.add_lease_items(lease.id(), vec![("layer".into(), "x".into())])
+                .await
+                .unwrap();
+            lease.release().await.unwrap();
+            assert!(!volatile::durable_writes());
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "leases::tests::the_rows_of_a_lease_are_not_durable",
+            ])
+            .env(IN_CHILD, tmp.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// The lock of a lease of a database in memory is held as long as the

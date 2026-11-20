@@ -1172,6 +1172,24 @@ impl Database {
             .map_err(DbError::Sqlite)
     }
 
+    /// The containers whose record says their processes are there (running
+    /// or paused), as [`Self::list_containers`] orders them.
+    pub async fn list_alive_containers(&self) -> DbResult<Vec<ContainerRecord>> {
+        self.conn
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, image_id, config, state, pid, created_at, started_at, finished_at, exit_code
+                     FROM containers WHERE state IN ('running', 'paused') ORDER BY created_at DESC",
+                )?;
+                let containers = stmt
+                    .query_map([], ContainerRecord::from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(containers)
+            })
+            .await
+            .map_err(DbError::Sqlite)
+    }
+
     /// Check if any containers reference the given image ID
     pub async fn image_has_containers(&self, image_id: &str) -> DbResult<bool> {
         let image_id = image_id.to_string();
@@ -1193,6 +1211,29 @@ impl Database {
         let image_id = image_id.to_string();
         self.conn
             .call(move |conn| containers_using_image(conn, &image_id))
+            .await
+            .map_err(DbError::Sqlite)
+    }
+
+    /// How many containers use each image (as [`Self::containers_using_image`]
+    /// tells for one), for the images that have any: one scan of the
+    /// containers for all of them.
+    pub async fn container_counts_by_image(
+        &self,
+    ) -> DbResult<std::collections::HashMap<String, usize>> {
+        self.conn
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT image, count(*) FROM (
+                         SELECT image_id AS image, id FROM containers
+                         UNION
+                         SELECT json_extract(m.value, '$.image.image'), c.id
+                         FROM containers c, json_each(c.config, '$.mounts') m)
+                     WHERE image IS NOT NULL GROUP BY image",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, usize>(1)?)))?;
+                Ok(rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?)
+            })
             .await
             .map_err(DbError::Sqlite)
     }

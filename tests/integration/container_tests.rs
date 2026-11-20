@@ -478,3 +478,36 @@ async fn test_a_container_made_for_a_pod_holds_the_operation_lock_of_the_pod() {
     let err = joined.unwrap_err();
     assert!(matches!(err, PodError::NotFound(_)), "{err:?}");
 }
+
+/// The listing of the running containers (the paused ones too) is made of
+/// the rows of those that can be alive: a stopped container is not read.
+#[tokio::test]
+async fn test_the_alive_listing_has_the_running_and_the_paused() {
+    use velarx_db::RecordState;
+
+    let e = super::common::env().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let with = WithRuntime::new(&e, tmp.path()).await;
+    for (id, state) in [
+        ("running", RecordState::Running),
+        ("paused", RecordState::Paused),
+        ("exited", RecordState::Exited),
+        ("created", RecordState::Created),
+    ] {
+        e.db.insert_container(&with.record(id, state))
+            .await
+            .unwrap();
+    }
+    let mut alive: Vec<_> = with
+        .containers
+        .list_alive_observed()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(c, _)| c.id)
+        .collect();
+    alive.sort();
+    assert_eq!(alive, ["paused", "running"]);
+    // (the runtime is asked for those two only)
+    assert_eq!(with.states_asked(), 2);
+}
