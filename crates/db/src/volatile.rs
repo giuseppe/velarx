@@ -83,6 +83,13 @@ pub fn durable_writes() -> bool {
     DURABLE.load(Ordering::Acquire)
 }
 
+/// A test that asks whether what follows is durable starts from nothing
+/// written (the open of a new store is).
+#[cfg(test)]
+pub(crate) fn forget_durable_writes() {
+    DURABLE.store(false, Ordering::Release);
+}
+
 /// Run `f` as a volatile scope when `volatile`: the rows it changes do not
 /// make this process write the log back at its end.  Not volatile: `f` as it
 /// is, durable.
