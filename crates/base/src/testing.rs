@@ -15,6 +15,33 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// A binary or example that cargo built, `NAME` in the profile directory of
+/// the test executable, or in its `examples/`.  The profile directory is the
+/// ancestor of the executable that holds `.fingerprint` (the executables are
+/// in `deps/` or, since cargo 1.100, in `build/PACKAGE/HASH/out/`), or
+/// `debug` and `release` of `CARGO_TARGET_DIR` when it is set.
+pub fn built_binary(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+    let profiles = exe
+        .ancestors()
+        .filter(|d| d.join(".fingerprint").is_dir())
+        .map(Path::to_path_buf)
+        .chain(
+            target
+                .into_iter()
+                .flat_map(|t| [t.join("debug"), t.join("release")]),
+        );
+    for dir in profiles {
+        for path in [dir.join(name), dir.join("examples").join(name)] {
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 /// The interface file `name` of `interfaces/` is `text`, which the types make
 /// (`VELARX_WRITE_INTERFACES=1` writes it).
 pub fn assert_interface_file(name: &str, text: &str) {

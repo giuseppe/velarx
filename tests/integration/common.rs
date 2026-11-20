@@ -1613,14 +1613,12 @@ pub fn client_conf(conf: &str) -> Resolver {
     )
 }
 
-/// A binary that cargo built next to the test executables (`target/debug/NAME`
-/// for `target/debug/deps/TEST`).  The binaries are in the package
-/// `velarx-bin`, whose tests make `cargo test` build them: `cargo test -p
-/// velarx` alone does not (`cargo build --bins` first).
+/// A binary that cargo built (see `velarx_base::testing::built_binary`).  The
+/// binaries are in the package `velarx-bin`, whose tests make `cargo test`
+/// build them: `cargo test -p velarx` alone does not (`cargo build --bins`
+/// first).
 pub fn built_binary(name: &str) -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let path = exe.parent()?.parent()?.join(name);
-    path.is_file().then_some(path)
+    velarx_base::testing::built_binary(name)
 }
 
 /// The daemon binary of this package (its build workers too), from

@@ -12,14 +12,7 @@ use std::time::{Duration, Instant};
 use velarx_config::Config;
 
 fn example() -> PathBuf {
-    // target/debug/deps/<test> -> target/debug/examples/dircache
-    let exe = std::env::current_exe().unwrap();
-    exe.parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples")
-        .join("dircache")
+    built_binary("dircache").expect("no dircache example: cargo build --example dircache")
 }
 
 struct Cache {

@@ -59,13 +59,7 @@ fn registry_binary() -> std::path::PathBuf {
     if let Some(path) = std::env::var_os("VELARX_TEST_REGISTRY").filter(|p| !p.is_empty()) {
         return path.into();
     }
-    let exe = std::env::current_exe().expect("the test binary");
-    let path = exe
-        .parent()
-        .and_then(|d| d.parent())
-        .map(|d| d.join("velarx-registry"))
-        .filter(|p| p.is_file());
-    path.expect(
+    velarx_base::testing::built_binary("velarx-registry").expect(
         "no velarx-registry binary next to the tests: build it first (`cargo build --bins`, \
          or `make test`) or set VELARX_TEST_REGISTRY",
     )
