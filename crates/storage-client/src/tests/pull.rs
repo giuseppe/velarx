@@ -181,6 +181,7 @@ impl PullFeed for TestFeed {
             proven: false,
             blob_checked: false,
             checked: Default::default(),
+            toc_z: None,
         })
     }
 

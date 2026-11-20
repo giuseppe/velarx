@@ -1098,7 +1098,19 @@ impl ImageService {
         let requirements = self.policy_for(&image_ref)?;
         let target = client.target(&image_ref)?;
         let access = client.request_access().cloned().unwrap_or_default();
-        let net = self.inspect_net(client, &image_ref, reach.tls_verify, &access)?;
+        let mut net = self.inspect_net(client, &image_ref, reach.tls_verify, &access)?;
+        // (a digest vouches for the manifest, and the manifest for the
+        // rest: what the fetchers before the registry have is checked
+        // against them, so the registry is asked for what they lack)
+        if let (Some(_), Net::Origin(origin)) = (&image_ref.digest, &net) {
+            let names = self.sources_of(sources.as_deref())?;
+            let shareable = self.shareable(client, &target, &image_ref).await;
+            let links = self.source_links(&names, shareable).await;
+            if !links.is_empty() {
+                let before = velarx_content::pull::net::origin::MetadataSources::open(links).await;
+                net = Net::Origin(origin.clone().with_sources(before));
+            }
+        }
         // (the instance an index names is not asked of the registry when the
         // store has that very manifest, which is checked against its digest)
         let stored = |digest: &Digest| -> futures::future::BoxFuture<'_, Option<bytes::Bytes>> {
@@ -2249,6 +2261,7 @@ mod stored_tests {
             chunks: vec![],
             tarsplit: tarsplit.map(<[u8]>::to_vec),
             blob_checked: false,
+            kept_toc: None,
         }
     }
 

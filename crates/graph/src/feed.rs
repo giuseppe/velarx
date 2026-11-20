@@ -1304,6 +1304,7 @@ impl PullFeed for StagedFeed {
             proven: false,
             blob_checked: false,
             checked: Default::default(),
+            toc_z: None,
         })
     }
 

@@ -23,16 +23,14 @@ use velarx_storage::{Toc, TocEntry, TocEntryType, TOC_VERSION};
 use velarx_types::digest::{Algorithm, Digest};
 use velarx_types::{ImageError, ImageResult, OciDescriptor};
 
-fn fail(msg: impl Into<String>) -> ImageError {
-    ImageError::Layer(msg.into())
-}
-
 /// The metadata of a lazy layer.
 pub struct LazyLayer {
     /// The TOC to store: tar headers and chunk positions.
     pub toc: Arc<Toc>,
     /// The verified, zstd compressed tar-split.
     pub tarsplit: bytes::Bytes,
+    /// The table as the registry sent it ([`chunked::Metadata::toc_z`])
+    pub toc_z: bytes::Bytes,
     pub report: LayerReport,
 }
 
@@ -120,7 +118,7 @@ pub async fn pull_metadata(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<
     };
     // (the fetcher finds them: `Probe`; what it gives is verified below)
     let (toc_z, ts_z) = chunked::metadata(ctx, layer).await?;
-    found_of(info, (toc_z, ts_z), layer.digest, max_tar)
+    found_of(info, toc_z, ts_z, layer.digest, max_tar)
         .await
         .map(Some)
 }
@@ -130,25 +128,22 @@ pub async fn pull_metadata(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<
 /// `info`.
 async fn found_of(
     info: Info,
-    (toc_z, ts_z): (Vec<u8>, Vec<u8>),
+    toc_z: Vec<u8>,
+    ts_z: Vec<u8>,
     layer_digest: Digest,
     max_tar: u64,
 ) -> ImageResult<Found> {
     let fetched = (toc_z.len() + ts_z.len()) as u64;
-    let layer_info: Info = info.clone();
-    let lazy = tokio::task::spawn_blocking(move || -> ImageResult<LazyLayer> {
-        let meta = chunked::verify_metadata(&layer_info, &toc_z, ts_z, &layer_digest, max_tar)?;
-        Ok(LazyLayer {
-            toc: meta.stored,
-            tarsplit: meta.tarsplit_z,
-            report: LayerReport {
-                fetched_bytes: fetched,
-                ..LayerReport::default()
-            },
-        })
-    })
-    .await
-    .map_err(|e| fail(format!("metadata task: {e}")))??;
+    let meta = chunked::verified(&info, toc_z, ts_z, layer_digest, max_tar).await?;
+    let lazy = LazyLayer {
+        toc: meta.stored,
+        tarsplit: meta.tarsplit_z,
+        toc_z: meta.toc_z,
+        report: LayerReport {
+            fetched_bytes: fetched,
+            ..LayerReport::default()
+        },
+    };
     Ok((info, lazy))
 }
 
@@ -167,10 +162,10 @@ pub async fn accept(
     let Some(info) = chunked::parse_info(layer)? else {
         return Ok(Err(Why::NoToc));
     };
-    let (TocSource::Carried, Some(metadata)) = (reply.toc, metadata) else {
+    let (TocSource::Carried, Some((toc_z, ts_z))) = (reply.toc, metadata) else {
         return Ok(Err(reply.reason.unwrap_or(Why::Unreachable)));
     };
-    let found = found_of(info, metadata, layer.digest, max_tar).await?;
+    let found = found_of(info, toc_z, ts_z, layer.digest, max_tar).await?;
     Ok(match reply.on_demand {
         true => Ok(found),
         false => Err(reply.reason.unwrap_or(Why::NoRanges)),

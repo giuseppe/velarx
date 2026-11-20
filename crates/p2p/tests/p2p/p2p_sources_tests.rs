@@ -452,8 +452,8 @@ async fn test_a_partial_pull_takes_its_chunks_from_a_peer() {
     b.publish(&[&layer], &[ZSTD]);
     let result = b.pull().await.unwrap();
     assert!(result.stats.from("source0").0 > 0, "{:?}", result.stats);
-    // B's registry was only asked for the metadata
-    assert_eq!(b.reg.ranged.load(Ordering::SeqCst), 1);
+    // (the table of contents came from A too: no range of the registry)
+    assert_eq!(b.reg.ranged.load(Ordering::SeqCst), 0);
     assert_eq!(b.db.get_layer(&layer.key()).await.unwrap().status, "ready");
     assert!(b.store.contains(&vid(b"hello\n")));
     let stats = s.node_a.get_stats().await;
@@ -520,8 +520,8 @@ fn data_layer(data: Vec<u8>) -> Built {
     ])
 }
 
-/// A node B pulls a layer whose file A has, and A gives its chunks (what
-/// B's registry gave is only the metadata of the layer).
+/// A node B pulls a layer whose file A has, and A gives its chunks and its
+/// table of contents (B's registry gives no range).
 async fn pulled_from_a(s: &Swarm, layer: &Built, size: usize) {
     let b = env_with_sources(&[&s.b_source]).await;
     b.publish(&[layer], &[ZSTD]);
@@ -532,7 +532,7 @@ async fn pulled_from_a(s: &Swarm, layer: &Built, size: usize) {
         "{from_a} of {size}: {:?}",
         result.stats
     );
-    assert_eq!(b.reg.ranged.load(Ordering::SeqCst), 1);
+    assert_eq!(b.reg.ranged.load(Ordering::SeqCst), 0);
     assert_eq!(b.db.get_layer(&layer.key()).await.unwrap().status, "ready");
 }
 
@@ -682,7 +682,7 @@ async fn test_a_layer_is_the_layer_of_its_table_whatever_serves_it() {
     drop(s);
 
     // A has the layer of the TOC, C pulls the descriptor from a registry
-    // with no ranges
+    // with no ranges: A gives the table of contents and the files
     let s = swarm(&[&layer], &[ZSTD]).await;
     let c = env_with_sources(&[&s.b_source]).await;
     c.publish(&[&layer], &[ZSTD]);
@@ -696,9 +696,10 @@ async fn test_a_layer_is_the_layer_of_its_table_whatever_serves_it() {
             .map(|l| l.key)
             .collect();
     assert_eq!(keys, [layer.key()]);
-    assert!(
-        c.reg.hits.lock().unwrap().get(&sha(&layer.blob)).copied() >= Some(1),
-        "the blob came from the registry, as the transport of the ranges"
+    assert_eq!(
+        c.reg.hits.lock().unwrap().get(&sha(&layer.blob)).copied(),
+        None,
+        "the registry is not asked for the blob"
     );
     let peers = NodePeers(s.node_b.clone());
     let a = s.node_a.peer_id();

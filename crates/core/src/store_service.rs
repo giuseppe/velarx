@@ -777,21 +777,37 @@ impl StoreService {
             .map_err(|e| StoreError::Unavailable {
                 reason: e.to_string(),
             })?;
-        let opened = futures::future::join_all(wants.iter().enumerate().map(|(i, want)| {
-            let shareable = shareable.get(i).copied().unwrap_or(false);
+        let shareable = |i: usize| shareable.get(i).copied().unwrap_or(false);
+        let mut opened = futures::future::join_all(wants.iter().enumerate().map(|(i, want)| {
             async move {
-                let found = match shareable {
+                match shareable(i) {
                     true => match self.inner.chunks() {
                         Some(chunks) => chunks.open(&want.digest).await,
                         None => None,
                     },
-                    // (not the store's: a piece of a checkpoint this node shares)
+                    // (not a file of the store: a piece of a checkpoint, or
+                    // the manifest, index or configuration of an image this
+                    // node shares, looked up below)
                     false => self.piece(&want.digest).await,
-                };
-                found.filter(|f| want.size.is_none_or(|size| size == f.len))
+                }
             }
         }))
         .await;
+        // (the metadata of the images, together; an fs-verity key names none)
+        let (asked, digests): (Vec<usize>, Vec<_>) = (0..wants.len())
+            .filter(|&i| !shareable(i) && opened[i].is_none())
+            .filter_map(|i| {
+                let digest = velarx_types::digest::Digest::parse_key(&wants[i].digest).ok()?;
+                (!digest.is_fsverity()).then_some((i, digest))
+            })
+            .unzip();
+        for (i, found) in asked.into_iter().zip(self.image_metadata(digests).await?) {
+            opened[i] = found;
+        }
+        let opened = opened
+            .into_iter()
+            .zip(wants)
+            .map(|(found, want)| found.filter(|f| want.size.is_none_or(|size| size == f.len)));
         let mut items = Vec::with_capacity(wants.len());
         let mut fds = Vec::new();
         for (want, found) in wants.iter().zip(opened) {
@@ -810,6 +826,49 @@ impl StoreService {
             items.push(item);
         }
         Ok((items, fds))
+    }
+
+    /// The manifest, index or configuration of a shared image that each of
+    /// `digests` names, in a file with no name.
+    async fn image_metadata(
+        &self,
+        digests: Vec<velarx_types::digest::Digest>,
+    ) -> Result<Vec<Option<ChunkFile>>, StoreError> {
+        if digests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let unavailable = |e: &dyn std::fmt::Display| StoreError::Unavailable {
+            reason: e.to_string(),
+        };
+        let texts = self
+            .inner
+            .db
+            .shared_image_metadata(&digests)
+            .await
+            .map_err(|e| unavailable(&e))?;
+        let objects = self.inner.objects.clone();
+        tokio::task::spawn_blocking(move || {
+            texts
+                .into_iter()
+                .map(|text| {
+                    text.map(|text| {
+                        let fd = velarx_content::pull::unnamed::read_only_unnamed(
+                            &objects,
+                            text.as_bytes(),
+                        )?;
+                        Ok(ChunkFile {
+                            file: fd.into(),
+                            offset: 0,
+                            len: text.len() as u64,
+                        })
+                    })
+                    .transpose()
+                })
+                .collect::<io::Result<Vec<_>>>()
+        })
+        .await
+        .map_err(|e| unavailable(&e))?
+        .map_err(|e| unavailable(&e))
     }
 
     /// The file of a piece or a manifest of a checkpoint this node shares.
@@ -893,6 +952,25 @@ impl StoreService {
         let unavailable = |e: velarx_types::DbError| StoreError::Unavailable {
             reason: e.to_string(),
         };
+        // (the digest of a table of contents asks for the index of the layer
+        // of that table, with the table as its descriptor vouched for it: the
+        // asker checks it against the descriptor)
+        if let velarx_db::LayerKey::Whole(checksum) = layer {
+            let toc = velarx_db::LayerKey::Toc(*checksum);
+            if db.is_layer_shareable(&toc).await.map_err(unavailable)? {
+                if let Some(toc_z) = db.kept_toc(checksum).await.map_err(unavailable)? {
+                    // (a layer whose tar-split was cleared is not complete;
+                    // a complete canonical one has an empty tar-split)
+                    let Some(tarsplit) = db.get_layer_tarsplit(&toc).await.map_err(unavailable)?
+                    else {
+                        return Ok(None);
+                    };
+                    let index =
+                        move || velarx_content::pull::index::encode_compressed(&toc_z, &tarsplit);
+                    return self.held(index, max).await;
+                }
+            }
+        }
         // a layer that may be private is not described to anyone
         if !db.is_layer_shareable(layer).await.map_err(unavailable)? {
             return Ok(None);
@@ -906,9 +984,20 @@ impl StoreService {
         let Some(tarsplit) = db.get_layer_tarsplit(layer).await.map_err(unavailable)? else {
             return Ok(None);
         };
+        let index = move || velarx_content::pull::index::encode(toc.as_bytes(), &tarsplit);
+        self.held(index, max).await
+    }
+
+    /// The index `make` makes in a file with no name, opened read-only, if
+    /// it is at most `max` bytes.
+    async fn held(
+        &self,
+        make: impl FnOnce() -> Option<Vec<u8>> + Send + 'static,
+        max: u64,
+    ) -> Result<Option<(OwnedFd, u64)>, StoreError> {
         let objects = self.inner.objects.clone();
         tokio::task::spawn_blocking(move || {
-            let index = velarx_content::pull::index::encode(toc.as_bytes(), &tarsplit)?;
+            let index = make()?;
             if index.len() as u64 > max {
                 return None;
             }

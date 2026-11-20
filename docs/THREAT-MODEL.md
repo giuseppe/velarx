@@ -190,8 +190,9 @@ member:
     it never falls back to anything weaker.
 * **One swarm is one trust domain**, with the key and with an authority:
   there is no per-image access control.  A member may be served any layer,
-  chunk, file or index that a node holds and shares (the pulls without
-  credentials, and those of `share_registries`), may test whether a node
+  chunk, file, layer index or table of contents, and the manifest, index
+  and configuration of any image, that a node holds and shares (the pulls
+  without credentials, and those of `share_registries`), may test whether a node
   holds a digest it already knows (a probe, or offline in the filter of the
   layers that `advertise_layers`, on by default, tells every member), and,
   when a node sets `announce_images = true`, may list its images.

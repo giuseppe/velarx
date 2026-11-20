@@ -1147,6 +1147,7 @@ impl PeerSource {
     pub(crate) async fn fetch_indexes(
         &self,
         items: &[Item],
+        toc: bool,
         well_formed: &(dyn Fn(&[u8]) -> bool + Sync),
         out: &mut dyn Sink,
     ) -> Result<(), String> {
@@ -1160,7 +1161,7 @@ impl PeerSource {
             let span =
                 tracing::info_span!("pull_index", group = log.id(), layer = short(&item.digest));
             tracing::Instrument::instrument(
-                log.scope(self.fetch_index(item, well_formed, out)),
+                log.scope(self.fetch_index(item, toc, well_formed, out)),
                 span,
             )
             .await?;
@@ -1171,6 +1172,7 @@ impl PeerSource {
     async fn fetch_index(
         &self,
         item: &Item,
+        toc: bool,
         well_formed: &(dyn Fn(&[u8]) -> bool + Sync),
         out: &mut dyn Sink,
     ) -> Result<(), String> {
@@ -1179,8 +1181,15 @@ impl PeerSource {
             .unwrap_or(MAX_ITEM_BYTES as u64)
             .min(MAX_ITEM_BYTES as u64);
         let mut why = Why::Served;
-        let mut providers = self.knowledge.providers(&item.digest);
-        let filtered = self.knowledge.filtered(&item.digest);
+        // (the layer a peer announces: by its blob, or by its table of
+        // contents, which the digest asked for is the checksum of)
+        let layer = match toc {
+            true => velarx_types::LayerKey::Toc(item.digest.parse().map_err(|_| "a digest")?)
+                .to_string(),
+            false => item.digest.clone(),
+        };
+        let mut providers = self.knowledge.providers(&layer);
+        let filtered = self.knowledge.filtered(&layer);
         if providers.is_empty() {
             why = Why::Filter;
             providers = self.maybe_of(&filtered).await;
@@ -3431,7 +3440,7 @@ mod tests {
                 .served(Some(&layer.digest), peer, Duration::from_millis(rtt));
         }
         let mut out = Collect::default();
-        s.fetch_indexes(std::slice::from_ref(&layer), &|_| true, &mut out)
+        s.fetch_indexes(std::slice::from_ref(&layer), false, &|_| true, &mut out)
             .await
             .unwrap();
         assert_eq!(out.0, [(layer.digest.clone(), b"an index".to_vec())]);
@@ -3467,6 +3476,7 @@ mod tests {
         let mut out = Collect::default();
         s.fetch_indexes(
             std::slice::from_ref(&layer),
+            false,
             &|bytes| bytes.starts_with(b"an "),
             &mut out,
         )
@@ -3478,6 +3488,46 @@ mod tests {
             s.strikes().strike(liar);
         }
         assert!(s.strikes().banned(&liar), "the first strike counted");
+    }
+
+    /// A table of contents is taken from a peer only when it has the
+    /// checksum of the layer's descriptor and its tar-split the digest the
+    /// table names: the table recompressed (what a node keeps as its view)
+    /// or another tar-split is passed over for the next peer, and with no
+    /// right one the layer is left to the next fetcher.
+    #[tokio::test]
+    async fn a_wrong_table_of_contents_from_a_peer_is_not_taken() {
+        use velarx_content::pull::index;
+        let tarsplit = b"a tar-split".to_vec();
+        let toc = format!(
+            r#"{{"version":1,"entries":[],"tarSplitDigest":"{}"}}"#,
+            digest_of(&tarsplit)
+        );
+        let toc_z = zstd::encode_all(toc.as_bytes(), 19).unwrap();
+        let checksum: velarx_types::digest::Digest = digest_of(&toc_z).parse().unwrap();
+        let wrong = [
+            index::encode(toc.as_bytes(), &tarsplit).unwrap(),
+            index::encode_compressed(&toc_z, b"another tar-split").unwrap(),
+        ];
+        let right = index::encode_compressed(&toc_z, &tarsplit).unwrap();
+        for honest in [true, false] {
+            let fake = Arc::new(Fake::default());
+            let mut peers = Vec::new();
+            for bytes in wrong.iter().chain(honest.then_some(&right)) {
+                let peer = fake.peer(0, Ok(vec![]));
+                fake.indexes.lock().unwrap().insert(peer, bytes.clone());
+                peers.push(peer);
+            }
+            let s = source(&fake, None);
+            let key = velarx_types::LayerKey::Toc(checksum).to_string();
+            for (rtt, peer) in peers.iter().enumerate() {
+                s.knowledge()
+                    .served(Some(&key), *peer, Duration::from_millis(rtt as u64 + 1));
+            }
+            let got = s.toc_of(&checksum, index::json_cap(1 << 20)).await;
+            assert_eq!(got, honest.then(|| (toc_z.clone(), tarsplit.clone())));
+            assert_eq!(*fake.index_asked.lock().unwrap(), peers);
+        }
     }
 
     #[tokio::test]

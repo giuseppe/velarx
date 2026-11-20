@@ -1608,6 +1608,7 @@ impl VarlinkDriver {
                 proven: false,
                 blob_checked: false,
                 checked: Default::default(),
+                toc_z: None,
             });
         }
         // the proof: what the driver stored, read back from it

@@ -117,6 +117,23 @@ impl Net {
             origin.manifest(&reference).await
         })
         .await
+        .map_err(|e| match (e, &image_ref.digest) {
+            // (only the registry says what a tag names: the peers serve
+            // what a digest names)
+            (ImageError::Transfer { party, object, mut failure }, None)
+                if matches!(
+                    failure.class,
+                    FailureClass::Transient | FailureClass::Unavailable
+                ) =>
+            {
+                failure.reason = format!(
+                    "{} (a tag needs its registry; a pull by digest can take the image from the peers)",
+                    failure.reason
+                );
+                ImageError::Transfer { party, object, failure }
+            }
+            (e, _) => e,
+        })
     }
 
     /// The configuration of an image and its bytes, checked against the
@@ -179,5 +196,27 @@ mod tests {
             .blob(&crate::sha256(b"x"), 1, &mut |_| Ok(()))
             .await
             .is_err());
+    }
+
+    /// A tag is resolved by the registry only: a pull of one with no
+    /// registry says so; a digest does not.
+    #[tokio::test]
+    async fn a_tag_without_a_registry_says_it_needs_one() {
+        let net = Net::Origin(origin::OriginNet::of_transport(
+            "/nonexistent/velarx-registry.sock".into(),
+            std::time::Duration::from_secs(5),
+            "docker://example.com/a".into(),
+            true,
+        ));
+        let digest = format!("@{}", crate::sha256(b"x"));
+        for (name, said) in [(":latest", true), (digest.as_str(), false)] {
+            let r = ImageReference::parse(&format!("example.com/a{name}")).unwrap();
+            let e = net.manifest_raw(&r, None, None).await.unwrap_err();
+            assert_eq!(
+                e.to_string().contains("a tag needs its registry"),
+                said,
+                "{e}"
+            );
+        }
     }
 }

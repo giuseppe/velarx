@@ -3601,6 +3601,7 @@ pub async fn a_lazy_layer_waits_and_is_completed(f: &Factory) {
         },
         toc: &serde_json::to_string(&*done.toc).unwrap(),
         tarsplit: &done.tarsplit,
+        toc_z: None,
     };
     area.remove_layer(&done.key).unwrap();
     area.publish_layer(&lying).unwrap();

@@ -379,6 +379,9 @@ pub struct LayerDone {
     pub report: LayerReport,
     /// The zstd compressed tar-split.
     pub tarsplit: bytes::Bytes,
+    /// The table of a layer of a TOC as the registry sent it
+    /// ([`chunked::Metadata::toc_z`]), recorded with the layer.
+    pub toc_z: Option<bytes::Bytes>,
     /// Only the metadata was fetched: the files come on demand and the layer
     /// is not verified against its diff id yet.
     pub lazy: bool,
@@ -508,6 +511,7 @@ fn layer_done(layer: &OciDescriptor, key: LayerKey, p: chunked::Pulled, proven: 
             .collect(),
         report: p.report,
         tarsplit: p.tarsplit,
+        toc_z: p.toc_z,
         lazy: false,
         proven,
         blob_checked: false,
@@ -587,6 +591,7 @@ pub fn whole_done(
         checked: Default::default(),
         report: ingested.report,
         tarsplit: ingested.tarsplit,
+        toc_z: None,
         lazy: false,
     }
 }
@@ -650,6 +655,7 @@ pub async fn pull_layer_lazy(
             chunks: Vec::new(),
             report: l.report,
             tarsplit: l.tarsplit,
+            toc_z: Some(l.toc_z),
             lazy: true,
             proven: false,
             blob_checked: false,
@@ -685,6 +691,7 @@ pub fn stage_layer(
         },
         toc: &toc,
         tarsplit: &done.tarsplit,
+        toc_z: done.toc_z.as_deref(),
     })
     .map_err(ImageError::Io)
 }
@@ -753,6 +760,7 @@ pub fn layer_commit(done: &LayerDone, registry_ref: Option<&str>) -> ImageResult
         refs,
         chunks: done.chunks.clone(),
         tarsplit: Some(done.tarsplit.to_vec()),
+        kept_toc: done.toc_z.as_deref().map(<[u8]>::to_vec),
         blob_checked: done.blob_checked && proven,
     })
 }
@@ -777,6 +785,7 @@ mod layer_commit_tests {
             chunks: Vec::new(),
             report: Default::default(),
             tarsplit: bytes::Bytes::from(zstd::encode_all(&b""[..], 0).unwrap()),
+            toc_z: None,
             lazy: false,
             proven: true,
             blob_checked: true,
@@ -864,6 +873,7 @@ mod budget_tests {
             chunks: Vec::new(),
             report: LayerReport::default(),
             tarsplit: vec![0; tarsplit].into(),
+            toc_z: None,
             proven: false,
             blob_checked: false,
             checked: Default::default(),

@@ -709,6 +709,7 @@ mod tests {
             proven: true,
             blob_checked: true,
             checked: Default::default(),
+            toc_z: None,
         }
     }
 

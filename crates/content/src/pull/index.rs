@@ -74,7 +74,12 @@ where
 /// The index of a layer whose TOC (JSON) and compressed tar-split are
 /// these; None when it would be larger than [`MAX_INDEX`].
 pub fn encode(toc_json: &[u8], tarsplit_z: &[u8]) -> Option<Vec<u8>> {
-    let toc_z = zstd::encode_all(toc_json, 3).ok()?;
+    encode_compressed(&zstd::encode_all(toc_json, 3).ok()?, tarsplit_z)
+}
+
+/// [`encode`] of a TOC that is compressed already (the bytes of a
+/// descriptor's checksum, which the index gives back as they were).
+pub fn encode_compressed(toc_z: &[u8], tarsplit_z: &[u8]) -> Option<Vec<u8>> {
     let total = MAGIC.len() + 8 + toc_z.len() + tarsplit_z.len();
     if total as u64 > MAX_INDEX {
         return None;
@@ -82,16 +87,14 @@ pub fn encode(toc_json: &[u8], tarsplit_z: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&(toc_z.len() as u64).to_le_bytes());
-    out.extend_from_slice(&toc_z);
+    out.extend_from_slice(toc_z);
     out.extend_from_slice(tarsplit_z);
     Some(out)
 }
 
-/// The TOC and the compressed tar-split of an index, checked for their
-/// sizes and their form only: its TOC decodes to at most `max_json` bytes
-/// of JSON, its entries are counted as they are read.
-pub fn decode(data: &[u8], max_json: u64) -> Result<(Toc, Vec<u8>), String> {
-    let max_json = max_json.min(MAX_TOC_JSON);
+/// The compressed TOC and the compressed tar-split of an index as they
+/// are, for the caller to check them.
+pub fn split(data: &[u8]) -> Result<(&[u8], &[u8]), String> {
     if data.len() as u64 > MAX_INDEX {
         return Err("the index is too large".into());
     }
@@ -107,7 +110,15 @@ pub fn decode(data: &[u8], max_json: u64) -> Result<(Toc, Vec<u8>), String> {
         .ok()
         .filter(|&l| l <= rest.len())
         .ok_or_else(|| "a truncated index".to_string())?;
-    let (toc_z, tarsplit_z) = rest.split_at(len);
+    Ok(rest.split_at(len))
+}
+
+/// The TOC and the compressed tar-split of an index, checked for their
+/// sizes and their form only: its TOC decodes to at most `max_json` bytes
+/// of JSON, its entries are counted as they are read.
+pub fn decode(data: &[u8], max_json: u64) -> Result<(Toc, Vec<u8>), String> {
+    let max_json = max_json.min(MAX_TOC_JSON);
+    let (toc_z, tarsplit_z) = split(data)?;
     let mut json = Vec::new();
     super::zstd_decoder(toc_z)
         .map_err(|e| format!("the TOC of the index: {e}"))?
@@ -134,6 +145,15 @@ pub fn decode(data: &[u8], max_json: u64) -> Result<(Toc, Vec<u8>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compressed_table_comes_back_as_it_was_given() {
+        let toc_z = zstd::encode_all(&br#"{"version":1,"entries":[]}"#[..], 19).unwrap();
+        let index = encode_compressed(&toc_z, b"tarsplit").unwrap();
+        assert_eq!(split(&index).unwrap(), (&toc_z[..], &b"tarsplit"[..]));
+        assert!(split(&index[..10]).is_err());
+        assert!(decode(&index, MAX_TOC_JSON).is_ok());
+    }
 
     #[test]
     fn an_index_is_decoded_and_bounded() {

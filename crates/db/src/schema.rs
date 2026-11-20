@@ -153,7 +153,10 @@ END;
 
 -- What the store was first used with (`runroot`: the state directory of
 -- its engine; another one is refused, as podman refuses another run root),
--- and the indexes (`index:<digest>`) that images were pulled by.
+-- the indexes (`index:<digest>`) that images were pulled by, and the
+-- compressed table of contents of a zstd:chunked layer as the registry sent
+-- it, a blob under the key of its layer (`toc:<digest>`), which the
+-- collection of the layer removes.
 CREATE TABLE IF NOT EXISTS store_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -616,6 +619,10 @@ pub struct LayerCommit {
     /// The zstd compressed tar-split: with the files of the layer it gives
     /// back the exact tar stream.
     pub tarsplit: Option<Vec<u8>>,
+    /// The table of contents of a layer of a TOC as the registry sent it
+    /// (compressed, the bytes its descriptor's checksum covers): the peers
+    /// check it against the same descriptor ([`crate::Database::kept_toc`]).
+    pub kept_toc: Option<Vec<u8>>,
     /// The blob was hashed to its digest (`layers.blob_checked`)
     pub blob_checked: bool,
 }

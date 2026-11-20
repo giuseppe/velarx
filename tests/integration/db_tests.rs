@@ -763,6 +763,7 @@ async fn test_a_layer_is_found_by_its_key_only() {
             chunks: Vec::new(),
             tarsplit: None,
             blob_checked,
+            kept_toc: None,
         }],
         image: ImageRecord {
             id: "i".into(),

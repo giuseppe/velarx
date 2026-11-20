@@ -794,6 +794,21 @@ impl Database {
             .map_err(DbError::Sqlite)
     }
 
+    /// The table of contents kept for `checksum` with its layer
+    /// ([`LayerCommit::kept_toc`]); removed with the layer.
+    pub async fn kept_toc(&self, checksum: &Digest) -> DbResult<Option<Vec<u8>>> {
+        let key = LayerKey::Toc(*checksum);
+        self.conn
+            .call(move |conn| {
+                let mut stmt =
+                    conn.prepare_cached("SELECT value FROM store_settings WHERE key = ?1")?;
+                let mut rows = stmt.query([&key])?;
+                Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
+            })
+            .await
+            .map_err(DbError::Sqlite)
+    }
+
     pub async fn insert_layer(&self, layer: &LayerRecord) -> DbResult<()> {
         let layer = layer.clone();
         self.conn
@@ -1775,6 +1790,35 @@ impl Database {
             .await?)
     }
 
+    /// The bytes of the manifest or of the configuration of a shared image
+    /// that each of `digests` names, or of a kept index that lists a shared
+    /// image (as the store keeps them), in one call.
+    pub async fn shared_image_metadata(&self, digests: &[Digest]) -> DbResult<Vec<Option<String>>> {
+        let digests = digests.to_vec();
+        Ok(self
+            .conn
+            .call(move |conn| {
+                use rusqlite::OptionalExtension;
+                let mut stmt = conn.prepare_cached(
+                    "SELECT CASE WHEN i.manifest_digest = ?1 THEN i.manifest ELSE i.config END
+                     FROM images i JOIN shared_images s ON s.image_id = i.id
+                     WHERE i.manifest_digest = ?1 OR i.config_digest = ?1
+                     UNION ALL
+                     SELECT k.value FROM store_settings k
+                     WHERE k.key = 'index:' || ?1 AND EXISTS (
+                         SELECT 1 FROM images i JOIN shared_images s ON s.image_id = i.id
+                         WHERE instr(k.value, i.manifest_digest) > 0)
+                     LIMIT 1",
+                )?;
+                digests
+                    .iter()
+                    .map(|d| stmt.query_row([d], |r| r.get(0)).optional())
+                    .collect::<Result<_, _>>()
+                    .map_err(Into::into)
+            })
+            .await?)
+    }
+
     /// The layers that came from pulls that may be shared.
     pub async fn public_layers(&self) -> DbResult<std::collections::HashSet<LayerKey>> {
         Ok(self
@@ -2367,6 +2411,14 @@ fn commit_layer(tx: &rusqlite::Transaction, layer: &LayerCommit) -> rusqlite::Re
         tx.execute(
             "UPDATE layers SET diff_id_other = ?2 WHERE id = ?1",
             rusqlite::params![key, other],
+        )?;
+    }
+    // (keyed by the layer, whose removal takes it: `LayerKey::Toc` of its
+    // checksum)
+    if let Some(toc_z) = &layer.kept_toc {
+        tx.execute(
+            "INSERT OR IGNORE INTO store_settings (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, toc_z],
         )?;
     }
     {
@@ -2987,6 +3039,49 @@ mod tests {
         Digest::of(Algorithm::Sha256, b"m")
     }
 
+    /// The table of contents a layer of a TOC was sent with is kept by the
+    /// transaction that records the layer, and only by it.
+    #[tokio::test]
+    async fn a_table_is_kept_with_its_layer() {
+        use crate::{LayerCommit, LayerKey};
+        let db = Database::open_in_memory().await.unwrap();
+        let sha = |s: &str| Digest::of(Algorithm::Sha256, s.as_bytes());
+        let commit = |n: &str, kept_toc: Option<Vec<u8>>| LayerCommit {
+            record: LayerRecord {
+                stream_size: Some(0),
+                key: LayerKey::Toc(sha(n)),
+                blob: None,
+                diff_id: None,
+                other_diff_id: None,
+                size: 1,
+                toc: Some("{}".into()),
+                status: "ready".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                registry_ref: None,
+                erofs: None,
+                owners: None,
+            },
+            files: vec![],
+            refs: vec![],
+            chunks: vec![],
+            tarsplit: Some(vec![]),
+            kept_toc,
+            blob_checked: false,
+        };
+        db.commit_layers(
+            vec![commit("kept", Some(b"sent".to_vec())), commit("none", None)],
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.kept_toc(&sha("kept")).await.unwrap(),
+            Some(b"sent".to_vec())
+        );
+        assert_eq!(db.kept_toc(&sha("none")).await.unwrap(), None);
+    }
+
     /// A chunk that two files have is found, and may be given to peers, as
     /// long as one of them is a file of a layer that may be given: the
     /// layer committed last (a newer version of the file, made of what the
@@ -3031,6 +3126,7 @@ mod tests {
                 .collect(),
             tarsplit: None,
             blob_checked: false,
+            kept_toc: None,
         };
         let (old, new) = (LayerKey::Whole(sha("old")), LayerKey::Whole(sha("new")));
         // the old file is c1 c2; the new one c1 c3, committed after it
@@ -3616,6 +3712,47 @@ mod tests {
             "/run/a"
         );
     }
+    /// A peer is served the manifest and the configuration of a shared
+    /// image, and a kept index that lists one; nothing of an image that is
+    /// not shared.
+    #[tokio::test]
+    async fn only_the_metadata_of_shared_images_is_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("db.sqlite")).await.unwrap();
+        let (shared, private) = (record("s"), record("p"));
+        for image in [&shared, &private] {
+            db.insert_image(&ImageRecord {
+                manifest: format!("manifest {}", image.id),
+                config: format!("config {}", image.id),
+                ..image.clone()
+            })
+            .await
+            .unwrap();
+            let index = format!(
+                r#"{{"manifests":[{{"digest":"{}"}}]}}"#,
+                image.manifest_digest
+            );
+            db.set_index(&Digest::of(Algorithm::Sha256, image.id.as_bytes()), &index)
+                .await
+                .unwrap();
+        }
+        db.share_pull("s", vec![], vec![], vec![]).await.unwrap();
+        let served = |d: Digest| {
+            let db = &db;
+            async move { db.shared_image_metadata(&[d]).await.unwrap().pop().unwrap() }
+        };
+        assert_eq!(served(shared.manifest_digest).await.unwrap(), "manifest s");
+        assert_eq!(served(shared.config_digest).await.unwrap(), "config s");
+        assert!(served(Digest::of(Algorithm::Sha256, b"s")).await.is_some());
+        for d in [
+            private.manifest_digest,
+            private.config_digest,
+            Digest::of(Algorithm::Sha256, b"p"),
+        ] {
+            assert_eq!(served(d).await, None);
+        }
+    }
+
     fn record(id: &str) -> ImageRecord {
         ImageRecord {
             id: id.into(),

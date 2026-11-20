@@ -100,8 +100,10 @@ const UNREFERENCED_LAYERS: &str = "SELECT l.id, l.stream_size FROM layers l
 /// Forget a layer (`?1`, its key): its files, and the repositories of its
 /// blob when no other layer is of that blob (a layer of its TOC and one
 /// pulled whole may be).
-const FORGET_LAYER: [&str; 3] = [
+const FORGET_LAYER: [&str; 4] = [
     "DELETE FROM file_refs WHERE layer_id = ?1",
+    // (the table of contents kept for the peers is under the key)
+    "DELETE FROM store_settings WHERE key = ?1",
     "DELETE FROM blob_sources WHERE digest = (SELECT blob FROM layers WHERE id = ?1)
          AND NOT EXISTS (SELECT 1 FROM layers WHERE blob = blob_sources.digest AND id != ?1)",
     "DELETE FROM layers WHERE id = ?1",
@@ -1365,6 +1367,7 @@ mod engine_copy_tests {
             },
             toc: "{}",
             tarsplit: b"",
+            toc_z: None,
         })
         .unwrap();
         assert_eq!(area.unnamed_layers(), [key]);

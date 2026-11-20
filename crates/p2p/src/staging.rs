@@ -417,6 +417,7 @@ impl PeerSource {
         let cap = velarx_content::pull::index::json_cap(max_json);
         self.fetch_indexes(
             &item,
+            false,
             &|bytes| velarx_content::pull::index::decode(bytes, cap).is_ok(),
             &mut index,
         )
@@ -517,7 +518,54 @@ impl Sink for One {
     }
 }
 
+/// The checksum of the table of contents the descriptor of `blob` names.
+fn checksum_of(blob: &Blob) -> Option<Digest> {
+    let desc = velarx_types::OciDescriptor {
+        media_type: blob.media_type.clone(),
+        digest: blob.digest.parse().ok()?,
+        size: i64::try_from(blob.size).ok()?,
+        annotations: blob
+            .annotations
+            .iter()
+            .flatten()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
+    velarx_types::layer::chunked_checksum(&desc)
+}
+
 impl PeerSource {
+    /// The compressed table of contents `checksum` names and its tar-split,
+    /// from the index of a peer: one whose table is not that one, or whose
+    /// tar-split is not the one the table names, is not taken (`cap`: the
+    /// largest JSON of the table).
+    pub(crate) async fn toc_of(&self, checksum: &Digest, cap: u64) -> Option<(Vec<u8>, Vec<u8>)> {
+        use velarx_content::pull::index;
+        let mut one = One(None);
+        let item = [Item {
+            digest: checksum.to_string(),
+            size: Some(index::MAX_INDEX),
+        }];
+        let well_formed = |bytes: &[u8]| {
+            let Ok((toc_z, tarsplit)) = index::split(bytes) else {
+                return false;
+            };
+            Digest::of(checksum.alg(), toc_z) == *checksum
+                && index::decode(bytes, cap).is_ok_and(|(toc, _)| match toc.tar_split_digest {
+                    Some(d) => d
+                        .parse::<Digest>()
+                        .is_ok_and(|d| Digest::of(d.alg(), tarsplit) == d),
+                    None => tarsplit.is_empty(),
+                })
+        };
+        self.fetch_indexes(&item, true, &well_formed, &mut one)
+            .await
+            .ok()?;
+        let index = one.0?;
+        let (toc, tarsplit) = index::split(&index).ok()?;
+        Some((toc.to_vec(), tarsplit.to_vec()))
+    }
+
     /// What the peers gave for `name` as a sealed memory file, or
     /// `unavailable`.
     async fn given(&self, one: One, name: &str) -> Result<std::fs::File, FetcherError> {
@@ -556,6 +604,78 @@ impl StagingFetcher for PeerSource {
                 .map_err(failed)?;
         }
         self.given(one, &blob.digest).await
+    }
+
+    /// The table of contents and tar-split of the zstd:chunked layers whose
+    /// descriptor's checksum a peer's index has the compressed bytes of;
+    /// what no peer has is `unreachable`, for the next fetcher.  A peer's
+    /// bytes are used only when they have the checksum (the engine checks
+    /// them against the descriptor again).
+    async fn probe(
+        &self,
+        _scope: &Scope,
+        layers: Vec<Blob>,
+        out: &Out<velarx_content::fetcher::fetch::Probed>,
+    ) -> Result<(), FetcherError> {
+        use velarx_content::fetcher::fetch::{NotLazy, Probed, TocSource};
+        for (at, blob) in layers.iter().enumerate() {
+            let none = Probed {
+                layer: at as u32,
+                toc: TocSource::None,
+                on_demand: false,
+                reason: Some(NotLazy::Unreachable),
+                toc_file: None,
+                tarsplit_file: None,
+            };
+            let cap =
+                velarx_content::pull::index::json_cap(i64::try_from(blob.size).unwrap_or(i64::MAX));
+            let found = match checksum_of(blob) {
+                Some(checksum) => self.toc_of(&checksum, cap).await,
+                None => None,
+            };
+            let Some((toc, tarsplit)) = found else {
+                out.send(none).await.map_err(gone)?;
+                continue;
+            };
+            let mut fds = vec![velarx_base::sealed::sealed_memory(&toc).map_err(failed)?];
+            if !tarsplit.is_empty() {
+                fds.push(velarx_base::sealed::sealed_memory(&tarsplit).map_err(failed)?);
+            }
+            let reply = Probed {
+                toc: TocSource::Carried,
+                on_demand: true,
+                reason: None,
+                toc_file: Some(0),
+                tarsplit_file: (!tarsplit.is_empty()).then_some(1),
+                ..none
+            };
+            out.send_with(reply, fds).await.map_err(gone)?;
+        }
+        Ok(())
+    }
+
+    /// The manifest a digest names: what the peers send is checked against
+    /// it (a tag is not one: nobody here says what it names).
+    async fn get_manifest(
+        &self,
+        _scope: &Scope,
+        reference: &str,
+        max: u64,
+    ) -> Result<(std::fs::File, Option<String>), FetcherError> {
+        let mut one = One(None);
+        let item = [Item {
+            digest: reference.to_string(),
+            size: None,
+        }];
+        if crate::limits::is_digest(reference) {
+            self.fetch_group(&item, None, &mut one)
+                .await
+                .map_err(failed)?;
+        }
+        if one.0.as_ref().is_some_and(|b| b.len() as u64 > max) {
+            return Err(FetcherError::unavailable(format!("{reference}: too large")));
+        }
+        Ok((self.given(one, reference).await?, None))
     }
 
     /// The startup profile of the image `image`.

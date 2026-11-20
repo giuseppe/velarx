@@ -76,6 +76,9 @@ pub struct Pulled {
     pub diff_id: Digest,
     /// The verified zstd compressed tar-split.
     pub tarsplit: bytes::Bytes,
+    /// The table as the registry sent it, of a layer pulled by its table
+    /// ([`Metadata::toc_z`])
+    pub toc_z: Option<bytes::Bytes>,
 }
 
 /// The positions of the metadata in the blob.
@@ -260,16 +263,26 @@ pub async fn layer_index(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<Op
     };
     let by_table = async {
         let (toc_z, ts_z) = metadata(ctx, layer).await?;
-        let digest = layer.digest;
-        let max_tar = ctx.limits.max_layer_bytes;
-        tokio::task::spawn_blocking(move || verify_metadata(&info, &toc_z, ts_z, &digest, max_tar))
-            .await
-            .map_err(|e| fail(e.to_string()))?
+        verified(&info, toc_z, ts_z, layer.digest, ctx.limits.max_layer_bytes).await
     };
     by_table
         .await
         .map(Some)
         .map_err(|e| naming(&layer.digest, e))
+}
+
+/// [`verify_metadata`] of what the fetchers found.
+pub(super) async fn verified(
+    info: &Info,
+    toc_z: Vec<u8>,
+    ts_z: Vec<u8>,
+    layer: Digest,
+    max_tar: u64,
+) -> ImageResult<Metadata> {
+    let info = info.clone();
+    tokio::task::spawn_blocking(move || verify_metadata(&info, &toc_z, ts_z, &layer, max_tar))
+        .await
+        .map_err(|e| fail(e.to_string()))?
 }
 
 /// Decompress at most `max` bytes, and exactly `expected` if it is known.
@@ -296,6 +309,10 @@ pub struct Metadata {
     /// What the layer is stored by: the entries of `toc` as a layer keeps
     /// them ([`super::lazy::toc_view`]); `toc` itself for a canonical layer.
     pub stored: Arc<Toc>,
+    /// The table as the registry sent it (compressed, the bytes its
+    /// descriptor's checksum covers): kept with the layer for the peers,
+    /// which check it against the same descriptor.
+    pub toc_z: bytes::Bytes,
     pub tarsplit_z: bytes::Bytes,
     pub tarsplit_size: u64,
 }
@@ -363,6 +380,7 @@ fn vouched_metadata(
         return Ok(Metadata {
             stored: toc.clone(),
             toc,
+            toc_z: bytes::Bytes::copy_from_slice(toc_z),
             tarsplit_z: bytes::Bytes::new(),
             tarsplit_size: 0,
         });
@@ -414,6 +432,7 @@ fn vouched_metadata(
     Ok(Metadata {
         toc: Arc::new(toc),
         stored: Arc::new(stored),
+        toc_z: bytes::Bytes::copy_from_slice(toc_z),
         tarsplit_z: ts_z,
         tarsplit_size: tarsplit.2,
     })
@@ -1555,14 +1574,7 @@ async fn pull_by_table(
         started.elapsed()
     );
     let metadata_bytes = (toc_z.len() + ts_z.len()) as u64;
-    let digest = layer.digest;
-    let meta = tokio::task::spawn_blocking({
-        let info = info.clone();
-        let max_tar = ctx.limits.max_layer_bytes;
-        move || verify_metadata(&info, &toc_z, ts_z, &digest, max_tar)
-    })
-    .await
-    .map_err(|e| fail(e.to_string()))??;
+    let meta = verified(info, toc_z, ts_z, layer.digest, ctx.limits.max_layer_bytes).await?;
 
     debug!(
         "Layer {}: metadata verified after {:?}",
@@ -1807,6 +1819,7 @@ pub async fn pull_whole(
             report,
             diff_id: ingested.diff_id,
             tarsplit: ingested.tarsplit,
+            toc_z: None,
         },
         by_registry,
     ))
@@ -2158,6 +2171,7 @@ async fn verify_layer(
         report,
         diff_id,
         tarsplit: meta.tarsplit_z,
+        toc_z: Some(meta.toc_z),
     })
 }
 

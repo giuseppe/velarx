@@ -15,7 +15,8 @@
 //!                         to a fetcher: `lease` (`flock`, held while files
 //!                         are fetched into it), and for a lazily staged
 //!                         layer layer.json (written last: the publish
-//!                         point), toc.json, tarsplit.zst
+//!                         point), toc.json, tarsplit.zst, toc.zst (the
+//!                         table as the registry sent it)
 //! composefs/              the EROFS images of the staged layers, moved to
 //!                         the store's `composefs/` with the layer's commit
 //!                         (`objects` beside it, never made, stands for the
@@ -261,6 +262,15 @@ impl StagedLayer {
     pub fn tarsplit(&self) -> io::Result<Vec<u8>> {
         std::fs::read(self.dir.join("tarsplit.zst"))
     }
+
+    /// The table as the registry sent it, recorded with the layer.
+    pub fn toc_z(&self) -> io::Result<Option<Vec<u8>>> {
+        match std::fs::read(self.dir.join("toc.zst")) {
+            Ok(toc_z) => Ok(Some(toc_z)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// What a layer is published with.
@@ -268,6 +278,7 @@ pub struct NewLayer<'a> {
     pub meta: StagedLayerMeta,
     pub toc: &'a str,
     pub tarsplit: &'a [u8],
+    pub toc_z: Option<&'a [u8]>,
 }
 
 /// A pull in the area, with what is known of its completion.
@@ -490,6 +501,9 @@ impl Staging {
         // once write the same table and tar-split)
         write_atomic(&dir.join("toc.json"), layer.toc.as_bytes())?;
         write_atomic(&dir.join("tarsplit.zst"), layer.tarsplit)?;
+        if let Some(toc_z) = layer.toc_z {
+            write_atomic(&dir.join("toc.zst"), toc_z)?;
+        }
         write_atomic(
             &dir.join("layer.json"),
             &serde_json::to_vec(&layer.meta).map_err(io::Error::other)?,
@@ -974,6 +988,7 @@ mod tests {
             meta: meta.clone(),
             toc: "{\"version\":1,\"entries\":[]}",
             tarsplit: b"ts",
+            toc_z: None,
         })
         .unwrap();
         let got = area.layer(&key).unwrap().unwrap();

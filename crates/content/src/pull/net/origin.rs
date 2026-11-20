@@ -157,9 +157,18 @@ pub struct OriginNet {
     /// The credentials and certificates of the command, for the scope
     access: Option<Access>,
     conn: Arc<tokio::sync::Mutex<Option<FetchConn>>>,
+    /// Asked first for what a digest names
+    before: Option<Arc<MetadataSources>>,
 }
 
 impl OriginNet {
+    /// The fetchers asked before the registry for a manifest or a
+    /// configuration a digest names.
+    pub fn with_sources(mut self, before: Arc<MetadataSources>) -> Self {
+        self.before = Some(before);
+        self
+    }
+
     /// `repository`: the reference the image is pulled from, as it is
     /// recorded for its layers (`registry_ref`).
     pub fn new(origin: Arc<RegistryOrigin>, repository: String, tls_verify: bool) -> Self {
@@ -169,6 +178,7 @@ impl OriginNet {
             tls_verify,
             access: None,
             conn: Arc::default(),
+            before: None,
         }
     }
 
@@ -181,6 +191,7 @@ impl OriginNet {
             tls_verify: false,
             access: None,
             conn: Arc::default(),
+            before: None,
         }
     }
 
@@ -199,6 +210,7 @@ impl OriginNet {
             tls_verify,
             access: None,
             conn: Arc::default(),
+            before: None,
         }
     }
 
@@ -295,6 +307,11 @@ impl OriginNet {
     /// The manifest `reference` (a tag or a digest) names and the digest of
     /// its bytes; None if the registry does not have it.
     pub async fn manifest_opt(&self, reference: &str) -> ImageResult<Option<(Bytes, Digest)>> {
+        if let (Some(before), Ok(digest)) = (&self.before, reference.parse::<Digest>()) {
+            if let Some(bytes) = before.manifest(&digest).await {
+                return Ok(Some((bytes, digest)));
+            }
+        }
         let mut slot = self.conn.lock().await;
         let conn = self.scoped(&mut slot).await?;
         let got = conn.get_manifest(reference, MAX_MANIFEST_SIZE).await;
@@ -392,6 +409,11 @@ impl OriginNet {
                 "the blob is too large",
             ));
         }
+        if let Some(before) = &self.before {
+            if let Some(bytes) = before.blob(blob).await {
+                return Ok(bytes);
+            }
+        }
         let mut slot = self.conn.lock().await;
         let conn = self.scoped(&mut slot).await?;
         let got = conn.get_blob(blob).await;
@@ -434,6 +456,76 @@ fn written_bytes(file: &std::fs::File, length: u64, max: u64, name: &str) -> Ima
     file.read_exact_at(&mut bytes, 0)
         .map_err(|e| invalid(e.to_string()))?;
     Ok(bytes)
+}
+
+/// The fetchers of `[pull] sources` asked for the metadata of a pull by
+/// digest before the registry: what one sends is untrusted, and is used only
+/// when it has the digest asked for, so that the registry is asked
+/// when nobody sent it right.
+pub struct MetadataSources {
+    links: tokio::sync::Mutex<Vec<crate::pull::staged_fetch::Link>>,
+}
+
+impl MetadataSources {
+    /// The links that accept a bare scope.
+    pub async fn open(links: Vec<crate::pull::staged_fetch::Link>) -> Arc<Self> {
+        let mut opened = Vec::new();
+        for mut link in links {
+            let scope = Scoping::bare(link.idle);
+            match crate::idle::within(link.idle, link.conn.open(scope)).await {
+                Ok(()) => opened.push(link),
+                Err(e) => tracing::debug!("The fetcher {} is left out: {e}", link.name),
+            }
+        }
+        Arc::new(Self {
+            links: tokio::sync::Mutex::new(opened),
+        })
+    }
+
+    /// The manifest `digest` names, from the first fetcher that has it.
+    pub async fn manifest(&self, digest: &Digest) -> Option<Bytes> {
+        let mut links = self.links.lock().await;
+        for link in links.iter_mut() {
+            let got = crate::idle::within(
+                link.idle,
+                link.conn
+                    .get_manifest(&digest.to_string(), MAX_MANIFEST_SIZE),
+            )
+            .await;
+            if let Some(bytes) =
+                checked(&link.name, digest, got.ok().map(|g| g.0), MAX_MANIFEST_SIZE)
+            {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    /// The blob `blob` names, of exactly its size, from the first fetcher
+    /// that has it.
+    pub async fn blob(&self, blob: &Blob) -> Option<Bytes> {
+        let digest: Digest = blob.digest.parse().ok()?;
+        let mut links = self.links.lock().await;
+        for link in links.iter_mut() {
+            let got = crate::idle::within(link.idle, link.conn.get_blob(blob)).await;
+            if let Some(bytes) = checked(&link.name, &digest, got.ok(), blob.size)
+                .filter(|b| b.len() as u64 == blob.size)
+            {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+}
+
+/// The bytes of the sealed memory file `file` if they have the digest.
+fn checked(party: &str, digest: &Digest, file: Option<std::fs::File>, max: u64) -> Option<Bytes> {
+    let bytes = velarx_base::sealed::read_sealed_whole(&file?, max).ok()?;
+    if Digest::of(digest.alg(), &bytes) != *digest {
+        tracing::debug!("The fetcher {party}: {digest} is not what it says");
+        return None;
+    }
+    Some(Bytes::from(bytes))
 }
 
 /// A repository of a registry reached through the registry fetcher for
@@ -530,6 +622,53 @@ impl OriginRemote {
 mod tests {
     use super::*;
     use velarx_proto::transfer::Failure;
+
+    async fn sources_of(bytes: &[u8]) -> (Arc<MetadataSources>, crate::serve_fetch::LocalFetcher) {
+        use crate::pull::staged_fetch::{Link, REGISTRY_IDLE};
+        let fetcher = crate::serve_fetch::LocalFetcher::start(
+            Arc::new(crate::fakes::Metadata(bytes.to_vec())),
+            crate::activation::Limits::default(),
+        )
+        .unwrap();
+        let conn = FetchConn::new(fetcher.connect().unwrap()).unwrap();
+        let link = Link {
+            name: "peer".into(),
+            conn,
+            own: false,
+            idle: REGISTRY_IDLE,
+        };
+        (MetadataSources::open(vec![link]).await, fetcher)
+    }
+
+    /// What a fetcher sends for a digest is used when it has that digest and
+    /// is not used otherwise: the pull then asks the registry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fetcher_before_the_registry_is_believed_only_by_the_digest() {
+        let body = br#"{"schemaVersion":2}"#;
+        let right = Digest::of(velarx_types::digest::Algorithm::Sha256, body);
+        let (sources, _keep) = sources_of(body).await;
+        assert_eq!(sources.manifest(&right).await.as_deref(), Some(&body[..]));
+        let blob = Blob {
+            digest: right.to_string(),
+            size: body.len() as u64,
+            media_type: "x".into(),
+            annotations: None,
+        };
+        assert!(sources.blob(&blob).await.is_some());
+        // (a descriptor that says another size is not the blob sent)
+        let bigger = Blob {
+            size: blob.size + 1,
+            ..blob.clone()
+        };
+        assert!(sources.blob(&bigger).await.is_none());
+        let wrong = Digest::of(velarx_types::digest::Algorithm::Sha256, b"other");
+        assert!(sources.manifest(&wrong).await.is_none());
+        let other = Blob {
+            digest: wrong.to_string(),
+            ..blob
+        };
+        assert!(sources.blob(&other).await.is_none());
+    }
 
     /// The refusals and the absences the fetcher tells keep their class: the
     /// status of the API comes from it.

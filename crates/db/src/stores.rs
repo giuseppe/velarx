@@ -571,6 +571,7 @@ mod tests {
             chunks: vec![],
             tarsplit: tarsplit.map(<[u8]>::to_vec),
             blob_checked: false,
+            kept_toc: None,
         };
         db.commit_layers(
             vec![

@@ -28,6 +28,8 @@ struct LazyLayer {
     diff_id: Digest,
     toc: Arc<Toc>,
     tarsplit: bytes::Bytes,
+    /// The table as the registry sent it, recorded with the layer
+    toc_z: Option<bytes::Bytes>,
     /// What the staging area says of it (`layer.json`)
     meta: velarx_content::pull::staged::StagedLayerMeta,
 }
@@ -469,6 +471,7 @@ impl ImageService {
                 diff_id: *diff_id,
                 toc: Arc::new(toc),
                 tarsplit: staged.tarsplit()?.into(),
+                toc_z: staged.toc_z()?.map(bytes::Bytes::from),
                 meta: staged.meta,
             });
         }
@@ -532,6 +535,8 @@ impl ImageService {
             diff_id: *diff_id,
             toc,
             tarsplit: tarsplit.into(),
+            // (the engine's row keeps it already)
+            toc_z: None,
             meta: velarx_content::pull::staged::StagedLayerMeta {
                 key: key.to_string(),
                 blob: blob.to_string(),
@@ -825,6 +830,7 @@ impl ImageService {
             );
             (commit.record.blob, commit.record.size) =
                 (layer.meta.blob.parse().ok(), layer.meta.size);
+            commit.kept_toc = layer.toc_z.as_deref().map(<[u8]>::to_vec);
             self.db
                 .commit_staged_layer(velarx_db::StagedLayerCommit {
                     layer: commit,
@@ -920,6 +926,7 @@ impl ImageService {
                 chunks,
                 report: Default::default(),
                 tarsplit: layer.tarsplit.clone(),
+                toc_z: layer.toc_z.clone(),
                 lazy: false,
                 proven: false,
                 blob_checked: false,
@@ -1517,6 +1524,7 @@ mod tests {
                 owners: String::new(),
                 created_at: String::new(),
             },
+            toc_z: None,
         }
     }
 
@@ -2065,6 +2073,7 @@ mod tests {
                     owners: String::new(),
                     created_at: String::new(),
                 },
+                toc_z: None,
             };
             service
                 .stage_lazy(&key, vec![file.clone()], Urgency::Background)
@@ -2264,6 +2273,7 @@ mod tests {
                 chunks: vec![],
                 tarsplit: Some(b"ts".to_vec()),
                 blob_checked: false,
+                kept_toc: None,
             }],
             vec![],
             vec![],
@@ -2349,6 +2359,7 @@ mod tests {
                 chunks: vec![],
                 tarsplit: Some(b"ts".to_vec()),
                 blob_checked: false,
+                kept_toc: None,
             }],
             vec![],
             vec![],

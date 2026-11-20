@@ -103,3 +103,39 @@ impl StagingFetcher for Fake {
             .map_err(|_| failed("gone".to_string()))
     }
 }
+
+/// A fetcher that has one manifest and one blob, as bytes it sends for any
+/// digest asked (so they may be the wrong ones).
+pub struct Metadata(pub Vec<u8>);
+
+#[async_trait]
+impl StagingFetcher for Metadata {
+    fn described(&self) -> Described {
+        Described {
+            name: "metadata".into(),
+            capabilities: vec!["metadata".into()],
+            max_objects: 1,
+        }
+    }
+
+    async fn get_manifest(
+        &self,
+        _scope: &Scope,
+        _reference: &str,
+        _max: u64,
+    ) -> Result<(std::fs::File, Option<String>), FetcherError> {
+        let file = velarx_base::sealed::sealed_memory(&self.0)
+            .map_err(|e| FetcherError::failed(e.to_string()))?;
+        Ok((file.into(), None))
+    }
+
+    async fn get_blob(
+        &self,
+        _scope: &Scope,
+        _blob: &crate::fetcher::fetch::Blob,
+    ) -> Result<std::fs::File, FetcherError> {
+        let file = velarx_base::sealed::sealed_memory(&self.0)
+            .map_err(|e| FetcherError::failed(e.to_string()))?;
+        Ok(file.into())
+    }
+}
