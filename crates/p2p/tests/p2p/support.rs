@@ -82,7 +82,31 @@ pub async fn fetch(
         "identify did not tell the QUIC endpoint"
     );
     let items: Vec<(String, Option<u64>)> = digests.iter().map(|d| (d.clone(), None)).collect();
-    a.fetch(b.peer_id(), &items).await
+    fetch_from(a, b.peer_id(), &items).await
+}
+
+/// [`P2PNode::fetch_into`], the chunks collected in the order asked.
+pub async fn fetch_from(
+    node: &P2PNode,
+    peer: libp2p::PeerId,
+    digests: &[(String, Option<u64>)],
+) -> velarx_p2p::P2PResult<Vec<(String, Vec<u8>)>> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(velarx_p2p::CHUNKS_IN_FLIGHT);
+    let (done, mut found) = futures::join!(node.fetch_into(peer, digests, tx), async move {
+        let mut found = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            found.push(chunk);
+        }
+        found
+    });
+    done?;
+    let order: HashMap<&str, usize> = digests
+        .iter()
+        .enumerate()
+        .map(|(i, (d, _))| (d.as_str(), i))
+        .collect();
+    found.sort_by_key(|(d, _)| order.get(d.as_str()).copied().unwrap_or(usize::MAX));
+    Ok(found)
 }
 
 /// Whether `holds` holds of what `node` heard from its peers within

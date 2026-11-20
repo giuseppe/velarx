@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use tracing::{error, warn};
 use velarx_storage::ChunkFile;
-use velarx_types::digest::{Digest, DigestWriter};
 
 /// Chunks read from the stores at the same time, and whose files are asked
 /// of the daemon in one round trip.
@@ -48,47 +47,6 @@ pub fn open_wave(
             })
             .collect(),
     ))
-}
-
-/// Whether the bytes of a chunk, as they go by, have the digest it is asked
-/// for by: the hash of the bytes for a content digest, their fs-verity
-/// digest (the name of an object) for an fs-verity one, in the algorithm of
-/// the digest either way.
-pub struct Verifier {
-    want: Digest,
-    hasher: Hasher,
-}
-
-enum Hasher {
-    Content(DigestWriter),
-    Verity(velarx_storage::VerityHasher),
-}
-
-impl Verifier {
-    /// A verifier for the digest `want`; `None` when it is not one.
-    pub fn new(want: &str) -> Option<Self> {
-        let want = Digest::parse_key(want).ok()?;
-        let hasher = match want.is_fsverity() {
-            true => Hasher::Verity(velarx_storage::VerityHasher::new(want.alg())),
-            false => Hasher::Content(DigestWriter::for_digest(&want)),
-        };
-        Some(Self { want, hasher })
-    }
-
-    pub fn update(&mut self, bytes: &[u8]) {
-        match &mut self.hasher {
-            Hasher::Content(h) => h.update(bytes),
-            Hasher::Verity(h) => h.update(bytes),
-        }
-    }
-
-    /// Whether all the bytes had the digest.
-    pub fn finish(self) -> bool {
-        match self.hasher {
-            Hasher::Content(h) => h.finalize() == self.want,
-            Hasher::Verity(h) => h.finish() == self.want.to_string(),
-        }
-    }
 }
 
 /// The bytes of the chunk `digest` from the provider (one that hands over no

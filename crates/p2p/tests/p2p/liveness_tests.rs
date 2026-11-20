@@ -459,7 +459,7 @@ async fn a_member_with_no_quic_path_is_not_asked_for_data() {
     assert!(why.contains("advertises no QUIC"), "{why}");
 
     let digest = digest_of(b"a chunk");
-    match a.fetch(peer, &[(digest.clone(), None)]).await {
+    match super::support::fetch_from(&a, peer, &[(digest.clone(), None)]).await {
         Err(P2PError::NoQuicPath {
             peer: named,
             reason,
@@ -483,8 +483,9 @@ async fn a_member_with_no_quic_path_is_not_asked_for_data() {
     ));
     // (a pull is told the same, to go on to the next peer)
     let peers = NodePeers(a.clone());
+    let (out, _chunks) = tokio::sync::mpsc::channel(1);
     assert!(matches!(
-        peers.request(peer, &[(digest, None)]).await,
+        peers.request(peer, &[(digest, None)], out).await,
         Err(PeerError::NoQuic(_))
     ));
     assert_eq!(peers.without_quic().await, 1);

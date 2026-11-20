@@ -78,34 +78,40 @@ impl Transport for SimTransport {
         crate::lanes_of(chunks, self.me().cfg.quic_streams)
     }
 
-    /// A stream for each lane, as `P2PNode::fetch` asks: what came is kept,
-    /// with nothing the failure of a lane is the answer.
-    async fn fetch(
+    /// A stream for each lane, as `P2PNode::fetch_into` asks: what came is
+    /// kept, with nothing the failure of a lane is the answer.
+    async fn fetch_into(
         &self,
         peer: PeerId,
         items: &[(String, Option<u64>)],
-    ) -> P2PResult<Vec<(String, Vec<u8>)>> {
+        out: crate::ChunkTx,
+    ) -> P2PResult<()> {
         let (me, target) = self.path(peer).await?;
         if items.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let idle = crate::quic::Limits::default().idle;
         let lanes = crate::lanes(items, me.cfg.quic_streams);
         let answers = futures::future::join_all(lanes.into_iter().map(|lane| {
-            let (a, b) = (me.clone(), target.clone());
+            let (a, b, out) = (me.clone(), target.clone(), out.clone());
             let digests: Vec<String> = lane.into_iter().map(|(d, _)| d).collect();
             let asked = 60 + 40 * digests.len() as u64;
             async move {
-                tokio::time::timeout(idle, async move {
+                let chunks = tokio::time::timeout(idle, async move {
                     Self::hop(&a, &b, asked).await;
                     b.answer_quic(&a, &digests).await
                 })
                 .await
-                .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "no answer")))
+                .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "no answer")))?;
+                let n = chunks.len();
+                for chunk in chunks {
+                    let _ = out.send(chunk).await;
+                }
+                Ok(n)
             }
         }))
         .await;
-        crate::lanes_answer(peer, items, answers)
+        crate::lanes_answer(peer, answers)
     }
 
     async fn without_quic(&self) -> usize {

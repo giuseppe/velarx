@@ -38,13 +38,13 @@
 //! byte, 1 and a length (u64) and that many bytes, or 0 (not here), or 2
 //! (no room in this answer: ask again), or 3 (the server could not read
 //! its store).
-//! * chunks ([`OP_CHUNKS`]): at most [`MAX_REQUEST_DIGESTS`].  What is sent is
-//!   hashed as it is sent, and its last piece goes only when the whole chunk
-//!   has its digest.  A chunk whose store file does not match it (or cannot
-//!   be read) is answered 3 before its first piece; after it, the stream is
-//!   reset with the code 3, and the peer takes that chunk and the rest of
-//!   the answer for another peer.  After the first chunk, the answer holds at most
-//!   [`MAX_RESPONSE_PAYLOAD`] bytes: the rest is answered with 2.
+//! * chunks ([`OP_CHUNKS`]): at most [`MAX_REQUEST_DIGESTS`].  What is sent
+//!   is what the store holds: the one that asks checks every chunk against its
+//!   digest.  A chunk whose store file cannot be read is answered 3 before its
+//!   first piece; after it, the stream is reset with the code 3, and the peer
+//!   takes that chunk and the rest of the answer for another peer.  After the
+//!   first chunk, the answer holds at most [`MAX_RESPONSE_PAYLOAD`] bytes: the
+//!   rest is answered with 2.
 //! * the question whether a chunk is here ([`OP_PROBE`]): one digest, one byte
 //!   back (1, 0, or 2: no room), no data and no credit; it has places of its
 //!   own ([`Admission::probe_slot`]).
@@ -775,41 +775,64 @@ impl Quic {
     }
 
     /// The chunks `digests` the peer at `addr` has, with their bytes (not
-    /// yet checked against their digests), in as many requests as it takes.
-    /// A peer that could not read its store for any of them and sent none
-    /// is an error ([`store_failed`]), not an answer without chunks; so is
-    /// one that sent none and had no room for some ([`no_room`]).
-    pub async fn fetch(
+    /// yet checked against their digests), in as many requests as it takes,
+    /// into `out` as each arrives; how many came.  A peer that could not
+    /// read its store for any of them and sent none is an error
+    /// ([`store_failed`]), not an answer without chunks; so is one that sent
+    /// none and had no room for some ([`no_room`]).
+    pub async fn fetch_into(
         self: &Arc<Self>,
         addr: SocketAddr,
         digests: &[(String, Option<u64>)],
-    ) -> io::Result<Vec<(String, Vec<u8>)>> {
+        out: crate::ChunkTx,
+    ) -> io::Result<usize> {
         if digests.is_empty() || digests.len() > MAX_REQUEST_DIGESTS {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        let mut found = Vec::new();
+        let mut found = 0;
         let mut asked = digests.to_vec();
         let (mut failed, mut busy) = (false, false);
         // an answer that brings nothing ends it
         while !asked.is_empty() {
-            let before = found.len();
+            let before = found;
             let mut reply = self.request(addr, &asked).await?;
             while let Some(chunk) = reply.next().await? {
-                found.push(chunk);
+                out.send(chunk)
+                    .await
+                    .map_err(|_| io::Error::other("nobody takes the chunks"))?;
+                found += 1;
             }
             failed |= reply.failed;
             let later = reply.later();
-            if found.len() == before {
+            if found == before {
                 busy = !later.is_empty();
                 break;
             }
             asked = later;
         }
-        match (found.is_empty(), failed, busy) {
+        match (found == 0, failed, busy) {
             (true, true, _) => Err(store_failure()),
             (true, false, true) => Err(io::Error::other(NoRoom)),
             _ => Ok(found),
         }
+    }
+
+    /// [`Quic::fetch_into`], the chunks collected.
+    #[cfg(test)]
+    pub async fn fetch(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        digests: &[(String, Option<u64>)],
+    ) -> io::Result<Vec<(String, Vec<u8>)>> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(crate::CHUNKS_IN_FLIGHT);
+        let (done, found) = futures::join!(self.fetch_into(addr, digests, tx), async move {
+            let mut found = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                found.push(chunk);
+            }
+            found
+        });
+        done.map(|_| found)
     }
 
     /// The index of the layer `layer` from the peer at `addr`, if it has
@@ -1544,13 +1567,12 @@ impl Server {
     /// does not come in time, marks the answer `full`.
     ///
     /// The credit comes before the bytes are read, a piece at a time: what
-    /// has been read is what may be sent.  A file is read, hashed and sent a
-    /// piece at a time, once, and its last piece goes only when the whole
-    /// chunk has its digest: a store file that does not (or that cannot be
-    /// read) is never complete at the peer.  Before its first piece is sent
-    /// it is answered "failed"; after, the stream is reset with that code:
-    /// the peer drops the chunk and takes the rest of the answer for another
-    /// peer, without taking this one for a liar or QUIC for broken.
+    /// has been read is what may be sent.  A file is read and sent a piece at
+    /// a time, once; the one that asks checks the chunk.  When it cannot be
+    /// read, before its first piece is sent it is answered "failed"; after,
+    /// the stream is reset with that code: the peer drops the chunk and takes
+    /// the rest of the answer for another peer, without taking this one for a
+    /// liar or QUIC for broken.
     async fn chunk(
         &self,
         answer: &mut Answer<'_>,
@@ -1567,16 +1589,7 @@ impl Server {
             room && len <= MAX_ITEM_BYTES as u64
         };
         let (len, source) = match file {
-            Some(c) => {
-                let Some(verifier) = serve::Verifier::new(digest) else {
-                    return Ok(Sent::No);
-                };
-                let file = Arc::new(c.file);
-                (
-                    c.len,
-                    Source::File(file, c.offset, Some(Box::new(verifier))),
-                )
-            }
+            Some(c) => (c.len, Source::File(Arc::new(c.file), c.offset)),
             // not held by a provider that hands over files
             None if !by_bytes => return Ok(Sent::No),
             // a provider that hands over bytes, not a file: read to tell
@@ -1620,30 +1633,15 @@ impl Server {
             let read;
             let bytes: &[u8] = match &mut source {
                 Source::Bytes(data) => &data[at as usize..(at + n) as usize],
-                Source::File(file, offset, verifier) => {
+                Source::File(file, offset) => {
                     let (f, offset) = (file.clone(), *offset + at);
-                    let mut hashing = verifier.take().expect("a verifier");
-                    let last = at + n == len;
-                    let (got, hashed) = tokio::task::spawn_blocking(move || {
+                    let got = tokio::task::spawn_blocking(move || {
                         use std::os::unix::fs::FileExt;
                         let mut buf = vec![0u8; n as usize];
-                        let got = f.read_exact_at(&mut buf, offset).map(|_| buf);
-                        if let Ok(buf) = &got {
-                            hashing.update(buf);
-                        }
-                        (got, hashing)
+                        f.read_exact_at(&mut buf, offset).map(|_| buf)
                     })
                     .await
                     .map_err(other)?;
-                    let got = match got {
-                        Ok(buf) if !last => {
-                            *verifier = Some(hashed);
-                            Ok(buf)
-                        }
-                        Ok(buf) if (*hashed).finish() => Ok(buf),
-                        Ok(_) => Err(serve::corrupt(digest)),
-                        Err(e) => Err(e),
-                    };
                     read = match got {
                         Ok(buf) => {
                             #[cfg(test)]
@@ -1681,10 +1679,9 @@ impl Server {
 }
 
 /// Where the bytes of a chunk being sent come from: a file of the store
-/// (from an offset, hashed as it is read), or bytes the provider handed
-/// over (checked).
+/// (from an offset), or bytes the provider handed over (checked).
 enum Source {
-    File(Arc<std::fs::File>, u64, Option<Box<serve::Verifier>>),
+    File(Arc<std::fs::File>, u64),
     Bytes(Vec<u8>),
 }
 
@@ -2407,8 +2404,11 @@ mod tests {
         assert_eq!(provider.0.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
+    /// The server sends what its store holds and hashes none of it: the
+    /// bytes of a store file that is not the chunk reach the asker, whose
+    /// check of the digest is what catches them.
     #[tokio::test]
-    async fn a_file_that_does_not_match_its_digest_is_not_served() {
+    async fn a_file_is_served_as_the_store_holds_it() {
         let dir = tempfile::tempdir().unwrap();
         let good = vec![5u8; 3 << 20];
         let path = dir.path().join("chunk");
@@ -2424,35 +2424,16 @@ mod tests {
             .unwrap();
         assert_eq!(found, vec![(digest_of(&good), good.clone())]);
 
-        // A store file that does not hold the chunk: the asker is told
-        // the store of the peer failed (it asks another peer, and keeps
-        // the peer and QUIC: not "absent", not a broken stream), never gets
-        // the bytes as the chunk, and the server serves nothing.  The last
-        // piece is held back until the whole chunk is hashed, so the
-        // damage in it is found before the chunk is complete at the peer.
         let mut bad = good.clone();
         bad[(3 << 20) - 1] ^= 1;
         std::fs::write(&path, &bad).unwrap();
         let (s, addr) = bind_with(provider(&path, bad.len() as u64), Limits::default());
-        let failed = client
+        let found = client
             .fetch(addr, &[(digest_of(&good), None)])
             .await
-            .unwrap_err();
-        assert!(store_failed(&failed), "{failed}");
-        assert_eq!(s.served(), 0);
-        // the same for a chunk of one piece, before any of it is sent; the
-        // chunks after it are still answered
-        let small = vec![6u8; 1000];
-        let mut bad = small.clone();
-        bad[999] ^= 1;
-        std::fs::write(&path, &bad).unwrap();
-        let (s, addr) = bind_with(provider(&path, bad.len() as u64), Limits::default());
-        let mut reply = client
-            .request(addr, &[(digest_of(&small), None), (digest_of(&bad), None)])
-            .await
             .unwrap();
-        assert_eq!(reply.next().await.unwrap(), Some((digest_of(&bad), bad)));
-        assert!(reply.failed);
+        assert_eq!(found, vec![(digest_of(&good), bad)]);
+        assert!(!crate::limits::names(&found[0].0, &found[0].1));
         assert_eq!(s.served(), 1);
     }
 

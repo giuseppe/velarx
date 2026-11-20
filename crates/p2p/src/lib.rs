@@ -420,43 +420,37 @@ pub fn lanes_of(chunks: usize, quic_streams: usize) -> usize {
     quic_streams.clamp(1, 8).min(chunks).max(1)
 }
 
-/// Chunks by their digest, as a peer sends them.
-pub type Chunks = Vec<(String, Vec<u8>)>;
+/// Where the chunks a peer sends go, each with its digest, as it arrives.
+pub type ChunkTx = tokio::sync::mpsc::Sender<(String, Vec<u8>)>;
 
-/// What the lanes of a request for `digests` to `peer` came to, as one
-/// answer: what came is kept, the rest is for another peer; with nothing,
-/// the failure of QUIC comes first, then the store, then no room.  In the
-/// order asked.
-pub fn lanes_answer(
-    peer: PeerId,
-    digests: &[(String, Option<u64>)],
-    answers: Vec<std::io::Result<Chunks>>,
-) -> P2PResult<Chunks> {
-    let (mut found, mut failures) = (Vec::new(), Vec::new());
+/// The chunks that can wait for the one that takes them: the peers' answers
+/// are not read faster than they are used.
+pub const CHUNKS_IN_FLIGHT: usize = 16;
+
+/// What the lanes of a request to `peer` came to (how many chunks each sent
+/// on its way), as one answer: what came is kept, the rest is for another
+/// peer; with nothing, the failure of QUIC comes first, then the store, then
+/// no room.
+pub fn lanes_answer(peer: PeerId, answers: Vec<std::io::Result<usize>>) -> P2PResult<()> {
+    let (mut found, mut failures) = (0, Vec::new());
     for answer in answers {
         match answer {
-            Ok(chunks) => found.extend(chunks),
+            Ok(n) => found += n,
             Err(e) => failures.push(e),
         }
     }
     // (the lanes that failed while another brought chunks)
-    for e in failures.iter().filter(|_| !found.is_empty()) {
+    for e in failures.iter().filter(|_| found > 0) {
         debug!("P2P: a stream to {peer} failed: {e}");
     }
-    if found.is_empty() {
+    if found == 0 {
         let rank =
             |e: &std::io::Error| u8::from(quic::store_failed(e)) + 2 * u8::from(quic::no_room(e));
         if let Some(e) = failures.into_iter().min_by_key(rank) {
             return Err(quic_error(peer, e));
         }
     }
-    let order: HashMap<&str, usize> = digests
-        .iter()
-        .enumerate()
-        .map(|(i, (d, _))| (d.as_str(), i))
-        .collect();
-    found.sort_by_key(|(d, _)| order.get(d.as_str()).copied().unwrap_or(usize::MAX));
-    Ok(found)
+    Ok(())
 }
 
 /// `digests` spread over the streams of one request ([`lanes_of`]), each
@@ -1239,25 +1233,31 @@ impl P2PNode {
         }
     }
 
-    /// The chunks `digests` from `peer` over QUIC, unchecked.  The digests
-    /// are spread over [`P2PConfig::quic_streams`] streams, answered at the
-    /// same time.  A peer that could not read its store for any of them is an
-    /// error ([`P2PError::StoreFailed`]), a peer with no room for any is
-    /// [`P2PError::Busy`]; with no QUIC path to it the error says so
-    /// ([`P2PError::NoQuicPath`]), and the pull asks another peer.
-    pub async fn fetch(
+    /// The chunks `digests` from `peer` over QUIC, unchecked, as they come
+    /// into `out`.  The digests are spread over [`P2PConfig::quic_streams`]
+    /// streams, answered at the same time.  A peer that could not read its
+    /// store for any of them is an error ([`P2PError::StoreFailed`]), a peer
+    /// with no room for any is [`P2PError::Busy`]; with no QUIC path to it
+    /// the error says so ([`P2PError::NoQuicPath`]), and the pull asks
+    /// another peer.
+    pub async fn fetch_into(
         &self,
         peer: PeerId,
         digests: &[(String, Option<u64>)],
-    ) -> P2PResult<Vec<(String, Vec<u8>)>> {
+        out: ChunkTx,
+    ) -> P2PResult<()> {
         let (quic, addr) = self.quic_path(peer).await?;
         if digests.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let parts = lanes(digests, self.config.quic_streams);
-        let answers =
-            futures::future::join_all(parts.iter().map(|part| quic.fetch(addr, part))).await;
-        lanes_answer(peer, digests, answers)
+        let answers = futures::future::join_all(
+            parts
+                .iter()
+                .map(|part| quic.fetch_into(addr, part, out.clone())),
+        )
+        .await;
+        lanes_answer(peer, answers)
     }
 
     /// Send a TUN packet to a specific peer (fire-and-forget)

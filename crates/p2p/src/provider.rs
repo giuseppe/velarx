@@ -121,12 +121,14 @@ pub trait Peers: Send + Sync + 'static {
     async fn connected(&self) -> Vec<PeerId>;
     /// The providers of the layer the DHT names (connected to first).
     async fn layer_providers(&self, layer: &str) -> Vec<PeerId>;
-    /// The chunks of `items` that `peer` has, unchecked.
+    /// The chunks of `items` that `peer` has, unchecked, into `out` as each
+    /// arrives.
     async fn request(
         &self,
         peer: PeerId,
         items: &[(String, Option<u64>)],
-    ) -> Result<Vec<(String, Vec<u8>)>, PeerError>;
+        out: super::ChunkTx,
+    ) -> Result<(), PeerError>;
     /// The index of a layer, if the peer has one of at most `max` bytes.
     async fn index(
         &self,
@@ -194,13 +196,15 @@ pub trait Transport: Send + Sync + 'static {
     fn received(&self) -> u64 {
         0
     }
-    /// The chunks over QUIC, unchecked; an error when there is no QUIC path
-    /// to the peer (there is no other way to fetch from it).
-    async fn fetch(
+    /// The chunks over QUIC, unchecked, into `out` as each arrives; an error
+    /// when there is no QUIC path to the peer (there is no other way to fetch
+    /// from it).
+    async fn fetch_into(
         &self,
         peer: PeerId,
         items: &[(String, Option<u64>)],
-    ) -> super::P2PResult<Vec<(String, Vec<u8>)>>;
+        out: super::ChunkTx,
+    ) -> super::P2PResult<()>;
     /// How many of the connected peers have no QUIC path: members for
     /// discovery, not asked for data.
     async fn without_quic(&self) -> usize {
@@ -251,12 +255,13 @@ impl Transport for P2PNode {
         P2PNode::connect_provider(self, peer).await
     }
 
-    async fn fetch(
+    async fn fetch_into(
         &self,
         peer: PeerId,
         items: &[(String, Option<u64>)],
-    ) -> super::P2PResult<Vec<(String, Vec<u8>)>> {
-        P2PNode::fetch(self, peer, items).await
+        out: super::ChunkTx,
+    ) -> super::P2PResult<()> {
+        P2PNode::fetch_into(self, peer, items, out).await
     }
 
     async fn without_quic(&self) -> usize {
@@ -316,8 +321,12 @@ impl<T: Transport> Peers for NodePeers<T> {
         &self,
         peer: PeerId,
         items: &[(String, Option<u64>)],
-    ) -> Result<Vec<(String, Vec<u8>)>, PeerError> {
-        self.0.fetch(peer, items).await.map_err(peer_error)
+        out: super::ChunkTx,
+    ) -> Result<(), PeerError> {
+        self.0
+            .fetch_into(peer, items, out)
+            .await
+            .map_err(peer_error)
     }
 
     async fn index(
@@ -374,34 +383,23 @@ fn looks_like_a_profile(text: &[u8]) -> bool {
     !velarx_fuse::profile::parse(text, 1).is_empty()
 }
 
-/// Answers of fewer bytes than this are hashed where they arrive; bigger
-/// ones on a blocking thread, their chunks in parallel.
-const CHECK_INLINE_BYTES: usize = 256 << 10;
+/// Chunks of fewer bytes than this are hashed where they arrive; bigger ones
+/// on a blocking thread.
+const CHECK_INLINE_BYTES: usize = 64 << 10;
 
-/// Each chunk with whether its bytes have its digest (hashed once).
-async fn checked(received: Vec<(String, Vec<u8>)>) -> Result<Vec<(String, Vec<u8>, bool)>, String> {
-    use rayon::prelude::*;
-    let bytes: usize = received.iter().map(|(_, d)| d.len()).sum();
-    if bytes <= CHECK_INLINE_BYTES {
-        return Ok(received
-            .into_iter()
-            .map(|(wanted, data)| {
-                let matches = crate::limits::names(&wanted, &data);
-                (wanted, data, matches)
-            })
-            .collect());
+/// The chunk, and whether its bytes have the digest it was asked by (hashed
+/// once: this is the check of the bytes of the peers).
+async fn checked(wanted: String, data: Vec<u8>) -> Result<(String, Vec<u8>, bool), String> {
+    if data.len() <= CHECK_INLINE_BYTES {
+        let matches = crate::limits::names(&wanted, &data);
+        return Ok((wanted, data, matches));
     }
     tokio::task::spawn_blocking(move || {
-        received
-            .into_par_iter()
-            .map(|(wanted, data)| {
-                let matches = crate::limits::names(&wanted, &data);
-                (wanted, data, matches)
-            })
-            .collect()
+        let matches = crate::limits::names(&wanted, &data);
+        (wanted, data, matches)
     })
     .await
-    .map_err(|e| format!("checking the chunks failed: {e}"))
+    .map_err(|e| format!("checking a chunk failed: {e}"))
 }
 
 /// What a fetch asks for: a digest, and its size if the asker knows it.
@@ -756,11 +754,43 @@ impl PeerSource {
     }
 }
 
-/// What one request to one peer came to.
+/// What one request to one peer came to, after its chunks (each was handed
+/// to the group as it arrived).
 struct Attempt {
+    request: u64,
     peer: PeerId,
     took: Duration,
-    result: Result<Vec<(String, Vec<u8>)>, PeerError>,
+    result: Result<(), PeerError>,
+}
+
+/// A chunk a peer sent, and the request it came with.
+struct Received {
+    request: u64,
+    peer: PeerId,
+    digest: String,
+    data: Vec<u8>,
+}
+
+/// What the requests of a group send back to it as they go: the chunks as
+/// each arrives, and for each request under way how many of its chunks
+/// matched and their bytes.
+struct Answers {
+    tx: tokio::sync::mpsc::Sender<Received>,
+    rx: tokio::sync::mpsc::Receiver<Received>,
+    valid: std::collections::HashMap<u64, (usize, u64)>,
+    requests: u64,
+}
+
+impl Answers {
+    fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(super::CHUNKS_IN_FLIGHT);
+        Self {
+            tx,
+            rx,
+            valid: Default::default(),
+            requests: 0,
+        }
+    }
 }
 
 /// What an attempt came to for the group that asked.
@@ -1097,12 +1127,16 @@ impl PeerSource {
 
     fn ask(
         &self,
+        answers: &mut Answers,
         peer: PeerId,
         items: Vec<(String, Option<u64>)>,
     ) -> impl std::future::Future<Output = Attempt> + Send + 'static {
         let peers = self.peers.clone();
         let requested = self.requested.clone();
         let streams = self.peers.streams(items.len());
+        let request = answers.requests;
+        answers.requests += 1;
+        let group = answers.tx.clone();
         let span = tracing::debug_span!(
             "chunk_request",
             %peer,
@@ -1115,8 +1149,25 @@ impl PeerSource {
                 // the others wait for a place, which is not the peer's time)
                 let _place = requested.places(peer, streams).await;
                 let started = tokio::time::Instant::now();
-                let result = peers.request(peer, &items).await;
+                let (out, mut chunks) = tokio::sync::mpsc::channel(super::CHUNKS_IN_FLIGHT);
+                let (result, ()) = futures::join!(peers.request(peer, &items, out), async {
+                    while let Some((digest, data)) = chunks.recv().await {
+                        let sent = group
+                            .send(Received {
+                                request,
+                                peer,
+                                digest,
+                                data,
+                            })
+                            .await;
+                        // (the group is done: nobody takes what is left)
+                        if sent.is_err() {
+                            break;
+                        }
+                    }
+                });
                 Attempt {
+                    request,
                     peer,
                     took: started.elapsed(),
                     result,
@@ -1474,6 +1525,7 @@ impl PeerSource {
         let mut hedged = false;
         let mut next: std::collections::VecDeque<PeerId> = Default::default();
         let mut running: futures::stream::FuturesUnordered<_> = Default::default();
+        let mut answers = Answers::new();
         let mut waiting_for: Option<PeerId> = None;
         // the peers whose requests are under way
         let mut asking: Vec<PeerId> = Vec::new();
@@ -1519,7 +1571,7 @@ impl PeerSource {
                 }
                 match next.pop_front() {
                     Some(peer) => {
-                        running.push(self.ask(peer, remaining.clone()));
+                        running.push(self.ask(&mut answers, peer, remaining.clone()));
                         asking.push(peer);
                         waiting_for = Some(peer);
                     }
@@ -1551,6 +1603,11 @@ impl PeerSource {
                 // (an answer that is in counts before a timer that fired
                 // with it)
                 biased;
+                // (the chunks of an answer are taken before it is done with)
+                Some(received) = answers.rx.recv() => {
+                    self.accept(items, sent, layer, &mut answers, received, out).await?;
+                    continue;
+                }
                 attempt = futures::StreamExt::next(&mut running), if !running.is_empty() => attempt,
                 _ = tick.tick() => {
                     if self.slow(&began) {
@@ -1568,7 +1625,7 @@ impl PeerSource {
                     if hedged && !running.is_empty() {
                         if let Some(peer) = next.pop_front() {
                             debug!("P2P: asking {peer} too, the one asked last is slow");
-                            running.push(self.ask(peer, remaining));
+                            running.push(self.ask(&mut answers, peer, remaining));
                             asking.push(peer);
                             waiting_for = Some(peer);
                         }
@@ -1579,7 +1636,7 @@ impl PeerSource {
                     if hedge.is_some() => {
                     if let Some(peer) = next.pop_front() {
                         debug!("P2P: asking {peer} too, {:?} passed without an answer", hedge);
-                        running.push(self.ask(peer, remaining));
+                        running.push(self.ask(&mut answers, peer, remaining));
                         asking.push(peer);
                         waiting_for = Some(peer);
                     } else if let Some(asked) = got.take() {
@@ -1594,7 +1651,10 @@ impl PeerSource {
             };
             let peer = attempt.peer;
             asking.retain(|p| *p != peer);
-            if let Taken::Busy = self.take(items, sent, layer, attempt, out).await? {
+            if let Taken::Busy = self
+                .settle(items, sent, layer, &mut answers, attempt, out)
+                .await?
+            {
                 if !busy.contains(&peer) {
                     busy.push(peer);
                 }
@@ -1679,6 +1739,7 @@ impl PeerSource {
         let mut active: Vec<PeerId> = holders;
         let mut busy: std::collections::HashMap<PeerId, usize> = Default::default();
         let mut running: futures::stream::FuturesUnordered<_> = Default::default();
+        let mut answers = Answers::new();
         // the bytes asked, and those of them asked twice
         let (mut asked_bytes, mut hedged_bytes) = (0u64, 0u64);
         let began = self.begin();
@@ -1780,7 +1841,8 @@ impl PeerSource {
                             .sum::<u64>();
                     }
                     *busy.entry(peer).or_default() += 1;
-                    let (ask, stop) = futures::future::abortable(self.ask(peer, wanted));
+                    let (ask, stop) =
+                        futures::future::abortable(self.ask(&mut answers, peer, wanted));
                     part.stops.push(stop);
                     running.push(futures::FutureExt::map(ask, move |a| (n, peer, a.ok())));
                 }
@@ -1791,8 +1853,12 @@ impl PeerSource {
             let wake = next_hedge;
             let (n, peer, attempt) = tokio::select! {
                 // (an answer that is in counts before a timer that fired
-                // with it)
+                // with it, and the chunks of an answer before it is done with)
                 biased;
+                Some(received) = answers.rx.recv() => {
+                    self.accept(items, sent, Some(layer), &mut answers, received, out).await?;
+                    continue;
+                }
                 done = futures::StreamExt::next(&mut running) => match done {
                     Some(done) => done,
                     None => continue,
@@ -1820,7 +1886,9 @@ impl PeerSource {
             let Some(attempt) = attempt else {
                 continue;
             };
-            let taken = self.take(items, sent, Some(layer), attempt, out).await?;
+            let taken = self
+                .settle(items, sent, Some(layer), &mut answers, attempt, out)
+                .await?;
             // (a hedge that was needed, the first peer being slow, is not
             // counted against the budget: the bytes asked twice that count
             // are the ones that were not)
@@ -1853,20 +1921,81 @@ impl PeerSource {
         }
     }
 
-    /// Pass on what `attempt` brought of `items` that was not sent yet (the
-    /// first valid answer of each chunk), and learn from it: how many of
-    /// the chunks asked it sent right, or that it failed or had no room.
-    async fn take(
+    /// Check a chunk a peer sent and, when it is one of `items` that was not
+    /// sent yet (the first valid answer of each chunk), pass it on.
+    async fn accept(
         &self,
         items: &[Item],
         sent: &mut [bool],
         layer: Option<&str>,
+        answers: &mut Answers,
+        received: Received,
+        out: &mut dyn Sink,
+    ) -> Result<(), String> {
+        let Received {
+            request,
+            peer,
+            digest,
+            data,
+        } = received;
+        let (wanted, data, matches) = checked(digest, data).await?;
+        if !matches {
+            warn!(
+                "P2P chunk mismatch from {}: the bytes sent for {} are not it",
+                peer,
+                short(&wanted),
+            );
+            self.strikes.strike(peer);
+            self.knowledge.lied(layer, peer);
+            return Ok(());
+        }
+        let mut asked = false;
+        for (i, item) in items.iter().enumerate() {
+            if item.digest == wanted && item.size.is_none_or(|s| s == data.len() as u64) {
+                asked = true;
+                if !sent[i] {
+                    out.put(&wanted, &data).await?;
+                    sent[i] = true;
+                }
+            }
+        }
+        if asked {
+            let (n, bytes) = answers.valid.entry(request).or_default();
+            *n += 1;
+            *bytes += data.len() as u64;
+        }
+        // (what is in the pipe is passed on together)
+        if answers.rx.is_empty() {
+            out.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Learn from what `attempt` came to: the chunks it sent that are still
+    /// waiting are taken first, then how many of the chunks asked it sent
+    /// right, or that it failed or had no room.
+    async fn settle(
+        &self,
+        items: &[Item],
+        sent: &mut [bool],
+        layer: Option<&str>,
+        answers: &mut Answers,
         attempt: Attempt,
         out: &mut dyn Sink,
     ) -> Result<Taken, String> {
-        let Attempt { peer, took, result } = attempt;
-        let received = match result {
-            Ok(received) => received,
+        while let Ok(received) = answers.rx.try_recv() {
+            self.accept(items, sent, layer, answers, received, out)
+                .await?;
+        }
+        let Attempt {
+            request,
+            peer,
+            took,
+            result,
+        } = attempt;
+        let (n, bytes) = answers.valid.remove(&request).unwrap_or_default();
+        match result {
+            Ok(()) => {}
             // (it may have the chunks: nothing is recorded of the layer, and
             // the peer is no worse for it)
             Err(PeerError::Busy) => {
@@ -1902,38 +2031,10 @@ impl PeerSource {
                 self.knowledge.count(peer, took, None);
                 return Ok(Taken::Failed);
             }
-        };
-        // a peer that sent valid chunks has the layer, even when another
-        // was quicker with them
-        let mut n = 0usize;
-        let mut bytes = 0u64;
-        for (wanted, data, matches) in checked(received).await? {
-            if !matches {
-                warn!(
-                    "P2P chunk mismatch from {}: the bytes sent for {} are not it",
-                    peer,
-                    short(&wanted),
-                );
-                self.strikes.strike(peer);
-                self.knowledge.lied(layer, peer);
-                continue;
-            }
-            let mut asked = false;
-            for (i, item) in items.iter().enumerate() {
-                if item.digest == wanted && item.size.is_none_or(|s| s == data.len() as u64) {
-                    asked = true;
-                    if !sent[i] {
-                        out.put(&wanted, &data).await?;
-                        sent[i] = true;
-                    }
-                }
-            }
-            if asked {
-                bytes += data.len() as u64;
-                n += 1;
-            }
         }
         out.flush().await?;
+        // a peer that sent valid chunks has the layer, even when another
+        // was quicker with them
         self.knowledge.count(peer, took, Some((n as u64, bytes)));
         self.rate.add(bytes);
         note(|| Event::Asked {
@@ -2049,7 +2150,8 @@ mod tests {
             &self,
             peer: PeerId,
             items: &[(String, Option<u64>)],
-        ) -> Result<Vec<(String, Vec<u8>)>, PeerError> {
+            out: crate::ChunkTx,
+        ) -> Result<(), PeerError> {
             self.asked.lock().unwrap().push(peer);
             if self.no_path.lock().unwrap().contains(&peer) {
                 return Err(PeerError::NoQuic("it advertises no QUIC endpoint".into()));
@@ -2075,7 +2177,10 @@ mod tests {
                 self.received.fetch_add(bytes / 8, Ordering::SeqCst);
             }
             self.answered.fetch_add(1, Ordering::SeqCst);
-            reply.map_err(PeerError::Failed)
+            for chunk in reply.map_err(PeerError::Failed)? {
+                let _ = out.send(chunk).await;
+            }
+            Ok(())
         }
 
         fn received(&self) -> u64 {
@@ -2602,6 +2707,81 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// A peer that sends a chunk, and the next one only when the one before
+    /// it was passed on.
+    struct Trickle {
+        peer: PeerId,
+        chunks: Vec<(String, Vec<u8>)>,
+        passed: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Peers for Trickle {
+        async fn connected(&self) -> Vec<PeerId> {
+            vec![self.peer]
+        }
+        async fn layer_providers(&self, _: &str) -> Vec<PeerId> {
+            Vec::new()
+        }
+        async fn request(
+            &self,
+            _: PeerId,
+            _: &[(String, Option<u64>)],
+            out: crate::ChunkTx,
+        ) -> Result<(), PeerError> {
+            for (at, chunk) in self.chunks.iter().enumerate() {
+                if at > 0 {
+                    self.passed.notified().await;
+                }
+                let _ = out.send(chunk.clone()).await;
+            }
+            Ok(())
+        }
+        async fn index(&self, _: PeerId, _: &str, _: u64) -> Result<Option<Vec<u8>>, PeerError> {
+            Ok(None)
+        }
+        async fn has(&self, _: PeerId, _: &str) -> Result<Presence, String> {
+            Ok(Presence::Has)
+        }
+        async fn profile(&self, _: PeerId, _: &str, _: u64) -> Result<Option<Vec<u8>>, PeerError> {
+            Ok(None)
+        }
+    }
+
+    struct Passing(Collect, Arc<tokio::sync::Notify>);
+
+    #[async_trait]
+    impl Sink for Passing {
+        async fn put(&mut self, digest: &str, data: &[u8]) -> Result<(), String> {
+            self.0.put(digest, data).await?;
+            self.1.notify_one();
+            Ok(())
+        }
+    }
+
+    /// The chunks of an answer are checked and passed on as each arrives,
+    /// not when the answer is complete.
+    #[tokio::test]
+    async fn a_chunk_is_passed_on_before_its_answer_is_complete() {
+        let c = chunks(4);
+        let passed = Arc::new(tokio::sync::Notify::new());
+        let peers = Trickle {
+            peer: PeerId::random(),
+            chunks: c.clone(),
+            passed: passed.clone(),
+        };
+        let s = PeerSource::with_peers(Arc::new(peers), Arc::new(Strikes::default()));
+        let mut out = Passing(Collect::default(), passed);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            s.fetch_group(&items(&c), Some(LAYER), &mut out),
+        )
+        .await
+        .expect("a chunk waited for the end of its answer")
+        .unwrap();
+        assert_eq!(digests_of(&out.0), sorted(&c));
     }
 
     #[tokio::test]

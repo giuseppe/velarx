@@ -342,7 +342,8 @@ impl Peers for Noting {
         &self,
         peer: libp2p::PeerId,
         items: &[(String, Option<u64>)],
-    ) -> Result<Vec<(String, Vec<u8>)>, velarx_p2p::provider::PeerError> {
+        out: velarx_p2p::ChunkTx,
+    ) -> Result<(), velarx_p2p::provider::PeerError> {
         self.1.lock().unwrap().push(peer);
         let delay = self.2.lock().unwrap().get(&peer).copied();
         if let Some(delay) = delay {
@@ -361,15 +362,18 @@ impl Peers for Noting {
                 "the request was lost".into(),
             ));
         }
-        let mut answer = self.0.request(peer, items).await?;
-        if fault.corrupt {
-            for (_, data) in &mut answer {
-                if let Some(first) = data.first_mut() {
-                    *first ^= 0xff;
+        let (inner, mut chunks) = tokio::sync::mpsc::channel(velarx_p2p::CHUNKS_IN_FLIGHT);
+        let (answer, ()) = futures::join!(self.0.request(peer, items, inner), async {
+            while let Some((digest, mut data)) = chunks.recv().await {
+                if fault.corrupt {
+                    if let Some(first) = data.first_mut() {
+                        *first ^= 0xff;
+                    }
                 }
+                let _ = out.send((digest, data)).await;
             }
-        }
-        Ok(answer)
+        });
+        answer
     }
 
     async fn index(
@@ -1641,12 +1645,15 @@ async fn test_sha512_chunks_and_files_go_from_a_peer() {
         .into_iter()
         .map(|d| (d.clone(), None))
         .collect();
-    let got: std::collections::HashMap<String, Vec<u8>> = peers
-        .request(a.peer_id(), &asked)
-        .await
-        .unwrap()
-        .into_iter()
-        .collect();
+    let (out, mut chunks) = tokio::sync::mpsc::channel(velarx_p2p::CHUNKS_IN_FLIGHT);
+    let (done, got) = futures::join!(peers.request(a.peer_id(), &asked, out), async move {
+        let mut got = std::collections::HashMap::new();
+        while let Some((digest, data)) = chunks.recv().await {
+            got.insert(digest, data);
+        }
+        got
+    });
+    done.unwrap();
     assert_eq!(got.get(&chunk), Some(&data));
     assert_eq!(got.get(&file), Some(&data));
     // (the other algorithm's name of the bytes, and a lie)
@@ -1657,6 +1664,8 @@ async fn test_sha512_chunks_and_files_go_from_a_peer() {
     );
     // the items came over QUIC, whose frames carry the kind and the
     // algorithm of each digest
-    let found = b.fetch(a.peer_id(), &asked[..2]).await.unwrap();
+    let found = super::support::fetch_from(&b, a.peer_id(), &asked[..2])
+        .await
+        .unwrap();
     assert_eq!(found.len(), 2);
 }

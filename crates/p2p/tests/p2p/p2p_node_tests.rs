@@ -2,7 +2,7 @@
 //! Real nodes on the loopback: only nodes with the same swarm key talk, and
 //! what a peer asks for is bounded.
 
-use super::support::{address, connected_within, digest_of, fetch, key, Chunks};
+use super::support::{address, connected_within, digest_of, fetch, fetch_from, key, Chunks};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,8 +53,7 @@ async fn test_nodes_with_the_same_key_exchange_chunks_and_others_do_not_connect(
     );
     assert!(!connected(&a, &stranger).await);
     // (a node that never was a member has no endpoint to ask)
-    let e = a
-        .fetch(stranger.peer_id(), &[(d.clone(), None)])
+    let e = fetch_from(&a, stranger.peer_id(), &[(d.clone(), None)])
         .await
         .unwrap_err();
     assert!(matches!(e, P2PError::NoQuicPath { .. }), "{e}");
@@ -156,8 +155,12 @@ async fn test_a_store_that_cannot_be_read_is_an_error_to_the_asker() {
     assert!(matches!(e, P2PError::StoreFailed), "{e}");
     let peers = NodePeers(b.clone());
     let peer = a.peer_id();
+    let (out, _chunks) = tokio::sync::mpsc::channel(1);
     assert!(
-        peers.request(peer, &[(d.clone(), None)]).await.is_err(),
+        peers
+            .request(peer, &[(d.clone(), None)], out)
+            .await
+            .is_err(),
         "chunks"
     );
     assert!(peers.has(peer, &d).await.is_err(), "probe");
@@ -169,7 +172,7 @@ async fn test_a_store_that_cannot_be_read_is_an_error_to_the_asker() {
     // QUIC itself worked: the peer is not taken for one without a path
     assert_eq!(b.no_quic_path(peer).await, None);
     assert!(matches!(
-        b.fetch(peer, &[(d, None)]).await,
+        fetch_from(&b, peer, &[(d, None)]).await,
         Err(P2PError::StoreFailed)
     ));
 }

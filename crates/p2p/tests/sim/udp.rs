@@ -64,11 +64,13 @@ fn holders_without_a_udp_path_are_passed_over_for_the_registry() {
             );
             assert!(considered(&asker, &layer, holders[0].id()));
             // the error names the peer and says why
+            let (out, _chunks) = tokio::sync::mpsc::channel(1);
             let e = asker
                 .transport()
-                .fetch(
+                .fetch_into(
                     holders[0].id(),
                     &[(image.layers[0].chunks[0].0.clone(), None)],
+                    out,
                 )
                 .await
                 .unwrap_err();

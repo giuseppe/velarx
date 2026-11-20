@@ -7,9 +7,10 @@
 //!
 //! * `Fetch` of named files: the chunks the layer's table of contents (as
 //!   the engine verified and told it) gives each file, asked of the peers
-//!   by their sha256, each checked against it by the peers' client and
-//!   again by the object contract ([`velarx_content::stager`]) while it is
-//!   written into the layer's staging directory.
+//!   by their sha256, each checked against it once, by the peers' client,
+//!   as it arrives; the file is checked against its name (its fs-verity
+//!   digest) by the object contract ([`velarx_content::stager`]) when it is
+//!   complete.
 //! * `Fetch` of a whole layer (one without a table of contents): the index
 //!   of a peer that has it (its table and tar-split), and its files by
 //!   their digests; the table and tar-split are a claim the engine replays
@@ -31,7 +32,7 @@ use velarx_content::fetcher::fetch::{
 use velarx_content::serve_fetch::{
     Described, FetchCall, LayerScope, Out, Scope, StagingFetcher, UnpackCall,
 };
-use velarx_content::stager::{self, content_of, name_of, LayerToc, Name, Unnamed};
+use velarx_content::stager::{self, name_of, LayerToc, Name, Unnamed};
 use velarx_storage::{Toc, TocEntryType};
 use velarx_types::digest::Digest;
 
@@ -71,8 +72,6 @@ struct Assembling {
     /// Its positions in the call
     positions: Vec<u32>,
     name: Name,
-    /// The digest of its content too, when it is named by its fs-verity
-    content: Option<Digest>,
     size: u64,
     file: Option<Unnamed>,
     /// Chunks still to come
@@ -84,9 +83,8 @@ struct Assembling {
     held: Vec<(String, u64, u64)>,
 }
 
-/// A place of an item in the files of a call: the file, the offset, and
-/// whether the item's digest is the sha256 of its bytes.
-type Place = (usize, u64, bool);
+/// A place of an item in the files of a call: the file and the offset.
+type Place = (usize, u64);
 
 /// Where the chunks the peers send go: written at their places in the
 /// files of the call, each file named once it is complete.
@@ -94,9 +92,7 @@ struct Files<'a> {
     staging: &'a File,
     verity: bool,
     files: Vec<Assembling>,
-    /// The places (file, offset) of each digest and size asked, and whether
-    /// the digest is the sha256 of the bytes (a chunk; not a whole file
-    /// asked by its fs-verity digest, which its name checks)
+    /// The places (file, offset) of each digest and size asked
     places: HashMap<(String, u64), Vec<Place>>,
     staged: Vec<u32>,
     failures: Vec<(Vec<u32>, String)>,
@@ -149,26 +145,22 @@ impl<'a> Files<'a> {
 }
 
 impl Files<'_> {
-    /// Write `data` at `offset` of the file `job`, and name it when it is
-    /// complete.
-    fn write(&mut self, job: usize, offset: u64, data: &[u8], sha: Option<&Digest>) {
+    /// Write `data` at `offset` of the file `job` (checked already against
+    /// the digest it was asked by), and name it when it is complete.
+    fn write(&mut self, job: usize, offset: u64, data: &[u8]) {
         let f = &mut self.files[job];
         if f.done {
             return;
         }
         let result = (|| {
             if f.file.is_none() {
-                let file = Unnamed::begin(self.staging.as_fd(), f.size)?;
-                f.file = Some(match f.content {
-                    Some(d) => file.expect_content(d),
-                    None => file,
-                });
+                f.file = Some(Unnamed::begin(self.staging.as_fd(), f.size)?);
             }
             if !data.is_empty() {
                 f.file
                     .as_ref()
                     .expect("begun")
-                    .write_chunk(offset, data, sha)?;
+                    .write_chunk(offset, data, None)?;
             }
             f.left = f.left.saturating_sub(usize::from(!data.is_empty()));
             if f.left == 0 {
@@ -209,14 +201,13 @@ impl Sink for Files<'_> {
         let Some(places) = self.places.remove(&(digest.to_string(), data.len() as u64)) else {
             return Ok(());
         };
-        let sha: Option<Digest> = digest.parse().ok();
-        for (job, offset, chunk) in places {
+        for (job, offset) in places {
             self.files[job].moved += data.len() as u64;
             self.files[job]
                 .held
                 .push((digest.to_string(), offset, data.len() as u64));
             self.changed.insert(job);
-            self.write(job, offset, data, sha.as_ref().filter(|_| chunk));
+            self.write(job, offset, data);
         }
         Ok(())
     }
@@ -293,6 +284,23 @@ impl Sink for Files<'_> {
     }
 }
 
+/// The groups of a call asked at the same time.
+const GROUPS_AT_ONCE: usize = 2;
+
+/// The [`Files`] of a call, written by the groups that are under way.
+struct Shared<'a, 'b, 'c>(&'a tokio::sync::Mutex<&'b mut Files<'c>>);
+
+#[async_trait]
+impl Sink for Shared<'_, '_, '_> {
+    async fn put(&mut self, digest: &str, data: &[u8]) -> Result<(), String> {
+        self.0.lock().await.put(digest, data).await
+    }
+
+    async fn flush(&mut self) -> Result<(), String> {
+        self.0.lock().await.flush().await
+    }
+}
+
 /// A chunk to ask the peers for: its digest, its place in its file, its
 /// size.
 type PeerChunk = (String, u64, u64);
@@ -331,7 +339,7 @@ impl PeerSource {
         // the files with no chunk (zeros only) are complete already
         for job in 0..files.files.len() {
             if files.files[job].left == 0 {
-                files.write(job, 0, &[], None);
+                files.write(job, 0, &[]);
             }
         }
         // The chunks go file by file, from a file that differs from node to
@@ -344,7 +352,7 @@ impl PeerSource {
             .places
             .iter()
             .map(|((digest, size), places)| {
-                let (job, offset, _) = places.iter().min_by_key(|p| (p.0, p.1)).expect("a place");
+                let (job, offset) = places.iter().min_by_key(|p| (p.0, p.1)).expect("a place");
                 (
                     (job + count - start) % count,
                     *offset,
@@ -357,13 +365,23 @@ impl PeerSource {
             .collect();
         order.sort_by(|a, b| (a.0, a.1, &a.2.digest).cmp(&(b.0, b.1, &b.2.digest)));
         let items: Vec<Item> = order.into_iter().map(|(_, _, item)| item).collect();
+        // two groups at a time: the next one is on its way while the files
+        // of the last are written
+        let shared = tokio::sync::Mutex::new(&mut *files);
+        let mut under_way = futures::stream::FuturesUnordered::new();
         for group in groups(&items) {
-            self.fetch_group(group, layer, &mut *files)
-                .await
-                .map_err(failed)?;
-            files.flush().await.map_err(gone)?;
-            self.holding(layer, files).await;
+            if under_way.len() == GROUPS_AT_ONCE {
+                futures::StreamExt::next(&mut under_way).await.transpose()?;
+            }
+            under_way.push(self.fetch_shared(group, layer, &shared));
         }
+        while futures::StreamExt::next(&mut under_way)
+            .await
+            .transpose()?
+            .is_some()
+        {}
+        drop(under_way);
+        let files = shared.into_inner();
         files.flush().await.map_err(gone)?;
         let left: Vec<u32> = files
             .files
@@ -374,10 +392,30 @@ impl PeerSource {
         Ok((!files.failed, left))
     }
 
+    /// The chunks of `group` into `files`, which the groups under way share.
+    async fn fetch_shared(
+        &self,
+        group: &[Item],
+        layer: Option<&str>,
+        files: &tokio::sync::Mutex<&mut Files<'_>>,
+    ) -> Result<(), FetcherError> {
+        self.fetch_group(group, layer, &mut Shared(files))
+            .await
+            .map_err(failed)?;
+        let kept = {
+            let mut files = files.lock().await;
+            files.flush().await.map_err(gone)?;
+            std::mem::take(&mut files.kept)
+        };
+        self.holding(layer, kept).await;
+        Ok(())
+    }
+
     /// Tell the peers that this node holds files of `layer`, the first time
-    /// a file of it was staged: they ask it for them while the pull goes on.
-    async fn holding(&self, layer: Option<&str>, files: &mut Files<'_>) {
-        if let Some(layer) = layer.filter(|_| std::mem::take(&mut files.kept) > 0) {
+    /// a file of it was staged (`kept` files came since it was looked at):
+    /// they ask it for them while the pull goes on.
+    async fn holding(&self, layer: Option<&str>, kept: usize) {
+        if let Some(layer) = layer.filter(|_| kept > 0) {
             if self.staged.first_of(layer) {
                 self.peers.holding(layer).await;
             }
@@ -455,15 +493,14 @@ impl PeerSource {
                 ));
             }
             total = total.saturating_add(e.size);
-            files.places.entry((asked, e.size)).or_default().push((
-                files.files.len(),
-                0,
-                e.verity().is_none(),
-            ));
+            files
+                .places
+                .entry((asked, e.size))
+                .or_default()
+                .push((files.files.len(), 0));
             files.files.push(Assembling {
                 positions: Vec::new(),
                 name: Name::Content(content),
-                content: None,
                 size: e.size,
                 file: None,
                 left: 1,
@@ -617,8 +654,24 @@ impl StagingFetcher for PeerSource {
         layers: Vec<Blob>,
         out: &Out<velarx_content::fetcher::fetch::Probed>,
     ) -> Result<(), FetcherError> {
+        use futures::StreamExt;
         use velarx_content::fetcher::fetch::{NotLazy, Probed, TocSource};
-        for (at, blob) in layers.iter().enumerate() {
+        // (all the layers at once, answered as each one is found)
+        let mut asking: futures::stream::FuturesUnordered<_> = layers
+            .iter()
+            .enumerate()
+            .map(|(at, blob)| async move {
+                let cap = velarx_content::pull::index::json_cap(
+                    i64::try_from(blob.size).unwrap_or(i64::MAX),
+                );
+                let found = match checksum_of(blob) {
+                    Some(checksum) => self.toc_of(&checksum, cap).await,
+                    None => None,
+                };
+                (at, found)
+            })
+            .collect();
+        while let Some((at, found)) = asking.next().await {
             let none = Probed {
                 layer: at as u32,
                 toc: TocSource::None,
@@ -626,12 +679,6 @@ impl StagingFetcher for PeerSource {
                 reason: Some(NotLazy::Unreachable),
                 toc_file: None,
                 tarsplit_file: None,
-            };
-            let cap =
-                velarx_content::pull::index::json_cap(i64::try_from(blob.size).unwrap_or(i64::MAX));
-            let found = match checksum_of(blob) {
-                Some(checksum) => self.toc_of(&checksum, cap).await,
-                None => None,
             };
             let Some((toc, tarsplit)) = found else {
                 out.send(none).await.map_err(gone)?;
@@ -719,7 +766,7 @@ impl StagingFetcher for PeerSource {
                 Files::new(&layer.staging, scope.verity, out).keeping(&self.staged, &layer.layer);
             // (for each file of `files`: the key and size it is asked whole
             // by when the peers do not have its chunks, with its name)
-            let mut whole_by: Vec<Option<(String, u64, Name, Option<Digest>)>> = Vec::new();
+            let mut whole_by: Vec<Option<(String, u64, Name)>> = Vec::new();
             let mut by_key: HashMap<&str, usize> = HashMap::new();
             let (mut present, mut nobody) = (Vec::new(), Vec::new());
             for (i, key) in call.objects.iter().enumerate() {
@@ -749,13 +796,12 @@ impl StagingFetcher for PeerSource {
                     _ => None,
                 };
                 let chunked = chunks_of(&indexed.toc, at).filter(|(_, c)| c.len() > 1);
-                let by_chunks = chunked.is_some() || whole.is_none();
                 // (a file of many chunks is asked by them first, the way the
                 // peers that pulled the same layer have them; a peer that
                 // has the file by another cutting, or from a layer it made
                 // some other way, has it by its fs-verity digest)
                 let again = (chunked.is_some() && whole.is_some())
-                    .then(|| (key.clone(), entry.size, name.clone(), content_of(entry)));
+                    .then(|| (key.clone(), entry.size, name.clone()));
                 let Some((size, chunks)) =
                     chunked.or(whole).or_else(|| chunks_of(&indexed.toc, at))
                 else {
@@ -769,13 +815,12 @@ impl StagingFetcher for PeerSource {
                         .places
                         .entry((digest.clone(), *size))
                         .or_default()
-                        .push((job, *offset, by_chunks));
+                        .push((job, *offset));
                 }
                 whole_by.push(again);
                 files.files.push(Assembling {
                     positions: vec![i as u32],
                     name,
-                    content: content_of(entry),
                     size,
                     file: None,
                     left: chunks.len(),
@@ -804,7 +849,7 @@ impl StagingFetcher for PeerSource {
                 Files::new(&layer.staging, scope.verity, out).keeping(&self.staged, &layer.layer);
             let mut again = Vec::new();
             for (job, f) in files.files.iter().enumerate() {
-                let Some((key, size, name, content)) = whole_by[job].take() else {
+                let Some((key, size, name)) = whole_by[job].take() else {
                     continue;
                 };
                 if f.done {
@@ -815,11 +860,10 @@ impl StagingFetcher for PeerSource {
                     .places
                     .entry((key, size))
                     .or_default()
-                    .push((at, 0, false));
+                    .push((at, 0));
                 whole_files.files.push(Assembling {
                     positions: f.positions.clone(),
                     name,
-                    content,
                     size,
                     file: None,
                     left: 1,
@@ -850,6 +894,10 @@ impl StagingFetcher for PeerSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{PeerError, Peers, Strikes};
+    use crate::Presence;
+    use libp2p::PeerId;
+    use std::sync::Arc;
 
     fn items(sizes: &[u64]) -> Vec<Item> {
         sizes
@@ -878,5 +926,184 @@ mod tests {
         let lens: Vec<usize> = groups(&mixed).iter().map(|g| g.len()).collect();
         assert_eq!(lens, [1, 1, 2]);
         assert!(groups(&[]).is_empty());
+    }
+
+    /// A peer whose index of a layer is answered only when the indexes of
+    /// all the layers of the call are asked at once.
+    struct Together(tokio::sync::Barrier, PeerId);
+
+    #[async_trait]
+    impl Peers for Together {
+        async fn connected(&self) -> Vec<PeerId> {
+            vec![self.1]
+        }
+        async fn layer_providers(&self, _: &str) -> Vec<PeerId> {
+            Vec::new()
+        }
+        async fn request(
+            &self,
+            _: PeerId,
+            _: &[(String, Option<u64>)],
+            _: crate::ChunkTx,
+        ) -> Result<(), PeerError> {
+            Ok(())
+        }
+        async fn index(&self, _: PeerId, _: &str, _: u64) -> Result<Option<Vec<u8>>, PeerError> {
+            self.0.wait().await;
+            Ok(None)
+        }
+        async fn has(&self, _: PeerId, _: &str) -> Result<Presence, String> {
+            Ok(Presence::Lacks)
+        }
+        async fn profile(&self, _: PeerId, _: &str, _: u64) -> Result<Option<Vec<u8>>, PeerError> {
+            Ok(None)
+        }
+    }
+
+    /// The layers of a `Probe` are asked of the peers all at once, not one
+    /// after another.
+    #[tokio::test]
+    async fn a_probe_asks_its_layers_at_once() {
+        let layers: Vec<Blob> = (0..6)
+            .map(|i| Blob {
+                digest: format!("sha256:{i:064x}"),
+                size: 1,
+                media_type: "application/vnd.oci.image.layer.v1.tar+zstd".into(),
+                annotations: Some(
+                    [
+                        (
+                            "io.github.containers.zstd-chunked.manifest-checksum".to_string(),
+                            format!("sha256:{:064x}", i + 100),
+                        ),
+                        (
+                            "io.github.containers.zstd-chunked.manifest-position".to_string(),
+                            "1:2:3:1".to_string(),
+                        ),
+                    ]
+                    .into(),
+                ),
+            })
+            .collect();
+        let source = PeerSource::with_peers(
+            Arc::new(Together(
+                tokio::sync::Barrier::new(layers.len()),
+                PeerId::random(),
+            )),
+            Arc::new(Strikes::default()),
+        );
+        let scope = Scope {
+            verity: false,
+            source: None,
+            tls_verify: None,
+            target: None,
+            access: None,
+            idle: std::time::Duration::from_secs(30),
+            kept: Arc::default(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            source.probe(&scope, layers, &Out::new(tx)),
+        )
+        .await
+        .expect("the layers are asked at once")
+        .unwrap();
+        let mut answered = 0;
+        while rx.try_recv().is_ok() {
+            answered += 1;
+        }
+        assert_eq!(answered, 6);
+    }
+
+    /// A peer that answers a request only when another is under way, and
+    /// has `chunks`.
+    struct Meeting(tokio::sync::Barrier, PeerId, HashMap<String, Vec<u8>>);
+
+    #[async_trait]
+    impl Peers for Meeting {
+        async fn connected(&self) -> Vec<PeerId> {
+            vec![self.1]
+        }
+        async fn layer_providers(&self, _: &str) -> Vec<PeerId> {
+            Vec::new()
+        }
+        async fn request(
+            &self,
+            _: PeerId,
+            items: &[(String, Option<u64>)],
+            out: crate::ChunkTx,
+        ) -> Result<(), PeerError> {
+            self.0.wait().await;
+            for (digest, _) in items {
+                let _ = out.send((digest.clone(), self.2[digest].clone())).await;
+            }
+            Ok(())
+        }
+        async fn index(&self, _: PeerId, _: &str, _: u64) -> Result<Option<Vec<u8>>, PeerError> {
+            Ok(None)
+        }
+        async fn has(&self, _: PeerId, _: &str) -> Result<Presence, String> {
+            Ok(Presence::Has)
+        }
+        async fn profile(&self, _: PeerId, _: &str, _: u64) -> Result<Option<Vec<u8>>, PeerError> {
+            Ok(None)
+        }
+    }
+
+    /// Two groups of a call are asked at the same time, and the files they
+    /// bring are all staged.
+    #[tokio::test]
+    async fn two_groups_are_in_flight_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = File::open(dir.path()).unwrap();
+        let contents: Vec<Vec<u8>> = (0..300u16).map(|i| i.to_be_bytes().to_vec()).collect();
+        let bytes: HashMap<String, Vec<u8>> = contents
+            .iter()
+            .map(|c| {
+                (
+                    Digest::of(velarx_types::digest::Algorithm::Sha256, c).to_string(),
+                    c.clone(),
+                )
+            })
+            .collect();
+        let source = PeerSource::with_peers(
+            Arc::new(Meeting(
+                tokio::sync::Barrier::new(2),
+                PeerId::random(),
+                bytes.clone(),
+            )),
+            Arc::new(Strikes::default()),
+        );
+        let (tx, mut events) = tokio::sync::mpsc::channel(1024);
+        let out = Out::new(tx);
+        let mut files = Files::new(&staging, false, &out);
+        for (job, (digest, data)) in bytes.iter().enumerate() {
+            files.places.insert((digest.clone(), 2), vec![(job, 0)]);
+            files.files.push(Assembling {
+                positions: vec![job as u32],
+                name: Name::Content(digest.parse().unwrap()),
+                size: data.len() as u64,
+                file: None,
+                left: 1,
+                done: false,
+                moved: 0,
+                held: Vec::new(),
+            });
+        }
+        let (sound, left) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            source.assemble(None, &mut files),
+        )
+        .await
+        .expect("the groups were asked one after the other")
+        .unwrap();
+        assert!(sound && left.is_empty());
+        let mut staged = 0;
+        while let Ok((event, _)) = events.try_recv() {
+            if event.kind == EventKind::Staged {
+                staged += event.objects.len();
+            }
+        }
+        assert_eq!(staged, 300);
     }
 }
