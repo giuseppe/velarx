@@ -174,6 +174,17 @@ impl Toc {
         self.version == TOC_VERSION_CANONICAL
     }
 
+    /// The files with content, by fs-verity digest, each once.
+    pub fn files(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.entries
+            .iter()
+            .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+            .filter_map(|e| e.verity())
+            .filter(|d| seen.insert(d.clone()))
+            .collect()
+    }
+
     pub fn find_by_name(&self, name: &str) -> Option<&TocEntry> {
         self.entries.iter().find(|e| e.name == name)
     }

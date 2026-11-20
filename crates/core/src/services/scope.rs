@@ -333,20 +333,12 @@ fn fork_holder(name: &str) -> io::Result<i32> {
 /// container, which the start of the next one does not kill.  A cgroup that
 /// is gone holds none.
 fn in_use(name: &str) -> io::Result<bool> {
-    let dir = match name.strip_prefix("velarx-") {
-        Some(id) => super::cgroups_mode::engine_scope_path(id)
-            .map_err(io::Error::other)?
-            .and_then(|path| super::cgroups_mode::engine_scope_dir(&path).map(str::to_string)),
-        None => None,
-    };
-    let Some(dir) = dir else {
+    let Some(dir) = scope_dir_of(name)? else {
         // (where it would be is not known: not touched)
         return Ok(true);
     };
-    let events = PathBuf::from(super::cgroups_mode::CGROUP_FS)
-        .join(dir.trim_start_matches('/'))
-        .join("cgroup.events");
-    Ok(std::fs::read_to_string(events).is_ok_and(|e| e.lines().any(|l| l == "populated 1")))
+    Ok(std::fs::read_to_string(dir.join("cgroup.events"))
+        .is_ok_and(|e| e.lines().any(|l| l == "populated 1")))
 }
 
 /// The cgroup directory the scope `name` has once the manager made it, when
