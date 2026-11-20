@@ -7,15 +7,15 @@
 //! asked, and every digest is checked by the caller.
 
 use super::proto::{
-    json, parse, read_bytes, read_header, write_data, write_frame, ChunkSpec, Done, ErrorKind,
-    ErrorMsg, Header, Kind, LayerTrailer, Request,
+    json, parse, read_bytes, read_header, write_data, write_frame, write_frame_with_fd, ChunkSpec,
+    Done, ErrorKind, ErrorMsg, Header, Kind, LayerTrailer, Request,
 };
 use crate::net::ranges::PieceSink;
 use bytes::Bytes;
 use reqwest::StatusCode;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -656,7 +656,7 @@ impl Pool {
             return Ok(());
         }
         let conn = self.spawn().await?;
-        let mut x = self.start(conn, slot, &Request::Warm, 0, 0).await?;
+        let mut x = self.start(conn, slot, (&Request::Warm, None), 0, 0).await?;
         match x.next().await {
             Ok(Event::Reply(_)) => Ok(()),
             Ok(Event::Data { .. }) => Err(worker_failed("data for a warm-up")),
@@ -762,6 +762,18 @@ impl Pool {
         max_frame: usize,
         budget: u64,
     ) -> ImageResult<Exchange> {
+        self.begin_with(request, None, max_frame, budget).await
+    }
+
+    /// [`begin`](Self::begin) with a descriptor that goes with the request
+    /// (the file a request that says `file` is about).
+    pub async fn begin_with(
+        self: &Arc<Self>,
+        request: &Request,
+        file: Option<std::os::fd::BorrowedFd<'_>>,
+        max_frame: usize,
+        budget: u64,
+    ) -> ImageResult<Exchange> {
         let slot = self
             .slots
             .clone()
@@ -773,7 +785,8 @@ impl Pool {
             Some(c) => c,
             None => self.spawn().await?,
         };
-        self.start(conn, slot, request, max_frame, budget).await
+        self.start(conn, slot, (request, file), max_frame, budget)
+            .await
     }
 
     /// Where a worker was sent for the blob `digest` not long ago.
@@ -842,7 +855,7 @@ impl Pool {
         self: &Arc<Self>,
         mut conn: Conn,
         slot: OwnedSemaphorePermit,
-        request: &Request,
+        (request, file): (&Request, Option<std::os::fd::BorrowedFd<'_>>),
         max_frame: usize,
         budget: u64,
     ) -> ImageResult<Exchange> {
@@ -863,13 +876,11 @@ impl Pool {
                 .map_err(lost)?;
             }
         }
-        write_frame(
-            &mut conn.stream,
-            Kind::Request,
-            &json(request).map_err(lost)?,
-            &[],
-        )
-        .await
+        let json = json(request).map_err(lost)?;
+        match file {
+            Some(fd) => write_frame_with_fd(&mut conn.stream, fd, Kind::Request, &json).await,
+            None => write_frame(&mut conn.stream, Kind::Request, &json, &[]).await,
+        }
         .map_err(lost)?;
         Ok(Exchange {
             digest,
@@ -925,6 +936,8 @@ pub enum Event {
 pub enum Failure {
     /// The server refuses the ranges.
     Rejected(StatusCode),
+    /// The server cannot give the ranges: the blob is asked whole.
+    WholeBlob,
     /// What was asked is not there (404); an error for who needs it.
     Missing(ImageError),
     /// The body is longer than the limit of the request.
@@ -942,6 +955,7 @@ impl From<Failure> for RangesError {
     fn from(f: Failure) -> Self {
         match f {
             Failure::Rejected(s) => RangesError::Rejected(s.as_u16()),
+            Failure::WholeBlob => RangesError::WholeBlob,
             Failure::Missing(e) | Failure::TooLarge(e) | Failure::Error(e) => RangesError::Other(e),
         }
     }
@@ -951,6 +965,7 @@ impl From<Failure> for ImageError {
     fn from(f: Failure) -> Self {
         match f {
             Failure::Rejected(s) => worker_failed(format!("the registry answered {s}")),
+            Failure::WholeBlob => worker_failed("the registry cannot give the ranges of the blob"),
             Failure::Missing(e) | Failure::TooLarge(e) | Failure::Error(e) => e,
         }
     }
@@ -1067,6 +1082,10 @@ impl Exchange {
                         Ok(s) => Err(Failure::Rejected(s)),
                         Err(_) => Err(worker_failed("invalid status").into()),
                     },
+                    Ok(ErrorMsg {
+                        kind: ErrorKind::WholeBlob,
+                        ..
+                    }) => Err(Failure::WholeBlob),
                     Ok(ErrorMsg {
                         kind: ErrorKind::Missing,
                         ..
@@ -1557,15 +1576,22 @@ impl Pool {
         self: &Arc<Self>,
         digest: &Digest,
         ranges: &[Range<u64>],
+        file: Option<&std::fs::File>,
         sink: &mut PieceSink<'_>,
     ) -> Result<(), RangesError> {
         let budget: u64 = ranges.iter().map(|r| r.end - r.start).sum();
         let request = Request::Ranges {
             digest: *digest,
             ranges: ranges.iter().map(|r| (r.start, r.end)).collect(),
+            file: file.is_some(),
         };
         let mut x = self
-            .begin(&request, super::proto::MAX_JSON, budget)
+            .begin_with(
+                &request,
+                file.map(AsFd::as_fd),
+                super::proto::MAX_JSON,
+                budget,
+            )
             .await
             .map_err(RangesError::Other)?;
         loop {
@@ -1600,18 +1626,21 @@ impl Pool {
         ranges: &[Range<u64>],
         members: &[Vec<ChunkSpec>],
         max_chunk: usize,
+        file: Option<&std::fs::File>,
     ) -> ImageResult<ChunkStream> {
         let budget: u64 = members.iter().flatten().map(|c| c.size).sum();
         let request = Request::Chunks {
             digest: *digest,
             ranges: ranges.iter().map(|r| (r.start, r.end)).collect(),
             chunks: members.to_vec(),
+            file: file.is_some(),
         };
         Ok(ChunkStream {
-            exchange: self.begin(&request, max_chunk, budget).await?,
+            exchange: self
+                .begin_with(&request, file.map(AsFd::as_fd), max_chunk, budget)
+                .await?,
             sizes: members.iter().flatten().map(|c| (c.idx, c.size)).collect(),
             seen: std::collections::HashSet::new(),
-            whole_blob: false,
         })
     }
 
@@ -1647,8 +1676,6 @@ pub struct ChunkStream {
     exchange: Exchange,
     sizes: std::collections::HashMap<usize, u64>,
     seen: std::collections::HashSet<usize>,
-    /// The registry answered with the whole blob (see [`super::proto::Done`])
-    pub whole_blob: bool,
 }
 
 impl ChunkStream {
@@ -1667,10 +1694,7 @@ impl ChunkStream {
                 }
                 Ok(Some((tag, len)))
             }
-            Event::Reply(body) => {
-                self.whole_blob = parse::<super::proto::Done>(&body).is_ok_and(|d| d.whole_blob);
-                Ok(None)
-            }
+            Event::Reply(_) => Ok(None),
         }
     }
 
@@ -1753,7 +1777,7 @@ impl Pool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::process::Stdio;
     use tokio::process::Command;
@@ -1824,7 +1848,7 @@ mod tests {
 
     /// A pool with one idle worker that is a task of the test: it reads the
     /// request and runs `script` on the socket.
-    async fn pool_with<F, Fut>(script: F) -> Arc<Pool>
+    pub(crate) async fn pool_with<F, Fut>(script: F) -> Arc<Pool>
     where
         F: FnOnce(UnixStream) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -2297,7 +2321,7 @@ mod tests {
                 as futures::future::BoxFuture<'static, velarx_types::ImageResult<()>>
         };
         match pool
-            .ranges(&crate::sha256(b"aa"), &[0..10], &mut sink)
+            .ranges(&crate::sha256(b"aa"), &[0..10], None, &mut sink)
             .await
         {
             Err(RangesError::Rejected(s)) => assert_eq!(s, 416),
@@ -2324,7 +2348,7 @@ mod tests {
                     as futures::future::BoxFuture<'static, velarx_types::ImageResult<()>>
             };
             let result = pool
-                .ranges(&crate::sha256(b"aa"), &[100..110], &mut sink)
+                .ranges(&crate::sha256(b"aa"), &[100..110], None, &mut sink)
                 .await;
             assert!(result.is_err(), "{tag} {offset} {len}");
             assert_eq!(got, 0);
@@ -2361,7 +2385,7 @@ mod tests {
             })
             .await;
             let mut chunks = pool
-                .chunks(&crate::sha256(b"aa"), &[0..20], &specs, 100)
+                .chunks(&crate::sha256(b"aa"), &[0..20], &specs, 100, None)
                 .await
                 .unwrap();
             let mut failed = false;

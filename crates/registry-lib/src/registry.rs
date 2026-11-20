@@ -754,7 +754,8 @@ pub fn main(
     reach.cgroups = crate::net::cgroup::place(&config.pull)
         .dir()
         .map(std::path::Path::to_path_buf);
-    reach.staging = Some(Arc::new(staging_dir));
+    let staging = Arc::new(staging_dir);
+    reach.staging = Some(staging.clone());
     let enforced = velarx_sandbox::fetch::enter(&reach, velarx_sandbox::fetch::Role::Front)
         .map_err(|e| anyhow::anyhow!("the fetcher cannot confine itself: {e}"))?;
     debug!("the fetcher is confined: {enforced:?}");
@@ -768,7 +769,7 @@ pub fn main(
     let endpoint = {
         let _on = runtime.enter();
         velarx_content::serve_fetch::FetchEndpoint::new(crate::registry_fetch::RegistryFetch::new(
-            service,
+            service, staging,
         ))
     };
     let (_stop, stopped) = tokio::sync::oneshot::channel::<()>();

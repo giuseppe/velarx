@@ -166,6 +166,10 @@ pub async fn read_header<R: AsyncRead + Unpin>(
 ) -> io::Result<Header> {
     let mut b = [0u8; HEADER];
     r.read_exact(&mut b).await?;
+    parse_header(&b, max_payload)
+}
+
+fn parse_header(b: &[u8; HEADER], max_payload: usize) -> io::Result<Header> {
     let kind = Kind::from_u8(b[0]).ok_or_else(|| invalid("unknown frame kind"))?;
     if b[1..4] != [0, 0, 0] {
         return Err(invalid("invalid frame header"));
@@ -184,6 +188,54 @@ pub async fn read_header<R: AsyncRead + Unpin>(
         tag: word(12),
         offset: u64::from_le_bytes(offset),
     })
+}
+
+/// Write a frame whose header carries the descriptor `fd` (`SCM_RIGHTS`):
+/// the header goes in one message of its own, the rest after it.
+pub async fn write_frame_with_fd(
+    socket: &mut tokio::net::UnixStream,
+    fd: std::os::fd::BorrowedFd<'_>,
+    kind: Kind,
+    json: &[u8],
+) -> io::Result<()> {
+    let header = header_bytes(&Header {
+        kind,
+        json_len: json.len(),
+        payload_len: 0,
+        tag: 0,
+        offset: 0,
+    })?;
+    let sock = &*socket;
+    sock.async_io(tokio::io::Interest::WRITABLE, || {
+        velarx_sys::scm::send(sock, &header, &[fd])
+    })
+    .await?;
+    write_all_parts(socket, &[json]).await?;
+    socket.flush().await
+}
+
+/// Read a header and the descriptor that came with it, if one did.  The
+/// peer sends the header in one message ([`write_frame_with_fd`]); a header
+/// that came in pieces keeps the descriptor of the piece it came with.
+pub async fn read_header_with_fd(
+    socket: &tokio::net::UnixStream,
+    max_payload: usize,
+) -> io::Result<(Header, Option<std::os::fd::OwnedFd>)> {
+    let mut b = [0u8; HEADER];
+    let (mut at, mut fd) = (0, None);
+    while at < HEADER {
+        let got = socket
+            .async_io(tokio::io::Interest::READABLE, || {
+                velarx_sys::scm::recv(socket, &mut b[at..], 1, rustix::net::RecvFlags::empty())
+            })
+            .await?;
+        if got.bytes == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        at += got.bytes;
+        fd = fd.or(got.fds.into_iter().next());
+    }
+    Ok((parse_header(&b, max_payload)?, fd))
 }
 
 /// Read exactly `len` bytes.
@@ -294,6 +346,10 @@ pub enum Request {
     Ranges {
         digest: Digest,
         ranges: Vec<(u64, u64)>,
+        /// The blob is the file whose descriptor came with the request:
+        /// the ranges are read from it, nothing is asked of the registry
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        file: bool,
     },
     /// Ranges of a blob made of chunks: for each range the chunks it holds
     /// in order.  The data frames are the chunks, decompressed (`tag` is
@@ -302,6 +358,9 @@ pub enum Request {
         digest: Digest,
         ranges: Vec<(u64, u64)>,
         chunks: Vec<Vec<ChunkSpec>>,
+        /// As for `Ranges`
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        file: bool,
     },
     /// A blob as the registry has it, of `size` bytes, in data frames
     /// (`offset` is the position); the reply is a `Done`.
@@ -413,10 +472,6 @@ impl Default for HelloReply {
 /// The reply to a request that has nothing to add to the data it sent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Done {
-    /// The registry answered a range request with the whole blob: the
-    /// daemon plans the next ones for that
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub whole_blob: bool,
     /// Where the registry sent the blob of the request, if it did
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redirect: Option<String>,
@@ -437,6 +492,9 @@ fn is_zero(n: &usize) -> bool {
 pub enum ErrorKind {
     /// The server refuses the ranges asked for (400, 416).
     Rejected,
+    /// The server cannot give the ranges (the whole blob, or a refusal of
+    /// a single range): the blob is asked whole.
+    WholeBlob,
     Failed,
     /// The registry refused the credentials (401, 403).
     Unauthorized,
@@ -481,6 +539,62 @@ mod tests {
         );
         assert_eq!(read_bytes(&mut b, h.json_len).await.unwrap(), b"{}");
         assert_eq!(read_bytes(&mut b, h.payload_len).await.unwrap(), b"payload");
+    }
+
+    /// A descriptor goes with the header of a frame, whose rest follows; a
+    /// frame without one has none, and a second descriptor is refused.
+    #[tokio::test]
+    async fn test_a_descriptor_comes_with_the_header_of_its_frame() {
+        use std::io::{Read, Seek, Write};
+        use std::os::fd::AsFd;
+        let (mut a, b) = tokio::net::UnixStream::pair().unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"the blob").unwrap();
+        write_frame_with_fd(&mut a, file.as_fd(), Kind::Request, b"{}")
+            .await
+            .unwrap();
+        write_frame(&mut a, Kind::Request, b"[]", &[])
+            .await
+            .unwrap();
+        let (h, fd) = read_header_with_fd(&b, 0).await.unwrap();
+        assert_eq!((h.kind, h.json_len), (Kind::Request, 2));
+        let mut got = std::fs::File::from(fd.expect("the descriptor"));
+        got.rewind().unwrap();
+        let mut text = String::new();
+        got.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "the blob");
+        let mut json = [0u8; 2];
+        b.readable().await.unwrap();
+        assert_eq!(b.try_read(&mut json).unwrap(), 2);
+        assert_eq!(&json, b"{}");
+        let (h, fd) = read_header_with_fd(&b, 0).await.unwrap();
+        assert_eq!((h.kind, h.json_len), (Kind::Request, 2));
+        assert!(fd.is_none());
+        let mut json = [0u8; 2];
+        b.readable().await.unwrap();
+        assert_eq!(b.try_read(&mut json).unwrap(), 2);
+        // (two are refused, and neither is left open)
+        let named = tempfile::NamedTempFile::new().unwrap();
+        let path = std::fs::canonicalize(named.path()).unwrap();
+        let open = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .flatten()
+                .filter(|fd| std::fs::read_link(fd.path()).is_ok_and(|t| t == path))
+                .count()
+        };
+        let header = header_bytes(&Header {
+            kind: Kind::Request,
+            json_len: 0,
+            payload_len: 0,
+            tag: 0,
+            offset: 0,
+        })
+        .unwrap();
+        let fd = named.as_file().as_fd();
+        velarx_sys::scm::send(&a, &header, &[fd, fd]).unwrap();
+        assert!(read_header_with_fd(&b, 0).await.is_err());
+        assert_eq!(open(), 1);
     }
 
     #[tokio::test]

@@ -431,6 +431,21 @@ pub struct Registry {
     pub cut: AtomicUsize,
     /// Milliseconds between the bytes of a whole blob (0: all at once).
     pub trickle_ms: AtomicU64,
+    /// Bytes of blob bodies the server has handed to the connections.
+    pub served: AtomicU64,
+    /// A blob (by its digest) that is not served as it is when it is sent
+    /// whole.
+    pub tamper: Mutex<Option<(String, Tamper)>>,
+}
+
+/// What a server does to the body of a blob it sends whole.
+pub enum Tamper {
+    /// Zeros after the end of the blob
+    Append(usize),
+    /// Half of the blob
+    Cut,
+    /// A byte of the blob changed
+    Flip,
 }
 
 impl Registry {
@@ -508,7 +523,39 @@ where
 /// fails gets to it.
 const RENDEZVOUS_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// The bytes of the answer are counted as the connection takes them.
 pub async fn serve_blob(
+    State(reg): State<Arc<Registry>>,
+    path: axum::extract::Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    use futures::StreamExt;
+    let counter = reg.clone();
+    let (parts, body) = answer_blob(State(reg), path, headers).await.into_parts();
+    // (in pieces: a body of one frame would be counted whole as soon as it is
+    // taken, whatever the client reads of it)
+    let body = body
+        .into_data_stream()
+        .flat_map(|chunk| {
+            futures::stream::iter(match chunk {
+                Ok(c) => c
+                    .chunks(16 * 1024)
+                    .map(|p| Ok(axum::body::Bytes::copy_from_slice(p)))
+                    .collect(),
+                Err(e) => vec![Err(e)],
+            })
+        })
+        .inspect(move |chunk| {
+            if let Ok(chunk) = chunk {
+                counter
+                    .served
+                    .fetch_add(chunk.len() as u64, Ordering::SeqCst);
+            }
+        });
+    Response::from_parts(parts, axum::body::Body::from_stream(body))
+}
+
+async fn answer_blob(
     State(reg): State<Arc<Registry>>,
     axum::extract::Path((name, digest)): axum::extract::Path<(String, String)>,
     headers: HeaderMap,
@@ -559,7 +606,20 @@ pub async fn serve_blob(
             });
             return axum::body::Body::from_stream(body).into_response();
         }
-        return blob.clone().into_response();
+        let mut body = blob.clone();
+        if let Some((tampered, how)) = &*reg.tamper.lock().unwrap() {
+            if *tampered == digest {
+                match how {
+                    Tamper::Append(n) => body.resize(body.len() + n, 0),
+                    Tamper::Cut => body.truncate(body.len() / 2),
+                    Tamper::Flip => {
+                        let middle = body.len() / 2;
+                        body[middle] ^= 1;
+                    }
+                }
+            }
+        }
+        return body.into_response();
     };
     reg.ranged.fetch_add(1, Ordering::SeqCst);
     reg.range_log.lock().unwrap().push(range.to_string());
@@ -819,6 +879,8 @@ pub async fn start_registry() -> (String, Arc<Registry>) {
         range_log: Mutex::new(Vec::new()),
         cut: AtomicUsize::new(0),
         trickle_ms: AtomicU64::new(0),
+        served: AtomicU64::new(0),
+        tamper: Mutex::new(None),
     });
     let app = Router::new()
         .route("/v2/", get(|| async { StatusCode::OK }))
@@ -869,7 +931,12 @@ pub async fn start_registry() -> (String, Arc<Registry>) {
         )
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(reg.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    // (a small send buffer: what the server has handed to a connection is
+    // about what the client has read of it)
+    socket.set_send_buffer_size(16 * 1024).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(1024).unwrap();
     let host = listener.local_addr().unwrap().to_string();
     let port = listener.local_addr().unwrap().port();
     let watched = reg.clone();

@@ -54,6 +54,9 @@ pub const MAX_OBJECTS: u32 = 4096;
 /// The registry as a fetcher.
 pub struct RegistryFetch {
     service: Arc<RegistryService>,
+    /// A directory of the staging, where the blobs read whole are kept in
+    /// files with no name
+    scratch: Arc<OwnedFd>,
 }
 
 fn failed(e: impl std::fmt::Display) -> FetcherError {
@@ -190,8 +193,68 @@ impl Handing {
 }
 
 impl RegistryFetch {
-    pub fn new(service: Arc<RegistryService>) -> Arc<Self> {
-        Arc::new(Self { service })
+    pub fn new(service: Arc<RegistryService>, scratch: Arc<OwnedFd>) -> Arc<Self> {
+        Arc::new(Self { service, scratch })
+    }
+
+    /// The blob `digest` of `size` bytes, read from the registry once into a
+    /// file with no name, for the registry that cannot give the ranges of
+    /// it.  Every request of ranges is answered by reading that file, in
+    /// the workers as it would be from the network.  It is kept with the
+    /// scope until `Forget` of the layer; the digest is checked as it is
+    /// written.
+    async fn downloaded(
+        &self,
+        scope: &Scope,
+        pool: &Arc<Pool>,
+        digest: &Digest,
+        size: u64,
+    ) -> Result<Arc<File>, ImageError> {
+        let once: Arc<tokio::sync::OnceCell<Arc<File>>> = scope
+            .kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(digest.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::<Arc<File>>::new()))
+            .clone()
+            .downcast()
+            .expect("what is kept for a blob is its download");
+        once.get_or_try_init(|| async {
+            read_whole(&self.scratch, pool, digest, size)
+                .await
+                .map(Arc::new)
+        })
+        .await
+        .cloned()
+    }
+
+    /// Run `ask` with no file, or, for a registry that cannot give the
+    /// ranges of a blob (it was found out earlier, or `ask` finds out), with
+    /// the file the blob was read into.
+    async fn sourced<T, Fut>(
+        &self,
+        scope: &Scope,
+        (pool, host): (&Arc<Pool>, &str),
+        (digest, size): (&Digest, u64),
+        ask: impl Fn(Option<Arc<File>>) -> Fut,
+    ) -> Result<T, RangesError>
+    where
+        Fut: std::future::Future<Output = Result<T, RangesError>>,
+    {
+        let mut known = ranges::learnt(host).whole;
+        loop {
+            let file = match known {
+                true => Some(self.downloaded(scope, pool, digest, size).await?),
+                false => None,
+            };
+            match ask(file).await {
+                Err(RangesError::WholeBlob) if !known => {
+                    ranges::ignores_ranges(host);
+                    known = true;
+                }
+                r => return r,
+            }
+        }
     }
 
     /// The workers for the repository of the scope.
@@ -232,7 +295,8 @@ impl RegistryFetch {
     /// layer, as the registry has them.
     async fn metadata(
         &self,
-        pool: &Arc<Pool>,
+        scope: &Scope,
+        (pool, host): (&Arc<Pool>, &str),
         layer: &OciDescriptor,
         info: &chunked::Info,
     ) -> Result<(Vec<u8>, Vec<u8>), ImageError> {
@@ -247,20 +311,16 @@ impl RegistryFetch {
         // (a canonical layer has no tar-split: its table of contents alone)
         let Some(ts) = info.tarsplit.map(|t| span((t.0, t.1))).transpose()? else {
             let mut got: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
-            ranges_into(
-                pool,
-                &layer.digest,
+            self.ranges_into(
+                scope,
+                (pool, host),
+                layer,
                 std::slice::from_ref(&toc),
                 Some(0),
                 &mut got,
             )
             .await
-            .map_err(|e| match e {
-                RangesError::Rejected(s) => {
-                    ImageError::Registry(format!("range request refused: {s}"))
-                }
-                RangesError::Other(e) => e,
-            })?;
+            .map_err(ranges_failed)?;
             let [toc_z, _] = got;
             if toc_z.len() as u64 != toc.end - toc.start {
                 return Err(ImageError::Layer("incomplete zstd:chunked metadata".into()));
@@ -284,36 +344,36 @@ impl RegistryFetch {
         if b.start - a.end <= chunked::METADATA_GAP && b.end - a.start <= chunked::METADATA_TOGETHER
         {
             let mut one: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
-            ranges_into(pool, &layer.digest, &[a.start..b.end], Some(0), &mut one)
-                .await
-                .map_err(|e| match e {
-                    RangesError::Rejected(s) => {
-                        ImageError::Registry(format!("range request refused: {s}"))
-                    }
-                    RangesError::Other(e) => e,
-                })?;
+            self.ranges_into(
+                scope,
+                (pool, host),
+                layer,
+                &[a.start..b.end],
+                Some(0),
+                &mut one,
+            )
+            .await
+            .map_err(ranges_failed)?;
             let whole = std::mem::take(&mut one[0]);
             let at = |r: &Range<u64>| (r.start - a.start) as usize..(r.end - a.start) as usize;
             if whole.len() as u64 == b.end - a.start {
                 got = [whole[at(&a)].to_vec(), whole[at(&b)].to_vec()];
             }
         } else {
-            match ranges_into(pool, &layer.digest, &wanted, None, &mut got).await {
+            match self
+                .ranges_into(scope, (pool, host), layer, &wanted, None, &mut got)
+                .await
+            {
                 Ok(()) => {}
                 Err(RangesError::Rejected(_)) => {
                     for (i, r) in wanted.clone().into_iter().enumerate() {
                         got[i].clear();
-                        ranges_into(pool, &layer.digest, &[r], Some(i), &mut got)
+                        self.ranges_into(scope, (pool, host), layer, &[r], Some(i), &mut got)
                             .await
-                            .map_err(|e| match e {
-                                RangesError::Rejected(s) => {
-                                    ImageError::Registry(format!("range request refused: {s}"))
-                                }
-                                RangesError::Other(e) => e,
-                            })?;
+                            .map_err(ranges_failed)?;
                     }
                 }
-                Err(RangesError::Other(e)) => return Err(e),
+                Err(e) => return Err(ranges_failed(e)),
             }
         }
         let [a, b] = got;
@@ -327,17 +387,17 @@ impl RegistryFetch {
 
     /// One request of ranges: each chunk, as the worker decompresses it, is
     /// checked and written into its file; a file whose last chunk came is
-    /// given its name.
+    /// given its name.  With `file` the ranges are read from it.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_batch(
         &self,
-        (pool, host): (&Arc<Pool>, &str),
+        pool: &Arc<Pool>,
         blob: &Digest,
         plan: &Arc<Planned>,
         files: &Arc<Files>,
         staging: &Arc<File>,
         verity: bool,
-        batch: &Batch,
+        (batch, file): (&Batch, Option<Arc<File>>),
         out: &Out<Event>,
     ) -> Result<(), RangesError> {
         let members: Vec<Vec<ChunkSpec>> = batch
@@ -368,6 +428,7 @@ impl RegistryFetch {
                 &batch.ranges,
                 &members,
                 limits.max_chunk_bytes as usize,
+                file.as_deref(),
             )
             .await?;
         let other = |e: ImageError| RangesError::Other(e);
@@ -392,10 +453,49 @@ impl RegistryFetch {
                 .await
                 .map_err(|()| other(ImageError::Layer("the asker is gone".into())))?;
         }
-        if chunks.whole_blob {
-            ranges::ignores_ranges(host);
-        }
         Ok(())
+    }
+
+    /// The bytes of `ranges` of the blob of `layer`, appended to `got` (the
+    /// range at `only`, or each at its index).
+    async fn ranges_into(
+        &self,
+        scope: &Scope,
+        (pool, host): (&Arc<Pool>, &str),
+        layer: &OciDescriptor,
+        ranges: &[Range<u64>],
+        only: Option<usize>,
+        got: &mut [Vec<u8>; 2],
+    ) -> Result<(), RangesError> {
+        let size = u64::try_from(layer.size).map_err(|_| bad_size())?;
+        let taken: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
+        let taken_ref = &taken;
+        let r = self
+            .sourced(
+                scope,
+                (pool, host),
+                (&layer.digest, size),
+                |file| async move {
+                    let mut sink = |p: Piece| {
+                        let i = only.unwrap_or(p.range);
+                        taken_ref
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((i, p.data.to_vec()));
+                        Box::pin(async { Ok(()) })
+                            as futures::future::BoxFuture<'_, Result<(), ImageError>>
+                    };
+                    pool.ranges(&layer.digest, ranges, file.as_deref(), &mut sink)
+                        .await
+                },
+            )
+            .await;
+        for (i, b) in taken.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            if let Some(slot) = got.get_mut(i) {
+                slot.extend_from_slice(&b);
+            }
+        }
+        r
     }
 
     /// Check and write a chunk (blocking: on a thread of its own), and
@@ -645,31 +745,58 @@ fn unpack(
     velarx_content::unpack::unpack_tar(reader, staging, kind, &mut files)
 }
 
-/// The bytes of `ranges` of the blob `digest`, appended to `got` (the
-/// range at `only`, or each at its index).
-async fn ranges_into(
+fn bad_size() -> RangesError {
+    RangesError::Other(ImageError::Layer("a negative size".into()))
+}
+
+/// The blob `digest` of `size` bytes, from the registry into a file with no
+/// name beneath `scratch`, as it comes, opened anew read only.  A blob that
+/// is longer or shorter than `size`, or has another digest, is an error, and
+/// the file goes.
+async fn read_whole(
+    scratch: &OwnedFd,
     pool: &Arc<Pool>,
     digest: &Digest,
-    ranges: &[Range<u64>],
-    only: Option<usize>,
-    got: &mut [Vec<u8>; 2],
-) -> Result<(), RangesError> {
-    let taken: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
-    let mut sink = |p: Piece| {
-        let i = only.unwrap_or(p.range);
-        taken
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((i, p.data.to_vec()));
-        Box::pin(async { Ok(()) }) as futures::future::BoxFuture<'_, Result<(), ImageError>>
-    };
-    let r = pool.ranges(digest, ranges, &mut sink).await;
-    for (i, b) in taken.into_inner().unwrap_or_else(|e| e.into_inner()) {
-        if let Some(slot) = got.get_mut(i) {
-            slot.extend_from_slice(&b);
-        }
+    size: u64,
+) -> Result<File, ImageError> {
+    use std::io::Write;
+    let file = File::from(
+        rustix::fs::openat(
+            scratch,
+            ".",
+            rustix::fs::OFlags::TMPFILE | rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    let mut hash = velarx_types::digest::DigestWriter::for_digest(digest);
+    let mut to = &file;
+    pool.blob(digest, size, &mut |data| {
+        hash.update(data);
+        to.write_all(data)
+    })
+    .await?;
+    let got = hash.finalize();
+    if got != *digest {
+        return Err(ImageError::DigestMismatch {
+            expected: digest.to_string(),
+            actual: got.to_string(),
+        });
     }
-    r
+    // (the workers are given it read only: what they read, nothing else)
+    use std::os::fd::AsRawFd;
+    Ok(File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?)
+}
+
+/// The error of a request of ranges that cannot be asked another way.
+fn ranges_failed(e: RangesError) -> ImageError {
+    match e {
+        RangesError::Rejected(s) => ImageError::Registry(format!("range request refused: {s}")),
+        RangesError::WholeBlob => {
+            ImageError::Registry("the registry answers ranges with the whole blob".into())
+        }
+        RangesError::Other(e) => e,
+    }
 }
 
 /// The error of a file of the layer at `path`.
@@ -863,7 +990,7 @@ impl StagingFetcher for RegistryFetch {
         layers: Vec<Blob>,
         out: &Out<Probed>,
     ) -> Result<(), FetcherError> {
-        let pool = self.pool(scope)?.0;
+        let (pool, host) = self.pool(scope)?;
         for (at, blob) in layers.iter().enumerate() {
             let at = at as u32;
             let reply = |toc, on_demand, reason| Probed {
@@ -892,12 +1019,12 @@ impl StagingFetcher for RegistryFetch {
             // (a layer with a table is pulled by it or not at all: no table
             // is an error of the layer, which no fetcher after this one
             // makes right)
-            let (toc_z, ts_z) =
-                self.metadata(&pool, layer, &info)
-                    .await
-                    .map_err(|e| FetcherError::Refused {
-                        reason: format!("layer {}: its table of contents: {e}", layer.digest),
-                    })?;
+            let (toc_z, ts_z) = self
+                .metadata(scope, (&pool, &host), layer, &info)
+                .await
+                .map_err(|e| FetcherError::Refused {
+                    reason: format!("layer {}: its table of contents: {e}", layer.digest),
+                })?;
             // (the engine checks what it keeps against the descriptor, and
             // gives the error of a table it cannot use)
             let mut fds = vec![velarx_base::sealed::sealed_memory(&toc_z).map_err(failed)?];
@@ -1093,26 +1220,25 @@ impl StagingFetcher for RegistryFetch {
                 .map_err(|()| failed("the asker is gone"))?;
         }
         let (pool, host) = self.pool(scope)?;
-        let all: Vec<usize> = (0..plan.comps.len())
-            .filter(|&i| !plan.got[i].load(Ordering::Acquire))
-            .collect();
         let concurrency = self.service.limits.range_concurrency.max(1);
-        let batches = make_batches(&plan.comps, &all, concurrency, ranges::learnt(&host));
-        let mut queue: VecDeque<Batch> = batches.into();
         let run = async {
-            let mut running = futures::stream::FuturesUnordered::new();
             let mut error: Option<ImageError> = None;
+            let all: Vec<usize> = (0..plan.comps.len())
+                .filter(|&i| !plan.got[i].load(Ordering::Acquire))
+                .collect();
+            let mut queue: VecDeque<Batch> =
+                make_batches(&plan.comps, &all, concurrency, ranges::learnt(&host)).into();
+            let mut running = futures::stream::FuturesUnordered::new();
             loop {
                 while running.len() < concurrency && error.is_none() {
                     let Some(batch) = queue.pop_front() else {
                         break;
                     };
-                    let bytes: u64 = batch.ranges.iter().map(|r| r.end - r.start).sum();
                     let (pool, plan, files, staging) =
                         (pool.clone(), plan.clone(), files.clone(), staging.clone());
                     let host = host.clone();
                     running.push(async move {
-                        let r = fetch_with_tries(
+                        fetch_with_tries(
                             batch,
                             &host,
                             &digest,
@@ -1120,38 +1246,40 @@ impl StagingFetcher for RegistryFetch {
                             |i| plan.got[i].load(Ordering::Acquire),
                             || false,
                             |b| {
-                                let (pool, plan, files, staging, host) = (
-                                    pool.clone(),
-                                    plan.clone(),
-                                    files.clone(),
-                                    staging.clone(),
-                                    host.clone(),
-                                );
+                                let (pool, plan, files, staging) =
+                                    (pool.clone(), plan.clone(), files.clone(), staging.clone());
+                                let host = host.clone();
                                 async move {
-                                    self.fetch_batch(
+                                    self.sourced(
+                                        scope,
                                         (&pool, &host),
-                                        &digest,
-                                        &plan,
-                                        &files,
-                                        &staging,
-                                        scope.verity,
-                                        &b,
-                                        out,
+                                        (&digest, blob.size),
+                                        |file| {
+                                            self.fetch_batch(
+                                                &pool,
+                                                &digest,
+                                                &plan,
+                                                &files,
+                                                &staging,
+                                                scope.verity,
+                                                (&b, file),
+                                                out,
+                                            )
+                                        },
                                     )
                                     .await
                                 }
                             },
                         )
-                        .await;
-                        (r, bytes)
+                        .await
                     });
                 }
                 use futures::StreamExt;
                 match running.next().await {
                     None => break,
-                    Some((Ok(()), _)) => {}
-                    Some((Err(e), _)) => {
-                        error.get_or_insert(e);
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => {
+                        error.get_or_insert(ranges_failed(e));
                     }
                 }
             }
@@ -1183,6 +1311,99 @@ impl StagingFetcher for RegistryFetch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The files with no name beneath `dir` that this process has open.
+    fn unnamed(dir: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+            .filter(|t| t.starts_with(dir) && t.to_string_lossy().ends_with(" (deleted)"))
+            .count()
+    }
+
+    /// A blob read whole from a worker that sends `frames` and then ends:
+    /// what `read_whole` made of it, and whether a file with no name is
+    /// left beneath the scratch directory.
+    async fn read_of(
+        blob: &[u8],
+        size: u64,
+        frames: Vec<Vec<u8>>,
+    ) -> (Result<File, ImageError>, usize) {
+        use crate::net::proto::{write_data, write_frame, Kind};
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = OwnedFd::from(File::open(dir.path()).unwrap());
+        let pool = crate::net::pool::tests::pool_with(move |mut w| async move {
+            let mut at = 0;
+            for frame in frames {
+                write_data(&mut w, Kind::Data, &[], 0, at, &frame)
+                    .await
+                    .unwrap();
+                at += frame.len() as u64;
+            }
+            write_frame(&mut w, Kind::Reply, b"{}", &[]).await.unwrap();
+        })
+        .await;
+        let digest = Digest::of(velarx_types::digest::Algorithm::Sha256, blob);
+        let read = read_whole(&scratch, &pool, &digest, size).await;
+        let open = unnamed(&std::fs::canonicalize(dir.path()).unwrap());
+        (read, open)
+    }
+
+    /// The blob goes into a file with no name, as it comes; one of another
+    /// size or digest is an error and leaves no file.
+    #[tokio::test]
+    async fn a_blob_read_whole_is_a_file_that_has_its_digest_and_its_size() {
+        use std::os::unix::fs::FileExt;
+        let blob = b"the blob of a registry".to_vec();
+        let (half, rest) = blob.split_at(5);
+        let (read, open) = read_of(&blob, 22, vec![half.to_vec(), rest.to_vec()]).await;
+        let file = read.unwrap();
+        assert_eq!(open, 1);
+        let mut got = vec![0u8; blob.len()];
+        file.read_exact_at(&mut got, 0).unwrap();
+        assert_eq!(got, blob);
+        // (read only: a worker it is given cannot change it)
+        assert!(file.write_at(b"x", 0).is_err());
+        // (a worker is refused for more than it was asked, the digest
+        // for other bytes, and a short blob is an error)
+        let (read, open) = read_of(&blob, 22, vec![b"another blob of a registry".to_vec()]).await;
+        assert!(read.is_err());
+        assert_eq!(open, 0);
+        let (read, open) = read_of(&blob, 22, vec![b"the blob of a registrx".to_vec()]).await;
+        assert!(
+            matches!(read, Err(ImageError::DigestMismatch { .. })),
+            "{read:?}"
+        );
+        assert_eq!(open, 0);
+        let (read, open) = read_of(&blob, 22, vec![half.to_vec()]).await;
+        assert!(read.is_err());
+        assert_eq!(open, 0);
+    }
+
+    /// A blob that is being read when its call is dropped leaves no file.
+    #[tokio::test]
+    async fn a_blob_read_whole_that_is_given_up_leaves_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = OwnedFd::from(File::open(dir.path()).unwrap());
+        let pool = crate::net::pool::tests::pool_with(|mut w| async move {
+            crate::net::proto::write_data(&mut w, crate::net::proto::Kind::Data, &[], 0, 0, b"the")
+                .await
+                .unwrap();
+            // (the rest never comes)
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let digest = Digest::of(velarx_types::digest::Algorithm::Sha256, b"the blob");
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let read = read_whole(&scratch, &pool, &digest, 8);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), read)
+                .await
+                .is_err()
+        );
+        assert_eq!(unnamed(&root), 0);
+    }
 
     /// The table of contents of a zstd:chunked layer is found through the
     /// annotations of the blob the engine sent in a `Probe`, and a blob

@@ -8,12 +8,14 @@
 //! decompresses goes back as frames, never to a file.
 
 use super::proto::{
-    json, parse, read_bytes, read_header, write_data, write_frame, AuthReply, AuthRequest,
-    ChunkSpec, Done, ErrorKind, ErrorMsg, Kind, LayerTrailer, Request,
+    json, parse, read_bytes, read_header, read_header_with_fd, write_data, write_frame, AuthReply,
+    AuthRequest, ChunkSpec, Done, ErrorKind, ErrorMsg, Kind, LayerTrailer, Request,
 };
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
+use std::fs::File;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, Mutex};
@@ -230,13 +232,12 @@ impl State {
 
     /// The reply to a request about the blob `digest`: where the registry
     /// sent it is told to the pool, for the other workers.
-    async fn done_for(&self, digest: &Digest, whole_blob: bool) -> Result<(), ErrorMsg> {
+    async fn done_for(&self, digest: &Digest) -> Result<(), ErrorMsg> {
         let (redirect_endpoint, redirect) = match self.client.redirect_of(&self.target, digest) {
             Some((i, url)) => (i, Some(url)),
             None => (0, None),
         };
         self.done(Done {
-            whole_blob,
             redirect,
             redirect_endpoint,
             ..Done::default()
@@ -437,7 +438,7 @@ impl State {
             .await
             .map_err(image_failed)?;
         self.out.whole(0, 0, &body).await.map_err(failed)?;
-        self.done_for(&desc.digest, false).await
+        self.done_for(&desc.digest).await
     }
 
     /// A layer, decompressed.  The compressed bytes are hashed here; the
@@ -529,7 +530,12 @@ impl State {
             .map_err(failed)
     }
 
-    async fn ranges(&self, digest: Digest, ranges: Vec<(u64, u64)>) -> Result<(), ErrorMsg> {
+    async fn ranges(
+        &self,
+        digest: Digest,
+        ranges: Vec<(u64, u64)>,
+        file: Option<File>,
+    ) -> Result<(), ErrorMsg> {
         let ranges: Vec<_> = ranges.into_iter().map(|(a, b)| a..b).collect();
         let out = self.out.clone();
         let mut sink = move |p: Piece| {
@@ -537,10 +543,21 @@ impl State {
             Box::pin(async move { out.data(p.range, p.offset, &p.data).await.map_err(io_error) })
                 as futures::future::BoxFuture<'static, ImageResult<()>>
         };
-        crate::net::ranges::fetch_ranges(&self.client, &self.target, &digest, &ranges, &mut sink)
-            .await
-            .map_err(ranges_error)?;
-        self.done_for(&digest, false).await
+        match &file {
+            Some(file) => crate::net::ranges::read_ranges(file, &ranges, &mut sink).await,
+            None => {
+                crate::net::ranges::fetch_ranges(
+                    &self.client,
+                    &self.target,
+                    &digest,
+                    &ranges,
+                    &mut sink,
+                )
+                .await
+            }
+        }
+        .map_err(ranges_error)?;
+        self.done_for(&digest).await
     }
 
     /// Chunks of a blob: the compressed bytes of each are put together,
@@ -552,6 +569,7 @@ impl State {
         digest: Digest,
         ranges: Vec<(u64, u64)>,
         members: Vec<Vec<ChunkSpec>>,
+        file: Option<File>,
     ) -> Result<(), ErrorMsg> {
         if ranges.len() != members.len() {
             return Err(failed("the ranges and the chunks do not match"));
@@ -575,9 +593,7 @@ impl State {
                     .map(|(k, b)| (specs[k].clone(), b))
                     .collect()),
                 Err(velarx_content::pull::ranges::RangesError::Other(e)) => Err(e),
-                Err(velarx_content::pull::ranges::RangesError::Rejected(s)) => {
-                    Err(ImageError::Layer(format!("rejected: {s}")))
-                }
+                Err(other) => Err(ImageError::Layer(format!("rejected: {other:?}"))),
             };
             let out = out.clone();
             Box::pin(async move {
@@ -597,14 +613,21 @@ impl State {
                 Ok(())
             }) as futures::future::BoxFuture<'_, ImageResult<()>>
         };
-        crate::net::ranges::fetch_ranges(&self.client, &self.target, &digest, &ranges, &mut sink)
-            .await
-            .map_err(ranges_error)?;
-        self.done_for(
-            &digest,
-            velarx_content::pull::ranges::learnt(&self.target.endpoint.host).whole,
-        )
-        .await
+        match &file {
+            Some(file) => crate::net::ranges::read_ranges(file, &ranges, &mut sink).await,
+            None => {
+                crate::net::ranges::fetch_ranges(
+                    &self.client,
+                    &self.target,
+                    &digest,
+                    &ranges,
+                    &mut sink,
+                )
+                .await
+            }
+        }
+        .map_err(ranges_error)?;
+        self.done_for(&digest).await
     }
 }
 
@@ -644,6 +667,12 @@ fn ranges_error(e: RangesError) -> ErrorMsg {
             message: format!("the registry refuses the ranges: {status}"),
             notices: Default::default(),
         },
+        RangesError::WholeBlob => ErrorMsg {
+            kind: ErrorKind::WholeBlob,
+            status: None,
+            message: "the registry cannot give the ranges of the blob".into(),
+            notices: Default::default(),
+        },
         RangesError::Other(e @ ImageError::Contradicted(_)) => image_failed(e),
         RangesError::Other(e) => failed(e),
     }
@@ -667,7 +696,7 @@ async fn serve(socket: tokio::net::UnixStream) -> io::Result<()> {
     let mut state: Option<State> = None;
     loop {
         let mut guard = reader.lock().await;
-        let header = match read_header(&mut *guard, 0).await {
+        let (header, mut fd) = match read_header_with_fd(guard.as_ref(), 0).await {
             Ok(h) => h,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
@@ -850,15 +879,29 @@ async fn serve(socket: tokio::net::UnixStream) -> io::Result<()> {
                 },
                 Some(s),
             ) => s.layer(digest, size, max_uncompressed).await,
-            (Request::Ranges { digest, ranges }, Some(s)) => s.ranges(digest, ranges).await,
+            (
+                Request::Ranges {
+                    digest,
+                    ranges,
+                    file,
+                },
+                Some(s),
+            ) => match source(file, &mut fd) {
+                Ok(file) => s.ranges(digest, ranges, file).await,
+                Err(e) => Err(e),
+            },
             (
                 Request::Chunks {
                     digest,
                     ranges,
                     chunks,
+                    file,
                 },
                 Some(s),
-            ) => s.chunks(digest, ranges, chunks).await,
+            ) => match source(file, &mut fd) {
+                Ok(file) => s.chunks(digest, ranges, chunks, file).await,
+                Err(e) => Err(e),
+            },
         };
         if let Err(mut e) = result {
             if let Some(s) = &state {
@@ -866,6 +909,15 @@ async fn serve(socket: tokio::net::UnixStream) -> io::Result<()> {
             }
             out.error(e).await?;
         }
+    }
+}
+
+/// The file that came with a request that says it has one.
+fn source(file: bool, fd: &mut Option<OwnedFd>) -> Result<Option<File>, ErrorMsg> {
+    match (file, fd.take()) {
+        (true, Some(fd)) => Ok(Some(File::from(fd))),
+        (true, None) => Err(failed("the file of the request did not come")),
+        (false, _) => Ok(None),
     }
 }
 

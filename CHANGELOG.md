@@ -143,6 +143,15 @@ without the numbers of issues or pull requests of any tracker.
 
 ### Changed
 
+- A registry that cannot give the parts of a zstd:chunked layer (S3-backed
+  registries ignore a request of several ranges and answer it with the whole
+  blob; some refuse a range with 400 or 416) is read once: the fetcher
+  reads the blob into a file with no name beneath the staging, checking its
+  digest as it goes, and the workers cut the table of contents and the
+  chunks of every request from that file.  The file goes with the layer
+  (`Forget`) and with the connection.  A pull of such a layer reads the blob
+  once (it read it about four times), a lazy pull and its completion once
+  each.
 - The binaries are position independent executables again, with packed
   relative relocations: the address space of the engine and of its helpers is
   randomized, at no cost in size.  They need glibc 2.36 or later (the

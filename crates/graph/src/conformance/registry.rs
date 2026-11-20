@@ -348,8 +348,16 @@ impl Registry {
             spawner,
         )
         .expect("the registry service");
+        std::fs::create_dir_all(staging).expect("the staging directory");
         let local = LocalFetcher::start(
-            velarx_registry_lib::registry_fetch::RegistryFetch::new(service),
+            velarx_registry_lib::registry_fetch::RegistryFetch::new(
+                service,
+                std::sync::Arc::new(
+                    std::fs::File::open(staging)
+                        .expect("the staging directory")
+                        .into(),
+                ),
+            ),
             velarx_content::activation::Limits::default(),
         )
         .expect("the registry fetcher");

@@ -29,6 +29,11 @@ pub enum RangesError {
     /// The server refuses the request (400, 416, the status): fewer ranges
     /// may work.
     Rejected(u16),
+    /// The server cannot give a part of the blob: it answered a request
+    /// for more than a prefix with the whole blob (it ignores `Range`), or
+    /// refused a single range; its body was not read.  The blob is asked
+    /// once, whole, and the parts are read from what came.
+    WholeBlob,
     Other(ImageError),
 }
 

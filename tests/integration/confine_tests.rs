@@ -1102,7 +1102,9 @@ async fn test_workers_connect_to_the_cdn_before_the_first_range() {
                 Box::pin(async { Ok(()) })
                     as futures::future::BoxFuture<'_, Result<(), velarx_types::ImageError>>
             };
-            pool.ranges(&digest, &wanted, &mut sink).await.unwrap();
+            pool.ranges(&digest, &wanted, None, &mut sink)
+                .await
+                .unwrap();
             assert_eq!(got, blob[(i * 1000) as usize..((i + 1) * 1000) as usize]);
         }
     };

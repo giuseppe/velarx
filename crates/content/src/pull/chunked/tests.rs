@@ -324,15 +324,6 @@ fn test_batches_merge_adjacent_chunks_and_respect_limits() {
     };
     let batches = make_batches(&comps(&chunks), &remote, 4, learnt);
     assert!(batches.iter().all(|b| b.ranges.len() <= 4));
-    // a registry that ignores Range: one request of everything
-    let learnt = Learnt {
-        per_request: None,
-        whole: true,
-    };
-    let batches = make_batches(&comps(&chunks), &remote, 4, learnt);
-    assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].ranges, vec![0..19 * (2 << 20) + (64 << 10)]);
-    assert_eq!(batches[0].members[0], remote);
     // overlapping chunks are not merged
     let chunks = vec![mk(0, 100), mk(50, 100)];
     let batches = make_batches(&comps(&chunks), &[0, 1], 4, Learnt::default());
@@ -426,6 +417,24 @@ async fn test_the_tries_of_a_range_request() {
     .await
     .unwrap();
     assert_eq!(*asked.lock().unwrap(), [4, 2, 2]);
+    // a server that answers with the whole blob is for the caller: no retry
+    let tries = AtomicUsize::new(0);
+    let e = fetch_with_tries(
+        batch(),
+        "tries-whole.invalid",
+        &digest,
+        comp,
+        |_| false,
+        || false,
+        |_| {
+            tries.fetch_add(1, Ordering::SeqCst);
+            async { Err(RangesError::WholeBlob) }
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(e, RangesError::WholeBlob), "{e:?}");
+    assert_eq!(tries.load(Ordering::SeqCst), 1);
     // a request that brings nothing is tried RETRIES times
     let tries = AtomicUsize::new(0);
     let e = fetch_with_tries(
@@ -442,7 +451,7 @@ async fn test_the_tries_of_a_range_request() {
     )
     .await
     .unwrap_err();
-    assert!(e.to_string().contains("down"), "{e}");
+    assert!(format!("{e:?}").contains("down"), "{e:?}");
     assert_eq!(tries.load(Ordering::SeqCst), RETRIES);
     // a pull that is over is not tried again
     let tries = AtomicUsize::new(0);

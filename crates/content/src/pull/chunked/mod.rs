@@ -872,7 +872,8 @@ pub(crate) fn unclaimed(
 /// asked half of them, and the limit is remembered for `host`; what arrived
 /// before an error (the chunks `claimed`) is not asked again, and the
 /// request is tried [`RETRIES`] times in a row that brought nothing, unless
-/// `stopped` says the pull is over.
+/// `stopped` says the pull is over.  A server that answers with the whole
+/// blob ([`RangesError::WholeBlob`]) is for the caller to ask once, whole.
 pub async fn fetch_with_tries<F, Fut>(
     batch: Batch,
     host: &str,
@@ -881,7 +882,7 @@ pub async fn fetch_with_tries<F, Fut>(
     claimed: impl Fn(usize) -> bool,
     stopped: impl Fn() -> bool,
     mut fetch: F,
-) -> ImageResult<()>
+) -> Result<(), crate::pull::ranges::RangesError>
 where
     Fut: std::future::Future<Output = Result<(), crate::pull::ranges::RangesError>>,
     F: FnMut(Batch) -> Fut,
@@ -895,11 +896,11 @@ where
             Ok(()) => {}
             Err(RangesError::Rejected(status)) => {
                 if b.ranges.len() == 1 {
-                    return Err(ImageError::transfer(
+                    return Err(RangesError::Other(ImageError::transfer(
                         "registry",
                         FailureClass::Unavailable,
                         format!("the registry refuses range requests: {status}"),
-                    ));
+                    )));
                 }
                 let mid = b.ranges.len() / 2;
                 ranges::lower_limit(host, mid);
@@ -911,6 +912,7 @@ where
                 work.push_front((rest, failed));
                 work.push_front((Batch { ranges, members }, failed));
             }
+            Err(RangesError::WholeBlob) => return Err(RangesError::WholeBlob),
             Err(RangesError::Other(e)) => {
                 let Some(rest) = unclaimed(&b, &comp, &claimed) else {
                     continue;
@@ -921,7 +923,7 @@ where
                     failed + 1
                 };
                 if failed >= RETRIES || stopped() {
-                    return Err(e);
+                    return Err(RangesError::Other(e));
                 }
                 debug!("Retrying a range request of {digest}: {e}");
                 work.push_front((rest, failed));
@@ -959,17 +961,6 @@ pub fn make_batches(
         .per_request
         .unwrap_or(MAX_RANGES_PER_REQUEST)
         .clamp(1, MAX_RANGES_PER_REQUEST);
-
-    // A registry that ignores Range sends the blob from its start at each
-    // request: one request then, of everything.
-    if learnt.whole {
-        let start = chunks[order[0]].start;
-        let end = order.iter().map(|&i| chunks[i].end).max().unwrap_or(start);
-        return vec![Batch {
-            ranges: vec![start..end],
-            members: vec![order],
-        }];
-    }
 
     let comps: Vec<Range<u64>> = order.iter().map(|&i| chunks[i].clone()).collect();
     let policy = super::merge::Policy {

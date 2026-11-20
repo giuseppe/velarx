@@ -2229,3 +2229,130 @@ fn test_a_hard_limit_of_open_files_below_the_need_is_refused_before_anything_is_
         });
     });
 }
+
+/// `files` files of `size` bytes each that do not compress, in chunks of
+/// 64 KiB.
+fn incompressible_files(files: usize, size: usize) -> Vec<Item> {
+    let names = ["f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7"];
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    names[..files]
+        .iter()
+        .map(|name| Item::File {
+            name,
+            data: (0..size)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 24) as u8
+                })
+                .collect(),
+            chunk: 64 * 1024,
+        })
+        .collect()
+}
+
+/// The files of `items` are in the store.
+fn assert_stored(e: &Env, items: &[Item]) {
+    for item in items {
+        if let Item::File { data, .. } = item {
+            assert!(e.store.contains(&vid(data)));
+        }
+    }
+}
+
+/// A registry that cannot give the ranges of a blob (it answers them with
+/// the whole blob, or refuses them) is read once: the blob goes into a file
+/// with no name, which every request for a part of it is served from, and
+/// which is let go with the layer.  A pull reads the blob once; so does a
+/// lazy one, and so does the completion that follows it.
+#[tokio::test]
+async fn test_a_registry_that_cannot_give_ranges_is_read_once() {
+    let items = incompressible_files(8, 1 << 20);
+    let layer = build_chunked(&items);
+    let blob = layer.blob.len() as u64;
+    for mode in [RangeMode::Ignore, RangeMode::Refuse] {
+        for lazy in [true, false] {
+            let e = env().await;
+            e.publish(&[&layer], &[ZSTD]);
+            *e.reg.mode.lock().unwrap() = mode;
+            let served = || e.reg.served.load(Ordering::SeqCst);
+            // (and what the registry had queued of the answer a worker that
+            // finds it is no range dropped unread)
+            let within = |bytes: u64, what: &str| {
+                assert!(bytes < blob + (2 << 20), "{what}: {bytes} of {blob}");
+            };
+            if lazy {
+                e.pull_lazy().await.unwrap();
+                within(served(), "a lazy pull");
+                let before = served();
+                e.service
+                    .complete_image(&format!("{}/test:latest", e.host))
+                    .await
+                    .unwrap();
+                within(served() - before, "its completion");
+            } else {
+                e.pull().await.unwrap();
+                within(served(), "a pull");
+            }
+            assert_stored(&e, &items);
+            assert_eq!(e.staged_leftovers(), 0);
+        }
+    }
+}
+
+/// A registry that has ranges is asked for what is needed only.
+#[tokio::test]
+async fn test_a_registry_with_ranges_is_not_read_whole() {
+    let items = incompressible_files(8, 1 << 20);
+    let layer = build_chunked(&items);
+    let e = env().await;
+    e.publish(&[&layer], &[ZSTD]);
+    e.pull().await.unwrap();
+    assert_stored(&e, &items);
+    let served = e.reg.served.load(Ordering::SeqCst);
+    assert!(
+        served < layer.blob.len() as u64 + (1 << 20),
+        "{served} bytes for a blob of {}",
+        layer.blob.len()
+    );
+    assert!(e.reg.ranged.load(Ordering::SeqCst) > 0, "no range request");
+}
+
+/// A registry that sends more than the blob has, or less, fails the pull and
+/// leaves nothing: no file, nothing in the store.
+#[tokio::test]
+async fn test_a_whole_blob_of_the_wrong_size() {
+    let items = incompressible_files(2, 1 << 20);
+    let layer = build_chunked(&items);
+    let digest = sha(&layer.blob).to_string();
+    for tamper in [Tamper::Append(64 << 20), Tamper::Cut] {
+        let e = env().await;
+        e.publish(&[&layer], &[ZSTD]);
+        *e.reg.mode.lock().unwrap() = RangeMode::Ignore;
+        *e.reg.tamper.lock().unwrap() = Some((digest.clone(), tamper));
+        assert!(e.pull().await.is_err());
+        assert_eq!(e.staged_leftovers(), 0);
+        assert!(!e.store.contains(&vid(match &items[0] {
+            Item::File { data, .. } => data,
+            _ => unreachable!(),
+        })));
+        assert!(e.db.list_layers().await.unwrap().is_empty());
+    }
+}
+
+/// A whole blob that is not the one of the descriptor is refused as it is
+/// written, whatever its size.
+#[tokio::test]
+async fn test_a_whole_blob_that_is_not_the_one_asked_for() {
+    let items = incompressible_files(2, 1 << 20);
+    let layer = build_chunked(&items);
+    let digest = sha(&layer.blob).to_string();
+    let e = env().await;
+    e.publish(&[&layer], &[ZSTD]);
+    *e.reg.mode.lock().unwrap() = RangeMode::Ignore;
+    *e.reg.tamper.lock().unwrap() = Some((digest, Tamper::Flip));
+    let err = e.pull().await.unwrap_err();
+    assert!(err.to_string().contains("sha256"), "{err}");
+    assert_eq!(e.staged_leftovers(), 0);
+}
