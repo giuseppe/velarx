@@ -342,7 +342,8 @@ without the numbers of issues or pull requests of any tracker.
   mount is given the open image as the source of the file system
   (`FSCONFIG_SET_FD`) and keeps the lock for as long as the mount exists.  The
   garbage collection keeps a layer whose image is locked, even when no image
-  or container names it any more.  A collection of many layers holds their images 256 at a time.
+  or container names it any more.  A collection of many layers holds their
+  images 256 at a time.
 - `velarx-kube play` opens the directory of the build of an image itself and
   gives the engine the descriptor of that directory, not its path, and the
   engine builds from the directory in place, nothing is copied: COPY and ADD
@@ -1126,10 +1127,10 @@ without the numbers of issues or pull requests of any tracker.
   monitor fetches what the container reads, and no longer records anything.
 
 - In a user namespace the overlay of an image of several layers is mounted
-  with `redirect_dir=followdata` where the kernel has that option (Linux 7.4), so that it follows the stub of
-  every layer into the data-only layer.  On a kernel without it the files of
-  the layers above the lowest are served by FUSE, as before.  Images of one
-  layer and mounts as root do not use it.
+  with `redirect_dir=followdata` where the kernel has that option (Linux
+  7.4), so that it follows the stub of every layer into the data-only layer.
+  On a kernel without it the files of the layers above the lowest are served
+  by FUSE, as before.  Images of one layer and mounts as root do not use it.
 - What Velarx finds the kernel and its tools can do is kept in the run root
   (`--runroot`), in `features/`, as one marker file per feature named
   `<feature>-yes` or `<feature>-no`; no file means not probed yet, and a new

@@ -73,11 +73,12 @@ pub fn out_of_system_files(e: &io::Error) -> bool {
 
 /// Whether `e`, the failure of [`mount_erofs`] or [`erofs_of_file`], is the
 /// kernel's refusal of an open file as the source of an EROFS: a file system
-/// the kernel cannot read the image through is `EINVAL` or `ENODEV`.  Any
-/// other failure (no memory, no descriptor, no privilege) says nothing of it.
+/// the kernel cannot read the image through is `EINVAL` or `ENODEV`, a
+/// stacked one (an overlay, a file-backed EROFS) is `ENOTBLK`.  Any other
+/// failure (no memory, no descriptor, no privilege) says nothing of it.
 pub fn refuses_a_file(e: &io::Error) -> bool {
     use rustix::io::Errno;
-    errno(e).is_some_and(|n| matches!(n, Errno::INVAL | Errno::NODEV))
+    errno(e).is_some_and(|n| matches!(n, Errno::NOTBLK | Errno::INVAL | Errno::NODEV))
 }
 
 /// What a kernel mount is made of: the EROFS images of the layers, each
@@ -635,7 +636,7 @@ mod tests {
     #[test]
     fn the_refusal_of_a_file_is_told_from_other_failures() {
         use rustix::io::Errno;
-        for no in [Errno::INVAL, Errno::NODEV] {
+        for no in [Errno::NOTBLK, Errno::INVAL, Errno::NODEV] {
             assert!(
                 refuses_a_file(&failed("fsconfig_create(erofs)", no)),
                 "{no}"
