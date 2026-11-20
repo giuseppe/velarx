@@ -65,7 +65,13 @@ pub struct Scope {
     /// The most this connection's calls stay silent: a call with replies to
     /// come says something at least every half of it
     pub idle: std::time::Duration,
+    /// What the fetcher keeps for the blobs of the scope, by the digest of
+    /// the layer: let go by `Forget` of the layer and with the scope
+    pub kept: Arc<Kept>,
 }
+
+/// See [`Scope::kept`].
+pub type Kept = Mutex<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>;
 
 /// `work` (the part of a fetcher that serves a call), and while it is
 /// pending a beat on `out` at least every half of `idle`: the engine ends a
@@ -763,6 +769,7 @@ impl ScopeKind for FetcherScope {
             target: old.target.clone(),
             access: Some(access),
             idle: old.idle,
+            kept: old.kept.clone(),
         })
     }
 }
@@ -985,6 +992,7 @@ mod service {
                 target,
                 access,
                 idle,
+                kept: Arc::default(),
             };
             Scoped::<FetcherScope>::of(self)
                 .open(scope, |scope| async move { self.api.opened(&scope).await })
@@ -1068,9 +1076,17 @@ mod service {
             Ok(Ack {})
         }
 
-        /// Forget the layer: its calls end, later ones are `Refused`.
+        /// Forget the layer: its calls end, later ones are `Refused`, and what
+        /// the fetcher kept for its blob is let go (of a layer that was only
+        /// probed too).
         pub async fn forget(&self, layer: String) -> Result<Ack, FetcherError> {
-            self.scope()?;
+            let scope = self.scope()?;
+            let kept = scope
+                .kept
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&layer)
+                .is_some();
             match self
                 .state
                 .lock()
@@ -1082,6 +1098,7 @@ mod service {
                     scope.cancel.cancel();
                     Ok(Ack {})
                 }
+                None if kept => Ok(Ack {}),
                 None => Err(refused("a layer that was not told")),
             }
         }
@@ -2254,11 +2271,28 @@ mod tests {
         e.layer(vec![dir()], "sha256:aa".into(), 0, None, None)
             .await
             .unwrap();
+        // what the fetcher kept for the blob goes with the layer
+        let kept = Arc::new(());
+        let scope = e.scope().unwrap();
+        scope
+            .kept
+            .lock()
+            .unwrap()
+            .insert("sha256:aa".into(), kept.clone());
         e.forget("sha256:aa".into()).await.unwrap();
+        assert_eq!(Arc::strong_count(&kept), 1);
         assert!(matches!(
             e.forget("sha256:aa".into()).await,
             Err(FetcherError::Refused { .. })
         ));
+        // and with a layer that was only probed, never told
+        scope
+            .kept
+            .lock()
+            .unwrap()
+            .insert("sha256:bb".into(), kept.clone());
+        e.forget("sha256:bb".into()).await.unwrap();
+        assert_eq!(Arc::strong_count(&kept), 1);
     }
 
     /// A descriptor is named by the position of a field; one that no field

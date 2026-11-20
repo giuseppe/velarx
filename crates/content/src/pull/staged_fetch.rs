@@ -336,6 +336,10 @@ pub struct StagedFetch {
     /// write into the removed one; a fetcher whose `Layer` failed is not
     /// marked, it is told again by the next walk
     told: Mutex<HashMap<String, Vec<Option<StagingId>>>>,
+    /// The layers the fetchers were asked about (`Probe`) since they were
+    /// last forgotten: what a fetcher keeps for a blob it read to answer
+    /// goes with `Forget`, told or not
+    probed: Mutex<std::collections::HashSet<String>>,
     /// Held while a layer is told: a second walk of the layer, at the same
     /// time, waits for the `Layer` call of the first, not for nothing
     telling: tokio::sync::Mutex<()>,
@@ -499,6 +503,7 @@ impl StagedFetch {
             layers: parsed.layers.iter().map(|l| l.digest).collect(),
             max_objects,
             told: Mutex::default(),
+            probed: Mutex::default(),
             telling: tokio::sync::Mutex::default(),
             open: Arc::default(),
         }))
@@ -548,6 +553,14 @@ impl StagedFetch {
         &self,
         at: &[u32],
     ) -> ImageResult<Vec<(Probed, Option<(Vec<u8>, Vec<u8>)>)>> {
+        self.probed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(
+                at.iter()
+                    .filter_map(|i| self.layers.get(*i as usize))
+                    .map(Digest::to_string),
+            );
         let mut found: Vec<(Probed, Option<(Vec<u8>, Vec<u8>)>)> = Vec::new();
         let mut left: Vec<u32> = at.to_vec();
         let breaker = Breaker::new(self.fetchers.len());
@@ -887,7 +900,12 @@ impl StagedFetch {
             .unwrap_or_else(|e| e.into_inner())
             .remove(layer)
             .is_some();
-        if !told {
+        let probed = self
+            .probed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(layer);
+        if !told && !probed {
             return;
         }
         for fetcher in &self.fetchers {

@@ -253,7 +253,9 @@ method Renew(access: int) -> ()
 # with `Forget`.  A scope keeps at most 1024 layers (`Busy`).
 method Layer(layer: string, staging: int, blob: ?Blob, toc: ?int) -> ()
 
-# Forget the layer: its calls end, later ones are `Refused`.
+# Forget the layer: its calls end, later ones are `Refused`, and what
+# the fetcher kept for its blob is let go (of a layer that was only
+# probed too).
 method Forget(layer: string) -> ()
 
 # The manifest or index `reference` names (a tag or a digest), at

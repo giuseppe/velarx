@@ -555,6 +555,7 @@ impl ArchiveTransport {
             target: Some(self.archive.clone()),
             access: None,
             idle: of.idle,
+            kept: Default::default(),
         }
     }
 }
