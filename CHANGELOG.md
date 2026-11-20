@@ -1131,8 +1131,7 @@ without the numbers of issues or pull requests of any tracker.
   monitor fetches what the container reads, and no longer records anything.
 
 - In a user namespace the overlay of an image of several layers is mounted
-  with `redirect_dir=followdata` where the kernel has that option (proposed
-  for the kernel, not in a released one yet), so that it follows the stub of
+  with `redirect_dir=followdata` where the kernel has that option (Linux 7.4), so that it follows the stub of
   every layer into the data-only layer.  On a kernel without it the files of
   the layers above the lowest are served by FUSE, as before.  Images of one
   layer and mounts as root do not use it.
