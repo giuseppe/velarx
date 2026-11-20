@@ -943,3 +943,45 @@ async fn the_container_counts_of_all_images_are_those_of_each() {
     assert_eq!(counts["img-b"], 3);
     assert_eq!(counts["img-c"], 1);
 }
+
+/// The listing of the containers whose processes are there has the running
+/// and the paused, in the order of the full listing, and no other.
+#[tokio::test]
+async fn the_alive_containers_are_the_running_and_the_paused() {
+    let db = Database::open_in_memory().await.unwrap();
+    let image_id = create_test_image(&db).await;
+    let states = [
+        RecordState::Created,
+        RecordState::Running,
+        RecordState::Stopped,
+        RecordState::Paused,
+        RecordState::Exited,
+        RecordState::Initialized,
+    ];
+    for (n, state) in states.into_iter().enumerate() {
+        db.insert_container(&ContainerRecord {
+            id: format!("c{n}"),
+            image_id: image_id.clone(),
+            config: "{}".to_string(),
+            state,
+            created_at: format!("2024-01-01T00:00:0{n}Z"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let alive: Vec<_> = db
+        .list_alive_containers()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(alive, ["c3", "c1"]);
+    let all = db.list_containers(true).await.unwrap();
+    assert!(all
+        .iter()
+        .filter(|c| c.state.is_alive())
+        .map(|c| &c.id)
+        .eq(&alive));
+}

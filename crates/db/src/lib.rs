@@ -1172,6 +1172,24 @@ impl Database {
             .map_err(DbError::Sqlite)
     }
 
+    /// The containers whose record says their processes are there (running
+    /// or paused), as [`Self::list_containers`] orders them.
+    pub async fn list_alive_containers(&self) -> DbResult<Vec<ContainerRecord>> {
+        self.conn
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, image_id, config, state, pid, created_at, started_at, finished_at, exit_code
+                     FROM containers WHERE state IN ('running', 'paused') ORDER BY created_at DESC",
+                )?;
+                let containers = stmt
+                    .query_map([], ContainerRecord::from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(containers)
+            })
+            .await
+            .map_err(DbError::Sqlite)
+    }
+
     /// Check if any containers reference the given image ID
     pub async fn image_has_containers(&self, image_id: &str) -> DbResult<bool> {
         let image_id = image_id.to_string();
