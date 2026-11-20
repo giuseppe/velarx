@@ -520,6 +520,11 @@ pub(crate) async fn list_of(
     let mut built_on = state.image_service.build_lineage().await?;
     built_on.retain(|_, p| p != velarx_db::BUILD_SCRATCH);
     let parents: HashSet<&str> = built_on.values().map(String::as_str).collect();
+    let using = state
+        .db
+        .container_counts_by_image()
+        .await
+        .map_err(|e| ApiError::db("listing the containers that use an image", e))?;
     for rec in records.iter().cloned() {
         let has_children = parents.contains(rec.id.as_str());
         let parent_id = built_on
@@ -539,7 +544,7 @@ pub(crate) async fn list_of(
         let mut r = v.record();
         r.parent_id = parent_id;
         r.has_children = has_children;
-        r.containers = containers_using(state, &v.rec).await? as u64;
+        r.containers = using.get(&v.rec.id).copied().unwrap_or(0) as u64;
         if !filter_match(filters, &r, &bounds) {
             continue;
         }
