@@ -1788,18 +1788,13 @@ impl ComposefsDriver {
         layers: Vec<(LayerKey, Toc)>,
     ) -> DriverResult<HashMap<LayerKey, LayerArtifact>> {
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || Self::make_images_blocking(layers, &store))
-            .await
-            .map_err(join_error)?
-            .map_err(storage_error)
-    }
-
-    fn make_images_blocking(
-        layers: Vec<(LayerKey, Toc)>,
-        store: &FileStore,
-    ) -> std::io::Result<HashMap<LayerKey, LayerArtifact>> {
-        let refs: Vec<(LayerKey, &Toc)> = layers.iter().map(|(d, t)| (*d, t)).collect();
-        make_layer_images(&refs, store)
+        tokio::task::spawn_blocking(move || {
+            let refs: Vec<(LayerKey, &Toc)> = layers.iter().map(|(d, t)| (*d, t)).collect();
+            make_layer_images(&refs, &store)
+        })
+        .await
+        .map_err(join_error)?
+        .map_err(storage_error)
     }
 }
 

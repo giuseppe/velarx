@@ -662,25 +662,23 @@ impl ContainerService {
 
     /// Pause a container
     pub async fn pause(&self, id: &str) -> ContainerResult<()> {
-        // (the lease is the container's, whatever the name asked)
-        let id = self.db.get_container(id).await?.id;
-        let id = id.as_str();
-        let _lock = self.pause_lock(id).await?;
-        self.runtime_freeze(id, "pause").await?;
-        self.set_pause_lease(id, None).await?;
-        self.notify_action_of(id, "pause", Vec::new()).await;
-        Ok(())
+        self.set_paused(id, true).await
     }
 
     /// Unpause a container
     pub async fn unpause(&self, id: &str) -> ContainerResult<()> {
+        self.set_paused(id, false).await
+    }
+
+    async fn set_paused(&self, id: &str, pause: bool) -> ContainerResult<()> {
         // (the lease is the container's, whatever the name asked)
         let id = self.db.get_container(id).await?.id;
         let id = id.as_str();
         let _lock = self.pause_lock(id).await?;
-        self.runtime_freeze(id, "resume").await?;
+        self.runtime_freeze(id, pause).await?;
         self.set_pause_lease(id, None).await?;
-        self.notify_action_of(id, "unpause", Vec::new()).await;
+        self.notify_action_of(id, if pause { "pause" } else { "unpause" }, Vec::new())
+            .await;
         Ok(())
     }
 
@@ -697,14 +695,18 @@ impl ContainerService {
 
     /// `pause` or `resume` through the monitor of the container, which
     /// runs the OCI runtime.
-    async fn runtime_freeze(&self, id: &str, op: &str) -> ContainerResult<()> {
+    async fn runtime_freeze(&self, id: &str, pause: bool) -> ContainerResult<()> {
         let container = self.db.get_container(id).await?;
         let config = stored_config(&container)?;
         if let Some(why) = no_freezer(&container.id, &config) {
             return Err(ContainerError::Unsupported(why));
         }
-        self.freeze(&container.id, op == "pause").await?;
-        info!("{op} of container {} done", container.id);
+        self.freeze(&container.id, pause).await?;
+        info!(
+            "{} of container {} done",
+            if pause { "pause" } else { "resume" },
+            container.id
+        );
         Ok(())
     }
 
