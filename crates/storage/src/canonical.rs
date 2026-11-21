@@ -111,7 +111,7 @@ pub const MAX_PAX_DATA: u64 = 1 << 20;
 const MAX_XATTRS: usize = 1024;
 const MAX_PATH: usize = 4096;
 /// The most entries of a layer, as many as a pull takes.
-const MAX_ENTRIES: usize = 4 << 20;
+pub const MAX_ENTRIES: usize = 4 << 20;
 /// The most bytes of the names of a layer together: a table of contents
 /// with more is larger than a pull takes (128 MiB).  With `MAX_ENTRIES` it
 /// bounds what a reader of a tar remembers of the entries before.

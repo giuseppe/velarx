@@ -28,6 +28,7 @@
 //! they fit, and the stubs as a single chunk that is a hole.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use velarx_storage::canonical::MAX_ENTRIES;
 use velarx_storage::{FsVerityHashAlgorithm, TocEntry, TocEntryType};
 use velarx_types::digest::Digest;
 
@@ -311,7 +312,9 @@ pub(crate) struct Path<'a> {
 /// link names the file its target is at that point; a directory that
 /// becomes another type, or a path with a parent that is not a directory,
 /// is an error.  A whiteout or an opaque marker is collected: the
-/// order of the archive says nothing of them.
+/// order of the archive says nothing of them.  A layer has at most as many
+/// paths, the root aside, as a pull takes entries: the directories it does
+/// not list count, as each is a directory of its image.
 pub(crate) fn resolve_entries(entries: &[TocEntry]) -> Result<Resolved<'_>, String> {
     let mut r = Resolved {
         entries,
@@ -350,6 +353,9 @@ pub(crate) fn resolve_entries(entries: &[TocEntry]) -> Result<Resolved<'_>, Stri
             }
             _ => r.put(i, &parts)?,
         }
+        if r.paths.len() - 1 > MAX_ENTRIES {
+            return Err(format!("the layer has more than {MAX_ENTRIES} paths"));
+        }
     }
     Ok(r)
 }
@@ -357,17 +363,6 @@ pub(crate) fn resolve_entries(entries: &[TocEntry]) -> Result<Resolved<'_>, Stri
 impl<'a> Resolved<'a> {
     fn is_dir(&self, entry: Option<usize>) -> bool {
         entry.is_none_or(|i| self.entries[i].entry_type == TocEntryType::Dir)
-    }
-
-    /// The components of the path `p`.
-    pub fn path(&self, mut p: usize) -> Vec<&'a str> {
-        let mut out = Vec::new();
-        while p != 0 {
-            out.push(self.paths[p].name);
-            p = self.paths[p].parent;
-        }
-        out.reverse();
-        out
     }
 
     /// The path `parts`, if the layer has it now.
@@ -1368,6 +1363,53 @@ pub(crate) mod tests {
             assert!(crate::MergedTree::build_entries(&[&entries]).is_ok());
         }
         assert!(start.elapsed().as_secs() < 20, "{:?}", start.elapsed());
+    }
+
+    /// A directory a layer does not list costs what one it lists does: a
+    /// table of many deep paths, each of its own directories, is as fast
+    /// as its directories are many, in the image and in the merged view.
+    #[test]
+    fn many_deep_paths_are_fast() {
+        let chain = "a/".repeat(1999);
+        let entries: Vec<TocEntry> = (0..250)
+            .map(|i| file(&format!("c{i}/{chain}f"), 1, 1))
+            .collect();
+        let start = std::time::Instant::now();
+        assert!(layer_image(&entries).is_ok());
+        let tree = crate::MergedTree::build_entries(&[&entries]).unwrap();
+        assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
+        assert_eq!(tree.count(), 1 + 250 * 2001);
+    }
+
+    /// The directories a layer does not list count as its entries.
+    #[test]
+    fn a_layer_has_at_most_as_many_paths_as_a_pull_takes() {
+        // (each entry has `depth` paths: its directory, the chain, itself)
+        let depth = 4096;
+        let chain = "a/".repeat(depth - 2);
+        let entries: Vec<TocEntry> = (0..MAX_ENTRIES / depth + 1)
+            .map(|i| entry(&format!("{i}/{chain}f"), TocEntryType::Fifo))
+            .collect();
+        let e = resolve_entries(&entries).err().unwrap();
+        assert!(e.contains("more than"), "{e}");
+        assert!(resolve_entries(&entries[1..]).is_ok());
+    }
+
+    /// A deep tree reads back whole: its paths, the names of its nodes.
+    #[test]
+    fn a_deep_tree_is_whole() {
+        let path = format!("{}f", "d/".repeat(100));
+        let entries = vec![entry("d", TocEntryType::Dir), file(&path, 1, 1)];
+        let listing = listing(&layer_image(&entries).unwrap().image);
+        assert!(listing.iter().any(|l| l.starts_with(&format!("/{path} "))));
+        let tree = crate::MergedTree::build_entries(&[&entries]).unwrap();
+        let mut dir = crate::merged::ROOT;
+        for name in path.split('/') {
+            dir = tree.lookup(dir, name).unwrap();
+            let node = tree.node(dir).unwrap();
+            assert!(node.entry.name.ends_with(name), "{}", node.entry.name);
+        }
+        assert_eq!(tree.resolve(&path), Some(dir));
     }
 
     #[test]

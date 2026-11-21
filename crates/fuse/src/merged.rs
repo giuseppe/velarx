@@ -179,7 +179,9 @@ impl MergedTree {
     /// opaque directories.  What a path names is what an extraction of the
     /// entries in their order makes of it ([`resolve_entries`]).  The root
     /// is the `./` entry, or a plain directory (`dir_entry`), and so is a
-    /// directory the layer has entries in and does not list.  A whiteout is
+    /// directory the layer has entries in and does not list (named by its
+    /// last component: a node is found by its path from the root, never by
+    /// the name of its entry).  A whiteout is
     /// a device 0:0, unless the layer has the name: a directory of the layer
     /// that it removes is opaque, as is one with an opaque marker.
     fn of_layer(entries: &[TocEntry]) -> Result<(Self, BTreeSet<usize>), String> {
@@ -199,9 +201,9 @@ impl MergedTree {
         // is one node)
         let mut node = vec![ROOT];
         let mut made: HashMap<usize, usize> = HashMap::new();
-        for (p, path) in layer.paths.iter().enumerate().skip(1) {
+        for path in layer.paths.iter().skip(1) {
             let n = match path.entry {
-                None => t.new_node(0, dir_entry(&layer.path(p).join("/"))),
+                None => t.new_node(0, dir_entry(path.name)),
                 Some(i) => *made
                     .entry(i)
                     .or_insert_with(|| t.new_node(0, entries[i].clone())),
@@ -218,7 +220,7 @@ impl MergedTree {
                 }
                 Some(_) => {}
                 None => {
-                    let mut w = dir_entry(&[layer.path(dir), vec![name]].concat().join("/"));
+                    let mut w = dir_entry(name);
                     (w.entry_type, w.mode, w.dev_major, w.dev_minor) =
                         (TocEntryType::Char, 0, Some(0), Some(0));
                     let n = t.new_node(0, w);
