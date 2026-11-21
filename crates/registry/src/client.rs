@@ -2450,6 +2450,83 @@ mod tests {
         }
     }
 
+    /// A document is an index or an image manifest, never both: one with
+    /// the list of an index and the configuration or layers of a manifest,
+    /// or whose media type says the other, is refused, and so is an index
+    /// below two others.
+    #[tokio::test]
+    async fn test_a_document_that_is_index_and_manifest_is_refused() {
+        let r = ImageReference::parse("example.com/a:latest").unwrap();
+        let index_type = "application/vnd.oci.image.index.v1+json";
+        let manifest_type = "application/vnd.oci.image.manifest.v1+json";
+        let config = r#""config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":1},"layers":[]"#;
+        let manifest = format!(r#"{{"schemaVersion":2,"mediaType":"{manifest_type}",{config}}}"#);
+        let index_of = |body: &str, extra: &str| {
+            format!(
+                r#"{{"schemaVersion":2{extra},"manifests":[{{"digest":"{}","platform":{{"os":"linux","architecture":"{}"}}}}]}}"#,
+                sha256_of(body.as_bytes()),
+                host_arch()
+            )
+        };
+        // the chain the tag names, the first document first
+        let chain = |docs: Vec<String>| {
+            move |reference: String| {
+                let body = match reference.as_str() {
+                    "latest" => docs[0].clone(),
+                    d => docs
+                        .iter()
+                        .find(|b| sha256_of(b.as_bytes()).to_string() == d)
+                        .unwrap()
+                        .clone(),
+                };
+                async move {
+                    let d = sha256_of(body.as_bytes());
+                    Ok::<_, ImageError>((Bytes::from(body), d))
+                }
+            }
+        };
+        let one = index_of(&manifest, "");
+        let two = index_of(&one, "");
+        let three = index_of(&two, "");
+        let (_, digest, _) = resolve_manifest(
+            &r,
+            None,
+            chain(vec![two.clone(), one.clone(), manifest.clone()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(digest, sha256_of(manifest.as_bytes()));
+        // (a fetch that says the digest the index names of other bytes)
+        let named = sha256_of(manifest.as_bytes());
+        let (top, other) = (one.clone(), format!("{manifest} "));
+        let lying = |reference: String| {
+            let body = match reference.as_str() {
+                "latest" => top.clone(),
+                _ => other.clone(),
+            };
+            async move { Ok::<_, ImageError>((Bytes::from(body), named)) }
+        };
+        assert!(matches!(
+            resolve_manifest(&r, None, lying).await,
+            Err(ImageError::DigestMismatch { .. })
+        ));
+        let both = index_of(&manifest, &format!(",{config}"));
+        let typed_manifest = index_of(&manifest, &format!(r#","mediaType":"{manifest_type}""#));
+        let typed_index = format!(r#"{{"schemaVersion":2,"mediaType":"{index_type}",{config}}}"#);
+        for docs in [
+            vec![both, manifest.clone()],
+            vec![typed_manifest, manifest.clone()],
+            vec![typed_index.clone()],
+            vec![index_of(&typed_index, ""), typed_index],
+            vec![three, two, one, manifest.clone()],
+        ] {
+            match resolve_manifest(&r, None, chain(docs)).await {
+                Err(ImageError::Manifest(_)) => {}
+                other => panic!("taken: {:?}", other.map(|(_, d, _)| d)),
+            }
+        }
+    }
+
     /// The instance an index names, from a store that has a manifest of
     /// that digest: it saves the request, and only a manifest that is the
     /// one of the digest is taken.

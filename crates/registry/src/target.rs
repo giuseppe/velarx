@@ -818,12 +818,18 @@ where
         verify_digest(pinned, &body)?;
         digest = *pinned;
     }
-    // An index: pick the instance for this platform.
-    for _ in 0..2 {
+    // An index: pick the instance for this platform (an index may list
+    // indexes, two levels of them).
+    for level in 0.. {
         let value: serde_json::Value = serde_json::from_slice(&body)?;
-        let Some(instances) = value.get("manifests").and_then(|m| m.as_array()) else {
+        let Some(instances) = instances_of(&value)? else {
             break;
         };
+        if level == 2 {
+            return Err(ImageError::Manifest(
+                "an index under two others is not read".into(),
+            ));
+        }
         let wanted = select_platform(instances, platform).ok_or_else(|| {
             ImageError::Manifest(format!("no manifest for {platform} in the index"))
         })?;
@@ -841,25 +847,50 @@ where
             None => None,
         };
         indexes.push((digest, body.clone()));
-        (body, digest) = match kept {
-            Some(body) => (body, wanted),
-            None => fetch(wanted.to_string()).await?,
+        body = match kept {
+            Some(body) => body,
+            None => fetch(wanted.to_string()).await?.0,
         };
         velarx_types::docker::refuse_manifest(&body)?;
         // whoever fetched it (a confined worker too), the instance is the
-        // one the index names
-        if digest != wanted {
-            return Err(ImageError::DigestMismatch {
-                expected: wanted.to_string(),
-                actual: digest.to_string(),
-            });
-        }
+        // one the index names: its bytes are hashed here
+        verify_digest(&wanted, &body)?;
+        digest = wanted;
         if body.len() as u64 > MAX_MANIFEST_SIZE {
             break;
         }
     }
     let manifest: OciManifest = serde_json::from_slice(&body)?;
     Ok((manifest, digest, body, indexes))
+}
+
+/// The instances `value` lists when it is an index; none for an image
+/// manifest.  A document that is both, by its fields or its media type, is
+/// an error: other tools would read it as the one Velarx did not.
+fn instances_of(value: &serde_json::Value) -> ImageResult<Option<&Vec<serde_json::Value>>> {
+    const INDEXES: [&str; 2] = [
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+    ];
+    let typed = value.get("mediaType").and_then(|t| t.as_str());
+    let both =
+        || ImageError::Manifest("the document is both an index and an image manifest".into());
+    let Some(listed) = value.get("manifests") else {
+        return match typed.is_some_and(|t| INDEXES.contains(&t)) {
+            true => Err(both()),
+            false => Ok(None),
+        };
+    };
+    if value.get("config").is_some()
+        || value.get("layers").is_some()
+        || typed.is_some_and(|t| !INDEXES.contains(&t))
+    {
+        return Err(both());
+    }
+    listed
+        .as_array()
+        .map(Some)
+        .ok_or_else(|| ImageError::Manifest("the manifests of the index are no list".into()))
 }
 
 /// An OS and architecture (and variant) images are built for.
