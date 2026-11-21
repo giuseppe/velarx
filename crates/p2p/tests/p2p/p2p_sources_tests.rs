@@ -994,6 +994,43 @@ async fn test_a_pull_with_credentials_is_given_to_and_taken_from_the_peers() {
     drop(s);
 }
 
+/// A node whose sources do not name the registry pulls an image by its
+/// digest from the peers alone, and cannot pull a tag: its registry, which
+/// has the image, is not asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_a_pull_by_digest_needs_only_the_peers() {
+    let layer = build_gzip(&sample());
+    let s = swarm_with(&[&layer], &[GZIP], None, Opts::default()).await;
+    let record = s.a.db.list_images().await.unwrap().remove(0);
+    let b = env_sources(
+        PullConfig {
+            sources: vec!["source0".into()],
+            ..PullConfig::default()
+        },
+        velarx_config::PushConfig::default(),
+        chain_of(&[&s.b_source]),
+    )
+    .await;
+    b.publish(&[&layer], &[GZIP]);
+    let err = b.pull().await.unwrap_err().to_string();
+    assert!(
+        err.contains("`registry` is not one of the sources") && err.contains("a tag needs"),
+        "{err}"
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let image = format!("{}/test@{}", b.host, record.manifest_digest);
+    let result = b
+        .service
+        .pull_with_client(&b.client(), &image, tx)
+        .await
+        .unwrap();
+    assert!(result.stats.from("source0").0 > 0, "{:?}", result.stats);
+    assert!(b.reg.hits.lock().unwrap().is_empty());
+    assert!(b.store.contains(&vid(b"hello\n")));
+    drop(s);
+}
+
 /// A layer of `n` files of `size` bytes in one directory, and their digests.
 fn files_layer(n: usize, size: usize) -> (Built, Vec<String>) {
     let mut items = vec![Item::Dir("d/")];

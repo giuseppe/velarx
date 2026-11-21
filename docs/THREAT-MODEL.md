@@ -91,7 +91,8 @@ lengths before allocating and verifies every digest.
   index, the configuration and layers against the manifest, the files of a
   zstd:chunked layer against the table its annotation names, every file
   against the fs-verity digest the engine measured).  A tag is taken only
-  from its registry; the peers serve what a digest names.  What is off the
+  from its registry, never when the `[pull] sources` do not name
+  `registry`; the peers serve what a digest names.  What is off the
   chain is recorded as a claim and never names anything: the diff id of a
   zstd:chunked layer, the content digest of a file the table also gives an
   fs-verity digest, the blob of a layer made from an index (a node that asks

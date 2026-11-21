@@ -380,8 +380,7 @@ impl Registry {
         };
         let manifest = serde_json::to_vec(&manifest).unwrap();
         let staged = StagedFetch::open(
-            Vec::new(),
-            conn,
+            (Vec::new(), Some(conn), Vec::new()),
             staging,
             false,
             (&format!("{}/r", self.host), false),

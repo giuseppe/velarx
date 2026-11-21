@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Fetchers before the registry fetcher: what they stage is verified like
+//! Fetchers other than the registry fetcher: what they stage is verified like
 //! what the registry fetcher stages, a fetcher that is not there is skipped,
 //! one that stages wrong bytes is fallen back from.  The fetchers here are
 //! processes' stand-ins on unix sockets, serving the interface of
@@ -83,6 +83,50 @@ async fn test_a_chain_without_sources_asks_nobody() {
     let result = e.pull().await.unwrap();
     assert_eq!(source.has_calls.load(Ordering::SeqCst), 0);
     assert_eq!(result.stats.from("source0").0, 0);
+}
+
+/// `[pull] sources` is used as written: a list without `registry` never
+/// asks the registry, so a tag cannot be pulled; with it, the order given is
+/// the order asked, `registry` first or not.
+#[tokio::test]
+async fn test_the_registry_is_a_source_only_when_it_is_listed() {
+    let source = fake_source().await;
+    *source.items.lock().unwrap() = chunk_map(&sample());
+    let pull = |list: &[&str]| velarx_config::PullConfig {
+        sources: list.iter().map(|n| n.to_string()).collect(),
+        ..Default::default()
+    };
+    let e = env_sources(
+        pull(&["source0"]),
+        velarx_config::PushConfig::default(),
+        chain_of(&[&source.socket]),
+    )
+    .await;
+    e.publish(&[&build_chunked(&sample())], &[ZSTD]);
+    let err = e.pull().await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("`registry` is not one of the sources")
+            && err.to_string().contains("a tag needs the registry"),
+        "{err}"
+    );
+    assert_eq!(e.reg.ranged.load(Ordering::SeqCst), 0);
+    let e = env_sources(
+        pull(&["registry", "source0"]),
+        velarx_config::PushConfig::default(),
+        chain_of(&[&source.socket]),
+    )
+    .await;
+    e.publish(&[&build_chunked(&sample())], &[ZSTD]);
+    e.pull().await.unwrap();
+    assert!(e.reg.ranged.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        e.db.get_layer(&build_chunked(&sample()).key())
+            .await
+            .unwrap()
+            .status,
+        "ready"
+    );
 }
 
 #[tokio::test]

@@ -294,8 +294,8 @@ impl ImageService {
     /// Stage the files `files` (fs-verity digests) of the lazily staged
     /// layer `key` in its staging directory: those in flight are joined,
     /// the others fetched in one request.  Returns what this call fetched
-    /// (the compressed bytes, and what the fetchers before the registry
-    /// fetcher staged).
+    /// (the compressed bytes, and what the fetchers but the registry fetcher
+    /// staged).
     pub async fn stage_lazy(
         &self,
         key: &LayerKey,
@@ -1157,8 +1157,11 @@ mod tests {
         .unwrap();
         let manifest = br#"{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","size":2},"layers":[]}"#;
         let walker = StagedFetch::open(
-            Vec::new(),
-            FetchConn::new(registry.connect().unwrap()).unwrap(),
+            (
+                Vec::new(),
+                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Vec::new(),
+            ),
             &service.staging_dir,
             false,
             ("localhost/a", true),

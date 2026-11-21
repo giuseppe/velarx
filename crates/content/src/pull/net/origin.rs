@@ -157,15 +157,24 @@ pub struct OriginNet {
     /// The credentials and certificates of the command, for the scope
     access: Option<Access>,
     conn: Arc<tokio::sync::Mutex<Option<FetchConn>>>,
-    /// Asked first for what a digest names
-    before: Option<Arc<MetadataSources>>,
+    /// Asked in order: the registry, and fetchers for what a digest names
+    sources: Vec<Source>,
+}
+
+/// One place [`OriginNet`] asks.
+#[derive(Clone)]
+pub enum Source {
+    /// Fetchers of `[pull] sources`, for what a digest names
+    Fetchers(Arc<MetadataSources>),
+    /// The origin (the registry fetcher), for a tag too
+    Registry,
 }
 
 impl OriginNet {
-    /// The fetchers asked before the registry for a manifest or a
-    /// configuration a digest names.
-    pub fn with_sources(mut self, before: Arc<MetadataSources>) -> Self {
-        self.before = Some(before);
+    /// What is asked, in order, instead of the registry alone; without
+    /// [`Source::Registry`] the registry is not asked at all.
+    pub fn with_sources(mut self, sources: Vec<Source>) -> Self {
+        self.sources = sources;
         self
     }
 
@@ -178,7 +187,7 @@ impl OriginNet {
             tls_verify,
             access: None,
             conn: Arc::default(),
-            before: None,
+            sources: vec![Source::Registry],
         }
     }
 
@@ -191,7 +200,7 @@ impl OriginNet {
             tls_verify: false,
             access: None,
             conn: Arc::default(),
-            before: None,
+            sources: vec![Source::Registry],
         }
     }
 
@@ -210,7 +219,7 @@ impl OriginNet {
             tls_verify,
             access: None,
             conn: Arc::default(),
-            before: None,
+            sources: vec![Source::Registry],
         }
     }
 
@@ -304,14 +313,42 @@ impl OriginNet {
         }
     }
 
+    /// What is said of `what` (a tag or a digest) when `registry` is not
+    /// one of the sources and no other had it.
+    fn unlisted(what: &str) -> ImageError {
+        let reason = match what.parse::<Digest>() {
+            Ok(_) => "`registry` is not one of the sources, and no other has it",
+            Err(_) => "`registry` is not one of the sources",
+        };
+        ImageError::transfer_of(REGISTRY, what, FailureClass::Unavailable, reason)
+    }
+
     /// The manifest `reference` (a tag or a digest) names and the digest of
-    /// its bytes; None if the registry does not have it.
+    /// its bytes, from the first source that has it (only the registry
+    /// resolves a tag); None if the registry does not have it.
     pub async fn manifest_opt(&self, reference: &str) -> ImageResult<Option<(Bytes, Digest)>> {
-        if let (Some(before), Ok(digest)) = (&self.before, reference.parse::<Digest>()) {
-            if let Some(bytes) = before.manifest(&digest).await {
-                return Ok(Some((bytes, digest)));
+        let digest = reference.parse::<Digest>().ok();
+        let mut got = Err(Self::unlisted(reference));
+        for source in &self.sources {
+            match (source, digest) {
+                (Source::Registry, _) => {
+                    got = self.registry_manifest(reference).await;
+                    if matches!(got, Ok(Some(_))) {
+                        break;
+                    }
+                }
+                (Source::Fetchers(fetchers), Some(digest)) => {
+                    if let Some(bytes) = fetchers.manifest(&digest).await {
+                        return Ok(Some((bytes, digest)));
+                    }
+                }
+                (Source::Fetchers(_), None) => {}
             }
         }
+        got
+    }
+
+    async fn registry_manifest(&self, reference: &str) -> ImageResult<Option<(Bytes, Digest)>> {
         let mut slot = self.conn.lock().await;
         let conn = self.scoped(&mut slot).await?;
         let got = conn.get_manifest(reference, MAX_MANIFEST_SIZE).await;
@@ -409,11 +446,26 @@ impl OriginNet {
                 "the blob is too large",
             ));
         }
-        if let Some(before) = &self.before {
-            if let Some(bytes) = before.blob(blob).await {
-                return Ok(bytes);
+        let mut got = Err(Self::unlisted(&blob.digest));
+        for source in &self.sources {
+            match source {
+                Source::Registry => {
+                    got = self.registry_blob(blob).await;
+                    if got.is_ok() {
+                        break;
+                    }
+                }
+                Source::Fetchers(fetchers) => {
+                    if let Some(bytes) = fetchers.blob(blob).await {
+                        return Ok(bytes);
+                    }
+                }
             }
         }
+        got
+    }
+
+    async fn registry_blob(&self, blob: &Blob) -> ImageResult<Bytes> {
         let mut slot = self.conn.lock().await;
         let conn = self.scoped(&mut slot).await?;
         let got = conn.get_blob(blob).await;
@@ -458,10 +510,9 @@ fn written_bytes(file: &std::fs::File, length: u64, max: u64, name: &str) -> Ima
     Ok(bytes)
 }
 
-/// The fetchers of `[pull] sources` asked for the metadata of a pull by
-/// digest before the registry: what one sends is untrusted, and is used only
-/// when it has the digest asked for, so that the registry is asked
-/// when nobody sent it right.
+/// Fetchers of `[pull] sources` asked for the metadata of a pull by digest:
+/// what one sends is untrusted, and is used only when it has the digest
+/// asked for, so that the next source is asked when nobody sent it right.
 pub struct MetadataSources {
     links: tokio::sync::Mutex<Vec<crate::pull::staged_fetch::Link>>,
 }
@@ -623,6 +674,28 @@ mod tests {
     use super::*;
     use velarx_proto::transfer::Failure;
 
+    /// Without `registry` among the sources a digest comes from the
+    /// fetchers alone, and what they lack is said to be nobody's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_digest_comes_from_the_fetchers_without_the_registry() {
+        let body = br#"{"schemaVersion":2}"#;
+        let right = Digest::of(velarx_types::digest::Algorithm::Sha256, body);
+        let (sources, _keep) = sources_of(body).await;
+        // (a socket that would be an error of another kind if it were used)
+        let net = OriginNet::of_transport(
+            "/nonexistent/velarx-registry.sock".into(),
+            std::time::Duration::from_secs(5),
+            "docker://example.com/a".into(),
+            true,
+        )
+        .with_sources(vec![Source::Fetchers(sources)]);
+        let got = net.manifest(&right.to_string()).await.unwrap();
+        assert_eq!((&got.0[..], got.1), (&body[..], right));
+        let wrong = Digest::of(velarx_types::digest::Algorithm::Sha256, b"other");
+        let e = net.manifest(&wrong.to_string()).await.unwrap_err();
+        assert!(e.to_string().contains("no other has it"), "{e}");
+    }
+
     async fn sources_of(bytes: &[u8]) -> (Arc<MetadataSources>, crate::serve_fetch::LocalFetcher) {
         use crate::pull::staged_fetch::{Link, REGISTRY_IDLE};
         let fetcher = crate::serve_fetch::LocalFetcher::start(
@@ -640,7 +713,7 @@ mod tests {
     }
 
     /// What a fetcher sends for a digest is used when it has that digest and
-    /// is not used otherwise: the pull then asks the registry.
+    /// is not used otherwise: the pull then asks the next source.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_fetcher_before_the_registry_is_believed_only_by_the_digest() {
         let body = br#"{"schemaVersion":2}"#;

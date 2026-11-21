@@ -92,8 +92,8 @@ fn lazily_staged(root: &Path, stem: &str) -> bool {
     root.join(META).join(stem).join("layer.json").is_file()
 }
 
-/// A fetcher of `[pull] sources` before the registry fetcher (a socket of
-/// `[[sources.external]]`), as the engine connected to it.
+/// A fetcher of `[pull] sources` other than the registry fetcher (a socket
+/// of `[[sources.external]]`), as the engine connected to it.
 pub struct Link {
     /// Its name in `[pull] sources`
     pub name: String,
@@ -306,8 +306,11 @@ pub struct StagedFetch {
     /// The fetcher that staged each file of a lazy layer, by the digest of
     /// the layer's blob and the key: what the failure of the completion names
     placed: Mutex<HashMap<(String, String), String>>,
-    /// In the order of `[pull] sources`, the registry fetcher last
+    /// In the order of `[pull] sources`
     fetchers: Vec<Fetcher>,
+    /// The place of the origin (the registry fetcher) in `fetchers`: none
+    /// when `registry` is not one of the sources
+    origin: Option<usize>,
     /// `<store>/staging`
     root: PathBuf,
     /// The layers of the manifest of the image, in order, as the engine
@@ -338,15 +341,15 @@ pub struct StagedFetch {
 }
 
 impl StagedFetch {
-    /// The scope of the fetchers of `before`, in order, with nothing but the
+    /// The scope of the fetchers of `links`, in order, with nothing but the
     /// verity of the store: one that is not there or refuses it is left out.
-    async fn open_before(before: Vec<Link>, verity: bool) -> Vec<Fetcher> {
+    async fn open_links(links: Vec<Link>, verity: bool) -> Vec<Fetcher> {
         let mut fetchers = Vec::new();
         for Link {
             name,
             mut conn,
             idle,
-        } in before
+        } in links
         {
             let opened = async {
                 let info = conn.get_info().await?;
@@ -379,54 +382,59 @@ impl StagedFetch {
         fetchers
     }
 
-    /// Open the scope of a pull of `manifest` on each fetcher: on `before`
-    /// (in order) with nothing but the verity of the store, then on the
-    /// registry fetcher `end` with the repository and the credentials
+    /// Open the scope of a pull of `manifest` on each fetcher, in order:
+    /// on those of `before` and `after` with nothing but the verity of the
+    /// store, on the registry fetcher `end` between them (none: `registry`
+    /// is not one of the sources) with the repository and the credentials
     /// `access` (the JSON of a `RegistryAccess`, in a sealed memory file).
-    /// A fetcher of `before` that is not there or refuses the scope is left
-    /// out.
-    #[allow(clippy::too_many_arguments)]
+    /// A fetcher of `before` or `after` that is not there or refuses the
+    /// scope is left out.
+    #[allow(clippy::type_complexity)]
     pub async fn open(
-        before: Vec<Link>,
-        mut end: FetchConn,
+        (before, end, after): (Vec<Link>, Option<FetchConn>, Vec<Link>),
         root: &Path,
         verity: bool,
         (repository, tls_verify): (&str, bool),
         access: Option<&[u8]>,
         manifest: &[u8],
     ) -> ImageResult<Arc<Self>> {
-        let mut fetchers = Self::open_before(before, verity).await;
-        let info = end
-            .get_info()
+        let mut fetchers = Self::open_links(before, verity).await;
+        let mut origin = None;
+        if let Some(mut end) = end {
+            let info = end
+                .get_info()
+                .await
+                .map_err(|e| fetcher_error("registry", e))?;
+            let access = access
+                .map(velarx_base::sealed::sealed_memory)
+                .transpose()
+                .map_err(ImageError::Io)?;
+            let requires = vec!["objects".to_string(), "metadata".to_string()];
+            end.open(Scoping {
+                verity,
+                source: Some(repository),
+                tls_verify: Some(tls_verify),
+                target: None,
+                access,
+                idle: REGISTRY_IDLE,
+                requires: &requires,
+            })
             .await
             .map_err(|e| fetcher_error("registry", e))?;
-        let access = access
-            .map(velarx_base::sealed::sealed_memory)
-            .transpose()
-            .map_err(ImageError::Io)?;
-        let requires = vec!["objects".to_string(), "metadata".to_string()];
-        end.open(Scoping {
-            verity,
-            source: Some(repository),
-            tls_verify: Some(tls_verify),
-            target: None,
-            access,
-            idle: REGISTRY_IDLE,
-            requires: &requires,
-        })
-        .await
-        .map_err(|e| fetcher_error("registry", e))?;
-        fetchers.push(Fetcher {
-            name: "registry".into(),
-            control: tokio::sync::Mutex::new(end),
-            idle: REGISTRY_IDLE,
-            max_objects: info.limit("max_objects").unwrap_or(1).max(1) as usize,
-            reuse: info.can("reuse"),
-            origin: info.can("origin"),
-            handover: info.can("handover"),
-            lost: Default::default(),
-        });
-        Self::assemble(fetchers, root, verity, manifest)
+            origin = Some(fetchers.len());
+            fetchers.push(Fetcher {
+                name: "registry".into(),
+                control: tokio::sync::Mutex::new(end),
+                idle: REGISTRY_IDLE,
+                max_objects: info.limit("max_objects").unwrap_or(1).max(1) as usize,
+                reuse: info.can("reuse"),
+                origin: info.can("origin"),
+                handover: info.can("handover"),
+                lost: Default::default(),
+            });
+        }
+        fetchers.extend(Self::open_links(after, verity).await);
+        Self::assemble(fetchers, origin, root, verity, manifest)
     }
 
     /// [`StagedFetch::open`] for a pull whose origin is a path: `end` is a
@@ -440,8 +448,9 @@ impl StagedFetch {
         verity: bool,
         manifest: &[u8],
     ) -> ImageResult<Arc<Self>> {
-        let mut fetchers = Self::open_before(before, verity).await;
+        let mut fetchers = Self::open_links(before, verity).await;
         let info = end.get_info().await.map_err(|e| fetcher_error(name, e))?;
+        let origin = Some(fetchers.len());
         fetchers.push(Fetcher {
             name: name.into(),
             control: tokio::sync::Mutex::new(end),
@@ -452,12 +461,13 @@ impl StagedFetch {
             handover: info.can("handover"),
             lost: Default::default(),
         });
-        Self::assemble(fetchers, root, verity, manifest)
+        Self::assemble(fetchers, origin, root, verity, manifest)
     }
 
     /// The pull of `manifest` over the fetchers once they are open.
     fn assemble(
         fetchers: Vec<Fetcher>,
+        origin: Option<usize>,
         root: &Path,
         verity: bool,
         manifest: &[u8],
@@ -468,6 +478,7 @@ impl StagedFetch {
             verity,
             placed: Mutex::default(),
             fetchers,
+            origin,
             root: root.to_path_buf(),
             blobs: parsed
                 .layers
@@ -813,7 +824,7 @@ impl StagedFetch {
     /// Tell the fetchers of `layer` once, then walk the list for the files
     /// `keys` in batches: each staged file is given to the sink (and its
     /// name taken away from the staging unless it is `kept`), or left where
-    /// it is staged.  The origin, the last of the list, only `with_origin`.
+    /// it is staged.  The origin only `with_origin`.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     async fn walk(
         &self,
@@ -876,19 +887,22 @@ impl StagedFetch {
                 .fetchers
                 .iter()
                 .zip(sourced.each)
-                .take(self.fetchers.len().saturating_sub(1))
-                .map(|(f, (bytes, files))| velarx_proto::workload::BySource {
-                    name: f.name.clone(),
-                    bytes: bytes.into_inner(),
-                    files: files.into_inner(),
-                })
+                .enumerate()
+                .filter(|(at, _)| Some(*at) != self.origin)
+                .map(
+                    |(_, (f, (bytes, files)))| velarx_proto::workload::BySource {
+                        name: f.name.clone(),
+                        bytes: bytes.into_inner(),
+                        files: files.into_inner(),
+                    },
+                )
                 .collect(),
         })
     }
 
-    /// The name of the origin of the pull, the last of its fetchers: the
-    /// party of what no fetcher had.
-    fn origin_name(&self) -> &str {
+    /// The name of the last fetcher of the pull: the party of what no
+    /// fetcher had.
+    fn last_name(&self) -> &str {
         self.fetchers.last().map_or("registry", |f| f.name.as_str())
     }
 
@@ -931,10 +945,9 @@ impl StagedFetch {
         }
     }
 
-    /// A fetcher before the registry fetcher refused a request for `layer`:
-    /// that it was not told of it is the engine's state, not the request's
-    /// fault.  It is not asked again by this call and told again by the
-    /// next, and the walk goes on.
+    /// A fetcher refused a request for `layer`: that it was not told of it
+    /// is the engine's state, not the request's fault.  It is not asked
+    /// again by this call and told again by the next, and the walk goes on.
     fn untell(&self, layer: &str, at: usize, e: &CallError) {
         if !refused(e) {
             return;
@@ -994,7 +1007,7 @@ impl StagedFetch {
             // registry fetcher)
             let last = self.fetchers.len() - 1;
             for (i, fetcher) in self.fetchers.iter().enumerate() {
-                if !missed[i] || !breaker.usable(i) || (!with_origin && i == last) {
+                if !missed[i] || !breaker.usable(i) || (!with_origin && Some(i) == self.origin) {
                     continue;
                 }
                 let toc = toc_fd
@@ -1018,7 +1031,7 @@ impl StagedFetch {
                     }
                     // (one that cannot take the layer, whatever it says, is
                     // not asked for it by this walk, and told again by the
-                    // next; the registry fetcher is the end of the list)
+                    // next; the last one's failure ends the walk)
                     Err(e) if i != last => breaker.distrust(i, fetcher, &e.to_string()),
                     Err(e) => return Err(fetcher_error(&fetcher.name, e)),
                 }
@@ -1045,7 +1058,14 @@ impl StagedFetch {
         let breaker = Breaker::new(self.fetchers.len());
         self.tell(layer, (&staging.dir, None), &breaker, true)
             .await?;
-        let at = self.fetchers.len() - 1;
+        let Some(at) = self.origin else {
+            return Err(ImageError::transfer_of(
+                self.last_name(),
+                name,
+                FailureClass::Unavailable,
+                "no source has a table of contents of the layer, and `registry` is not one of them",
+            ));
+        };
         let fetcher = &self.fetchers[at];
         let mut bytes = 0u64;
         let mut fatal: Option<ImageError> = None;
@@ -1151,12 +1171,12 @@ impl StagedFetch {
         let mut given = vec![false; batch.len()];
         let mut failure: Option<ImageError> = None;
         let mut fatal: Option<ImageError> = None;
-        let last = self.fetchers.len() - 1;
+        let last = self.fetchers.len().saturating_sub(1);
         for (at, fetcher) in self
             .fetchers
             .iter()
             .enumerate()
-            .filter(|(at, _)| breaker.usable(*at) && (with_origin || *at != last))
+            .filter(|(at, _)| breaker.usable(*at) && (with_origin || Some(*at) != self.origin))
         {
             let left: Vec<usize> = (0..batch.len()).filter(|i| !given[*i]).collect();
             if left.is_empty() {
@@ -1165,12 +1185,12 @@ impl StagedFetch {
             let asked: Vec<String> = left.iter().map(|i| batch[*i].clone()).collect();
             // (the bytes of each object so far, by its place in `asked`)
             let mut moved: HashMap<u32, u64> = HashMap::new();
-            // (a file is given: the pull knows it, and what a fetcher before
-            // the registry fetcher brought is counted)
+            // (a file is given: the pull knows it, and what a fetcher other
+            // than the registry fetcher brought is counted)
             let mark = |given: &mut [bool], i: usize| {
                 given[i] = true;
                 staged(&batch[i]);
-                if at != last {
+                if Some(at) != self.origin {
                     use std::sync::atomic::Ordering::Relaxed;
                     sourced.each[at].1.fetch_add(1, Relaxed);
                 }
@@ -1354,7 +1374,7 @@ impl StagedFetch {
                             let so_far = event.bytes.unwrap_or(0);
                             let n =
                                 so_far.saturating_sub(moved.insert(object, so_far).unwrap_or(0));
-                            let counter = if at == last {
+                            let counter = if Some(at) == self.origin {
                                 bytes
                             } else {
                                 &sourced.each[at].0
@@ -1392,9 +1412,9 @@ impl StagedFetch {
             let walked = walked.await;
             // (a call that failed leaves no file being taken in)
             while taken.join_next().await.is_some() {}
-            // (what a fetcher before the registry fetcher sent of a file it
-            // did not stage is thrown away: not counted as brought by it)
-            if at != last {
+            // (what a fetcher other than the registry fetcher sent of a file
+            // it did not stage is thrown away: not counted as brought by it)
+            if Some(at) != self.origin {
                 let lost: u64 = moved
                     .iter()
                     .filter(|(j, _)| left.get(**j as usize).is_none_or(|i| !given[*i]))
@@ -1446,13 +1466,13 @@ impl StagedFetch {
                     // (every fetcher answered: it has not; only the origin's
                     // own `not_found`, a failed event, says it does not exist)
                     true => ImageError::transfer_of(
-                        self.origin_name(),
+                        self.last_name(),
                         batch[i].clone(),
                         FailureClass::Unavailable,
                         "no fetcher has it",
                     ),
                     false => ImageError::transfer_of(
-                        self.origin_name(),
+                        self.last_name(),
                         batch[i].clone(),
                         FailureClass::Transient,
                         format!("no fetcher has it (not asked: {})", broken.join("; ")),
@@ -1487,7 +1507,7 @@ enum Said {
 pub struct Walked {
     /// The compressed bytes the registry fetcher said it fetched
     pub bytes: u64,
-    /// What the fetchers before it brought (the compressed bytes they said
+    /// What the other fetchers brought (the compressed bytes they said
     /// they fetched, the files they staged), by name, in the order of the
     /// walk
     pub sources: Vec<velarx_proto::workload::BySource>,
@@ -1511,8 +1531,8 @@ impl Walked {
 
 #[derive(Default)]
 struct Sourced {
-    /// The bytes and files of each fetcher before the registry fetcher, by
-    /// its place in the list
+    /// The bytes and files of each fetcher but the registry fetcher, by its
+    /// place in the list
     each: Vec<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>,
 }
 
@@ -1953,8 +1973,11 @@ mod tests {
             .collect();
         let staging = tempfile::tempdir().unwrap();
         StagedFetch::open(
-            links,
-            FetchConn::new(end.connect().unwrap()).unwrap(),
+            (
+                links,
+                Some(FetchConn::new(end.connect().unwrap()).unwrap()),
+                Vec::new(),
+            ),
             staging.path(),
             false,
             ("localhost/a", true),
@@ -1991,6 +2014,54 @@ mod tests {
                 (3, TocSource::None)
             ]
         );
+    }
+
+    /// The list is walked as given: the registry fetcher where the sources
+    /// have it, or nowhere.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_registry_fetcher_is_where_the_sources_have_it() {
+        let (peers, cache, registry) = (local(&[0], false), local(&[1], false), local(&[2], false));
+        let link = |name: &str, f: &LocalFetcher| Link {
+            name: name.to_string(),
+            conn: FetchConn::new(f.connect().unwrap()).unwrap(),
+            idle: REGISTRY_IDLE,
+        };
+        let staging = tempfile::tempdir().unwrap();
+        for end in [Some(&registry), None] {
+            let staged = StagedFetch::open(
+                (
+                    vec![link("peers", &peers)],
+                    end.map(|f| FetchConn::new(f.connect().unwrap()).unwrap()),
+                    vec![link("cache", &cache)],
+                ),
+                staging.path(),
+                false,
+                ("localhost/a", true),
+                Some(b"{}"),
+                &manifest(),
+            )
+            .await
+            .unwrap();
+            let mut answered: Vec<u32> = staged
+                .probe_all(&[0, 1, 2], false)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|(r, _)| r.toc != TocSource::None)
+                .map(|(r, _)| r.layer)
+                .collect();
+            answered.sort();
+            match end {
+                Some(_) => {
+                    assert_eq!(staged.sources(), ["peers", "registry", "cache"]);
+                    assert_eq!(answered, [0, 1, 2]);
+                }
+                None => {
+                    assert_eq!(staged.sources(), ["peers", "cache"]);
+                    assert_eq!(answered, [0, 1]);
+                }
+            }
+        }
     }
 
     /// A fetcher whose connection fails (a peer that restarted: its scope
@@ -2213,8 +2284,11 @@ mod tests {
         let registry = LocalFetcher::start(Arc::new(Stages), Limits::default()).unwrap();
         let root = tempfile::tempdir().unwrap();
         let staged = StagedFetch::open(
-            Vec::new(),
-            FetchConn::new(registry.connect().unwrap()).unwrap(),
+            (
+                Vec::new(),
+                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Vec::new(),
+            ),
             root.path(),
             false,
             ("localhost/a", true),
@@ -2262,8 +2336,11 @@ mod tests {
         let registry = LocalFetcher::start(Arc::new(Stages), Limits::default()).unwrap();
         let root = tempfile::tempdir().unwrap();
         let staged = StagedFetch::open(
-            Vec::new(),
-            FetchConn::new(registry.connect().unwrap()).unwrap(),
+            (
+                Vec::new(),
+                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Vec::new(),
+            ),
             root.path(),
             false,
             ("localhost/a", true),
@@ -2359,8 +2436,11 @@ mod tests {
         }
         let registry = LocalFetcher::start(end, Limits::default()).unwrap();
         let staged = StagedFetch::open(
-            links,
-            FetchConn::new(registry.connect().unwrap()).unwrap(),
+            (
+                links,
+                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Vec::new(),
+            ),
             root,
             false,
             ("localhost/a", true),

@@ -2031,12 +2031,15 @@ mod tests {
             );
             let manifest = br#"{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","size":2},"layers":[]}"#;
             let walker = StagedFetch::open(
-                vec![Link {
-                    name: "first".into(),
-                    conn: FetchConn::new(first.connect().unwrap()).unwrap(),
-                    idle: velarx_content::pull::staged_fetch::REGISTRY_IDLE,
-                }],
-                FetchConn::new(end.connect().unwrap()).unwrap(),
+                (
+                    vec![Link {
+                        name: "first".into(),
+                        conn: FetchConn::new(first.connect().unwrap()).unwrap(),
+                        idle: velarx_content::pull::staged_fetch::REGISTRY_IDLE,
+                    }],
+                    Some(FetchConn::new(end.connect().unwrap()).unwrap()),
+                    Vec::new(),
+                ),
                 &service.staging_dir,
                 false,
                 ("localhost/a", true),
@@ -2146,8 +2149,11 @@ mod tests {
         .unwrap();
         let manifest = br#"{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","size":2},"layers":[]}"#;
         let walker = StagedFetch::open(
-            Vec::new(),
-            FetchConn::new(registry.connect().unwrap()).unwrap(),
+            (
+                Vec::new(),
+                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Vec::new(),
+            ),
             &service.staging_dir,
             false,
             ("localhost/a", true),

@@ -146,6 +146,10 @@ socket = "/run/velarx/services/p2p-fetcher.sock"
 sources = ["p2p", "registry"]
 ```
 
+The sources are asked in the order written (the default is
+`["registry"]`): with `["p2p"]` alone the registry is never asked, and
+images are pulled by digest only.
+
 Nothing listens on the network until you set `listen_addresses`. See
 [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) for what a member of a swarm can
 do.

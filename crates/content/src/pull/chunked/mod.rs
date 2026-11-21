@@ -1879,7 +1879,7 @@ pub async fn complete_layer(
         staged.forget(&layer.digest.to_string()).await;
     }
     let mut pulled = verified?;
-    // (what the fetchers before the registry fetcher staged)
+    // (what the fetchers but the registry fetcher staged)
     for s in std::mem::take(&mut sourced.sources) {
         pulled.report.sources.push(s);
     }

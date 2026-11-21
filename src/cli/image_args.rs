@@ -46,7 +46,10 @@ pub enum ImageCommands {
         #[arg(long)]
         lazy: bool,
         /// The fetchers of this pull, in the order they are asked: names of
-        /// `[[sources.external]]`, then `registry` (added when missing)
+        /// `[[sources.external]]` and `registry`; the default is `registry`
+        /// alone, a list without it never asks the registry and cannot pull
+        /// a tag (the files a lazy pull fetches later come from `[pull]
+        /// sources`)
         #[arg(long, value_name = "NAME,...", value_delimiter = ',')]
         sources: Option<Vec<String>>,
         /// Verify the TLS certificates of the registry; `--tls-verify=false`

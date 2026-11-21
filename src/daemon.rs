@@ -1182,7 +1182,7 @@ async fn build_core(
             velarx_core::storage_driver::blocking(|| image_service.with_varlink(options))
                 .map_err(|e| anyhow::anyhow!("[storage] driver = \"varlink\": {e}"))?;
     }
-    // The fetchers of the pulls before the registry fetcher
+    // The fetchers of the pulls but the registry fetcher
     image_service = image_service.with_fetchers(config.sources.external.clone());
     // a lazy pull outlives the command that made it: it is the engine
     // service's, which this process is, or which a command's engine

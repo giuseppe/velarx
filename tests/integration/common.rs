@@ -1078,8 +1078,9 @@ pub async fn env_built(
     read_only: Option<std::path::PathBuf>,
     built: impl FnOnce(ImageService) -> ImageService,
 ) -> Env {
-    if pull.sources.is_none() && !sources.0.is_empty() {
-        pull.sources = Some(sources.0.iter().map(|f| f.name.clone()).collect());
+    if pull.sources == PullConfig::default().sources && !sources.0.is_empty() {
+        pull.sources = sources.0.iter().map(|f| f.name.clone()).collect();
+        pull.sources.push("registry".into());
     }
     // The tests run in the test binary, which is not a worker: the pulls
     // need the binary that is (a test that names a worker keeps it).

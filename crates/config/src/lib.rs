@@ -471,11 +471,12 @@ pub struct PullConfig {
     #[serde(default = "default_true")]
     pub registry_hints: bool,
     /// Where the content comes from, in order: the names of
-    /// `[[sources.external]]` and, last, `registry`, the origin (added if
-    /// missing).  By default `["registry"]`.  Every digest a source sends is
-    /// verified; a source that fails is skipped and the next one is asked.
-    #[serde(default)]
-    pub sources: Option<Vec<String>>,
+    /// `[[sources.external]]` and `registry`, the origin.  The list is used
+    /// as written, in that order: one without `registry` never asks the
+    /// registry.  Every digest a source sends is verified;
+    /// a source that fails is skipped and the next one is asked.
+    #[serde(default = "default_sources")]
+    pub sources: Vec<String>,
     /// Files of lazily pulled images fetched at the same time by one process
     #[serde(default = "default_lazy_fetches")]
     pub lazy_fetches: usize,
@@ -636,7 +637,7 @@ impl Default for PullConfig {
             dir_path: None,
             max_workers: default_max_workers(),
             registry_hints: default_true(),
-            sources: None,
+            sources: default_sources(),
             lazy_fetches: default_lazy_fetches(),
             lazy_complete_fetches: default_lazy_complete_fetches(),
             lazy_completers: default_lazy_completers(),
@@ -1342,6 +1343,10 @@ pub struct BridgeConfig {
 
 pub use velarx_base::dirs::DefaultDirs;
 
+fn default_sources() -> Vec<String> {
+    vec!["registry".to_string()]
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1488,16 +1493,6 @@ impl Config {
                 .unwrap_or_else(|| Path::new("."))
                 .join("engine/engine.sock")
         })
-    }
-
-    /// The content sources of a pull in order, the origin (`registry`)
-    /// last: `[pull] sources`, or the default.
-    pub fn pull_sources(&self) -> Vec<String> {
-        let mut sources = self.pull.sources.clone().unwrap_or_default();
-        if sources.last().map(String::as_str) != Some("registry") {
-            sources.push("registry".to_string());
-        }
-        sources
     }
 
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
@@ -1851,31 +1846,15 @@ impl Config {
         {
             return invalid("[pull] lazy_* settings must not be 0".into());
         }
-        if let Some(list) = &pull.sources {
-            let mut seen: Vec<&str> = Vec::new();
-            for (i, name) in list.iter().enumerate() {
-                let name = name.as_str();
-                if seen.contains(&name) {
-                    return invalid(format!("[pull] sources lists `{name}` twice"));
-                }
-                seen.push(name);
-                match name {
-                    "registry" if i + 1 != list.len() => {
-                        return invalid(
-                            "[pull] sources: `registry` is the origin and must be last".into(),
-                        )
-                    }
-                    "registry" => {}
-                    other if defined.contains(&other) => {}
-                    other => {
-                        let mut known = vec!["registry"];
-                        known.extend(defined.iter().copied());
-                        return invalid(format!(
-                            "[pull] sources: unknown source `{other}` (known: {})",
-                            known.join(", ")
-                        ));
-                    }
-                }
+        for name in &pull.sources {
+            let name = name.as_str();
+            if name != "registry" && !defined.contains(&name) {
+                let mut known = vec!["registry"];
+                known.extend(defined.iter().copied());
+                return invalid(format!(
+                    "[pull] sources: unknown source `{name}` (known: {})",
+                    known.join(", ")
+                ));
             }
         }
         Ok(())
@@ -2354,10 +2333,12 @@ mod tests {
 
     #[test]
     fn test_the_sources_default_to_the_registry() {
-        assert_eq!(parse("").unwrap().pull_sources(), ["registry"]);
-        // The origin is last even if it is not written.
+        assert_eq!(parse("").unwrap().pull.sources, ["registry"]);
+        // A list is used as written, the empty one too.
         let config = parse("[pull]\nsources = []\n").unwrap();
-        assert_eq!(config.pull_sources(), ["registry"]);
+        assert!(config.pull.sources.is_empty());
+        let config = parse("[pull]\nsources = [\"registry\"]\n").unwrap();
+        assert_eq!(config.pull.sources, ["registry"]);
     }
 
     const EXTERNAL: &str = "[[sources.external]]\nname = \"cache\"\nsocket = \"/run/cache.sock\"\n";
@@ -2437,28 +2418,27 @@ mod tests {
             "{EXTERNAL}[pull]\nsources = [\"cache\", \"registry\"]\n"
         ))
         .unwrap();
-        assert_eq!(config.pull_sources(), ["cache", "registry"]);
+        assert_eq!(config.pull.sources, ["cache", "registry"]);
         assert_eq!(config.sources.external[0].idle_timeout_secs, 15);
+        // The registry is not added to a list.
         let config = parse(&format!("{EXTERNAL}[pull]\nsources = [\"cache\"]\n")).unwrap();
-        assert_eq!(config.pull_sources(), ["cache", "registry"]);
+        assert_eq!(config.pull.sources, ["cache"]);
     }
 
     #[test]
-    fn test_unknown_or_misplaced_sources_are_errors() {
+    fn test_unknown_sources_are_errors() {
         let err = |text: &str| parse(text).unwrap_err().to_string();
         let e = err("[pull]\nsources = [\"ipfs\", \"registry\"]\n");
         assert!(
             e.contains("unknown source `ipfs`") && e.contains("registry"),
             "{e}"
         );
-        let e = err(&format!(
+        // (the order is the one given: the registry is a name like another)
+        let config = parse(&format!(
             "{EXTERNAL}[pull]\nsources = [\"registry\", \"cache\"]\n"
-        ));
-        assert!(e.contains("must be last"), "{e}");
-        let e = err(&format!(
-            "{EXTERNAL}[pull]\nsources = [\"cache\", \"cache\"]\n"
-        ));
-        assert!(e.contains("twice"), "{e}");
+        ))
+        .unwrap();
+        assert_eq!(config.pull.sources, ["registry", "cache"]);
         // (an archive is no source of a pull: it is its origin, by scheme)
         for name in ["stores", "archive"] {
             let e = err(&format!("[pull]\nsources = [\"{name}\"]\n"));
@@ -2756,6 +2736,6 @@ mod tests {
     #[test]
     fn test_the_example_configuration_is_valid() {
         let config = parse(include_str!("../../../config.toml.example")).unwrap();
-        assert_eq!(config.pull_sources(), ["registry"]);
+        assert_eq!(config.pull.sources, ["registry"]);
     }
 }

@@ -118,8 +118,8 @@ impl Net {
         })
         .await
         .map_err(|e| match (e, &image_ref.digest) {
-            // (only the registry says what a tag names: the peers serve
-            // what a digest names)
+            // (only the registry says what a tag names: the other sources
+            // serve what a digest names)
             (ImageError::Transfer { party, object, mut failure }, None)
                 if matches!(
                     failure.class,
@@ -127,7 +127,7 @@ impl Net {
                 ) =>
             {
                 failure.reason = format!(
-                    "{} (a tag needs its registry; a pull by digest can take the image from the peers)",
+                    "{} (a tag needs the registry; a pull by digest can take the image from the other sources)",
                     failure.reason
                 );
                 ImageError::Transfer { party, object, failure }
@@ -213,8 +213,34 @@ mod tests {
             let r = ImageReference::parse(&format!("example.com/a{name}")).unwrap();
             let e = net.manifest_raw(&r, None, None).await.unwrap_err();
             assert_eq!(
-                e.to_string().contains("a tag needs its registry"),
+                e.to_string().contains("a tag needs the registry"),
                 said,
+                "{e}"
+            );
+        }
+    }
+
+    /// With `registry` out of the sources the registry fetcher is not
+    /// asked at all: the error says so, for a tag and for a digest.
+    #[tokio::test]
+    async fn a_pull_without_the_registry_in_its_sources_does_not_ask_it() {
+        // (a socket that would be an error of another kind if it were used)
+        let net = Net::Origin(
+            origin::OriginNet::of_transport(
+                "/nonexistent/velarx-registry.sock".into(),
+                std::time::Duration::from_secs(5),
+                "docker://example.com/a".into(),
+                true,
+            )
+            .with_sources(Vec::new()),
+        );
+        let digest = format!("@{}", crate::sha256(b"x"));
+        for name in [":latest", digest.as_str()] {
+            let r = ImageReference::parse(&format!("example.com/a{name}")).unwrap();
+            let e = net.manifest_raw(&r, None, None).await.unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains("`registry` is not one of the sources"),
                 "{e}"
             );
         }

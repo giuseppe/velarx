@@ -248,8 +248,7 @@ pub struct ImageService {
     /// Who completes the lazy pulls (`completer`)
     owner: completer::Owner,
     /// The fetchers of `[[sources.external]]`, which `[pull] sources` (or a
-    /// pull's own list) puts before the registry fetcher in the list of a
-    /// pull
+    /// pull's own list) puts in the list of a pull
     fetchers: Arc<Vec<velarx_config::ExternalSourceConfig>>,
     /// The pushers of `[[sinks.external]]`, which `[push] sinks` (or a
     /// push's own list) puts before the destination's own in the list of a

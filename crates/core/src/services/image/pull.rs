@@ -197,7 +197,7 @@ pub(super) struct EngineOptions {
     /// Fetch only the metadata of the layers that allow it.
     pub lazy: bool,
     /// The names of the fetchers of the pull, in the order they are asked,
-    /// `registry` last ([`ImageService::sources_of`]); none: `[pull] sources`
+    /// as given ([`ImageService::sources_of`]); none: `[pull] sources`
     pub sources: Option<Vec<String>>,
     /// How the registry is reached: with TLS verification or not, with
     /// credentials and certificates of the request or not.
@@ -625,26 +625,15 @@ impl ImageService {
     }
 
     /// The names of the fetchers of a pull, in the order they are asked:
-    /// `asked` (`--sources`) or `[pull] sources`, with `registry`, the
-    /// registry fetcher, last (added when it is missing).  A name that is
-    /// not `registry` or of `[[sources.external]]` is refused before
-    /// anything is fetched.
+    /// `asked` (`--sources`) or `[pull] sources`, as written (by default
+    /// `registry` alone).  A name that is not `registry` or of
+    /// `[[sources.external]]` is refused before anything is fetched.
     pub(super) fn sources_of(&self, asked: Option<&[String]>) -> ImageResult<Vec<String>> {
-        let mut names: Vec<String> = asked
-            .map(<[String]>::to_vec)
-            .or_else(|| self.pull_config.sources.clone())
-            .unwrap_or_default();
-        if names.last().map(String::as_str) != Some("registry") {
-            names.push("registry".to_string());
-        }
-        for (i, name) in names.iter().enumerate() {
-            let known = match name.as_str() {
-                "registry" => i + 1 == names.len(),
-                other => self.fetchers.iter().any(|f| f.name == other),
-            };
-            if !known || names[..i].contains(name) {
+        let names = asked.map_or_else(|| self.pull_config.sources.clone(), <[String]>::to_vec);
+        for name in &names {
+            if name != "registry" && !self.fetchers.iter().any(|f| f.name == *name) {
                 return Err(ImageError::Invalid(format!(
-                    "the sources {}: `{name}` is not a fetcher of [[sources.external]], or is named twice; `registry` is the last",
+                    "the sources {}: `{name}` is neither `registry` nor a fetcher of [[sources.external]]",
                     names.join(",")
                 )));
             }
@@ -667,22 +656,26 @@ impl ImageService {
             Some(n) => n.to_vec(),
             None => self.sources_of(None)?,
         };
-        let before = self.source_links(&names).await;
-        // (the registry fetcher process: nothing of a pull is fetched by
-        // this one)
-        let end = self.origin()?.connect().await.map_err(|e| {
-            ImageError::transfer(
-                "registry",
-                velarx_proto::transfer::FailureClass::Transient,
-                e.to_string(),
-            )
-        })?;
+        let (first, rest) = split_at_registry(&names);
+        let before = self.source_links(first).await;
+        // (the registry fetcher process, when `registry` is one of the
+        // sources: nothing of a pull is fetched by this one)
+        let end = match rest {
+            Some(_) => Some(self.origin()?.connect().await.map_err(|e| {
+                ImageError::transfer(
+                    "registry",
+                    velarx_proto::transfer::FailureClass::Transient,
+                    e.to_string(),
+                )
+            })?),
+            None => None,
+        };
+        let after = self.source_links(rest.unwrap_or_default()).await;
         let verity = self.fsverity != velarx_storage::VerityMode::Off
             && velarx_storage::probe(&self.staging_dir).is_ok();
         let access = access.map(serde_json::to_vec).transpose()?;
         let staged = StagedFetch::open(
-            before,
-            end,
+            (before, end, after),
             &self.staging_dir,
             verity,
             (repository, tls_verify),
@@ -730,7 +723,7 @@ impl ImageService {
     }
 
     /// The bytes of the blob `digest` of `size` bytes from the fetchers of
-    /// `[pull] sources` before the registry (the pieces of a shared
+    /// `[pull] sources` but the registry (the pieces of a shared
     /// checkpoint), checked against its digest; none when nobody has it.
     pub async fn source_blob(&self, digest: &Digest, size: u64) -> Option<Vec<u8>> {
         let names = self.sources_of(None).ok()?;
@@ -1131,16 +1124,27 @@ impl ImageService {
         let target = client.target(&image_ref)?;
         let access = client.request_access().cloned().unwrap_or_default();
         let mut net = self.inspect_net(client, &image_ref, reach.tls_verify, &access)?;
-        // (a digest vouches for the manifest, and the manifest for the
-        // rest: what the fetchers before the registry have is checked
-        // against them, so the registry is asked for what they lack)
-        if let (Some(_), Net::Origin(origin)) = (&image_ref.digest, &net) {
+        // (the sources are asked in their order; a digest vouches for the
+        // manifest, and the manifest for the rest: what the fetchers have is
+        // checked against them, and only the registry resolves a tag)
+        if let Net::Origin(origin) = &net {
+            use velarx_content::pull::net::origin::{MetadataSources, Source};
             let names = self.sources_of(sources.as_deref())?;
-            let links = self.source_links(&names).await;
-            if !links.is_empty() {
-                let before = velarx_content::pull::net::origin::MetadataSources::open(links).await;
-                net = Net::Origin(origin.clone().with_sources(before));
+            let (first, rest) = split_at_registry(&names);
+            let digest = image_ref.digest.is_some();
+            let mut listed = Vec::new();
+            if digest {
+                let links = self.source_links(first).await;
+                listed.push(Source::Fetchers(MetadataSources::open(links).await));
             }
+            if let Some(rest) = rest {
+                listed.push(Source::Registry);
+                if digest {
+                    let links = self.source_links(rest).await;
+                    listed.push(Source::Fetchers(MetadataSources::open(links).await));
+                }
+            }
+            net = Net::Origin(origin.clone().with_sources(listed));
         }
         // (the instance an index names is not asked of the registry when the
         // store has that very manifest, which is checked against its digest)
@@ -2114,6 +2118,15 @@ pub(super) fn feed_layers(
         .collect()
 }
 
+/// The sources before `registry` and those after it; none after when
+/// `registry` is not one of them.
+fn split_at_registry(names: &[String]) -> (&[String], Option<&[String]>) {
+    match names.iter().position(|n| n == "registry") {
+        Some(at) => (&names[..at], Some(&names[at + 1..])),
+        None => (names, None),
+    }
+}
+
 #[cfg(test)]
 mod opened_tests {
     use super::*;
@@ -2366,5 +2379,19 @@ mod stored_tests {
         )
         .unwrap()
         .with_driver(kind)
+    }
+}
+
+#[cfg(test)]
+mod sources_tests {
+    use super::split_at_registry;
+
+    #[test]
+    fn the_sources_are_split_where_the_registry_is() {
+        let names = |l: &[&str]| l.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let list = names(&["a", "registry", "b"]);
+        assert_eq!(split_at_registry(&list), (&list[..1], Some(&list[2..])));
+        let list = names(&["a", "b"]);
+        assert_eq!(split_at_registry(&list), (&list[..], None));
     }
 }

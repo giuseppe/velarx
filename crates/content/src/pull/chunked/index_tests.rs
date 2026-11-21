@@ -321,8 +321,11 @@ async fn rig_with(
     );
     let staging_root = root.join("fetch");
     let staged = StagedFetch::open(
-        links,
-        FetchConn::new(origin_fetcher.connect().unwrap()).unwrap(),
+        (
+            links,
+            Some(FetchConn::new(origin_fetcher.connect().unwrap()).unwrap()),
+            Vec::new(),
+        ),
         &staging_root,
         false,
         ("localhost/a", true),

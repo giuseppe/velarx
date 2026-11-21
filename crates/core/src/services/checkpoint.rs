@@ -511,7 +511,7 @@ impl SharedCheckpoints {
 }
 
 /// Where the blobs of a shared checkpoint come from: the fetchers of
-/// `[pull] sources` before the registry
+/// `[pull] sources` but the registry
 /// ([`crate::services::image::ImageService::source_blob`]).
 #[async_trait::async_trait]
 pub trait Blobs: Sync {

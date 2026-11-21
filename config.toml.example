@@ -408,8 +408,8 @@ lazy_completers = 2
 # registry has lost the blob) stops it, the staging is kept and `velarx image
 # pulls` says why
 lazy_retry_max_secs = 600
-# The files of lazily pulled images come from the fetchers of `sources`, and
-# last from the registry, a fetcher too (`velarx-registry`, with
+# The files of lazily pulled images come from the fetchers of `sources`, the
+# registry a fetcher too (`velarx-registry`, with
 # the pull workers above): the one the engine starts (its socket is
 # `registry-<digest>/registry.sock` in the services directory) and shares with
 # the monitors of its containers (and with the engines of the same
@@ -448,13 +448,15 @@ lazy_profile_files = 4096
 # order while the container is made.  Only an order, at most 64 MiB of it:
 # every file is checked as it is fetched.
 lazy_profile_peers = true
-# Where the content of images comes from, in order.  The registry is the
-# origin and always last (it is added when missing).  Every source is untrusted:
-# sizes and digests are verified and a source that fails, sends wrong bytes or
-# is too slow is skipped and the next one is asked.  By default
-# ["registry"].  interfaces/org.velarx.Fetcher.varlink is the interface to
-# write one.
-# sources = ["dircache", "p2p", "registry"]
+# Where the content of images comes from: names of [[sources.external]] and
+# "registry", the origin, asked in the order written.  A list without
+# "registry" never asks the registry: an image is then pulled only by
+# digest, from the other sources.  Every source is untrusted: sizes and
+# digests are verified and a source that fails, sends wrong bytes or is too
+# slow is skipped and the next one is asked.
+# interfaces/org.velarx.Fetcher.varlink is the interface to write one.  A
+# list of several: ["dircache", "p2p", "registry"].
+# sources = ["registry"]
 
 [push]
 # Layers regenerated and uploaded at the same time
