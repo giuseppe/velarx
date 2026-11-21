@@ -180,7 +180,13 @@ fn main() -> anyhow::Result<()> {
         println!("  private_key_path = \"{}\"", path.display());
         return Ok(());
     }
-    logging::init(&args.log_level, &args.log_format);
+    // (libp2p walks the DHT when a node starts listening with no peer, and
+    // warns that it has none on the first node of a swarm: no fault)
+    logging::init_quieter(
+        &args.log_level,
+        &args.log_format,
+        "libp2p_kad::behaviour=error",
+    );
     if let Some(Command::Ca { command }) = &args.command {
         return run_ca(command, &args);
     }

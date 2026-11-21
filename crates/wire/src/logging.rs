@@ -5,27 +5,41 @@ use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+/// What is always quieter than the level asked: FUSE's chatter.
+const QUIET: &str = "fuser=off,velarx_fuse=warn";
+
 /// Start logging at `level` (or `RUST_LOG`: a level or `target=level,...`);
 /// `format` is `text` or `json`.
 pub fn init(level: &str, format: &str) {
+    init_quieter(level, format, "");
+}
+
+/// [`init`], with `quiet` (`target=level,...`) quieter than the level asked
+/// too: what a program knows its dependencies say that is no fault.
+pub fn init_quieter(level: &str, format: &str, quiet: &str) {
+    let quiet = if quiet.is_empty() {
+        QUIET.to_string()
+    } else {
+        format!("{QUIET},{quiet}")
+    };
     let mut problems = Vec::new();
     let from_env = std::env::var("RUST_LOG").ok().filter(|v| !v.is_empty());
     let filter = from_env
         .as_deref()
         .and_then(|v| {
-            let parsed = format!("{v},fuser=off,velarx_fuse=warn").parse::<Targets>();
+            let parsed = format!("{v},{quiet}").parse::<Targets>();
             parsed
                 .map_err(|e| problems.push(format!("RUST_LOG `{v}` is not a filter: {e}")))
                 .ok()
         })
         .or_else(|| {
-            let parsed = format!("{level},fuser=off,velarx_fuse=warn").parse::<Targets>();
+            let parsed = format!("{level},{quiet}").parse::<Targets>();
             parsed
                 .map_err(|e| problems.push(format!("the log level `{level}` is not a filter: {e}")))
                 .ok()
         })
         .unwrap_or_else(|| {
-            "info,fuser=off,velarx_fuse=warn"
+            format!("info,{quiet}")
                 .parse::<Targets>()
                 .unwrap_or_default()
         });
