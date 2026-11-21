@@ -1110,32 +1110,20 @@ fn link_copy(
     object: &Object,
     store: &FileStore,
 ) -> io::Result<Step> {
-    store.place(file, object)?;
+    place(store, file, object)?;
     drop_name(dir, rel, meta);
     Ok(Step::Linked(object.clone()))
 }
 
-/// The operation of a storage driver that gives a verified file its name:
-/// the commit hands each file, verified and durable, to the driver's own way
-/// of keeping it.  The objects of the engine's own store (composefs and vfs,
-/// which keep the same files by their fs-verity digest) are linked by their
-/// inode; the `varlink` driver takes the file as a descriptor handed over its
-/// typed interface (`org.velarx.StorageFeed`, event `staged`) and keeps it in
-/// its own way.  An object that is there is kept.
-pub trait Place: Sync {
-    fn place(&self, file: &File, object: &Object) -> io::Result<()>;
-}
-
-impl Place for FileStore {
-    /// `linkat` of the file into `objects/` under the name of `object`: no
-    /// second write of the bytes, no copy, no reflink.
-    fn place(&self, file: &File, object: &Object) -> io::Result<()> {
-        let target = self.object_path(object);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        link_object(&velarx_sys::fd::proc_str(file), &target, object)
+/// Give the verified, durable `file` the name of `object` in the store:
+/// `linkat` into `objects/`, no second write of the bytes, no copy, no
+/// reflink.  An object that is there is kept.
+fn place(store: &FileStore, file: &File, object: &Object) -> io::Result<()> {
+    let target = store.object_path(object);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    link_object(&velarx_sys::fd::proc_str(file), &target, object)
 }
 
 /// Give a file that was made ready its name (the step that follows the
