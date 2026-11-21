@@ -230,7 +230,7 @@ def commands(bindir):
     argument of one (that `--help` could reach a container), and the
     internal commands not at all.  The binaries see a scratch home, no
     variable of the caller's environment and BINDIR as PATH, so that
-    `velarx NAME` runs the velarx-NAME of BINDIR, never an older one
+    `velarx kube` runs the velarx-kube of BINDIR, never an older one
     installed; one that is not built (`make ci` builds the default members
     only) is not checked (`make test-all` builds every program)."""
     helps, refused, absent = {}, set(), set()

@@ -383,7 +383,6 @@ YAML
     out=$("$SH" kube --version 2>&1)
     check "velarx kube runs velarx-kube" 0 $?
     check_match "and it is velarx-kube" "velarx-kube" "$out"
-    check "velarx knows nothing of velarx-kube" 0 "$(grep -c 'velarx-kube' "$BIN/velarx")"
 }
 
 @test "init containers and the annotations of podman" {

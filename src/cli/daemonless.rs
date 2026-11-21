@@ -55,7 +55,7 @@ pub fn daemonless(cmd: &Commands) -> Daemonless {
         Commands::AutoUpdate(_) => InProcess,
         Commands::Health => NeedsServer("`health` (it reports the health of the engine service)"),
         Commands::Varlink { .. } => Standalone("it is the engine service"),
-        Commands::External(_) => Standalone("it is another program"),
+        Commands::Kube { .. } => Standalone("it is another program"),
         Commands::Unshare { .. } => Standalone("it joins the namespaces of the rootless user"),
         // (a password of a secret is in the engine's store)
         Commands::Registry(RegistryCommands::Login {
@@ -278,8 +278,8 @@ mod daemonless_tests {
     }
 
     #[test]
-    fn an_unknown_command_is_another_program() {
-        assert!(matches!(of(&["foo", "bar"]), Daemonless::Standalone(_)));
+    fn kube_is_another_program() {
+        assert!(matches!(of(&["kube", "play"]), Daemonless::Standalone(_)));
     }
 
     /// Every command the command line has, as the words that name it.
@@ -355,6 +355,7 @@ mod daemonless_tests {
         "image trust show",
         "image untag",
         "info",
+        "kube",
         "manifest add",
         "manifest annotate",
         "manifest create",
@@ -530,6 +531,7 @@ mod daemonless_tests {
             "image generate-sigstore-key: Standalone(\"it writes the files of a key pair\")",
             "image trust set: Standalone(\"it edits the policy and registries.d files\")",
             "image trust show: Standalone(\"it edits the policy and registries.d files\")",
+            "kube: Standalone(\"it is another program\")",
             "quadlet disable: Standalone(\"it links the systemd generators\")",
             "quadlet enable: Standalone(\"it links the systemd generators\")",
             "quadlet status: Standalone(\"it links the systemd generators\")",
@@ -559,6 +561,7 @@ mod daemonless_tests {
                 "image generate-sigstore-key",
                 "image trust set",
                 "image trust show",
+                "kube",
                 "quadlet disable",
                 "quadlet enable",
                 "quadlet status",

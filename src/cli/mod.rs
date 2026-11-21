@@ -12,8 +12,8 @@ pub mod commands;
 pub mod cp;
 pub mod engine;
 pub mod events;
-pub mod external;
 pub mod gpg;
+pub mod kube;
 pub mod manifest;
 pub mod progress;
 pub mod quadlet;
@@ -354,11 +354,16 @@ pub enum Commands {
         shell: CompletionShell,
     },
 
-    /// `velarx NAME ARGS` runs the program `velarx-NAME ARGS`, found next
-    /// to this executable or in PATH, with the global options `--config`,
-    /// `--log-level` and `--log-format` in front of ARGS.
-    #[command(external_subcommand)]
-    External(Vec<OsString>),
+    /// Play, tear down, generate and apply Kubernetes YAML (runs `velarx-kube`)
+    ///
+    /// The program is found next to this executable or in PATH, and gets the
+    /// global options `--config`, `--log-level` and `--log-format` in front
+    /// of the arguments.
+    #[command(disable_help_flag = true)]
+    Kube {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
 }
 
 /// When `container run` and `container create` pull the image.

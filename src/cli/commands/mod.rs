@@ -146,9 +146,8 @@ fn main_as(binary: Binary, startup: &velarx_sys::fd::Startup) -> anyhow::Result<
             Binary::Client => exec_engine(),
         };
     }
-    // `velarx NAME ...` is the program `velarx-NAME`
-    if let Commands::External(ref args) = cli.command {
-        return cli::external::run(&cli.global, args);
+    if let Commands::Kube { ref args } = cli.command {
+        return cli::kube::run(&cli.global, args);
     }
     if let Commands::Unshare {
         rootless_netns,
@@ -393,7 +392,7 @@ fn run(cli: cli::Cli, startup: &velarx_sys::fd::Startup) -> anyhow::Result<()> {
         Commands::Secret(cmd) => cli::secret::run(cmd, &get_client(&inv)?)?,
         Commands::Artifact(cmd) => cli::artifact::run(cmd, &get_client(&inv)?)?,
         Commands::Manifest(cmd) => cli::manifest::run(cmd, &get_client(&inv)?, &registry_access)?,
-        Commands::External(_) => unreachable!("run before the engine is chosen"),
+        Commands::Kube { .. } => unreachable!("run before the engine is chosen"),
         Commands::Quadlet(cmd) => cli::quadlet::run(cmd)?,
         Commands::Version { format } => {
             // the server's too, if one answers

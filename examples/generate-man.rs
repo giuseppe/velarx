@@ -8,9 +8,9 @@
 //! subcommand (velarx-image.1, velarx-container.1, ...), and the same tree
 //! for the thin client (velarx-client.1, velarx-client-image.1, ...), which
 //! takes the same command line and leaves the engine's part of it to
-//! `velarx`.  `velarx NAME` runs the program `velarx-NAME`, so the pages of
-//! the subcommands of a binary of its own are written by an example of that
-//! binary's package (the peers service's, in section 8).
+//! `velarx`.  The pages of the commands of a binary of its own are written
+//! by an example of that binary's package (the peers service's, in
+//! section 8).
 
 use std::path::{Path, PathBuf};
 
@@ -46,7 +46,11 @@ fn main() -> std::io::Result<()> {
 /// engine's command line, the binary's for the thin client's copy of it.
 fn write(dir: &Path, cmd: &clap::Command, binary: Option<&'static str>) -> std::io::Result<()> {
     let name = cmd.get_name().to_owned();
-    for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
+    // (`velarx kube` is velarx-kube, whose page is man/velarx-kube.1)
+    for sub in cmd
+        .get_subcommands()
+        .filter(|s| !s.is_hide_set() && s.get_name() != "kube")
+    {
         write(dir, sub, binary)?;
     }
     let mut cmd = cmd.clone();
