@@ -13,7 +13,7 @@ RestartSec=5
 RuntimeDirectory=velarx
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
-# The identity of the node (identity_path of p2p.toml): its peer id outlives a
+# The identity of the node (identity_path of its settings): its peer id outlives a
 # restart and a boot; and the staging of the layers of the store, which the
 # service opens before any pull made it (the rest of the store stays read-only)
 StateDirectory=velarx/staging/layers velarx/p2p

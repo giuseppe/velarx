@@ -19,7 +19,7 @@ scenario_start netem 4 || exit 1
 img=$REG/netem:latest
 
 image netem "$mb" > "$OUT/build.log" 2>&1 || { echo "the image is not built, see $OUT/build.log" >&2; exit 1; }
-printf '[serving]\nupload_limit_mbit = %s\n' "$up" > "$W/serving.toml"
+printf '[sources.external.settings.serving]\nupload_limit_mbit = %s\n' "$up" > "$W/serving.toml"
 node 0 "$W/serving.toml" || exit 1
 v 0 image pull --tls-verify=false "$img" > "$OUT/seed-pull.log" 2>&1
 for i in 1 2; do

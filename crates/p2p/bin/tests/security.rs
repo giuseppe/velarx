@@ -48,21 +48,20 @@ impl Node {
         key
     }
 
-    /// The configuration of the engine, and `p2p.toml` next to it with
-    /// the lines `p2p`.
+    /// The configuration of the engine, with the lines `p2p` in the settings
+    /// of the source `p2p`.
     fn config(&self, p2p: &str) -> PathBuf {
         let config = self.path("config.toml");
+        let dir = self.dir.path().display();
         std::fs::write(
             &config,
             format!(
-                "[server]\nsocket = \"{}/run/velarx.sock\"\n",
-                self.dir.path().display()
+                "[server]\nsocket = \"{dir}/run/velarx.sock\"\n\
+                 [[sources.external]]\nname = \"p2p\"\n\
+                 socket = \"{dir}/run/services/p2p-fetcher.sock\"\n\
+                 [sources.external.settings]\nmdns = false\n\
+                 listen_addresses = [\"/ip4/127.0.0.1/tcp/0\"]\n{p2p}"
             ),
-        )
-        .unwrap();
-        std::fs::write(
-            self.path("p2p.toml"),
-            format!("mdns = false\nlisten_addresses = [\"/ip4/127.0.0.1/tcp/0\"]\n{p2p}"),
         )
         .unwrap();
         config

@@ -6,9 +6,16 @@
 use clap::Parser;
 use velarx_config::Config;
 use velarx_p2p::cli::{Args, CaCommand, Command};
-use velarx_p2p::settings::{self, Settings};
+use velarx_p2p::settings::Settings;
 use velarx_p2p::{control, overlay_helper, overlay_service, sandbox, service, Role};
 use velarx_wire::logging;
+
+/// The settings of the service: those of its source in the configuration
+/// file, whose directory the relative paths in them are relative to.
+fn load_settings(config: &Config, args: &Args) -> anyhow::Result<Settings> {
+    let dir = args.config.parent().unwrap_or(std::path::Path::new(""));
+    Settings::load(config, &args.source, dir)
+}
 
 /// Ask the running service on its control socket and print the answer.
 fn ask(config: &Config, settings: &Settings, command: Command) -> anyhow::Result<()> {
@@ -62,11 +69,7 @@ fn run_ca(command: &CaCommand, args: &Args) -> anyhow::Result<()> {
                 Some(file) => file.clone(),
                 None => {
                     let config = Config::load_or_default(&args.config)?;
-                    let path = args
-                        .p2p_config
-                        .clone()
-                        .unwrap_or_else(|| settings::default_path(&args.config));
-                    Settings::load_or_default(&path)?.identity_file(&config)
+                    load_settings(&config, args)?.identity_file(&config)
                 }
             };
             let key = velarx_p2p::identity::load_or_create(&file)
@@ -130,7 +133,6 @@ fn run_overlay(
     config: Config,
     settings: Settings,
     config_path: &std::path::Path,
-    settings_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let settings = settings.of_overlay(&config)?;
     let helper = overlay_service::start_overlay_helper(&settings)?;
@@ -142,13 +144,8 @@ fn run_overlay(
     // (removed when this process is gone: once confined it may not)
     let _remover = velarx_base::ipc::remove_when_gone(&[socket])
         .map_err(|e| anyhow::anyhow!("cannot start the remover of the socket: {e}"))?;
-    sandbox::enter(
-        Role::Overlay,
-        &config,
-        &settings,
-        &[config_path, settings_path],
-    )
-    .map_err(|e| anyhow::anyhow!(e))?;
+    sandbox::enter(Role::Overlay, &config, &settings, config_path)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -176,7 +173,9 @@ fn main() -> anyhow::Result<()> {
         control::generate_swarm_key(path)
             .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
         println!("Wrote the swarm key to {}", path.display());
-        println!("Copy it to the other nodes (keep it private) and set in p2p.toml:");
+        println!(
+            "Copy it to the other nodes (keep it private) and set in [sources.external.settings]:"
+        );
         println!("  private_key_path = \"{}\"", path.display());
         return Ok(());
     }
@@ -192,11 +191,7 @@ fn main() -> anyhow::Result<()> {
     }
     let config = Config::load_or_default(&args.config)?;
     config.validate()?;
-    let settings_path = args
-        .p2p_config
-        .clone()
-        .unwrap_or_else(|| settings::default_path(&args.config));
-    let settings = Settings::load_or_default(&settings_path)?;
+    let settings = load_settings(&config, &args)?;
     if let Some(Command::Serve { dir }) = &args.command {
         let identity = velarx_p2p::identity::load_or_create(&settings.identity_file(&config))
             .map_err(|e| anyhow::anyhow!("the identity of the node: {e}"))?;
@@ -207,7 +202,7 @@ fn main() -> anyhow::Result<()> {
         return runtime.block_on(service::serve_dir(settings, dir, identity, authority));
     }
     if let Some(Command::Overlay) = &args.command {
-        return run_overlay(config, settings, &args.config, &settings_path);
+        return run_overlay(config, settings, &args.config);
     }
     if let Some(command) = args.command {
         return ask(&config, &settings, command);
@@ -226,13 +221,8 @@ fn main() -> anyhow::Result<()> {
     // (removed when this process is gone: once confined it may not)
     let _remover = velarx_base::ipc::remove_when_gone(&sockets.paths)
         .map_err(|e| anyhow::anyhow!("cannot start the remover of the sockets: {e}"))?;
-    sandbox::enter(
-        Role::Content,
-        &config,
-        &settings,
-        &[&args.config, &settings_path],
-    )
-    .map_err(|e| anyhow::anyhow!(e))?;
+    sandbox::enter(Role::Content, &config, &settings, &args.config)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

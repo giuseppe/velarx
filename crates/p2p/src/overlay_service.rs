@@ -83,14 +83,14 @@ pub async fn run_overlay(
             .contains(&base_cidr.prefix_len())
     {
         anyhow::bail!(
-            "[overlay] cidr = \"{base_cidr}\": a network of /{} to /{} is needed",
+            "settings.overlay.cidr = \"{base_cidr}\": a network of /{} to /{} is needed",
             crate::overlay_router::MIN_OVERLAY_PREFIX,
             crate::overlay_router::MAX_OVERLAY_PREFIX
         );
     }
     if p2p.overlay.subnet_attempt >= crate::overlay_router::MAX_SUBNET_ATTEMPTS {
         anyhow::bail!(
-            "[overlay] subnet_attempt = {}: at most {}",
+            "settings.overlay.subnet_attempt = {}: at most {}",
             p2p.overlay.subnet_attempt,
             crate::overlay_router::MAX_SUBNET_ATTEMPTS - 1
         );
@@ -120,7 +120,7 @@ pub async fn run_overlay(
             .iter()
             .map(|s| {
                 velarx_netkernel::dnsrec::parse_upstream(s).ok_or_else(|| {
-                    anyhow::anyhow!("[overlay] dns_upstreams: `{s}` is not an address")
+                    anyhow::anyhow!("settings.overlay.dns_upstreams: `{s}` is not an address")
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?

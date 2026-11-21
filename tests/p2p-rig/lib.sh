@@ -115,7 +115,7 @@ x () {
         env -i $(envof "$i") RUST_LOG="${RUST_LOG:-info}" "$@"
 }
 v () { local i=$1; shift; x "$i" "$BIN/velarx" --config "$W/nodes/n$i/engine.toml" "$@"; }
-p () { local i=$1; shift; x "$i" "$BIN/velarx-p2p" --config "$W/nodes/n$i/engine.toml" --p2p-config "$W/nodes/n$i/p2p.toml" "$@"; }
+p () { local i=$1; shift; x "$i" "$BIN/velarx-p2p" --config "$W/nodes/n$i/engine.toml" "$@"; }
 
 # the registry, access log in $W/registry.log (started again: empty store)
 reg () {
@@ -148,9 +148,9 @@ EOT
 
 # node I [EXTRA_P2P_TOML_FILE]: engine + p2p service, the bootstrap peers are
 # the nodes of BOOTN (default 0; none for node 0 and with NOBOOT).  EXTRA is
-# appended to p2p.toml.  NOP2P=1: the engine only (sources = registry).
-# NOKEY=1: no swarm key (the node has a certificate).  ENGINE_EXTRA: a file
-# appended to engine.toml.
+# appended to the settings of the source p2p in engine.toml.  NOP2P=1: the
+# engine only (sources = registry).  NOKEY=1: no swarm key (the node has a
+# certificate).  ENGINE_EXTRA: a file appended to engine.toml.
 node () {
     local i=$1 extra=${2:-} d=$W/nodes/n$1 boot="" a b sources='["p2p", "registry"]'
     a=$(ip_of "$i")
@@ -173,21 +173,22 @@ name = "p2p"
 socket = "$d/services/p2p-fetcher.sock"
 idle_timeout_secs = 30
 EOT
-    [ -n "${ENGINE_EXTRA:-}" ] && cat "$ENGINE_EXTRA" >> "$d/engine.toml"
     if [ "$i" != 0 ] && [ -z "${NOBOOT:-}" ]; then
         for b in ${BOOTN:-0}; do
             boot="$boot${boot:+, }\"/ip4/$(ip_of "$b")/tcp/4001/p2p/$(cat "$W/nodes/n$b/peerid")\""
         done
     fi
     {
+        echo '[sources.external.settings]'
         echo 'mdns = false'
         [ -z "${NOKEY:-}" ] && echo "private_key_path = \"$W/swarm.key\""
         echo "listen_addresses = [\"/ip4/$a/tcp/4001\"]"
         echo "bootstrap_peers = [$boot]"
         echo "socket = \"$d/services/p2p.sock\""
         [ -n "$extra" ] && cat "$extra"
-    } > "$d/p2p.toml"
-    chown "$RUSER:" "$d/engine.toml" "$d/p2p.toml"
+    } >> "$d/engine.toml"
+    [ -n "${ENGINE_EXTRA:-}" ] && cat "$ENGINE_EXTRA" >> "$d/engine.toml"
+    chown "$RUSER:" "$d/engine.toml"
     # shellcheck disable=SC2046
     nsenter --net=/run/netns/"$(ns_of "$i")" setpriv --reuid="$RUSER" --regid="$RUSER" --init-groups \
         env -i $(envof "$i") RUST_LOG=info setsid "$BIN/velarx" --config "$d/engine.toml" varlink \
@@ -198,7 +199,7 @@ EOT
     [ -n "${NOP2P:-}" ] && return 0
     # shellcheck disable=SC2046
     nsenter --net=/run/netns/"$(ns_of "$i")" setpriv --reuid="$RUSER" --regid="$RUSER" --init-groups \
-        env -i $(envof "$i") RUST_LOG="${P2P_LOG:-info}" setsid "$BIN/velarx-p2p" --config "$d/engine.toml" --p2p-config "$d/p2p.toml" \
+        env -i $(envof "$i") RUST_LOG="${P2P_LOG:-info}" setsid "$BIN/velarx-p2p" --config "$d/engine.toml" \
         >> "$d/p2p.log" 2>&1 < /dev/null &
     echo $! > "$d/p2p.pid"
     disown
@@ -302,16 +303,18 @@ state_dir = "$o/state"
 root_dir = "$o/root"
 [storage]
 root = "$o/store"
-EOT
-    cat > "$o/p2p.toml" <<EOT
+[[sources.external]]
+name = "p2p"
+socket = "$o/p2p-fetcher.sock"
+[sources.external.settings]
 private_key_path = "$o/swarm.key"
 socket = "$o/p2p.sock"
-[overlay]
+[sources.external.settings.overlay]
 listen_addresses = ["/ip4/$(ip_of "$i")/tcp/4002"]
 bootstrap_peers = [$boot]
 EOT
     nsenter --net=/run/netns/"$(ns_of "$i")" env -i PATH="$BIN:/usr/bin:/usr/sbin" RUST_LOG="${P2P_LOG:-info}" \
-        setsid "$BIN/velarx-p2p" --config "$o/engine.toml" --p2p-config "$o/p2p.toml" overlay \
+        setsid "$BIN/velarx-p2p" --config "$o/engine.toml" overlay \
         >> "$o/overlay.log" 2>&1 < /dev/null &
     echo $! > "$o/overlay.pid"
     disown

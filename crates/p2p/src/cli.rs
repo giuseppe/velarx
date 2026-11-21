@@ -43,18 +43,18 @@ fn version() -> &'static str {
         authority; `ca request` on a node and `ca sign` on the operator's machine make \
         its certificate (sign again before it ends); `ca revoke` revokes a node by peer \
         id.  ca_path, certificate_path, revocation_path, allow_names, allow_peers and \
-        ca_sweep_secs of p2p.toml tell the service where they are; see \
+        ca_sweep_secs of its settings tell the service where they are; see \
         docs/THREAT-MODEL.md."
 )]
 pub struct Args {
-    /// Path to the config file of the engine
+    /// Path to the config file
     #[arg(long, default_value_os_t = velarx::cli::default_config())]
     pub config: PathBuf,
 
-    /// Path to the settings of the service (default: p2p.toml next to the
-    /// config file of the engine)
-    #[arg(long)]
-    pub p2p_config: Option<PathBuf>,
+    /// The name of the source the service is in `[[sources.external]]` of
+    /// the config file: its `settings` are the settings of the service
+    #[arg(long, default_value = "p2p")]
+    pub source: String,
 
     #[arg(long, default_value = "info")]
     pub log_level: String,

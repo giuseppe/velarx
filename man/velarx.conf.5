@@ -250,6 +250,17 @@ The process serving
 must run as the user of the engine or as root; the engine checks it
 .RB ( SO_PEERCRED )
 on every connection and refuses another.
+The table
+.B settings
+of a source (sub-tables allowed) is for the program that serves it, which
+reads this file itself; the engine keeps it as it is and never reads it.
+.BR velarx\-p2p (8)
+reads the settings of the source named
+.B p2p
+(or the name given with
+.BR \-\-source );
+its keys are in
+.BR config.toml.example .
 .SH SEE ALSO
 .BR velarx (1),
 .BR velarx\-api (8)

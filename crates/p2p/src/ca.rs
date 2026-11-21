@@ -5,7 +5,7 @@
 //! where they choose, and no node ever holds it.
 //!
 //! * `ca init DIR`: the key (`ca.key`, 0600) and the certificate (`ca.crt`);
-//!   the certificate goes to the nodes (`ca_path` of p2p.toml).
+//!   the certificate goes to the nodes (`ca_path` of its settings).
 //! * `ca request`, on a node: its public key and a proof that it holds the
 //!   private key (the key itself does not leave the node).
 //! * `ca sign`: the certificate of a node from its request.

@@ -64,9 +64,9 @@ pub struct Paths {
 }
 
 /// What the service may read and write.
-pub fn paths(role: Role, config: &Config, settings: &Settings, config_paths: &[&Path]) -> Paths {
+pub fn paths(role: Role, config: &Config, settings: &Settings, config_path: &Path) -> Paths {
     let mut readable: Vec<PathBuf> = READABLE.iter().map(PathBuf::from).collect();
-    readable.extend(config_paths.iter().map(|p| p.to_path_buf()));
+    readable.push(config_path.to_path_buf());
     for var in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
         if let Some(p) = std::env::var_os(var) {
             readable.push(p.into());
@@ -235,15 +235,15 @@ fn seccomp(role: Role) -> Result<(), String> {
 
 /// Confine the service.  Call it before any thread is started (the
 /// runtime): Landlock and seccomp apply to the threads created afterwards.
-/// `config_paths`: the configuration files it was started with.
+/// `config_path`: the configuration file it was started with.
 pub fn enter(
     role: Role,
     config: &Config,
     settings: &Settings,
-    config_paths: &[&Path],
+    config_path: &Path,
 ) -> Result<(), String> {
     velarx_sys::confine::require_single_thread()?;
-    enter_role_thread(role, config, settings, config_paths)
+    enter_role_thread(role, config, settings, config_path)
 }
 
 /// Confine the calling thread and those it makes afterwards, whatever other
@@ -252,9 +252,9 @@ pub fn enter(
 pub fn enter_thread(
     config: &Config,
     settings: &Settings,
-    config_paths: &[&Path],
+    config_path: &Path,
 ) -> Result<(), String> {
-    enter_role_thread(Role::Content, config, settings, config_paths)
+    enter_role_thread(Role::Content, config, settings, config_path)
 }
 
 /// [`enter_thread`] for a role.
@@ -262,7 +262,7 @@ pub fn enter_role_thread(
     role: Role,
     config: &Config,
     settings: &Settings,
-    config_paths: &[&Path],
+    config_path: &Path,
 ) -> Result<(), String> {
     // (the trace file, when there is one, is opened before the confinement)
     velarx_base::trace::enabled();
@@ -288,7 +288,7 @@ pub fn enter_role_thread(
     // the soft limit of 1024)
     velarx_base::hardening::raise_open_files().map_err(|e| format!("RLIMIT_NOFILE: {e}"))?;
     drop_privileges()?;
-    let paths = paths(role, config, settings, config_paths);
+    let paths = paths(role, config, settings, config_path);
     // The directories exist before Landlock is told about them (a missing
     // path gets no rule).
     for dir in &paths.sockets {

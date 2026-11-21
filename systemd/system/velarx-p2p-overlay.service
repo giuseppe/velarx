@@ -11,7 +11,7 @@ RestartSec=5
 RuntimeDirectory=velarx
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
-# The identity of the overlay node (identity_path of [overlay] in p2p.toml):
+# The identity of the overlay node (overlay.identity_path of its settings):
 # its peer id, and so the subnet it takes, outlive a restart and a boot
 StateDirectory=velarx/p2p
 StateDirectoryMode=0700

@@ -288,7 +288,6 @@ install-files: ## install what is already built into DESTDIR/PREFIX (make man fi
 		for b in $(BINARIES); do \
 			$(INSTALL) -m 0644 $(LICENSESOUT)/THIRD-PARTY-LICENSES.$$b $(DESTDIR)$(LICENSEDIR)/ || exit 1; \
 		done)
-	$(if $(P2P),$(INSTALL) -m 0644 crates/p2p/p2p.toml.example $(DESTDIR)$(DOCDIR)/p2p.toml.example)
 	for k in $(GENERATORS); do \
 		$(INSTALL) -d $(DESTDIR)$(SYSTEMDDIR)/$$k-generators && \
 		sed 's|/usr/bin/velarx|$(BINDIR)/velarx|g' systemd/generators/velarx-generator \
@@ -318,7 +317,6 @@ list: ## print what install lays out (without DESTDIR)
 	@echo $(DOCDIR)/config.toml.example
 	@$(if $(LICENSEDIR),for f in LICENSE NOTICE; do echo $(LICENSEDIR)/$$f; done; \
 		for b in $(BINARIES); do echo $(LICENSEDIR)/THIRD-PARTY-LICENSES.$$b; done)
-	@$(if $(P2P),echo $(DOCDIR)/p2p.toml.example)
 	@for k in $(GENERATORS); do echo $(SYSTEMDDIR)/$$k-generators/velarx-$$k-generator; done
 	@for p in `cd $(GENMANDIR) && ls $(MANPAGES) 2>/dev/null`; do \
 		echo $(MANDIR)/man$${p##*.}/$$p; \

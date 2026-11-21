@@ -57,7 +57,7 @@ type Lookups (
 )
 
 # The dials refused for the address they were to, by the reason
-# (`dial_allow` of p2p.toml).
+# (`dial_allow` of the settings).
 type DialsRefused (
 	loopback: int,
 	link_local: int,

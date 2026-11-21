@@ -10,8 +10,8 @@
 //! ids for one subnet.  What it gets by that is nothing: a subnet that two
 //! peers claim has no route at all, on any node and whatever the order of
 //! the announcements, and the log of the nodes names both peers and the
-//! remedy (`[p2p.overlay] subnet_attempt`).  A member can make the subnet of
-//! a victim unreachable that way, and never receives the victim's traffic.  The
+//! remedy (`settings.overlay.subnet_attempt`).  A member can make the subnet
+//! of a victim unreachable that way, and never receives the victim's traffic.  The
 //! subnet is routed again when one of the two leaves or takes another
 //! attempt number.
 
@@ -240,14 +240,14 @@ impl OverlayRouter {
             if others.contains(&self.local_peer_id) {
                 error!(
                     "The subnet {} of this node is also the one of peer {}: nobody routes \
-                     to either of them; set [p2p.overlay] subnet_attempt to another \
+                     to either of them; set settings.overlay.subnet_attempt to another \
                      number and restart",
                     node_subnet, peer_id
                 );
             } else {
                 error!(
                     "The subnet {} is claimed by peer {} and by {}: nobody routes to \
-                     either of them until one sets [p2p.overlay] subnet_attempt to another \
+                     either of them until one sets settings.overlay.subnet_attempt to another \
                      number and restarts, or leaves",
                     node_subnet,
                     peer_id,

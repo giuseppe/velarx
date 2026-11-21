@@ -87,7 +87,7 @@ pub fn has(provider: &dyn ChunkProvider, digest: &str) -> io::Result<bool> {
     }
 }
 
-/// What the node bounds in what it serves (`[serving]` of `p2p.toml`).
+/// What the node bounds in what it serves (`settings.serving` of its source).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Serving {
@@ -126,14 +126,14 @@ impl Serving {
             ("quic_window_mib", self.quic_window_mib),
         ] {
             if n == 0 {
-                return Err(format!("[serving] {name} must not be 0"));
+                return Err(format!("settings.serving.{name} must not be 0"));
             }
         }
         if self.upload_limit_mbit > 1_000_000 {
-            return Err("[serving] upload_limit_mbit is more than 1 Tbit/s".into());
+            return Err("settings.serving.upload_limit_mbit is more than 1 Tbit/s".into());
         }
         if self.quic_window_mib > 1024 {
-            return Err("[serving] quic_window_mib is more than 1 GiB".into());
+            return Err("settings.serving.quic_window_mib is more than 1 GiB".into());
         }
         Ok(())
     }

@@ -129,8 +129,7 @@ lazy_completers = 0
 name = "p2p"
 socket = "$WORKDIR/$n/services/p2p-fetcher.sock"
 idle_timeout_secs = 30
-EOT
-    cat > "$WORKDIR/$n.p2p.toml" <<EOT
+[sources.external.settings]
 mdns = false
 private_key_path = "$WORKDIR/swarm.key"
 listen_addresses = ["/ip4/127.0.0.1/tcp/$port"]
@@ -142,7 +141,7 @@ EOT
     E2E_SPAWN_LOG=$WORKDIR/$n.log e2e_spawn_ready ENGINE_PID "$BIN/velarx" --config "$WORKDIR/$n.toml" varlink ||
         { echo "the engine of node $n does not start"; cat "$WORKDIR/$n.log"; return 1; }
     echo "$ENGINE_PID" >> "$WORKDIR/pids"
-    RUST_LOG=$level "$BIN/velarx-p2p" --config "$WORKDIR/$n.toml" --p2p-config "$WORKDIR/$n.p2p.toml" >> "$WORKDIR/$n.p2p.log" 2>&1 3>&- &
+    RUST_LOG=$level "$BIN/velarx-p2p" --config "$WORKDIR/$n.toml" >> "$WORKDIR/$n.p2p.log" 2>&1 3>&- &
     echo $! >> "$WORKDIR/pids"
     # (the service says so once it listens and serves the chunks; its control
     # socket answers then)

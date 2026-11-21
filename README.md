@@ -114,23 +114,33 @@ accepted and no signature is verified.
 
 ## Peer-to-peer
 
-As root: create a swarm key once, copy it to every node, write
-`/etc/velarx/p2p.toml` ([crates/p2p/p2p.toml.example](crates/p2p/p2p.toml.example)
-has every setting) and start the service, or enable `velarx-p2p.service`:
+As root: create a swarm key once, copy it to every node, add the service as
+a content source of `/etc/velarx/config.toml` with its settings
+([config.toml.example](config.toml.example) has every setting) and start the
+service, or enable `velarx-p2p.service`:
 
 ```sh
 velarx-p2p generate-key /etc/velarx/swarm.key
 ```
 
 ```toml
+[[sources.external]]
+name = "p2p"
+socket = "/run/velarx/services/p2p-fetcher.sock"
+
+[sources.external.settings]     # read by velarx-p2p, not by the engine
 private_key_path = "/etc/velarx/swarm.key"
 listen_addresses = ["/ip4/<lan-ip>/tcp/4001"]   # the default is the loopback
 bootstrap_peers = ["/ip4/<peer-ip>/tcp/4001"]
+
+[pull]
+sources = ["p2p", "registry"]
 ```
 
-A bootstrap peer may be named with its id too (`/p2p/<peer-id>` at the
-end); without it any node of the swarm at that address is taken.  The id of a
-node stays the same across restarts (`identity_path`).
+`velarx-p2p` reads the settings of the source named `p2p` (`--source` names
+another).  A bootstrap peer may be named with its id too (`/p2p/<peer-id>` at
+the end); without it any node of the swarm at that address is taken.  The id
+of a node stays the same across restarts (`identity_path`).
 
 ```sh
 velarx-p2p &
@@ -138,17 +148,7 @@ velarx-p2p status
 ```
 
 The data goes over QUIC on the UDP port of the same number: open TCP and
-UDP 4001 between the nodes. Then add the service as a content source in
-`config.toml`:
-
-```toml
-[[sources.external]]
-name = "p2p"
-socket = "/run/velarx/services/p2p-fetcher.sock"
-
-[pull]
-sources = ["p2p", "registry"]
-```
+UDP 4001 between the nodes.
 
 The sources are asked in the order written (the default is
 `["registry"]`): with `["p2p"]` alone the registry is never asked, and

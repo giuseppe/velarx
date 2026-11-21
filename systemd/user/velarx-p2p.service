@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # The P2P service of a user (rootless): `systemctl --user enable --now
-# velarx-p2p`, with its p2p.toml next to the configuration (the swarm key).  It needs no
-# daemon: the content it serves comes from the store service.  `velarx-p2p
-# status` asks it on its own socket (org.velarx.P2p).
+# velarx-p2p`, with its settings (the swarm key) in those of the source p2p
+# of the configuration.  It needs no daemon: the content it serves comes from
+# the store service.  `velarx-p2p status` asks it on its own socket (org.velarx.P2p).
 [Unit]
 Description=Velarx P2P service
 Documentation=man:velarx-p2p(8) man:velarx.conf(5)
@@ -24,7 +24,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 ProtectSystem=strict
 # (and the root directory of the engine, where the identity of the node is made
-# before the process confines itself: identity_path of p2p.toml)
+# before the process confines itself: identity_path of its settings)
 ReadWritePaths=%t/velarx -%h/.local/share/velarx
 ProtectHome=read-only
 PrivateTmp=yes

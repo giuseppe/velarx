@@ -139,7 +139,7 @@ pub struct Lookups {
 }
 
 /// The dials refused for the address they were to, by the reason
-/// (`dial_allow` of p2p.toml).
+/// (`dial_allow` of the settings).
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, introspect::CustomType,
 )]

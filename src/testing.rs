@@ -872,7 +872,7 @@ mod tests {
     /// the peers (`crates/` + that name): the file, the part of a line that
     /// makes it allowed, and why.  Everything else in the engine knows the
     /// service as a source or a provider named in the configuration.
-    const MAY_NAME_THE_SERVICE: [(&str, &str, &str); 7] = [
+    const MAY_NAME_THE_SERVICE: [(&str, &str, &str); 4] = [
         ("Cargo.toml", "crates/p2p", "the workspace member"),
         (
             "Cargo.toml",
@@ -888,21 +888,6 @@ mod tests {
             "deny.toml",
             "velarx-p2p",
             "the package whose dependency graph it is about",
-        ),
-        (
-            "config.toml.example",
-            "p2p-fetcher.sock",
-            "the socket of one source, the example of [[sources.external]]",
-        ),
-        (
-            "config.toml.example",
-            "\"p2p\"",
-            "the name of the source in the examples of [[sources.external]] and [pull] sources",
-        ),
-        (
-            "config.toml.example",
-            "p2p-network.sock",
-            "the socket of one provider, the example of [[network.providers]]",
         ),
     ];
 
@@ -921,9 +906,7 @@ mod tests {
                 {
                     sources_and_manifests(&p, root, out);
                 }
-            } else if name == "config.toml.example"
-                || p.extension().is_some_and(|x| x == "rs" || x == "toml")
-            {
+            } else if p.extension().is_some_and(|x| x == "rs" || x == "toml") {
                 out.push(p);
             }
         }
@@ -933,7 +916,9 @@ mod tests {
     /// peers are a source of the pulls (`[[sources.external]]`, the
     /// interface `org.velarx.Fetcher`), the store a service
     /// (`org.velarx.Store`), the overlay network a network provider
-    /// (`org.velarx.Network`).  Only `crates/p2p` has the word.
+    /// (`org.velarx.Network`), its settings the `settings` of its source,
+    /// which the configuration keeps as they are.  Only `crates/p2p` has the
+    /// word in its code (`config.toml.example` documents the service).
     #[test]
     fn nothing_but_the_p2p_package_knows_p2p() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));

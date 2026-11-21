@@ -139,8 +139,9 @@ pub enum P2PError {
     InvalidPrivateKey(String),
     #[error(
         "no swarm key and no certificate authority: the P2P network is private. Generate a \
-         key with `velarx-p2p generate-key <path>`, copy it to every node, and set `private_key_path` in p2p.toml \
-         or VELARX_P2P_SWARM_KEY in the environment; or make an authority (`velarx-p2p ca \
+         key with `velarx-p2p generate-key <path>`, copy it to every node, and set \
+         `private_key_path` in the settings of the source in config.toml or \
+         VELARX_P2P_SWARM_KEY in the environment; or make an authority (`velarx-p2p ca \
          init`) and set `ca_path` and `certificate_path`"
     )]
     MissingSwarmKey,
@@ -417,7 +418,7 @@ pub struct P2PNode {
 }
 
 /// The streams a request for `chunks` chunks is spread over with
-/// `quic_streams` (`p2p.toml`): one a chunk at most, 8 at most.
+/// `quic_streams` (the settings): one a chunk at most, 8 at most.
 pub fn lanes_of(chunks: usize, quic_streams: usize) -> usize {
     quic_streams.clamp(1, 8).min(chunks).max(1)
 }

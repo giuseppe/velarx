@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The settings of `velarx-p2p`: its own file, `p2p.toml` next to the
-//! configuration of the engine (`--p2p-config` names another), with every
-//! key in `crates/p2p/p2p.toml.example`.  The paths of the engine (the
-//! services directory the sockets are in) come from the engine's
-//! configuration.
+//! The settings of `velarx-p2p`: the table `settings` of its source in the
+//! configuration of the engine (`[[sources.external]]`, the one named by
+//! `--source`), with `settings.serving` and `settings.overlay` in it and
+//! every key in `config.toml.example`.  The engine does not read them; the
+//! paths of the engine (the services directory the sockets are in) come from
+//! the rest of the configuration.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -317,22 +318,25 @@ impl Default for Settings {
     }
 }
 
-/// The file of the settings next to the configuration of the engine.
-pub fn default_path(engine_config: &Path) -> PathBuf {
-    engine_config.with_file_name("p2p.toml")
-}
-
 impl Settings {
-    /// The settings of `path`, the defaults when there is no such file; a
-    /// relative key path is relative to the directory of the file.
-    pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-        let mut settings: Self =
-            toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    /// The settings of the source `name` of the configuration (its
+    /// `settings` in `[[sources.external]]`; the defaults when there is no
+    /// such source); a relative key path is relative to the directory of the
+    /// configuration file.
+    pub fn load(config: &Config, name: &str, config_dir: &Path) -> anyhow::Result<Self> {
+        let table = config
+            .sources
+            .external
+            .iter()
+            .find(|source| source.name == name)
+            .map(|source| source.settings.clone())
+            .unwrap_or_default();
+        Self::from_table(table, config_dir)
+            .map_err(|e| anyhow::anyhow!("the settings of the source `{name}`: {e}"))
+    }
+
+    fn from_table(table: toml::Table, config_dir: &Path) -> anyhow::Result<Self> {
+        let mut settings: Self = toml::Value::Table(table).try_into()?;
         for file in [
             &mut settings.private_key_path,
             &mut settings.identity_path,
@@ -342,10 +346,8 @@ impl Settings {
             &mut settings.overlay.identity_path,
             &mut settings.overlay.certificate_path,
         ] {
-            if let (Some(name), Some(dir)) = (file.as_ref(), path.parent()) {
-                if name.is_relative() {
-                    *file = Some(dir.join(name));
-                }
+            if let Some(name) = file.as_ref().filter(|name| name.is_relative()) {
+                *file = Some(config_dir.join(name));
             }
         }
         settings.validate()?;
@@ -391,8 +393,14 @@ impl Settings {
         for (key, addresses) in [
             ("listen_addresses", &self.listen_addresses),
             ("bootstrap_peers", &self.bootstrap_peers),
-            ("[overlay] listen_addresses", &self.overlay.listen_addresses),
-            ("[overlay] bootstrap_peers", &self.overlay.bootstrap_peers),
+            (
+                "settings.overlay.listen_addresses",
+                &self.overlay.listen_addresses,
+            ),
+            (
+                "settings.overlay.bootstrap_peers",
+                &self.overlay.bootstrap_peers,
+            ),
         ] {
             for a in addresses {
                 a.parse::<libp2p::Multiaddr>()
@@ -419,7 +427,7 @@ impl Settings {
             self.overlay.dns_table,
             self.overlay.dns_rule_priority,
         )
-        .map_err(|e| anyhow::anyhow!("[overlay] dns_table, dns_rule_priority: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("settings.overlay.dns_table, dns_rule_priority: {e}"))?;
         Ok(())
     }
 
@@ -461,7 +469,7 @@ impl Settings {
         let overlay = &self.overlay;
         if self.ca_path.is_some() && overlay.certificate_path.is_none() {
             anyhow::bail!(
-                "[overlay] certificate_path: with ca_path the overlay node needs a certificate \
+                "settings.overlay.certificate_path: with ca_path the overlay node needs a certificate \
                  of its own identity"
             );
         }
@@ -530,20 +538,54 @@ impl Settings {
 mod tests {
     use super::*;
 
+    /// The header of the overlay's settings.
+    const OVERLAY: &str = "[sources.external.settings.overlay]\n";
+
+    /// The settings of the source `p2p` with this text in them.
     fn parse(text: &str) -> anyhow::Result<Settings> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("p2p.toml");
-        std::fs::write(&path, text)?;
-        Settings::load_or_default(&path)
+        let config: Config = toml::from_str(&format!(
+            "[[sources.external]]\nname = \"p2p\"\nsocket = \"/s\"\n\
+             [sources.external.settings]\n{text}"
+        ))?;
+        Settings::load(&config, "p2p", Path::new("/etc/velarx"))
+    }
+
+    /// The settings of the source `p2p` of the example configuration.
+    fn example() -> Settings {
+        let config: Config = toml::from_str(include_str!("../../../config.toml.example")).unwrap();
+        Settings::load(&config, "p2p", Path::new("/etc/velarx")).unwrap()
+    }
+
+    /// The settings are those of the source named, as they are written, and
+    /// the defaults when no source has the name.
+    #[test]
+    fn the_settings_are_those_of_the_source_named() {
+        let config: Config = toml::from_str(
+            "[[sources.external]]\nname = \"other\"\nsocket = \"/o\"\n\
+             [sources.external.settings]\nquic_streams = 9\n\
+             [[sources.external]]\nname = \"peers\"\nsocket = \"/p\"\n\
+             [sources.external.settings]\nquic_streams = 2\nmdns = true\n\
+             [sources.external.settings.serving]\nquic_slots = 7\n",
+        )
+        .unwrap();
+        let s = Settings::load(&config, "peers", Path::new("/etc/velarx")).unwrap();
+        assert_eq!((s.quic_streams, s.mdns, s.serving.quic_slots), (2, true, 7));
+        let e = Settings::load(&config, "other", Path::new("/etc/velarx")).unwrap_err();
+        assert!(e.to_string().contains("`other`"), "{e}");
+        let s = Settings::load(&config, "p2p", Path::new("/etc/velarx")).unwrap();
+        assert_eq!(s.quic_streams, 4);
     }
 
     /// A table or a priority of the DNS routing that is the kernel's is
     /// refused when the settings are read, not when the overlay starts.
     #[test]
     fn the_kernels_routing_tables_are_refused() {
-        assert!(parse("[overlay]\ndns_table = 254\n").is_err());
-        assert!(parse("[overlay]\ndns_rule_priority = 32766\n").is_err());
-        let s = parse("[overlay]\ndns_table = 7777\ndns_rule_priority = 700\n").unwrap();
+        assert!(parse(&format!("{OVERLAY}dns_table = 254\n")).is_err());
+        assert!(parse(&format!("{OVERLAY}dns_rule_priority = 32766\n")).is_err());
+        let s = parse(&format!(
+            "{OVERLAY}dns_table = 7777\ndns_rule_priority = 700\n"
+        ))
+        .unwrap();
         assert_eq!(
             (s.overlay.dns_table, s.overlay.dns_rule_priority),
             (7777, 700)
@@ -566,9 +608,8 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_file_is_the_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Settings::load_or_default(&dir.path().join("p2p.toml")).unwrap();
+    fn no_settings_are_the_defaults() {
+        let s = Settings::load(&Config::default(), "p2p", Path::new("/etc/velarx")).unwrap();
         assert_eq!(s.quic_streams, 4);
         assert!(!s.announce_images, "no list of images is told by default");
         assert!(
@@ -606,7 +647,7 @@ mod tests {
     #[test]
     fn a_key_that_is_not_a_setting_is_an_error() {
         assert!(parse("quicc = true\n").is_err());
-        assert!(parse("[overlay]\nx = 1\n").is_err());
+        assert!(parse(&format!("{OVERLAY}x = 1\n")).is_err());
     }
 
     #[test]
@@ -617,20 +658,14 @@ mod tests {
             s.identity_file(&config),
             config.server.root_dir.join("p2p/identity.key")
         );
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("p2p.toml");
-        std::fs::write(&path, "identity_path = \"me.key\"\n").unwrap();
-        let s = Settings::load_or_default(&path).unwrap();
-        assert_eq!(s.identity_file(&config), dir.path().join("me.key"));
+        let s = parse("identity_path = \"me.key\"\n").unwrap();
+        assert_eq!(s.identity_file(&config), Path::new("/etc/velarx/me.key"));
     }
 
     #[test]
-    fn the_key_is_relative_to_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("p2p.toml");
-        std::fs::write(&path, "private_key_path = \"swarm.key\"\n").unwrap();
-        let s = Settings::load_or_default(&path).unwrap();
-        assert_eq!(s.private_key_path, Some(dir.path().join("swarm.key")));
+    fn the_key_is_relative_to_the_configuration_file() {
+        let s = parse("private_key_path = \"swarm.key\"\n").unwrap();
+        assert_eq!(s.private_key_path, Some("/etc/velarx/swarm.key".into()));
     }
 
     #[test]
@@ -654,13 +689,13 @@ mod tests {
     }
 
     /// Starting the service opens nothing to the network until the file
-    /// says so: loopback, no mDNS (an empty file and the example agree).
+    /// says so: loopback, no mDNS (an empty table and the example agree).
     #[test]
     fn the_defaults_open_nothing_to_the_network() {
         let s = parse("").unwrap();
         assert_eq!(s.listen_addresses, ["/ip4/127.0.0.1/tcp/4001"]);
         assert!(!s.mdns);
-        let e: Settings = toml::from_str(include_str!("../p2p.toml.example")).unwrap();
+        let e = example();
         assert_eq!(e.listen_addresses, s.listen_addresses);
         assert!(!e.mdns);
     }
@@ -670,11 +705,11 @@ mod tests {
     #[test]
     fn the_overlay_node_has_its_own_address_identity_and_certificate() {
         let config = Config::default();
-        let s = parse(
+        let s = parse(&format!(
             "mdns = true\nca_path = \"/ca\"\ncertificate_path = \"/node.crt\"\n\
-             [overlay]\ncertificate_path = \"/overlay.crt\"\n\
+             {OVERLAY}certificate_path = \"/overlay.crt\"\n\
              listen_addresses = [\"/ip4/192.0.2.1/tcp/4002\"]\n",
-        )
+        ))
         .unwrap();
         let o = s.of_overlay(&config).unwrap();
         assert_eq!(o.listen_addresses, ["/ip4/192.0.2.1/tcp/4002"]);
@@ -694,7 +729,10 @@ mod tests {
                 .is_err()
         );
         // (the overlay's addresses are checked as the node's are)
-        assert!(parse("[overlay]\nlisten_addresses = [\"127.0.0.1:4002\"]\n").is_err());
+        assert!(parse(&format!(
+            "{OVERLAY}listen_addresses = [\"127.0.0.1:4002\"]\n"
+        ))
+        .is_err());
     }
 
     #[test]
@@ -732,7 +770,10 @@ mod tests {
                 }
             }
         }
-        let example = include_str!("../p2p.toml.example");
+        let text = include_str!("../../../config.toml.example");
+        let block = text
+            .lines()
+            .skip_while(|l| !l.starts_with("[sources.external.settings]"));
         let v = toml::Value::try_from(Settings::default()).unwrap();
         let mut keys = Vec::new();
         names(&v, &mut keys);
@@ -749,16 +790,14 @@ mod tests {
         let missing: Vec<_> = keys
             .iter()
             .filter(|k| {
-                !example.lines().any(|l| {
+                !block.clone().any(|l| {
                     l.trim_start_matches([' ', '#'])
                         .split(['.', '[', ']', '='])
                         .any(|p| p.trim() == k.as_str())
                 })
             })
             .collect();
-        assert!(missing.is_empty(), "p2p.toml.example has no {missing:?}");
-        let s: Settings = toml::from_str(example).unwrap();
-        s.validate().unwrap();
-        assert!(s.private_key_path.is_some());
+        assert!(missing.is_empty(), "the example has no {missing:?}");
+        assert!(example().private_key_path.is_some());
     }
 }

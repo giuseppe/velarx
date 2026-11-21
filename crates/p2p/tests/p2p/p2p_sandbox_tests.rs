@@ -59,7 +59,7 @@ fn child(dir: &Path) {
     // (the store service is reached through a process forked before)
     let connector =
         velarx_sys::connector::Connector::start_beside_idle_threads(&store_sock).unwrap();
-    velarx_p2p::sandbox::enter_role_thread(role, &config, &settings, &[&conf_path]).unwrap();
+    velarx_p2p::sandbox::enter_role_thread(role, &config, &settings, &conf_path).unwrap();
     let mut out = Vec::new();
     let mut probe = |what: &str, ok: bool| out.push(format!("{what}={ok}"));
     probe(
@@ -409,7 +409,7 @@ fn stager_child(dir: &Path) {
     velarx_p2p::sandbox::enter_thread(
         &config,
         &velarx_p2p::settings::Settings::default(),
-        &[&conf_path],
+        &conf_path,
     )
     .unwrap();
     let layers = config.storage.staging_dir().join("layers");

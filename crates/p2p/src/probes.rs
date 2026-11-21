@@ -25,8 +25,8 @@ pub const ROUND_TTL: Duration = Duration::from_secs(5);
 
 /// The QUIC streams of chunk requests a node has open to one peer at most:
 /// what a connection carries at a time (`streams_per_connection` of the QUIC limits).  A
-/// request takes a stream for each of its lanes (`quic_streams` in
-/// `p2p.toml`, at most one a chunk): two requests of four lanes, or eight of
+/// request takes a stream for each of its lanes (`quic_streams` of the
+/// settings, at most one a chunk): two requests of four lanes, or eight of
 /// one chunk.
 pub const STREAMS_PER_PEER: usize = 8;
 

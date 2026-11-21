@@ -25,9 +25,9 @@
 #                         port and the peer-to-peer port to node B's loopback,
 #                         so the registry is 127.0.0.1:PORT on both nodes and
 #                         no port of this host has to be open (the firewall of a
-#                         workstation drops them; QUIC, which is UDP, is off
-#                         then, the peers talk over TCP); `direct`: node B
-#                         connects to --host-addr
+#                         workstation drops them; QUIC, which is UDP, does not
+#                         pass it, so the peers find each other but send no
+#                         chunks); `direct`: node B connects to --host-addr
 #   --host-addr ADDR      `direct`: the address of this host that node B
 #                         reaches (the registry and the peer-to-peer port are
 #                         there); default the source address of `ip route get`
@@ -36,7 +36,9 @@
 #                         configuration of both nodes; @SOCKDIR@ in it is the
 #                         directory of the sockets of the node, @REGISTRY@ the
 #                         registry.  Default: a `p2p` socket source and
-#                         `sources = ["p2p", "registry"]`.  Step 4 is
+#                         `sources = ["p2p", "registry"]`.  The settings of
+#                         the P2P service are appended to the last
+#                         `[[sources.external]]`, its source.  Step 4 is
 #                         skipped with the reason when the P2P service does
 #                         not start with it
 #   --out FILE.json       the result file (default: validate-fetch.json in the
@@ -615,8 +617,8 @@ if [ "$USEB" = 1 ] && ! skip_step p2p; then
 	if [ -z "$P2P_SKIP" ]; then
 		PORT_A_P2P=$(freeport)
 		PORT_B_P2P=$(freeport)
-		QUIC=true; LISTEN_B=0.0.0.0
-		[ "$LINK" = direct ] || { QUIC=false; LISTEN_B=127.0.0.1; }
+		LISTEN_B=0.0.0.0
+		[ "$LINK" = direct ] || LISTEN_B=127.0.0.1
 		if [ "$LINK" = tunnel ]; then
 			# (a pid in the list of the processes the cleanup stops: sshpass, then its ssh)
 			# (-v: ssh says "remote forward success" for each forward the moment
@@ -631,14 +633,14 @@ if [ "$USEB" = 1 ] && ! skip_step p2p; then
 		rcp "$WORK/swarm.key" "$NODEB:$RW/swarm.key"
 		rsh "chmod 600 $RW/swarm.key"
 		# node A: the P2P service (it serves the store that pulled the images)
-		cat > "$WORK/a.p2p.toml" <<EOF
+		cat >> "$WORK/a.toml" <<EOF
+[sources.external.settings]
 mdns = false
 private_key_path = "$WORK/swarm.key"
 listen_addresses = ["/ip4/$HOSTADDR/tcp/$PORT_A_P2P"]
 bootstrap_peers = []
-quic = $QUIC
 EOF
-		( . "$WORK/a.env"; RUST_LOG=info spawn "$WORK/a.p2p.log" "$BINDIR/velarx-p2p" --config "$WORK/a.toml" --p2p-config "$WORK/a.p2p.toml" )
+		( . "$WORK/a.env"; RUST_LOG=info spawn "$WORK/a.p2p.log" "$BINDIR/velarx-p2p" --config "$WORK/a.toml" )
 		timeout 20 tail -n +1 -F "$WORK/a.p2p.log" 2> /dev/null | grep -q -m1 'Chunk provider set'
 		if ! grep -q 'Chunk provider set' "$WORK/a.p2p.log" 2> /dev/null; then
 			P2P_SKIP="the P2P service of node A does not start with this configuration (see $WORK/a.p2p.log: $(tail -2 "$WORK/a.p2p.log" | tr '\n' ' '))"
@@ -653,16 +655,16 @@ EOF
 		mknode b "$WORK" "$REG"
 		sed -i "s|$WORK/b/|$RW/b/|g;s|$WORK/b\.|$RW/b.|g" "$WORK/b.toml" "$WORK/b.env" "$WORK/b.registries.conf" "$WORK/b.sources.toml"
 		sed -i "s|$WORK/|$RW/|g" "$WORK/b.toml" "$WORK/b.env"
-		cat > "$WORK/b.p2p.toml" <<EOF
+		cat >> "$WORK/b.toml" <<EOF
+[sources.external.settings]
 mdns = false
 private_key_path = "$RW/swarm.key"
 listen_addresses = ["/ip4/$LISTEN_B/tcp/$PORT_B_P2P"]
 bootstrap_peers = ["/ip4/$HOSTADDR/tcp/$PORT_A_P2P/p2p/$peerid"]
-quic = $QUIC
 EOF
-		for f in b.toml b.env b.registries.conf b.p2p.toml; do rcp "$WORK/$f" "$NODEB:$RW/$f"; done
+		for f in b.toml b.env b.registries.conf; do rcp "$WORK/$f" "$NODEB:$RW/$f"; done
 		rsh "mkdir -p $RW/b/home/.config/velarx $RW/b/run $RW/b/data && chmod 700 $RW/b $RW/b/run"
-		rsh ". $RW/b.env; RUST_LOG=info,velarx_p2p=debug nohup $RW/bin/velarx-p2p --config $RW/b.toml --p2p-config $RW/b.p2p.toml >> $RW/b.p2p.log 2>&1 < /dev/null & echo \$! >> $RW/pids"
+		rsh ". $RW/b.env; RUST_LOG=info,velarx_p2p=debug nohup $RW/bin/velarx-p2p --config $RW/b.toml >> $RW/b.p2p.log 2>&1 < /dev/null & echo \$! >> $RW/pids"
 		rsh "touch $RW/b.p2p.log; timeout 30 tail -n +1 -F $RW/b.p2p.log 2> /dev/null | grep -q -m1 'Chunk provider set'" || P2P_SKIP="the P2P service of node B does not start (see its log: $(rsh "tail -2 $RW/b.p2p.log" | tr '\n' ' '))"
 	fi
 	if [ -z "$P2P_SKIP" ]; then

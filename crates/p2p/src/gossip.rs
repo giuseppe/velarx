@@ -4,7 +4,7 @@
 //! The layers a node holds are told as a filter ([`crate::filter`]), which
 //! the peers keep in [`Knowledge`] (the one table of who holds what); the
 //! messages of it come through here.  A node tells the list of its images
-//! only when it was told to announce (`announce_images` in `p2p.toml`,
+//! only when it was told to announce (`announce_images` in the settings,
 //! [`GossipDiscovery::announcing`]) and refuses the question for it
 //! otherwise; what it holds can be asked for one digest at a time (the probe
 //! of the QUIC data protocol, [`super::quic::OP_PROBE`]) or tested in its
