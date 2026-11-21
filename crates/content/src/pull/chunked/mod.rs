@@ -1307,14 +1307,19 @@ impl CopiesTo {
 /// and, when `content` asks for it, the digest of its content in `alg`.  A
 /// file the kernel measures cannot change: it is linked, and read only for
 /// the digest of its content; any other is copied to a file of `to`, and its
-/// digests are those of the bytes written.
+/// digests are those of the bytes written.  Anything but a regular file (a
+/// pipe would block the read, a device has no end) is the fetcher's error.
 fn take_in(
     file: File,
     alg: Algorithm,
     to: &CopiesTo,
     content: bool,
 ) -> io::Result<(Option<String>, Copied)> {
-    let size = file.metadata()?.len();
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(io::Error::other("a handed file is not a regular file"));
+    }
+    let size = meta.len();
     let mut hash = content.then(|| match size >= OFFLOAD_FROM {
         true => Content::Beside(Offloaded::new(DigestWriter::new(alg))),
         false => Content::Here(DigestWriter::new(alg)),

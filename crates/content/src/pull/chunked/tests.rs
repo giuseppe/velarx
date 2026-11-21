@@ -944,6 +944,24 @@ fn the_content_of_a_handed_file_is_hashed_only_when_asked() {
     }
 }
 
+/// A descriptor handed over that is not a regular file (a pipe) is the
+/// fetcher's error, not a read that waits for it.
+#[test]
+fn a_handed_descriptor_that_is_not_a_regular_file_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = intake_session(tmp.path());
+    let sink: Arc<dyn crate::pull::sink::Sink> = session;
+    let (read, _write) = std::io::pipe().unwrap();
+    let key = Digest::of(Algorithm::Sha256, b"x").to_string();
+    let e = take_handed(
+        File::from(std::os::fd::OwnedFd::from(read)),
+        (&key, None),
+        &sink,
+    )
+    .unwrap_err();
+    assert!(matches!(e, ImageError::Layer(_)), "{e:?}");
+}
+
 /// The engine failing to store a file a fetcher handed over (the system
 /// refuses it a file) is its own failure, not the fetcher's: an I/O error,
 /// not a file that contradicts its name.
