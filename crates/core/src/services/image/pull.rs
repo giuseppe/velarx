@@ -1557,6 +1557,19 @@ impl ImageService {
             }
         });
         let walker = from.as_ref().map(|from| self.open_walker(from));
+        // (the profile of the image comes while the layers are probed)
+        let profile = match &from {
+            Some(_) => {
+                let names = self.sources_of(sources.as_deref())?;
+                let (this, id) = (self.clone(), image_id.clone());
+                let (ask, asked) = futures::FutureExt::remote_handle(async move {
+                    this.pull_profile(&id, (&names, shareable)).await
+                });
+                tokio::spawn(ask);
+                Some(asked)
+            }
+            None => None,
+        };
         let accepted = match (&staged, lazy) {
             (Some(staged), true) => {
                 let image = registry_ref.clone().unwrap_or_default();
@@ -1762,7 +1775,7 @@ impl ImageService {
                     .collect();
                 let (tocs, config) = (layers.clone(), config.config.clone());
                 let planned = tokio::task::spawn_blocking(move || {
-                    super::lazy_fetch::plan_start_set(&tocs, &config)
+                    super::lazy_fetch::plan_start_set(&tocs, &config, &[])
                 });
                 (from, layers, walker, planned)
             });
@@ -1832,7 +1845,9 @@ impl ImageService {
             velarx_base::trace::point("pull layers staged");
             if let Some((from, layers, walker, planned)) = set {
                 let first = planned.await.unwrap_or_default();
-                self.fetch_start_set((layers, from), walker, first).await;
+                let first = (first, config.config.clone());
+                self.fetch_start_set((layers, from), walker, first, profile)
+                    .await;
             }
             debug!("Pull staged after {:?}", start.elapsed());
         } else {

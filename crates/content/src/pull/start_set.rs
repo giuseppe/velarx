@@ -39,6 +39,8 @@ const MAX_PATH_DIRS: usize = 64;
 
 /// The names of the tables of an image, as the overlay of its layers sees them.
 pub struct Layers<'a> {
+    /// The tables, the lowest layer first
+    tocs: Vec<&'a Toc>,
     /// The names of each, the topmost layer first
     tables: Vec<HashMap<&'a str, &'a TocEntry>>,
 }
@@ -95,7 +97,10 @@ impl<'a> Layers<'a> {
                 names
             })
             .collect();
-        Self { tables }
+        Self {
+            tocs: tocs.to_vec(),
+            tables,
+        }
     }
 
     /// The entry the overlay shows for the name `path` (no link in it
@@ -166,10 +171,17 @@ impl<'a> Layers<'a> {
     }
 
     /// The files of the start set of an image whose configuration is
-    /// `config`: each as the position of its layer (from the lowest) and its
-    /// fs-verity digest.  The engine's files come first, then the program,
-    /// each content once, up to [`MAX_BYTES`].
-    pub fn start_set(&self, config: &velarx_types::OciImageConfig) -> Vec<(usize, String)> {
+    /// `config` and whose startup profile is `profile`: each as the position
+    /// of its layer (from the lowest) and its fs-verity digest.  The engine's
+    /// files come first, then the program, then the files of the profile in
+    /// its order, each content once, up to [`MAX_BYTES`].  The profile is a
+    /// hint that anybody may have written: what it names that is not a
+    /// regular file of one of the tables is left out.
+    pub fn start_set(
+        &self,
+        config: &velarx_types::OciImageConfig,
+        profile: &[String],
+    ) -> Vec<(usize, String)> {
         let path = config.env.iter().find_map(|e| e.strip_prefix("PATH="));
         let command = config
             .entrypoint
@@ -183,9 +195,18 @@ impl<'a> Layers<'a> {
             .filter_map(|f| self.file(f))
             .chain(command)
             .filter_map(|(layer, e)| Some((layer, e.verity()?, e.size)));
+        let profiled = (!profile.is_empty())
+            .then(|| self.contents())
+            .into_iter()
+            .flat_map(|at| {
+                profile
+                    .iter()
+                    .filter_map(move |d| at.get(d).map(|&(layer, size)| (layer, d.clone(), size)))
+            });
         let mut seen = HashSet::new();
         let mut bytes = 0u64;
         named
+            .chain(profiled)
             .filter(|(_, d, size)| {
                 let fits = bytes.saturating_add(*size) <= MAX_BYTES;
                 if fits && seen.insert(d.clone()) {
@@ -196,6 +217,24 @@ impl<'a> Layers<'a> {
             })
             .map(|(layer, d, _)| (layer, d))
             .collect()
+    }
+
+    /// The regular files with content of the tables by fs-verity digest: the
+    /// lowest layer that has the content, and its size.
+    fn contents(&self) -> HashMap<String, (usize, u64)> {
+        let mut at = HashMap::new();
+        for (layer, toc) in self.tocs.iter().enumerate() {
+            for e in toc
+                .entries
+                .iter()
+                .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+            {
+                if let Some(d) = e.verity() {
+                    at.entry(d).or_insert((layer, e.size));
+                }
+            }
+        }
+        at
     }
 }
 
@@ -350,13 +389,13 @@ mod tests {
             cmd: Some(vec!["python3".into()]),
             ..Default::default()
         };
-        assert_eq!(sizes(&layers, &[&low], &config), [10, 5, 1000]);
+        assert_eq!(sizes(&layers, &config, &[]), [10, 5, 1000]);
         let config = OciImageConfig {
             entrypoint: Some(vec!["/usr/local/bin/other".into()]),
             cmd: Some(vec!["python3".into()]),
             ..Default::default()
         };
-        assert_eq!(sizes(&layers, &[&low], &config), [10, 5, 3]);
+        assert_eq!(sizes(&layers, &config, &[]), [10, 5, 3]);
     }
 
     /// The program is looked for in the first [`MAX_PATH_DIRS`] directories
@@ -374,18 +413,52 @@ mod tests {
 
     /// The sizes of the files of the start set, as the table of the first
     /// layer gives them.
-    fn sizes(layers: &Layers, tocs: &[&Toc], config: &OciImageConfig) -> Vec<u64> {
+    fn sizes(layers: &Layers, config: &OciImageConfig, profile: &[String]) -> Vec<u64> {
         layers
-            .start_set(config)
+            .start_set(config, profile)
             .iter()
             .map(|(at, d)| {
-                tocs[*at]
+                layers.tocs[*at]
                     .entries
                     .iter()
                     .find(|e| e.verity().as_deref() == Some(d))
                     .map_or(0, |e| e.size)
             })
             .collect()
+    }
+
+    #[test]
+    fn the_profile_follows_in_its_order_and_only_names_files_of_the_tables() {
+        let low = toc(vec![
+            dir("etc/"),
+            file("etc/passwd", 10),
+            file("usr/a", 1),
+            file("usr/b", 2),
+            file("usr/c", 3),
+            dir("usr/d"),
+        ]);
+        let layers = Layers::new(&[&low]);
+        let digest = |size: u64, name: &str| file(name, size).verity().unwrap();
+        let profile = vec![
+            digest(3, "usr/c"),
+            "fsverity-sha256-12:".to_string() + &"0".repeat(64),
+            digest(1, "usr/a"),
+            digest(3, "usr/c"),
+            digest(10, "etc/passwd"),
+        ];
+        assert_eq!(
+            sizes(&layers, &OciImageConfig::default(), &profile),
+            [10, 3, 1]
+        );
+    }
+
+    #[test]
+    fn a_profile_is_bounded_in_bytes() {
+        let low = toc(vec![file("a", 1), file("big", MAX_BYTES), file("bb", 2)]);
+        let layers = Layers::new(&[&low]);
+        let digest = |size: u64, name: &str| file(name, size).verity().unwrap();
+        let profile = vec![digest(1, "a"), digest(MAX_BYTES, "big"), digest(2, "bb")];
+        assert_eq!(sizes(&layers, &OciImageConfig::default(), &profile), [1, 2]);
     }
 
     #[test]
@@ -396,7 +469,7 @@ mod tests {
             file("etc/group", MAX_BYTES),
         ]);
         let layers = Layers::new(&[&low]);
-        let set = layers.start_set(&OciImageConfig::default());
+        let set = layers.start_set(&OciImageConfig::default(), &[]);
         assert_eq!(set.len(), 1);
     }
 }

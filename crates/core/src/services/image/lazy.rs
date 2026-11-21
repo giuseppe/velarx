@@ -18,6 +18,11 @@ const GROUP_FILES: usize = 64;
 /// group of its own).
 const GROUP_BYTES: u64 = 8 << 20;
 
+/// How long a pull waits for the startup profile of its image from the
+/// sources: a peer that has it answers in a round trip, and a pull is not
+/// held longer for what is only a hint.
+const PROFILE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A staged layer of an image being completed, and what its proof needs.
 #[derive(Clone)]
 struct LazyLayer {
@@ -196,10 +201,46 @@ impl ImageService {
         let Ok(Some(pull)) = self.staging_area().pull(id) else {
             return Vec::new();
         };
-        let Ok(image) = velarx_types::digest::Digest::from_id(id) else {
+        let Ok(names) = self.sources_of(None) else {
             return Vec::new();
         };
-        let Ok(names) = self.sources_of(None) else {
+        self.profile_from(id, (&names, pull.shareable), max).await
+    }
+
+    /// The startup profile of the image `id` for a pull that starts: the
+    /// one this node recorded, else the one of the sources (the peers) if
+    /// the settings ask them.  Empty when there is none.
+    pub(super) async fn pull_profile(
+        &self,
+        id: &str,
+        (sources, shareable): (&[String], bool),
+    ) -> Vec<String> {
+        let config = &self.pull_config;
+        if config.lazy_profile_secs == 0 {
+            return Vec::new();
+        }
+        let path = velarx_fuse::composefs::profile_path(self.file_store.root(), id);
+        let max = config.lazy_profile_files;
+        let local = tokio::task::spawn_blocking(move || velarx_fuse::profile::read(&path, max))
+            .await
+            .unwrap_or_default();
+        if !local.is_empty() || !config.lazy_profile_peers {
+            return local;
+        }
+        let asked = self.profile_from(id, (sources, shareable), max);
+        tokio::time::timeout(PROFILE_WAIT, asked)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// The profile of the image `id` from the fetchers `sources`.
+    async fn profile_from(
+        &self,
+        id: &str,
+        (names, shareable): (&[String], bool),
+        max: usize,
+    ) -> Vec<String> {
+        let Ok(image) = velarx_types::digest::Digest::from_id(id) else {
             return Vec::new();
         };
         let (name, max_bytes) = (
@@ -207,7 +248,7 @@ impl ImageService {
             velarx_content::fetcher::fetch::PROFILE_MAX_BYTES,
         );
         let mut text = None;
-        for mut link in self.source_links(&names, pull.shareable).await {
+        for mut link in self.source_links(names, shareable).await {
             let got = async {
                 link.conn
                     .open(velarx_content::fetcher::fetch_client::Scoping::bare(
@@ -2236,6 +2277,27 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// The profile a pull starts with is the one this node recorded (the
+    /// sources are not asked then), none when the settings turn it off.
+    #[tokio::test]
+    async fn a_pull_starts_with_the_profile_this_node_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = velarx_db::Database::open_in_memory().await.unwrap();
+        let store = Arc::new(FileStore::new(tmp.path().join("objects")).unwrap());
+        let mut service =
+            ImageService::new(db, store.clone(), tmp.path().join("pulls"), VerityMode::Off)
+                .unwrap();
+        let id = "a".repeat(64);
+        let path = velarx_fuse::composefs::profile_path(store.root(), &id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = format!("fsverity-sha256-12:{}", "b".repeat(64));
+        std::fs::write(&path, format!(r#"{{"v":1,"files":["{file}"]}}"#)).unwrap();
+        let names = ["peers".to_string()];
+        assert_eq!(service.pull_profile(&id, (&names, true)).await, [file]);
+        service.pull_config.lazy_profile_secs = 0;
+        assert!(service.pull_profile(&id, (&names, true)).await.is_empty());
     }
 
     #[test]

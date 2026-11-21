@@ -66,14 +66,16 @@ struct InFlight {
 pub(super) type StartLayer = (LayerKey, OciDescriptor, Arc<Toc>);
 
 /// The files of the start set of an image (`start_set`), in each of its
-/// layers (the lowest first): the engine's files and the program.
+/// layers (the lowest first): the engine's files, the program and the files
+/// of the profile.
 pub(super) fn plan_start_set(
     layers: &[StartLayer],
     config: &velarx_types::OciImageConfig,
+    profile: &[String],
 ) -> Vec<Vec<String>> {
     let tocs: Vec<&Toc> = layers.iter().map(|(.., toc)| &**toc).collect();
     let mut sets = vec![Vec::new(); layers.len()];
-    for (at, digest) in start_set::Layers::new(&tocs).start_set(config) {
+    for (at, digest) in start_set::Layers::new(&tocs).start_set(config, profile) {
         sets[at].push(digest);
     }
     sets
@@ -190,6 +192,9 @@ struct LayerCtx {
     /// The position of each regular file in `toc`, by its fs-verity digest
     /// (made when a miss asks for it)
     files: std::sync::OnceLock<HashMap<String, usize>>,
+    /// The startup profile of the image, when its pull got one (the files
+    /// of the image in the order a start read them)
+    profile: std::sync::OnceLock<Arc<[String]>>,
     /// The repository, its TLS verification, whether its pull had credentials
     walk: WalkKey,
     shareable: bool,
@@ -417,13 +422,17 @@ impl ImageService {
     /// Fetch the files a start of the image reads (`start_set`) from the
     /// layers `layers` (the lazy ones, the lowest first, each with its
     /// table), in the background: they are staged while the container is
-    /// made, and what asks for one meanwhile joins the fetch.  A hint: what
-    /// cannot be fetched is fetched when it is read.
+    /// made, and what asks for one meanwhile joins the fetch.  `profile` is
+    /// the startup profile of the image, when the pull asked for one: its
+    /// files come after the others, in its order, and the window of the
+    /// layers follows it.  A hint: what cannot be fetched is fetched when it
+    /// is read.
     pub(super) async fn fetch_start_set(
         &self,
         (layers, pulled): (Vec<StartLayer>, PulledFrom),
         opened: impl std::future::Future<Output = OpenedWalker>,
-        first: Vec<Vec<String>>,
+        (first, config): (Vec<Vec<String>>, velarx_types::OciImageConfig),
+        profile: Option<impl std::future::Future<Output = Vec<String>> + Send + 'static>,
     ) {
         // (what a fetch of the layers needs is what the pull has in hand:
         // it is not read from the staging and parsed again)
@@ -434,25 +443,46 @@ impl ImageService {
                 walkers.insert(walk.clone(), opened);
             }
         }
-        {
+        let ctxs: Vec<Arc<LayerCtx>> = {
             let mut kept = self.funnel.layers.lock().unwrap_or_else(|e| e.into_inner());
-            for (key, desc, toc) in &layers {
-                let ctx = LayerCtx {
-                    desc: desc.clone(),
-                    files: std::sync::OnceLock::new(),
-                    toc: toc.clone(),
-                    walk: walk.clone(),
-                    shareable: pulled.shareable,
-                    manifest: pulled.manifest.clone(),
-                };
-                kept.insert(*key, Arc::new(ctx));
-            }
-        }
+            layers
+                .iter()
+                .map(|(key, desc, toc)| {
+                    let ctx = Arc::new(LayerCtx {
+                        desc: desc.clone(),
+                        files: std::sync::OnceLock::new(),
+                        profile: std::sync::OnceLock::new(),
+                        toc: toc.clone(),
+                        walk: walk.clone(),
+                        shareable: pulled.shareable,
+                        manifest: pulled.manifest.clone(),
+                    });
+                    kept.insert(*key, ctx.clone());
+                    ctx
+                })
+                .collect()
+        };
         // (the fetches are in the table of those in flight when this
         // returns: a read of one of the files joins it)
         let first = self.begin_set(&layers, first);
+        let this = self.clone();
         tokio::spawn(async move {
-            for failed in first.await.into_iter().filter_map(Result::err) {
+            let mut done = first.await;
+            if let Some(asked) = profile {
+                let profile: Arc<[String]> = asked.await.into();
+                if !profile.is_empty() {
+                    for ctx in &ctxs {
+                        let _ = ctx.profile.set(profile.clone());
+                    }
+                    let (tocs, files) = (layers.clone(), profile.clone());
+                    let sets =
+                        tokio::task::spawn_blocking(move || plan_start_set(&tocs, &config, &files))
+                            .await
+                            .unwrap_or_default();
+                    done.extend(this.begin_set(&layers, sets).await);
+                }
+            }
+            for failed in done.into_iter().filter_map(Result::err) {
                 debug!("The start set of the image: {failed}");
             }
         });
@@ -760,6 +790,7 @@ impl ImageService {
             Ok::<_, ImageError>(LayerCtx {
                 desc,
                 files: std::sync::OnceLock::new(),
+                profile: std::sync::OnceLock::new(),
                 toc,
                 walk: walk_key(repository, &layer.meta.reach),
                 shareable: pull.shareable,
@@ -915,8 +946,9 @@ impl ImageService {
         Ok(ctx.files().contains_key(digest))
     }
 
-    /// The files of its directory that follow `digest` in the staged layer
-    /// `key` (the window of `[pull] lazy_window_files` and `lazy_window_kib`,
+    /// The files that follow `digest` in the staged layer `key`, in the
+    /// startup profile of its image when the file is in it, else in its
+    /// directory (the window of `[pull] lazy_window_files` and `lazy_window_kib`,
     /// which starts small and grows with each miss of the layer), staged in the
     /// background after a miss (`ahead`): the next reads of the container
     /// find them, or join their fetch.  It never takes the place of a miss,
@@ -957,7 +989,11 @@ impl ImageService {
             !self.file_store.contains(d)
                 && !staged.as_ref().is_some_and(|s| s.get_path(d).is_some())
         };
-        let positions = window::select(&ctx.toc, at, ahead, wanted);
+        let positions = ctx
+            .profile
+            .get()
+            .and_then(|p| window::follow(p, ctx.files(), digest, ahead, wanted, &ctx.toc))
+            .unwrap_or_else(|| window::select(&ctx.toc, at, ahead, wanted));
         let files: Vec<String> = positions
             .iter()
             .filter_map(|&i| ctx.toc.entries[i].verity())
@@ -1006,6 +1042,7 @@ impl ImageService {
                 Arc::new(LayerCtx {
                     desc,
                     files: std::sync::OnceLock::new(),
+                    profile: std::sync::OnceLock::new(),
                     toc: Arc::new(toc),
                     walk: walk.clone(),
                     shareable: false,
@@ -1147,9 +1184,10 @@ mod tests {
             .with_lazy_walker(&key, (desc.clone(), toc.clone()), walker)
             .await;
         assert!(service.lazy_file_path(&key, &file).is_none());
+        let profile = futures::future::ready(vec![file.clone()]);
         let layers = vec![(key, desc, Arc::new(toc))];
         let config = velarx_types::OciImageConfig::default();
-        let first = plan_start_set(&layers, &config);
+        let first = plan_start_set(&layers, &config, &[]);
         assert_eq!(first, [[file.clone()]]);
         service
             .fetch_start_set(
@@ -1167,7 +1205,8 @@ mod tests {
                     },
                 ),
                 async { None },
-                first,
+                (first, config),
+                Some(profile),
             )
             .await;
         // (a read of the file joins the fetch begun above)
@@ -1185,6 +1224,9 @@ mod tests {
         assert!(service.lazy_file_path(&key, &file).is_some());
         for _ in 0..100 {
             if service.funnel.setting.lock().unwrap().is_empty() {
+                // (the window of the layer follows the profile now)
+                let ctx = service.funnel.layers.lock().unwrap()[&key].clone();
+                assert_eq!(ctx.profile.get().map(|p| &p[..]), Some(&[file.clone()][..]));
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

@@ -570,8 +570,8 @@ pub struct PullConfig {
     /// Files a startup profile holds at most
     #[serde(default = "default_lazy_profile_files")]
     pub lazy_profile_files: usize,
-    /// A container of an image this node has no profile for asks the
-    /// content sources (the peers) for theirs, and fetches in that order
+    /// A pull of an image this node has no profile for asks the content
+    /// sources (the peers) for theirs, and fetches in that order
     #[serde(default = "default_true")]
     pub lazy_profile_peers: bool,
 }

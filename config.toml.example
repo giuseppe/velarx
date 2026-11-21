@@ -438,7 +438,9 @@ fetcher_connections = 1024
 # range.  The window of a layer starts at 256 KiB and doubles with each miss
 # of the layer, up to lazy_window_kib; at most lazy_window_files files (0 for
 # either setting: only the file that was asked for); files the store has or
-# another fetch holds are left out.
+# another fetch holds are left out.  No window is fetched while the files a
+# start reads are being fetched; where the image has a startup profile (below)
+# the window is the files that follow the missed one in the profile.
 lazy_window_files = 64
 lazy_window_kib = 4096
 # The first time a lazily pulled image runs, the files its container looks up
@@ -454,9 +456,10 @@ lazy_window_kib = 4096
 lazy_profile_secs = 10
 # Files in a profile at most
 lazy_profile_files = 4096
-# The first container of an image this node has no profile for asks the
-# sources (the peers of the swarm) for theirs, and fetches the files of the
-# image in that order.  Only an order: every file is checked as it is fetched.
+# A pull of an image this node has no profile for asks the sources (the
+# peers of the swarm) for theirs, and fetches the files of the image in that
+# order while the container is made.  Only an order, at most 64 MiB of it:
+# every file is checked as it is fetched.
 lazy_profile_peers = true
 # Where the content of images comes from, in order.  The registry is the
 # origin and always last (it is added when missing).  Every source is untrusted:

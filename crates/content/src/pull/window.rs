@@ -164,6 +164,40 @@ pub fn select(
     out
 }
 
+/// The positions of the files that follow `digest` in `profile` (the files
+/// a start read, in the order it read them), among the files of the table
+/// (`at`: where each is, see [`file_positions`]), up to the limits, that
+/// `wanted` accepts.  None when `digest` is not in the profile: the window
+/// of the directory is the answer then.
+pub fn follow(
+    profile: &[String],
+    at: &HashMap<String, usize>,
+    digest: &str,
+    window: Window,
+    mut wanted: impl FnMut(&str) -> bool,
+    toc: &Toc,
+) -> Option<Vec<usize>> {
+    let first = profile.iter().position(|d| d == digest)?;
+    let mut out = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::from([digest]);
+    let mut bytes = 0u64;
+    for d in &profile[first + 1..] {
+        if out.len() >= window.files {
+            break;
+        }
+        let Some(&i) = at.get(d).filter(|_| seen.insert(d)) else {
+            continue;
+        };
+        let total = bytes.saturating_add(toc.entries[i].size);
+        if total > window.bytes || !wanted(d) {
+            continue;
+        }
+        bytes = total;
+        out.push(i);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +249,32 @@ mod tests {
         assert_eq!(names(&t, &got), ["f2", "f3", "f4"]);
         let got = select(&t, first, Window { files: 2, ..W }, |_| true);
         assert_eq!(names(&t, &got), ["f2", "f3"]);
+    }
+
+    #[test]
+    fn the_window_follows_the_profile_when_the_file_is_in_it() {
+        let toc = toc(&[10, 20, 30, 40, 50]);
+        let at = file_positions(&toc);
+        let d = |i: usize| format!("fsverity-sha256-12:{i:064x}");
+        let profile = vec![d(3), d(0), d(9), d(2), d(0), d(4), d(1)];
+        let window = Window {
+            files: 3,
+            bytes: 1 << 20,
+        };
+        let names = |got: Option<Vec<usize>>| -> Option<Vec<String>> {
+            got.map(|at| at.iter().map(|&i| toc.entries[i].name.clone()).collect())
+        };
+        // (what the profile names that the table lacks, and what repeats,
+        // is left out)
+        assert_eq!(
+            names(follow(&profile, &at, &d(3), window, |_| true, &toc)),
+            Some(vec!["f0".into(), "f2".into(), "f4".into()])
+        );
+        assert_eq!(
+            names(follow(&profile, &at, &d(3), window, |x| x != d(0), &toc)),
+            Some(vec!["f2".into(), "f4".into(), "f1".into()])
+        );
+        assert_eq!(follow(&profile, &at, &d(8), window, |_| true, &toc), None);
     }
 
     #[test]
