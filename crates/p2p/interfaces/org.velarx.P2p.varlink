@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The interface org.velarx.P2p: the control socket of velarx-p2p (p2p.sock),
-# for its commands (velarx p2p status, peers, stats, images).  Generated from
+# for its commands (velarx-p2p status, peers, stats, images).  Generated from
 # the Rust types (crates/p2p/src/control.rs and service.rs) by the test
 # `service::tests::the_interface_files_are_current`:
 # VELARX_WRITE_INTERFACES=1 cargo test -p velarx-p2p --lib service writes it.

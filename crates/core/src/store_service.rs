@@ -1560,7 +1560,7 @@ mod tests {
     #[test]
     fn the_interface_file_is_current() {
         let text = definition();
-        velarx_base::testing::assert_interface_file("org.velarx.Store.varlink", &text);
+        velarx_base::testing::assert_interface_file("interfaces/org.velarx.Store.varlink", &text);
         assert!(
             text.contains("\tsnapshot,"),
             "the enum values as the wire has them"

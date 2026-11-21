@@ -735,11 +735,14 @@ mod tests {
     /// The file is made from the types: when they change it changes.
     #[test]
     fn the_interface_file_is_current() {
-        check("org.velarx.Storage.varlink", &definition());
+        check("interfaces/org.velarx.Storage.varlink", &definition());
     }
 
     #[test]
     fn the_feed_file_is_current() {
-        check("org.velarx.StorageFeed.varlink", &feed_definition());
+        check(
+            "interfaces/org.velarx.StorageFeed.varlink",
+            &feed_definition(),
+        );
     }
 }

@@ -268,13 +268,14 @@ def commands(bindir):
 
     try:
         for program in PROGRAMS:
-            check_commands(program, help_of, has_option, refused, absent)
+            if os.path.exists(os.path.join(bindir, program)):
+                check_commands(program, help_of, has_option, refused, absent)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
 # The binaries whose commands the documents show.
-PROGRAMS = ("velarx", "velarx-kube")
+PROGRAMS = ("velarx", "velarx-kube", "velarx-p2p")
 
 
 def check_commands(program, help_of, has_option, refused, absent):

@@ -26,7 +26,7 @@ fn the_registry_description_served_is_what_the_types_say() {
 #[test]
 fn the_registry_interface_file_is_current() {
     let text = crate::serve_fetch::registry_definition();
-    velarx_base::testing::assert_interface_file("org.velarx.Registry.varlink", &text);
+    velarx_base::testing::assert_interface_file("interfaces/org.velarx.Registry.varlink", &text);
     assert!(text.contains("interface org.velarx.Registry"));
     for method in ["GetInfo", "Tags", "Search", "Login", "Download"] {
         assert!(text.contains(&format!("method {method}(")), "{method}");
@@ -71,7 +71,7 @@ fn the_pusher_description_served_is_what_the_types_say() {
 #[test]
 fn the_pusher_interface_file_is_current() {
     let text = crate::serve_fetch::pusher_definition();
-    velarx_base::testing::assert_interface_file("org.velarx.Pusher.varlink", &text);
+    velarx_base::testing::assert_interface_file("interfaces/org.velarx.Pusher.varlink", &text);
     assert!(text.contains("interface org.velarx.Pusher"));
     for method in [
         "GetInfo",

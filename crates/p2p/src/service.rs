@@ -8,9 +8,10 @@
 //! the DHT its layers only with `announce_images`: the
 //! content and what may be announced come from the store service
 //! (`velarx_core::store_service`).  It is a fetcher (`org.velarx.Fetcher`, on
-//! its own socket) for the pulls.  `velarx p2p` talks to it on its control
-//! socket (`org.velarx.P2p`, [`crate::control`]).  The overlay network of the
-//! containers is another process ([`crate::overlay_service`]).
+//! its own socket) for the pulls.  Its commands (`velarx-p2p status`, ...)
+//! talk to it on its control socket (`org.velarx.P2p`, [`crate::control`]).
+//! The overlay network of the containers is another process
+//! ([`crate::overlay_service`]).
 
 use super::provider::{PeerSource, Policy};
 use super::staged::{Given, Staged};
@@ -467,21 +468,22 @@ use control::Control;
 /// built from the descriptors of its types (the tests compare the two).
 fn description(interface: &str) -> String {
     let file = match interface {
-        "org.velarx.P2p" => include_str!("../../../interfaces/org.velarx.P2p.varlink"),
+        "org.velarx.P2p" => include_str!("../interfaces/org.velarx.P2p.varlink"),
         other => unreachable!("{other} is not served here"),
     };
     let (_, text) = file.split_once("\n\n").expect("a comment, an empty line");
     text.strip_suffix('\n').unwrap_or(text).to_string()
 }
 
-/// The text of the interface definition `interfaces/org.velarx.P2p.varlink`.
+/// The text of the interface definition
+/// `crates/p2p/interfaces/org.velarx.P2p.varlink`.
 #[cfg(test)]
 pub fn control_definition() -> String {
     format!(
         "# SPDX-License-Identifier: Apache-2.0\n\
          #\n\
          # The interface org.velarx.P2p: the control socket of velarx-p2p (p2p.sock),\n\
-         # for its commands (velarx p2p status, peers, stats, images).  Generated from\n\
+         # for its commands (velarx-p2p status, peers, stats, images).  Generated from\n\
          # the Rust types (crates/p2p/src/control.rs and service.rs) by the test\n\
          # `service::tests::the_interface_files_are_current`:\n\
          # VELARX_WRITE_INTERFACES=1 cargo test -p velarx-p2p --lib service writes it.\n\
@@ -761,9 +763,12 @@ mod tests {
     #[test]
     fn the_interface_files_are_current() {
         for (name, text) in [
-            ("org.velarx.P2p.varlink", control_definition()),
             (
-                "org.velarx.Network.varlink",
+                "crates/p2p/interfaces/org.velarx.P2p.varlink",
+                control_definition(),
+            ),
+            (
+                "interfaces/org.velarx.Network.varlink",
                 crate::overlay_service::network_definition(),
             ),
         ] {

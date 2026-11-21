@@ -42,12 +42,12 @@ pub fn built_binary(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// The interface file `name` of `interfaces/` is `text`, which the types make
-/// (`VELARX_WRITE_INTERFACES=1` writes it).
-pub fn assert_interface_file(name: &str, text: &str) {
+/// The interface file `path` (of the source tree) is `text`, which the types
+/// make (`VELARX_WRITE_INTERFACES=1` writes it).
+pub fn assert_interface_file(path: &str, text: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../interfaces")
-        .join(name);
+        .join("../..")
+        .join(path);
     if std::env::var_os("VELARX_WRITE_INTERFACES").is_some() {
         std::fs::write(&path, text).unwrap();
     }

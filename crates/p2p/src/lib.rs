@@ -139,9 +139,8 @@ pub enum P2PError {
     InvalidPrivateKey(String),
     #[error(
         "no swarm key and no certificate authority: the P2P network is private. Generate a \
-         key with `velarx-p2p generate-key <path>` (or `velarx p2p generate-key <path>`), \
-         copy it to every node, and set `private_key_path` in p2p.toml \
-         or VELARX_P2P_SWARM_KEY in the environment; or make an authority (`velarx p2p ca \
+         key with `velarx-p2p generate-key <path>`, copy it to every node, and set `private_key_path` in p2p.toml \
+         or VELARX_P2P_SWARM_KEY in the environment; or make an authority (`velarx-p2p ca \
          init`) and set `ca_path` and `certificate_path`"
     )]
     MissingSwarmKey,

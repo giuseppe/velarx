@@ -18,7 +18,7 @@
 //! Only what a peer proved is recorded (the caller checks the bytes against
 //! their digests first).  Everything is bounded and expires.
 //!
-//! It also counts, for `velarx p2p status`, what each peer was asked and
+//! It also counts, for `velarx-p2p status`, what each peer was asked and
 //! sent: requests, failures, the chunks and bytes that matched their
 //! digests, and the time of the answers.
 

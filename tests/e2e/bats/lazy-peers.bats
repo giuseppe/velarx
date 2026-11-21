@@ -151,8 +151,8 @@ EOT
 # chunks_sent NODE: the chunks the P2P service of the node has sent
 chunks_sent () { p2p_ "$1" stats | grep -oE '"chunks_sent": *[0-9]+' | grep -oE '[0-9]+$'; }
 sh_ () { local n=$1; shift; "$BIN/velarx" --socket "$WORKDIR/$n/sh.sock" "$@"; }
-# p2p_ NODE ARGS: `velarx p2p`, which asks the P2P service of the node itself
-p2p_ () { local n=$1; shift; "$BIN/velarx" --config "$WORKDIR/$n.toml" p2p "$@"; }
+# p2p_ NODE ARGS: `velarx-p2p`, which asks the P2P service of the node itself
+p2p_ () { local n=$1; shift; "$BIN/velarx-p2p" --config "$WORKDIR/$n.toml" "$@"; }
 
 # wait_profile: until the store of node b has a startup profile (5 s at most)
 wait_profile () { e2e_wait_glob "$WORKDIR/b/store/composefs/*.profile.json" 5; }

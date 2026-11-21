@@ -89,7 +89,7 @@
 #      on --host-addr, B bootstraps to it with its peer id and the swarm key
 #      is copied); A has the images; B pulls them with
 #      `[pull] sources = ["peers", "registry"]` under strace.  It prints the
-#      bytes B got from the peers (`velarx p2p status` of B: bytes_received)
+#      bytes B got from the peers (`velarx-p2p status` of B: bytes_received)
 #      and from the registry (the request log: blob bodies), and the sync calls
 #      of B.
 #   5. A table on stdout and the JSON file, then the cleanup of both nodes:
@@ -421,6 +421,7 @@ EOF
 }
 # vx NODE ARGS: the command line of a node, in its own process
 vx() { local n=$1; shift; ( . "$WORK/$n.env"; exec "$BINDIR/velarx" --config "$WORK/$n.toml" "$@" ); }
+vp2p() { local n=$1; shift; ( . "$WORK/$n.env"; exec "$BINDIR/velarx-p2p" --config "$WORK/$n.toml" "$@" ); }
 
 BIGSIZE=3145728
 if ! skip_step build; then
@@ -644,8 +645,8 @@ EOF
 		fi
 	fi
 	if [ -z "$P2P_SKIP" ]; then
-		peerid=$(vx a p2p status 2>&1 | grep -oE '12D3KooW[A-Za-z0-9]+' | head -1)
-		[ -n "$peerid" ] || P2P_SKIP="no peer id of node A (velarx p2p status)"
+		peerid=$(vp2p a status 2>&1 | grep -oE '12D3KooW[A-Za-z0-9]+' | head -1)
+		[ -n "$peerid" ] || P2P_SKIP="no peer id of node A (velarx-p2p status)"
 	fi
 	if [ -z "$P2P_SKIP" ]; then
 		# node B: the same configuration with the registry of this host
@@ -691,7 +692,7 @@ EOF
 			rc=$?
 			echo "$from $(wc -l < "$REGLOG")" > "$WORK/b.$name.window"
 			rcp "$NODEB:$RW/b.$name.strace" "$WORK/b.$name.strace" 2> /dev/null || : > "$WORK/b.$name.strace"
-			peerstat=$(rsh ". $RW/b.env; $RW/bin/velarx --config $RW/b.toml p2p status 2>&1")
+			peerstat=$(rsh ". $RW/b.env; $RW/bin/velarx-p2p --config $RW/b.toml status 2>&1")
 			echo "$peerstat" > "$WORK/b.$name.p2pstatus"
 			rep=$(pull_report b "$name")
 			put "pull_b_$name" "$rep"
@@ -723,9 +724,9 @@ except Exception:
 			prev=$pb
 		done
 		# what each service says of its peers, and the end of their logs, for the one who reads the result
-		put p2p_peers_b "$(rsh ". $RW/b.env; $RW/bin/velarx --config $RW/b.toml p2p peers 2>&1" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
-		put p2p_status_b "$(rsh ". $RW/b.env; $RW/bin/velarx --config $RW/b.toml p2p status 2>&1" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
-		put p2p_status_a "$(vx a p2p status 2>&1 | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+		put p2p_peers_b "$(rsh ". $RW/b.env; $RW/bin/velarx-p2p --config $RW/b.toml peers 2>&1" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+		put p2p_status_b "$(rsh ". $RW/b.env; $RW/bin/velarx-p2p --config $RW/b.toml status 2>&1" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+		put p2p_status_a "$(vp2p a status 2>&1 | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
 		put p2p_log_a "$(tail -15 "$WORK/a.p2p.log" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
 		put p2p_log_b "$(rsh "tail -15 $RW/b.p2p.log" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
 		b_status=ran

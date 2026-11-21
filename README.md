@@ -130,7 +130,7 @@ bootstrap_peers = ["/ip4/<peer-ip>/tcp/4001/p2p/<peer-id>"]
 
 ```sh
 velarx-p2p &
-velarx p2p status
+velarx-p2p status
 ```
 
 The data goes over QUIC on the UDP port of the same number: open TCP and

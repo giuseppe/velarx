@@ -110,12 +110,13 @@ EOT
     e2e_wait_line "$WORKDIR/$n.p2p.log" 'Chunk provider set' || { echo "the P2P service of node $n does not start"; cat "$WORKDIR/$n.p2p.log"; return 1; }
 }
 # chunks_sent NODE: the chunks the P2P service of the node has sent
-chunks_sent () { sh_ "$1" p2p stats | grep -oE '"chunks_sent": *[0-9]+' | grep -oE '[0-9]+$'; }
+chunks_sent () { p2p_ "$1" stats | grep -oE '"chunks_sent": *[0-9]+' | grep -oE '[0-9]+$'; }
 # the commands of a node run in their own process: nothing listens on its
 # API socket
 sh_ () { local n=$1; shift; "$BIN/velarx" --config "$WORKDIR/$n.toml" "$@"; }
-peers_of () { sh_ "$1" p2p peers; }
-status_of () { sh_ "$1" p2p status; }
+p2p_ () { local n=$1; shift; "$BIN/velarx-p2p" --config "$WORKDIR/$n.toml" "$@"; }
+peers_of () { p2p_ "$1" peers; }
+status_of () { p2p_ "$1" status; }
 
 # wait_profile: until the store of node b has a startup profile (5 s at most)
 wait_profile () { e2e_wait_glob "$WORKDIR/b/store/composefs/*.profile.json" 5; }
@@ -164,20 +165,20 @@ wait_profile () { e2e_wait_glob "$WORKDIR/b/store/composefs/*.profile.json" 5; }
     check_match "the next container runs with it" "^[0-9]+\.[0-9]+" "$out"
     ! grep -q 'layers to the DHT' "$WORKDIR/a.p2p.log"
     check "node a still announced nothing in the DHT" 0 $?
-    ! sh_ b p2p images 2>&1 | grep -q "$peer_id"
+    ! p2p_ b images 2>&1 | grep -q "$peer_id"
     check "node b is not given the images of node a" 0 $?
     # what a node says of what it knows and did
-    sh_ b p2p advertised | grep -q '"announcing": *false'
+    p2p_ b advertised | grep -q '"announcing": *false'
     check "node b tells no list of its images" 0 $?
-    sh_ b p2p advertised | grep -q '"filter": *true'
+    p2p_ b advertised | grep -q '"filter": *true'
     check "node b tells the filter of its layers" 0 $?
-    sh_ a p2p serving | grep -q '"quic_slots"'
+    p2p_ a serving | grep -q '"quic_slots"'
     check "node a tells what it is serving" 0 $?
-    sh_ b p2p peers | grep -q "$peer_id"
+    p2p_ b peers | grep -q "$peer_id"
     check "node b lists node a among its peers" 0 $?
-    sh_ b p2p knowledge > /dev/null
+    p2p_ b knowledge > /dev/null
     check "node b tells what it believes of its peers" 0 $?
-    sh_ b p2p explain | grep -qE '^decision [0-9]+: |no pull has asked'
+    p2p_ b explain | grep -qE '^decision [0-9]+: |no pull has asked'
     check "node b tells why its pulls asked the peers they did" 0 $?
     # (the pull of node b goes on: the next test completes it)
 }

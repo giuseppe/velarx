@@ -198,7 +198,7 @@ member:
   how an authority is replaced), validity, revocation, `allow_names` and
   `allow_peers`, and the role (a `serve` node is not served, a `pull` node is
   not asked for data).  A refusal is a typed error, counted
-  (`admission_refused` of `velarx p2p status`) and logged.  A node whose own certificate is for another key, expired,
+  (`admission_refused` of `velarx-p2p status`) and logged.  A node whose own certificate is for another key, expired,
   or not signed by its `ca_path` does not start.
   * **The key of the authority** is made by `ca init` on the operator's
     machine and stays there: no setting names it, so a compromised node can

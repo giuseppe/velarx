@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The varlink interface `org.velarx.P2p`, the control of the service
-//! (`velarx-p2p`), and the client its commands use (`velarx p2p status`).
+//! (`velarx-p2p`), and the client its commands use (`velarx-p2p status`).
 //! The service's control socket serves:
 //!
 //! * `GetInfo`: the version and the protocol;

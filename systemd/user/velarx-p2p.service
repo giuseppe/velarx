@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # The P2P service of a user (rootless): `systemctl --user enable --now
 # velarx-p2p`, with its p2p.toml next to the configuration (the swarm key).  It needs no
-# daemon: the content it serves comes from the store service.  `velarx p2p
+# daemon: the content it serves comes from the store service.  `velarx-p2p
 # status` asks it on its own socket (org.velarx.P2p).
 [Unit]
 Description=Velarx P2P service

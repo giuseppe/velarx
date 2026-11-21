@@ -273,7 +273,7 @@ pub struct Sent {
     pub bytes: u64,
 }
 
-/// What a node tells of its own filter: for `velarx p2p advertised`.
+/// What a node tells of its own filter: for `velarx-p2p advertised`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Own {
     pub keys: usize,

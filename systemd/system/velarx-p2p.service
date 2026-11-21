@@ -21,7 +21,7 @@ StateDirectoryMode=0700
 
 # The service talks to the network: it needs its sockets in
 # /run/velarx/services (p2p.sock, the varlink interface org.velarx.P2p
-# of `velarx p2p`; p2p-fetcher.sock, org.velarx.Fetcher for the pulls;
+# of `velarx-p2p`; p2p-fetcher.sock, org.velarx.Fetcher for the pulls;
 # it is not socket-activated: it is a member of a swarm while it runs), its
 # configuration and swarm key (read), the network, and nothing else.  The
 # process confines itself further (Landlock, seccomp:

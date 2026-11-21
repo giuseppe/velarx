@@ -2199,7 +2199,7 @@ mod tests {
     #[test]
     fn the_interface_file_is_current() {
         let text = definition();
-        velarx_base::testing::assert_interface_file("org.velarx.Fetcher.varlink", &text);
+        velarx_base::testing::assert_interface_file("interfaces/org.velarx.Fetcher.varlink", &text);
         for method in [
             "GetInfo",
             "Open",

@@ -457,7 +457,10 @@ mod tests {
     #[test]
     fn the_interface_file_is_current() {
         let text = definition();
-        velarx_base::testing::assert_interface_file("org.velarx.ImageFetch.varlink", &text);
+        velarx_base::testing::assert_interface_file(
+            "interfaces/org.velarx.ImageFetch.varlink",
+            &text,
+        );
         for method in ["GetInfo", "Open", "Miss", "GetProfile"] {
             assert!(text.contains(&format!("method {method}(")), "{method}");
         }

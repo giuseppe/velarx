@@ -17,7 +17,7 @@
 #   sources = ["peers", "registry"]
 
 # Control socket of the service, the varlink interface `org.velarx.P2p` that
-# `velarx p2p status` calls (default: p2p.sock in the services directory of
+# `velarx-p2p status` calls (default: p2p.sock in the services directory of
 # the engine).  The sockets of the fetcher (p2p-fetcher.sock) and of the
 # overlay network (p2p-network.sock) are next to it.
 # socket = "/run/velarx/services/p2p.sock"
@@ -49,7 +49,7 @@ bootstrap_retry_max_secs = 60
 # such as /dns4/...; an address in an address; port 0).  Private ranges are
 # allowed (10/8, 172.16/12, 192.168/16, fd00::/8: clusters live there).  The
 # bootstrap peers named above are exempt.  What was refused is counted by reason
-# in `velarx p2p status` (lookups, dials_refused) and logged at debug level.
+# in `velarx-p2p status` (lookups, dials_refused) and logged at debug level.
 # `dial_allow` lets networks through those refusals (a swarm of nodes on one
 # host needs 127.0.0.0/8).
 # dial_allow = ["127.0.0.0/8"]
@@ -127,7 +127,7 @@ ca_sweep_secs = 10
 # authority) on each connection.  A peer that cannot be reached over UDP (a firewall, a
 # NAT with no port forwarded, no endpoint advertised) is still a member and is
 # not asked for data: the pull goes on to the next peer and then to the next
-# source; `velarx p2p status` and `velarx p2p peers` say which peers have no
+# source; `velarx-p2p status` and `velarx-p2p peers` say which peers have no
 # QUIC path and why.
 #
 # The UDP port of that endpoint, which the firewall must let through between
