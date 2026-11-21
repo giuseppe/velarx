@@ -165,7 +165,7 @@ impl Node {
     }
 }
 
-fn components(path: &str) -> Result<Vec<&str>, String> {
+pub(crate) fn components(path: &str) -> Result<Vec<&str>, String> {
     let mut out = Vec::new();
     for c in path.split('/') {
         match c {

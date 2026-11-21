@@ -6,7 +6,7 @@
 //! layers.  What a build, a squash and the copy of the `vfs` driver read of
 //! an image.
 
-use crate::layer_erofs::resolve_entries;
+use crate::layer_erofs::{components, resolve_entries};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use velarx_storage::{Toc, TocEntry, TocEntryType};
 
@@ -38,18 +38,6 @@ pub fn dir_entry(name: &str) -> TocEntry {
 /// Whether the entry is a whiteout of the image of a layer: a device 0:0.
 fn is_whiteout(e: &TocEntry) -> bool {
     e.entry_type == TocEntryType::Char && e.dev_major == Some(0) && e.dev_minor == Some(0)
-}
-
-fn components(path: &str) -> Result<Vec<&str>, String> {
-    let mut out = Vec::new();
-    for c in path.split('/') {
-        match c {
-            "" | "." => {}
-            ".." => return Err(format!("`{path}` goes up")),
-            c => out.push(c),
-        }
-    }
-    Ok(out)
 }
 
 impl MergedTree {

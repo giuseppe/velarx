@@ -9,7 +9,7 @@ use velarx_storage::{toc_time, Toc, TocEntry, TocEntryType};
 use velarx_types::digest::{Algorithm, Digest};
 
 /// Entries of one layer accepted.
-pub const MAX_ENTRIES: usize = 4 * 1024 * 1024;
+pub use velarx_storage::canonical::MAX_ENTRIES;
 
 /// What is wrong with the size of a table of contents: too many entries, or
 /// a name with too many components.
