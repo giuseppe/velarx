@@ -9,7 +9,7 @@
 //! content and what may be announced come from the store service
 //! (`velarx_core::store_service`).  It is a fetcher (`org.velarx.Fetcher`, on
 //! its own socket) for the pulls.  Its commands (`velarx-p2p status`, ...)
-//! talk to it on its control socket (`org.velarx.P2p`, [`crate::control`]).
+//! ask it on its control socket (a line of text, [`crate::control`]).
 //! The overlay network of the containers is another process
 //! ([`crate::overlay_service`]).
 
@@ -18,9 +18,8 @@ use super::staged::{Given, Staged};
 use super::store::{follow_store_on_thread, StoreContent};
 use super::{P2PConfig as NodeConfig, P2PNode};
 use crate::control::{
-    Advertised, Belief, BeliefListed, Certificate, Decision, DecisionListed, DialsRefused,
-    ImageListed, Lookups, P2pError, Peer, PeerFilter, PeerListed, PeerTraffic, RemoteImage,
-    Serving, Slots, Stats, Status, Step, PROTO,
+    self, Advertised, Belief, Decision, Peer, PeerFilter, PeerTraffic, RemoteImage, Serving, Slots,
+    Stats, Status, Step,
 };
 use crate::settings::Settings;
 use std::path::PathBuf;
@@ -29,8 +28,6 @@ use std::time::Duration;
 use tracing::{info, warn};
 use velarx_config::Config;
 use velarx_core::store_service::Announcement;
-use velarx_core::store_service::ImageInfo;
-use velarx_proto::info::Info;
 
 /// What the handlers share
 struct Service {
@@ -186,323 +183,221 @@ pub(super) async fn announce_to_peers(node: &P2PNode, announcement: Announcement
     }
 }
 
-mod control {
-    use super::*;
-
-    /// The calls of `org.velarx.P2p`.
-    #[derive(Clone)]
-    pub(super) struct Control(pub(super) Arc<Service>);
-
-    #[zlink::service(
-        interface = "org.velarx.P2p",
-        description = super::description,
-        vendor = "org.velarx",
-        product = "velarx",
-        version = env!("CARGO_PKG_VERSION"),
-        url = env!("CARGO_PKG_REPOSITORY"),
-        types = [Certificate, Lookups, DialsRefused, PeerTraffic, Peer, PeerFilter, Slots, Belief, Step, Decision, RemoteImage, ImageInfo]
-    )]
-    impl Control {
-        /// Who serves this interface and what it can do.  The first call of a
-        /// connection; a client refuses a `proto` other than its own.
-        async fn get_info(&self) -> Info {
-            Info {
-                name: "p2p".into(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                proto: PROTO,
-                ..Info::default()
-            }
-        }
-
-        /// What the node is: its id, addresses, peers and the DHT.
-        async fn status(&self) -> Status {
-            let status = self.0.node.status();
-            let served = self.0.node.get_stats().await;
-            Status {
-                peer_id: status.peer_id.to_string(),
-                listen_addresses: status
-                    .listen_addresses
-                    .iter()
-                    .map(|a| a.to_string())
-                    .collect(),
-                connected_peers: status.connected.len() as u64,
-                connected_without_quic: self.0.node.without_quic().await as u64,
-                provider_records: status.provider_records as u64,
-                peers: peer_traffic(&self.0.knowledge),
-                chunks_sent: served.chunks_sent,
-                bytes_sent: served.bytes_sent,
-                lookups: self.0.node.lookups().await,
-                certificate: self.0.node.authority().map(|a| a.this_node().into()),
-                admission_refused: self.0.node.authority().map_or(0, |a| a.refused()),
-            }
-        }
-
-        /// The peers it is connected to, and what it moved with each, one
-        /// a reply.
-        #[zlink(more)]
-        async fn peer_list(
-            &self,
-            more: bool,
-        ) -> impl futures::Stream<Item = Result<zlink::Reply<PeerListed>, P2pError>> + Unpin
-        {
-            if !more {
-                return list_replies(Err(expected_more("PeerList")), |peer| PeerListed { peer });
-            }
-            let svc = &self.0;
-            let mut traffic: std::collections::HashMap<String, PeerTraffic> =
-                peer_traffic(&svc.knowledge)
-                    .into_iter()
-                    .map(|t| (t.peer_id.clone(), t))
-                    .collect();
-            let mut filters = svc.knowledge.filter_infos();
-            let mut peers = Vec::new();
-            for p in svc.node.peers().await {
-                let (has, lacks) = svc.knowledge.layers_of(&p.peer_id);
-                peers.push(Peer {
-                    peer_id: p.peer_id.to_string(),
-                    addresses: p.addresses.iter().map(|a| a.to_string()).collect(),
-                    no_quic_path: svc.node.no_quic_path(p.peer_id).await,
-                    filter: filters.remove(&p.peer_id).map(|f| PeerFilter {
-                        keys: f.keys as u64,
-                        bytes: f.bytes as u64,
-                        version: f.version,
-                        estimated_fpr: f.estimated_fpr,
-                        age_secs: f.age.as_secs(),
-                        believed: f.believed,
-                        behind: f.behind,
-                        hits: f.hits,
-                        false_positives: f.false_positives,
-                        refused: f.refused,
-                        last_refused: f.last_refused.map(|r| r.to_string()),
-                    }),
-                    believed_has: has as u64,
-                    believed_lacks: lacks as u64,
-                    certificate: svc
-                        .node
-                        .authority()
-                        .and_then(|a| a.who(&p.peer_id))
-                        .map(Into::into),
-                    traffic: traffic.remove(&p.peer_id.to_string()),
-                });
-            }
-            list_replies(Ok(peers), |peer| PeerListed { peer })
-        }
-
-        /// What the node tells the peers of the layers and images it has.
-        async fn advertised(&self) -> Advertised {
-            let own = self.0.node.advertised();
-            Advertised {
-                announcing: self.0.node.gossip().is_announcing(),
-                filter: self.0.node.advertises(),
-                layers: own.keys as u64,
-                filter_bytes: own.bytes as u64,
-                filter_hashes: own.hashes as u64,
-                filter_version: own.version,
-                estimated_fpr: own.estimated_fpr,
-                fulls_sent: own.sent.fulls,
-                deltas_sent: own.sent.deltas,
-                bytes_sent: own.sent.bytes,
-                images: self.0.node.gossip().images_told().await as u64,
-                dht_records: self.0.node.status().provider_records as u64,
-            }
-        }
-
-        /// What the node is serving and has admitted: the slots of its QUIC
-        /// server and the upload credit.
-        async fn serving(&self) -> Serving {
-            let state = self.0.node.serving_state();
-            let slots = |(used, total): (usize, usize)| Slots {
-                used: used as u64,
-                total: total as u64,
-            };
-            Serving {
-                quic_slots: slots(state.quic_slots),
-                upload_bytes_per_sec: state.admission.upload.bytes_per_sec,
-                upload_waiting_callers: state.admission.upload.waiting_callers as u64,
-                upload_waiting_requests: state.admission.upload.waiting_requests as u64,
-            }
-        }
-
-        /// What the node believes of the layers and the peers: which peers
-        /// have a layer (they served it lately) and which lack it (they did
-        /// not when asked lately), one a reply; of `layer` only, when given.
-        #[zlink(more)]
-        async fn belief_list(
-            &self,
-            more: bool,
-            layer: Option<String>,
-        ) -> impl futures::Stream<Item = Result<zlink::Reply<BeliefListed>, P2pError>> + Unpin
-        {
-            let wrap = |belief| BeliefListed { belief };
-            if !more {
-                return list_replies(Err(expected_more("BeliefList")), wrap);
-            }
-            let beliefs = self
-                .0
-                .knowledge
-                .beliefs(layer.as_deref())
-                .into_iter()
-                .map(|b| Belief {
-                    layer: b.layer,
-                    peer_id: b.peer.to_string(),
-                    has: b.has,
-                    age_secs: b.age.as_secs(),
-                })
-                .collect();
-            list_replies(Ok(beliefs), wrap)
-        }
-
-        /// Why the pulls asked the peers they did: the recent decisions
-        /// about `target` (a digest or the start of one, a layer, a chunk
-        /// or an image id; the name of an image the store has), the last
-        /// first, one a reply; all of them when `target` is empty.
-        #[zlink(more)]
-        async fn explain(
-            &self,
-            more: bool,
-            target: String,
-        ) -> impl futures::Stream<Item = Result<zlink::Reply<DecisionListed>, P2pError>> + Unpin
-        {
-            let wrap = |decision| DecisionListed { decision };
-            if !more {
-                return list_replies(Err(expected_more("Explain")), wrap);
-            }
-            let also = crate::store::layers_of_image(&self.0.store_socket, &target).await;
-            let decisions = self
-                .0
-                .decisions
-                .about(&target, &also)
-                .into_iter()
-                .map(decision)
-                .collect();
-            list_replies(Ok(decisions), wrap)
-        }
-
-        /// What the node moved, in all.
-        async fn stats(&self) -> Stats {
-            let stats = self.0.node.get_stats().await;
-            Stats {
-                chunks_sent: stats.chunks_sent,
-                bytes_sent: stats.bytes_sent,
-            }
-        }
-
-        /// The images of the other nodes, one a reply; with `query`, they
-        /// are asked to refresh first, and answer within a moment
-        /// (`Unavailable`: the node cannot ask them).
-        #[zlink(more)]
-        async fn image_list(
-            &self,
-            more: bool,
-            query: bool,
-        ) -> impl futures::Stream<Item = Result<zlink::Reply<ImageListed>, P2pError>> + Unpin
-        {
-            let wrap = |image| ImageListed { image };
-            if !more {
-                return list_replies(Err(expected_more("ImageList")), wrap);
-            }
-            if query {
-                if let Err(e) = self.0.node.query_peer_images().await {
-                    return list_replies(
-                        Err(P2pError::Unavailable {
-                            reason: e.to_string(),
-                        }),
-                        wrap,
-                    );
-                }
-            }
-            let images = self
-                .0
-                .node
-                .get_remote_images()
-                .await
-                .into_iter()
-                .map(|(peer, image)| RemoteImage {
-                    peer_id: peer.to_string(),
-                    image,
-                })
-                .collect();
-            list_replies(Ok(images), wrap)
-        }
-    }
-
-    /// The error of a list called without `more`.
-    fn expected_more(method: &str) -> P2pError {
-        P2pError::InvalidArgument {
-            reason: format!("{method} answers one record a reply: call it with more"),
-        }
-    }
-
-    /// The replies of a list: one record each, the last with `continues:
-    /// false`; an empty list is one reply without a record.
-    fn list_replies<R: Send + 'static, T: Send + 'static>(
-        listed: Result<Vec<R>, P2pError>,
-        wrap: fn(Option<R>) -> T,
-    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<zlink::Reply<T>, P2pError>> + Send>>
-    {
-        use futures::stream;
-        match listed {
-            Err(e) => Box::pin(stream::once(std::future::ready(Err(e)))),
-            Ok(list) if list.is_empty() => Box::pin(stream::once(std::future::ready(Ok(
-                zlink::Reply::new(Some(wrap(None))).set_continues(Some(false)),
-            )))),
-            Ok(list) => {
-                let last = list.len() - 1;
-                Box::pin(stream::iter(list.into_iter().enumerate().map(
-                    move |(i, record)| {
-                        Ok(zlink::Reply::new(Some(wrap(Some(record))))
-                            .set_continues(Some(i < last)))
-                    },
-                )))
-            }
-        }
-    }
-
-    /// The interface as the macro described it (the binary serves the file).
-    #[cfg(test)]
-    pub(super) fn description() -> String {
-        format!("{}", __Control_INTERFACE_0)
-    }
-}
-use control::Control;
-
-/// The description of an interface of this service as zlink sends it: its
-/// checked-in definition without the comment that opens the file.  The
-/// service answers `GetInterfaceDescription` with it, not with a description
-/// built from the descriptors of its types (the tests compare the two).
-fn description(interface: &str) -> String {
-    let file = match interface {
-        "org.velarx.P2p" => include_str!("../interfaces/org.velarx.P2p.varlink"),
-        other => unreachable!("{other} is not served here"),
-    };
-    let (_, text) = file.split_once("\n\n").expect("a comment, an empty line");
-    text.strip_suffix('\n').unwrap_or(text).to_string()
-}
-
-/// The text of the interface definition
-/// `crates/p2p/interfaces/org.velarx.P2p.varlink`.
-#[cfg(test)]
-pub fn control_definition() -> String {
-    format!(
-        "# SPDX-License-Identifier: Apache-2.0\n\
-         #\n\
-         # The interface org.velarx.P2p: the control socket of velarx-p2p (p2p.sock),\n\
-         # for its commands (velarx-p2p status, peers, stats, images).  Generated from\n\
-         # the Rust types (crates/p2p/src/control.rs and service.rs) by the test\n\
-         # `service::tests::the_interface_files_are_current`:\n\
-         # VELARX_WRITE_INTERFACES=1 cargo test -p velarx-p2p --lib service writes it.\n\
-         # A client calls GetInfo on each connection and refuses a `proto` other than\n\
-         # its own ({}).\n\
-         # Who may call: a peer of the same user or root (SO_PEERCRED); any\n\
-         # accepted peer may make every call.\n\
-         \n{}\n",
-        crate::control::PROTO,
-        control::description()
+/// One connection of the control socket ([`crate::control`]): the request
+/// line (read within `wait`), the reply of `answer` to it (`ok` and the JSON,
+/// or `error: REASON`), and the end of the connection.
+async fn exchange<F>(
+    mut stream: tokio::net::UnixStream,
+    wait: Duration,
+    answer: impl FnOnce(String) -> F,
+) where
+    F: std::future::Future<Output = Result<String, String>>,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    let mut line = Vec::new();
+    let limited = (&mut stream).take(control::MAX_REQUEST);
+    let read = tokio::time::timeout(
+        wait,
+        tokio::io::BufReader::new(limited).read_until(b'\n', &mut line),
     )
+    .await;
+    let reply = match read {
+        Err(_) => return,
+        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(_)) if line.pop() != Some(b'\n') => {
+            Err("a request is one line of 1 KiB at most".to_string())
+        }
+        Ok(Ok(_)) => match String::from_utf8(line) {
+            Ok(request) => answer(request).await,
+            Err(_) => Err("a request is text".to_string()),
+        },
+    };
+    let text = match reply {
+        Ok(json) => format!("ok\n{json}\n"),
+        Err(reason) => format!("error: {reason}\n"),
+    };
+    let _ = tokio::time::timeout(wait, stream.write_all(text.as_bytes())).await;
 }
 
-/// Serve the control interface from a thread of its own, on `listener`,
-/// until the returned guard is dropped.
+/// What the control socket answers.
+impl Service {
+    /// The JSON that answers `request`, `COMMAND [ARG]`.
+    async fn answer(&self, request: &str) -> Result<String, String> {
+        let (command, arg) = request.split_once(' ').unwrap_or((request, ""));
+        match command {
+            "status" => pretty(&self.status().await),
+            "peers" => pretty(&self.peers().await),
+            "stats" => {
+                let stats = self.node.get_stats().await;
+                pretty(&Stats {
+                    chunks_sent: stats.chunks_sent,
+                    bytes_sent: stats.bytes_sent,
+                })
+            }
+            "advertised" => pretty(&self.advertised().await),
+            "serving" => pretty(&self.serving()),
+            "knowledge" => pretty(&self.beliefs((!arg.is_empty()).then_some(arg))),
+            "explain" => pretty(&self.explain(arg).await),
+            "images" => pretty(&self.images().await?),
+            _ => Err(format!("unknown command `{command}`")),
+        }
+    }
+
+    /// What the node is: its id, addresses, peers and the DHT.
+    async fn status(&self) -> Status {
+        let status = self.node.status();
+        let served = self.node.get_stats().await;
+        Status {
+            peer_id: status.peer_id.to_string(),
+            listen_addresses: status
+                .listen_addresses
+                .iter()
+                .map(|a| a.to_string())
+                .collect(),
+            connected_peers: status.connected.len() as u64,
+            connected_without_quic: self.node.without_quic().await as u64,
+            provider_records: status.provider_records as u64,
+            peers: peer_traffic(&self.knowledge),
+            chunks_sent: served.chunks_sent,
+            bytes_sent: served.bytes_sent,
+            lookups: self.node.lookups().await,
+            certificate: self.node.authority().map(|a| a.this_node().into()),
+            admission_refused: self.node.authority().map_or(0, |a| a.refused()),
+        }
+    }
+
+    /// The peers it is connected to, and what it moved with each.
+    async fn peers(&self) -> Vec<Peer> {
+        let mut traffic: std::collections::HashMap<String, PeerTraffic> =
+            peer_traffic(&self.knowledge)
+                .into_iter()
+                .map(|t| (t.peer_id.clone(), t))
+                .collect();
+        let mut filters = self.knowledge.filter_infos();
+        let mut peers = Vec::new();
+        for p in self.node.peers().await {
+            let (has, lacks) = self.knowledge.layers_of(&p.peer_id);
+            peers.push(Peer {
+                peer_id: p.peer_id.to_string(),
+                addresses: p.addresses.iter().map(|a| a.to_string()).collect(),
+                no_quic_path: self.node.no_quic_path(p.peer_id).await,
+                filter: filters.remove(&p.peer_id).map(|f| PeerFilter {
+                    keys: f.keys as u64,
+                    bytes: f.bytes as u64,
+                    version: f.version,
+                    estimated_fpr: f.estimated_fpr,
+                    age_secs: f.age.as_secs(),
+                    believed: f.believed,
+                    behind: f.behind,
+                    hits: f.hits,
+                    false_positives: f.false_positives,
+                    refused: f.refused,
+                    last_refused: f.last_refused.map(|r| r.to_string()),
+                }),
+                believed_has: has as u64,
+                believed_lacks: lacks as u64,
+                certificate: self
+                    .node
+                    .authority()
+                    .and_then(|a| a.who(&p.peer_id))
+                    .map(Into::into),
+                traffic: traffic.remove(&p.peer_id.to_string()),
+            });
+        }
+        peers
+    }
+
+    /// What the node tells the peers of the layers and images it has.
+    async fn advertised(&self) -> Advertised {
+        let own = self.node.advertised();
+        Advertised {
+            announcing: self.node.gossip().is_announcing(),
+            filter: self.node.advertises(),
+            layers: own.keys as u64,
+            filter_bytes: own.bytes as u64,
+            filter_hashes: own.hashes as u64,
+            filter_version: own.version,
+            estimated_fpr: own.estimated_fpr,
+            fulls_sent: own.sent.fulls,
+            deltas_sent: own.sent.deltas,
+            bytes_sent: own.sent.bytes,
+            images: self.node.gossip().images_told().await as u64,
+            dht_records: self.node.status().provider_records as u64,
+        }
+    }
+
+    /// What the node is serving and has admitted: the slots of its QUIC
+    /// server and the upload credit.
+    fn serving(&self) -> Serving {
+        let state = self.node.serving_state();
+        let slots = |(used, total): (usize, usize)| Slots {
+            used: used as u64,
+            total: total as u64,
+        };
+        Serving {
+            quic_slots: slots(state.quic_slots),
+            upload_bytes_per_sec: state.admission.upload.bytes_per_sec,
+            upload_waiting_callers: state.admission.upload.waiting_callers as u64,
+            upload_waiting_requests: state.admission.upload.waiting_requests as u64,
+        }
+    }
+
+    /// What the node believes of the layers and the peers: which peers
+    /// have a layer (they served it lately) and which lack it (they did
+    /// not when asked lately); of `layer` only, when given.
+    fn beliefs(&self, layer: Option<&str>) -> Vec<Belief> {
+        self.knowledge
+            .beliefs(layer)
+            .into_iter()
+            .map(|b| Belief {
+                layer: b.layer,
+                peer_id: b.peer.to_string(),
+                has: b.has,
+                age_secs: b.age.as_secs(),
+            })
+            .collect()
+    }
+
+    /// Why the pulls asked the peers they did: the recent decisions about
+    /// `target` (a digest or the start of one, a layer, a chunk or an image
+    /// id; the name of an image the store has), the last first; all of them
+    /// when `target` is empty.
+    async fn explain(&self, target: &str) -> Vec<Decision> {
+        let also = crate::store::layers_of_image(&self.store_socket, target).await;
+        self.decisions
+            .about(target, &also)
+            .into_iter()
+            .map(decision)
+            .collect()
+    }
+
+    /// The images of the other nodes, who are asked to refresh first and
+    /// answer within a moment.
+    async fn images(&self) -> Result<Vec<RemoteImage>, String> {
+        self.node
+            .query_peer_images()
+            .await
+            .map_err(|e| format!("unavailable: {e}"))?;
+        Ok(self
+            .node
+            .get_remote_images()
+            .await
+            .into_iter()
+            .map(|(peer, image)| RemoteImage {
+                peer_id: peer.to_string(),
+                image,
+            })
+            .collect())
+    }
+}
+
+/// The JSON of a reply, as the commands print it.
+fn pretty<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    serde_json::to_string_pretty(value).map_err(|e| e.to_string())
+}
+
+/// Serve the varlink service `control` from a thread of its own, on
+/// `listener`, until the returned guard is dropped.
 pub(crate) fn serve_control<S>(
     listener: std::os::unix::net::UnixListener,
     name: &'static str,
@@ -538,6 +433,40 @@ where
             }
         })?;
     Ok(stop)
+}
+
+/// Answer the requests that come to the control socket, a connection each
+/// in a task of its own; one over the limits is answered why.
+async fn serve_requests(
+    listener: tokio::net::UnixListener,
+    limits: velarx_content::activation::Limits,
+    svc: Arc<Service>,
+) {
+    use velarx_content::activation::{serve_loop_refusing, Activity};
+    let wait = limits.first_call;
+    serve_loop_refusing(
+        listener,
+        None,
+        velarx_base::ipc::trusted_uid,
+        Activity::new(limits),
+        "p2p-control",
+        move |stream, busy| {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                let _busy = busy;
+                exchange(
+                    stream,
+                    wait,
+                    |request| async move { svc.answer(&request).await },
+                )
+                .await;
+            });
+        },
+        move |stream, reason| {
+            tokio::spawn(exchange(stream, wait, |_| async move { Err(reason) }));
+        },
+    )
+    .await;
 }
 
 /// The store service is reached through a process forked now (this one has
@@ -735,7 +664,12 @@ pub async fn run_with(
         decisions,
         store_socket,
     });
-    let _control = serve_control(listener, "p2p-control", limits, Control(svc))?;
+    listener.set_nonblocking(true)?;
+    let control = tokio::spawn(serve_requests(
+        tokio::net::UnixListener::from_std(listener)?,
+        limits,
+        svc,
+    ));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
@@ -743,6 +677,7 @@ pub async fn run_with(
         _ = sigterm.recv() => {}
     }
     info!("P2P service shutting down");
+    control.abort();
     let _ = shutdown_tx.send(());
     if let Some(follower) = follower {
         let _ = tokio::task::spawn_blocking(move || follower.join()).await;
@@ -755,42 +690,26 @@ pub async fn run_with(
 mod tests {
     use super::*;
 
-    /// The text a service sends for `GetInterfaceDescription` (the file,
-    /// embedded) is what the descriptors of the types and methods say.
-    #[test]
-    fn the_descriptions_served_are_what_the_types_say() {
-        assert_eq!(description("org.velarx.P2p"), control::description());
-    }
-
-    /// The files are made from the types: when they change they change.
-    /// `VELARX_WRITE_INTERFACES=1` writes them.
+    /// The file is made from the types: when they change it changes.
+    /// `VELARX_WRITE_INTERFACES=1` writes it.
     #[test]
     fn the_interface_files_are_current() {
-        for (name, text) in [
-            (
-                "crates/p2p/interfaces/org.velarx.P2p.varlink",
-                control_definition(),
-            ),
-            (
-                "interfaces/org.velarx.Network.varlink",
-                crate::overlay_service::network_definition(),
-            ),
-        ] {
-            velarx_base::testing::assert_interface_file(name, &text);
-            // (every type a field names is declared in the file)
-            let declared: std::collections::HashSet<&str> = text
-                .lines()
-                .filter_map(|l| l.strip_prefix("type ")?.split([' ', '(']).next())
-                .collect();
-            for line in text.lines().filter(|l| !l.trim_start().starts_with('#')) {
-                for word in line.split(|c: char| !c.is_alphanumeric() && c != '_') {
-                    if word.starts_with(|c: char| c.is_ascii_uppercase())
-                        && line.contains(&format!(": {word}"))
-                            | line.contains(&format!("?{word}"))
-                            | line.contains(&format!("[]{word}"))
-                    {
-                        assert!(declared.contains(word), "{name}: {word} is not declared");
-                    }
+        let name = "interfaces/org.velarx.Network.varlink";
+        let text = crate::overlay_service::network_definition();
+        velarx_base::testing::assert_interface_file(name, &text);
+        // (every type a field names is declared in the file)
+        let declared: std::collections::HashSet<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("type ")?.split([' ', '(']).next())
+            .collect();
+        for line in text.lines().filter(|l| !l.trim_start().starts_with('#')) {
+            for word in line.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                if word.starts_with(|c: char| c.is_ascii_uppercase())
+                    && line.contains(&format!(": {word}"))
+                        | line.contains(&format!("?{word}"))
+                        | line.contains(&format!("[]{word}"))
+                {
+                    assert!(declared.contains(word), "{name}: {word} is not declared");
                 }
             }
         }
@@ -803,17 +722,6 @@ mod tests {
     /// sent, the files and the DHT requests).
     #[test]
     fn no_reply_carries_a_value_the_node_does_not_have() {
-        let text = control::description();
-        for name in [
-            "dht_mode",
-            "routing_table_size",
-            "files_announced",
-            "files_found",
-            "dht_requests",
-            "peer_discoveries",
-        ] {
-            assert!(!text.contains(name), "{name} is in the interface");
-        }
         let stats = serde_json::to_value(Stats {
             chunks_sent: 1,
             bytes_sent: 10,

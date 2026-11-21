@@ -13,8 +13,8 @@ use velarx_config::{Config, PullConfig};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
-    /// Control socket (`org.velarx.P2p`); the sockets of the fetcher and of
-    /// the overlay network are next to it
+    /// Control socket; the sockets of the fetcher and of the overlay network
+    /// are next to it
     #[serde(default)]
     pub socket: Option<PathBuf>,
     /// Where the node listens (multiaddr); loopback by default, so that
@@ -499,7 +499,7 @@ impl Settings {
             .unwrap_or_else(|| config.server.root_dir.join("p2p").join("identity.key"))
     }
 
-    /// The control socket (`org.velarx.P2p`).
+    /// The control socket (`velarx-p2p status` asks it).
     pub fn control_socket(&self, config: &Config) -> PathBuf {
         self.socket
             .clone()

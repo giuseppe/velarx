@@ -2,7 +2,7 @@
 # The P2P service of a user (rootless): `systemctl --user enable --now
 # velarx-p2p`, with its settings (the swarm key) in those of the source p2p
 # of the configuration.  It needs no daemon: the content it serves comes from
-# the store service.  `velarx-p2p status` asks it on its own socket (org.velarx.P2p).
+# the store service.  `velarx-p2p status` asks it on its own socket.
 [Unit]
 Description=Velarx P2P service
 Documentation=man:velarx-p2p(8) man:velarx.conf(5)

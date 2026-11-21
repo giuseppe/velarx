@@ -19,32 +19,15 @@ fn load_settings(config: &Config, args: &Args) -> anyhow::Result<Settings> {
 
 /// Ask the running service on its control socket and print the answer.
 fn ask(config: &Config, settings: &Settings, command: Command) -> anyhow::Result<()> {
-    let client = control::P2pClient::new(&settings.control_socket(config));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let json = match command {
-        Command::Status => serde_json::to_string_pretty(&runtime.block_on(client.status())?)?,
-        Command::Peers => serde_json::to_string_pretty(&runtime.block_on(client.peers())?)?,
-        Command::Stats => serde_json::to_string_pretty(&runtime.block_on(client.stats())?)?,
-        Command::Images => {
-            serde_json::to_string_pretty(&runtime.block_on(client.remote_images(true))?)?
-        }
-        Command::Advertised => {
-            serde_json::to_string_pretty(&runtime.block_on(client.advertised())?)?
-        }
-        Command::Serving => serde_json::to_string_pretty(&runtime.block_on(client.serving())?)?,
-        Command::Knowledge { layer } => {
-            serde_json::to_string_pretty(&runtime.block_on(client.beliefs(layer.as_deref()))?)?
-        }
-        Command::Explain { target, json } => {
-            let decisions = runtime.block_on(client.explain(target.as_deref().unwrap_or("")))?;
-            if json {
-                serde_json::to_string_pretty(&decisions)?
-            } else {
-                control::render_decisions(&decisions)
-            }
-        }
+    let request = match &command {
+        Command::Status => "status".to_string(),
+        Command::Peers => "peers".to_string(),
+        Command::Stats => "stats".to_string(),
+        Command::Images => "images".to_string(),
+        Command::Advertised => "advertised".to_string(),
+        Command::Serving => "serving".to_string(),
+        Command::Knowledge { layer } => format!("knowledge {}", layer.as_deref().unwrap_or("")),
+        Command::Explain { target, .. } => format!("explain {}", target.as_deref().unwrap_or("")),
         Command::GenerateKey { .. }
         | Command::Ca { .. }
         | Command::Serve { .. }
@@ -52,7 +35,18 @@ fn ask(config: &Config, settings: &Settings, command: Command) -> anyhow::Result
             unreachable!("handled before")
         }
     };
-    println!("{json}");
+    let json = control::request(&settings.control_socket(config), request.trim_end())?;
+    match command {
+        Command::Explain { json: false, .. } => {
+            let decisions: Vec<control::Decision> = serde_json::from_str(&json).map_err(|_| {
+                anyhow::anyhow!(
+                    "the service does not answer as this program asks: restart velarx-p2p"
+                )
+            })?;
+            println!("{}", control::render_decisions(&decisions));
+        }
+        _ => println!("{json}"),
+    }
     Ok(())
 }
 

@@ -190,18 +190,56 @@ fn test_the_socket_is_private_and_answers_its_owner() {
     assert_eq!(meta.mode() & 0o777, 0o600);
     assert_eq!(meta.uid(), rustix::process::geteuid().as_raw());
 
+    let answer = ask(&node, b"status\n");
+    assert!(answer.starts_with("ok\n"), "{answer}");
+    assert!(answer.contains("peer_id"), "{answer}");
+    let answer = ask(&node, b"nothing\n");
+    assert!(answer.starts_with("error: "), "{answer}");
+}
+
+/// What the control socket answers to `request`: its whole reply.
+fn ask(node: &Node, request: &[u8]) -> String {
     let mut stream = std::os::unix::net::UnixStream::connect(node.socket()).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    // varlink: one JSON object, ended by a NUL, for the call and for the answer
-    stream
-        .write_all(b"{\"method\":\"org.velarx.P2p.Status\"}\0")
-        .unwrap();
+    stream.write_all(request).unwrap();
     let mut answer = Vec::new();
-    std::io::BufRead::read_until(&mut std::io::BufReader::new(&stream), 0, &mut answer).unwrap();
-    let answer = String::from_utf8_lossy(&answer);
-    assert!(answer.contains("peer_id"), "{answer}");
+    // (a request that was not read to its end may reset the connection once
+    // the answer is read)
+    let _ = std::io::Read::read_to_end(&mut stream, &mut answer);
+    String::from_utf8_lossy(&answer).into_owned()
+}
+
+#[test]
+fn test_a_request_over_one_kib_is_refused() {
+    let mut node = Node::new();
+    let key = node.key(0o600);
+    let config = node.config(&format!("private_key_path = \"{}\"\n", key.display()));
+    node.start(&config);
+    let mut long = vec![b'a'; 4096];
+    long.push(b'\n');
+    let answer = ask(&node, &long);
+    assert!(answer.starts_with("error: "), "{answer}");
+    // (and the service goes on)
+    assert_eq!(ask(&node, b"status\n").lines().next(), Some("ok"));
+}
+
+#[test]
+fn test_a_connection_over_the_limit_is_told_why() {
+    let mut node = Node::new();
+    let key = node.key(0o600);
+    let config = node.config(&format!(
+        "private_key_path = \"{}\"\n[services]\nmax_per_client = 1\n",
+        key.display()
+    ));
+    node.start(&config);
+    let _held = std::os::unix::net::UnixStream::connect(node.socket()).unwrap();
+    let answer = ask(&node, b"status\n");
+    assert!(
+        answer.starts_with("error: too many connections"),
+        "{answer}"
+    );
 }
 
 #[test]

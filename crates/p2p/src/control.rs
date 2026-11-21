@@ -1,35 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The varlink interface `org.velarx.P2p`, the control of the service
-//! (`velarx-p2p`), and the client its commands use (`velarx-p2p status`).
-//! The service's control socket serves:
+//! The control of the service (`velarx-p2p`), and the client its commands use
+//! (`velarx-p2p status`).  The control socket (`p2p.sock`) takes one request
+//! line, `COMMAND [ARG]` (1 KiB at most), and answers `ok` or `error: REASON`
+//! on a first line; after `ok` comes the JSON of the command, which is the
+//! types of this file, and the end of the connection.  The commands:
 //!
-//! * `GetInfo`: the version and the protocol;
-//! * `Status`, `PeerList`, `Stats`: what the node is, who it is connected
-//!   to (one peer a reply, `more`: its state and what was fetched from it)
-//!   and what it moved;
-//! * `Advertised`, `Serving`, `BeliefList`: what the node tells the peers,
-//!   what it is serving and has admitted (slots, credit), and what
-//!   it believes of each peer and layer;
-//! * `Explain`: why the pulls asked the peers they did (a bounded ring of
-//!   recent decisions, one a reply);
-//! * `ImageList`: the images of the other nodes, one a reply (`more`).
+//! * `status`, `peers`, `stats`: what the node is, who it is connected to
+//!   and what was fetched from each, and what it moved;
+//! * `advertised`, `serving`, `knowledge [LAYER]`: what the node tells the
+//!   peers, what it is serving and has admitted (slots, credit), and what it
+//!   believes of each peer and layer;
+//! * `explain [TARGET]`: why the pulls asked the peers they did (a bounded
+//!   ring of recent decisions);
+//! * `images`: the images of the other nodes, who are asked to refresh
+//!   first.
 //!
-//! Every blob that comes from a peer is untrusted and is verified by its
-//! digest by whoever uses it, as one from a registry.
+//! Who may ask: the same user or root (SO_PEERCRED).  Every blob that comes
+//! from a peer is untrusted and is verified by its digest by whoever uses
+//! it, as one from a registry.
 
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::path::{Path, PathBuf};
-use thiserror::Error;
+use std::path::Path;
 use velarx_core::store_service::ImageInfo;
-use velarx_proto::info::Info;
-use zlink::{introspect, proxy};
 
-/// The version of the protocol: a client refuses another one.
-pub const PROTO: u32 = 1;
+/// The most a request is, in bytes, the newline included.
+pub const MAX_REQUEST: u64 = 1024;
 
 /// What the pulls of this node fetched from a peer.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::CustomType)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PeerTraffic {
     /// The peer, by its libp2p id
     pub peer_id: String,
@@ -52,7 +51,7 @@ pub struct PeerTraffic {
     pub busy: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::Type)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Status {
     /// The id of this node
     pub peer_id: String,
@@ -60,7 +59,7 @@ pub struct Status {
     pub listen_addresses: Vec<String>,
     pub connected_peers: u64,
     /// Of those, the peers with no QUIC (UDP) path: members for discovery,
-    /// not asked for data (`PeerList` says why, one by one)
+    /// not asked for data (`peers` says why, one by one)
     pub connected_without_quic: u64,
     pub provider_records: u64,
     /// What the pulls of this node fetched from each peer
@@ -81,7 +80,7 @@ pub struct Status {
 }
 
 /// What the certificate of a node says of it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::CustomType)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Certificate {
     pub name: String,
     pub zone: Option<String>,
@@ -101,9 +100,7 @@ impl From<crate::authority::Admitted> for Certificate {
 
 /// What the probes of a chunk, the lookups of the DHT and the dials of the
 /// providers it named came to, since the service started.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, introspect::CustomType,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lookups {
     /// Peers whose filter of layers is believed now
     pub filter_peers: u64,
@@ -140,9 +137,7 @@ pub struct Lookups {
 
 /// The dials refused for the address they were to, by the reason
 /// (`dial_allow` of the settings).
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, introspect::CustomType,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DialsRefused {
     pub loopback: u64,
     pub link_local: u64,
@@ -157,7 +152,7 @@ pub struct DialsRefused {
 }
 
 /// A connected peer.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::CustomType)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Peer {
     /// Its libp2p id
     pub peer_id: String,
@@ -180,7 +175,7 @@ pub struct Peer {
 }
 
 /// The filter of the layers a peer told this node.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::CustomType)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PeerFilter {
     /// The layers it says it put in it, its bytes and its version
     pub keys: u64,
@@ -209,7 +204,7 @@ pub struct PeerFilter {
 /// What a node tells the peers of the layers it holds: a filter (unless
 /// `advertise_layers` is off), and with `announce_images` its images and
 /// provider records of the DHT.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::Type)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Advertised {
     /// Whether it tells the peers its images and the DHT its layers
     /// (`announce_images`)
@@ -236,14 +231,14 @@ pub struct Advertised {
 }
 
 /// The requests answered at a time, and the most.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, introspect::CustomType)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Slots {
     pub used: u64,
     pub total: u64,
 }
 
 /// What the node is serving and has admitted.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::Type)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Serving {
     /// The requests being answered over QUIC, and the most at a time
     pub quic_slots: Slots,
@@ -255,7 +250,7 @@ pub struct Serving {
 }
 
 /// What this node believes of a layer and a peer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::CustomType)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Belief {
     pub layer: String,
     pub peer_id: String,
@@ -266,16 +261,8 @@ pub struct Belief {
     pub age_secs: u64,
 }
 
-/// A reply of `BeliefList`: a belief, none in the only reply of an empty
-/// list.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::Type)]
-pub struct BeliefListed {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub belief: Option<Belief>,
-}
-
 /// One thing a pull did when it asked the peers.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::CustomType)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Step {
     /// `candidate` (a peer to ask, in order), `filters` (what the filters
     /// of the connected peers said of the layer: maybe, no, none), `probe`
@@ -295,7 +282,7 @@ pub struct Step {
 }
 
 /// A call that asked the peers for something, and what came of it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::CustomType)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Decision {
     /// Its number, in the order the node made them
     pub id: u64,
@@ -316,22 +303,7 @@ pub struct Decision {
     pub summary: String,
 }
 
-/// A reply of `Explain`: a decision, none in the only reply of an empty
-/// list.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::Type)]
-pub struct DecisionListed {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decision: Option<Decision>,
-}
-
-/// A reply of `PeerList`: a peer, none in the only reply of an empty list.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::Type)]
-pub struct PeerListed {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer: Option<Peer>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::Type)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stats {
     /// The chunks, indexes and profiles the node served over QUIC
     pub chunks_sent: u64,
@@ -340,7 +312,7 @@ pub struct Stats {
 }
 
 /// An image of another node
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::CustomType)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteImage {
     /// The node that has it
     pub peer_id: String,
@@ -348,180 +320,27 @@ pub struct RemoteImage {
     pub image: ImageInfo,
 }
 
-/// A reply of `ImageList`: an image, none in the only reply of an empty
-/// list.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::Type)]
-pub struct ImageListed {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image: Option<RemoteImage>,
-}
-
-/// Why a call failed.
-#[derive(Debug, Clone, PartialEq, zlink::ReplyError, introspect::ReplyError)]
-#[zlink(interface = "org.velarx.P2p")]
-pub enum P2pError {
-    /// A call the service does not take (a list called without `more`)
-    InvalidArgument { reason: String },
-    /// The service cannot answer now (it is not connected to its network)
-    Unavailable { reason: String },
-}
-
-impl std::fmt::Display for P2pError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidArgument { reason } => write!(f, "invalid argument: {reason}"),
-            Self::Unavailable { reason } => write!(f, "unavailable: {reason}"),
-        }
+/// Ask the service on `socket`: send the line `request` and return the JSON
+/// it answers.
+pub fn request(socket: &Path, request: &str) -> anyhow::Result<String> {
+    use std::io::{Read, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|e| anyhow::anyhow!("the service does not answer on {}: {e}", socket.display()))?;
+    let uid = rustix::net::sockopt::socket_peercred(&stream)?.uid.as_raw();
+    if !velarx_base::ipc::trusted_uid(uid) {
+        anyhow::bail!("{} is served by uid {uid}", socket.display());
     }
-}
-
-impl std::error::Error for P2pError {}
-
-/// The calls of the service, as a client makes them.
-#[proxy("org.velarx.P2p")]
-pub trait P2pProxy {
-    async fn get_info(&mut self) -> zlink::Result<Result<Info, P2pError>>;
-    async fn status(&mut self) -> zlink::Result<Result<Status, P2pError>>;
-    #[zlink(more)]
-    async fn peer_list(
-        &mut self,
-    ) -> zlink::Result<impl futures::Stream<Item = zlink::Result<Result<PeerListed, P2pError>>>>;
-    async fn stats(&mut self) -> zlink::Result<Result<Stats, P2pError>>;
-    async fn advertised(&mut self) -> zlink::Result<Result<Advertised, P2pError>>;
-    async fn serving(&mut self) -> zlink::Result<Result<Serving, P2pError>>;
-    #[zlink(more)]
-    async fn belief_list(
-        &mut self,
-        layer: Option<&str>,
-    ) -> zlink::Result<impl futures::Stream<Item = zlink::Result<Result<BeliefListed, P2pError>>>>;
-    #[zlink(more)]
-    async fn explain(
-        &mut self,
-        target: &str,
-    ) -> zlink::Result<impl futures::Stream<Item = zlink::Result<Result<DecisionListed, P2pError>>>>;
-    #[zlink(more)]
-    async fn image_list(
-        &mut self,
-        query: bool,
-    ) -> zlink::Result<impl futures::Stream<Item = zlink::Result<Result<ImageListed, P2pError>>>>;
-}
-
-#[derive(Error, Debug)]
-pub enum P2pClientError {
-    #[error("the service does not answer on {}", .socket.display())]
-    Unreachable {
-        socket: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("{0}")]
-    Service(#[from] P2pError),
-    #[error("{0}")]
-    Protocol(String),
-}
-
-pub type P2pClientResult<T> = Result<T, P2pClientError>;
-
-fn protocol(e: zlink::Error) -> P2pClientError {
-    P2pClientError::Protocol(e.to_string())
-}
-
-/// A client of the service on `socket`: one connection for each call, its
-/// `GetInfo` checked first.
-#[derive(Debug, Clone)]
-pub struct P2pClient {
-    socket: PathBuf,
-}
-
-/// A connection to the service, its `GetInfo` checked.
-macro_rules! connected {
-    ($self:ident) => {{
-        let mut conn = velarx_content::activation::connect(&$self.socket)
-            .await
-            .map_err(|source| P2pClientError::Unreachable {
-                socket: $self.socket.clone(),
-                source,
-            })?;
-        let info = conn
-            .get_info()
-            .await
-            .map_err(protocol)?
-            .map_err(P2pClientError::Service)?;
-        velarx_proto::info::check("org.velarx.P2p", &info, PROTO).map_err(|e| {
-            P2pClientError::Protocol(format!("the service on {}: {e}", $self.socket.display()))
-        })?;
-        conn
-    }};
-}
-
-macro_rules! call {
-    ($self:ident . $method:ident ( $($arg:expr),* )) => {{
-        let mut conn = connected!($self);
-        conn.$method($($arg),*)
-            .await
-            .map_err(protocol)?
-            .map_err(P2pClientError::Service)
-    }};
-}
-
-/// The records of a list call, all of them.
-macro_rules! list {
-    ($self:ident . $method:ident ( $($arg:expr),* ), $field:ident) => {{
-        use futures::StreamExt;
-        let mut conn = connected!($self);
-        let replies = conn.$method($($arg),*).await.map_err(protocol)?;
-        futures::pin_mut!(replies);
-        let mut out = Vec::new();
-        while let Some(reply) = replies.next().await {
-            out.extend(reply.map_err(protocol)?.map_err(P2pClientError::Service)?.$field);
-        }
-        Ok(out)
-    }};
-}
-
-impl P2pClient {
-    pub fn new(socket: &Path) -> Self {
-        Self {
-            socket: socket.to_path_buf(),
-        }
-    }
-
-    pub async fn status(&self) -> P2pClientResult<Status> {
-        call!(self.status())
-    }
-
-    pub async fn peers(&self) -> P2pClientResult<Vec<Peer>> {
-        list!(self.peer_list(), peer)
-    }
-
-    pub async fn stats(&self) -> P2pClientResult<Stats> {
-        call!(self.stats())
-    }
-
-    pub async fn advertised(&self) -> P2pClientResult<Advertised> {
-        call!(self.advertised())
-    }
-
-    pub async fn serving(&self) -> P2pClientResult<Serving> {
-        call!(self.serving())
-    }
-
-    /// What the node believes of the layers and the peers (of `layer` only,
-    /// when given).
-    pub async fn beliefs(&self, layer: Option<&str>) -> P2pClientResult<Vec<Belief>> {
-        list!(self.belief_list(layer), belief)
-    }
-
-    /// Why the pulls asked the peers they did: the recent decisions about
-    /// `target` (a digest, or the start of one; an image's layers are given
-    /// by the caller), the last first; all when `target` is empty.
-    pub async fn explain(&self, target: &str) -> P2pClientResult<Vec<Decision>> {
-        list!(self.explain(target), decision)
-    }
-
-    /// Images of the other nodes; asks them to refresh first when `query`.
-    pub async fn remote_images(&self, query: bool) -> P2pClientResult<Vec<RemoteImage>> {
-        list!(self.image_list(query), image)
+    writeln!(stream, "{request}")?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    let (head, json) = reply.split_once('\n').unwrap_or((&reply, ""));
+    match (head, head.strip_prefix("error: ")) {
+        ("ok", _) => Ok(json.trim_end().to_string()),
+        (_, Some(reason)) => anyhow::bail!("{reason}"),
+        _ => anyhow::bail!(
+            "the service on {} does not answer as this program asks: restart velarx-p2p",
+            socket.display()
+        ),
     }
 }
 

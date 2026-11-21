@@ -440,6 +440,32 @@ pub async fn serve_loop(
     what: &str,
     admit: impl Fn(tokio::net::UnixStream, Busy),
 ) {
+    let first_call = activity.limits.first_call;
+    serve_loop_refusing(
+        connections,
+        idle,
+        trusted,
+        activity,
+        what,
+        admit,
+        move |stream, reason| {
+            tokio::spawn(refuse(stream, reason, first_call));
+        },
+    )
+    .await;
+}
+
+/// [`serve_loop`] for a protocol other than varlink: a connection over a
+/// limit is given to `refusal` with the reason.
+pub async fn serve_loop_refusing(
+    connections: impl Into<Connections>,
+    idle: Option<IdleExit>,
+    trusted: fn(u32) -> bool,
+    activity: Arc<Activity>,
+    what: &str,
+    admit: impl Fn(tokio::net::UnixStream, Busy),
+    refusal: impl Fn(tokio::net::UnixStream, String),
+) {
     let mut connections = connections.into();
     let take = |accepted: io::Result<tokio::net::UnixStream>| match accepted {
         Ok(stream) => {
@@ -456,7 +482,7 @@ pub async fn serve_loop(
                 }
                 Err(reason) => {
                     warn!("{what}: a connection of process {pid} refused: {reason}");
-                    tokio::spawn(refuse(stream, reason, activity.limits.first_call));
+                    refusal(stream, reason);
                 }
             }
             Ok(())
