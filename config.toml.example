@@ -454,7 +454,7 @@ lazy_profile_peers = true
 # is too slow is skipped and the next one is asked.  By default
 # ["registry"].  interfaces/org.velarx.Fetcher.varlink is the interface to
 # write one.
-# sources = ["dircache", "peers", "registry"]
+# sources = ["dircache", "p2p", "registry"]
 
 [push]
 # Layers regenerated and uploaded at the same time
@@ -729,7 +729,7 @@ timeout_secs = 60
 # idle_timeout_secs = 15
 #
 # [[sources.external]]
-# name = "peers"
+# name = "p2p"
 # socket = "/run/velarx/services/p2p-fetcher.sock"
 # idle_timeout_secs = 30
 #

@@ -86,11 +86,11 @@ root_dir = "$WORKDIR/$n/root"
 [storage]
 root = "$WORKDIR/$n/store"
 [pull]
-sources = ["peers", "registry"]
+sources = ["p2p", "registry"]
 # (no background completion: a pull stays a pull, its containers lazy)
 lazy_completers = 0
 [[sources.external]]
-name = "peers"
+name = "p2p"
 socket = "$WORKDIR/$n/services/p2p-fetcher.sock"
 idle_timeout_secs = 30
 EOT

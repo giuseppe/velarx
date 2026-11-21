@@ -139,11 +139,11 @@ UDP 4001 between the nodes. Then add the service as a content source in
 
 ```toml
 [[sources.external]]
-name = "peers"
+name = "p2p"
 socket = "/run/velarx/services/p2p-fetcher.sock"
 
 [pull]
-sources = ["peers", "registry"]
+sources = ["p2p", "registry"]
 ```
 
 Nothing listens on the network until you set `listen_addresses`. See

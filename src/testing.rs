@@ -872,7 +872,7 @@ mod tests {
     /// the peers (`crates/` + that name): the file, the part of a line that
     /// makes it allowed, and why.  Everything else in the engine knows the
     /// service as a source or a provider named in the configuration.
-    const MAY_NAME_THE_SERVICE: [(&str, &str, &str); 6] = [
+    const MAY_NAME_THE_SERVICE: [(&str, &str, &str); 7] = [
         ("Cargo.toml", "crates/p2p", "the workspace member"),
         (
             "Cargo.toml",
@@ -893,6 +893,11 @@ mod tests {
             "config.toml.example",
             "p2p-fetcher.sock",
             "the socket of one source, the example of [[sources.external]]",
+        ),
+        (
+            "config.toml.example",
+            "\"p2p\"",
+            "the name of the source in the examples of [[sources.external]] and [pull] sources",
         ),
         (
             "config.toml.example",

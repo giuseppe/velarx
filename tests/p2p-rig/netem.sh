@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 # netem.sh [-m MB] [-r RUNS] [-t SECONDS] [-u MBIT] [-l SHAPE]...: three seeds
-# hold an image, a new puller pulls it from them (sources peers, registry) over
+# hold an image, a new puller pulls it from them (sources p2p, registry) over
 # a link shaped by each SHAPE (netem arguments, both directions, e.g.
 # "delay 5ms 2ms" or "delay 25ms loss 1%"), RUNS times each, SECONDS at most.
 # The QUIC connections of the peers must stay fast under jitter, reordering
@@ -49,7 +49,7 @@ for shape in "${shapes[@]}"; do
         w=$(echo "$(date +%s.%N) - $s" | bc)
         tc -n "${NSP}-n3" qdisc del dev eth0 root 2> /dev/null
         tc -n "${NSP}-hub" qdisc del dev "$hub" root 2> /dev/null
-        log "[${shape:-none}] run $r: rc=$rc wall=${w}s $(grep -o '[0-9.]*% registry, [0-9.]*% peers' "$OUT/pull-$n.log")"
+        log "[${shape:-none}] run $r: rc=$rc wall=${w}s $(grep -o '[0-9.]*% registry, [0-9.]*% p2p' "$OUT/pull-$n.log")"
         forget_nodes 3
     done
 done

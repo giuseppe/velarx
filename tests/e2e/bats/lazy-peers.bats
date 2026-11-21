@@ -122,11 +122,11 @@ store_service = true
 [storage]
 root = "$WORKDIR/$n/store"
 [pull]
-sources = ["peers", "registry"]
+sources = ["p2p", "registry"]
 # (no background completion: a pull stays a pull, its containers lazy)
 lazy_completers = 0
 [[sources.external]]
-name = "peers"
+name = "p2p"
 socket = "$WORKDIR/$n/services/p2p-fetcher.sock"
 idle_timeout_secs = 30
 EOT
@@ -270,7 +270,7 @@ wait_profile () { e2e_wait_glob "$WORKDIR/b/store/composefs/*.profile.json" 5; }
     e2e_wait_line "$WORKDIR/f.p2p.log" "Connected to $e_id" 30 || true
     out=$(sh_ f image pull --tls-verify=false "$VERSIONS:1" 2>&1)
     check "node f pulls the first version" 0 $?
-    # (the text of the pull: "Total: 3.2 MB (0.4% registry, ..., 99.5% peers)")
+    # (the text of the pull: "Total: 3.2 MB (0.4% registry, ..., 99.5% p2p)")
     check_match "the registry gave only the metadata" "\([0-4]\.[0-9]% registry" "$out"
-    check_match "the peer gave the file" "(9[5-9]|100)\.[0-9]% peers" "$out"
+    check_match "the peer gave the file" "(9[5-9]|100)\.[0-9]% p2p" "$out"
 }

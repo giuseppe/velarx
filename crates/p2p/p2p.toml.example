@@ -10,11 +10,11 @@
 # configuration:
 #
 #   [[sources.external]]
-#   name = "peers"
+#   name = "p2p"
 #   socket = "/run/velarx/services/p2p-fetcher.sock"
 #   idle_timeout_secs = 30
 #   [pull]
-#   sources = ["peers", "registry"]
+#   sources = ["p2p", "registry"]
 
 # Control socket of the service, the varlink interface `org.velarx.P2p` that
 # `velarx-p2p status` calls (default: p2p.sock in the services directory of

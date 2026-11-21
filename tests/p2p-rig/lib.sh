@@ -152,7 +152,7 @@ EOT
 # NOKEY=1: no swarm key (the node has a certificate).  ENGINE_EXTRA: a file
 # appended to engine.toml.
 node () {
-    local i=$1 extra=${2:-} d=$W/nodes/n$1 boot="" a b sources='["peers", "registry"]'
+    local i=$1 extra=${2:-} d=$W/nodes/n$1 boot="" a b sources='["p2p", "registry"]'
     a=$(ip_of "$i")
     install -d -m 700 -o "$RUSER" -g "$RUSER" "$d" "$d/home" "$d/run" "$d/home/.config" "$d/home/data"
     [ -n "${NOP2P:-}" ] && sources='["registry"]'
@@ -169,7 +169,7 @@ root = "$d/store"
 [pull]
 sources = $sources
 [[sources.external]]
-name = "peers"
+name = "p2p"
 socket = "$d/services/p2p-fetcher.sock"
 idle_timeout_secs = 30
 EOT

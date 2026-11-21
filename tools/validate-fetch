@@ -35,8 +35,8 @@
 #   --sources-config FILE the `[pull]` / `[[sources.external]]` part of the
 #                         configuration of both nodes; @SOCKDIR@ in it is the
 #                         directory of the sockets of the node, @REGISTRY@ the
-#                         registry.  Default: a `peers` socket source and
-#                         `sources = ["peers", "registry"]`.  Step 4 is
+#                         registry.  Default: a `p2p` socket source and
+#                         `sources = ["p2p", "registry"]`.  Step 4 is
 #                         skipped with the reason when the P2P service does
 #                         not start with it
 #   --out FILE.json       the result file (default: validate-fetch.json in the
@@ -88,7 +88,7 @@
 #   4. The peers: both nodes run `velarx-p2p` (node A on this host, listening
 #      on --host-addr, B bootstraps to it with its peer id and the swarm key
 #      is copied); A has the images; B pulls them with
-#      `[pull] sources = ["peers", "registry"]` under strace.  It prints the
+#      `[pull] sources = ["p2p", "registry"]` under strace.  It prints the
 #      bytes B got from the peers (`velarx-p2p status` of B: bytes_received)
 #      and from the registry (the request log: blob bodies), and the sync calls
 #      of B.
@@ -389,9 +389,9 @@ EOF
 	else
 		cat > "$root/$n.sources.toml" <<EOF
 [pull]
-sources = ["peers", "registry"]
+sources = ["p2p", "registry"]
 [[sources.external]]
-name = "peers"
+name = "p2p"
 socket = "$sock/p2p-fetcher.sock"
 idle_timeout_secs = 30
 EOF

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # rollout.sh [-n PULLERS] [-m MB_LAYER1[,MB_LAYER2]] [-s NETEM]: a new image
 # lands on N nodes at once; node 0 has it (pulled from the registry), the
-# others pull it with sources peers, registry.  Reports how the pulls were
+# others pull it with sources p2p, registry.  Reports how the pulls were
 # fed (registry share, load of the registry, spread over the peers); see
 # analyze.py.  Links of 1 Gbit/s; -s shapes the registry's egress (netem
 # arguments, e.g. "delay 10ms").  Defaults: 8 pullers, layers of 20 and 5 MB.
