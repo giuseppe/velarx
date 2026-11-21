@@ -800,6 +800,7 @@ impl ImageService {
             // no time when a prune could take it
             lease: opts.lease.clone(),
             pulled: Vec::new(),
+            indexes: Vec::new(),
             access: None,
             recorded,
         };

@@ -4,8 +4,8 @@
 //! holds it shared.  In order: the leases of pulls that died and their
 //! staging directories (and staging directories without a lease), the
 //! expired chunks, the layers no image uses and no lease pins, the files no
-//! layer references (with their chunk locations), and the files on disk the
-//! database does not know.
+//! layer references (with their chunk locations), the files on disk the
+//! database does not know, and the kept indexes that list no image.
 
 use crate::storage_driver::{Keep, StorageDriver};
 use serde::Serialize;
@@ -542,6 +542,12 @@ impl GcService {
             // have, those this collection removed included: they go with
             // them, not with the next collection.
             self.collect_storage(&mut report).await?;
+            // (an index is kept for the images it lists, those of the staged
+            // pulls included; a pull that holds its lease has kept its
+            // indexes and not recorded its image yet)
+            if let Err(e) = self.collect_indexes().await {
+                report.errors.push(format!("the kept indexes: {e}"));
+            }
             // (the rows the collection removed leave free pages in the file)
             if let Err(e) = self.db.shrink().await {
                 report
@@ -558,6 +564,23 @@ impl GcService {
             report.bytes_freed
         );
         Ok(report)
+    }
+
+    /// Forget the kept indexes that list no image of the store nor of a
+    /// staged pull, unless a pull is in progress.
+    async fn collect_indexes(&self) -> GcResult<()> {
+        if self.pull_in_progress().await? {
+            return Ok(());
+        }
+        let staged = self
+            .staging()
+            .pulls()
+            .into_iter()
+            .map(|p| p.pull.manifest_digest)
+            .collect();
+        let n = self.db.forget_unlisted_indexes(staged).await?;
+        debug!("Forgot {n} indexes that list no image");
+        Ok(())
     }
 
     /// Whether a pull holds a lease (a process holds its lock).

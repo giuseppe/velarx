@@ -780,6 +780,45 @@ impl Database {
             .map_err(DbError::Sqlite)
     }
 
+    /// Forget the kept indexes that list no image of the store nor one of
+    /// `staged` (the manifest digests of the pulls in progress), neither
+    /// themselves nor through a kept index they list.  The number forgotten.
+    pub async fn forget_unlisted_indexes(&self, staged: Vec<Digest>) -> DbResult<usize> {
+        self.conn
+            .call(move |conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let mut indexes: Vec<(String, String)> = tx
+                    .prepare("SELECT key, value FROM store_settings WHERE key LIKE 'index:%'")?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<_, _>>()?;
+                let mut listed: Vec<String> = tx
+                    .prepare("SELECT manifest_digest FROM images")?
+                    .query_map([], |r| r.get(0))?
+                    .collect::<Result<_, _>>()?;
+                listed.extend(staged.iter().map(Digest::to_string));
+                // (an index that lists a listed digest is kept, and its own
+                // digest is then listed: as deep as indexes go)
+                while !listed.is_empty() {
+                    let (kept, rest) = indexes
+                        .into_iter()
+                        .partition(|(_, v)| listed.iter().any(|d| v.contains(d.as_str())));
+                    indexes = rest;
+                    listed = kept
+                        .into_iter()
+                        .map(|(k, _): (String, String)| k["index:".len()..].to_string())
+                        .collect();
+                }
+                for (key, _) in &indexes {
+                    tx.execute("DELETE FROM store_settings WHERE key = ?1", [key])?;
+                }
+                tx.commit()?;
+                Ok(indexes.len())
+            })
+            .await
+            .map_err(DbError::Sqlite)
+    }
+
     /// The bytes kept for the index `digest`, as stored (not checked).
     pub async fn index(&self, digest: &Digest) -> DbResult<Option<String>> {
         let key = format!("index:{digest}");
@@ -3548,6 +3587,33 @@ mod tests {
             "/run/a"
         );
     }
+    /// The collection forgets a kept index that lists no image of the store,
+    /// and keeps one that lists an image or a pull in progress, itself or
+    /// through another index.
+    #[tokio::test]
+    async fn the_indexes_that_list_no_image_are_forgotten() {
+        let db = Database::open_in_memory().await.unwrap();
+        let image = record("a");
+        db.insert_image(&image).await.unwrap();
+        let sha = |s: &str| Digest::of(Algorithm::Sha256, s.as_bytes());
+        let lists = |d: &Digest| format!(r#"{{"manifests":[{{"digest":"{d}"}}]}}"#);
+        let (inner, outer, gone) = (sha("inner"), sha("outer"), sha("gone"));
+        db.set_index(&inner, &lists(&image.manifest_digest))
+            .await
+            .unwrap();
+        db.set_index(&outer, &lists(&inner)).await.unwrap();
+        db.set_index(&gone, &lists(&sha("other"))).await.unwrap();
+        let staged = sha("staged");
+        db.set_index(&sha("of a pull"), &lists(&staged))
+            .await
+            .unwrap();
+        assert_eq!(db.forget_unlisted_indexes(vec![staged]).await.unwrap(), 1);
+        assert!(db.index(&inner).await.unwrap().is_some());
+        assert!(db.index(&outer).await.unwrap().is_some());
+        assert!(db.index(&sha("of a pull")).await.unwrap().is_some());
+        assert!(db.index(&gone).await.unwrap().is_none());
+    }
+
     /// The manifest and the configuration of an image, and a kept index,
     /// are found by their digests.
     #[tokio::test]

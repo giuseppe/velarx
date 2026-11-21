@@ -328,6 +328,7 @@ impl ImageService {
                         lease: None,
                         pulled: Vec::new(),
                         access: None,
+                        indexes: Vec::new(),
                         recorded: Vec::new(),
                     };
                     self.install(net.clone(), incoming, progress_tx.clone(), start)

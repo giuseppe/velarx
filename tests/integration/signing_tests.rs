@@ -155,6 +155,49 @@ async fn source_trusting(dirs: &Dirs, hosts: &[&str]) -> Env {
     a
 }
 
+/// A pull the policy refuses records nothing of the image, not even the
+/// index it went through; one it accepts records the index.
+#[tokio::test]
+async fn test_a_pull_the_policy_refuses_records_no_index() {
+    let dirs = Dirs::new();
+    let e = env_with(dirs.config()).await;
+    let layer = build_gzip(&[Item::File {
+        name: "etc/hello",
+        data: b"hello\n".to_vec(),
+        chunk: 4096,
+    }]);
+    let arch = velarx_registry::target::host_arch();
+    let digest = publish_arch(&e.reg, &[&layer], &[GZIP], arch, "*");
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": digest, "size": 1,
+            "platform": {"architecture": arch, "os": "linux"},
+        }],
+    })
+    .to_string()
+    .into_bytes();
+    let index_digest = Digest::of(Algorithm::Sha256, &index);
+    e.reg
+        .blobs
+        .lock()
+        .unwrap()
+        .insert("manifest:latest".into(), index);
+    // (no signature of the key: refused)
+    dirs.allow(&e.host, "test");
+    assert!(e.pull().await.is_err());
+    assert_eq!(e.db.index(&index_digest).await.unwrap(), None);
+    std::fs::write(
+        dirs.dir.path().join("policy.json"),
+        r#"{"default":[{"type":"insecureAcceptAnything"}]}"#,
+    )
+    .unwrap();
+    e.pull().await.unwrap();
+    assert!(e.db.index(&index_digest).await.unwrap().is_some());
+}
+
 #[tokio::test]
 async fn test_a_signed_push_is_pulled_under_a_sigstore_policy() {
     let dirs = Dirs::new();

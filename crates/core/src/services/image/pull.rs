@@ -246,6 +246,9 @@ pub(super) struct Incoming {
     /// image (a lazy pull's: the staging area keeps them until the image is
     /// committed).
     pub pulled: Vec<(String, Vec<u8>)>,
+    /// The indexes that led to the manifest, by digest, kept once the store
+    /// is locked for the pull ([`ImageService::keep_indexes`]).
+    pub indexes: Vec<(Digest, Bytes)>,
     /// The credentials and certificates the layers are fetched with (a pull
     /// from a registry)
     pub access: Option<velarx_registry::auth::RegistryAccess>,
@@ -1019,6 +1022,19 @@ impl ImageService {
         }))
     }
 
+    /// Keep the bytes of the indexes that led to the manifest of a pull: an
+    /// image named later by the digest of an index is verified from that
+    /// index (a start hashes the bytes again).  Called once the image is in
+    /// the store, staged, or the store is locked for the pull, so that the
+    /// collection, which forgets the indexes that list no image, never sees
+    /// them first.
+    async fn keep_indexes(&self, indexes: &[(Digest, Bytes)]) -> ImageResult<()> {
+        for (digest, bytes) in indexes {
+            self.db.set_index(digest, &utf8(bytes, "index")?).await?;
+        }
+        Ok(())
+    }
+
     /// A pull of an image whose pull is in progress joins it: its names and
     /// signatures are added to the staged ones, and an eager pull completes
     /// it (the files are not fetched a second time).  None: there is no such
@@ -1139,11 +1155,6 @@ impl ImageService {
             .manifest_raw(&image_ref, platform.as_ref(), Some(&stored))
             .await?;
         velarx_base::trace::point("pull manifest");
-        // (an image named later by the digest of an index is verified from
-        // that index: a start hashes the bytes again)
-        for (digest, bytes) in &indexes {
-            self.db.set_index(digest, &utf8(bytes, "index")?).await?;
-        }
         // the policy, before anything else of the image is read
         let signatures = self
             .verify_signatures(
@@ -1190,6 +1201,7 @@ impl ImageService {
             )
             .await?
         {
+            self.keep_indexes(&indexes).await?;
             for (reference, signatures) in signed {
                 self.db
                     .set_pulled_image(&manifest_digest, &reference, signatures)
@@ -1215,6 +1227,7 @@ impl ImageService {
             .join_staged(&image_id, names, &signed, (lazy, &access), start)
             .await?
         {
+            self.keep_indexes(&indexes).await?;
             for layer in &manifest.layers {
                 let n = layer.size.max(0) as u64;
                 progress(&progress_tx, layer, "exists", n, true);
@@ -1245,6 +1258,7 @@ impl ImageService {
             states: false,
             lease: None,
             pulled: signed,
+            indexes,
             access: Some(velarx_content::pull::access::access_for(
                 client,
                 &image_ref.full_name(),
@@ -1300,6 +1314,7 @@ impl ImageService {
             states,
             lease: image_lease,
             pulled,
+            indexes,
             access,
             recorded,
         } = incoming;
@@ -1382,6 +1397,7 @@ impl ImageService {
             .lock_layers(&missing, !lazy && (registry_ref.is_some() || via.is_some()))
             .await?;
         let store = self.lock_store().await?;
+        self.keep_indexes(&indexes).await?;
         let mut stored = self.stored_layers(&expected, &config).await?;
         if stored.iter().any(|ok| !ok) {
             if let Some(done) = self

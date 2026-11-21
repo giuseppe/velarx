@@ -292,6 +292,7 @@ impl ImageService {
             lease: None,
             pulled: Vec::new(),
             access: None,
+            indexes: Vec::new(),
             recorded: Vec::new(),
         };
         let (progress, mut rx) = mpsc::channel(8);
