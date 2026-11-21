@@ -376,7 +376,8 @@ impl<'a> Durable<'a> {
 
     /// `contents` for `path`, in place of what is there, read-only; with
     /// `verity` (the algorithm of the digests of the layer), fs-verity with
-    /// its hash is enabled on it where the file system has it.
+    /// its hash is enabled on it where the file system has it, and a failure
+    /// to enable it there is an error.
     fn replace(
         &mut self,
         path: &Path,
@@ -394,16 +395,13 @@ impl<'a> Durable<'a> {
         // (closed for writing, and writable by its owner: what enabling
         // fs-verity needs)
         let tmp = tmp.into_temp_path();
+        // (where the file system has fs-verity, never an image without it:
+        // the overlay is mounted with the verity of the store, and the image
+        // would be measured against nothing)
         if let Some((m, alg)) = VerityMode::On.manager().zip(verity) {
-            match m.for_algorithm(alg).enable(&tmp) {
-                Ok(()) => {}
-                // (never an image of a layer of this hash without it: a
-                // check against the digest of the layer would find none)
-                Err(e @ velarx_storage::FsVerityError::AlgorithmUnavailable(_)) => {
-                    return Err(std::io::Error::other(e.to_string()))
-                }
-                Err(_) => {}
-            }
+            m.for_algorithm(alg)
+                .enable(&tmp)
+                .map_err(|e| std::io::Error::other(format!("{}: {e}", path.display())))?;
         }
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444))?;
         self.files.push((tmp, path.to_path_buf()));
@@ -778,6 +776,23 @@ pub struct ComposefsDriver {
     /// What fs-verity stored files get
     fsverity: VerityMode,
     options: ComposefsOptions,
+    /// [`Self::store_has_verity`]
+    store_verity: std::sync::OnceLock<bool>,
+}
+
+/// The `verity=` of the overlay: what the store requires, else what its file
+/// system has (`store`), never what an image of a layer happens to have.  The
+/// overlay checks the fs-verity digests of the files where the store has
+/// fs-verity, as the images of its layers and its objects then have it (on a
+/// file system without it, every digest would be one that the file lacks).
+fn overlay_verity(mode: VerityMode, enforce: bool, store: impl FnOnce() -> bool) -> &'static str {
+    match mode {
+        _ if enforce => "require",
+        VerityMode::Require => "require",
+        VerityMode::Off => "off",
+        VerityMode::On if store() => "on",
+        VerityMode::On => "off",
+    }
 }
 
 /// Why the image server's mount could not be made: the words, and whether
@@ -866,11 +881,19 @@ impl ComposefsDriver {
             staging_dir,
             fsverity,
             options,
+            store_verity: std::sync::OnceLock::new(),
         }
     }
 
     fn staging(&self) -> Staging {
         Staging::new(&self.staging_dir)
+    }
+
+    /// Whether the file system of the store has fs-verity (probed once).
+    fn store_has_verity(&self) -> bool {
+        *self
+            .store_verity
+            .get_or_init(|| velarx_storage::probe(self.store.root()).is_ok())
     }
 
     /// A directory beside the objects of the store (the one the images of the
@@ -1056,22 +1079,12 @@ impl ComposefsDriver {
         } = req;
         let (image, layers, mapping, enforce) = (*image, *layers, *mapping, verity.enforced());
         let files = self.layer_images(&image.id, layers)?;
-        // The overlay checks the fs-verity digests of the files where the
-        // store has fs-verity: the images of its layers have it then, as its
-        // objects (on a file system without it, every digest would be one
-        // that the file lacks, and so on one whose blocks are smaller than
-        // those of the digests that name the files).
         let has_verity = files
             .first()
             .is_some_and(|(image, _)| velarx_fuse::view::layer_image_has_verity(image));
         let first_image = files.first().map(|(image, _)| image.clone());
         let enforce = enforce || self.options.digests == ComposefsDigests::Require;
-        let verity = match (self.fsverity, has_verity, enforce) {
-            (_, _, true) | (VerityMode::Require, _, _) => "require",
-            (VerityMode::Off, _, _) | (VerityMode::On, false, _) => "off",
-            (VerityMode::On, true, _) => "on",
-        }
-        .to_string();
+        let verity = overlay_verity(self.fsverity, enforce, || self.store_has_verity()).to_string();
         let complete = !image.is_lazy;
         // (the kernel cannot check the files an image lacks, and nothing
         // else would: the files of a lazy image come as the container reads
@@ -2971,6 +2984,18 @@ mod tests {
                 && said.contains("digests are enforced"),
             "{said}"
         );
+    }
+
+    /// The `verity=` of the overlay is the store's: what it requires, else
+    /// whether its file system has fs-verity, asked only then.
+    #[test]
+    fn the_verity_of_the_overlay_is_the_stores() {
+        let never = || -> bool { panic!("the store is not asked") };
+        assert_eq!(overlay_verity(VerityMode::Off, true, never), "require");
+        assert_eq!(overlay_verity(VerityMode::Require, false, never), "require");
+        assert_eq!(overlay_verity(VerityMode::Off, false, never), "off");
+        assert_eq!(overlay_verity(VerityMode::On, false, || true), "on");
+        assert_eq!(overlay_verity(VerityMode::On, false, || false), "off");
     }
 
     /// Where the store requires fs-verity, an image without it is refused
