@@ -528,17 +528,27 @@ fn storage_error(store: &FileStore, what: String) -> io::Error {
 }
 
 /// The object the store holds under `verity` ([`FileStore::holds`]),
-/// `checked` when the kernel measures it as its name.
-fn present(store: &FileStore, verity: &str, size: u64) -> Option<Object> {
-    if !store.holds(verity, size) {
-        return None;
+/// `checked` when the kernel measures it as its name.  A file the kernel
+/// measures as another object is an error of the store: a record names
+/// only the object that was measured.
+fn present(store: &FileStore, verity: &str, size: u64) -> io::Result<Option<Object>> {
+    let Some(object) = Object::new(verity, false).filter(|_| store.holds(verity, size)) else {
+        return Ok(None);
+    };
+    let measured = store
+        .local_path(verity)
+        .and_then(|p| File::open(p).ok())
+        .and_then(|f| measure(&f, object.alg()));
+    match measured {
+        Some(m) if m != object.verity => Err(storage_error(
+            store,
+            format!("the object {verity} is measured by the kernel as {m}"),
+        )),
+        m => Ok(Some(Object {
+            checked: m.is_some(),
+            ..object
+        })),
     }
-    let checked = File::open(store.local_path(verity)?)
-        .ok()
-        .and_then(|f| measure_file(&f).ok())
-        .and_then(|m| m.object())
-        .is_some_and(|o| o.to_string() == verity);
-    Object::new(verity, checked)
 }
 
 /// The kernel's measure of `file` in `alg`, of the canonical block size.
@@ -820,7 +830,10 @@ fn prepare_one(
                 .ok()
                 .map(|s| s.st_size as u64)
         });
-        if let Some(object) = size.and_then(|size| present(store, v, size)) {
+        if let Some(object) = match size {
+            Some(size) => present(store, v, size)?,
+            None => None,
+        } {
             let _ = unlinkat(dir, rel, AtFlags::empty());
             return done(Step::Linked(object));
         }
@@ -935,7 +948,7 @@ fn prepare_one(
     }
     if let Some(m) = &measured {
         if !matches!(want.check, Check::Verity(_)) {
-            if let Some(object) = present(store, m, meta.len()) {
+            if let Some(object) = present(store, m, meta.len())? {
                 let _ = unlinkat(dir, rel, AtFlags::empty());
                 return done(Step::Linked(object));
             }
@@ -974,7 +987,7 @@ fn prepare_one(
         let Some(object) = Object::new(&computed, false) else {
             return wrong("not an fs-verity digest");
         };
-        if let Some(object) = present(store, &object.verity, meta.len()) {
+        if let Some(object) = present(store, &object.verity, meta.len())? {
             let _ = unlinkat(dir, rel, AtFlags::empty());
             return done(Step::Linked(object));
         }
@@ -1051,7 +1064,7 @@ fn prepare_one(
     let Some(object) = kernel.or_else(|| Object::new(&computed, false)) else {
         return wrong("not an fs-verity digest");
     };
-    if let Some(object) = present(store, &object.verity, meta.len()) {
+    if let Some(object) = present(store, &object.verity, meta.len())? {
         drop_name(dir, rel, &meta);
         return done(Step::Linked(object));
     }

@@ -1247,6 +1247,32 @@ mod tests {
         );
     }
 
+    /// On a file system with fs-verity (VELARX_VERITY_DIR): a file that the
+    /// store got under the name of a staged one before its commit, and that
+    /// the kernel measures as another object (same size, other bytes,
+    /// fs-verity of its own), is an error of the store at the commit, never
+    /// the object a record names.
+    #[test]
+    fn a_stored_file_measured_as_another_object_is_an_error() {
+        let Some(dir) = std::env::var_os("VELARX_VERITY_DIR") else {
+            eprintln!("VELARX_VERITY_DIR not set: skipped");
+            return;
+        };
+        let tmp = tempfile::tempdir_in(dir).unwrap();
+        let store = Arc::new(FileStore::new(tmp.path().join("files")).unwrap());
+        let verity = velarx_storage::VerityMode::On.manager().unwrap();
+        let alg = velarx_types::digest::Algorithm::Sha256;
+        let d = velarx_storage::fsverity_digest_of(alg, b"hello");
+        let s = Session::create(&tmp.path().join("staging"), store.clone()).unwrap();
+        s.put(&d, b"hello").unwrap();
+        let path = store.local_path(&d).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"evil!").unwrap();
+        verity.enable(&path).unwrap();
+        let e = s.commit(Some(&verity)).unwrap_err().to_string();
+        assert!(e.contains(&format!("the object {d} is measured")), "{e}");
+    }
+
     /// On a file system with fs-verity (VELARX_VERITY_DIR): with
     /// `fsverity_require` the commit refuses a file whose fs-verity is made
     /// with blocks smaller than 4096 bytes (as a file system with smaller
