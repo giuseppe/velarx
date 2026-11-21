@@ -375,7 +375,7 @@ pub struct Quic {
     window: u64,
     /// The addresses no connection could be made to, when and why
     unreachable: Mutex<HashMap<SocketAddr, (tokio::time::Instant, String)>>,
-    served: Arc<std::sync::atomic::AtomicU64>,
+    served: Arc<Served>,
     /// The bytes of chunks read from the peers so far, as they come
     received: Arc<std::sync::atomic::AtomicU64>,
     /// The requests the server answers at the same time, and its slots
@@ -883,9 +883,14 @@ impl Quic {
         self.slots.taken()
     }
 
-    /// The chunks served so far.
+    /// The chunks, indexes and profiles served so far.
     pub fn served(&self) -> u64 {
-        self.served.load(std::sync::atomic::Ordering::Relaxed)
+        self.served.items.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The bytes of the answers sent so far.
+    pub fn served_bytes(&self) -> u64 {
+        self.served.bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Stop serving and close the connections: the endpoint answers nothing
@@ -1804,11 +1809,19 @@ impl Drop for ExtraPlace {
     }
 }
 
+/// What the server sent: the chunks, indexes and profiles, and the bytes
+/// of its answers.
+#[derive(Default)]
+struct Served {
+    items: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
 /// The state of the serving side.
 struct Server {
     provider: SharedProvider,
     slots: Arc<Slots>,
-    served: Arc<std::sync::atomic::AtomicU64>,
+    served: Arc<Served>,
     auth: Auth,
     limits: Limits,
     connections: Arc<Semaphore>,
@@ -1942,7 +1955,13 @@ impl Server {
             .get()
             .cloned()
             .ok_or_else(|| io::Error::other("no chunk provider"))?;
-        let mut answer = Answer::new(&mut send, &self.admission, Caller::new(ip), &self.limits);
+        let mut answer = Answer::new(
+            &mut send,
+            &self.admission,
+            &self.served,
+            Caller::new(ip),
+            &self.limits,
+        );
         match head[0] {
             OP_CHUNKS => {
                 self.chunks(&mut answer, &provider, urgency, &digests)
@@ -2052,9 +2071,16 @@ impl Server {
                 head.push(HERE);
                 head.extend_from_slice(&(index.len() as u64).to_be_bytes());
                 answer.write(&head).await?;
+                let parts = index.len().div_ceil(piece);
                 for (i, part) in index.chunks(piece).enumerate() {
                     if i > 0 {
                         answer.pace(part.len() as u64, None).await;
+                    }
+                    if i + 1 == parts {
+                        // (counted before the peer can have its last byte)
+                        self.served
+                            .items
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     answer.write(part).await?;
                 }
@@ -2156,10 +2182,7 @@ impl Server {
                             Err(()) => Sent::Failed,
                         };
                         match sent {
-                            Sent::Yes => {
-                                self.served
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
+                            Sent::Yes => {}
                             Sent::No => {
                                 answer.write(&[if full { NO_ROOM } else { ABSENT }]).await?
                             }
@@ -2205,9 +2228,11 @@ impl Server {
             #[cfg(test)]
             self.held.read(run[..sent].iter().map(|c| c.len).sum());
             if sent > 0 {
-                answer.write_bytes(wire.into()).await?;
+                // (counted before the peer can have them)
                 self.served
+                    .items
                     .fetch_add(sent as u64, std::sync::atomic::Ordering::Relaxed);
+                answer.write_bytes(wire.into()).await?;
                 #[cfg(test)]
                 self.held.written(run[..sent].iter().map(|c| c.len).sum());
             }
@@ -2325,6 +2350,12 @@ impl Server {
                 head.extend_from_slice(&len.to_be_bytes());
                 answer.write(&head).await?;
             }
+            if at + n == len {
+                // (counted before the peer can have its last byte)
+                self.served
+                    .items
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             answer.write_bytes(bytes).await?;
             #[cfg(test)]
             if matches!(source, Source::File(..)) {
@@ -2371,6 +2402,8 @@ enum Source {
 struct Answer<'a> {
     send: &'a mut quinn::SendStream,
     admission: &'a Admission,
+    /// Where the bytes are counted, before they are written
+    served: &'a Served,
     who: Caller,
     grace: Duration,
     /// When the peer last had a byte of the answer (or sent its request)
@@ -2384,12 +2417,14 @@ impl<'a> Answer<'a> {
     fn new(
         send: &'a mut quinn::SendStream,
         admission: &'a Admission,
+        served: &'a Served,
         who: Caller,
         limits: &Limits,
     ) -> Self {
         Self {
             send,
             admission,
+            served,
             who,
             grace: limits.grace,
             answered: tokio::time::Instant::now(),
@@ -2421,9 +2456,18 @@ impl<'a> Answer<'a> {
         let _ = self.send.reset(quinn::VarInt::from(FAILED));
     }
 
+    /// `len` bytes more of the answer, counted before the peer can have
+    /// them.
+    fn count(&mut self, len: usize) {
+        self.sent += len as u64;
+        self.served
+            .bytes
+            .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Write `buf`, for which the credit was waited for.
     async fn write(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.sent += buf.len() as u64;
+        self.count(buf.len());
         let written = write(self.send, buf, self.grace).await;
         self.answered = tokio::time::Instant::now();
         written
@@ -2431,7 +2475,7 @@ impl<'a> Answer<'a> {
 
     /// [`Answer::write`] of bytes the stream takes as they are (no copy).
     async fn write_bytes(&mut self, buf: bytes::Bytes) -> io::Result<()> {
-        self.sent += buf.len() as u64;
+        self.count(buf.len());
         let written = tokio::time::timeout(self.grace, self.send.write_chunk(buf))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "QUIC write"))

@@ -37,9 +37,10 @@ pub struct PeerTraffic {
     pub requests: u64,
     /// Those that failed
     pub failures: u64,
-    /// The chunks it sent that matched their digests
+    /// What it sent: the chunks that matched their digests, the indexes of
+    /// layers and the startup profiles
     pub chunks_received: u64,
-    /// The bytes of those chunks
+    /// The bytes of those
     pub bytes_received: u64,
     /// The average time of an answer, in milliseconds
     pub average_ms: Option<f64>,
@@ -62,6 +63,10 @@ pub struct Status {
     pub provider_records: u64,
     /// What the pulls of this node fetched from each peer
     pub peers: Vec<PeerTraffic>,
+    /// What this node served its peers: the chunks, indexes and profiles,
+    /// and the bytes of its answers
+    pub chunks_sent: u64,
+    pub bytes_sent: u64,
     /// How the questions of who has what were answered
     pub lookups: Lookups,
     /// What the certificate of this node says of it (`name`, `zone`, `role`),
@@ -326,8 +331,10 @@ pub struct PeerListed {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::Type)]
 pub struct Stats {
-    /// The chunks the node served over QUIC
+    /// The chunks, indexes and profiles the node served over QUIC
     pub chunks_sent: u64,
+    /// The bytes of its answers
+    pub bytes_sent: u64,
 }
 
 /// An image of another node

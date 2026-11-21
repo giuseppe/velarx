@@ -217,6 +217,7 @@ mod control {
         /// What the node is: its id, addresses, peers and the DHT.
         async fn status(&self) -> Status {
             let status = self.0.node.status();
+            let served = self.0.node.get_stats().await;
             Status {
                 peer_id: status.peer_id.to_string(),
                 listen_addresses: status
@@ -228,6 +229,8 @@ mod control {
                 connected_without_quic: self.0.node.without_quic().await as u64,
                 provider_records: status.provider_records as u64,
                 peers: peer_traffic(&self.0.knowledge),
+                chunks_sent: served.chunks_sent,
+                bytes_sent: served.bytes_sent,
                 lookups: self.0.node.lookups().await,
                 certificate: self.0.node.authority().map(|a| a.this_node().into()),
                 admission_refused: self.0.node.authority().map_or(0, |a| a.refused()),
@@ -380,6 +383,7 @@ mod control {
             let stats = self.0.node.get_stats().await;
             Stats {
                 chunks_sent: stats.chunks_sent,
+                bytes_sent: stats.bytes_sent,
             }
         }
 
@@ -810,8 +814,12 @@ mod tests {
         ] {
             assert!(!text.contains(name), "{name} is in the interface");
         }
-        let stats = serde_json::to_value(Stats { chunks_sent: 1 }).unwrap();
-        assert_eq!(stats.as_object().unwrap().len(), 1);
+        let stats = serde_json::to_value(Stats {
+            chunks_sent: 1,
+            bytes_sent: 10,
+        })
+        .unwrap();
+        assert_eq!(stats.as_object().unwrap().len(), 2);
         let peer = serde_json::to_value(Peer {
             peer_id: String::new(),
             addresses: Vec::new(),

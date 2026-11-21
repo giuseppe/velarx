@@ -252,8 +252,10 @@ pub struct P2PStatus {
 
 #[derive(Debug, Clone, Default)]
 pub struct P2PStats {
-    /// The chunks served over QUIC
+    /// The chunks, indexes and profiles served over QUIC
     pub chunks_sent: u64,
+    /// The bytes of the answers served over QUIC
+    pub bytes_sent: u64,
 }
 
 /// Configuration for P2P node
@@ -1097,6 +1099,7 @@ impl P2PNode {
     pub async fn get_stats(&self) -> P2PStats {
         P2PStats {
             chunks_sent: self.quic().served(),
+            bytes_sent: self.quic().served_bytes(),
         }
     }
 

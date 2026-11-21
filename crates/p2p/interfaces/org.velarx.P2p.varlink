@@ -79,9 +79,10 @@ type PeerTraffic (
 	requests: int,
 	# Those that failed
 	failures: int,
-	# The chunks it sent that matched their digests
+	# What it sent: the chunks that matched their digests, the indexes of
+	# layers and the startup profiles
 	chunks_received: int,
-	# The bytes of those chunks
+	# The bytes of those
 	bytes_received: int,
 	# The average time of an answer, in milliseconds
 	average_ms: ?float,
@@ -252,6 +253,10 @@ method Status() -> (
 	provider_records: int,
 	# What the pulls of this node fetched from each peer
 	peers: []PeerTraffic,
+	# What this node served its peers: the chunks, indexes and profiles,
+	# and the bytes of its answers
+	chunks_sent: int,
+	bytes_sent: int,
 	# How the questions of who has what were answered
 	lookups: Lookups,
 	# What the certificate of this node says of it (`name`, `zone`, `role`),
@@ -318,8 +323,10 @@ method Explain(target: string) -> (decision: ?Decision)
 
 # What the node moved, in all.
 method Stats() -> (
-	# The chunks the node served over QUIC
-	chunks_sent: int
+	# The chunks, indexes and profiles the node served over QUIC
+	chunks_sent: int,
+	# The bytes of its answers
+	bytes_sent: int
 )
 
 # The images of the other nodes, one a reply; with `query`, they
