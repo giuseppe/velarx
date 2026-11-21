@@ -1993,6 +1993,54 @@ async fn test_an_updated_file_takes_the_chunks_the_store_has() {
     assert_eq!(e.staged_leftovers(), 0);
 }
 
+/// A layer with a table of contents records the places of the chunks of
+/// all of its files, those the store had from a gzip pull of the same files
+/// too: the node serves their chunks to its peers.
+#[tokio::test]
+async fn test_the_files_the_store_had_record_their_chunk_places() {
+    let e = env().await;
+    let noise = |mut x: u64| -> Vec<u8> {
+        (0..64 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    };
+    let (had, new) = (noise(0x9e37_79b9_7f4a_7c15), noise(0x2545_f491_4f6c_dd1d));
+    let items = |with_new: bool| {
+        let mut items = vec![
+            Item::Dir("usr/"),
+            Item::File {
+                name: "usr/had",
+                data: had.clone(),
+                chunk: 16 * 1024,
+            },
+        ];
+        if with_new {
+            items.push(Item::File {
+                name: "usr/new",
+                data: new.clone(),
+                chunk: 16 * 1024,
+            });
+        }
+        items
+    };
+    e.publish(&[&build_gzip(&items(false))], &[GZIP]);
+    e.pull().await.unwrap();
+    e.publish(&[&build_chunked(&items(true))], &[ZSTD]);
+    e.pull().await.unwrap();
+    let place = |data: &[u8]| {
+        let chunk = Digest::of(Algorithm::Sha256, &data[16 * 1024..32 * 1024]);
+        let db = e.db.clone();
+        async move { db.get_chunk_location(&chunk).await.unwrap() }
+    };
+    assert_eq!(place(&new).await.unwrap().file_digest, vid(&new));
+    assert_eq!(place(&had).await.unwrap().file_digest, vid(&had));
+}
+
 /// A barrier of the store that fails fails the pull, whichever of the two
 /// it is: nothing is recorded for names and images that did not reach the
 /// disk, and nothing stays staged.

@@ -2436,18 +2436,11 @@ async fn verify_layer(
         }
     };
     let files = FileUse::of_toc(&toc);
-    // (the places of the chunks the verified table gives: each file is
-    // named by what the commit checks it against, and the fetch of a chunk
-    // from it checks the bytes)
-    let located = located_chunks(&toc);
+    // (the places of the chunks the verified table gives, of every file of
+    // the layer: the staged ones and those the store had, each checked as
+    // the file it is; whoever copies a chunk from a place checks its bytes)
+    let chunks = located_chunks(&toc);
     let diff_id = *expected_diff_id;
-    // (the chunks the table gives for the read, staged or stored: each place
-    // once)
-    let mut seen = HashSet::new();
-    let chunks = located
-        .into_iter()
-        .filter(|c| seen.insert(c.chunk_digest))
-        .collect();
     let report = LayerReport {
         fetched_bytes: metadata_bytes,
         fetched_files: 0,
