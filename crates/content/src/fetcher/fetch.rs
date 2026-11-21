@@ -85,6 +85,25 @@ pub struct Blob {
     pub annotations: Option<std::collections::BTreeMap<String, String>>,
 }
 
+impl Blob {
+    /// The checksum of the zstd:chunked table of contents its descriptor
+    /// names: none for a layer without one.
+    pub fn toc_checksum(&self) -> Option<velarx_types::digest::Digest> {
+        let desc = velarx_types::OciDescriptor {
+            media_type: self.media_type.clone(),
+            digest: self.digest.parse().ok()?,
+            size: i64::try_from(self.size).ok()?,
+            annotations: self
+                .annotations
+                .iter()
+                .flatten()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        };
+        velarx_types::layer::chunked_checksum(&desc)
+    }
+}
+
 /// A chunk the store of the engine holds: `length` bytes at `offset` of
 /// the descriptor `fd` of the message (a file with no name the engine made
 /// of the chunks it hints, read-only; never a file of the store).  A

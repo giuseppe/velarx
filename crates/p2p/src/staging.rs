@@ -561,47 +561,32 @@ impl Sink for One {
     }
 }
 
-/// The checksum of the table of contents the descriptor of `blob` names.
-fn checksum_of(blob: &Blob) -> Option<Digest> {
-    let desc = velarx_types::OciDescriptor {
-        media_type: blob.media_type.clone(),
-        digest: blob.digest.parse().ok()?,
-        size: i64::try_from(blob.size).ok()?,
-        annotations: blob
-            .annotations
-            .iter()
-            .flatten()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-    };
-    velarx_types::layer::chunked_checksum(&desc)
-}
-
 impl PeerSource {
-    /// The compressed table of contents `checksum` names and its tar-split,
-    /// from the index of a peer: one whose table is not that one, or whose
-    /// tar-split is not the one the table names, is not taken (`cap`: the
-    /// largest JSON of the table).
-    pub(crate) async fn toc_of(&self, checksum: &Digest, cap: u64) -> Option<(Vec<u8>, Vec<u8>)> {
+    /// The compressed table of contents and the tar-split of the index
+    /// named `digest`: the checksum of the table of a zstd:chunked layer
+    /// (`toc`), or the blob of a layer without one.  An index whose table
+    /// is not the one `digest` names, or whose tar-split is not the one the
+    /// table names, is not taken (`cap`: the largest JSON of the table).
+    pub(crate) async fn index_of(
+        &self,
+        digest: &Digest,
+        toc: bool,
+        cap: u64,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
         use velarx_content::pull::index;
         let mut one = One(None);
         let item = [Item {
-            digest: checksum.to_string(),
+            digest: digest.to_string(),
             size: Some(index::MAX_INDEX),
         }];
         let well_formed = |bytes: &[u8]| {
-            let Ok((toc_z, tarsplit)) = index::split(bytes) else {
+            let Ok((toc_z, _)) = index::split(bytes) else {
                 return false;
             };
-            Digest::of(checksum.alg(), toc_z) == *checksum
-                && index::decode(bytes, cap).is_ok_and(|(toc, _)| match toc.tar_split_digest {
-                    Some(d) => d
-                        .parse::<Digest>()
-                        .is_ok_and(|d| Digest::of(d.alg(), tarsplit) == d),
-                    None => tarsplit.is_empty(),
-                })
+            (!toc || Digest::of(digest.alg(), toc_z) == *digest)
+                && index::is_well_formed(bytes, cap)
         };
-        self.fetch_indexes(&item, true, &well_formed, &mut one)
+        self.fetch_indexes(&item, toc, &well_formed, &mut one)
             .await
             .ok()?;
         let index = one.0?;
@@ -650,10 +635,11 @@ impl StagingFetcher for PeerSource {
     }
 
     /// The table of contents and tar-split of the zstd:chunked layers whose
-    /// descriptor's checksum a peer's index has the compressed bytes of;
-    /// what no peer has is `unreachable`, for the next fetcher.  A peer's
-    /// bytes are used only when they have the checksum (the engine checks
-    /// them against the descriptor again).
+    /// descriptor's checksum a peer's index has the compressed bytes of,
+    /// and the index of the layers without one (a claim, `no_toc`: not
+    /// lazy); what no peer has is `unreachable`, for the next fetcher.  A
+    /// peer's bytes are used only when they have the checksum (the engine
+    /// checks them against the descriptor again).
     async fn probe(
         &self,
         _scope: &Scope,
@@ -670,14 +656,16 @@ impl StagingFetcher for PeerSource {
                 let cap = velarx_content::pull::index::json_cap(
                     i64::try_from(blob.size).unwrap_or(i64::MAX),
                 );
-                let found = match checksum_of(blob) {
-                    Some(checksum) => self.toc_of(&checksum, cap).await,
-                    None => None,
+                let checksum = blob.toc_checksum();
+                let found = match (&checksum, blob.digest.parse()) {
+                    (Some(checksum), _) => self.index_of(checksum, true, cap).await,
+                    (None, Ok(digest)) => self.index_of(&digest, false, cap).await,
+                    (None, Err(_)) => None,
                 };
-                (at, found)
+                (at, found, checksum.is_none())
             })
             .collect();
-        while let Some((at, found)) = asking.next().await {
+        while let Some((at, found, whole)) = asking.next().await {
             let none = Probed {
                 layer: at as u32,
                 toc: TocSource::None,
@@ -696,8 +684,8 @@ impl StagingFetcher for PeerSource {
             }
             let reply = Probed {
                 toc: TocSource::Carried,
-                on_demand: true,
-                reason: None,
+                on_demand: !whole,
+                reason: whole.then_some(NotLazy::NoToc),
                 toc_file: Some(0),
                 tarsplit_file: (!tarsplit.is_empty()).then_some(1),
                 ..none

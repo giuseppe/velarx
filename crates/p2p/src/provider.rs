@@ -3742,9 +3742,90 @@ mod tests {
                 s.knowledge()
                     .served(Some(&key), *peer, Duration::from_millis(rtt as u64 + 1));
             }
-            let got = s.toc_of(&checksum, index::json_cap(1 << 20)).await;
+            let got = s.index_of(&checksum, true, index::json_cap(1 << 20)).await;
             assert_eq!(got, honest.then(|| (toc_z.clone(), tarsplit.clone())));
             assert_eq!(*fake.index_asked.lock().unwrap(), peers);
+        }
+    }
+
+    /// The `Probe` of a layer without a table of contents carries the index
+    /// a peer has for its blob (not lazy: `no_toc`), unless its tar-split is
+    /// not the one its table names; a zstd:chunked layer is answered as it
+    /// was, from the index of its checksum.
+    #[tokio::test]
+    async fn a_probe_of_a_whole_layer_carries_its_index() {
+        use velarx_content::fetcher::fetch::{Blob, NotLazy, TocSource};
+        use velarx_content::pull::index;
+        use velarx_content::serve_fetch::{Out, Scope, StagingFetcher};
+        let tarsplit = b"a tar-split".to_vec();
+        let toc = format!(
+            r#"{{"version":1,"entries":[],"tarSplitDigest":"{}"}}"#,
+            digest_of(&tarsplit)
+        );
+        let toc_z = zstd::encode_all(toc.as_bytes(), 19).unwrap();
+        let right = index::encode_compressed(&toc_z, &tarsplit).unwrap();
+        let wrong = index::encode_compressed(&toc_z, b"another tar-split").unwrap();
+        let checksum = digest_of(&toc_z);
+        let blob = |checksum: Option<&str>| Blob {
+            digest: digest_of(b"a layer"),
+            size: 1 << 20,
+            media_type: "application/vnd.oci.image.layer.v1.tar+zstd".into(),
+            annotations: checksum.map(|c| {
+                [
+                    (
+                        "io.github.containers.zstd-chunked.manifest-checksum".to_string(),
+                        c.to_string(),
+                    ),
+                    (
+                        "io.github.containers.zstd-chunked.manifest-position".to_string(),
+                        "1:2:3:1".to_string(),
+                    ),
+                ]
+                .into()
+            }),
+        };
+        let scope = Scope {
+            verity: false,
+            source: None,
+            tls_verify: None,
+            target: None,
+            access: None,
+            idle: Duration::from_secs(30),
+            kept: Arc::default(),
+        };
+        // (the blob, the index its peer has, the key the peer served it by,
+        // and what the probe says)
+        let blob_key = blob(None).digest;
+        let cases = [
+            (blob(None), &right, blob_key.clone(), true, false),
+            (blob(None), &wrong, blob_key.clone(), false, false),
+            (
+                blob(Some(&checksum)),
+                &right,
+                velarx_types::LayerKey::Toc(checksum.parse().unwrap()).to_string(),
+                true,
+                true,
+            ),
+        ];
+        for (blob, index, key, carried, lazy) in cases {
+            let fake = Arc::new(Fake::default());
+            let peer = fake.peer(0, Ok(vec![]));
+            fake.indexes.lock().unwrap().insert(peer, index.clone());
+            let s = source(&fake, None);
+            s.knowledge()
+                .served(Some(&key), peer, Duration::from_millis(1));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            s.probe(&scope, vec![blob], &Out::new(tx)).await.unwrap();
+            let (reply, fds) = rx.recv().await.unwrap();
+            assert_eq!(reply.toc == TocSource::Carried, carried, "{key}");
+            assert_eq!(reply.on_demand, carried && lazy);
+            assert_eq!(fds.len(), if carried { 2 } else { 0 });
+            if carried && !lazy {
+                assert_eq!(reply.reason, Some(NotLazy::NoToc));
+            }
+            if !carried {
+                assert_eq!(reply.reason, Some(NotLazy::Unreachable));
+            }
         }
     }
 }

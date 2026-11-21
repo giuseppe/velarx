@@ -16,7 +16,8 @@
 //! socket.
 
 use crate::fetcher::fetch::{
-    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, TARSPLIT, TOC_CLAIM,
+    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, NotLazy, Probed,
+    TocSource, TARSPLIT, TOC_CLAIM,
 };
 use crate::serve_fetch::{
     Described, FetchCall, LayerScope, Out, Scope, StagingFetcher, UnpackCall,
@@ -283,6 +284,59 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
         }
     }
 
+    /// The index of each layer without a table of contents that the items
+    /// keep (a claim, `no_toc`: not lazy); the others are `unreachable`.
+    async fn probe(
+        &self,
+        _scope: &Scope,
+        layers: Vec<Blob>,
+        out: &Out<Probed>,
+    ) -> Result<(), FetcherError> {
+        let gone = |_| FetcherError::failed("the asker is gone".to_string());
+        for (at, blob) in layers.iter().enumerate() {
+            let (items, layer) = (self.items.clone(), blob.digest.clone());
+            let cap = crate::pull::index::json_cap(i64::try_from(blob.size).unwrap_or(i64::MAX));
+            let whole = blob.toc_checksum().is_none();
+            let index = tokio::task::spawn_blocking(move || {
+                whole
+                    .then(|| items.index(&layer))
+                    .flatten()
+                    .filter(|i| crate::pull::index::is_well_formed(i, cap))
+            })
+            .await
+            .map_err(|e| FetcherError::failed(e.to_string()))?;
+            let none = Probed {
+                layer: at as u32,
+                toc: TocSource::None,
+                on_demand: false,
+                reason: Some(NotLazy::Unreachable),
+                toc_file: None,
+                tarsplit_file: None,
+            };
+            let Some(index) = index else {
+                out.send(none).await.map_err(gone)?;
+                continue;
+            };
+            let (toc_z, tarsplit_z) =
+                crate::pull::index::split(&index).map_err(FetcherError::failed)?;
+            let fds = vec![
+                velarx_base::sealed::sealed_memory(toc_z)
+                    .map_err(|e| FetcherError::failed(e.to_string()))?,
+                velarx_base::sealed::sealed_memory(tarsplit_z)
+                    .map_err(|e| FetcherError::failed(e.to_string()))?,
+            ];
+            let reply = Probed {
+                toc: TocSource::Carried,
+                reason: Some(NotLazy::NoToc),
+                toc_file: Some(0),
+                tarsplit_file: Some(1),
+                ..none
+            };
+            out.send_with(reply, fds).await.map_err(gone)?;
+        }
+        Ok(())
+    }
+
     /// A blob of exactly the bytes its descriptor says, by its digest.
     async fn get_blob(&self, _scope: &Scope, blob: &Blob) -> Result<std::fs::File, FetcherError> {
         self.item_file(&blob.digest, Some(blob.size), blob.size)
@@ -417,5 +471,100 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
                 .map_err(|_| failed("the asker is gone".into()))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    struct Indexes(HashMap<String, Vec<u8>>);
+
+    impl Items for Indexes {
+        fn item(&self, _: &str, _: Option<u64>, _: u64) -> Option<Vec<u8>> {
+            None
+        }
+        fn index(&self, layer: &str) -> Option<Vec<u8>> {
+            self.0.get(layer).cloned()
+        }
+    }
+
+    /// The `Probe` of a layer carries the index the items keep for its blob
+    /// (not lazy: `no_toc`) unless its tar-split is not the one its table
+    /// names; a layer with none, or with a zstd:chunked table, is
+    /// unreachable.
+    #[tokio::test]
+    async fn a_probe_carries_the_index_of_a_layer() {
+        use crate::pull::index;
+        let tarsplit = b"a tar-split".to_vec();
+        let toc = format!(
+            r#"{{"version":1,"entries":[],"tarSplitDigest":"{}"}}"#,
+            Digest::of(velarx_types::digest::Algorithm::Sha256, &tarsplit)
+        );
+        let right = index::encode(toc.as_bytes(), &tarsplit).unwrap();
+        let wrong = index::encode(toc.as_bytes(), b"another tar-split").unwrap();
+        let chunked = Blob {
+            digest: format!("sha256:{}", "d".repeat(64)),
+            size: 1 << 20,
+            media_type: "application/vnd.oci.image.layer.v1.tar+zstd".into(),
+            annotations: Some(
+                [
+                    (
+                        "io.github.containers.zstd-chunked.manifest-checksum".to_string(),
+                        format!("sha256:{}", "e".repeat(64)),
+                    ),
+                    (
+                        "io.github.containers.zstd-chunked.manifest-position".to_string(),
+                        "1:2:3:1".to_string(),
+                    ),
+                ]
+                .into(),
+            ),
+        };
+        let fetch = ItemFetch::of(
+            "dir",
+            Indexes(HashMap::from([
+                ("sha256:aa".to_string(), right.clone()),
+                ("sha256:bb".to_string(), wrong),
+                (chunked.digest.clone(), right),
+            ])),
+        );
+        let blob = |digest: &str| Blob {
+            digest: digest.into(),
+            size: 1 << 20,
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            annotations: None,
+        };
+        let scope = Scope {
+            verity: false,
+            source: None,
+            tls_verify: None,
+            target: None,
+            access: None,
+            idle: std::time::Duration::from_secs(30),
+            kept: Arc::default(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let layers = vec![
+            blob("sha256:aa"),
+            blob("sha256:bb"),
+            blob("sha256:cc"),
+            chunked,
+        ];
+        fetch.probe(&scope, layers, &Out::new(tx)).await.unwrap();
+        let mut got = Vec::new();
+        while let Ok((reply, fds)) = rx.try_recv() {
+            got.push((reply.toc, reply.on_demand, reply.reason, fds.len()));
+        }
+        assert_eq!(
+            got,
+            [
+                (TocSource::Carried, false, Some(NotLazy::NoToc), 2),
+                (TocSource::None, false, Some(NotLazy::Unreachable), 0),
+                (TocSource::None, false, Some(NotLazy::Unreachable), 0),
+                (TocSource::None, false, Some(NotLazy::Unreachable), 0),
+            ]
+        );
     }
 }

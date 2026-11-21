@@ -142,6 +142,18 @@ pub fn decode(data: &[u8], max_json: u64) -> Result<(Toc, Vec<u8>), String> {
     Ok((toc, tarsplit_z.to_vec()))
 }
 
+/// Whether `data` is an index of the form [`decode`] accepts whose tar-split
+/// is the one its table names.  It filters junk: nothing in an index is
+/// trusted for that.
+pub fn is_well_formed(data: &[u8], max_json: u64) -> bool {
+    decode(data, max_json).is_ok_and(|(toc, tarsplit_z)| match toc.tar_split_digest {
+        Some(d) => d
+            .parse::<velarx_types::digest::Digest>()
+            .is_ok_and(|d| velarx_types::digest::Digest::of(d.alg(), &tarsplit_z) == d),
+        None => tarsplit_z.is_empty(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
