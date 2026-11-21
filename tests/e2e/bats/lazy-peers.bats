@@ -167,8 +167,8 @@ wait_profile () { e2e_wait_glob "$WORKDIR/b/store/composefs/*.profile.json" 5; }
     check "node a pulls the image" 0 $?
     # (what a pulled is told to the swarm as a filter of its layers, which is
     # not a list: its images and its DHT records need `announce_images`)
-    e2e_wait_line "$WORKDIR/a.p2p.log" 'Holding [1-9][0-9]* layers' 30 || true
-    check_match "node a puts its layers in its filter" "Holding [1-9][0-9]* layers" "$(cat "$WORKDIR/a.p2p.log")"
+    e2e_wait_line "$WORKDIR/a.p2p.log" 'Announcing [1-9][0-9]* new layers' 30 || true
+    check_match "node a puts its layers in its filter" "Announcing [1-9][0-9]* new layers" "$(cat "$WORKDIR/a.p2p.log")"
     ! grep -q 'layers to the DHT' "$WORKDIR/a.p2p.log"
     check "node a announces nothing in the DHT" 0 $?
 }

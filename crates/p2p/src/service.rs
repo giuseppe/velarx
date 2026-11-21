@@ -176,9 +176,8 @@ fn decision(r: super::explain::Record) -> Decision {
 /// images are told only by a node that announces them.
 pub(super) async fn announce_to_peers(node: &P2PNode, announcement: Announcement) {
     if !announcement.layers.is_empty() {
-        match node.announce_layers(announcement.layers).await {
-            Ok(count) => info!("Holding {} layers for the peers", count),
-            Err(e) => warn!("Failed to announce layers: {}", e),
+        if let Err(e) = node.announce_layers(announcement.layers).await {
+            warn!("Failed to announce layers: {}", e);
         }
     }
     if !announcement.images.is_empty() {

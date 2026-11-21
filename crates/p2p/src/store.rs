@@ -246,26 +246,24 @@ pub async fn apply_change(node: &P2PNode, change: Change) -> bool {
     // (what the store has, it gives; what it lost is gone: the files kept
     // for the peers while a pull staged them are not needed)
     node.release_staged(&change.layers);
-    if change.kind == ChangeKind::Removed {
-        // (the peers forget what the DHT does not renew)
-        node.withdraw_layers(&change.layers).await;
-        debug!(
-            "{} layers and {} images are not shared any more",
-            change.layers.len(),
-            change.images.len()
-        );
-    } else {
-        if change.kind == ChangeKind::Snapshot {
+    let (layers, images_changed) = (change.layers.len(), change.images.len());
+    match change.kind {
+        ChangeKind::Removed => {
+            // (the peers forget what the DHT does not renew)
+            node.withdraw_layers(&change.layers).await;
+            info!("No longer announcing {layers} layers and {images_changed} images of the store");
+        }
+        ChangeKind::Snapshot => {
             // (the snapshot is the whole truth: what the store lost while
             // the service was away goes)
             node.withdraw_layers_not_in(&change.layers).await;
-            info!(
-                "Announcing {} layers and {} images of the store",
-                change.layers.len(),
-                change.images.len()
-            );
+            info!("Announcing {layers} layers and {images_changed} images of the store");
+            super::service::announce_to_peers(node, announcement(change)).await;
         }
-        super::service::announce_to_peers(node, announcement(change)).await;
+        ChangeKind::Added => {
+            info!("Announcing {layers} new layers and {images_changed} new images of the store");
+            super::service::announce_to_peers(node, announcement(change)).await;
+        }
     }
     images
 }
