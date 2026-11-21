@@ -63,10 +63,13 @@ lengths before allocating and verifies every digest.
 * **A malicious image** controls the layers, the configuration and the
   annotations. Layers are parsed in a confined pull worker (Landlock and
   seccomp, no access to the store), not in the engine: names, extension
-  headers, extended attributes and entry counts are bounded; `..`, NUL,
-  sparse files and the `trusted.`, `security.`, `system.` and overlay
-  attributes are refused or dropped; decompression is cut at
-  `max_inflate_ratio` times the compressed size and at `max_layer_gib`.
+  headers, extended attributes and entry counts are bounded; `..`, NUL and
+  sparse files are refused; the attributes of the overlay file system
+  (`overlay.*` in any namespace) and values over 64 KiB are dropped, and
+  the other attributes are data of the image (a file capability,
+  `security.capability`, is kept: it grants nothing past the bounding set
+  of the container); decompression is cut at `max_inflate_ratio` times the
+  compressed size and at `max_layer_gib`.
 * **A malicious or compromised registry or content source** is verified:
   the manifest by policy, the configuration and layers by digest and diff id,
   chunks by their hash, files by fs-verity digest.  A layer with a table of
