@@ -82,6 +82,19 @@ lengths before allocating and verifies every digest.
   gives an index learns which of the files it names the store holds, as the
   publisher of a table of contents does.  A source cannot make a pull
   wrong, only slower, and a circuit breaker skips one that fails.
+* **The chain of trust of a pull** starts at what the user names: a digest
+  (`name@digest`) is checked against the manifest or index it names, and
+  each step against the one above it (the platform's manifest against the
+  index, the configuration and layers against the manifest, the files of a
+  zstd:chunked layer against the table its annotation names, every file
+  against the fs-verity digest the engine measured).  A tag is taken only
+  from its registry; the peers serve what a digest names.  What is off the
+  chain is recorded as a claim and never names, serves or shares anything:
+  the diff id of a zstd:chunked layer, the content digest of a file the
+  table also gives an fs-verity digest, the blob of a layer made from an
+  index, and the places of chunks, which whoever copies one checks.  The
+  file a record names is the one the engine opened or measured, never one a
+  claim names.
 * **A dual view image** has a layer whose table of contents (zstd:chunked),
   which the manifest vouches for, and whose tar stream describe different
   filesystems: other names, modes or contents, a file only in one of them.
@@ -244,6 +257,19 @@ the entries and names of an archive, the number of tasks of
 a pull worker, the datagrams of the notify socket.  Not bounded: what a
 container itself does within its cgroup limits, and the load a trusted client
 of the API can cause.
+
+## A store without fs-verity
+
+Every file is still checked once before it is named: the engine computes its
+fs-verity digest (and its content digest where that is what is known) as it
+copies or commits it, so the objects are the same as in a store with
+fs-verity.  What is lost is the kernel's check at every read: nothing keeps
+a file from changing after that, the overlay does not check what a container
+reads, and the store's integrity rests on its permissions ("A writer of the
+store").  A file of the staging of a lazy pull, written by a fetcher and not
+yet in the store, is hashed on the descriptor that is served each time it is
+opened (by the FUSE file system, and when it is copied out of the image) and
+once more when the completion commits it.
 
 ## Configuration choices that lower the guarantees
 
