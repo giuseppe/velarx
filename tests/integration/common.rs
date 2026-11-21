@@ -1821,6 +1821,7 @@ pub fn chain_of(sockets: &[&std::path::Path]) -> Fetchers {
                 socket: Some(s.to_path_buf()),
                 dir: None,
                 idle_timeout_secs: velarx_config::default_source_idle_secs(),
+                settings: Default::default(),
             })
             .collect(),
     )

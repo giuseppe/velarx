@@ -244,6 +244,10 @@ pub struct ExternalSourceConfig {
     /// Seconds without a byte after which the source is given up
     #[serde(default = "default_source_idle_secs")]
     pub idle_timeout_secs: u64,
+    /// The settings of the program that serves the source, which reads this
+    /// file itself: kept as they are, never read or checked here.
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    pub settings: toml::Table,
 }
 
 /// The `idle_timeout_secs` of a source that does not set it.
@@ -2462,6 +2466,27 @@ mod tests {
         let e = err("[[sources.external]]\nname = \"a\"\nsocket = \"/s\"\nidle_timeout_secs = 0\n");
         assert!(e.contains("idle_timeout"), "{e}");
         assert!(parse("[pull]\nlazy_fetches = 0\n").is_err());
+        // a key of the engine is still refused when it is not one
+        let e = err("[[sources.external]]\nname = \"a\"\nsocket = \"/s\"\nidle_timeout = 5\n");
+        assert!(e.contains("idle_timeout"), "{e}");
+    }
+
+    /// The settings of an external source reach its program as they are
+    /// written: any key, any value, sub-tables, none of them checked.
+    #[test]
+    fn test_the_settings_of_a_source_are_kept_as_they_are() {
+        let text = "[[sources.external]]\nname = \"cache\"\nsocket = \"/run/cache.sock\"\n\
+                    [sources.external.settings]\nanything = [\"a\", 1]\nport = 0\n\
+                    [sources.external.settings.deeper]\nx = { y = true }\n";
+        let config = parse(text).unwrap();
+        let written: toml::Table = toml::from_str(text).unwrap();
+        assert_eq!(
+            toml::Value::Table(config.sources.external[0].settings.clone()),
+            written["sources"]["external"][0]["settings"]
+        );
+        // (and none for a source that has no settings)
+        let config = parse(EXTERNAL).unwrap();
+        assert!(config.sources.external[0].settings.is_empty());
     }
 
     #[test]
@@ -2679,6 +2704,10 @@ mod tests {
     fn the_settings_of_the_example_are_accepted() {
         let mut checked = 0;
         for (header, settings) in &example_settings() {
+            // the settings of a source are its program's to check
+            if header.starts_with("[sources.external.settings") {
+                continue;
+            }
             let text = format!("{header}\n{}\n", settings.join("\n"));
             // the names and types: some values are valid only with other
             // settings of the file (the sources of [pull])
