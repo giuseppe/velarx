@@ -444,7 +444,8 @@ async fn only_the_files_the_store_lacks_are_fetched() {
 /// A claim that the files do not replay to is given up for the origin,
 /// which is not told it, and nothing of it is left: a file swapped for one of
 /// the same size, a header edited, a fs-verity digest that is another file's,
-/// a file nobody has, a file with no fs-verity digest.
+/// a file nobody has, a file with no fs-verity digest, a file whose digest
+/// is a fs-verity digest.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wrong_index_is_given_up_for_the_origin() {
     let layer = made(&files());
@@ -473,11 +474,19 @@ async fn a_wrong_index_is_given_up_for_the_origin() {
         other.toc.entries[1].fsverity = None;
         other.index()
     };
+    let verity_named = {
+        // (a file keyed by the fs-verity digest of another: the stream is
+        // right, the table would name the other)
+        let mut other = made(&files());
+        other.toc.entries[1].digest = other.toc.entries[2].verity();
+        other.index()
+    };
     let cases = [
         (Some(layer.index()), swapped),
         (Some(edited), layer.bodies.clone()),
         (Some(other_file), layer.bodies.clone()),
         (Some(no_verity), layer.bodies.clone()),
+        (Some(verity_named), layer.bodies.clone()),
         (Some(layer.index()), HashMap::new()),
     ];
     for (index, bodies) in cases {
@@ -495,6 +504,43 @@ async fn a_wrong_index_is_given_up_for_the_origin() {
         assert!(done.proven && done.blob_checked);
         assert!(rig.staging_is_empty());
     }
+}
+
+/// A claim that keys a file by an object (here a private one of the store)
+/// while its bytes are another's is refused, and nothing the pull records
+/// names that object: what a record names is what the engine opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_never_names_an_object_the_pull_did_not_open() {
+    let layer = made(&files());
+    let private = b"a private file of the store";
+    let secret = verity(private);
+    let claim = {
+        let mut other = made(&files());
+        other.toc.entries[1].digest = Some(secret.clone());
+        other.index()
+    };
+    let rig = rig(&layer, Some(claim), layer.bodies.clone()).await;
+    let stored = rig
+        .session()
+        .store()
+        .put(Algorithm::Sha256, private)
+        .unwrap();
+    assert_eq!(stored, secret);
+    let wrong = unpack_by_index(&rig.ctx, &layer.desc, &layer.diff, false, &|_| {}).await;
+    assert!(
+        matches!(wrong, Err(ImageError::Contradicted(_))),
+        "{:?}",
+        wrong.err()
+    );
+    let done = rig.pull(&layer).await.unwrap();
+    assert_eq!(rig.origin.unpacked.load(Ordering::SeqCst), 1);
+    assert!(done.files.iter().all(|f| f.digest != secret));
+    assert!(done
+        .toc
+        .entries
+        .iter()
+        .all(|e| e.verity().as_deref() != Some(secret.as_str())
+            && e.digest.as_deref() != Some(secret.as_str())));
 }
 
 /// An index that does not replay is asked for again, of another provider

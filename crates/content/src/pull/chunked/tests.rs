@@ -611,6 +611,61 @@ fn a_file_that_is_not_what_a_claim_says_fails_the_replay() {
     }
 }
 
+/// A file is known by the digest of its content, never by an object: a key
+/// that is an fs-verity digest fails the replay, of a copy the origin handed
+/// over (which the replay does not hash) too.
+#[test]
+fn a_file_known_by_an_object_fails_the_replay() {
+    use crate::pull::tarsplit::{decoder, Recorder, MAX_SIZE};
+    use std::io::Cursor;
+
+    struct Handed(Option<Opened>, String, bool);
+    impl Opens for Handed {
+        fn opened(&mut self) -> &mut Option<Opened> {
+            &mut self.0
+        }
+    }
+    impl Contents for Handed {
+        fn open(&mut self, name: &str, size: u64) -> io::Result<Box<dyn Read + Send>> {
+            self.0 = Some(Opened {
+                name: name.into(),
+                size,
+                digest: self.1.clone(),
+                copy: None,
+                verified: self.2,
+            });
+            Ok(Box::new(Cursor::new(b"data".to_vec())))
+        }
+    }
+
+    let mut b = tar::Builder::new(Vec::new());
+    let mut h = tar::Header::new_gnu();
+    h.set_size(4);
+    h.set_mode(0o644);
+    b.append_data(&mut h, "f", &b"data"[..]).unwrap();
+    let stream = b.into_inner().unwrap();
+    let mut r = TarReader::with_sink(Cursor::new(stream), Recorder::new().unwrap());
+    while r.next_entry().unwrap().is_some() {}
+    let (_, recorder) = r.finish().unwrap();
+    let tarsplit = recorder.finish().unwrap().compressed;
+    let object = velarx_storage::fsverity_digest_of(Algorithm::Sha256, b"data");
+    for verified in [true, false] {
+        let input = decoder(tarsplit.clone(), MAX_SIZE).unwrap();
+        match replay_of(
+            input,
+            Handed(None, object.clone(), verified),
+            Algorithm::Sha256,
+            Algorithm::Sha256,
+        ) {
+            Err(ImageError::Contradicted(e)) => {
+                assert!(e.contains("no digest of a content"), "{e}")
+            }
+            Err(e) => panic!("not a contradiction: {e}"),
+            Ok(_) => panic!("a file known by an object was taken"),
+        }
+    }
+}
+
 /// A file is not hashed by the replay only when the copy it reads was proved
 /// to be its digest: a file opened before its content (whose bytes may come
 /// from elsewhere) fails the replay.

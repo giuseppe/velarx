@@ -1581,7 +1581,6 @@ fn replay_of(
         if entries.len() >= MAX_ENTRIES {
             return Err(fail("the layer has too many entries"));
         }
-        let mut claimed_object = None;
         let mut cut_in = None;
         let digest = if h.kind == Kind::Regular {
             if h.size == 0 {
@@ -1644,20 +1643,25 @@ fn replay_of(
                         opened.name
                     )));
                 }
-                // (a file the store has is its object, named by its
-                // fs-verity digest: the store's, not the fetcher's)
+                // (every file is the digest of its content it is known by,
+                // never an object: the object the store gave for it is the
+                // pull's to name)
+                if Digest::parse_fsverity(&opened.digest).is_ok() {
+                    return Err(ImageError::Contradicted(format!(
+                        "`{path}` is known by {}, which is no digest of a content",
+                        opened.digest
+                    )));
+                }
                 let read = match content {
                     Some(c) => c.finalize().to_string(),
                     None => opened.digest.clone(),
                 };
-                let object = velarx_storage::to_toc(&opened.digest);
-                if object.is_none() && read != opened.digest {
+                if read != opened.digest {
                     return Err(ImageError::Contradicted(format!(
                         "`{path}` is {read}, not the {} the fetcher said",
                         opened.digest
                     )));
                 }
-                claimed_object = object;
                 if let Some((path, verity)) = opened.copy.take() {
                     copies.insert(opened.digest.clone(), (path, h.size, verity));
                 }
@@ -1671,9 +1675,6 @@ fn replay_of(
             None
         };
         let mut e = entry::from_header(&h, digest.as_deref()).map_err(data_fail)?;
-        if claimed_object.is_some() {
-            e.fsverity = claimed_object;
-        }
         let chunks = cut_in.map(|pieces| cut(&mut e, pieces));
         entries.push(e);
         entries.extend(chunks.into_iter().flatten());
