@@ -1840,3 +1840,61 @@ async fn test_sha512_chunks_and_files_go_from_a_peer() {
         .unwrap();
     assert_eq!(found.len(), 2);
 }
+
+/// A node whose service already runs announces an image pulled after it
+/// started, by another connection to the database (the engine is another
+/// process than the store service): its follower of the store service
+/// hears the change, and the peer's filter learns the layers without being
+/// told by anyone else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_an_image_pulled_while_the_service_runs_is_announced() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("swarm.key");
+    velarx_p2p::control::generate_swarm_key(&key).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let db_path = dir.path().join("db.sqlite");
+    let a = env_on(
+        velarx_db::Database::open(&db_path).await.unwrap(),
+        PullConfig::default(),
+        velarx_config::PushConfig::default(),
+        Fetchers::default(),
+        None,
+    )
+    .await;
+    let service = StoreService::new(
+        velarx_db::Database::open(&db_path).await.unwrap(),
+        a.store.clone(),
+    )
+    .await
+    .unwrap();
+    let socket = dir.path().join("a").join("services").join("store.sock");
+    let _served = serve_store(service, &socket).await;
+    let node_a = node(&key, [127, 0, 0, 1]).await;
+    node_a
+        .set_chunk_provider(Arc::new(StoreContent::new(socket.clone())))
+        .unwrap();
+    let (stop, stopped) = tokio::sync::broadcast::channel(1);
+    let follower =
+        velarx_p2p::store::follow_store_on_thread(node_a.clone(), socket, stopped).unwrap();
+    let node_b = node(&key, [127, 0, 0, 2]).await;
+    connect(&node_b, &node_a).await;
+
+    let layer = build_chunked(&sample());
+    a.publish(&[&layer], &[ZSTD]);
+    a.pull().await.unwrap();
+    let keys = velarx_core::store_service::Announcement::from_database(&a.db)
+        .await
+        .unwrap()
+        .layers;
+    assert!(!keys.is_empty());
+    assert!(
+        heard_within(&node_b, Duration::from_secs(10), || async {
+            keys.iter()
+                .all(|k| (node_b.knowledge().filtered(k).maybe).contains(&node_a.peer_id()))
+        })
+        .await,
+        "the layers pulled while the service ran were not announced"
+    );
+    stop.send(()).unwrap();
+    follower.join().unwrap();
+}
