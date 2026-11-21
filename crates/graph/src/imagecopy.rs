@@ -153,26 +153,24 @@ impl TreeSource<'_> {
                 node.entry.name
             )));
         };
-        match self.objects.object_file(&digest, node.entry.size) {
-            Ok(file) => {
-                self.checked(&digest, &file, true)?;
-                self.named(&digest, &file)?;
-                return Ok(file);
+        let (file, stored) = match self.objects.object_file(&digest, node.entry.size) {
+            Ok(file) => (file, true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let Some(fetcher) = self.fetcher else {
+                    return Err(io::Error::other(format!(
+                        "the file {digest} is not in the store"
+                    )));
+                };
+                let layer = self.layers.get(node.layer).cloned().unwrap_or_default();
+                let path = fetcher
+                    .fetch_file_blocking(&digest, &layer, Some(fetch_limit(node.entry.size)))
+                    .map_err(io::Error::other)?;
+                (File::open(path)?, false)
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
-        }
-        let Some(fetcher) = self.fetcher else {
-            return Err(io::Error::other(format!(
-                "the file {digest} is not in the store"
-            )));
         };
-        let layer = self.layers.get(node.layer).cloned().unwrap_or_default();
-        let path = fetcher
-            .fetch_file_blocking(&digest, &layer, Some(fetch_limit(node.entry.size)))
-            .map_err(io::Error::other)?;
-        let file = File::open(path)?;
-        self.checked(&digest, &file, false)?;
+        self.checked(&digest, &file, stored)?;
+        self.named(&digest, &file)?;
         Ok(file)
     }
 
@@ -196,9 +194,10 @@ impl TreeSource<'_> {
 }
 
 impl TreeSource<'_> {
-    /// Err when the bytes of `file`, which came from the driver, are not the
-    /// content its key `digest` names, whatever `[storage] fsverity` says: a
-    /// driver is trusted to store, not to be right, and a file that is
+    /// Err when the bytes of `file`, which came from the driver or a fetch,
+    /// are not the content its key `digest` names, whatever `[storage]
+    /// fsverity` says: a driver is trusted to store, not to be right, a
+    /// fetcher to serve, not to be right, and a file that is
     /// copied out of an image or read for `cp` is not checked by a container's
     /// overlay.  A file that has fs-verity is measured by the kernel in
     /// constant time; a file that has none is read and hashed (the digest it
@@ -704,6 +703,83 @@ mod tests {
             let e = set("user.big", &vec![0u8; 1 << 17]).unwrap_err();
             assert!(e.to_string().contains("user.big of f"), "{e}");
         });
+    }
+
+    /// A file of a lazy image fetched on demand is read out only when it is
+    /// the content its entry names, on a store without fs-verity too: the
+    /// overlay of a container does not check what is copied out.
+    #[test]
+    fn a_fetched_file_is_its_digest_whatever_the_store() {
+        use velarx_storage::TocEntryType::{Dir, Reg};
+        let data = b"the file".to_vec();
+        let digest =
+            velarx_storage::fsverity_digest_of(velarx_types::digest::Algorithm::Sha256, &data);
+        struct OneFile(TocEntry);
+        impl ImageTree for OneFile {
+            fn lookup(&self, dir: usize, name: &str) -> Option<usize> {
+                (dir == 0 && name == "f").then_some(1)
+            }
+            fn children(&self, _: usize) -> io::Result<Vec<(String, usize)>> {
+                Ok(vec![("f".into(), 1)])
+            }
+            fn node(&self, id: usize) -> Option<ViewNode> {
+                let entry = match id {
+                    0 => TocEntry::new("./".to_string(), Dir),
+                    1 => self.0.clone(),
+                    _ => return None,
+                };
+                Some(ViewNode {
+                    entry,
+                    layer: 0,
+                    nlink: 1,
+                    key: (0, id as u64),
+                })
+            }
+            fn has_verity(&self) -> bool {
+                false
+            }
+        }
+        struct NoObjects;
+        impl ObjectOpener for NoObjects {
+            fn object_file(&self, _: &str, _: u64) -> io::Result<File> {
+                Err(io::ErrorKind::NotFound.into())
+            }
+        }
+        struct Fetched(PathBuf);
+        impl LazyFileFetcher for Fetched {
+            fn fetch_file_blocking(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<Duration>,
+            ) -> Result<PathBuf, String> {
+                Ok(self.0.clone())
+            }
+        }
+        let tree = OneFile(TocEntry {
+            size: data.len() as u64,
+            fsverity: velarx_storage::to_toc(&digest),
+            ..TocEntry::new("./f".to_string(), Reg)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let translate = IdTranslate::default();
+        for (body, right) in [(&b"the file"[..], true), (&b"the fil?"[..], false)] {
+            let path = dir.path().join("fetched");
+            std::fs::write(&path, body).unwrap();
+            let fetcher = Fetched(path);
+            let source = TreeSource {
+                tree: &tree,
+                layers: &[],
+                objects: &NoObjects,
+                verity: VerityMode::Off,
+                fetcher: Some(&fetcher),
+                translate: &translate,
+            };
+            match source.read_file("f", 1 << 20) {
+                Ok(got) => assert!(right && got.unwrap() == data),
+                Err(e) => assert!(!right, "{e}"),
+            }
+        }
     }
 
     #[test]
