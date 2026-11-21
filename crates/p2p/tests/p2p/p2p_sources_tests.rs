@@ -476,13 +476,15 @@ async fn test_a_partial_pull_takes_its_chunks_from_a_peer() {
     let (peer, t) = traffic[0];
     assert_eq!(peer, s.node_a.peer_id());
     assert!(t.requests >= 1 && t.chunks >= 1 && t.failures == 0, "{t:?}");
-    assert_eq!(t.bytes, result.stats.from("source0").0);
+    // (and the table of contents, an index the pull does not count)
+    assert!(t.bytes > result.stats.from("source0").0, "{t:?}");
     assert!(t.average().is_some());
-    // B asked A because its filter said maybe, and A had the layer
+    // B asked A because its filter said maybe, and A had the layer: for
+    // its table of contents and for its chunks
     let said = s.node_b.lookups().await;
     assert_eq!(
         (said.filter_hits, said.filter_false_positives),
-        (1, 0),
+        (2, 0),
         "{said:?}"
     );
 }
@@ -1227,6 +1229,13 @@ async fn test_a_peer_that_loses_requests_or_sends_wrong_bytes_is_replaced_by_one
         let quick = add_holder(&s, Duration::ZERO).await;
         let b = lazy_b(&s, &layer, 0).await;
         let ranged = b.reg.ranged.load(Ordering::SeqCst);
+        // (what the lazy pull took of A: the table of contents)
+        let chunks_of = |peer: libp2p::PeerId| {
+            (s.source.knowledge().traffic().iter())
+                .find(|(p, _)| *p == peer)
+                .map_or(0, |(_, t)| t.chunks)
+        };
+        let before_a = chunks_of(s.node_a.peer_id());
         for f in &d {
             b.service.fetch_lazy_file(f, &layer_digest).await.unwrap();
             assert!(b.pooled().contains(f), "{name}: {f} is not in the pool");
@@ -1237,15 +1246,9 @@ async fn test_a_peer_that_loses_requests_or_sends_wrong_bytes_is_replaced_by_one
             "{name}: the registry was asked"
         );
         // the one that did not fail gave the chunks; the wrong bytes of the other were refused
+        let from_quick = chunks_of(quick.peer_id());
+        let from_a = chunks_of(s.node_a.peer_id()) - before_a;
         let traffic = s.source.knowledge().traffic();
-        let from_quick = traffic
-            .iter()
-            .find(|(p, _)| *p == quick.peer_id())
-            .map_or(0, |(_, t)| t.chunks);
-        let from_a = traffic
-            .iter()
-            .find(|(p, _)| *p == s.node_a.peer_id())
-            .map_or(0, |(_, t)| t.chunks);
         assert!(from_quick > 0 && from_a == 0, "{name}: {traffic:?}");
     }
 }

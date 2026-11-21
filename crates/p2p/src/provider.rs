@@ -1242,21 +1242,30 @@ impl PeerSource {
                         outcome: Outcome::Failed("not an index".into()),
                         took: started.elapsed(),
                     });
+                    self.knowledge.failed(provider);
+                    self.knowledge.count(provider, started.elapsed(), None);
                 }
                 Ok(Some(index)) => {
+                    let took = started.elapsed();
                     note(|| Event::Asked {
                         peer: provider,
                         outcome: Outcome::Sent(1, index.len() as u64),
-                        took: started.elapsed(),
+                        took,
                     });
+                    self.knowledge
+                        .count(provider, took, Some((1, index.len() as u64)));
+                    self.knowledge.served(Some(&layer), provider, took);
                     out.put(&item.digest, &index).await?;
                     return Ok(Some(provider));
                 }
-                Ok(None) => note(|| Event::Asked {
-                    peer: provider,
-                    outcome: Outcome::Lacks,
-                    took: started.elapsed(),
-                }),
+                Ok(None) => {
+                    note(|| Event::Asked {
+                        peer: provider,
+                        outcome: Outcome::Lacks,
+                        took: started.elapsed(),
+                    });
+                    self.knowledge.missed(Some(&layer), provider);
+                }
                 // (it may have the index: nothing is recorded of the layer)
                 Err(PeerError::Busy) => {
                     note(|| Event::Asked {
@@ -1284,6 +1293,7 @@ impl PeerSource {
                         outcome: Outcome::Failed(e.clone()),
                         took: started.elapsed(),
                     });
+                    self.knowledge.count(provider, started.elapsed(), None);
                     debug!(
                         "P2P: the index of {} from {}: {}",
                         short(&item.digest),
@@ -1367,11 +1377,14 @@ impl PeerSource {
             let started = tokio::time::Instant::now();
             match self.peers.profile(peer, &item.digest, max).await {
                 Ok(Some(profile)) if looks_like_a_profile(&profile) => {
+                    let took = started.elapsed();
                     note(|| Event::Asked {
                         peer,
                         outcome: Outcome::Sent(1, profile.len() as u64),
-                        took: started.elapsed(),
+                        took,
                     });
+                    self.knowledge
+                        .count(peer, took, Some((1, profile.len() as u64)));
                     debug!(
                         "P2P: the startup profile of {} from {} ({} bytes)",
                         short(&item.digest),
@@ -3709,6 +3722,12 @@ mod tests {
         assert_eq!(out.0, [(layer.digest.clone(), b"an index".to_vec())]);
         assert_eq!(given, Some(honest));
         assert_eq!(*fake.index_asked.lock().unwrap(), [liar, honest]);
+        // (what each sent is in the traffic of the status)
+        let traffic: HashMap<PeerId, (u64, u64, u64)> = (s.knowledge().traffic().into_iter())
+            .map(|(p, t)| (p, (t.requests, t.failures, t.bytes)))
+            .collect();
+        assert_eq!(traffic[&honest], (1, 0, 8));
+        assert_eq!(traffic[&liar], (1, 1, 0));
         // (a provider the puller refused the index of is not asked)
         let mut out = Collect::default();
         let given = s
