@@ -366,19 +366,6 @@ pub async fn ingest(
 /// pieces of the blob.
 async fn ingest_stream<S>(
     ctx: &PullCtx,
-    body: S,
-    layer: &OciDescriptor,
-    expected_diff_id: &Digest,
-    progress: impl Fn(u64),
-) -> ImageResult<Ingested>
-where
-    S: futures::Stream<Item = ImageResult<Bytes>> + Unpin,
-{
-    ingest_feed(ctx, body, layer, expected_diff_id, progress).await
-}
-
-async fn ingest_feed<S>(
-    ctx: &PullCtx,
     mut body: S,
     layer: &OciDescriptor,
     expected_diff_id: &Digest,
