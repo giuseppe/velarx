@@ -304,20 +304,13 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
                     staged.push(i as u32);
                     continue;
                 }
-                // (only the bytes of what it staged count)
-                let before = counted.1.load(std::sync::atomic::Ordering::Relaxed);
-                let result = stage_file(&counted, &indexed, (key, at), &staging, verity);
-                if !matches!(result, Ok(true)) {
-                    counted
-                        .1
-                        .store(before, std::sync::atomic::Ordering::Relaxed);
-                }
-                match result {
+                // (the bytes this object took)
+                counted.1.store(0, std::sync::atomic::Ordering::Relaxed);
+                match stage_file(&counted, &indexed, (key, at), &staging, verity) {
                     Ok(true) => {
                         staged.push(i as u32);
-                        // (the bytes this object took: its own, cumulative)
                         let moved = counted.1.load(std::sync::atomic::Ordering::Relaxed);
-                        events.push(Event::progress(Some(i as u32), moved - before));
+                        events.push(Event::progress(Some(i as u32), moved));
                     }
                     Ok(false) => nobody.push(i as u32),
                     Err(e) => events.push(Event::failed(
