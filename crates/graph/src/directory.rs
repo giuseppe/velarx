@@ -1537,15 +1537,20 @@ mod tests {
             1,
             "nothing was made outside"
         );
-        // in one layer too, as the image of the layer has it
+        // in one layer a link is not a directory to put files in: the
+        // layer is refused
         let same = Img::new();
-        let tree = same.merged(&[vec![
-            dir("", 0o755),
-            link("escape", &out),
-            same.file("escape/pwned", b"x", 0o644),
-        ]]);
-        same.write(&c, &tree, None).unwrap();
-        assert!(same.dst.join("escape/pwned").is_file() && !same.dst.join("escape").is_symlink());
+        let layer = Toc {
+            version: 1,
+            entries: vec![
+                dir("", 0o755),
+                link("escape", &out),
+                same.file("escape/pwned", b"x", 0o644),
+            ],
+            tar_split_digest: None,
+        };
+        let e = MergedTree::build(&[&layer]).unwrap_err();
+        assert!(e.contains("`escape` is not a directory"), "{e}");
         // a path that goes up is refused
         let up = Toc {
             version: 1,

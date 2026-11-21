@@ -6,12 +6,9 @@
 //! layers.  What a build, a squash and the copy of the `vfs` driver read of
 //! an image.
 
-use crate::layer_erofs::LINK_BELOW;
+use crate::layer_erofs::resolve_entries;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use velarx_storage::{Toc, TocEntry, TocEntryType};
-
-const WHITEOUT_PREFIX: &str = ".wh.";
-const OPAQUE_MARKER: &str = ".wh..wh..opq";
 
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -179,139 +176,58 @@ impl MergedTree {
     }
 
     /// The tree of one layer as its image has it (`layer_erofs`), and its
-    /// opaque directories.  The last entry of a path wins.  The root is the
-    /// `./` entry, or a plain directory (`dir_entry`), and so is a directory
-    /// the layer has entries in and does not list, in the place of a file
-    /// of the layer that has its name.  A hard link names a file of the
-    /// layer.  A whiteout is a device 0:0, unless the layer has the name:
-    /// a directory of the layer that it removes is opaque, as is one with
-    /// an opaque marker.
+    /// opaque directories.  What a path names is what an extraction of the
+    /// entries in their order makes of it ([`resolve_entries`]).  The root
+    /// is the `./` entry, or a plain directory (`dir_entry`), and so is a
+    /// directory the layer has entries in and does not list.  A whiteout is
+    /// a device 0:0, unless the layer has the name: a directory of the layer
+    /// that it removes is opaque, as is one with an opaque marker.
     fn of_layer(entries: &[TocEntry]) -> Result<(Self, BTreeSet<usize>), String> {
-        let mut by_path: BTreeMap<Vec<&str>, &TocEntry> = BTreeMap::new();
-        let mut whiteouts: BTreeSet<Vec<&str>> = BTreeSet::new();
-        let mut opaque_dirs: BTreeSet<Vec<&str>> = BTreeSet::new();
-        for e in entries {
-            if e.entry_type == TocEntryType::Chunk {
-                continue;
-            }
-            let parts = components(&e.name).map_err(|m| format!("`{}`: {m}", e.name))?;
-            match parts.split_last() {
-                // (the root of an overlay is the merge of the roots of all its
-                // layers, whatever the layers say: a marker in the root of a
-                // layer hides nothing)
-                Some((&OPAQUE_MARKER, [])) => {}
-                Some((&OPAQUE_MARKER, dir)) => {
-                    opaque_dirs.insert(dir.to_vec());
-                }
-                Some((last, dir)) if last.starts_with(WHITEOUT_PREFIX) => {
-                    // (`.wh.`, `.wh..` and `.wh...` hide nothing)
-                    let hidden = &last[WHITEOUT_PREFIX.len()..];
-                    if !matches!(hidden, "" | "." | "..") {
-                        whiteouts.insert([dir, &[hidden]].concat());
-                    }
-                }
-                _ => {
-                    by_path.insert(parts, e);
-                }
-            }
-        }
+        let layer = resolve_entries(entries)?;
         let mut t = Self::new();
-        let mut links = Vec::new();
-        for (parts, e) in by_path {
-            let Some((last, dir)) = parts.split_last() else {
-                if e.entry_type != TocEntryType::Dir {
-                    return Err("the root of the layer is not a directory".into());
-                }
-                t.nodes[ROOT].entry = TocEntry {
-                    name: String::new(),
-                    ..e.clone()
-                };
-                t.nodes[ROOT]
-                    .entry
-                    .xattrs
-                    .retain(|k, _| !super::image_fs::hidden_xattr(k));
-                continue;
+        if let Some(i) = layer.paths[ROOT].entry {
+            t.nodes[ROOT].entry = TocEntry {
+                name: String::new(),
+                ..entries[i].clone()
             };
-            if e.entry_type == TocEntryType::Hardlink {
-                links.push((parts, e));
-                continue;
-            }
-            let parent = t.dir_at(dir);
-            let n = t.new_node(0, e.clone());
-            t.unlink(parent, last);
-            t.link(parent, last, n);
+            t.nodes[ROOT]
+                .entry
+                .xattrs
+                .retain(|k, _| !super::image_fs::hidden_xattr(k));
         }
-        // (a link may name another link: until no more of them resolve)
-        while !links.is_empty() {
-            let before = links.len();
-            let mut unresolved = Vec::new();
-            for (parts, e) in links {
-                let target = e
-                    .link_name
-                    .as_deref()
-                    .ok_or_else(|| format!("`{}`: a hard link without a target", e.name))?;
-                let Some(n) = t.resolve(target) else {
-                    unresolved.push((parts, e));
-                    continue;
-                };
-                if t.nodes[n].entry.entry_type == TocEntryType::Dir {
-                    return Err(format!("`{}`: a hard link to a directory", e.name));
-                }
-                let (last, dir) = parts.split_last().expect("the root is no link");
-                let parent = t.dir_at(dir);
-                t.unlink(parent, last);
-                t.link(parent, last, n);
-            }
-            if let Some((_, e)) = unresolved.first().filter(|_| unresolved.len() == before) {
-                let target = e.link_name.as_deref().unwrap_or_default();
-                return Err(format!(
-                    "`{}`: a hard link to `{target}`, {LINK_BELOW}",
-                    e.name
-                ));
-            }
-            links = unresolved;
+        // (the node of each path, the root first: a file with several names
+        // is one node)
+        let mut node = vec![ROOT];
+        let mut made: HashMap<usize, usize> = HashMap::new();
+        for (p, path) in layer.paths.iter().enumerate().skip(1) {
+            let n = match path.entry {
+                None => t.new_node(0, dir_entry(&layer.path(p).join("/"))),
+                Some(i) => *made
+                    .entry(i)
+                    .or_insert_with(|| t.new_node(0, entries[i].clone())),
+            };
+            t.link(node[path.parent], path.name, n);
+            node.push(n);
         }
         let mut opaque = BTreeSet::new();
-        for parts in whiteouts {
-            let (last, dir) = parts.split_last().expect("a whiteout names a file");
-            let parent = t.dir_at(dir);
-            match t.lookup(parent, last) {
+        for &(dir, name) in &layer.whiteouts {
+            let parent = node[dir];
+            match t.lookup(parent, name) {
                 Some(c) if t.nodes[c].entry.entry_type == TocEntryType::Dir => {
                     opaque.insert(c);
                 }
                 Some(_) => {}
                 None => {
-                    let mut w = dir_entry(&parts.join("/"));
+                    let mut w = dir_entry(&[layer.path(dir), vec![name]].concat().join("/"));
                     (w.entry_type, w.mode, w.dev_major, w.dev_minor) =
                         (TocEntryType::Char, 0, Some(0), Some(0));
                     let n = t.new_node(0, w);
-                    t.link(parent, last, n);
+                    t.link(parent, name, n);
                 }
             }
         }
-        for parts in opaque_dirs {
-            let d = t.dir_at(&parts);
-            opaque.insert(d);
-        }
+        opaque.extend(layer.opaque.iter().map(|&d| node[d]));
         Ok((t, opaque))
-    }
-
-    /// The directory at `parts` of the tree of a layer, made plain where it
-    /// is missing or is not a directory.
-    fn dir_at(&mut self, parts: &[&str]) -> usize {
-        let mut cur = ROOT;
-        for (depth, c) in parts.iter().enumerate() {
-            cur = match self.lookup(cur, c) {
-                Some(n) if self.nodes[n].entry.entry_type == TocEntryType::Dir => n,
-                _ => {
-                    let n = self.new_node(0, dir_entry(&parts[..=depth].join("/")));
-                    self.unlink(cur, c);
-                    self.link(cur, c, n);
-                    n
-                }
-            };
-        }
-        cur
     }
 
     fn new_node(&mut self, layer: usize, entry: TocEntry) -> usize {
@@ -569,15 +485,14 @@ mod tests {
 
     #[test]
     fn test_a_hard_link_names_a_file_of_its_layer() {
-        // (the table lists the link before its target)
         let mut h = e("y", TocEntryType::Hardlink);
         h.link_name = Some("x".into());
-        let t = MergedTree::build(&[&toc(vec![h.clone(), file("x", "1")])]).unwrap();
+        let t = MergedTree::build(&[&toc(vec![file("x", "1"), h.clone()])]).unwrap();
         assert_eq!(t.resolve("x"), t.resolve("y"));
         // one to a file of a layer below is an error, as the image of the
         // layer is
         let e = MergedTree::build(&[&toc(vec![file("x", "1")]), &toc(vec![h])]).unwrap_err();
-        assert!(e.contains(LINK_BELOW), "{e}");
+        assert!(e.contains(crate::layer_erofs::LINK_BELOW), "{e}");
     }
 
     #[test]

@@ -112,7 +112,11 @@ lengths before allocating and verifies every digest.
   containers on it once every byte is checked against the table, and
   replays its tar-split at the completion, which commits nothing of a pull
   whose tar-split is not the table's.  Only a layer without the annotations
-  is read as a stream.
+  is read as a stream.  The image of a layer is what an extraction of its
+  entries in their order makes: a hard link names the file its target is at
+  that point of the archive, and a layer whose entry has a parent that is not
+  a directory there, or that turns a directory into another type, is
+  refused.
 * **A node outside the peer-to-peer swarm**: see "The peer-to-peer swarm"
   below.
 * **A storage service** (`[storage] driver = "varlink"`) is chosen by the

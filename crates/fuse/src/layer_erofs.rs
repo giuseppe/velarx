@@ -27,7 +27,7 @@
 //! attributes in the inodes, the directories and symbolic links inline where
 //! they fit, and the stubs as a single chunk that is a hole.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use velarx_storage::{FsVerityHashAlgorithm, TocEntry, TocEntryType};
 use velarx_types::digest::Digest;
 
@@ -220,8 +220,9 @@ struct Tree {
 
 const ROOT: usize = 0;
 
-/// What the error of a hard link to a file the layer does not have says.
-pub const LINK_BELOW: &str = "which the layer does not have";
+/// What the error of a hard link to a file the layer does not have before
+/// the link says.
+pub const LINK_BELOW: &str = "which the layer does not have before it";
 
 /// The node an entry is.
 fn node_of(e: &TocEntry) -> Result<Node, String> {
@@ -281,101 +282,197 @@ fn node_of(e: &TocEntry) -> Result<Node, String> {
     Ok(node)
 }
 
-impl Tree {
-    fn build(entries: &[TocEntry]) -> Result<Self, String> {
-        // the entries by path (the last of a path wins, as in the archive),
-        // the whiteouts and the opaque directories
-        let mut by_path: Vec<(Vec<&str>, &TocEntry)> = Vec::new();
-        let mut whiteouts: BTreeSet<Vec<&str>> = BTreeSet::new();
-        let mut opaque: BTreeSet<Vec<&str>> = BTreeSet::new();
-        for e in entries {
-            if e.entry_type == TocEntryType::Chunk {
-                continue;
+/// What the entries of a layer make, as an extraction of them in their
+/// order: its paths and what each names, its whiteouts and its opaque
+/// markers.
+pub(crate) struct Resolved<'a> {
+    entries: &'a [TocEntry],
+    /// The paths: the root first, and every other one after its directory.
+    pub paths: Vec<Path<'a>>,
+    /// The whiteouts (`.wh.name`): the directory, the name it hides.
+    pub whiteouts: BTreeSet<(usize, &'a str)>,
+    /// The directories with an opaque marker.
+    pub opaque: BTreeSet<usize>,
+}
+
+/// A path of a layer.
+pub(crate) struct Path<'a> {
+    /// The directory it is in (the root is in itself), and its name there.
+    pub parent: usize,
+    pub name: &'a str,
+    /// The entry it names (the one of the file for every name of a hard
+    /// link), none for a directory the layer does not list.
+    pub entry: Option<usize>,
+    children: BTreeMap<&'a str, usize>,
+}
+
+/// Walk the entries in their order.  An entry replaces what its path names
+/// (a directory merges with a directory, and keeps what is in it); a hard
+/// link names the file its target is at that point; a directory that
+/// becomes another type, or a path with a parent that is not a directory,
+/// is an error.  A whiteout or an opaque marker is collected: the
+/// order of the archive says nothing of them.
+pub(crate) fn resolve_entries(entries: &[TocEntry]) -> Result<Resolved<'_>, String> {
+    let mut r = Resolved {
+        entries,
+        paths: vec![Path {
+            parent: 0,
+            name: "",
+            entry: None,
+            children: BTreeMap::new(),
+        }],
+        whiteouts: BTreeSet::new(),
+        opaque: BTreeSet::new(),
+    };
+    for (i, e) in entries.iter().enumerate() {
+        if e.entry_type == TocEntryType::Chunk {
+            continue;
+        }
+        let parts = components(&e.name)?;
+        match parts.split_last() {
+            // (the overlay never reads the attribute on the root of a lower
+            // layer: a marker in the root hides nothing, and the root has
+            // none)
+            Some((&OPAQUE_MARKER, [])) => {}
+            Some((&OPAQUE_MARKER, dir)) => {
+                let d = r.dir(dir)?;
+                r.opaque.insert(d);
             }
-            let parts = components(&e.name)?;
-            match parts.last() {
-                // (the overlay never reads the attribute on the root of a
-                // lower layer: a marker in the root hides nothing, and the
-                // root has none)
-                Some(&OPAQUE_MARKER) if parts.len() == 1 => {}
-                Some(&OPAQUE_MARKER) => {
-                    opaque.insert(parts[..parts.len() - 1].to_vec());
+            Some((last, dir)) if last.starts_with(WHITEOUT_PREFIX) => {
+                // (`.wh.`, `.wh..` and `.wh...` hide nothing, as in the
+                // merged views: an entry of no name, `.` or `..` would be
+                // one of the directory itself)
+                let hidden = &last[WHITEOUT_PREFIX.len()..];
+                if !matches!(hidden, "" | "." | "..") {
+                    let d = r.dir(dir)?;
+                    r.whiteouts.insert((d, hidden));
                 }
-                Some(last) if last.starts_with(WHITEOUT_PREFIX) => {
-                    // (`.wh.`, `.wh..` and `.wh...` hide nothing, as in the
-                    // merged views: an entry of no name, `.` or `..` would be
-                    // one of the directory itself)
-                    let hidden = &last[WHITEOUT_PREFIX.len()..];
-                    if !matches!(hidden, "" | "." | "..") {
-                        let mut target = parts[..parts.len() - 1].to_vec();
-                        target.push(hidden);
-                        whiteouts.insert(target);
+            }
+            _ => r.put(i, &parts)?,
+        }
+    }
+    Ok(r)
+}
+
+impl<'a> Resolved<'a> {
+    fn is_dir(&self, entry: Option<usize>) -> bool {
+        entry.is_none_or(|i| self.entries[i].entry_type == TocEntryType::Dir)
+    }
+
+    /// The components of the path `p`.
+    pub fn path(&self, mut p: usize) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        while p != 0 {
+            out.push(self.paths[p].name);
+            p = self.paths[p].parent;
+        }
+        out.reverse();
+        out
+    }
+
+    /// The path `parts`, if the layer has it now.
+    fn find(&self, parts: &[&str]) -> Option<usize> {
+        parts
+            .iter()
+            .try_fold(0, |p, c| self.paths[p].children.get(c).copied())
+    }
+
+    fn add(&mut self, parent: usize, name: &'a str, entry: Option<usize>) -> usize {
+        let p = self.paths.len();
+        self.paths.push(Path {
+            parent,
+            name,
+            entry,
+            children: BTreeMap::new(),
+        });
+        self.paths[parent].children.insert(name, p);
+        p
+    }
+
+    /// The directory `parts`, and its parents, plain where the layer does
+    /// not list them.
+    fn dir(&mut self, parts: &[&'a str]) -> Result<usize, String> {
+        let mut p = 0;
+        for (k, c) in parts.iter().enumerate() {
+            p = match self.paths[p].children.get(c) {
+                Some(&d) if self.is_dir(self.paths[d].entry) => d,
+                Some(_) => {
+                    return Err(format!("`{}` is not a directory", parts[..=k].join("/")));
+                }
+                None => self.add(p, c, None),
+            };
+        }
+        Ok(p)
+    }
+
+    fn put(&mut self, i: usize, parts: &[&'a str]) -> Result<(), String> {
+        let entries = self.entries;
+        let e = &entries[i];
+        let entry = if e.entry_type == TocEntryType::Hardlink {
+            let target = e
+                .link_name
+                .as_deref()
+                .ok_or_else(|| format!("`{}`: a hard link without a target", e.name))?;
+            let at = self
+                .find(&components(target)?)
+                .ok_or_else(|| format!("`{}`: a hard link to `{target}`, {LINK_BELOW}", e.name))?;
+            let entry = self.paths[at].entry;
+            if self.is_dir(entry) {
+                return Err(format!("`{}`: a hard link to a directory", e.name));
+            }
+            entry
+        } else {
+            Some(i)
+        };
+        let at = match parts.split_last() {
+            None => 0,
+            Some((last, dir)) => {
+                let d = self.dir(dir)?;
+                match self.paths[d].children.get(last) {
+                    Some(&at) => at,
+                    None => {
+                        self.add(d, last, entry);
+                        return Ok(());
                     }
                 }
-                _ => by_path.push((parts, e)),
             }
-        }
-        // (a stable sort keeps the entries of a path in the order of the
-        // archive, and the last of them is the one it has)
-        by_path.sort_by(|a, b| a.0.cmp(&b.0));
-        let by_path = by_path
-            .chunk_by(|a, b| a.0 == b.0)
-            .filter_map(|same| same.last());
-        let mut tree = Tree {
-            nodes: vec![Node::plain_dir()],
         };
-        let mut links: Vec<(Vec<&str>, &TocEntry)> = Vec::new();
-        // (parents before their children: the paths are sorted)
-        for (parts, e) in by_path {
-            if parts.is_empty() {
-                if e.entry_type != TocEntryType::Dir {
-                    return Err("the root of the layer is not a directory".into());
-                }
-                tree.nodes[ROOT] = node_of(e)?;
-                continue;
-            }
-            if e.entry_type == TocEntryType::Hardlink {
-                links.push((parts.clone(), e));
-                continue;
-            }
-            let node = node_of(e)?;
-            let parent = tree.parent(parts)?;
-            let idx = tree.nodes.len();
-            tree.nodes.push(node);
-            tree.link(parent, parts.last().unwrap(), idx)?;
+        if self.is_dir(self.paths[at].entry) && !self.is_dir(entry) {
+            return Err(format!("`{}` turns a directory into another type", e.name));
         }
-        // (a link may name another link: until no more of them resolve)
-        while !links.is_empty() {
-            let before = links.len();
-            let mut unresolved = Vec::new();
-            for (parts, e) in links {
-                let target = e
-                    .link_name
-                    .as_deref()
-                    .ok_or_else(|| format!("`{}`: a hard link without a target", e.name))?;
-                let Some(t) = tree.resolve(&components(target)?) else {
-                    unresolved.push((parts, e));
-                    continue;
-                };
-                if matches!(tree.nodes[t].kind, Kind::Dir(_)) {
-                    return Err(format!("`{}`: a hard link to a directory", e.name));
-                }
-                let parent = tree.parent(&parts)?;
-                tree.link(parent, parts.last().unwrap(), t)?;
+        self.paths[at].entry = entry;
+        Ok(())
+    }
+}
+
+impl Tree {
+    fn build(entries: &[TocEntry]) -> Result<Self, String> {
+        let layer = resolve_entries(entries)?;
+        let mut tree = Tree { nodes: Vec::new() };
+        // (the node of each path, the root first: a file with several names
+        // is one node)
+        let mut node: Vec<usize> = Vec::with_capacity(layer.paths.len());
+        let mut made: HashMap<usize, usize> = HashMap::new();
+        for (p, path) in layer.paths.iter().enumerate() {
+            let n = match path.entry {
+                None => tree.push(Node::plain_dir()),
+                Some(i) => match made.get(&i) {
+                    Some(&n) => n,
+                    None => {
+                        let n = tree.push(node_of(&entries[i])?);
+                        made.insert(i, n);
+                        n
+                    }
+                },
+            };
+            if p != ROOT {
+                tree.link(node[path.parent], path.name, n)?;
             }
-            if let Some((_, e)) = unresolved.first().filter(|_| unresolved.len() == before) {
-                let target = e.link_name.as_deref().unwrap_or_default();
-                return Err(format!(
-                    "`{}`: a hard link to `{target}`, {LINK_BELOW}",
-                    e.name
-                ));
-            }
-            links = unresolved;
+            node.push(n);
         }
-        for parts in whiteouts {
-            let parent = tree.parent(&parts)?;
-            let name = parts.last().unwrap().as_bytes();
-            match tree.child(parent, name) {
+        for (dir, name) in layer.whiteouts {
+            let parent = node[dir];
+            match tree.child(parent, name.as_bytes()) {
                 // a directory of the layer that it removed first: it does
                 // not merge with the one below
                 Some(c) if matches!(tree.nodes[c].kind, Kind::Dir(_)) => {
@@ -387,26 +484,26 @@ impl Tree {
                 // the archive says nothing)
                 Some(_) => {}
                 None => {
-                    let idx = tree.nodes.len();
-                    tree.nodes.push(Node {
+                    let idx = tree.push(Node {
                         kind: Kind::Char(0),
                         perm: 0,
                         ..Node::plain_dir()
                     });
-                    tree.link(parent, parts.last().unwrap(), idx)?;
+                    tree.link(parent, name, idx)?;
                 }
             }
         }
-        for parts in opaque {
-            let mut dir = ROOT;
-            for c in &parts {
-                dir = tree.dir_child(dir, c)?;
-            }
-            tree.nodes[dir]
+        for dir in layer.opaque {
+            tree.nodes[node[dir]]
                 .xattrs
                 .insert(XATTR_OPAQUE.as_bytes().to_vec(), b"y".to_vec());
         }
         Ok(tree)
+    }
+
+    fn push(&mut self, node: Node) -> usize {
+        self.nodes.push(node);
+        self.nodes.len() - 1
     }
 
     fn child(&self, dir: usize, name: &[u8]) -> Option<usize> {
@@ -414,37 +511,6 @@ impl Tree {
             Kind::Dir(c) => c.get(name).copied(),
             _ => None,
         }
-    }
-
-    fn resolve(&self, parts: &[&str]) -> Option<usize> {
-        let mut cur = ROOT;
-        for c in parts {
-            cur = self.child(cur, c.as_bytes())?;
-        }
-        Some(cur)
-    }
-
-    /// The directory `name` of `dir`, made plain if the layer does not list
-    /// it (a file of that name gives way to it, as in an extraction).
-    fn dir_child(&mut self, dir: usize, name: &str) -> Result<usize, String> {
-        match self.child(dir, name.as_bytes()) {
-            Some(c) if matches!(self.nodes[c].kind, Kind::Dir(_)) => Ok(c),
-            _ => {
-                let idx = self.nodes.len();
-                self.nodes.push(Node::plain_dir());
-                self.link(dir, name, idx)?;
-                Ok(idx)
-            }
-        }
-    }
-
-    /// The directory that holds `parts`, made if it is not there.
-    fn parent(&mut self, parts: &[&str]) -> Result<usize, String> {
-        let mut cur = ROOT;
-        for c in &parts[..parts.len().saturating_sub(1)] {
-            cur = self.dir_child(cur, c)?;
-        }
-        Ok(cur)
     }
 
     fn link(&mut self, dir: usize, name: &str, node: usize) -> Result<(), String> {
@@ -937,15 +1003,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_image_is_the_same_whatever_the_order_of_the_entries() {
+    fn the_image_is_the_same_whatever_the_order_of_the_paths() {
         let entries = sample();
         let a = layer_image(&entries).unwrap();
+        // (the entries of a path keep their order, and so do the links after
+        // the files: the rest is free)
+        let linked = |e: &TocEntry| e.entry_type == TocEntryType::Hardlink;
         let mut reversed = entries.clone();
         reversed.reverse();
+        reversed.sort_by_key(linked);
         let b = layer_image(&reversed).unwrap();
         let mut shuffled = entries.clone();
         // a fixed permutation: every third entry first
-        shuffled.sort_by_key(|e| (e.name.len() % 3, e.name.clone()));
+        shuffled.sort_by_key(|e| (linked(e), e.name.len() % 3, e.name.clone()));
         let c = layer_image(&shuffled).unwrap();
         assert!(a.image == b.image && a.image == c.image);
         assert_eq!(a.index, b.index);
@@ -1077,7 +1147,9 @@ pub(crate) mod tests {
         a.link_name = Some("b/second".into());
         let mut b = entry("b/second", TocEntryType::Hardlink);
         b.link_name = Some("c/file".into());
-        let built = layer_image(&[a, b, file("c/file", 1, 3)]).unwrap();
+        // (a link names a file the archive has at that point: a chain goes
+        // from the file on)
+        let built = layer_image(&[file("c/file", 1, 3), b, a]).unwrap();
         let list = listing(&built.image);
         let of = |p: &str| {
             let l = list
@@ -1100,6 +1172,204 @@ pub(crate) mod tests {
         );
     }
 
+    /// A layer as the tests of the order of its entries give it: a file is
+    /// the byte of its content.
+    #[derive(Debug)]
+    enum T {
+        File(u8),
+        Dir,
+        Link(&'static str),
+    }
+
+    fn layer(spec: &[(&str, T)]) -> Vec<TocEntry> {
+        spec.iter()
+            .map(|(name, t)| match t {
+                T::File(byte) => file(name, *byte, 1),
+                T::Dir => entry(name, TocEntryType::Dir),
+                T::Link(to) => {
+                    let mut e = entry(name, TocEntryType::Hardlink);
+                    e.link_name = Some(to.to_string());
+                    e
+                }
+            })
+            .collect()
+    }
+
+    /// The content of the files the entries make when `tar` extracts them.
+    fn extracted(spec: &[(&str, T)]) -> Result<BTreeMap<String, u8>, String> {
+        fn walk(dir: &std::path::Path, prefix: &str, out: &mut BTreeMap<String, u8>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let e = e.unwrap();
+                let path = format!("{prefix}{}", e.file_name().to_str().unwrap());
+                if e.path().is_dir() {
+                    walk(&e.path(), &format!("{path}/"), out);
+                } else {
+                    out.insert(path, std::fs::read(e.path()).unwrap()[0]);
+                }
+            }
+        }
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, t) in spec {
+            let mut h = tar::Header::new_gnu();
+            h.set_mode(0o755);
+            h.set_size(0);
+            match t {
+                T::File(byte) => {
+                    h.set_entry_type(tar::EntryType::Regular);
+                    h.set_size(1);
+                    tar.append_data(&mut h, name, &[*byte][..])
+                }
+                T::Dir => {
+                    h.set_entry_type(tar::EntryType::Directory);
+                    tar.append_data(&mut h, name, std::io::empty())
+                }
+                T::Link(to) => {
+                    h.set_entry_type(tar::EntryType::Link);
+                    tar.append_link(&mut h, name, to)
+                }
+            }
+            .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("layer.tar"), tar.into_inner().unwrap()).unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let tar = std::process::Command::new("tar")
+            .args(["-xf", "layer.tar", "-C", "root"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        if !tar.status.success() {
+            return Err(String::from_utf8_lossy(&tar.stderr).into());
+        }
+        let mut out = BTreeMap::new();
+        walk(&root, "", &mut out);
+        Ok(out)
+    }
+
+    /// The byte of the content a stub of an image (or an entry) stands for.
+    fn byte_of(fsverity_hex: &str) -> u8 {
+        u8::from_str_radix(&fsverity_hex[..2], 16).unwrap()
+    }
+
+    fn in_image(spec: &[(&str, T)]) -> Result<BTreeMap<String, u8>, String> {
+        let image = layer_image(&layer(spec))?.image;
+        Ok(listing(&image)
+            .iter()
+            .filter_map(|l| {
+                let (path, rest) = l.split_once(' ').unwrap();
+                let at = rest.find("redirect=/")? + "redirect=/".len();
+                Some((path[1..].to_string(), byte_of(&rest[at..])))
+            })
+            .collect())
+    }
+
+    fn in_merged(spec: &[(&str, T)]) -> Result<BTreeMap<String, u8>, String> {
+        let entries = layer(spec);
+        let tree = crate::MergedTree::build_entries(&[&entries])?;
+        let mut out = BTreeMap::new();
+        let mut todo = vec![(crate::merged::ROOT, String::new())];
+        while let Some((n, path)) = todo.pop() {
+            let node = tree.node(n).unwrap();
+            if let Some(d) = &node.entry.fsverity {
+                out.insert(path.clone(), byte_of(&d.hex()));
+            }
+            for (name, &c) in &node.children {
+                let sep = if path.is_empty() { "" } else { "/" };
+                todo.push((c, format!("{path}{sep}{name}")));
+            }
+        }
+        Ok(out)
+    }
+
+    const LONG: &str = "a-directory-with-a-name-of-more-than-one-hundred-bytes-as-tar-headers-have/and-a-file-in-it";
+
+    /// What a path names follows the order of the entries, as in an
+    /// extraction, for the image of the layer and for the merged view.
+    #[test]
+    fn a_layer_is_what_an_extraction_of_its_entries_makes() {
+        use T::*;
+        let cases: &[&[(&str, T)]] = &[
+            // a link keeps the file it was made to, whatever comes after
+            &[("f", File(1)), ("l", Link("f")), ("f", File(2))],
+            // a file after a link of its name replaces it, a link after a
+            // file replaces it: the order decides, not the type
+            &[("f", File(1)), ("g", File(2)), ("f", Link("g"))],
+            &[("g", File(2)), ("f", Link("g")), ("f", File(1))],
+            // a chain, and a link to a link of the chain
+            &[
+                ("f", File(1)),
+                ("a", Link("f")),
+                ("b", Link("a")),
+                ("f", File(2)),
+                ("c", Link("b")),
+            ],
+            // a link to what comes later, or to nothing
+            &[("l", Link("f")), ("f", File(1))],
+            &[("l", Link("missing"))],
+            // a link to a directory
+            &[("d", Dir), ("l", Link("d"))],
+            // a parent that is not a directory, a directory that is
+            // not one any more, a file that becomes one
+            &[("a", File(1)), ("a/b", File(2))],
+            &[("a/b", File(2)), ("a", File(1))],
+            &[("a", File(1)), ("a", Dir)],
+            &[("a", Dir), ("a/b", File(1)), ("a", Link("a/b"))],
+            &[("a", File(1)), ("a/.wh.b", File(2))],
+            &[("a", File(1)), ("a/.wh..wh..opq", File(2))],
+            // what is fine: parents the layer does not list, a directory
+            // again, a file over a file, names spelled with `./`, long names
+            &[
+                ("a/b/c", File(1)),
+                ("a", Dir),
+                ("a/b", Dir),
+                ("a/b/c", File(2)),
+            ],
+            &[("./a", File(1)), ("b", Link("./a")), ("./c/", Dir)],
+            &[(LONG, File(1)), ("l", Link(LONG)), ("d/l", Link("l"))],
+        ];
+        for spec in cases {
+            let want = extracted(spec).ok();
+            assert_eq!(in_image(spec).ok(), want, "image of {spec:?}");
+            assert_eq!(in_merged(spec).ok(), want, "merged view of {spec:?}");
+        }
+        // (a link to a whiteout, which tar makes, is refused: the image has
+        // no file there)
+        let spec: &[(&str, T)] = &[("a/.wh.b", File(1)), ("c", Link("a/.wh.b"))];
+        assert!(in_image(spec).is_err() && in_merged(spec).is_err());
+        let spec: &[(&str, T)] = &[("f", File(1)), ("l", Link("f")), ("f", File(2))];
+        assert_eq!(
+            in_image(spec).unwrap(),
+            BTreeMap::from([("f".to_string(), 2), ("l".to_string(), 1)])
+        );
+    }
+
+    /// A chain of links is resolved once, not once per link of it, and a
+    /// path is walked once, not once per parent.
+    #[test]
+    fn a_long_chain_of_hard_links_or_a_deep_tree_is_fast() {
+        let mut entries = vec![file("f", 1, 1)];
+        for i in 0..50_000 {
+            let mut l = entry(&format!("l{i}"), TocEntryType::Hardlink);
+            l.link_name = Some(if i == 0 {
+                "f".into()
+            } else {
+                format!("l{}", i - 1)
+            });
+            entries.push(l);
+        }
+        let deep = "d/".repeat(2000);
+        let deep: Vec<TocEntry> = (0..2000)
+            .map(|i| file(&format!("{deep}f{i}"), 1, 1))
+            .collect();
+        let start = std::time::Instant::now();
+        for entries in [entries, deep] {
+            assert!(layer_image(&entries).is_ok());
+            assert!(crate::MergedTree::build_entries(&[&entries]).is_ok());
+        }
+        assert!(start.elapsed().as_secs() < 20, "{:?}", start.elapsed());
+    }
+
     #[test]
     fn what_cannot_be_a_layer_is_an_error() {
         let mut hard = entry("a", TocEntryType::Hardlink);
@@ -1115,8 +1385,8 @@ pub(crate) mod tests {
         assert!(layer_image(&[f]).is_err());
         let mut root = entry("./", TocEntryType::Hardlink);
         root.link_name = Some("f".into());
-        let e = layer_image(&[root, file("f", 1, 1)]).err().unwrap();
-        assert!(e.contains("root of the layer"), "{e}");
+        let e = layer_image(&[file("f", 1, 1), root]).err().unwrap();
+        assert!(e.contains("turns a directory into another type"), "{e}");
     }
 }
 
