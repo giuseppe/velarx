@@ -5320,6 +5320,7 @@ dependencies = [
  "velarx-sys",
  "velarx-types",
  "velarx-wire",
+ "zeroize",
  "zstd",
 ]
 

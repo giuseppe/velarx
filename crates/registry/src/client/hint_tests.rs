@@ -23,6 +23,15 @@ pub(crate) fn dns(name: &str) -> Option<Vec<std::net::SocketAddr>> {
     Some(entry.1.clone())
 }
 
+/// What the requests of `client` found out for the cache of hints (the
+/// scheme of the registry is for the pool, not the cache).
+fn hint_notices(client: &RegistryClient) -> Notices {
+    Notices {
+        schemes: Vec::new(),
+        ..client.take_notices()
+    }
+}
+
 fn name_resolves_to(name: &str, addrs: Vec<std::net::SocketAddr>) {
     DNS.lock().unwrap().push((name.into(), addrs, 0));
 }
@@ -170,6 +179,7 @@ fn spec(host: &str, hint: Option<Hint>) -> EndpointSpec {
         hint,
         hints: true,
         min_speed: Default::default(),
+        scheme: None,
     }
 }
 
@@ -208,7 +218,7 @@ async fn without_a_hint_the_first_request_is_refused_and_asked_again() {
     get_blob(&client, &t).await;
     assert_eq!(requests(&c), 2, "the 401 and the request again");
     assert_eq!(auth_counts.token.load(Ordering::SeqCst), 1);
-    let notices = client.take_notices();
+    let notices = hint_notices(&client);
     assert!(notices.warnings.is_empty());
     assert_eq!(
         notices.hints,
@@ -251,7 +261,7 @@ async fn a_hint_goes_straight_to_the_token_endpoint_of_the_registry() {
     );
     assert_eq!(c.token.load(Ordering::SeqCst), 1);
     assert!(
-        client.take_notices().is_empty(),
+        hint_notices(&client).is_empty(),
         "nothing is said when the hint works"
     );
 }
@@ -264,7 +274,7 @@ async fn a_hint_whose_token_endpoint_is_gone_is_dropped_and_the_user_told() {
     let stale = format!("http://{host}/gone");
     let (client, t) = client(spec(&host, Some(bearer(stale))));
     get_blob(&client, &t).await;
-    let notices = client.take_notices();
+    let notices = hint_notices(&client);
     assert_eq!(notices.warnings.len(), 1, "{notices:?}");
     assert!(notices.warnings[0].contains(&host), "{notices:?}");
     assert!(notices.warnings[0].contains("404"), "{notices:?}");
@@ -282,7 +292,7 @@ async fn a_hint_whose_token_endpoint_is_gone_is_dropped_and_the_user_told() {
     assert!(c.blob.load(Ordering::SeqCst) >= 1);
     // the registry's own answer is used from now on: no more words
     get_blob(&client, &t).await;
-    assert!(client.take_notices().is_empty());
+    assert!(hint_notices(&client).is_empty());
 }
 
 #[tokio::test]
@@ -293,7 +303,7 @@ async fn a_token_endpoint_that_refuses_the_hint_is_asked_about_again() {
     get_blob(&client, &t).await;
     assert_eq!(c.refused.load(Ordering::SeqCst), 1);
     assert_eq!(auth_counts.token.load(Ordering::SeqCst), 1);
-    let notices = client.take_notices();
+    let notices = hint_notices(&client);
     assert_eq!(notices.warnings.len(), 1);
     assert!(notices.warnings[0].contains("403"), "{notices:?}");
 }
@@ -311,7 +321,7 @@ async fn a_token_the_registry_rejects_drops_the_hint_and_the_request_goes_again_
     // the request with the stale token, the one without a token that says
     // what the registry wants, and the one with the new token
     assert_eq!(c.blob.load(Ordering::SeqCst), 3);
-    let notices = client.take_notices();
+    let notices = hint_notices(&client);
     assert_eq!(notices.warnings.len(), 1, "{notices:?}");
     assert!(notices.warnings[0].contains("401"), "{notices:?}");
     assert!(notices
@@ -326,7 +336,7 @@ async fn a_hint_that_was_served_is_not_blamed_for_a_later_401() {
     let (client, t) = client(spec(&host, Some(bearer(format!("http://{host}/token")))));
     get_blob(&client, &t).await;
     assert!(!client.drop_hint(&t.endpoint.host, "an expired token"));
-    assert!(client.take_notices().is_empty());
+    assert!(hint_notices(&client).is_empty());
 }
 
 #[tokio::test]
@@ -348,7 +358,7 @@ async fn a_basic_registry_with_credentials_goes_straight_to_the_request() {
     let (client, t) = client(s);
     get_blob(&client, &t).await;
     assert_eq!(requests(&c), 1);
-    assert!(client.take_notices().is_empty());
+    assert!(hint_notices(&client).is_empty());
 }
 
 #[tokio::test]
@@ -363,7 +373,7 @@ async fn a_basic_registry_without_a_hint_learns_it() {
     let (client, t) = client(s);
     get_blob(&client, &t).await;
     assert!(requests(&c) >= 1);
-    assert!(client.take_notices().hints.iter().any(|n| matches!(
+    assert!(hint_notices(&client).hints.iter().any(|n| matches!(
         n,
         Note::Auth {
             auth: Auth::Basic,
@@ -477,7 +487,7 @@ async fn a_worker_that_does_not_report_keeps_quiet() {
     s.hints = false;
     let (client, t) = client(s);
     get_blob(&client, &t).await;
-    assert!(client.take_notices().is_empty());
+    assert!(hint_notices(&client).is_empty());
 }
 
 /// A listener that counts the connections it is made, and drops them.
@@ -606,7 +616,7 @@ async fn what_v2_says_is_no_hint_for_a_pull_without_credentials() {
     let (host, _c) = registry(format!("http://{auth}/token"), "good", false).await;
     let (client, t) = client(spec(&host, None));
     client.warm(&t).await.unwrap();
-    assert!(client.take_notices().is_empty());
+    assert!(hint_notices(&client).is_empty());
 }
 
 /// A name with this port, as a listener on 127.0.0.1 is reached by it.
@@ -955,5 +965,5 @@ fn a_hint_that_does_not_work_is_forgotten_with_a_word() {
     s.hint.as_mut().unwrap().transport = "https".into();
     let (client, _) = self::client(s);
     assert!(client.drop_hint("registry.example", "token endpoint: 404"));
-    assert_eq!(client.take_notices().warnings.len(), 1);
+    assert_eq!(hint_notices(&client).warnings.len(), 1);
 }

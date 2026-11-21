@@ -378,7 +378,10 @@ impl RegistryClient {
             };
             // (certificates that cannot be used fail here, not at the first
             // request)
-            client.host(&target)?;
+            let host = client.host(&target)?;
+            if let Some(scheme) = spec.scheme {
+                host.know_scheme(scheme);
+            }
             targets.push(target);
         }
         if targets.is_empty() {
@@ -612,7 +615,9 @@ impl RegistryClient {
 
     /// What the requests found out since the last call.
     pub fn take_notices(&self) -> Notices {
-        std::mem::take(&mut *self.hinting.notices.lock().unwrap())
+        let mut notices = std::mem::take(&mut *self.hinting.notices.lock().unwrap());
+        notices.schemes = self.transport.untold_schemes();
+        notices
     }
 
     /// Where the endpoint that served the blob `digest` sent it, if it did,
@@ -3800,7 +3805,53 @@ mod tests {
             }),
             hints: false,
             min_speed: Default::default(),
+            scheme: None,
         }
+    }
+
+    /// The scheme a worker found an insecure registry to speak is told
+    /// once, and a worker that is told it does not probe the registry.
+    #[tokio::test]
+    async fn test_a_scheme_found_is_told_and_not_probed_again() {
+        let (host, c) = start_mode_registry(Tokenless::Open).await;
+        let spec = EndpointSpec {
+            hint: None,
+            ..spec_with_hint(&host, "", false)
+        };
+        let (client, t) = RegistryClient::from_specs(std::slice::from_ref(&spec)).unwrap();
+        assert_eq!(
+            client.get_blob(&t, &digest(), None).await.unwrap().status(),
+            200
+        );
+        assert_eq!(c.ping.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            client.take_notices().schemes,
+            [(host.clone(), Scheme::Http)]
+        );
+        assert!(client.take_notices().schemes.is_empty());
+
+        let told = EndpointSpec {
+            scheme: Some(Scheme::Http),
+            ..spec.clone()
+        };
+        let (client, t) = RegistryClient::from_specs(&[told]).unwrap();
+        assert_eq!(
+            client.get_blob(&t, &digest(), None).await.unwrap().status(),
+            200
+        );
+        assert_eq!(c.ping.load(Ordering::SeqCst), 1);
+        assert!(client.take_notices().schemes.is_empty());
+
+        // a registry that is not insecure is reached over HTTPS whatever
+        // it is told
+        let secure = EndpointSpec {
+            insecure: false,
+            scheme: Some(Scheme::Http),
+            ..spec
+        };
+        let (client, t) = RegistryClient::from_specs(&[secure]).unwrap();
+        let base = client.host(&t).unwrap().base_url().await.unwrap();
+        assert_eq!(base, format!("https://{host}"));
     }
 
     async fn pull_with_hint(spec: EndpointSpec) {

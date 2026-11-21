@@ -192,6 +192,18 @@ impl Handing {
     }
 }
 
+/// What [`Scope::kept`] holds the workers of the scope under (not the digest of
+/// a layer).
+const WORKERS: &str = "workers";
+
+/// The workers of a scope, with the access they were made for: a `Renew`
+/// of the scope has new ones made.
+struct Workers {
+    access: Option<zeroize::Zeroizing<Vec<u8>>>,
+    pool: Arc<Pool>,
+    host: String,
+}
+
 impl RegistryFetch {
     pub fn new(service: Arc<RegistryService>, scratch: Arc<OwnedFd>) -> Arc<Self> {
         Arc::new(Self { service, scratch })
@@ -257,7 +269,10 @@ impl RegistryFetch {
         }
     }
 
-    /// The workers for the repository of the scope.
+    /// The workers for the repository of the scope: the same for all its
+    /// calls with the same access, so that their connections to the
+    /// registry are reused.  (A scope that brings credentials of its own has
+    /// workers of its own; they are let go with it.)
     fn pool(&self, scope: &Scope) -> Result<(Arc<Pool>, String), FetcherError> {
         let repository = scope
             .source
@@ -265,14 +280,32 @@ impl RegistryFetch {
             .ok_or_else(|| FetcherError::Refused {
                 reason: "this scope names no repository".into(),
             })?;
-        self.service
+        let mut kept = scope.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(w) = kept
+            .get(WORKERS)
+            .and_then(|w| w.clone().downcast::<Workers>().ok())
+            .filter(|w| w.access == scope.access)
+        {
+            return Ok((w.pool.clone(), w.host.clone()));
+        }
+        let (pool, host) = self
+            .service
             .pool_for(
                 repository,
                 scope.tls_verify.unwrap_or(true),
                 scope.access.as_deref().map(Vec::as_slice),
                 Reach::Pull,
             )
-            .map_err(failed)
+            .map_err(failed)?;
+        kept.insert(
+            WORKERS.into(),
+            Arc::new(Workers {
+                access: scope.access.clone(),
+                pool: pool.clone(),
+                host: host.clone(),
+            }),
+        );
+        Ok((pool, host))
     }
 
     /// The compressed table of contents and tar-split of a zstd:chunked
@@ -1295,6 +1328,42 @@ impl StagingFetcher for RegistryFetch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The calls of a scope share their workers, with or without credentials
+    /// of their own.
+    #[test]
+    fn the_calls_of_a_scope_share_the_workers() {
+        let fetch = RegistryFetch::new(
+            crate::registry::pool_tests::service(),
+            Arc::new(OwnedFd::from(File::open("/").unwrap())),
+        );
+        let scope = |access: &[u8]| Scope {
+            verity: false,
+            source: Some("registry.invalid/r/app".into()),
+            tls_verify: None,
+            target: None,
+            access: Some(access.to_vec().into()),
+            idle: std::time::Duration::from_secs(1),
+            kept: Arc::default(),
+        };
+        let creds = br#"{"creds":{"username":"u","password":"p"}}"#.as_slice();
+        for access in [br#"{}"#.as_slice(), creds] {
+            let scope = scope(access);
+            let (first, _) = fetch.pool(&scope).unwrap();
+            let (second, _) = fetch.pool(&scope).unwrap();
+            assert!(Arc::ptr_eq(&first, &second));
+        }
+        // a scope renewed with other credentials has other workers
+        let scope = scope(creds);
+        let (first, _) = fetch.pool(&scope).unwrap();
+        let renewed = Scope {
+            access: Some(br#"{"creds":{"username":"v","password":"q"}}"#.to_vec().into()),
+            kept: scope.kept.clone(),
+            ..scope
+        };
+        let (second, _) = fetch.pool(&renewed).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
 
     /// The files with no name beneath `dir` that this process has open.
     fn unnamed(dir: &std::path::Path) -> usize {

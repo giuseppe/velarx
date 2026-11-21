@@ -312,6 +312,7 @@ impl Registry {
             hint: None,
             hints: false,
             min_speed: Default::default(),
+            scheme: None,
         };
         let (fetch_client, target) = RegistryClient::from_specs(&[spec]).unwrap();
         let pull = velarx_config::PullConfig {

@@ -1085,6 +1085,7 @@ async fn test_workers_connect_to_the_cdn_before_the_first_range() {
         }),
         hints: true,
         min_speed: Default::default(),
+        scheme: None,
     };
     let pool = velarx_registry_lib::net::pool::Pool::new(spawner(), vec![spec], 3);
     pool.warm(3);

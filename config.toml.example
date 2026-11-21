@@ -384,7 +384,7 @@ max_archive_gib = 256
 # The worker executable (default: the registry fetcher itself, `pull-worker`)
 # worker_path = "/usr/bin/velarx-registry"
 # Worker processes of a pull at the same time
-max_workers = 12
+max_workers = 8
 # Remember for each registry how it asks for a token (the realm and service
 # of its 401, never a token or a credential) and the host its blobs are
 # redirected to (its CDN), in $XDG_CACHE_HOME/velarx (root:

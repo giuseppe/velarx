@@ -67,21 +67,7 @@ impl HostCerts {
     }
 }
 
-/// URL scheme of a registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scheme {
-    Https,
-    Http,
-}
-
-impl Scheme {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Scheme::Https => "https",
-            Scheme::Http => "http",
-        }
-    }
-}
+pub use super::target::Scheme;
 
 /// Names whose addresses were checked before a connection in advance, and
 /// that the connections to them are made to (so that the name is resolved
@@ -146,6 +132,8 @@ pub struct HostTransport {
     /// the registry to another one never needs it.
     client: std::sync::OnceLock<Result<reqwest::Client, String>>,
     scheme: tokio::sync::OnceCell<Scheme>,
+    /// The scheme was told, or came from who found it out
+    scheme_told: std::sync::atomic::AtomicBool,
     pinned: Arc<Pinned>,
     policy: Arc<Policy>,
     /// The registry refused a `Content-Range` on an upload: its pieces go
@@ -161,6 +149,7 @@ impl HostTransport {
             certs,
             client: std::sync::OnceLock::new(),
             scheme: tokio::sync::OnceCell::new(),
+            scheme_told: std::sync::atomic::AtomicBool::new(false),
             pinned: Arc::default(),
             policy: Arc::new(Policy::new(host, allow_private)),
             no_content_range: std::sync::atomic::AtomicBool::new(false),
@@ -273,6 +262,24 @@ impl HostTransport {
             .copied()
     }
 
+    /// Take `scheme` as the one an insecure host speaks (another process
+    /// found it out): the host is not probed.
+    pub fn know_scheme(&self, scheme: Scheme) {
+        if self.insecure && self.scheme.set(scheme).is_ok() {
+            self.scheme_told
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The scheme the probe found, once.
+    fn untold_scheme(&self) -> Option<Scheme> {
+        let scheme = *self.scheme.get()?;
+        (!self
+            .scheme_told
+            .swap(true, std::sync::atomic::Ordering::Relaxed))
+        .then_some(scheme)
+    }
+
     /// `scheme://host`.
     pub async fn base_url(&self) -> ImageResult<String> {
         Ok(format!("{}://{}", self.scheme().await?.as_str(), self.host))
@@ -335,6 +342,17 @@ impl Transport {
         let transport = Arc::new(HostTransport::new(host, insecure, allow_private, certs));
         hosts.insert(key, transport.clone());
         Ok(transport)
+    }
+
+    /// The schemes the insecure hosts were found to speak since the last
+    /// call.
+    pub fn untold_schemes(&self) -> Vec<(String, Scheme)> {
+        self.hosts
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|h| Some((h.host.clone(), h.untold_scheme()?)))
+            .collect()
     }
 }
 

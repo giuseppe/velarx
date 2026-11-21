@@ -157,16 +157,21 @@ pub struct Notices {
     pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hints: Vec<Note>,
+    /// The schemes insecure registries were found to speak: the next
+    /// workers do not probe them
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schemes: Vec<(String, crate::target::Scheme)>,
 }
 
 impl Notices {
     pub fn is_empty(&self) -> bool {
-        self.warnings.is_empty() && self.hints.is_empty()
+        self.warnings.is_empty() && self.hints.is_empty() && self.schemes.is_empty()
     }
 
     pub fn append(&mut self, mut other: Notices) {
         self.warnings.append(&mut other.warnings);
         self.hints.append(&mut other.hints);
+        self.schemes.append(&mut other.schemes);
     }
 }
 

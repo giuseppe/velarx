@@ -39,6 +39,7 @@ velarx-storage = { path = "../storage" }
 zstd.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 velarx-storage = { path = "../storage", features = ["test-support"] }

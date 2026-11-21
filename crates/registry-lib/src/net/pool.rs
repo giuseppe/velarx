@@ -172,6 +172,9 @@ pub struct Pool {
     warned: Mutex<Vec<String>>,
     /// The CDN host told to the hints (once)
     cdn_told: Mutex<HashMap<usize, String>>,
+    /// The schemes the insecure endpoints were found to speak, told to the
+    /// next workers
+    schemes: Mutex<HashMap<String, velarx_registry::target::Scheme>>,
     /// Whether the workers must have a user namespace (`[pull]
     /// require_userns`)
     require_userns: std::sync::atomic::AtomicBool,
@@ -385,6 +388,7 @@ impl Pool {
             warning: std::sync::OnceLock::new(),
             warned: Mutex::new(Vec::new()),
             cdn_told: Mutex::default(),
+            schemes: Mutex::default(),
             require_userns: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -417,6 +421,11 @@ impl Pool {
         if let Some(store) = self.hints.get() {
             let known: Vec<&str> = self.endpoints.iter().map(|e| e.host.as_str()).collect();
             store.apply(&notices.hints, &known);
+        }
+        for (host, scheme) in notices.schemes {
+            if self.endpoints.iter().any(|e| e.insecure && e.host == host) {
+                self.schemes.lock().unwrap().insert(host, scheme);
+            }
         }
         for line in notices.warnings {
             let line = printable(line.trim());
@@ -620,9 +629,14 @@ impl Pool {
     }
 
     /// The endpoints a worker is told about: the hint of the first has the
-    /// CDN this pool knows.
+    /// CDN this pool knows, the insecure ones the scheme a worker found.
     fn endpoints_for_a_worker(&self) -> Vec<EndpointSpec> {
         let mut endpoints = self.endpoints.clone();
+        let schemes = self.schemes.lock().unwrap();
+        for e in &mut endpoints {
+            e.scheme = schemes.get(&e.host).copied();
+        }
+        drop(schemes);
         if let (Some(first), Some((scheme, cdn))) = (endpoints.first_mut(), self.cdn()) {
             let hint = first
                 .hint
@@ -697,6 +711,7 @@ impl Pool {
             warning: std::sync::OnceLock::new(),
             warned: Mutex::new(Vec::new()),
             cdn_told: Mutex::default(),
+            schemes: Mutex::default(),
             require_userns: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -2047,6 +2062,7 @@ pub(crate) mod tests {
             hint: None,
             hints: true,
             min_speed: Default::default(),
+            scheme: None,
         }
     }
 
@@ -2079,6 +2095,7 @@ pub(crate) mod tests {
                 notices: Notices {
                     warnings: vec!["registry.example: \x1b[2Jthe hint did not work\n".into(); 3],
                     hints: vec![auth("other.example"), auth("registry.example")],
+                    ..Default::default()
                 },
                 ..Default::default()
             };
@@ -2119,10 +2136,35 @@ pub(crate) mod tests {
         for i in 0..100 {
             pool.absorb(velarx_registry::hints::Notices {
                 warnings: vec![format!("line {i}")],
-                hints: Vec::new(),
+                ..Default::default()
             });
         }
         assert_eq!(lines.lock().unwrap().len(), WARNINGS_SHOWN);
+    }
+
+    /// The scheme a worker found an insecure endpoint to speak is told to
+    /// the next workers; what it says of a secure endpoint or of another
+    /// registry is not.
+    #[test]
+    fn test_the_scheme_a_worker_found_is_told_to_the_next() {
+        use velarx_registry::target::Scheme;
+        let insecure = EndpointSpec {
+            insecure: true,
+            ..endpoint("mirror.example:5000")
+        };
+        let pool = Pool::new(spawner(), vec![insecure, endpoint("registry.example")], 2);
+        pool.absorb(velarx_registry::hints::Notices {
+            schemes: ["mirror.example:5000", "registry.example", "other.example"]
+                .map(|h| (h.to_string(), Scheme::Http))
+                .into(),
+            ..Default::default()
+        });
+        let told: Vec<_> = pool
+            .endpoints_for_a_worker()
+            .into_iter()
+            .map(|e| e.scheme)
+            .collect();
+        assert_eq!(told, [Some(Scheme::Http), None]);
     }
 
     /// The host the blobs are sent to is kept for the registry, once.

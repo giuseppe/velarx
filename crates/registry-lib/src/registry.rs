@@ -103,6 +103,7 @@ fn access_of(bytes: Option<&[u8]>) -> Result<Option<RegistryAccess>, RegistryErr
                 .map_err(|_| bad("the access file is not credentials"))
         })
         .transpose()
+        .map(|access| access.filter(|a| !a.is_empty()))
 }
 
 /// What an upload tells: the bytes of the blob the registry has taken.
@@ -817,5 +818,47 @@ mod search_tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "a/alpine");
         assert!(hits_of(true, b"not json", "x").is_err());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod pool_tests {
+    use super::*;
+
+    /// A service that starts no worker.
+    pub(crate) fn service() -> Arc<RegistryService> {
+        let spawner = Arc::new(Spawner::start_beside_idle_threads(Vec::new(), |_| Ok(())).unwrap());
+        RegistryService::with_client(
+            Default::default(),
+            RegistryClient::with_config(
+                velarx_registry::target::TransportConfig {
+                    registries: Default::default(),
+                    certs_dirs: Vec::new(),
+                    tls_verify: true,
+                },
+                velarx_registry::auth::AuthConfig::from_credentials(std::iter::empty()),
+            ),
+            spawner,
+        )
+        .unwrap()
+    }
+
+    /// A call that brings nothing (the engine sends an empty `RegistryAccess`
+    /// with every call) is served by the workers of the repository: one
+    /// pool, so one set of kept-alive connections, not one per call.
+    #[test]
+    fn calls_with_no_credentials_share_the_pool_of_the_repository() {
+        let service = service();
+        let empty = br#"{}"#.as_slice();
+        let pool = |access| {
+            service
+                .pool_for("registry.invalid/r/app", true, access, Reach::Pull)
+                .unwrap()
+                .0
+        };
+        assert!(Arc::ptr_eq(&pool(None), &pool(Some(empty))));
+        assert!(Arc::ptr_eq(&pool(Some(empty)), &pool(Some(empty))));
+        let creds = br#"{"creds":{"username":"u","password":"p"}}"#.as_slice();
+        assert!(!Arc::ptr_eq(&pool(Some(creds)), &pool(Some(creds))));
     }
 }

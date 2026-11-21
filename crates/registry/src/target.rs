@@ -365,6 +365,23 @@ impl Target {
     }
 }
 
+/// URL scheme of a registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scheme {
+    Https,
+    Http,
+}
+
+impl Scheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scheme::Https => "https",
+            Scheme::Http => "http",
+        }
+    }
+}
+
 /// An endpoint described for a process that has no configuration of its own:
 /// where it is, how to reach it and who to be.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -393,6 +410,10 @@ pub struct EndpointSpec {
     /// The least a download from this endpoint must bring
     #[serde(default)]
     pub min_speed: crate::speed::Speed,
+    /// The scheme an insecure endpoint was found to speak, so that it is
+    /// not probed again (ignored for an endpoint that is not insecure)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<Scheme>,
 }
 
 /// The configuration and the credentials of the registries: the endpoints
@@ -595,6 +616,7 @@ impl Resolver {
                     hint: self.hint(&e.endpoint.host),
                     hints: self.store.is_some(),
                     min_speed: self.speed,
+                    scheme: None,
                 })
             })
             .collect()

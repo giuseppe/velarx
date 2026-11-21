@@ -513,7 +513,8 @@ pub struct PullConfig {
     /// `velarx`
     #[serde(default)]
     pub dir_path: Option<PathBuf>,
-    /// Worker processes of a pull at the same time
+    /// Worker processes of a pull at the same time, each with its
+    /// connection to the registry
     #[serde(default = "default_max_workers")]
     pub max_workers: usize,
     /// Remember, for each registry, how it asks for a token and where its
@@ -612,7 +613,7 @@ fn default_lazy_profile_files() -> usize {
 }
 
 fn default_max_workers() -> usize {
-    12
+    8
 }
 
 fn default_parallel_layers() -> usize {
