@@ -653,15 +653,6 @@ impl Resolver {
         Ok((pull, auth))
     }
 
-    /// Whether the requests to `t` (its mirrors and its registry) carry
-    /// credentials, a password or a token, or a client certificate: what
-    /// comes from there may be private.  It may run credential
-    /// helpers: not on an async thread.
-    pub fn has_credentials(&self, t: &Target) -> bool {
-        t.chain()
-            .any(|e| e.certs.cert.is_some() || !matches!(self.credentials(e), Ok(None)))
-    }
-
     /// The credentials for the repository of `t`, if any.
     pub fn credentials(&self, t: &Target) -> ImageResult<Option<Credentials>> {
         self.auth

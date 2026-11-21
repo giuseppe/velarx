@@ -765,15 +765,6 @@ impl RegistryClient {
         }
     }
 
-    /// The credentials for the repository of `t`, if any.
-    /// Whether the requests to `t` (its mirrors and its registry) carry
-    /// credentials, a password or a token, or a client certificate: what
-    /// comes from there may be private.  It may run credential
-    /// helpers: not on an async thread.
-    pub fn has_credentials(&self, t: &Target) -> bool {
-        self.brokered.is_some() || self.resolver.has_credentials(t)
-    }
-
     /// Run the credential helpers in `runner` (this process cannot).
     pub fn set_helper_runner(&mut self, runner: Arc<super::helper::HelperRunner>) {
         self.resolver.set_helper_runner(runner);

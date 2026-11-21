@@ -245,6 +245,37 @@ async fn test_completing_a_lazy_image_from_a_source_leaves_the_objects_in_the_st
     assert_eq!(source.fetched.load(Ordering::SeqCst), asked);
 }
 
+/// A file the store gets while a lazy image is completed is taken as one it
+/// had: the completion commits the layer all the same.
+#[tokio::test]
+async fn test_a_file_the_store_gets_during_a_completion_is_taken() {
+    for meanwhile in [false, true] {
+        let source = fake_source().await;
+        *source.items.lock().unwrap() = chunk_map(&sample());
+        let e = env_with_sources(&[&source.socket]).await;
+        let layer = build_chunked(&sample());
+        e.publish(&[&layer], &[ZSTD]);
+        let result = e.pull_lazy().await.unwrap();
+        if meanwhile {
+            let store = e.store.clone();
+            *source.on_first.lock().unwrap() = Some(Box::new(move || {
+                store
+                    .put(velarx_types::digest::Algorithm::Sha256, &sample_big())
+                    .unwrap();
+            }));
+        }
+        e.service.complete_image(&result.id).await.unwrap();
+        assert!(source.fetched.load(Ordering::SeqCst) > 0);
+        let key = stored_key(&e.db, &sha(&layer.blob)).await;
+        assert_eq!(
+            e.db.get_layer(&key).await.unwrap().status,
+            "ready",
+            "meanwhile {meanwhile}"
+        );
+        assert!(e.store.contains(&vid(&sample_big())));
+    }
+}
+
 /// A pull with a directory configured as a source, in this process: no daemon,
 /// no socket.
 mod dir_source {
@@ -263,7 +294,7 @@ mod dir_source {
 
     async fn env_for(dir: &std::path::Path) -> Env {
         env_sources(
-            sharing(),
+            velarx_config::PullConfig::default(),
             velarx_config::PushConfig::default(),
             chain_for(dir),
         )
@@ -315,6 +346,21 @@ mod dir_source {
         let e = env_for(odd.path()).await;
         e.publish(&[&build_chunked(&sample())], &[ZSTD]);
         assert_eq!(e.pull().await.unwrap().stats.from("source0").0, 0);
+    }
+
+    /// A lazy image is completed from the files of a directory.
+    #[tokio::test]
+    async fn test_a_layer_is_completed_from_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fill(dir.path(), &chunk_map(&sample()));
+        let e = env_for(dir.path()).await;
+        let layer = build_chunked(&sample());
+        e.publish(&[&layer], &[ZSTD]);
+        let result = e.pull_lazy().await.unwrap();
+        let stats = e.service.complete_image(&result.id).await.unwrap();
+        assert!(stats.from("cache").0 > 0, "{stats:?}");
+        let key = stored_key(&e.db, &sha(&layer.blob)).await;
+        assert_eq!(e.db.get_layer(&key).await.unwrap().status, "ready");
     }
 }
 
@@ -544,99 +590,6 @@ async fn test_a_shared_checkpoint_from_a_source_that_lies_is_refused() {
         .is_err());
 }
 
-/// A pull with credentials may be of a private image: its sources are not
-/// asked (they would learn its digests) and its layers are not shareable;
-/// a pull without is, and the snapshot of the daemon tells only what is
-/// shareable.
-#[tokio::test]
-async fn test_what_may_be_private_is_neither_asked_nor_told() {
-    use velarx_registry::auth::{Credentials, RegistryAccess};
-    let layer = build_chunked(&sample());
-    let source = fake_source().await;
-    *source.items.lock().unwrap() = chunk_map(&sample());
-    let e = env_with_sources(&[&source.socket]).await;
-    e.publish(&[&layer], &[ZSTD]);
-    let client = e.client().with_access(&RegistryAccess {
-        creds: Some(Credentials::basic("alice", "secret")),
-        ..Default::default()
-    });
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    e.service
-        .pull_with_client(&client, &format!("{}/test:latest", e.host), tx)
-        .await
-        .unwrap();
-    assert_eq!(
-        source.has_calls.load(Ordering::SeqCst),
-        0,
-        "a source was asked"
-    );
-    let digest = sha(&layer.blob);
-    assert!(!e
-        .db
-        .is_layer_shareable(&stored_key(&e.db, &digest).await)
-        .await
-        .unwrap());
-    assert!(!e.db.is_content_shareable(&vid(b"hello\n")).await.unwrap());
-    let snapshot = velarx_core::store_service::Announcement::from_database(&e.db, true)
-        .await
-        .unwrap();
-    assert!(snapshot.layers.is_empty() && snapshot.images.is_empty());
-
-    let e = env_with_sources(&[&source.socket]).await;
-    e.publish(&[&layer], &[ZSTD]);
-    e.pull().await.unwrap();
-    assert!(e
-        .db
-        .is_layer_shareable(&stored_key(&e.db, &digest).await)
-        .await
-        .unwrap());
-    assert!(e.db.is_content_shareable(&vid(b"hello\n")).await.unwrap());
-    let snapshot = velarx_core::store_service::Announcement::from_database(&e.db, true)
-        .await
-        .unwrap();
-    assert_eq!(snapshot.layers, layer.announced_names());
-    assert_eq!(snapshot.images.len(), 1);
-
-    // a local name of the image, and an image no pull recorded (a commit
-    // that changes the configuration only has the layers of the image)
-    let image = snapshot.images[0].clone();
-    assert_eq!(image.tags, vec![format!("{}/test:latest", e.host)]);
-    e.db.insert_image_tag(&velarx_db::ImageTag {
-        repository: "localhost/secret-project".into(),
-        tag: "v2".into(),
-        image_id: image.id.clone(),
-    })
-    .await
-    .unwrap();
-    let id = image.id.clone();
-    e.db.conn()
-        .call(move |c| {
-            c.execute(
-                "INSERT INTO images (id, manifest_digest, config_digest, manifest, config, created_at)
-                 SELECT 'committed0000', 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', config_digest, manifest, config, created_at
-                 FROM images WHERE id = ?1",
-                [&id],
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-    e.db.insert_image_tag(&velarx_db::ImageTag {
-        repository: "localhost/committed".into(),
-        tag: "latest".into(),
-        image_id: "committed0000".into(),
-    })
-    .await
-    .unwrap();
-    let snapshot = velarx_core::store_service::Announcement::from_database(&e.db, true)
-        .await
-        .unwrap();
-    assert_eq!(snapshot.images.len(), 1);
-    assert_eq!(snapshot.images[0].id, image.id);
-    assert_eq!(snapshot.images[0].tags, image.tags);
-}
-
 /// An index that names more than its layer: files the layer does not use,
 /// or more bytes than a layer of its size may hold.  What it made this
 /// node fetch is not kept, and too much is not asked at all.
@@ -701,504 +654,120 @@ async fn test_what_an_index_adds_is_not_kept_nor_asked() {
     );
 }
 
-/// A public image that names the digest and diff id of a private layer
-/// the store has (they leak through inspect, SBOMs, logs) does not make it
-/// shareable, whatever its repository says: only what a pull fetched and
-/// checked is.
+/// The files a read-only store has that a pull names (a zstd:chunked TOC, or
+/// the index a source gives for a gzip layer) are copied into the store to
+/// be used, and the layer they make is complete.
 #[tokio::test]
-async fn test_a_public_image_does_not_make_a_private_layer_shareable() {
-    use velarx_registry::auth::{Credentials, RegistryAccess};
-    let e = env_sharing().await;
-    let private = build_gzip(&sample());
-    let public = build_gzip(&sample()[..2]);
-    e.publish(&[&private], &[GZIP]);
-    let creds = e.client().with_access(&RegistryAccess {
-        creds: Some(Credentials::basic("alice", "secret")),
-        ..Default::default()
-    });
-    let pull = |client: velarx_registry::target::Resolver, image: String| {
-        let service = e.service.clone();
-        async move {
-            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-            tokio::spawn(async move { while rx.recv().await.is_some() {} });
-            service.pull_with_client(&client, &image, tx).await
-        }
-    };
-    pull(creds, format!("{}/test:latest", e.host))
-        .await
-        .unwrap();
-    let (p, q) = (sha(&private.blob), sha(&public.blob));
-    assert!(!e
-        .db
-        .is_layer_shareable(&stored_key(&e.db, &p).await)
-        .await
-        .unwrap());
-
-    // a public image of the private layer and another: the registry even
-    // answers for the private one
-    publish_arch(&e.reg, &[&private, &public], &[GZIP, GZIP], "amd64", "pub1");
-    pull(e.client(), format!("{}/test:pub1", e.host))
-        .await
-        .unwrap();
-    assert!(
-        e.db.is_layer_shareable(&stored_key(&e.db, &q).await)
-            .await
-            .unwrap(),
-        "the layer it fetched"
-    );
-    assert!(
-        !e.db
-            .is_layer_shareable(&stored_key(&e.db, &p).await)
-            .await
-            .unwrap(),
-        "the private layer"
-    );
-    assert!(!e
-        .db
-        .is_content_shareable(&vid(&sample_big()))
-        .await
-        .unwrap());
-}
-
-/// A layer made from an index and files the store had is not shareable: its
-/// blob was never seen.  A peer offers a fake gzip layer (a digest of its
-/// own) with the diff id, TOC and tar-split of a private layer of the
-/// victim; the victim's public pull rebuilds it from its private files:
-/// neither the layer nor those files become shareable.
-#[tokio::test]
-async fn test_a_layer_rebuilt_from_an_index_is_not_shareable() {
-    use velarx_registry::auth::{Credentials, RegistryAccess};
-    let private = build_gzip(&sample());
-    let source = fake_source().await;
-    let e = env_with_sources(&[&source.socket]).await;
-    // the victim's private image
-    e.publish(&[&private], &[GZIP]);
-    let creds = e.client().with_access(&RegistryAccess {
-        creds: Some(Credentials::basic("alice", "secret")),
-        ..Default::default()
-    });
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    e.service
-        .pull_with_client(&creds, &format!("{}/test:latest", e.host), tx)
-        .await
-        .unwrap();
-    // the fake layer: other bytes, the private layer's diff id; its index
-    // is the private layer's, offered by the peer
-    let fake = Built {
-        blob: b"not the layer".to_vec(),
-        diff_id: private.diff_id,
-        annotations: Default::default(),
-    };
-    let x = sha(&fake.blob);
-    let index = index_of(&private).await;
-    source
-        .items
-        .lock()
-        .unwrap()
-        .insert(format!("index:{x}"), index);
-    publish_arch(&e.reg, &[&fake], &[GZIP], "amd64", "evil");
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    e.service
-        .pull_with_client(&e.client(), &format!("{}/test:evil", e.host), tx)
-        .await
-        .unwrap();
-    assert_eq!(
-        e.reg.hits.lock().unwrap().get(&x).copied().unwrap_or(0),
-        0,
-        "the layer came from the index"
-    );
-    assert_eq!(
-        e.db.get_layer(&stored_key(&e.db, &x).await)
-            .await
-            .unwrap()
-            .diff_id
-            .as_ref(),
-        Some(&private.diff_id)
-    );
-    assert!(!e
-        .db
-        .is_layer_shareable(&stored_key(&e.db, &x).await)
-        .await
-        .unwrap());
-    assert!(!e
-        .db
-        .is_content_shareable(&vid(&sample_big()))
-        .await
-        .unwrap());
-}
-
-/// Nothing is shared unless the configuration says so: an anonymous pull
-/// of a registry it does not list is private.
-#[tokio::test]
-async fn test_nothing_is_shared_by_default() {
-    let e = env().await;
-    let layer = build_gzip(&sample());
-    e.publish(&[&layer], &[GZIP]);
-    e.pull().await.unwrap();
-    assert!(!e.db.is_layer_shareable(&layer.key()).await.unwrap());
-    let e = env_sharing().await;
-    e.publish(&[&layer], &[GZIP]);
-    e.pull().await.unwrap();
-    assert!(e.db.is_layer_shareable(&layer.key()).await.unwrap());
-}
-
-/// A client certificate is a credential: what is pulled with one may be
-/// private.
-#[tokio::test]
-async fn test_a_client_certificate_is_a_credential() {
-    use velarx_registry::auth::RegistryAccess;
-    use velarx_registry::certs::RawCerts;
-    let e = env().await;
-    let layer = build_gzip(&sample());
-    e.publish(&[&layer], &[GZIP]);
-    let target = e
-        .client()
-        .target(&velarx_types::ImageReference::parse(&format!("{}/test:latest", e.host)).unwrap())
-        .unwrap();
-    assert!(!e.client().has_credentials(&target));
-    // a client certificate of its own, self-signed
-    let key = openssl::pkey::PKey::from_rsa(openssl::rsa::Rsa::generate(2048).unwrap()).unwrap();
-    let mut name = openssl::x509::X509NameBuilder::new().unwrap();
-    name.append_entry_by_text("CN", "client").unwrap();
-    let name = name.build();
-    let mut b = openssl::x509::X509Builder::new().unwrap();
-    b.set_version(2).unwrap();
-    b.set_subject_name(&name).unwrap();
-    b.set_issuer_name(&name).unwrap();
-    b.set_pubkey(&key).unwrap();
-    b.set_not_before(&openssl::asn1::Asn1Time::days_from_now(0).unwrap())
-        .unwrap();
-    b.set_not_after(&openssl::asn1::Asn1Time::days_from_now(1).unwrap())
-        .unwrap();
-    b.sign(&key, openssl::hash::MessageDigest::sha256())
-        .unwrap();
-    let cert = b.build();
-    let with_cert = e.client().with_access(&RegistryAccess {
-        certs: Some(RawCerts {
-            ca: vec![],
-            cert: Some(String::from_utf8(cert.to_pem().unwrap()).unwrap()),
-            key: Some(String::from_utf8(key.private_key_to_pem_pkcs8().unwrap()).unwrap()),
-        }),
-        ..Default::default()
-    });
-    let target = with_cert
-        .target(&velarx_types::ImageReference::parse(&format!("{}/test:latest", e.host)).unwrap());
-    assert!(with_cert.has_credentials(&target.unwrap()));
-}
-
-/// A zstd:chunked layer made of files the store had before its pull (of a
-/// private image) is not given, though its pull was public: they may be
-/// private files a public image names.  Fetched whole, or from the
-/// sources, it is.
-#[tokio::test]
-async fn test_a_layer_of_files_the_store_had_is_not_shareable() {
-    use velarx_registry::auth::{Credentials, RegistryAccess};
-    let e = env_sharing().await;
-    let private = build_gzip(&sample());
-    e.publish(&[&private], &[GZIP]);
-    let creds = e.client().with_access(&RegistryAccess {
-        creds: Some(Credentials::basic("alice", "secret")),
-        ..Default::default()
-    });
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    e.service
-        .pull_with_client(&creds, &format!("{}/test:latest", e.host), tx)
-        .await
-        .unwrap();
-    // a public zstd:chunked layer of the same files
-    let chunked = build_chunked(&sample());
-    publish_arch(&e.reg, &[&chunked], &[ZSTD], "amd64", "chunked");
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    e.service
-        .pull_with_client(&e.client(), &format!("{}/test:chunked", e.host), tx)
-        .await
-        .unwrap();
-    let c = sha(&chunked.blob);
-    assert_eq!(
-        e.db.get_layer(&stored_key(&e.db, &c).await)
-            .await
-            .unwrap()
-            .status,
-        "ready"
-    );
-    assert!(!e
-        .db
-        .is_layer_shareable(&stored_key(&e.db, &c).await)
-        .await
-        .unwrap());
-    assert!(!e
-        .db
-        .is_content_shareable(&vid(&sample_big()))
-        .await
-        .unwrap());
-
-    let e = env_sharing().await;
-    e.publish(&[&chunked], &[ZSTD]);
-    e.pull().await.unwrap();
-    assert!(e
-        .db
-        .is_layer_shareable(&stored_key(&e.db, &c).await)
-        .await
-        .unwrap());
-    assert!(e
-        .db
-        .is_content_shareable(&vid(&sample_big()))
-        .await
-        .unwrap());
-}
-
-/// What the store service tells the peers this node has: the layers and
-/// the images it may give.
-async fn told(e: &Env) -> Vec<String> {
-    let a = velarx_core::store_service::Announcement::from_database(&e.db, true)
-        .await
-        .unwrap();
-    a.content.into_iter().chain(a.layers).collect()
-}
-
-/// Files a read-only store has (a private image's) that a public pull
-/// names (a zstd:chunked TOC, or an index a peer crafted) are copied to be
-/// used, but never announced nor given, and the layer they make is not
-/// proven.
-#[tokio::test]
-async fn test_the_files_of_a_read_only_store_are_not_given() {
+async fn test_a_pull_uses_the_files_of_a_read_only_store() {
     let dir = tempfile::tempdir().unwrap();
     let ro = velarx_storage::FileStore::new(dir.path().join("ro-objects")).unwrap();
     for (_, data) in file_map(&sample()) {
         ro.put(velarx_types::digest::Algorithm::Sha256, &data)
             .unwrap();
     }
-    let private: Vec<String> = file_map(&sample()).into_keys().collect();
-
-    // a public zstd:chunked image of those files
-    let e = env_sources_over(
-        sharing(),
-        velarx_config::PushConfig::default(),
-        Fetchers::default(),
-        Some(dir.path().join("ro-objects")),
-    )
-    .await;
     let chunked = build_chunked(&sample());
-    e.publish(&[&chunked], &[ZSTD]);
-    e.pull().await.unwrap();
-    let c = sha(&chunked.blob);
-    assert_eq!(
-        e.db.get_layer(&stored_key(&e.db, &c).await)
-            .await
-            .unwrap()
-            .status,
-        "ready"
-    );
-    assert!(!e
-        .db
-        .is_layer_shareable(&stored_key(&e.db, &c).await)
-        .await
-        .unwrap());
-    let all = told(&e).await;
-    for d in &private {
-        assert!(!all.contains(d), "{d} was announced");
-        assert!(!e.db.is_content_shareable(d).await.unwrap());
-    }
-    assert!(!all.contains(&c.to_string()));
-
-    // a gzip layer whose index a peer crafted to name them
-    let layer = build_gzip(&sample());
+    let gzip = build_gzip(&sample());
     let source = fake_source().await;
-    let index = index_of(&layer).await;
+    let index = index_of(&gzip).await;
     source
         .items
         .lock()
         .unwrap()
-        .insert(format!("index:{}", sha(&layer.blob)), index);
-    let e = env_sources_over(
-        sharing(),
-        velarx_config::PushConfig::default(),
-        chain_of(&[&source.socket]),
-        Some(dir.path().join("ro-objects")),
-    )
-    .await;
-    e.publish(&[&layer], &[GZIP]);
-    e.pull().await.unwrap();
-    let g = sha(&layer.blob);
-    assert!(!e
-        .db
-        .is_layer_shareable(&stored_key(&e.db, &g).await)
-        .await
-        .unwrap());
-    let all = told(&e).await;
-    for d in &private {
-        assert!(!all.contains(d), "{d} was announced");
-        assert!(!e.db.is_content_shareable(d).await.unwrap());
+        .insert(format!("index:{}", sha(&gzip.blob)), index);
+    for (layer, media, chain) in [
+        (&chunked, ZSTD, Fetchers::default()),
+        (&gzip, GZIP, chain_of(&[&source.socket])),
+    ] {
+        let e = env_sources_over(
+            velarx_config::PullConfig::default(),
+            velarx_config::PushConfig::default(),
+            chain,
+            Some(dir.path().join("ro-objects")),
+        )
+        .await;
+        e.publish(&[layer], &[media]);
+        e.pull().await.unwrap();
+        let record =
+            e.db.get_layer(&stored_key(&e.db, &sha(&layer.blob)).await)
+                .await
+                .unwrap();
+        assert_eq!(record.status, "ready", "{media}");
+        if media == GZIP {
+            assert_eq!(record.diff_id.as_ref(), Some(&layer.diff_id));
+        }
+        assert!(e.store.contains_local(&vid(&sample_big())), "{media}");
     }
 }
 
-/// A file a public zstd:chunked TOC names whose content is one chunk of a
-/// private file of the store is assembled from that chunk, but neither
-/// told nor given while the pull runs nor after it: the TOC proves only
-/// that its author knows the chunk's digest.
+/// A pull with credentials asks the source that asks other nodes, as any
+/// other pull, and takes the files from it.
 #[tokio::test]
-async fn test_a_file_made_of_a_private_chunk_is_not_given() {
+async fn test_a_pull_with_credentials_asks_the_peer_source() {
     use velarx_registry::auth::{Credentials, RegistryAccess};
-    let e = env_sharing().await;
-    // a private zstd:chunked image: the store has the chunks of usr/big
-    let private = build_chunked(&sample());
-    e.publish(&[&private], &[ZSTD]);
-    let creds = e.client().with_access(&RegistryAccess {
+    let layer = build_chunked(&sample());
+    let source = fake_source().await;
+    *source.items.lock().unwrap() = chunk_map(&sample());
+    let e = env_with_sources(&[&source.socket]).await;
+    e.publish(&[&layer], &[ZSTD]);
+    let client = e.client().with_access(&RegistryAccess {
         creds: Some(Credentials::basic("alice", "secret")),
         ..Default::default()
     });
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    e.service
-        .pull_with_client(&creds, &format!("{}/test:latest", e.host), tx)
+    let result = e
+        .service
+        .pull_with_client(&client, &format!("{}/test:latest", e.host), tx)
         .await
         .unwrap();
-
-    // a public one of a file equal to the first chunk of usr/big
-    let chunk = sample_big()[..16 * 1024].to_vec();
-    let d = sha(&chunk);
-    let public = build_chunked(&[Item::File {
-        name: "usr/guess",
-        data: chunk.clone(),
-        chunk: 16 * 1024,
-    }]);
-    publish_arch(&e.reg, &[&public], &[ZSTD], "amd64", "chunked");
-    let (tx, mut prx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move { while prx.recv().await.is_some() {} });
-    e.service
-        .pull_with_client(&e.client(), &format!("{}/test:chunked", e.host), tx)
-        .await
-        .unwrap();
-    let p = sha(&public.blob);
-    assert_eq!(
-        e.db.get_layer(&stored_key(&e.db, &p).await)
-            .await
-            .unwrap()
-            .status,
-        "ready"
-    );
-    let all = told(&e).await;
-    assert!(!all.contains(&p.to_string()));
-    assert!(!e
-        .db
-        .is_layer_shareable(&stored_key(&e.db, &p).await)
-        .await
-        .unwrap());
-    for d in [d.to_string(), vid(&chunk)] {
-        assert!(!all.contains(&d), "the file of a private chunk was told");
-        assert!(!e.db.is_content_shareable(&d).await.unwrap());
-    }
+    assert!(source.has_calls.load(Ordering::SeqCst) > 0);
+    assert!(source.fetched.load(Ordering::SeqCst) > 0);
+    assert!(result.stats.from("source0").0 > 0);
+    assert!(e.store.contains(&vid(&sample_big())));
 }
 
-/// A private pull (nothing is shared by default) asks the user's own
-/// sources, not the peers: asking a peer tells what is pulled.  A pull
-/// that may be shared asks both.
+/// A store of version 1, with the two tables of what could be given to
+/// peers, loses them when it is opened, and pulls as any other.
 #[tokio::test]
-async fn test_a_private_pull_asks_the_local_sources_not_the_peers() {
-    let (local, peer) = (fake_source().await, fake_source().await);
-    *local.items.lock().unwrap() = chunk_map(&sample());
-    *peer.items.lock().unwrap() = chunk_map(&sample());
-    let chain = chain_trusted(&[(&peer.socket, true), (&local.socket, false)]);
-    let e = env_sources(
+async fn test_a_store_with_the_old_tables_opens_and_pulls() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let old = velarx_db::Database::open(&path).await.unwrap();
+    old.conn()
+        .call(|c| {
+            Ok(c.execute_batch(
+                "CREATE TABLE shared_layers (layer_id TEXT PRIMARY KEY, proven INTEGER);
+                 CREATE TABLE shared_images (image_id TEXT, repository TEXT, tag TEXT);
+                 INSERT INTO shared_layers VALUES ('l', 1);
+                 INSERT INTO shared_images VALUES ('i', '', '');
+                 PRAGMA user_version = 1;",
+            )?)
+        })
+        .await
+        .unwrap();
+    old.close().await.unwrap();
+    let db = velarx_db::Database::open(&path).await.unwrap();
+    let e = env_on(
+        db,
         velarx_config::PullConfig::default(),
         velarx_config::PushConfig::default(),
-        chain.clone(),
-    )
-    .await;
-    e.publish(&[&build_chunked(&sample())], &[ZSTD]);
-    let result = e.pull().await.unwrap();
-    assert_eq!(peer.has_calls.load(Ordering::SeqCst), 0);
-    assert!(local.fetched.load(Ordering::SeqCst) > 0);
-    assert!(result.stats.from("source1").0 > 0);
-    assert!(e.store.contains(&vid(&sample_big())));
-
-    // shared: the peer first
-    let (local, peer) = (fake_source().await, fake_source().await);
-    *local.items.lock().unwrap() = chunk_map(&sample());
-    *peer.items.lock().unwrap() = chunk_map(&sample());
-    let e = env_sources(
-        sharing(),
-        velarx_config::PushConfig::default(),
-        chain_trusted(&[(&peer.socket, true), (&local.socket, false)]),
+        Fetchers::default(),
+        None,
     )
     .await;
     e.publish(&[&build_chunked(&sample())], &[ZSTD]);
     e.pull().await.unwrap();
-    assert!(peer.fetched.load(Ordering::SeqCst) > 0);
-    assert_eq!(local.fetched.load(Ordering::SeqCst), 0);
-}
-
-/// The files of a lazily pulled private layer are not asked of the peers
-/// either, only of the user's own sources.
-#[tokio::test]
-async fn test_a_lazy_file_of_a_private_pull_is_not_asked_of_the_peers() {
-    let (local, peer) = (fake_source().await, fake_source().await);
-    *local.items.lock().unwrap() = chunk_map(&sample());
-    *peer.items.lock().unwrap() = chunk_map(&sample());
-    let e = env_sources(
-        velarx_config::PullConfig::default(),
-        velarx_config::PushConfig::default(),
-        chain_trusted(&[(&peer.socket, true), (&local.socket, false)]),
-    )
-    .await;
-    let layer = build_chunked(&sample());
-    e.publish(&[&layer], &[ZSTD]);
-    e.pull_lazy().await.unwrap();
-    let big = sample_big();
-    let path = e
-        .service
-        .fetch_lazy_file(&vid(&big), &layer.key())
-        .await
-        .unwrap();
-    assert_eq!(std::fs::read(path).unwrap(), big);
-    assert_eq!(peer.has_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(peer.fetched.load(Ordering::SeqCst), 0);
-    assert!(local.fetched.load(Ordering::SeqCst) > 0);
-}
-
-/// What a local source gives is the user's, like what the store has: a
-/// public image naming it gets it, but neither the files nor the layer are
-/// told or given (a public TOC may name a private file of a cache), while
-/// the pull runs or after it.
-#[tokio::test]
-async fn test_what_a_local_source_gives_is_not_given() {
-    let private: Vec<String> = file_map(&sample()).into_keys().collect();
-    {
-        let local = fake_source().await;
-        let layer = build_chunked(&sample());
-        *local.items.lock().unwrap() = chunk_map(&sample());
-        let e = env_sources(
-            sharing(),
-            velarx_config::PushConfig::default(),
-            chain_trusted(&[(&local.socket, false)]),
-        )
-        .await;
-        e.publish(&[&layer], &[ZSTD]);
-        let result = e.pull().await.unwrap();
-        assert!(local.fetched.load(Ordering::SeqCst) > 0);
-        assert!(result.stats.from("source0").0 > 0);
-        let l = sha(&layer.blob);
-        assert_eq!(
-            e.db.get_layer(&stored_key(&e.db, &l).await)
-                .await
-                .unwrap()
-                .status,
-            "ready"
-        );
-        assert!(!e
-            .db
-            .is_layer_shareable(&stored_key(&e.db, &l).await)
+    let tables: i64 =
+        e.db.conn()
+            .call(|c| {
+                Ok(c.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name LIKE 'shared_%'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
             .await
-            .unwrap(),);
-        let all = told(&e).await;
-        assert!(!all.contains(&l.to_string()));
-        for d in &private {
-            assert!(!all.contains(d), "{d} was told");
-            assert!(!e.db.is_content_shareable(d).await.unwrap());
-        }
-    }
+            .unwrap();
+    assert_eq!(tables, 0);
+    assert!(e.store.contains(&vid(&sample_big())));
 }

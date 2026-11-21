@@ -1087,12 +1087,6 @@ pub async fn env_built(
         pull.worker_path = Some(registry_bin().into());
     }
     let (host, reg) = start_registry().await;
-    // `SELF` in share_registries: the registry of this environment
-    for e in pull.share_registries.iter_mut() {
-        if e.prefix() == "SELF" {
-            *e = velarx_config::ShareEntry::Prefix(host.clone());
-        }
-    }
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(
         FileStore::new(tmp.path().join("objects"))
@@ -1703,19 +1697,28 @@ pub struct FakeSource {
     pub has_calls: Arc<AtomicUsize>,
     /// Items given
     pub fetched: Arc<AtomicUsize>,
+    /// Run when the first item is asked for
+    pub on_first: OnFirst,
     pub socket: std::path::PathBuf,
     _dir: tempfile::TempDir,
     _server: velarx_content::serve_fetch::ServerThread,
 }
 
+/// What a fake source runs when it is asked for its first item.
+pub type OnFirst = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
 struct MapItems {
     items: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     has_calls: Arc<AtomicUsize>,
     fetched: Arc<AtomicUsize>,
+    on_first: OnFirst,
 }
 
 impl MapItems {
     fn get(&self, key: &str) -> Option<Vec<u8>> {
+        if let Some(f) = self.on_first.lock().unwrap().take() {
+            f();
+        }
         self.has_calls.fetch_add(1, Ordering::SeqCst);
         let data = self.items.lock().unwrap().get(key).cloned()?;
         self.fetched.fetch_add(1, Ordering::SeqCst);
@@ -1740,12 +1743,14 @@ pub async fn fake_source() -> FakeSource {
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let items = Arc::new(Mutex::new(HashMap::new()));
     let (has_calls, fetched) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let on_first = OnFirst::default();
     let provider = velarx_content::dir_fetch::ItemFetch::of(
         "fake",
         MapItems {
             items: items.clone(),
             has_calls: has_calls.clone(),
             fetched: fetched.clone(),
+            on_first: on_first.clone(),
         },
     );
     let server = velarx_content::serve_fetch::serve_in_thread(
@@ -1758,6 +1763,7 @@ pub async fn fake_source() -> FakeSource {
         items,
         has_calls,
         fetched,
+        on_first,
         socket,
         _dir: dir,
         _server: server,
@@ -1803,28 +1809,20 @@ async fn scoped(
     Some(conn)
 }
 
-/// The fetchers on `sockets`, each saying whether it asks the network
-/// (`peer`: asked only by the pulls that may be shared) or is the user's own
-/// (asked by every pull).  Each is called `source<N>`.
-pub fn chain_trusted(sockets: &[(&std::path::Path, bool)]) -> Fetchers {
+/// The fetchers of the peers on `sockets`.
+pub fn chain_of(sockets: &[&std::path::Path]) -> Fetchers {
     Fetchers(
         sockets
             .iter()
             .enumerate()
-            .map(|(i, (s, peer))| velarx_config::ExternalSourceConfig {
+            .map(|(i, s)| velarx_config::ExternalSourceConfig {
                 name: format!("source{i}"),
                 socket: Some(s.to_path_buf()),
                 dir: None,
                 idle_timeout_secs: velarx_config::default_source_idle_secs(),
-                peer: *peer,
             })
             .collect(),
     )
-}
-
-/// The fetchers of the peers on `sockets`.
-pub fn chain_of(sockets: &[&std::path::Path]) -> Fetchers {
-    chain_trusted(&sockets.iter().map(|s| (*s, true)).collect::<Vec<_>>())
 }
 
 /// The service of the store of `env`, served on `socket` from a thread of
@@ -1859,25 +1857,9 @@ pub struct StoreServer {
 }
 
 /// An environment whose chunks may come from these sockets, in order.
-/// An environment that shares what it pulls from its registry without
-/// credentials (`[pull] share_registries`), as a node of a swarm would.
-pub async fn env_sharing() -> Env {
-    env_with(sharing()).await
-}
-
-/// The pull configuration of a node that shares its registry's images.
-pub fn sharing() -> PullConfig {
-    PullConfig {
-        share_registries: vec![velarx_config::ShareEntry::Prefix("SELF".into())],
-        ..PullConfig::default()
-    }
-}
-
-/// Content sources are asked only by pulls that may be shared: these
-/// environments share their registry's images.
 pub async fn env_with_sources(sockets: &[&std::path::Path]) -> Env {
     env_sources(
-        sharing(),
+        PullConfig::default(),
         velarx_config::PushConfig::default(),
         chain_of(sockets),
     )

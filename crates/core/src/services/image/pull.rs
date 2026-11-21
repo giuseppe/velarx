@@ -14,7 +14,7 @@ use velarx_graph::feed::{
 };
 use velarx_graph::LayerRef;
 use velarx_proto::workload::{SOURCE_REGISTRY, SOURCE_STORE};
-use velarx_registry::target::{Platform, Target};
+use velarx_registry::target::Platform;
 use velarx_types::digest::Digest;
 
 /// Progress is reported when at least this many bytes arrived since the last
@@ -234,8 +234,6 @@ pub(super) struct Incoming {
     pub sources: Option<Vec<String>>,
     /// How the registry is reached, to fetch files later.
     pub reach: LayerReach,
-    /// The layers may be given to peers, and asked of them
-    pub shareable: bool,
     /// An image made here: the manifest gets the digest of its merged
     /// EROFS (`seal`), and so its id.
     pub seal: bool,
@@ -256,31 +254,6 @@ pub(super) struct Incoming {
     /// whatever route their pull took); the others are looked up by the key
     /// their descriptor asks for ([`LayerKey::expected`]).
     pub recorded: Vec<LayerKey>,
-}
-
-/// Whether `[pull] share_registries` lists the image (its registry, the
-/// upstream one, not a mirror it is pulled from, or a prefix of its
-/// repository there: `docker.io/library`), and if so whether an entry
-/// shares its pulls with credentials too.  None: not listed.
-fn shared_registry(
-    listed: &[velarx_config::ShareEntry],
-    image_ref: &ImageReference,
-) -> Option<bool> {
-    let full = format!("{}/{}", image_ref.registry, image_ref.repository);
-    listed
-        .iter()
-        .filter(|e| {
-            let r = e.prefix().trim_end_matches('/');
-            !r.is_empty()
-                && (r == image_ref.registry
-                    || full == r
-                    || full
-                        .strip_prefix(r)
-                        .is_some_and(|rest| rest.starts_with('/')))
-        })
-        .fold(None, |acc, e| {
-            Some(acc.unwrap_or(false) || e.with_credentials())
-        })
 }
 
 /// The most layers a mount of the driver takes for an image of the pull
@@ -541,42 +514,6 @@ impl ImageService {
         .await
     }
 
-    /// Whether what is pulled from `target` may be given to peers:
-    /// pulled without credentials, or from a registry the configuration
-    /// shares (`[pull] share_registries`).
-    pub(super) async fn shareable(
-        &self,
-        client: &Resolver,
-        target: &Target,
-        image_ref: &ImageReference,
-    ) -> bool {
-        // nothing unless the configuration says (opt-in)
-        let Some(with_credentials) = shared_registry(&self.pull_config.share_registries, image_ref)
-        else {
-            return false;
-        };
-        if with_credentials {
-            return true;
-        }
-        let (client, target) = (client.clone(), target.clone());
-        tokio::task::spawn_blocking(move || !client.has_credentials(&target))
-            .await
-            .unwrap_or(false)
-    }
-
-    /// The image and its names come from a pull that may be shared, which
-    /// brought no layer of it (the store had the image).
-    pub(super) async fn share_image(&self, image_id: &str, tags: &[ImageTag]) {
-        let names = names_of(tags);
-        if let Err(e) = self
-            .db
-            .share_pull(image_id, names, Vec::new(), Vec::new())
-            .await
-        {
-            warn!("Cannot record that the image {image_id} may be shared: {e}");
-        }
-    }
-
     /// How a pull talks to the registries: through confined workers, or
     /// from this process.
     /// The digest of the manifest the registry serves for `reference` now
@@ -714,11 +651,10 @@ impl ImageService {
 
     /// The walker of a pull of the image of `manifest` from `repository`: the
     /// fetchers of `names` (none: `[pull] sources`), each in its own scope,
-    /// in the engine's order, then the registry fetcher, which gets the credentials `access`; a fetcher that asks the
-    /// network (`peer`) only when the pull may be `shareable`.
+    /// in the engine's order, then the registry fetcher, which gets the credentials `access`.
     pub(super) async fn staged_fetch(
         &self,
-        (repository, names, shareable): (&str, Option<&[String]>, bool),
+        (repository, names): (&str, Option<&[String]>),
         tls_verify: bool,
         access: Option<&velarx_registry::auth::RegistryAccess>,
         manifest: &[u8],
@@ -728,7 +664,7 @@ impl ImageService {
             Some(n) => n.to_vec(),
             None => self.sources_of(None)?,
         };
-        let before = self.source_links(&names, shareable).await;
+        let before = self.source_links(&names).await;
         // (the registry fetcher process: nothing of a pull is fetched by
         // this one)
         let end = self.origin()?.connect().await.map_err(|e| {
@@ -757,14 +693,11 @@ impl ImageService {
 
     /// Connections to the fetchers of `names` but the registry fetcher, in
     /// their order: a fetcher of `[[sources.external]]` on its socket, or the
-    /// fetcher of a `dir`, a confined process of its own for this connection; a fetcher that
-    /// asks the network (`peer`) only when what is asked may be `shareable`
-    /// (asking a peer tells what is pulled).  A fetcher that cannot be
-    /// reached is left out.
+    /// fetcher of a `dir`, a confined process of its own for this connection.  A
+    /// fetcher that cannot be reached is left out.
     pub(super) async fn source_links(
         &self,
         names: &[String],
-        shareable: bool,
     ) -> Vec<velarx_content::pull::staged_fetch::Link> {
         use velarx_content::fetcher::fetch_client::FetchConn;
         use velarx_content::pull::staged_fetch::Link;
@@ -773,9 +706,6 @@ impl ImageService {
             let Some(def) = self.fetchers.iter().find(|f| f.name == *name) else {
                 continue;
             };
-            if def.peer && !shareable {
-                continue;
-            }
             let conn = match (&def.dir, &def.socket) {
                 (Some(dir), _) => match self.origin() {
                     Ok(origin) => origin.connect_dir(name, dir).await,
@@ -788,7 +718,6 @@ impl ImageService {
                 Ok(conn) => links.push(Link {
                     name: name.clone(),
                     conn,
-                    own: !def.peer,
                     idle: std::time::Duration::from_secs(def.idle_timeout_secs),
                 }),
                 Err(e) => debug!("The fetcher {name} is left out: {e}"),
@@ -803,7 +732,7 @@ impl ImageService {
     pub async fn source_blob(&self, digest: &Digest, size: u64) -> Option<Vec<u8>> {
         let names = self.sources_of(None).ok()?;
         let name = digest.to_string();
-        for mut link in self.source_links(&names, true).await {
+        for mut link in self.source_links(&names).await {
             let blob = velarx_content::fetcher::fetch::Blob {
                 digest: name.clone(),
                 size,
@@ -1191,8 +1120,7 @@ impl ImageService {
         // against them, so the registry is asked for what they lack)
         if let (Some(_), Net::Origin(origin)) = (&image_ref.digest, &net) {
             let names = self.sources_of(sources.as_deref())?;
-            let shareable = self.shareable(client, &target, &image_ref).await;
-            let links = self.source_links(&names, shareable).await;
+            let links = self.source_links(&names).await;
             if !links.is_empty() {
                 let before = velarx_content::pull::net::origin::MetadataSources::open(links).await;
                 net = Net::Origin(origin.clone().with_sources(before));
@@ -1267,9 +1195,6 @@ impl ImageService {
                     .set_pulled_image(&manifest_digest, &reference, signatures)
                     .await?;
             }
-            if self.shareable(client, &target, &image_ref).await {
-                self.share_image(&done.id, &tags).await;
-            }
             // Another name for an image the store has: its repository has
             // the blobs too.
             let sources = blob_sources(&manifest, Some(&image_ref.full_name()));
@@ -1301,7 +1226,6 @@ impl ImageService {
         if let Some(p) = platform {
             Self::check_platform(&config, p, &progress_tx);
         }
-        let shareable = self.shareable(client, &target, &image_ref).await;
         let incoming = Incoming {
             manifest,
             manifest_bytes,
@@ -1317,7 +1241,6 @@ impl ImageService {
             lazy,
             sources: sources.clone(),
             reach,
-            shareable,
             seal: false,
             states: false,
             lease: None,
@@ -1373,7 +1296,6 @@ impl ImageService {
             lazy,
             sources,
             reach,
-            shareable,
             seal,
             states,
             lease: image_lease,
@@ -1480,9 +1402,6 @@ impl ImageService {
                         .set_pulled_image(&manifest_digest, reference, signatures.clone())
                         .await?;
                 }
-                if shareable {
-                    self.share_image(&done.id, &tags).await;
-                }
                 return Ok(done);
             }
             stored = self.stored_layers(&expected, &config).await?;
@@ -1531,7 +1450,7 @@ impl ImageService {
             ),
             (Some(Source::Registry(_)), Some(repository), _) => Some(
                 self.staged_fetch(
-                    (repository, sources.as_deref(), shareable),
+                    (repository, sources.as_deref()),
                     reach.tls_verify,
                     access.as_ref(),
                     &manifest_bytes,
@@ -1552,7 +1471,6 @@ impl ImageService {
             super::lazy_fetch::PulledFrom {
                 repository: repository.clone(),
                 reach,
-                shareable,
                 manifest: manifest_bytes.to_vec(),
             }
         });
@@ -1563,7 +1481,7 @@ impl ImageService {
                 let names = self.sources_of(sources.as_deref())?;
                 let (this, id) = (self.clone(), image_id.clone());
                 let (ask, asked) = futures::FutureExt::remote_handle(async move {
-                    this.pull_profile(&id, (&names, shareable)).await
+                    this.pull_profile(&id, &names).await
                 });
                 tokio::spawn(ask);
                 Some(asked)
@@ -1740,21 +1658,8 @@ impl ImageService {
             // The store holds only complete layers: the whole ones are
             // recorded now, the lazy ones wait in the staging area with the
             // image, which the store gets when its last layer is complete.
-            let shared_layers: Vec<(LayerKey, bool)> = if shareable {
-                done_layers
-                    .values()
-                    .filter(|d| !d.lazy)
-                    .map(|d| (d.key, d.proven))
-                    .collect()
-            } else {
-                Vec::new()
-            };
             self.db
-                .commit_layers(
-                    commits,
-                    blob_sources(&manifest, registry_ref.as_deref()),
-                    shared_layers,
-                )
+                .commit_layers(commits, blob_sources(&manifest, registry_ref.as_deref()))
                 .await?;
             velarx_base::trace::point("pull rows committed");
             // (the files a start reads are planned while the barrier waits)
@@ -1801,7 +1706,6 @@ impl ImageService {
                     (d, &toc),
                     registry_ref.as_deref(),
                     reach,
-                    shareable,
                     (&m.image_digest, &m.owners),
                 )?;
             }
@@ -1823,7 +1727,6 @@ impl ImageService {
                     .iter()
                     .map(|(r, d)| (r.clone(), d.to_string()))
                     .collect(),
-                shareable,
                 pulls: pulled
                     .iter()
                     .map(
@@ -1851,7 +1754,6 @@ impl ImageService {
             }
             debug!("Pull staged after {:?}", start.elapsed());
         } else {
-            let tags_shared = if shareable { tags.clone() } else { Vec::new() };
             self.db
                 .commit_pull(PullCommit {
                     layers: commits,
@@ -1868,30 +1770,6 @@ impl ImageService {
             }
 
             debug!("Database updated after {:?}", start.elapsed());
-            if shareable {
-                // only the layers whose every byte this registry gave,
-                // checked: not one the store had (a public image may name
-                // the digest of a private layer), not one made of what the
-                // store or the sources had
-                let (proven, public): (Vec<&LayerDone>, Vec<&LayerDone>) =
-                    done_layers.values().partition(|d| d.proven);
-                let digests = |l: Vec<&LayerDone>| l.into_iter().map(|d| d.key).collect();
-                // the others: their files may be asked of the sources, not
-                // given.  One transaction: the image is announced complete
-                // when all of it is there
-                if let Err(e) = self
-                    .db
-                    .share_pull(
-                        &image_id,
-                        names_of(&tags_shared),
-                        digests(public),
-                        digests(proven),
-                    )
-                    .await
-                {
-                    warn!("Cannot record that the image {image_id} may be shared: {e}");
-                }
-            }
         }
         // (what the origin brought is counted under its name)
         let origin = via.as_ref().map_or(SOURCE_REGISTRY, |v| v.party());
@@ -2220,13 +2098,6 @@ pub(super) fn feed_layers(
         .collect()
 }
 
-/// The (repository, tag) names of `tags`.
-fn names_of(tags: &[ImageTag]) -> Vec<(String, String)> {
-    tags.iter()
-        .map(|t| (t.repository.clone(), t.tag.clone()))
-        .collect()
-}
-
 #[cfg(test)]
 mod opened_tests {
     use super::*;
@@ -2262,66 +2133,6 @@ mod opened_tests {
         .err()
         .expect("the verdict of another check");
         assert!(e.to_string().contains("another check"), "{e}");
-    }
-}
-
-#[cfg(test)]
-mod share_tests {
-    use super::*;
-
-    #[test]
-    fn listed_registries_and_repositories() {
-        use velarx_config::ShareEntry;
-        let r = |s: &str| ImageReference::parse(s).unwrap();
-        let listed = vec![
-            ShareEntry::Prefix("docker.io/library".into()),
-            ShareEntry::Prefix("quay.io".into()),
-            ShareEntry::Table(velarx_config::ShareTable {
-                prefix: "registry.example/team".into(),
-                with_credentials: true,
-            }),
-        ];
-        assert_eq!(
-            shared_registry(&listed, &r("docker.io/library/alpine")),
-            Some(false)
-        );
-        assert_eq!(
-            shared_registry(&listed, &r("docker.io/someone/alpine")),
-            None
-        );
-        assert_eq!(
-            shared_registry(&listed, &r("docker.io/libraryx/alpine")),
-            None
-        );
-        assert_eq!(
-            shared_registry(&listed, &r("quay.io/any/thing")),
-            Some(false)
-        );
-        assert_eq!(
-            shared_registry(&listed, &r("registry.example/team/x")),
-            Some(true)
-        );
-        assert_eq!(shared_registry(&listed, &r("registry.example/other")), None);
-        // nothing listed: nothing shared
-        assert_eq!(shared_registry(&[], &r("quay.io/any/thing")), None);
-        // as the configuration reads them
-        let c: velarx_config::PullConfig = toml::from_str(
-            r#"share_registries = ["docker.io/library", { prefix = "ghcr.io/me", with_credentials = true }]"#,
-        )
-        .unwrap();
-        assert_eq!(
-            shared_registry(&c.share_registries, &r("ghcr.io/me/app")),
-            Some(true)
-        );
-        assert_eq!(
-            shared_registry(&c.share_registries, &r("docker.io/library/busybox")),
-            Some(false)
-        );
-        // a misspelt key is an error, not an entry shared otherwise
-        assert!(toml::from_str::<velarx_config::PullConfig>(
-            r#"share_registries = [{ prefix = "quay.io", with_credential = true }]"#
-        )
-        .is_err());
     }
 }
 
@@ -2466,7 +2277,6 @@ mod stored_tests {
                 commit(3, None, Some(b"ts")),
             ],
             vec![],
-            vec![],
         )
         .await
         .unwrap();
@@ -2528,7 +2338,7 @@ mod stored_tests {
         kind: velarx_config::StorageDriverKind,
     ) -> ImageService {
         let db = velarx_db::Database::open_in_memory().await.unwrap();
-        db.commit_layers(vec![commit(1, Some("{}"), Some(b"ts"))], vec![], vec![])
+        db.commit_layers(vec![commit(1, Some("{}"), Some(b"ts"))], vec![])
             .await
             .unwrap();
         let store = Arc::new(velarx_storage::FileStore::new(tmp.path().join("objects")).unwrap());

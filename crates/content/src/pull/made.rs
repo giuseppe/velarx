@@ -186,7 +186,7 @@ impl Out for MadeOut<'_> {
                 file,
                 stream: &mut self.stream,
             };
-            let staged = stage_file(self.session, self.alg, &mut tee, size, false)?;
+            let staged = stage_file(self.session, self.alg, &mut tee, size)?;
             if staged.added {
                 self.report.fetched_files += 1;
             } else {
@@ -300,7 +300,6 @@ pub fn from_walk(
             report: out.report,
             diff_id: out.stream.diff.finalize(),
             tarsplit: bytes::Bytes::new(),
-            from_local_source: true,
         },
         size,
     ))

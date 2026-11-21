@@ -141,7 +141,6 @@ UDP 4001 between the nodes. Then add the service as a content source in
 [[sources.external]]
 name = "peers"
 socket = "/run/velarx/services/p2p-fetcher.sock"
-peer = true
 
 [pull]
 sources = ["peers", "registry"]

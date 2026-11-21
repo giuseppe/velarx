@@ -161,7 +161,6 @@ impl PullFeed for TestFeed {
                 key,
                 name: e.name.clone(),
                 size: e.size,
-                copy: false,
                 verity_keyed: false,
             })
             .map_err(|e| ImageError::Layer(e.to_string()))?;
@@ -178,7 +177,6 @@ impl PullFeed for TestFeed {
             report: Default::default(),
             tarsplit: index.tarsplit,
             lazy: false,
-            proven: false,
             blob_checked: false,
             checked: Default::default(),
             toc_z: None,

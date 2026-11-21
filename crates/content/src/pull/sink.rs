@@ -46,9 +46,6 @@ pub struct Finished {
     pub key: String,
     pub name: String,
     pub size: u64,
-    /// Made with a chunk of the store or of a local source: the store's,
-    /// not the pull's
-    pub copy: bool,
     /// The key is the fs-verity digest the TOC gives: the commit refuses
     /// a file with another
     pub verity_keyed: bool,
@@ -140,9 +137,6 @@ pub trait Sink: Stage {
     /// Whether the file known by `key`, of `size` bytes, is there already
     /// and whole, so that it is not fetched.
     fn holds(&self, key: &str, size: u64) -> bool;
-    /// Whether the content of `key` came from the store as it was before the
-    /// pull (not staged by it, or a copy of what the store had).
-    fn existed(&self, key: &str) -> bool;
     /// Whether the content of `key` is read from the store's own file only.
     fn in_store_only(&self, key: &str) -> bool;
     /// The file of the store the key names, to read chunks from; none when
@@ -157,7 +151,7 @@ pub trait Sink: Stage {
     /// The file `name` staged as `key` is known by its fs-verity digest.
     fn known_by_verity(&self, key: &str, name: &str);
     /// Stage content that is in memory; whether it was added.
-    fn put_as(&self, key: &str, data: &[u8], copy: bool) -> io::Result<bool>;
+    fn put_as(&self, key: &str, data: &[u8]) -> io::Result<bool>;
     /// Stage the `size` bytes `entry` reads, known by their hash in `alg`;
     /// the key and whether it was added.  None: this sink has no way of its
     /// own to take a stream, and the content goes through files with a name.
@@ -166,12 +160,11 @@ pub trait Sink: Stage {
         _alg: Algorithm,
         _entry: &mut dyn Read,
         _size: u64,
-        _copy: bool,
     ) -> io::Result<Option<(String, bool)>> {
         Ok(None)
     }
     /// Stage the complete file `temp` as `key`; whether it was kept.
-    fn adopt_as(&self, temp: &Path, key: &str, size: u64, copy: bool) -> io::Result<bool>;
+    fn adopt_as(&self, temp: &Path, key: &str, size: u64) -> io::Result<bool>;
     /// [`Sink::adopt_as`] for a file whose content was hashed (`key`, the
     /// hash of the layer's algorithm) and measured (`verity`, its fs-verity
     /// digest) in the one pass that wrote it: a sink that has the file by its
@@ -183,32 +176,18 @@ pub trait Sink: Stage {
         key: &str,
         _verity: &str,
         size: u64,
-        copy: bool,
     ) -> io::Result<(String, bool)> {
-        self.adopt_as(temp, key, size, copy)
+        self.adopt_as(temp, key, size)
             .map(|added| (key.to_string(), added))
     }
     /// [`Sink::adopt_measured`] for content in memory, which a sink that has
     /// the file does not write.
-    fn put_measured(
-        &self,
-        key: &str,
-        _verity: &str,
-        data: &[u8],
-        copy: bool,
-    ) -> io::Result<(String, bool)> {
-        self.put_as(key, data, copy)
-            .map(|added| (key.to_string(), added))
+    fn put_measured(&self, key: &str, _verity: &str, data: &[u8]) -> io::Result<(String, bool)> {
+        self.put_as(key, data).map(|added| (key.to_string(), added))
     }
     /// Give a complete file with no name its place as `key`; whether it was
     /// kept.
-    fn adopt_file(
-        &self,
-        file: &File,
-        key: &str,
-        copy: bool,
-        verity_keyed: Option<&str>,
-    ) -> io::Result<bool>;
+    fn adopt_file(&self, file: &File, key: &str, verity_keyed: Option<&str>) -> io::Result<bool>;
     /// Give the file `file`, which a fetcher staged as `key` in the staging
     /// of `layer` and the engine opened and measured, its place as `key`.
     /// The default takes the bytes ([`Sink::adopt_file`]) and the name of the
@@ -220,10 +199,9 @@ pub trait Sink: Stage {
         layer: &Arc<LayerStaging>,
         file: &File,
         key: &str,
-        copy: bool,
         verity_keyed: Option<&str>,
     ) -> io::Result<bool> {
-        let kept = self.adopt_file(file, key, copy, verity_keyed)?;
+        let kept = self.adopt_file(file, key, verity_keyed)?;
         if !layer.kept() {
             layer.forget_name(key);
         }
@@ -274,7 +252,7 @@ impl Stage for Session {
         let temp = finished
             .temp
             .ok_or_else(|| io::Error::other("a file of the session has a name"))?;
-        self.adopt_as(&temp, &finished.key, finished.size, finished.copy)
+        self.adopt_as(&temp, &finished.key, finished.size)
     }
 
     fn open_object(&self, digest: &str) -> io::Result<File> {
@@ -307,10 +285,6 @@ impl Sink for Session {
         Session::holds(self, key, size)
     }
 
-    fn existed(&self, key: &str) -> bool {
-        Session::from_store(self, key)
-    }
-
     fn in_store_only(&self, key: &str) -> bool {
         Session::in_store_only(self, key)
     }
@@ -323,12 +297,12 @@ impl Sink for Session {
         Session::known_by_verity(self, key, name)
     }
 
-    fn put_as(&self, key: &str, data: &[u8], copy: bool) -> io::Result<bool> {
-        Session::put_as(self, key, data, copy)
+    fn put_as(&self, key: &str, data: &[u8]) -> io::Result<bool> {
+        Session::put_as(self, key, data)
     }
 
-    fn adopt_as(&self, temp: &Path, key: &str, size: u64, copy: bool) -> io::Result<bool> {
-        Session::adopt_as(self, temp, key, size, copy)
+    fn adopt_as(&self, temp: &Path, key: &str, size: u64) -> io::Result<bool> {
+        Session::adopt_as(self, temp, key, size)
     }
 
     fn adopt_verified(
@@ -346,29 +320,16 @@ impl Sink for Session {
         key: &str,
         verity: &str,
         size: u64,
-        copy: bool,
     ) -> io::Result<(String, bool)> {
-        Session::adopt_measured(self, temp, key, verity, size, copy)
+        Session::adopt_measured(self, temp, key, verity, size)
     }
 
-    fn put_measured(
-        &self,
-        key: &str,
-        verity: &str,
-        data: &[u8],
-        copy: bool,
-    ) -> io::Result<(String, bool)> {
-        Session::put_measured(self, key, verity, data, copy)
+    fn put_measured(&self, key: &str, verity: &str, data: &[u8]) -> io::Result<(String, bool)> {
+        Session::put_measured(self, key, verity, data)
     }
 
-    fn adopt_file(
-        &self,
-        file: &File,
-        key: &str,
-        copy: bool,
-        verity_keyed: Option<&str>,
-    ) -> io::Result<bool> {
-        Session::adopt_file(self, file, key, copy, verity_keyed)
+    fn adopt_file(&self, file: &File, key: &str, verity_keyed: Option<&str>) -> io::Result<bool> {
+        Session::adopt_file(self, file, key, verity_keyed)
     }
 
     fn adopt_staged(
@@ -376,10 +337,9 @@ impl Sink for Session {
         layer: &Arc<LayerStaging>,
         file: &File,
         key: &str,
-        copy: bool,
         verity_keyed: Option<&str>,
     ) -> io::Result<bool> {
-        Session::adopt_staged(self, layer, file, key, copy, verity_keyed)
+        Session::adopt_staged(self, layer, file, key, verity_keyed)
     }
 
     fn scratch(self: Arc<Self>) -> io::Result<Arc<dyn Sink>> {
@@ -814,10 +774,6 @@ impl Sink for Spool {
         false
     }
 
-    fn existed(&self, _key: &str) -> bool {
-        false
-    }
-
     fn in_store_only(&self, _key: &str) -> bool {
         false
     }
@@ -828,7 +784,7 @@ impl Sink for Spool {
 
     fn known_by_verity(&self, _key: &str, _name: &str) {}
 
-    fn put_as(&self, key: &str, data: &[u8], _copy: bool) -> io::Result<bool> {
+    fn put_as(&self, key: &str, data: &[u8]) -> io::Result<bool> {
         let kind = Digest::parse_key(key)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{key}: {e}")))?;
         let (made, added) = self.put(kind.alg(), &mut &data[..], data.len() as u64)?;
@@ -845,12 +801,11 @@ impl Sink for Spool {
         alg: Algorithm,
         entry: &mut dyn Read,
         size: u64,
-        _copy: bool,
     ) -> io::Result<Option<(String, bool)>> {
         self.put(alg, entry, size).map(Some)
     }
 
-    fn adopt_as(&self, _temp: &Path, _key: &str, _size: u64, _copy: bool) -> io::Result<bool> {
+    fn adopt_as(&self, _temp: &Path, _key: &str, _size: u64) -> io::Result<bool> {
         Err(not_here("a file with a name"))
     }
 
@@ -858,7 +813,6 @@ impl Sink for Spool {
         &self,
         _file: &File,
         _key: &str,
-        _copy: bool,
         _verity_keyed: Option<&str>,
     ) -> io::Result<bool> {
         Err(not_here("a file of a job"))
@@ -1038,10 +992,6 @@ impl Sink for FilesSink {
         !self.wants(key)
     }
 
-    fn existed(&self, _key: &str) -> bool {
-        false
-    }
-
     fn in_store_only(&self, _key: &str) -> bool {
         false
     }
@@ -1059,11 +1009,11 @@ impl Sink for FilesSink {
 
     fn known_by_verity(&self, _key: &str, _name: &str) {}
 
-    fn put_as(&self, _key: &str, _data: &[u8], _copy: bool) -> io::Result<bool> {
+    fn put_as(&self, _key: &str, _data: &[u8]) -> io::Result<bool> {
         Err(not_here("content in memory"))
     }
 
-    fn adopt_as(&self, _temp: &Path, _key: &str, _size: u64, _copy: bool) -> io::Result<bool> {
+    fn adopt_as(&self, _temp: &Path, _key: &str, _size: u64) -> io::Result<bool> {
         Err(not_here("a file with a name"))
     }
 
@@ -1071,7 +1021,6 @@ impl Sink for FilesSink {
         &self,
         _file: &File,
         _key: &str,
-        _copy: bool,
         _verity_keyed: Option<&str>,
     ) -> io::Result<bool> {
         Err(not_here("a file to copy: staged files are handed over"))
@@ -1086,7 +1035,6 @@ impl Sink for FilesSink {
         layer: &Arc<LayerStaging>,
         file: &File,
         key: &str,
-        _copy: bool,
         _verity_keyed: Option<&str>,
     ) -> io::Result<bool> {
         let note = |n: usize| {
@@ -1163,7 +1111,6 @@ mod tests {
                 name: key.into(),
                 key: key.into(),
                 size: 10,
-                copy: false,
                 verity_keyed: false,
             })
             .unwrap();
@@ -1182,7 +1129,7 @@ mod tests {
 
     fn put(spool: &Spool, data: &[u8]) -> (String, bool) {
         spool
-            .put_reader(Algorithm::Sha256, &mut &data[..], data.len() as u64, false)
+            .put_reader(Algorithm::Sha256, &mut &data[..], data.len() as u64)
             .unwrap()
             .unwrap()
     }
@@ -1288,7 +1235,7 @@ mod tests {
         free.store(1 << 20, Ordering::SeqCst);
         let big = vec![7u8; (SPOOL_STEP + 1) as usize];
         let key = Digest::of(Algorithm::Sha256, &big).to_string();
-        let e = spool.put_as(&key, &big, false).unwrap_err();
+        let e = spool.put_as(&key, &big).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::StorageFull);
         let msg = e.to_string();
         assert!(msg.contains(&dir.path().display().to_string()), "{msg}");
@@ -1297,7 +1244,7 @@ mod tests {
         assert!(!spool.has(&key), "nothing of it is kept");
         // and it goes on when there is room
         free.store(u64::MAX, Ordering::SeqCst);
-        assert!(spool.put_as(&key, &big, false).unwrap());
+        assert!(spool.put_as(&key, &big).unwrap());
     }
 
     /// The holes of a content are told as they are copied, with offsets from
@@ -1332,16 +1279,16 @@ mod tests {
     fn a_short_stream_leaves_nothing() {
         let (_dir, spool) = spool();
         let e = spool
-            .put_reader(Algorithm::Sha256, &mut &b"abc"[..], 10, false)
+            .put_reader(Algorithm::Sha256, &mut &b"abc"[..], 10)
             .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
         assert_eq!(spool.index().end, 0);
         assert!(spool.index().at.is_empty());
         let key = Digest::of(Algorithm::Sha256, b"abc").to_string();
-        assert!(spool.put_as(&key, b"abc", false).unwrap());
-        assert!(!spool.put_as(&key, b"abc", false).unwrap());
+        assert!(spool.put_as(&key, b"abc").unwrap());
+        assert!(!spool.put_as(&key, b"abc").unwrap());
         let other = Digest::of(Algorithm::Sha256, b"abd").to_string();
-        assert!(spool.put_as(&other, b"abc", false).is_err());
+        assert!(spool.put_as(&other, b"abc").is_err());
         let out = tempfile::tempfile().unwrap();
         spool.copy_to(&key, &out, 4096, || Ok(())).unwrap();
         let mut got = [0u8; 3];
@@ -1359,7 +1306,7 @@ mod tests {
         let (_dir, spool) = spool();
         let cut = vec![9u8; 3 * 4096];
         let e = spool
-            .put_reader(Algorithm::Sha256, &mut &cut[..], 4 * 4096, false)
+            .put_reader(Algorithm::Sha256, &mut &cut[..], 4 * 4096)
             .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
         let mut zeros = vec![0u8; 4 * 4096];
@@ -1397,7 +1344,7 @@ mod tests {
         put(&spool, b"0123456789");
         assert_eq!(looked.load(Ordering::SeqCst), 2, "past what was free");
         let e = spool
-            .put_reader(Algorithm::Sha256, &mut &[1u8; 1001][..], 1001, false)
+            .put_reader(Algorithm::Sha256, &mut &[1u8; 1001][..], 1001)
             .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::StorageFull, "{e}");
         assert!(e.to_string().contains("needs 1001 bytes"), "{e}");
@@ -1453,13 +1400,11 @@ mod tests {
             (File::open(&path).unwrap(), path)
         };
         let (wrong, _) = stage(&other, &content);
-        assert!(sink
-            .adopt_staged(&layer, &wrong, &other, false, None)
-            .is_err());
+        assert!(sink.adopt_staged(&layer, &wrong, &other, None).is_err());
         assert!(told.lock().unwrap().is_empty(), "a wrong file is not told");
         let (file, path) = stage(&key, &content);
         let ino = std::fs::metadata(&path).unwrap().ino();
-        assert!(sink.adopt_staged(&layer, &file, &key, false, None).unwrap());
+        assert!(sink.adopt_staged(&layer, &file, &key, None).unwrap());
         let told = told.lock().unwrap();
         assert_eq!(told.len(), 1);
         assert_eq!((told[0].0.as_str(), told[0].1), (key.as_str(), ino));

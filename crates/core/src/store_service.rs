@@ -5,30 +5,25 @@
 //!
 //! The service owns the database and the objects; a client opens neither.
 //! It asks for content by its sha256 and gets read-only descriptors of the
-//! files that hold it, beside the reply, for what may be given to peers:
-//! the files and chunks of the layers that `shared_layers` lists as proven.
-//! What is private, or not in the store, simply has no descriptor.
+//! files that hold it, beside the reply: whatever the store holds, in its
+//! own directory or in a read-only one, is given to the peer that names it
+//! by its digest.  What the store does not have simply has no descriptor.
 //!
 //! * `GetInfo`: the version of the protocol (a client refuses another) and
 //!   the most digests a `Lookup` may carry ([`MAX_LOOKUP`]).
 //! * `Lookup`: up to [`MAX_LOOKUP`] digests; for each one that may be
 //!   given, a descriptor (an index into the descriptors of the reply), an
 //!   offset and a length.  The descriptors are opened read-only.
-//! * `Index`: the index of a shareable layer ([`velarx_content::pull::index`]) in a
+//! * `Index`: the index of a layer ([`velarx_content::pull::index`]) in a
 //!   file with no name, read-only.
 //! * `Profile`: the startup profile of an image, the file of the store
 //!   itself, read-only.
 //! * `ImageList` (one a reply, `more`), `ImageInspect`: the images the
-//!   store has that may be given
-//!   to peers ([`ImageInfo`]: the digests of the manifest, the
-//!   configuration and the layers, the size, and whether the image is
-//!   `complete`: a lazy image is listed as partial until its completion
-//!   proved its layers).  Names are given only when the configuration says
-//!   (`[pull] share_image_names`); builds, commits, loads and local tags
-//!   are not the service's to tell.
-//! * `Subscribe` (streamed, `more`): the shareable layers and images, a
-//!   snapshot first, then what is added (an image added again is one that
-//!   changed: it became complete) and removed.  The service watches
+//!   store has ([`ImageInfo`]: the digests of the manifest, the
+//!   configuration and the layers, the names and the size).  A lazy image
+//!   is in the store when it is complete.
+//! * `Subscribe` (streamed, `more`): the layers and images, a
+//!   snapshot first, then what is added and removed.  The service watches
 //!   the database (each commit of any process tells, once it is
 //!   published) and the shares of checkpoints, so what any process commits
 //!   is seen: no daemon is needed.
@@ -130,8 +125,7 @@ pub struct ProfileReply {
     pub file: u32,
 }
 
-/// An image that may be announced: the digests of what it is made of, and
-/// the names a shared pull gave it when the configuration shares them.
+/// An image of the store: the digests of what it is made of, and its names.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::CustomType)]
 pub struct ImageInfo {
     /// Its id (the digest of its manifest without its algorithm: 64 hex
@@ -141,9 +135,9 @@ pub struct ImageInfo {
     pub manifest_digest: String,
     /// The digest of its configuration
     pub config_digest: String,
-    /// `repository:tag`; empty unless the names are shared
+    /// `repository:tag`
     pub tags: Vec<String>,
-    /// `repository@manifest digest`; empty unless the names are shared
+    /// `repository@manifest digest`
     pub repo_digests: Vec<String>,
     /// The layers, in order, by their keys (`sha256:<hex>`, the blob of a
     /// layer pulled whole; `toc:sha256:<hex>`, the TOC of a layer pulled
@@ -154,9 +148,6 @@ pub struct ImageInfo {
     pub size: u64,
     /// When it was made, as its configuration says (RFC 3339)
     pub created_at: String,
-    /// Every layer is proven and every file is in the store: the image is
-    /// given whole.  False for a lazy image, until its completion.
-    pub complete: bool,
 }
 
 /// A reply of `ImageList`: an image, none in the only reply of an empty
@@ -174,7 +165,7 @@ pub struct ImageReply {
 }
 
 /// What the store may announce to peers: the content digests, the layers and
-/// the images that may be shared.
+/// the images.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Announcement {
     /// Chunk or file digests
@@ -189,106 +180,60 @@ pub struct Announcement {
 }
 
 impl Announcement {
-    /// The layers and images in the database.  `names`: the images carry
-    /// the names a shared pull gave them.
-    pub async fn from_database(
-        db: &velarx_db::Database,
-        names: bool,
-    ) -> Result<Self, velarx_types::DbError> {
-        // only what may be given to peers: the layers of public pulls, and
-        // the images all of whose layers are (see below for the names)
-        let shared = db.shareable_layers().await?;
-        let public = db.public_layers().await?;
+    /// The complete layers and the images in the database.
+    pub async fn from_database(db: &velarx_db::Database) -> Result<Self, velarx_types::DbError> {
         // (a layer is announced by its key and by the blob it was pulled
         // for: a node that pulls the layer names it by its blob, and the
         // key of a layer pulled through its table of contents is the
         // digest of the table)
-        let blobs = db.layer_blobs().await?;
         let mut layers: Vec<String> = Vec::new();
-        for key in db.layer_digests().await? {
-            if !shared.contains(&key) {
-                continue;
-            }
-            let blob = blobs
-                .get(&key)
-                .filter(|b| velarx_db::LayerKey::parse(b).is_some());
-            layers.extend(blob.cloned());
+        for (key, blob) in db.layer_blobs().await? {
+            layers.extend(Some(blob).filter(|b| velarx_db::LayerKey::parse(b).is_some()));
             layers.push(key.to_string());
         }
         layers.sort();
         layers.dedup();
-        // only images a pull that may be shared recorded, under the names
-        // that pull gave them: not a local tag, not a commit, not a
-        // private repository
-        let named = db.shared_images().await?;
         let mut images = Vec::new();
         for img in db.list_images().await? {
-            let Some(allowed) = named.get(&img.id) else {
-                continue;
-            };
             let manifest: serde_json::Value =
                 serde_json::from_str(&img.manifest).unwrap_or_default();
-            let manifest_layers = manifest
-                .get("layers")
-                .and_then(|l| l.as_array())
-                .cloned()
-                .unwrap_or_default();
             // (its layers as the store has them: a layer of a TOC is not
             // the layer of its blob)
-            let keys: Vec<velarx_db::LayerKey> = db
+            let layers: Vec<String> = db
                 .get_image_layers_without_toc(&img.id)
                 .await?
                 .into_iter()
-                .map(|l| l.key)
+                .map(|l| l.key.to_string())
                 .collect();
-            if keys.is_empty() || !keys.iter().all(|k| public.contains(k)) {
-                continue;
-            }
-            // (an image with a layer that may not be given is not the
-            // store's to list)
-            if !keys.iter().all(|k| shared.contains(k)) {
-                continue;
-            }
-            let layers: Vec<String> = keys.iter().map(ToString::to_string).collect();
-            let (tags, repo_digests) = match names {
-                true => {
-                    let tags: Vec<(String, String)> = db
-                        .get_tags_for_image(&img.id)
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|t| (t.repository, t.tag))
-                        .filter(|name| allowed.contains(name))
-                        .collect();
-                    let mut repos: Vec<String> = tags
-                        .iter()
-                        .map(|(r, _)| format!("{r}@{}", img.manifest_digest))
-                        .collect();
-                    repos.sort();
-                    repos.dedup();
-                    (
-                        tags.into_iter().map(|(r, t)| format!("{r}:{t}")).collect(),
-                        repos,
-                    )
-                }
-                false => (Vec::new(), Vec::new()),
-            };
-            let size = manifest_layers
+            let tags: Vec<(String, String)> = db
+                .get_tags_for_image(&img.id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| (t.repository, t.tag))
+                .collect();
+            let mut repo_digests: Vec<String> = tags
                 .iter()
+                .map(|(r, _)| format!("{r}@{}", img.manifest_digest))
+                .collect();
+            repo_digests.sort();
+            repo_digests.dedup();
+            let size = manifest
+                .get("layers")
+                .and_then(|l| l.as_array())
+                .into_iter()
+                .flatten()
                 .filter_map(|l| l.get("size").and_then(|s| s.as_u64()))
                 .sum();
-
             images.push(ImageInfo {
                 id: img.id.clone(),
                 manifest_digest: img.manifest_digest.to_string(),
                 config_digest: img.config_digest.to_string(),
-                tags,
+                tags: tags.into_iter().map(|(r, t)| format!("{r}:{t}")).collect(),
                 repo_digests,
                 layers,
                 size,
                 created_at: img.created_at.clone(),
-                // (the store holds only complete images)
-                complete: true,
             });
         }
         Ok(Self {
@@ -307,8 +252,7 @@ pub enum ChangeKind {
     /// Everything that may be announced (the first change of a stream, and
     /// again after the subscriber fell behind)
     Snapshot,
-    /// New layers and content, and the images that are new or changed (an
-    /// image that became complete is one of them: take it as it is now)
+    /// New layers and content, and the images that are new or changed
     Added,
     /// What is not there any more (an image by its id)
     Removed,
@@ -337,9 +281,8 @@ pub enum StoreError {
     InvalidArgument { reason: String },
     /// The store cannot answer now (its database)
     Unavailable { reason: String },
-    /// The store has nothing to give: no such image, or one that is not for
-    /// the peers; for `Index` and `Profile`: no file, because the layer or
-    /// the image is not shareable, the store has none for it, or it is
+    /// The store has nothing to give: no such image; for `Index` and
+    /// `Profile`: no file, because the store has none for it, or it is
     /// larger than `max`
     NotFound { reason: String },
 }
@@ -356,15 +299,15 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-/// What a call that has nothing to give answers: the layer or the image is
-/// not shareable, the store has none for it, or it is larger than `max`.
+/// What a call that has nothing to give answers: the store has none for it,
+/// or it is larger than `max`.
 fn none_to_give(what: &str, of: &str) -> StoreError {
     StoreError::NotFound {
         reason: format!("no {what} to give for {:?}", short(of)),
     }
 }
 
-/// What may be announced now: the shareable layers and images.
+/// What may be announced now: the layers and images.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Shared {
     layers: Vec<String>,
@@ -470,8 +413,6 @@ struct Inner {
     objects: PathBuf,
     /// The checkpoints this node shares
     checkpoints: Option<Arc<SharedCheckpoints>>,
-    /// Whether the images carry the names a shared pull gave them
-    names: bool,
     /// One look at the database at a time: a look that is older than
     /// another never replaces it
     looking: tokio::sync::Mutex<()>,
@@ -505,39 +446,12 @@ impl StoreService {
             Err(_) => None,
         }
         .unwrap_or_else(|| config.storage.driver_kind());
-        Self::build(
-            db,
-            files,
-            Some(Arc::new(checkpoints)),
-            config.pull.share_image_names,
-            kind,
-        )
-        .await
+        Self::build(db, files, Some(Arc::new(checkpoints)), kind).await
     }
 
-    /// The service of `db` and `files`, which gives no names of images.
+    /// The service of `db` and `files`.
     pub async fn new(db: Database, files: Arc<FileStore>) -> io::Result<Self> {
-        Self::build(
-            db,
-            files,
-            None,
-            false,
-            velarx_config::StorageDriverKind::DEFAULT,
-        )
-        .await
-    }
-
-    /// The service of `db` and `files`, which gives the names of the images
-    /// that a shared pull recorded.
-    pub async fn with_names(db: Database, files: Arc<FileStore>) -> io::Result<Self> {
-        Self::build(
-            db,
-            files,
-            None,
-            true,
-            velarx_config::StorageDriverKind::DEFAULT,
-        )
-        .await
+        Self::build(db, files, None, velarx_config::StorageDriverKind::DEFAULT).await
     }
 
     /// The service of `db` and `files`, which also gives the pieces of the
@@ -551,7 +465,6 @@ impl StoreService {
             db,
             files,
             Some(checkpoints),
-            false,
             velarx_config::StorageDriverKind::DEFAULT,
         )
         .await
@@ -561,7 +474,6 @@ impl StoreService {
         db: Database,
         files: Arc<FileStore>,
         checkpoints: Option<Arc<SharedCheckpoints>>,
-        names: bool,
         kind: velarx_config::StorageDriverKind,
     ) -> io::Result<Self> {
         let objects = files.root().to_path_buf();
@@ -573,7 +485,7 @@ impl StoreService {
         // engine has no files of its own to name the chunks by)
         let serves_content =
             crate::storage_driver::local_capabilities(kind).is_some_and(|c| c.serve_content);
-        let shared = Shared::of(announcement(&db, checkpoints.as_ref(), names).await?);
+        let shared = Shared::of(announcement(&db, checkpoints.as_ref()).await?);
         let (changes, _) = broadcast::channel(CHANGES_KEPT);
         Ok(Self {
             inner: Arc::new(Inner {
@@ -582,7 +494,6 @@ impl StoreService {
                 chunks,
                 objects,
                 checkpoints,
-                names,
                 looking: tokio::sync::Mutex::new(()),
                 shared: Mutex::new(shared),
                 changes,
@@ -595,14 +506,7 @@ impl StoreService {
     /// anything changed.
     pub async fn refresh(&self) -> io::Result<bool> {
         let _look = self.inner.looking.lock().await;
-        let now = Shared::of(
-            announcement(
-                &self.inner.db,
-                self.inner.checkpoints.as_ref(),
-                self.inner.names,
-            )
-            .await?,
-        );
+        let now = Shared::of(announcement(&self.inner.db, self.inner.checkpoints.as_ref()).await?);
         // (sent under the lock: a subscriber takes its snapshot and joins
         // under it too, so it misses no change and gets none twice)
         let mut shared = self.inner.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -692,7 +596,7 @@ impl StoreService {
         }
     }
 
-    /// The images that may be given, as the store has them now (what any
+    /// The images, as the store has them now (what any
     /// process committed is in them).
     pub async fn images_now(&self) -> Result<Vec<ImageInfo>, StoreError> {
         let unavailable = |e: io::Error| StoreError::Unavailable {
@@ -704,8 +608,7 @@ impl StoreService {
     }
 
     /// The image `image` names: its id (or the start of it, twelve digits
-    /// or more), its manifest digest, and, when the names are given, one of
-    /// its names or `repository@digest`.
+    /// or more), its manifest digest, one of its names or `repository@digest`.
     pub async fn image_by(&self, image: &str) -> Result<ImageInfo, StoreError> {
         if image.is_empty() || image.len() > MAX_REFERENCE {
             return Err(StoreError::InvalidArgument {
@@ -736,7 +639,7 @@ impl StoreService {
         match found.as_slice() {
             [one] => Ok((*one).clone()),
             [] => Err(StoreError::NotFound {
-                reason: format!("no image {:?} for the peers", short(image)),
+                reason: format!("no image {:?}", short(image)),
             }),
             _ => Err(StoreError::InvalidArgument {
                 reason: format!("{:?} names more than one image", short(image)),
@@ -770,65 +673,37 @@ impl StoreService {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let digests: Vec<String> = wants.iter().map(|w| w.digest.clone()).collect();
-        let shareable = self
-            .inner
-            .db
-            .are_contents_shareable(&digests)
-            .await
-            .map_err(|e| StoreError::Unavailable {
-                reason: e.to_string(),
-            })?;
-        let shareable = |i: usize| shareable.get(i).copied().unwrap_or(false);
-        // the files of the store, together; the others: a piece of a
-        // checkpoint, or the manifest, index or configuration of an image
-        // this node shares (looked up together; an fs-verity key names none)
-        let of_store = async {
-            match self.inner.chunks() {
-                Some(chunks) => {
-                    let digests = (0..wants.len())
-                        .filter(|&i| shareable(i))
-                        .map(|i| parsed[i])
-                        .collect();
-                    chunks.open_all(digests).await
-                }
-                None => Vec::new(),
-            }
+        // the files and chunks of the store; what they do not have: a piece
+        // of a checkpoint, or the manifest, index or configuration of an
+        // image (an fs-verity key names none)
+        let mut found = match self.inner.chunks() {
+            Some(chunks) => chunks.open_all(parsed.clone()).await,
+            None => Vec::new(),
         };
-        let others = async {
-            let unshared: Vec<usize> = (0..wants.len()).filter(|&i| !shareable(i)).collect();
-            let pieces =
-                futures::future::join_all(unshared.iter().map(|&i| self.piece(&wants[i].digest)))
-                    .await;
-            let asks: Vec<bool> = pieces
-                .iter()
-                .zip(&unshared)
-                .map(|(piece, &i)| piece.is_none() && !parsed[i].is_fsverity())
-                .collect();
-            let asked = unshared
-                .iter()
-                .zip(&asks)
-                .filter(|(_, &ask)| ask)
-                .map(|(&i, _)| parsed[i])
-                .collect();
-            let mut found = self.image_metadata(asked).await?.into_iter();
-            Ok::<_, StoreError>(
-                pieces
-                    .into_iter()
-                    .zip(asks)
-                    .map(|(piece, ask)| if ask { found.next().flatten() } else { piece })
-                    .collect::<Vec<_>>(),
-            )
+        found.resize_with(wants.len(), || None);
+        let missing = |found: &[Option<ChunkFile>]| -> Vec<usize> {
+            (0..wants.len()).filter(|&i| found[i].is_none()).collect()
         };
-        let (of_store, others) = futures::join!(of_store, others);
-        let (mut of_store, mut others) = (of_store.into_iter(), others?.into_iter());
-        let opened = wants.iter().enumerate().map(|(i, want)| {
-            let found = match shareable(i) {
-                true => of_store.next().flatten(),
-                false => others.next().flatten(),
-            };
-            found.filter(|f| want.size.is_none_or(|size| size == f.len))
-        });
+        let lacking = missing(&found);
+        let pieces =
+            futures::future::join_all(lacking.iter().map(|&i| self.piece(&wants[i].digest))).await;
+        for (i, piece) in lacking.into_iter().zip(pieces) {
+            found[i] = piece;
+        }
+        let lacking: Vec<usize> = missing(&found)
+            .into_iter()
+            .filter(|&i| !parsed[i].is_fsverity())
+            .collect();
+        let texts = self
+            .image_metadata(lacking.iter().map(|&i| parsed[i]).collect())
+            .await?;
+        for (i, text) in lacking.into_iter().zip(texts) {
+            found[i] = text;
+        }
+        let opened = wants
+            .iter()
+            .zip(found)
+            .map(|(want, f)| f.filter(|f| want.size.is_none_or(|size| size == f.len)));
         let mut items = Vec::with_capacity(wants.len());
         let mut fds = Vec::new();
         for (want, found) in wants.iter().zip(opened) {
@@ -849,7 +724,7 @@ impl StoreService {
         Ok((items, fds))
     }
 
-    /// The manifest, index or configuration of a shared image that each of
+    /// The manifest, index or configuration of an image that each of
     /// `digests` names, in a file with no name.
     async fn image_metadata(
         &self,
@@ -864,7 +739,7 @@ impl StoreService {
         let texts = self
             .inner
             .db
-            .shared_image_metadata(&digests)
+            .image_metadata(&digests)
             .await
             .map_err(|e| unavailable(&e))?;
         let objects = self.inner.objects.clone();
@@ -907,8 +782,7 @@ impl StoreService {
     }
 
     /// The startup profile of the image `image` (`sha256:` and its id): the
-    /// file of the store, opened read-only, if every layer of the image may
-    /// be given, it is a profile, and it is at most `max` bytes.
+    /// file of the store, opened read-only, if it is at most `max` bytes.
     pub async fn profile_of(
         &self,
         image: &str,
@@ -921,28 +795,6 @@ impl StoreService {
         };
         let id = digest.hex();
         let id = id.as_str();
-        let db = &self.inner.db;
-        let unavailable = |e: velarx_types::DbError| StoreError::Unavailable {
-            reason: e.to_string(),
-        };
-        // (an image no shareable pull recorded, as a commit that adds no
-        // layer to a public base, is not given whatever its layers are)
-        if !db.is_image_shared(id).await.map_err(unavailable)? {
-            return Ok(None);
-        }
-        let layers = db.get_image_layers(id).await.map_err(unavailable)?;
-        if layers.is_empty() {
-            return Ok(None);
-        }
-        for layer in &layers {
-            if !db
-                .is_layer_shareable(&layer.key)
-                .await
-                .map_err(unavailable)?
-            {
-                return Ok(None);
-            }
-        }
         let (objects, id) = (self.inner.objects.clone(), id.to_string());
         let max = max.min(velarx_content::fetcher::fetch::PROFILE_MAX_BYTES);
         tokio::task::spawn_blocking(move || {
@@ -956,8 +808,8 @@ impl StoreService {
     }
 
     /// The index of the layer `layer` (its key: the layer of a TOC is not
-    /// the one of its blob) in a file with no name, opened read-only, if it
-    /// may be given and is at most `max` bytes.
+    /// the one of its blob) in a file with no name, opened read-only, if the
+    /// layer is complete and the index is at most `max` bytes.
     pub async fn index_of(
         &self,
         layer: &str,
@@ -978,23 +830,16 @@ impl StoreService {
         // asker checks it against the descriptor)
         if let velarx_db::LayerKey::Whole(checksum) = layer {
             let toc = velarx_db::LayerKey::Toc(*checksum);
-            if db.is_layer_shareable(&toc).await.map_err(unavailable)? {
-                if let Some(toc_z) = db.kept_toc(checksum).await.map_err(unavailable)? {
-                    // (a layer whose tar-split was cleared is not complete;
-                    // a complete canonical one has an empty tar-split)
-                    let Some(tarsplit) = db.get_layer_tarsplit(&toc).await.map_err(unavailable)?
-                    else {
-                        return Ok(None);
-                    };
-                    let index =
-                        move || velarx_content::pull::index::encode_compressed(&toc_z, &tarsplit);
-                    return self.held(index, max).await;
-                }
+            if let Some(toc_z) = db.kept_toc(checksum).await.map_err(unavailable)? {
+                // (a layer whose tar-split was cleared is not complete; a
+                // complete canonical one has an empty tar-split)
+                let Some(tarsplit) = db.get_layer_tarsplit(&toc).await.map_err(unavailable)? else {
+                    return Ok(None);
+                };
+                let index =
+                    move || velarx_content::pull::index::encode_compressed(&toc_z, &tarsplit);
+                return self.held(index, max).await;
             }
-        }
-        // a layer that may be private is not described to anyone
-        if !db.is_layer_shareable(layer).await.map_err(unavailable)? {
-            return Ok(None);
         }
         let Ok(record) = db.get_layer(layer).await else {
             return Ok(None);
@@ -1067,15 +912,14 @@ impl StoreService {
     }
 }
 
-/// What may be announced: the shareable layers and images of the database,
+/// What may be announced: the layers and images of the database,
 /// and the manifests and pieces of the shared checkpoints (announced as the
 /// layers are, and by their digests).
 async fn announcement(
     db: &Database,
     checkpoints: Option<&Arc<SharedCheckpoints>>,
-    names: bool,
 ) -> io::Result<Announcement> {
-    let mut a = Announcement::from_database(db, names)
+    let mut a = Announcement::from_database(db)
         .await
         .map_err(io::Error::other)?;
     if let Some(shared) = checkpoints.cloned() {
@@ -1220,8 +1064,7 @@ mod service {
             }
         }
 
-        /// The images that may be given to peers, complete or not, one a
-        /// reply.
+        /// The images of the store, one a reply.
         #[zlink(more)]
         async fn image_list(
             &self,
@@ -1245,7 +1088,7 @@ mod service {
         }
 
         /// Read-only descriptors of the files that hold `wants`, for those
-        /// that may be given to peers.
+        /// the store has.
         #[zlink(return_fds)]
         async fn lookup(
             &self,
@@ -1257,7 +1100,7 @@ mod service {
             }
         }
 
-        /// The index of a shareable layer, in a file with no name.
+        /// The index of a layer, in a file with no name.
         #[zlink(return_fds)]
         async fn index(
             &self,
@@ -1316,8 +1159,7 @@ pub fn definition() -> String {
          # VELARX_WRITE_INTERFACES=1 cargo test -p velarx-core --lib store_service writes it.\n\
          #\n\
          # A client calls GetInfo on each connection and refuses a `proto` other than its\n\
-         # own ({PROTO}).  Only what shareable pulls stored is given (the layers of\n\
-         # public pulls, and the images whose layers are all public); the files cross as\n\
+         # own ({PROTO}).  What the store holds is given by its digest; the files cross as\n\
          # read-only descriptors in the SCM_RIGHTS of the reply, named in the JSON by\n\
          # their position, and a client checks every byte it reads from them.\n\
          # Who may call: a peer of the same user or root (SO_PEERCRED); any\n\
@@ -1735,7 +1577,6 @@ mod tests {
             layers: layers.iter().map(|s| s.to_string()).collect(),
             size: 1,
             created_at: String::new(),
-            complete: true,
         }
     }
 
@@ -1765,12 +1606,12 @@ mod tests {
         assert_eq!(after.diff(&after), (None, None));
     }
 
-    /// An image that becomes complete is told as added again, as it is
-    /// now: not as removed.
+    /// An image that changes is told as added again, as it is now: not as
+    /// removed.
     #[test]
     fn an_image_that_changes_is_added_again_and_not_removed() {
         let partial = ImageInfo {
-            complete: false,
+            tags: vec!["r:t".into()],
             ..image("1", &["a"])
         };
         let before = Shared {

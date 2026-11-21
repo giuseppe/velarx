@@ -86,7 +86,6 @@ pub(super) fn plan_start_set(
 pub(super) struct PulledFrom {
     pub repository: String,
     pub reach: velarx_db::LayerReach,
-    pub shareable: bool,
     /// The bytes of the manifest
     pub manifest: Vec<u8>,
 }
@@ -197,7 +196,6 @@ struct LayerCtx {
     profile: std::sync::OnceLock<Arc<[String]>>,
     /// The repository, its TLS verification, whether its pull had credentials
     walk: WalkKey,
-    shareable: bool,
     manifest: Vec<u8>,
 }
 
@@ -454,7 +452,6 @@ impl ImageService {
                         profile: std::sync::OnceLock::new(),
                         toc: toc.clone(),
                         walk: walk.clone(),
-                        shareable: pulled.shareable,
                         manifest: pulled.manifest.clone(),
                     });
                     kept.insert(*key, ctx.clone());
@@ -516,7 +513,7 @@ impl ImageService {
         let (this, pulled) = (self.clone(), pulled.clone());
         let (open, opened) = async move {
             let walk = pulled.walk();
-            this.open_lazy_walker((&walk, pulled.shareable, &pulled.manifest))
+            this.open_lazy_walker((&walk, &pulled.manifest))
                 .await
                 .map_err(|e| debug!("The fetchers of the pull are not opened: {e}"))
                 .ok()
@@ -591,10 +588,7 @@ impl ImageService {
             return Ok(Walked::default());
         }
         let mut stale = false;
-        let staged = match self
-            .lazy_walker((&ctx.walk, ctx.shareable, &ctx.manifest))
-            .await
-        {
+        let staged = match self.lazy_walker((&ctx.walk, &ctx.manifest)).await {
             Ok(walker) => {
                 let staged = walker
                     .stage_files(&key.file_stem(), &ctx.desc, &ctx.toc, left, (urgency, told))
@@ -793,7 +787,6 @@ impl ImageService {
                 profile: std::sync::OnceLock::new(),
                 toc,
                 walk: walk_key(repository, &layer.meta.reach),
-                shareable: pull.shareable,
                 manifest: pull.manifest.into_bytes(),
             })
         })
@@ -810,13 +803,13 @@ impl ImageService {
     /// The list of fetchers `walk` of this process, opened on first use.
     async fn lazy_walker(
         &self,
-        (walk, shareable, manifest): (&WalkKey, bool, &[u8]),
+        (walk, manifest): (&WalkKey, &[u8]),
     ) -> ImageResult<Arc<StagedFetch>> {
         let mut walkers = self.funnel.walkers.lock().await;
         if let Some(w) = self.kept_walker(&walkers, walk) {
             return Ok(w);
         }
-        let (epoch, walker) = self.open_lazy_walker((walk, shareable, manifest)).await?;
+        let (epoch, walker) = self.open_lazy_walker((walk, manifest)).await?;
         walkers.insert(walk.clone(), (epoch, walker.clone()));
         Ok(walker)
     }
@@ -846,7 +839,7 @@ impl ImageService {
     /// registry.
     async fn open_lazy_walker(
         &self,
-        (walk, shareable, manifest): (&WalkKey, bool, &[u8]),
+        (walk, manifest): (&WalkKey, &[u8]),
     ) -> ImageResult<(u64, Arc<StagedFetch>)> {
         let epoch = self
             .funnel
@@ -897,12 +890,7 @@ impl ImageService {
             &given,
         )?;
         let walker = self
-            .staged_fetch(
-                (repository, None, shareable),
-                *tls_verify,
-                Some(&access),
-                manifest,
-            )
+            .staged_fetch((repository, None), *tls_verify, Some(&access), manifest)
             .await?;
         Ok((epoch, walker))
     }
@@ -1045,7 +1033,6 @@ impl ImageService {
                     profile: std::sync::OnceLock::new(),
                     toc: Arc::new(toc),
                     walk: walk.clone(),
-                    shareable: false,
                     manifest: Vec::new(),
                 }),
             );
@@ -1200,7 +1187,6 @@ mod tests {
                             creds: false,
                             certs: false,
                         },
-                        shareable: false,
                         manifest: Vec::new(),
                     },
                 ),

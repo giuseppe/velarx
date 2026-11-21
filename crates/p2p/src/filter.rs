@@ -3,8 +3,8 @@
 //!
 //! A node that pulls a layer asks "who has it?"; without an answer it asks
 //! its neighbours one by one.  Each node therefore tells its peers a filter
-//! of the keys of the layers it may give ([`velarx_types::LayerKey`], only
-//! those the store service lets be shared): a peer tests the key of the layer
+//! of the keys of the layers it holds ([`velarx_types::LayerKey`], those the
+//! store service announces): a peer tests the key of the layer
 //! it wants against the filter of each neighbour and asks the ones that say
 //! "maybe", and skips the ones that say "no".  A false positive costs a
 //! request that is answered "I do not have it"; the bytes are checked by the

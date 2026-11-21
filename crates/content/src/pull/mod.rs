@@ -386,13 +386,6 @@ pub struct LayerDone {
     /// Only the metadata was fetched: the files come on demand and the layer
     /// is not verified against its diff id yet.
     pub lazy: bool,
-    /// No byte of the layer came from the store as it was before the pull:
-    /// the whole blob was checked against its digest, or every chunk
-    /// against a TOC the manifest names, from the registry or the sources
-    /// (whose bytes hash to their digests: they had them).  A layer made of
-    /// what the store had may be a private one named by a public image: it
-    /// is not given.
-    pub proven: bool,
     /// The blob was hashed to its digest: a layer pulled whole (not one of a
     /// TOC, nor one made of the files the peers have for its diff id)
     pub blob_checked: bool,
@@ -492,7 +485,7 @@ impl ImageBudget {
 
 /// A layer that was pulled with its table of contents: the one of the
 /// descriptor (`key` is its TOC), or a peer's index (`key` is the blob).
-fn layer_done(layer: &OciDescriptor, key: LayerKey, p: chunked::Pulled, proven: bool) -> LayerDone {
+fn layer_done(layer: &OciDescriptor, key: LayerKey, p: chunked::Pulled) -> LayerDone {
     LayerDone {
         key,
         blob: layer.digest,
@@ -514,7 +507,6 @@ fn layer_done(layer: &OciDescriptor, key: LayerKey, p: chunked::Pulled, proven: 
         tarsplit: p.tarsplit,
         toc_z: p.toc_z,
         lazy: false,
-        proven,
         blob_checked: false,
         checked: Default::default(),
     }
@@ -540,10 +532,7 @@ pub async fn pull_layer(
         let key = LayerKey::Toc(info.checksum);
         let toc_ctx = ctx.clone().with_layer(key);
         let pulled = chunked::pull(&toc_ctx, target, layer, &info, diff_id, move |n| p(n)).await?;
-        // nothing of the store as it was: what the sources gave
-        // hashes to its digest, they had it already
-        let proven = pulled.from_store == 0;
-        return Ok(layer_done(layer, key, pulled, proven));
+        return Ok(layer_done(layer, key, pulled));
     }
     // a layer with no table of contents, through the fetchers: one
     // unpacks it, the replay proves it
@@ -559,31 +548,23 @@ pub async fn pull_layer(
             chunked::pull_whole(ctx, registry_only, layer, diff_id, move |n| p(n)).await?;
         // (every file was measured here; the blob was hashed by the
         // origin's workers, which the index of a source did not: it is not
-        // the blob's proof, and it is a proof of the layer only when no
-        // byte of it was the store's as it was, nor the user's own)
-        let proven = pulled.from_store == 0;
-        let mut done = layer_done(layer, whole, pulled, proven);
+        // the blob's proof)
+        let mut done = layer_done(layer, whole, pulled);
         done.blob_checked = by_registry;
         return Ok(done);
     }
     let p = progress.clone();
     let ingested = stream::ingest(ctx, Some(source), layer, diff_id, move |n| p(n)).await?;
-    Ok(whole_done(Some(source), layer, ingested))
+    Ok(whole_done(layer, ingested))
 }
 
 /// The layer of a blob read whole, as [`stream::ingest`] made it.
-pub fn whole_done(
-    source: Option<&Source>,
-    layer: &OciDescriptor,
-    ingested: stream::Ingested,
-) -> LayerDone {
+pub fn whole_done(layer: &OciDescriptor, ingested: stream::Ingested) -> LayerDone {
     LayerDone {
         key: LayerKey::Whole(layer.digest),
         blob: layer.digest,
         diff_id: ingested.diff_id,
         size: layer.size,
-        proven: matches!(source, Some(Source::Registry(_) | Source::Path))
-            && !ingested.from_local_source,
         toc: ingested.toc,
         files: ingested.files,
         chunks: Vec::new(),
@@ -601,7 +582,7 @@ pub fn whole_done(
 /// Fetch the files the sink of `ctx` wants of a zstd:chunked layer whose
 /// verified `meta` is known, and nothing else: the layer is not replayed, the
 /// sink is read back by the engine to prove the diff id, which `done` carries as
-/// claimed (nothing here proved it, and the layer is not `proven`).
+/// claimed (nothing here proved it).
 pub async fn pull_layer_files(
     ctx: &PullCtx,
     target: &Target,
@@ -618,7 +599,7 @@ pub async fn pull_layer_files(
         progress(n)
     })
     .await?;
-    Ok(layer_done(layer, key, p, false))
+    Ok(layer_done(layer, key, p))
 }
 
 /// Pull one layer, fetching only its metadata if it is a zstd:chunked layer
@@ -659,7 +640,6 @@ pub async fn pull_layer_lazy(
             tarsplit: l.tarsplit,
             toc_z: Some(l.toc_z),
             lazy: true,
-            proven: false,
             blob_checked: false,
             checked: Default::default(),
         });
@@ -677,7 +657,6 @@ pub fn stage_layer(
     (done, toc): (&LayerDone, &str),
     registry_ref: Option<&str>,
     reach: velarx_db::LayerReach,
-    public: bool,
     (erofs, owners): (&str, &str),
 ) -> ImageResult<()> {
     area.publish_layer_in(
@@ -688,7 +667,6 @@ pub fn stage_layer(
                 size: done.size,
                 registry_ref: registry_ref.map(str::to_string),
                 reach,
-                public,
                 erofs: erofs.to_string(),
                 owners: owners.to_string(),
                 created_at: chrono::Utc::now().to_rfc3339(),
@@ -793,7 +771,6 @@ mod layer_commit_tests {
             tarsplit: bytes::Bytes::from(zstd::encode_all(&b""[..], 0).unwrap()),
             toc_z: None,
             lazy: false,
-            proven: true,
             blob_checked: true,
             checked: Default::default(),
         }
@@ -880,7 +857,6 @@ mod budget_tests {
             report: LayerReport::default(),
             tarsplit: vec![0; tarsplit].into(),
             toc_z: None,
-            proven: false,
             blob_checked: false,
             checked: Default::default(),
             lazy: false,

@@ -511,7 +511,7 @@ impl WireFeed {
                     for c in copied {
                         self.apply_copy(file, *size, c)?;
                     }
-                    sink.adopt_as(path, key, *size, false).map_err(io)?;
+                    sink.adopt_as(path, key, *size).map_err(io)?;
                 }
                 None => {
                     let (pack, _) = &files[0];
@@ -528,7 +528,7 @@ impl WireFeed {
                         self.apply_copy(&tmp, *size, c)?;
                     }
                     drop(tmp);
-                    sink.adopt_as(&path, key, *size, false).map_err(io)?;
+                    sink.adopt_as(&path, key, *size).map_err(io)?;
                 }
             }
         }
@@ -653,7 +653,6 @@ impl WireFeed {
             },
             tarsplit: index.tarsplit.clone(),
             lazy: false,
-            proven: false,
             blob_checked: false,
             checked: Default::default(),
             toc_z: None,

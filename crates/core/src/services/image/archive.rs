@@ -287,7 +287,6 @@ impl ImageService {
             lazy: false,
             sources: None,
             reach: Default::default(),
-            shareable: false,
             seal: false,
             states: true,
             lease: None,

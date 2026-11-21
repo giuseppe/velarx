@@ -160,8 +160,6 @@ pub struct Linked {
     /// For each `Want` that is in the store now (index in the call): its
     /// object, `checked` when the kernel measured it
     pub objects: Vec<(usize, Object)>,
-    /// Of those, the ones the store had already
-    pub present: Vec<usize>,
     /// The ones that are not in the store
     pub refused: Vec<(usize, Refusal)>,
     /// What became of the layer's staged EROFS image (none asked for: none)
@@ -323,7 +321,7 @@ impl Verified {
                 prepared
                     .iter()
                     .map(|p| match p {
-                        Prepared::Done(Step::Linked(o) | Step::Present(o)) => Ok((o.clone(), None)),
+                        Prepared::Done(Step::Linked(o)) => Ok((o.clone(), None)),
                         Prepared::Done(Step::Refused(why)) => Err(why.clone()),
                         Prepared::Staged { rel, object, .. } => {
                             Ok((object.clone(), Some(staging.dir.join(rel))))
@@ -705,10 +703,6 @@ fn place_files(
     for (i, step) in steps {
         match step {
             Step::Linked(object) => done.objects.push((i, object)),
-            Step::Present(object) => {
-                done.objects.push((i, object));
-                done.present.push(i);
-            }
             Step::Refused(why) => done.refused.push((i, why)),
         }
     }
@@ -717,7 +711,6 @@ fn place_files(
 
 enum Step {
     Linked(Object),
-    Present(Object),
     Refused(Refusal),
 }
 
@@ -829,7 +822,7 @@ fn prepare_one(
         });
         if let Some(object) = size.and_then(|size| present(store, v, size)) {
             let _ = unlinkat(dir, rel, AtFlags::empty());
-            return done(Step::Present(object));
+            return done(Step::Linked(object));
         }
     }
     let mut file = match open_staged_file(dir, rel) {
@@ -944,7 +937,7 @@ fn prepare_one(
         if !matches!(want.check, Check::Verity(_)) {
             if let Some(object) = present(store, m, meta.len()) {
                 let _ = unlinkat(dir, rel, AtFlags::empty());
-                return done(Step::Present(object));
+                return done(Step::Linked(object));
             }
         }
     }
@@ -983,7 +976,7 @@ fn prepare_one(
         };
         if let Some(object) = present(store, &object.verity, meta.len()) {
             let _ = unlinkat(dir, rel, AtFlags::empty());
-            return done(Step::Present(object));
+            return done(Step::Linked(object));
         }
         return settle_staged(rel, &file, meta, object, store);
     }
@@ -1060,7 +1053,7 @@ fn prepare_one(
     };
     if let Some(object) = present(store, &object.verity, meta.len()) {
         drop_name(dir, rel, &meta);
-        return done(Step::Present(object));
+        return done(Step::Linked(object));
     }
     if copies.take() {
         return Ok(Prepared::Copy {
@@ -1104,12 +1097,9 @@ fn link_copy(
     object: &Object,
     store: &FileStore,
 ) -> io::Result<Step> {
-    let linked = link_into(store, file, object)?;
+    store.place(file, object)?;
     drop_name(dir, rel, meta);
-    Ok(match linked {
-        true => Step::Linked(object.clone()),
-        false => Step::Present(object.clone()),
-    })
+    Ok(Step::Linked(object.clone()))
 }
 
 /// The operation of a storage driver that gives a verified file its name:
@@ -1118,28 +1108,21 @@ fn link_copy(
 /// which keep the same files by their fs-verity digest) are linked by their
 /// inode; the `varlink` driver takes the file as a descriptor handed over its
 /// typed interface (`org.velarx.StorageFeed`, event `staged`) and keeps it in
-/// its own way.  Whether the name was made by this call: an object that is
-/// there is kept.
+/// its own way.  An object that is there is kept.
 pub trait Place: Sync {
-    fn place(&self, file: &File, object: &Object) -> io::Result<bool>;
+    fn place(&self, file: &File, object: &Object) -> io::Result<()>;
 }
 
 impl Place for FileStore {
     /// `linkat` of the file into `objects/` under the name of `object`: no
     /// second write of the bytes, no copy, no reflink.
-    fn place(&self, file: &File, object: &Object) -> io::Result<bool> {
+    fn place(&self, file: &File, object: &Object) -> io::Result<()> {
         let target = self.object_path(object);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
         link_object(&velarx_sys::fd::proc_str(file), &target, object)
     }
-}
-
-/// Give the file `file` the place of `object` in the store; whether this
-/// call made the name (an object that is there is kept, `false`).
-fn link_into(store: &FileStore, file: &File, object: &Object) -> io::Result<bool> {
-    store.place(file, object)
 }
 
 /// Give a file that was made ready its name (the step that follows the
@@ -1173,10 +1156,10 @@ fn place_one(dir: BorrowedFd<'_>, prepared: Prepared, store: &FileStore) -> io::
 /// Give the file at `from` (a name of its own or `/proc/self/fd/N`) the place
 /// of `object`: never over an object that is there, unless that one is not
 /// as long as `from`, or is checked and does not have the fs-verity digest
-/// it is named by.  Whether the name was made by this call.
-pub fn link_object(from: &str, target: &std::path::Path, object: &Object) -> io::Result<bool> {
+/// it is named by.
+pub fn link_object(from: &str, target: &std::path::Path, object: &Object) -> io::Result<()> {
     match linkat(CWD, from, CWD, target, AtFlags::SYMLINK_FOLLOW) {
-        Ok(()) => Ok(true),
+        Ok(()) => Ok(()),
         Err(Errno::EXIST) => {
             let measures = |p: &std::path::Path| {
                 File::open(p)
@@ -1189,7 +1172,7 @@ pub fn link_object(from: &str, target: &std::path::Path, object: &Object) -> io:
             if length(target) == length(std::path::Path::new(from))
                 && (!object.checked || measures(target))
             {
-                return Ok(false);
+                return Ok(());
             }
             warn!("{} is not what its name says: replaced", target.display());
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1204,7 +1187,7 @@ pub fn link_object(from: &str, target: &std::path::Path, object: &Object) -> io:
                 let _ = std::fs::remove_file(&temporary);
                 io::Error::from(e)
             })?;
-            Ok(true)
+            Ok(())
         }
         Err(e) => Err(e.into()),
     }
@@ -1794,8 +1777,7 @@ mod tests {
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(&target, b"kept").unwrap();
         let before = std::fs::metadata(&target).unwrap().ino();
-        let done = link_files(l.staging.as_fd(), std::slice::from_ref(&w), &l.store, None).unwrap();
-        assert_eq!(done.present, vec![0]);
+        link_files(l.staging.as_fd(), std::slice::from_ref(&w), &l.store, None).unwrap();
         assert_eq!(std::fs::metadata(&target).unwrap().ino(), before);
         // (a file system without fs-verity cannot satisfy `require_kernel`;
         // one that has it names the file by the kernel's measure: the

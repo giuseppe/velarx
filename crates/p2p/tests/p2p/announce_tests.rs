@@ -67,7 +67,6 @@ fn image(layer: &str) -> ImageInfo {
         layers: vec![layer.to_string()],
         size: 1,
         created_at: "2026-01-01T00:00:00Z".to_string(),
-        complete: true,
     }
 }
 

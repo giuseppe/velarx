@@ -34,9 +34,6 @@ pub struct Session {
     counter: AtomicU64,
     /// The session this one is the scratch of: what it staged is here too
     parent: std::sync::OnceLock<Arc<Session>>,
-    /// The staged files that are copies of files of read-only stores: the
-    /// store's, not the pull's; never given
-    copies: Mutex<std::collections::HashSet<String>>,
     /// The staged files known by their fs-verity digest, and their names:
     /// the commit moves nothing unless each has it
     by_verity: Mutex<HashMap<String, String>>,
@@ -103,7 +100,6 @@ impl Session {
             staged: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
             parent: std::sync::OnceLock::new(),
-            copies: Mutex::new(std::collections::HashSet::new()),
             by_verity: Mutex::new(HashMap::new()),
             by_content: Mutex::new(HashMap::new()),
             verified: Mutex::new(HashMap::new()),
@@ -166,28 +162,11 @@ impl Session {
 
     /// Whether the content of `digest` is read from this store's own file:
     /// neither this session nor the one it is next to staged it (what a
-    /// pull staged may be a file of its job, a copy or not).
+    /// pull staged may be a file of its job).
     pub fn in_store_only(&self, digest: &str) -> bool {
         !self.has_staged(digest)
             && !self.parent.get().is_some_and(|p| p.has_staged(digest))
             && self.store.contains_local(digest)
-    }
-
-    /// Whether `digest` is a copy of a file of a read-only store, or was
-    /// made with what the store or a local source had: not what the pull
-    /// got.
-    pub fn is_copy(&self, digest: &str) -> bool {
-        self.copies
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(digest)
-            || self.parent.get().is_some_and(|p| p.is_copy(digest))
-    }
-
-    /// Whether `digest` came from the store as it was before this pull:
-    /// not staged by it, or a copy of a read-only store's.
-    pub fn from_store(&self, digest: &str) -> bool {
-        !self.has_staged(digest) || self.is_copy(digest)
     }
 
     /// Move what this session staged and `keep` names into `other`
@@ -220,13 +199,11 @@ impl Session {
             },
         ) in staged
         {
-            // a copy stays one there too
-            let copy = self.is_copy(&digest);
             let kept = match home {
                 // (committed from the staging it is in, which the other
                 // session holds from now on)
-                Some(home) => other.stage_in(&home, &path, &digest, (size, copy), None)?,
-                None => other.adopt_path(&path, &digest, (size, copy), own)?,
+                Some(home) => other.stage_in(&home, &path, &digest, size, None)?,
+                None => other.adopt_path(&path, &digest, size, own)?,
             };
             if kept {
                 // (and what the commit checks it against)
@@ -339,7 +316,7 @@ impl Session {
             Ok(size)
         })();
         match copied {
-            Ok(size) => self.adopt_as(&temp, digest, size, true).map(|_| ()),
+            Ok(size) => self.adopt_as(&temp, digest, size).map(|_| ()),
             Err(e) => {
                 let _ = fs::remove_file(&temp);
                 Err(e)
@@ -399,31 +376,17 @@ impl Session {
         Ok(to)
     }
 
-    /// Stage the complete file `temp` as `digest`; `copy`: the file is a copy
-    /// of what the store or a local source had, which is the store's, not the
-    /// pull's.  The file keeps a name of the session (`tmp-N`): `digest` is
-    /// what it is known by, not what it is called, and the commit gives it
-    /// the name of its fs-verity digest after it has measured it.  Dropped if
-    /// the session has the content already, or the store.  Whether the file
-    /// was kept.
-    pub(crate) fn adopt_as(
-        &self,
-        temp: &Path,
-        digest: &str,
-        size: u64,
-        copy: bool,
-    ) -> io::Result<bool> {
-        self.adopt_path(temp, digest, (size, copy), true)
+    /// Stage the complete file `temp` as `digest`.  The file keeps a name of
+    /// the session (`tmp-N`): `digest` is what it is known by, not what it is
+    /// called, and the commit gives it the name of its fs-verity digest after
+    /// it has measured it.  Dropped if the session has the content already,
+    /// or the store.  Whether the file was kept.
+    pub(crate) fn adopt_as(&self, temp: &Path, digest: &str, size: u64) -> io::Result<bool> {
+        self.adopt_path(temp, digest, size, true)
     }
 
     /// [`Session::adopt_as`] of a file that `own`s its inode or not.
-    fn adopt_path(
-        &self,
-        temp: &Path,
-        digest: &str,
-        (size, copy): (u64, bool),
-        own: bool,
-    ) -> io::Result<bool> {
+    fn adopt_path(&self, temp: &Path, digest: &str, size: u64, own: bool) -> io::Result<bool> {
         if self.staged.lock().unwrap().contains_key(digest) || self.store.holds(digest, size) {
             fs::remove_file(temp)?;
             return Ok(false);
@@ -448,13 +411,6 @@ impl Session {
             drop(staged);
             fs::remove_file(&path)?;
             return Ok(false);
-        }
-        // A copy is one before it is staged: the store's, not the pull's.
-        if copy {
-            self.copies
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(digest.to_string());
         }
         staged.insert(
             digest.to_string(),
@@ -491,13 +447,12 @@ impl Session {
         key: &str,
         verity: &str,
         size: u64,
-        copy: bool,
     ) -> io::Result<(String, bool)> {
         if self.holds_object(verity, size) {
             fs::remove_file(temp)?;
             return Ok((verity.to_string(), false));
         }
-        let added = self.adopt_as(temp, key, size, copy)?;
+        let added = self.adopt_as(temp, key, size)?;
         if added {
             // (the commit's measure of the file must be the digest it was
             // written with: its tree is not made a third time to know it)
@@ -516,13 +471,11 @@ impl Session {
         key: &str,
         verity: &str,
         data: &[u8],
-        copy: bool,
     ) -> io::Result<(String, bool)> {
         if self.holds_object(verity, data.len() as u64) {
             return Ok((verity.to_string(), false));
         }
-        self.put_as(key, data, copy)
-            .map(|added| (key.to_string(), added))
+        self.put_as(key, data).map(|added| (key.to_string(), added))
     }
 
     /// Give the file `file` (made by a fetcher, complete
@@ -536,7 +489,6 @@ impl Session {
         &self,
         file: &File,
         digest: &str,
-        copy: bool,
         verity_keyed: Option<&str>,
     ) -> io::Result<bool> {
         let size = file.metadata()?.len();
@@ -558,12 +510,6 @@ impl Session {
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(digest.to_string(), None);
             }
-        }
-        if copy {
-            self.copies
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(digest.to_string());
         }
         staged.insert(
             digest.to_string(),
@@ -657,7 +603,6 @@ impl Session {
         layer: &Arc<LayerStaging>,
         file: &File,
         digest: &str,
-        copy: bool,
         verity_keyed: Option<&str>,
     ) -> io::Result<bool> {
         let rel = crate::stager::staged_rel(digest)
@@ -665,7 +610,7 @@ impl Session {
             .ok_or_else(|| io::Error::other(format!("{digest} is not the key of a file")))?;
         let size = file.metadata()?.len();
         let path = layer.files().join(rel);
-        self.stage_in(layer, &path, digest, (size, copy), Some(verity_keyed))
+        self.stage_in(layer, &path, digest, size, Some(verity_keyed))
     }
 
     /// Record the file at `path` of the staging of `layer` as staged as
@@ -677,7 +622,7 @@ impl Session {
         layer: &Arc<LayerStaging>,
         path: &Path,
         digest: &str,
-        (size, copy): (u64, bool),
+        size: u64,
         known: Option<Option<&str>>,
     ) -> io::Result<bool> {
         let mut staged = self.staged.lock().unwrap();
@@ -694,12 +639,6 @@ impl Session {
             }
             None => {}
         }
-        if copy {
-            self.copies
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(digest.to_string());
-        }
         staged.insert(
             digest.to_string(),
             Staged {
@@ -712,9 +651,8 @@ impl Session {
         Ok(true)
     }
 
-    /// Stage content that is in memory; a `copy` (of what the store or a
-    /// local source had) is the store's, not the pull's.
-    pub fn put_as(&self, digest: &str, data: &[u8], copy: bool) -> io::Result<bool> {
+    /// Stage content that is in memory.
+    pub fn put_as(&self, digest: &str, data: &[u8]) -> io::Result<bool> {
         if self.holds(digest, data.len() as u64) {
             return Ok(false);
         }
@@ -724,7 +662,7 @@ impl Session {
             return Err(e);
         }
         drop(file);
-        self.adopt_as(&temp, digest, data.len() as u64, copy)
+        self.adopt_as(&temp, digest, data.len() as u64)
     }
 
     /// Make the staged content part of the store, through the commit of a
@@ -1056,7 +994,7 @@ impl Drop for Session {
 impl Session {
     /// Stage content that is in memory.
     pub fn put(&self, digest: &str, data: &[u8]) -> io::Result<bool> {
-        self.put_as(digest, data, false)
+        self.put_as(digest, data)
     }
 
     /// Number of files and bytes staged.
@@ -1072,7 +1010,7 @@ impl Session {
     /// recorded at once, under the lock of the session, and a content that
     /// another thread recorded first has the same bytes, so this file goes.
     pub fn adopt(&self, temp: &Path, digest: &str, size: u64) -> io::Result<bool> {
-        self.adopt_as(temp, digest, size, false)
+        self.adopt_as(temp, digest, size)
     }
 }
 
@@ -1109,52 +1047,45 @@ mod tests {
     }
 
     /// Threads that stage the same content at once: one keeps its file,
-    /// the content is staged for all; a copy stays one whoever wins, and
-    /// is never registered for the peers.
+    /// the content is staged for all.
     #[test]
     fn the_same_content_staged_at_once() {
-        for copy in [true, false] {
-            let (_tmp, s) = session();
-            let data = format!("same content {copy}");
-            let d = velarx_storage::fsverity_digest_of(
-                velarx_types::digest::Algorithm::Sha256,
-                data.as_bytes(),
-            );
-            let kept: usize = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..8)
-                    .map(|_| {
-                        scope.spawn(|| {
-                            let (mut f, temp) = s.create_temp().unwrap();
-                            f.write_all(data.as_bytes()).unwrap();
-                            drop(f);
-                            s.adopt_as(&temp, &d, data.len() as u64, copy).unwrap()
-                        })
+        let (_tmp, s) = session();
+        let data = "same content";
+        let d = velarx_storage::fsverity_digest_of(
+            velarx_types::digest::Algorithm::Sha256,
+            data.as_bytes(),
+        );
+        let kept: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let (mut f, temp) = s.create_temp().unwrap();
+                        f.write_all(data.as_bytes()).unwrap();
+                        drop(f);
+                        s.adopt_as(&temp, &d, data.len() as u64).unwrap()
                     })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| usize::from(h.join().unwrap()))
-                    .sum()
-            });
-            assert_eq!(kept, 1);
-            assert!(s.has_staged(&d));
-            assert_eq!(
-                fs::read(s.content_path(&d).unwrap()).unwrap(),
-                data.as_bytes()
-            );
-            assert_eq!(s.is_copy(&d), copy);
-            assert_eq!(s.from_store(&d), copy);
-            let left = s.temp_files().len();
-            assert_eq!(left, 1);
-        }
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| usize::from(h.join().unwrap()))
+                .sum()
+        });
+        assert_eq!(kept, 1);
+        assert!(s.has_staged(&d));
+        assert_eq!(
+            fs::read(s.content_path(&d).unwrap()).unwrap(),
+            data.as_bytes()
+        );
+        let left = s.temp_files().len();
+        assert_eq!(left, 1);
     }
 
     /// A file only a read-only store has is copied into the session to be
-    /// used, but it is the store's: never registered for the peers nor
-    /// counted as the store's, and still a copy when it moves
-    /// to another session.
+    /// used, and moves to another session with its scratch.
     #[test]
-    fn copies_of_read_only_stores_are_the_stores() {
+    fn a_file_of_a_read_only_store_is_copied_into_the_session() {
         let tmp = tempfile::tempdir().unwrap();
         let ro = FileStore::new(tmp.path().join("ro")).unwrap();
         let store = Arc::new(
@@ -1163,40 +1094,24 @@ mod tests {
                 .with_additional(vec![tmp.path().join("ro")]),
         );
         let s = Session::create(&tmp.path().join("staging"), store.clone()).unwrap();
-        let mut digests = Vec::new();
-        for i in 0..4 {
-            let d = ro
-                .put(
-                    velarx_types::digest::Algorithm::Sha256,
-                    format!("private {i}").as_bytes(),
-                )
-                .unwrap();
-            assert!(s.have(&d));
-            digests.push(d);
-        }
-        for d in &digests {
-            assert!(s.is_copy(d) && s.from_store(d));
-            // (a copy is a file of the session: what reads it hashes it)
-            assert!(!s.in_store_only(d));
-        }
+        let d = ro
+            .put(velarx_types::digest::Algorithm::Sha256, b"read-only")
+            .unwrap();
+        assert!(s.have(&d));
+        // (a copy is a file of the session: what reads it hashes it)
+        assert!(s.has_staged(&d) && !s.in_store_only(&d));
         let own = store
             .put(velarx_types::digest::Algorithm::Sha256, b"of the store")
             .unwrap();
         assert!(s.have(&own) && s.in_store_only(&own));
-        // what the pull itself got is the pull's
-        let mine =
-            velarx_storage::fsverity_digest_of(velarx_types::digest::Algorithm::Sha256, b"fetched");
-        s.put(&mine, b"fetched").unwrap();
-        assert!(!s.from_store(&mine) && !s.in_store_only(&mine));
-        // a copy moved to another session is still one
         let scratch = s.scratch().unwrap();
         let other = ro
-            .put(velarx_types::digest::Algorithm::Sha256, b"private other")
+            .put(velarx_types::digest::Algorithm::Sha256, b"read-only other")
             .unwrap();
         assert!(scratch.have(&other));
         let keep: std::collections::HashSet<&str> = [other.as_str()].into();
         scratch.transfer_into(&s, &keep).unwrap();
-        assert!(s.has_staged(&other) && s.is_copy(&other));
+        assert!(s.has_staged(&other));
     }
 
     /// A scratch session finds what its parent staged; what it stages
@@ -1307,7 +1222,7 @@ mod tests {
         let (mut f, temp) = s.create_temp().unwrap();
         io::Write::write_all(&mut f, b"hello").unwrap();
         drop(f);
-        s.adopt_as(&temp, &v, 5, false).unwrap();
+        s.adopt_as(&temp, &v, 5).unwrap();
         s.known_by_verity(&v, "f");
         s.commit(Some(&verity)).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"hello");
@@ -1323,7 +1238,6 @@ mod tests {
             &temp,
             "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
             5,
-            false,
         )
         .unwrap();
         s.commit(Some(&verity)).unwrap();
@@ -1410,7 +1324,7 @@ mod tests {
             );
             kept.write_all(b"abc").unwrap();
             let given = File::open(velarx_sys::fd::proc_str(&kept)).unwrap();
-            assert!(s.adopt_file(&given, &key, false, None).unwrap());
+            assert!(s.adopt_file(&given, &key, None).unwrap());
             if change {
                 kept.write_all_at(b"xyz", 0).unwrap();
             }
@@ -1506,9 +1420,7 @@ mod tests {
         let (mut f, temp) = s.create_temp().unwrap();
         f.write_all(b"with a name").unwrap();
         drop(f);
-        assert!(s
-            .adopt_as(&temp, &by_verity(b"with a name"), 11, false)
-            .unwrap());
+        assert!(s.adopt_as(&temp, &by_verity(b"with a name"), 11).unwrap());
         // a file with no name
         let mut kept = File::from(
             rustix::fs::open(
@@ -1521,7 +1433,7 @@ mod tests {
         kept.write_all(b"no name").unwrap();
         let given = File::open(velarx_sys::fd::proc_str(&kept)).unwrap();
         assert!(s
-            .adopt_file(&given, &by_verity(b"no name"), false, Some("b/file"))
+            .adopt_file(&given, &by_verity(b"no name"), Some("b/file"))
             .unwrap());
         // a session inside, whose file moves out
         let scratch = s.scratch().unwrap();
@@ -1617,7 +1529,7 @@ mod tests {
         drop(f);
         let ino = fs::metadata(&temp).unwrap().ino();
         let key = crate::sha256_text(&data);
-        s.adopt_measured(&temp, &key, &verity, data.len() as u64, false)
+        s.adopt_measured(&temp, &key, &verity, data.len() as u64)
             .unwrap();
         let committed = s.commit(None).unwrap();
         assert_eq!(committed[0].object.verity, verity);
@@ -1646,13 +1558,12 @@ mod tests {
         let temp = temp_with(&in_store);
         let key = crate::sha256_text(&in_store);
         assert_eq!(
-            s.adopt_measured(&temp, &key, &verity, 400_000, false)
-                .unwrap(),
+            s.adopt_measured(&temp, &key, &verity, 400_000).unwrap(),
             (verity.clone(), false)
         );
         assert!(!temp.exists());
         assert_eq!(
-            s.put_measured(&key, &verity, &in_store, false).unwrap(),
+            s.put_measured(&key, &verity, &in_store).unwrap(),
             (verity.clone(), false)
         );
         assert_eq!(s.temp_files().len(), 0);
@@ -1665,7 +1576,7 @@ mod tests {
         let key = crate::sha256_text(b"staged by its digest");
         let temp = temp_with(b"staged by its digest");
         assert_eq!(
-            s.adopt_measured(&temp, &key, &claimed, 20, false).unwrap(),
+            s.adopt_measured(&temp, &key, &claimed, 20).unwrap(),
             (claimed.clone(), false)
         );
         assert!(!temp.exists());
@@ -1675,16 +1586,16 @@ mod tests {
         let new = b"nobody has it";
         let (key, verity) = (crate::sha256_text(new), by_verity(new));
         assert_eq!(
-            s.put_measured(&key, &verity, new, false).unwrap(),
+            s.put_measured(&key, &verity, new).unwrap(),
             (key.clone(), true)
         );
         assert_eq!(
-            s.put_measured(&key, &verity, new, false).unwrap(),
+            s.put_measured(&key, &verity, new).unwrap(),
             (key.clone(), false)
         );
         let temp = temp_with(new);
         assert_eq!(
-            s.adopt_measured(&temp, &key, &verity, 13, false).unwrap(),
+            s.adopt_measured(&temp, &key, &verity, 13).unwrap(),
             (key.clone(), false)
         );
         assert!(!temp.exists());
@@ -1693,12 +1604,7 @@ mod tests {
         let scratch = s.scratch().unwrap();
         assert_eq!(
             scratch
-                .put_measured(
-                    &crate::sha256_text(b"staged by its digest"),
-                    &claimed,
-                    b"x",
-                    false
-                )
+                .put_measured(&crate::sha256_text(b"staged by its digest"), &claimed, b"x")
                 .unwrap(),
             (claimed, false)
         );
@@ -1866,7 +1772,7 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, data).unwrap();
             let file = File::open(&path).unwrap();
-            assert!(s.adopt_staged(&layer, &file, &key, false, None).unwrap());
+            assert!(s.adopt_staged(&layer, &file, &key, None).unwrap());
             // (the file is where the fetcher staged it: one name)
             assert_eq!(fs::metadata(&path).unwrap().nlink(), 1);
         }
@@ -1921,7 +1827,7 @@ mod tests {
             inodes.push(fs::metadata(&path).unwrap().ino());
             total += data.len() as u64;
             let file = File::open(&path).unwrap();
-            assert!(s.adopt_staged(&layer, &file, &key, false, None).unwrap());
+            assert!(s.adopt_staged(&layer, &file, &key, None).unwrap());
         }
         assert_eq!(store.hashed(), 0, "nothing is read before the verification");
         let verified = s.verify(None).unwrap();

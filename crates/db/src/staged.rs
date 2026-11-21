@@ -9,17 +9,6 @@ use super::{commit_layer, write_image, Database, DbError, DbResult};
 use crate::{BlobSource, ImageTag, LayerCommit, LayerKey, PullCommit};
 use velarx_types::digest::Digest;
 
-/// A layer of a lazy pull that is complete: its files are in `objects/`, its
-/// tar-split was replayed against its diff id.
-pub struct StagedLayerCommit {
-    pub layer: LayerCommit,
-    /// The pull may be shared: the layer may have its files asked of the
-    /// content sources.
-    pub public: bool,
-    /// No byte of the layer came from the store as it was: it may be given.
-    pub proven: bool,
-}
-
 /// The image of a lazy pull whose layers are all in the store.
 pub struct StagedImageCommit {
     /// The image, its layers, its names and the repositories of its blobs;
@@ -28,20 +17,16 @@ pub struct StagedImageCommit {
     /// When the pull started (RFC 3339): a name goes to this image only if
     /// the image that holds it in the store was recorded before.
     pub started_at: String,
-    /// The names the image may be announced under, when the pull may be
-    /// shared.
-    pub shared: Option<Vec<(String, String)>>,
 }
 
 impl Database {
-    /// The layers a lazy pull fetched whole, with where their blobs are, in
-    /// one transaction: complete layers, and no image yet.  `shared`: the
-    /// layers of a pull that may be shared, and whether each is proven.
+    /// Complete layers, with where their blobs are, in one transaction, and
+    /// no image yet: the layers a lazy pull fetched whole, or one its
+    /// completion made complete.
     pub async fn commit_layers(
         &self,
         layers: Vec<LayerCommit>,
         sources: Vec<BlobSource>,
-        shared: Vec<(LayerKey, bool)>,
     ) -> DbResult<()> {
         self.conn
             .call(move |conn| {
@@ -53,27 +38,6 @@ impl Database {
                 for source in &sources {
                     super::add_blob_source(&tx, source)?;
                 }
-                for (key, proven) in &shared {
-                    share_layer(&tx, key, *proven)?;
-                }
-                tx.commit()?;
-                Ok(())
-            })
-            .await
-            .map_err(DbError::Sqlite)
-    }
-
-    /// A layer of a lazy pull, complete, in one transaction: its row, files,
-    /// references and chunks, and whether it may be shared.
-    pub async fn commit_staged_layer(&self, commit: StagedLayerCommit) -> DbResult<()> {
-        self.conn
-            .call(move |conn| {
-                let tx =
-                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                commit_layer(&tx, &commit.layer)?;
-                if commit.public {
-                    share_layer(&tx, &commit.layer.record.key, commit.proven)?;
-                }
                 tx.commit()?;
                 Ok(())
             })
@@ -83,8 +47,7 @@ impl Database {
 
     /// The image of a lazy pull, once every layer of it is in the store:
     /// the image, its layers, its names (those that a newer image of the
-    /// store does not have), the signatures of its pulls and the right to
-    /// announce it.
+    /// store does not have) and the signatures of its pulls.
     pub async fn commit_staged_image(&self, commit: StagedImageCommit) -> DbResult<()> {
         self.conn
             .call(move |conn| {
@@ -93,23 +56,11 @@ impl Database {
                 let StagedImageCommit {
                     mut pull,
                     started_at,
-                    shared,
                 } = commit;
                 pull.tags.retain(|t| !tag_is_newer(&tx, t, &started_at));
                 pull.digest_names
                     .retain(|(r, d)| !digest_name_is_newer(&tx, r, d, &pull.image.id, &started_at));
                 write_image(&tx, &pull)?;
-                if let Some(names) = shared {
-                    for (repository, tag) in
-                        std::iter::once((String::new(), String::new())).chain(names)
-                    {
-                        tx.execute(
-                            "INSERT OR IGNORE INTO shared_images (image_id, repository, tag)
-                             VALUES (?1, ?2, ?3)",
-                            rusqlite::params![pull.image.id, repository, tag],
-                        )?;
-                    }
-                }
                 tx.commit()?;
                 Ok(())
             })
@@ -129,16 +80,6 @@ impl Database {
             .await
             .map_err(DbError::Sqlite)
     }
-}
-
-fn share_layer(tx: &rusqlite::Transaction, key: &LayerKey, proven: bool) -> rusqlite::Result<()> {
-    tx.execute(
-        "INSERT INTO shared_layers (layer_id, proven)
-         SELECT id, ?2 FROM layers WHERE id = ?1
-         ON CONFLICT(layer_id) DO UPDATE SET proven = MAX(proven, ?2)",
-        rusqlite::params![key, proven as i64],
-    )?;
-    Ok(())
 }
 
 /// The tag is held by another image of the store that was recorded after

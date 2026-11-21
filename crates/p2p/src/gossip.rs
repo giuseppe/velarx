@@ -86,7 +86,6 @@ fn sane_images(images: Vec<ImageInfo>) -> Vec<ImageInfo> {
         .into_iter()
         .filter(|i| {
             sane_string(&i.id, 128)
-                && i.complete
                 && crate::limits::is_digest(&i.manifest_digest)
                 && crate::limits::is_digest(&i.config_digest)
                 && i.repo_digests.iter().all(|t| sane_string(t, 512))
@@ -294,7 +293,6 @@ mod tests {
             layers: vec![hex_digest(1)],
             size: 1,
             created_at: "2026-01-01T00:00:00Z".to_string(),
-            complete: true,
         }
     }
 
@@ -320,19 +318,12 @@ mod tests {
         let g = GossipDiscovery::announcing();
         let mut big = image("big", &hex_digest(9));
         big.layers = (0..512).map(hex_digest).collect();
-        let mut images: Vec<ImageInfo> = (0..5000)
+        let images: Vec<ImageInfo> = (0..5000)
             .map(|n| ImageInfo {
                 id: format!("{n}"),
                 ..big.clone()
             })
             .collect();
-        images.insert(
-            0,
-            ImageInfo {
-                complete: false,
-                ..image("partial", &hex_digest(8))
-            },
-        );
         g.set_images(images).await;
         let Some(message) = g.get_image_announce_message().await else {
             panic!("no message");
@@ -341,7 +332,6 @@ mod tests {
             panic!("{message:?}");
         };
         assert!(!images.is_empty() && images.len() < 5000);
-        assert!(images.iter().all(|i| i.complete));
         assert!(serde_json::to_vec(&message).unwrap().len() <= MAX_REQUEST_BYTES);
         let reply = g.image_reply().await;
         assert!(serde_json::to_vec(&reply).unwrap().len() <= MAX_REQUEST_BYTES);
@@ -410,9 +400,6 @@ mod tests {
         let mut bad_layer = good.clone();
         bad_layer.layers = vec!["../../etc".to_string()];
         images.push(bad_layer);
-        let mut partial = good.clone();
-        partial.complete = false;
-        images.push(partial);
         g.handle_gossip_message(peer, GossipMessage::ImageAnnounce { images })
             .await;
         let seen = g.get_remote_images().await;

@@ -176,7 +176,7 @@ fn decision(r: super::explain::Record) -> Decision {
 pub(super) async fn announce_to_peers(node: &P2PNode, announcement: Announcement) {
     if !announcement.layers.is_empty() {
         match node.announce_layers(announcement.layers).await {
-            Ok(count) => info!("Holding {} layers the peers may be given", count),
+            Ok(count) => info!("Holding {} layers for the peers", count),
             Err(e) => warn!("Failed to announce layers: {}", e),
         }
     }
@@ -350,9 +350,8 @@ mod control {
 
         /// Why the pulls asked the peers they did: the recent decisions
         /// about `target` (a digest or the start of one, a layer, a chunk
-        /// or an image id; the name of an image the store has whole and
-        /// shares), the last first, one a reply; all of them when `target`
-        /// is empty.
+        /// or an image id; the name of an image the store has), the last
+        /// first, one a reply; all of them when `target` is empty.
         #[zlink(more)]
         async fn explain(
             &self,

@@ -244,12 +244,6 @@ pub struct ExternalSourceConfig {
     /// Seconds without a byte after which the source is given up
     #[serde(default = "default_source_idle_secs")]
     pub idle_timeout_secs: u64,
-    /// The source asks the network (other nodes), not only what is on this
-    /// machine: it is asked only by the pulls that may be shared, as asking
-    /// tells what is pulled.  By default a source is the user's own and
-    /// every pull asks it.
-    #[serde(default)]
-    pub peer: bool,
 }
 
 /// The `idle_timeout_secs` of a source that does not set it.
@@ -385,57 +379,10 @@ impl Default for PushConfig {
     }
 }
 
-/// An entry of `[pull] share_registries`.  Entries that match the same
-/// image combine: it is shared with credentials if one of them says so.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum ShareEntry {
-    /// Shared when pulled without credentials
-    Prefix(String),
-    Table(ShareTable),
-}
-
-/// `{ prefix = "...", with_credentials = true }`: nothing else (a key
-/// misspelt is an error, not a registry shared otherwise than meant).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ShareTable {
-    pub prefix: String,
-    /// Shared when pulled with credentials too
-    #[serde(default)]
-    pub with_credentials: bool,
-}
-
-impl ShareEntry {
-    pub fn prefix(&self) -> &str {
-        match self {
-            ShareEntry::Prefix(p) => p,
-            ShareEntry::Table(t) => &t.prefix,
-        }
-    }
-
-    pub fn with_credentials(&self) -> bool {
-        matches!(self, ShareEntry::Table(t) if t.with_credentials)
-    }
-}
-
 /// How images are pulled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PullConfig {
-    /// What is given to peers, nothing by default: registries or
-    /// repository prefixes (`docker.io/library`, the upstream registry,
-    /// not a mirror) whose images pulled without credentials nor client
-    /// certificate are shared; `{ prefix = "...", with_credentials = true }`
-    /// shares those pulled with credentials too
-    #[serde(default)]
-    pub share_registries: Vec<ShareEntry>,
-    /// Whether the store service gives the names (`repository:tag`,
-    /// `repository@digest`) a shared pull recorded for its images to its
-    /// clients, and so the peers learn them: names are local metadata, so
-    /// only the digests of the images are given unless this is set
-    #[serde(default)]
-    pub share_image_names: bool,
     /// Layers fetched at the same time
     #[serde(default = "default_parallel_layers")]
     pub parallel_layers: usize,
@@ -683,8 +630,6 @@ impl Default for PullConfig {
             max_archive_gib: default_max_archive_gib(),
             policy_path: None,
             registries_d: None,
-            share_registries: Vec::new(),
-            share_image_names: false,
             require_userns: false,
             worker_path: None,
             registry_path: None,

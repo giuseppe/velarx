@@ -4,13 +4,19 @@ use std::io::Read;
 
 /// The version of the schema, kept in `PRAGMA user_version`: a database of
 /// another version is not opened, and a new file (`user_version` 0, no table)
-/// is told from a made one.  It stays 1 until a release starts to version the
-/// schema (owner decision, 2026-11-08): a breaking change edits the schema in
-/// place, with no bump and no upgrade steps, and a store made by another build
-/// must be removed.  Such a store is not told when it is opened: it fails at
-/// the first statement that needs the new shape, and `system check` stops
-/// on a table of contents of the old form and removes nothing.
-pub const SCHEMA_VERSION: i64 = 1;
+/// is told from a made one.  Version 2 dropped the two tables of what could
+/// be given to peers: a store of version 1 becomes 2 when it is opened, so
+/// that a velarx of version 1 refuses it with the error of its version, and
+/// a read-only store of version 1 is read as it is (it only has those two
+/// tables more, which nothing reads).  Other changes edit the schema in
+/// place with no bump: a store made by another build is not told when it is
+/// opened, it fails at the first statement that needs the new shape, and
+/// `system check` stops on a table of contents of the old form and removes
+/// nothing.
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// The oldest version a read-only store is read at.
+pub const OLDEST_READ_ONLY_VERSION: i64 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaError {
@@ -25,7 +31,8 @@ pub enum SchemaError {
 
 /// The tables of the database.  `PRAGMA user_version` is 0 for a file with
 /// no table of ours; it is then made, in one transaction that the processes
-/// opening it together wait for.
+/// opening it together wait for.  A store of version 1 loses the two tables
+/// of what could be given to peers (`shared_layers`, `shared_images`), once.
 pub(super) fn init(conn: &mut Connection) -> Result<(), SchemaError> {
     let found: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if found == SCHEMA_VERSION {
@@ -34,6 +41,16 @@ pub(super) fn init(conn: &mut Connection) -> Result<(), SchemaError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let found: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if found == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if found == 1 {
+        tx.execute_batch(&format!(
+            "DROP TABLE IF EXISTS shared_layers; DROP TABLE IF EXISTS shared_images;
+             PRAGMA user_version = {SCHEMA_VERSION};"
+        ))?;
+        tx.commit()?;
+        // (no row was counted: a table dropped is a write that must survive)
+        super::volatile::mark_durable();
         return Ok(());
     }
     let tables: i64 = tx.query_row(
@@ -347,25 +364,6 @@ CREATE TABLE IF NOT EXISTS pulled_images (
     reference TEXT NOT NULL,
     signatures BLOB NOT NULL,
     PRIMARY KEY (manifest_digest, reference)
-);
-
--- The layers this node may give its peers: pulled without credentials, or
--- from a registry the configuration shares; `proven` when no byte of one
--- came from the store as it was.
-CREATE TABLE IF NOT EXISTS shared_layers (
-    layer_id TEXT PRIMARY KEY REFERENCES layers(id) ON DELETE CASCADE,
-    proven INTEGER NOT NULL DEFAULT 0
-);
-
--- The images, and the names of them, that a pull which may be shared
--- recorded: only these are announced to peers.  A row ('', '') says the
--- image may be announced; the rows with a repository and a tag are the
--- names it may be announced under.
-CREATE TABLE IF NOT EXISTS shared_images (
-    image_id TEXT NOT NULL REFERENCES images(id) ON DELETE CASCADE,
-    repository TEXT NOT NULL DEFAULT '',
-    tag TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (image_id, repository, tag)
 );
 
 CREATE INDEX IF NOT EXISTS idx_file_refs_file ON file_refs(file_digest);
@@ -929,17 +927,16 @@ mod tests {
     /// A file with tables and `user_version` 0 is refused with its version,
     /// not taken for a new, empty file.
     #[tokio::test]
-    async fn the_previous_schema_version_is_refused() {
+    async fn a_made_file_of_version_0_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.sqlite");
         Database::open(&path).await.unwrap().close().await.unwrap();
-        let previous = SCHEMA_VERSION - 1;
         rusqlite::Connection::open(&path)
             .unwrap()
-            .execute_batch(&format!("PRAGMA user_version = {previous};"))
+            .execute_batch("PRAGMA user_version = 0;")
             .unwrap();
         let e = Database::open(&path).await.err().unwrap().to_string();
-        assert!(e.contains(&format!("schema version {previous}")), "{e}");
+        assert!(e.contains("schema version 0"), "{e}");
         assert!(e.contains("remove the store"), "{e}");
     }
 

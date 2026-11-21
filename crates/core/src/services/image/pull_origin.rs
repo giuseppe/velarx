@@ -120,7 +120,7 @@ impl ImageService {
         use velarx_content::pull::net::origin::image_error_of;
         use velarx_content::pull::staged_fetch::StagedFetch;
         let names = self.origin_sources(sources)?;
-        let before = self.source_links(&names, false).await;
+        let before = self.source_links(&names).await;
         let verity = self.staging_verity();
         let (end, name) = match via {
             Via::Path(path) => (path.connect().await?, via.party().to_string()),
@@ -323,7 +323,6 @@ impl ImageService {
                         lazy: false,
                         sources: options.sources.clone(),
                         reach: Default::default(),
-                        shareable: false,
                         seal: false,
                         states: false,
                         lease: None,

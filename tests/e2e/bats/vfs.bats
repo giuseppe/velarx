@@ -36,7 +36,7 @@ print(json.dumps(d) if not isinstance(d, str) else d)' "$1"; }
     check_match "the status says fs-verity is pull only" 'fs-verity.*checked at pull only' "$out"
     check_match "the status says there is no kernel mount" 'kernel mount.*no \(vfs mounts no layer' "$out"
     check "the driver is recorded in the store" vfs "$(sqlite3 "$(store)/db.sqlite" "SELECT value FROM store_settings WHERE key = 'driver'")"
-    check "the schema is version 1" 1 "$(sqlite3 "$(store)/db.sqlite" 'PRAGMA user_version')"
+    check "the schema is version 2" 2 "$(sqlite3 "$(store)/db.sqlite" 'PRAGMA user_version')"
     if [ -S "$SOCK" ]; then
         check "libpod info" vfs "$(curl -s --unix-socket "$SOCK" http://d/v5.0.0/libpod/info | field store.storageDriver)"
     fi

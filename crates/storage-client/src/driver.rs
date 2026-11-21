@@ -1605,7 +1605,6 @@ impl VarlinkDriver {
                 lazy: false,
                 // (the engine did not fetch the bytes: nothing of the
                 // layer is vouched for as coming from the registry)
-                proven: false,
                 blob_checked: false,
                 checked: Default::default(),
                 toc_z: None,

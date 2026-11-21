@@ -182,9 +182,6 @@ pub struct Ingested {
     pub diff_id: Digest,
     /// The zstd compressed tar-split of the layer.
     pub tarsplit: bytes::Bytes,
-    /// The blob came from a local source: its files are the user's, not
-    /// proven public by the pull
-    pub from_local_source: bool,
 }
 
 /// A regular file written to the session.
@@ -203,16 +200,14 @@ pub(super) struct StagedFile {
 /// content are made in the one pass over its bytes: its hash in `alg` (the
 /// algorithm of the digests of its layer), which the layer knows it by, and
 /// its fs-verity digest, which the store names it by; a file the store has is
-/// not kept, and is known by the digest the store has it by.  A `copy` is
-/// staged as what the store had: not told nor given.
+/// not kept, and is known by the digest the store has it by.
 pub(super) fn stage_file<R: Read>(
     session: &dyn Sink,
     alg: Algorithm,
     entry: &mut R,
     size: u64,
-    copy: bool,
 ) -> io::Result<StagedFile> {
-    if let Some((key, added)) = session.put_reader(alg, entry, size, copy)? {
+    if let Some((key, added)) = session.put_reader(alg, entry, size)? {
         return Ok(StagedFile {
             content: key.clone(),
             key,
@@ -224,7 +219,7 @@ pub(super) fn stage_file<R: Read>(
         entry.read_exact(&mut data)?;
         let content = Digest::of(alg, &data).to_string();
         let verity = velarx_storage::fsverity_digest_of(alg, &data);
-        let (key, added) = session.put_measured(&content, &verity, &data, copy)?;
+        let (key, added) = session.put_measured(&content, &verity, &data)?;
         return Ok(StagedFile {
             key,
             content,
@@ -263,7 +258,7 @@ pub(super) fn stage_file<R: Read>(
         return Err(e);
     }
     let content = hasher.finalize().to_string();
-    let (key, added) = session.adopt_measured(&path, &content, &verity.finish(), size, copy)?;
+    let (key, added) = session.adopt_measured(&path, &content, &verity.finish(), size)?;
     Ok(StagedFile {
         key,
         content,
@@ -277,7 +272,6 @@ pub(super) fn parse(
     alg: Algorithm,
     session: &dyn Sink,
     report: &mut LayerReport,
-    copy: bool,
 ) -> io::Result<(Vec<TocEntry>, Vec<FileUse>, Vec<u8>)> {
     let mut tar = TarReader::with_sink(ChannelReader::new(frames), Recorder::new()?);
     let mut entries: Vec<TocEntry> = Vec::new();
@@ -294,7 +288,7 @@ pub(super) fn parse(
         let file_digest = if h.kind == Kind::Regular && h.size == 0 {
             Some(Digest::empty(alg).to_string())
         } else if h.kind == Kind::Regular {
-            let staged = stage_file(session, alg, &mut tar, h.size, copy)?;
+            let staged = stage_file(session, alg, &mut tar, h.size)?;
             if staged.added {
                 report.fetched_files += 1;
             } else {
@@ -363,7 +357,7 @@ pub async fn ingest(
             let body = archive
                 .blob_stream(&layer.digest)
                 .map_err(|e| ImageError::Layer(e.to_string()))?;
-            ingest_stream(ctx, body, layer, expected_diff_id, progress, false).await
+            ingest_stream(ctx, body, layer, expected_diff_id, progress).await
         }
     }
 }
@@ -376,12 +370,11 @@ async fn ingest_stream<S>(
     layer: &OciDescriptor,
     expected_diff_id: &Digest,
     progress: impl Fn(u64),
-    copy: bool,
 ) -> ImageResult<Ingested>
 where
     S: futures::Stream<Item = ImageResult<Bytes>> + Unpin,
 {
-    ingest_feed(ctx, body, layer, expected_diff_id, progress, copy).await
+    ingest_feed(ctx, body, layer, expected_diff_id, progress).await
 }
 
 async fn ingest_feed<S>(
@@ -390,7 +383,6 @@ async fn ingest_feed<S>(
     layer: &OciDescriptor,
     expected_diff_id: &Digest,
     progress: impl Fn(u64),
-    copy: bool,
 ) -> ImageResult<Ingested>
 where
     S: futures::Stream<Item = ImageResult<Bytes>> + Unpin,
@@ -409,7 +401,7 @@ where
     let layer_alg = layer.digest.alg();
     let parser = tokio::task::spawn_blocking(move || {
         let mut report = LayerReport::default();
-        parse(frames_rx, layer_alg, &*session, &mut report, copy).map(|(e, f, t)| (e, f, t, report))
+        parse(frames_rx, layer_alg, &*session, &mut report).map(|(e, f, t)| (e, f, t, report))
     });
 
     // Stage 1: the network.
@@ -510,7 +502,6 @@ where
         report,
         diff_id,
         tarsplit: tarsplit.into(),
-        from_local_source: copy,
     })
 }
 
@@ -561,7 +552,7 @@ mod tests {
         diff: &Digest,
     ) -> ImageResult<Ingested> {
         let body = futures::stream::iter(vec![Ok::<_, ImageError>(Bytes::from(gz))]);
-        ingest_stream(ctx, body, layer, diff, |_| {}, false).await
+        ingest_stream(ctx, body, layer, diff, |_| {}).await
     }
 
     /// A layer that is not compressed is its own stream: one hash is the
@@ -706,7 +697,6 @@ mod tests {
             report: ingested.report,
             tarsplit: ingested.tarsplit,
             lazy: false,
-            proven: true,
             blob_checked: true,
             checked: Default::default(),
             toc_z: None,
@@ -1055,7 +1045,7 @@ mod tests {
                 )));
             }
             let body = futures::stream::iter(pieces);
-            let result = ingest_stream(&ctx, body, &layer, &diff, |_| {}, false).await;
+            let result = ingest_stream(&ctx, body, &layer, &diff, |_| {}).await;
             assert!(result.is_err(), "{what}");
             let session = session_of(&ctx);
             assert!(
@@ -1098,7 +1088,7 @@ mod tests {
                 .map(|c| Ok::<_, ImageError>(Bytes::copy_from_slice(c)))
                 .collect::<Vec<_>>(),
         );
-        ingest_stream(&ctx, body, &layer, &diff, |_| {}, false)
+        ingest_stream(&ctx, body, &layer, &diff, |_| {})
             .await
             .unwrap();
         assert_eq!(session.staged_totals().0, 3);

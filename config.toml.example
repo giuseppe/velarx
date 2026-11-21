@@ -290,19 +290,6 @@ timeout_secs = 60
 # name = "velarx-storage-server"
 
 [pull]
-# What is given to the peers (the sources of the pulls that ask other
-# nodes, `peer = true`): nothing unless listed here.  An entry
-# is a registry or a repository prefix of the upstream registry (not a
-# mirror); what is pulled from it without credentials nor client certificate
-# is shared, `{ prefix = "...", with_credentials = true }` shares what is
-# pulled with credentials too (entries that match the same image combine).
-# A registry of a private network that needs
-# no authentication is private all the same: do not list it.
-# share_registries = ["docker.io/library", "quay.io", "ghcr.io"]
-# Whether the images given to the peers carry their names (repository:tag,
-# as the shared pull named them): off, the peers learn the digests only (and
-# only when the peer-to-peer service announces its images: its `announce_images` setting)
-share_image_names = false
 # Layers fetched at the same time
 parallel_layers = 6
 # Range requests in flight for one zstd:chunked layer
@@ -740,16 +727,11 @@ timeout_secs = 60
 # socket = "/run/user/1000/velarx/services/dircache.sock"
 # Seconds without a reply after which the source is given up
 # idle_timeout_secs = 15
-# Every pull asks a source, private ones included: it is the user's own.  One
-# that asks other nodes says so, and only the pulls that may be shared
-# ([pull] share_registries) ask it, like the service of a swarm of nodes:
-# peer = false
 #
 # [[sources.external]]
 # name = "peers"
 # socket = "/run/velarx/services/p2p-fetcher.sock"
 # idle_timeout_secs = 30
-# peer = true
 #
 # or a directory of files named by the hex of their SHA-256, read in the
 # process that pulls (no daemon, no socket):

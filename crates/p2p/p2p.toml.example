@@ -12,7 +12,6 @@
 #   [[sources.external]]
 #   name = "peers"
 #   socket = "/run/velarx/services/p2p-fetcher.sock"
-#   peer = true
 #   idle_timeout_secs = 30
 #   [pull]
 #   sources = ["peers", "registry"]
@@ -162,9 +161,8 @@ stripe_peers = 3
 # What the node tells the other nodes of the swarm about what it has.
 #
 # THE FILTER OF THE LAYERS.  The node tells each peer a Bloom filter of the
-# layers it holds and may give (the layers of pulls without credentials or
-# from `share_registries`, complete and proven, and the layers a pull of the
-# node is staging, from their first file: the files staged and checked so
+# layers it holds (the complete layers of its store, and the layers a pull of
+# the node is staging, from their first file: the files staged and checked so
 # far are given while the pull goes on): a few KiB, sent when the
 # peer connects and then as small updates, at most one every
 # `filter_interval_secs`, so that a pull asks the peers whose filter says
@@ -208,8 +206,6 @@ filter_interval_secs = 2
 # publishes each layer it holds in the DHT (what a peer far away that is
 # connected to nobody that holds the layer finds it by).  EVERY peer of the
 # swarm, and anyone who has the swarm key, can then list what the node has.
-# The names of the images are told only when `[pull] share_image_names` of
-# the engine is set too (default: not).
 announce_images = false
 # The connected peers asked at once ("do you have this chunk?"; the answer is
 # yes or no, the chunk is not sent) when no peer is known to have the chunk of

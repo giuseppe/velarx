@@ -4,7 +4,7 @@
 //! arrived and the file was named (and measured) before it is listed here,
 //! and the asker checks every chunk again.  The nodes of a rollout then
 //! serve each other what they have while the seed serves the rest, instead
-//! of everyone waiting for a layer to be complete and proven.
+//! of everyone waiting for a layer to be complete.
 //!
 //! Only the files of the most recent pulls are kept (a descriptor each, at
 //! most [`MAX_FILES`]); the store service gives the rest once the layer is

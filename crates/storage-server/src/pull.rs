@@ -556,7 +556,7 @@ async fn publish(
     }
     store
         .db
-        .commit_layers(commits, vec![], vec![])
+        .commit_layers(commits, vec![])
         .await
         .map_err(|e| e.to_string())
 }

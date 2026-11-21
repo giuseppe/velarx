@@ -199,17 +199,15 @@ fn announcement(change: Change) -> Announcement {
     }
 }
 
-/// The images the store service has, whole: the ones it may give to the
-/// peers (a lazy image is not announced before its completion).
+/// The images the store service has.
 async fn stored_images(socket: &std::path::Path) -> io::Result<Vec<ImageInfo>> {
     let mut conn = store_service::connect(socket).await?;
-    let images = store_service::image_list(&mut conn).await?;
-    Ok(images.into_iter().filter(|i| i.complete).collect())
+    store_service::image_list(&mut conn).await
 }
 
 /// The layers of the image `name` names, as keys, and its id as a digest
 /// (its startup profile is asked for by it): the image whose id (or the
-/// start of it, at least 6 characters), manifest digest or a name it shares
+/// start of it, at least 6 characters), manifest digest or a name
 /// is `name`; nothing when the store has no such image, or is not there.
 pub async fn layers_of_image(socket: &std::path::Path, name: &str) -> Vec<String> {
     if name.len() < 6 || crate::limits::is_digest(name) {
@@ -264,7 +262,7 @@ pub async fn apply_change(node: &P2PNode, change: Change) -> bool {
             info!(
                 "Announcing {} layers and {} images of the store",
                 change.layers.len(),
-                change.images.iter().filter(|i| i.complete).count()
+                change.images.len()
             );
         }
         super::service::announce_to_peers(node, announcement(change)).await;

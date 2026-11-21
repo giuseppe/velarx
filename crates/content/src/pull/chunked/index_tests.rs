@@ -312,7 +312,6 @@ async fn rig_with(
     let links = vec![Link {
         name: "peers".into(),
         conn: FetchConn::new(peer_fetcher.connect().unwrap()).unwrap(),
-        own: false,
         idle: REGISTRY_IDLE,
     }];
     let manifest = format!(
@@ -389,8 +388,7 @@ impl Rig {
 
 /// With an empty store every file comes from the source, and the layer is
 /// the layer of its blob, the diff id of the configuration, its blob not
-/// checked (nobody read it) and proven (every byte was the pull's): a node
-/// that has it serves it.
+/// checked (nobody read it).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_layer_comes_from_the_index_of_a_source() {
     let layer = made(&files());
@@ -398,7 +396,7 @@ async fn a_layer_comes_from_the_index_of_a_source() {
     let done = rig.pull(&layer).await.unwrap();
     assert_eq!(done.key, velarx_types::LayerKey::Whole(layer.desc.digest));
     assert_eq!(done.diff_id, layer.diff);
-    assert!(done.proven && !done.blob_checked);
+    assert!(!done.blob_checked);
     assert_eq!(rig.asked(), layer.keys());
     assert_eq!(rig.origin.unpacked.load(Ordering::SeqCst), 0);
     assert_eq!(done.report.fetched_files, 3);
@@ -436,8 +434,6 @@ async fn only_the_files_the_store_lacks_are_fetched() {
     assert_eq!(rig.asked(), [all[2].clone()]);
     assert_eq!(done.diff_id, layer.diff);
     assert_eq!(done.report.fetched_files, 1);
-    // (a byte of the store as it was: the layer is not served by this node)
-    assert!(!done.proven);
     assert_eq!(rig.origin.unpacked.load(Ordering::SeqCst), 0);
 }
 
@@ -501,30 +497,26 @@ async fn a_wrong_index_is_given_up_for_the_origin() {
         assert_eq!(rig.origin.told.load(Ordering::SeqCst), 0);
         assert_eq!(rig.origin.fetched.load(Ordering::SeqCst), 0);
         // (the layer is the origin's: its blob was hashed there)
-        assert!(done.proven && done.blob_checked);
+        assert!(done.blob_checked);
         assert!(rig.staging_is_empty());
     }
 }
 
-/// A claim that keys a file by an object (here a private one of the store)
+/// A claim that keys a file by an object (here one the store has)
 /// while its bytes are another's is refused, and nothing the pull records
 /// names that object: what a record names is what the engine opened.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_claim_never_names_an_object_the_pull_did_not_open() {
     let layer = made(&files());
-    let private = b"a private file of the store";
-    let secret = verity(private);
+    let held = b"a file of the store";
+    let secret = verity(held);
     let claim = {
         let mut other = made(&files());
         other.toc.entries[1].digest = Some(secret.clone());
         other.index()
     };
     let rig = rig(&layer, Some(claim), layer.bodies.clone()).await;
-    let stored = rig
-        .session()
-        .store()
-        .put(Algorithm::Sha256, private)
-        .unwrap();
+    let stored = rig.session().store().put(Algorithm::Sha256, held).unwrap();
     assert_eq!(stored, secret);
     let wrong = unpack_by_index(&rig.ctx, &layer.desc, &layer.diff, false, &|_| {}).await;
     assert!(
@@ -541,6 +533,46 @@ async fn a_claim_never_names_an_object_the_pull_did_not_open() {
         .iter()
         .all(|e| e.verity().as_deref() != Some(secret.as_str())
             && e.digest.as_deref() != Some(secret.as_str())));
+}
+
+/// A layer made from an index on a store without fs-verity (`VerityMode::Off`,
+/// which the rig's store is): the commit measures each file in userspace and
+/// names it by that measure, and a file that is not the one the replay read
+/// is refused, with nothing of it named.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_layer_by_index_on_a_store_without_fs_verity() {
+    let layer = made(&files());
+    for wrong in [false, true] {
+        let rig = rig(&layer, Some(layer.index()), layer.bodies.clone()).await;
+        assert_eq!(
+            rig.session().store().verity(),
+            velarx_storage::VerityMode::Off
+        );
+        let done = rig.pull(&layer).await.unwrap();
+        assert_eq!(done.diff_id, layer.diff);
+        let keys = layer.keys();
+        if wrong {
+            // (the same size, other bytes, after the replay)
+            let path = rig.session().content_path(&keys[0]).unwrap();
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[0] ^= 1;
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+                .unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            let e = rig.session().commit(None).unwrap_err().to_string();
+            assert!(e.contains("not the fs-verity digest it is known by"), "{e}");
+            assert!(!rig.session().store().contains(&keys[0]));
+            continue;
+        }
+        let committed = rig.session().commit(None).unwrap();
+        let mut named: Vec<String> = committed.iter().map(|c| c.object.verity.clone()).collect();
+        named.sort();
+        assert_eq!(named, keys);
+        for (key, body) in &layer.bodies {
+            assert_eq!(&verity(body), key);
+            assert!(rig.session().store().contains(key));
+        }
+    }
 }
 
 /// An index that does not replay is asked for again, of another provider
@@ -573,7 +605,7 @@ async fn a_layer_nobody_has_an_index_of_comes_from_the_origin() {
     let rig = rig(&layer, None, HashMap::new()).await;
     let done = rig.pull(&layer).await.unwrap();
     assert_eq!(rig.origin.unpacked.load(Ordering::SeqCst), 1);
-    assert!(done.proven && done.blob_checked);
+    assert!(done.blob_checked);
     assert!(rig.asked().is_empty());
 }
 

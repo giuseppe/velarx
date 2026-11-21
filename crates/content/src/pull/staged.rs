@@ -161,8 +161,6 @@ pub struct StagedPull {
     pub tags: Vec<StagedTag>,
     /// `(repository, digest)` names of a pull by digest
     pub digest_names: Vec<(String, String)>,
-    /// The pull may be shared (announced, its files asked of the sources)
-    pub shareable: bool,
     pub pulls: Vec<StagedSignatures>,
     /// The repository the blobs came from: `registry/repository`
     pub registry_ref: Option<String>,
@@ -203,7 +201,6 @@ impl StagedPull {
                 None => self.pulls.push(p.clone()),
             }
         }
-        self.shareable |= other.shareable;
         if other.started_at > self.started_at {
             self.started_at = other.started_at.clone();
         }
@@ -218,8 +215,6 @@ pub struct StagedLayerMeta {
     pub size: i64,
     pub registry_ref: Option<String>,
     pub reach: LayerReach,
-    /// Its pull may be shared
-    pub public: bool,
     /// The fs-verity digest of the EROFS image, and the owners of its files
     pub erofs: String,
     pub owners: String,
@@ -622,9 +617,8 @@ impl Staging {
             // The same TOC, pulled again: the table, the tar-split and the
             // image are the same.  The blob, the registry and how it was
             // reached are those of the last pull (the fetches ask that
-            // registry for that blob), and a layer once public stays so.
+            // registry for that blob).
             let meta = StagedLayerMeta {
-                public: there.public || layer.meta.public,
                 erofs: there.erofs.clone(),
                 owners: there.owners.clone(),
                 created_at: there.created_at.clone(),
@@ -1108,7 +1102,6 @@ mod tests {
                 tag: tag.into(),
             }],
             digest_names: Vec::new(),
-            shareable: false,
             pulls: Vec::new(),
             registry_ref: None,
             started_at: "2026-01-01T00:00:00+00:00".into(),
@@ -1124,13 +1117,31 @@ mod tests {
                 size: 10,
                 registry_ref: Some("docker.io/library/nginx:latest".into()),
                 reach: LayerReach::default(),
-                public: false,
                 erofs: "sha256:00".into(),
                 owners: "[[0],[0]]".into(),
                 created_at: now(),
             },
             key,
         )
+    }
+
+    /// A staging made before the pull stopped telling what may be shared
+    /// still has the fields it wrote: they are ignored.
+    #[test]
+    fn an_old_staging_is_read() {
+        let mut pull_json = serde_json::to_value(pull(1, "a")).unwrap();
+        pull_json["shareable"] = true.into();
+        assert_eq!(
+            serde_json::from_value::<StagedPull>(pull_json).unwrap(),
+            pull(1, "a")
+        );
+        let (meta, _) = layer(2);
+        let mut layer_json = serde_json::to_value(&meta).unwrap();
+        layer_json["public"] = true.into();
+        assert_eq!(
+            serde_json::from_value::<StagedLayerMeta>(layer_json).unwrap(),
+            meta
+        );
     }
 
     #[test]

@@ -8,8 +8,7 @@
 # VELARX_WRITE_INTERFACES=1 cargo test -p velarx-core --lib store_service writes it.
 #
 # A client calls GetInfo on each connection and refuses a `proto` other than its
-# own (1).  Only what shareable pulls stored is given (the layers of
-# public pulls, and the images whose layers are all public); the files cross as
+# own (1).  What the store holds is given by its digest; the files cross as
 # read-only descriptors in the SCM_RIGHTS of the reply, named in the JSON by
 # their position, and a client checks every byte it reads from them.
 # Who may call: a peer of the same user or root (SO_PEERCRED); any
@@ -40,8 +39,7 @@ type Item (
 	length: int
 )
 
-# An image that may be announced: the digests of what it is made of, and
-# the names a shared pull gave it when the configuration shares them.
+# An image of the store: the digests of what it is made of, and its names.
 type ImageInfo (
 	# Its id (the digest of its manifest without its algorithm: 64 hex
 	# digits for a sha256, 128 for a sha512)
@@ -50,9 +48,9 @@ type ImageInfo (
 	manifest_digest: string,
 	# The digest of its configuration
 	config_digest: string,
-	# `repository:tag`; empty unless the names are shared
+	# `repository:tag`
 	tags: []string,
-	# `repository@manifest digest`; empty unless the names are shared
+	# `repository@manifest digest`
 	repo_digests: []string,
 	# The layers, in order, by their keys (`sha256:<hex>`, the blob of a
 	# layer pulled whole; `toc:sha256:<hex>`, the TOC of a layer pulled
@@ -62,10 +60,7 @@ type ImageInfo (
 	# The sizes of the layers, together
 	size: int,
 	# When it was made, as its configuration says (RFC 3339)
-	created_at: string,
-	# Every layer is proven and every file is in the store: the image is
-	# given whole.  False for a lazy image, until its completion.
-	complete: bool
+	created_at: string
 )
 
 # What a change of `Subscribe` is.
@@ -73,8 +68,7 @@ type ChangeKind (
 	# Everything that may be announced (the first change of a stream, and
 	# again after the subscriber fell behind)
 	snapshot,
-	# New layers and content, and the images that are new or changed (an
-	# image that became complete is one of them: take it as it is now)
+	# New layers and content, and the images that are new or changed
 	added,
 	# What is not there any more (an image by its id)
 	removed
@@ -94,21 +88,20 @@ method GetInfo() -> (
 	limits: [string]int
 )
 
-# The images that may be given to peers, complete or not, one a
-# reply.
+# The images of the store, one a reply.
 method ImageList() -> (image: ?ImageInfo)
 
 # One image, by id, manifest digest or name.
 method ImageInspect(image: string) -> (image: ImageInfo)
 
 # Read-only descriptors of the files that hold `wants`, for those
-# that may be given to peers.
+# the store has.
 method Lookup(wants: []Want) -> (
 	# One for each digest asked, in order
 	items: []Item
 )
 
-# The index of a shareable layer, in a file with no name.
+# The index of a layer, in a file with no name.
 method Index(layer: string, max: int) -> (
 	# The position of the file among the descriptors of the reply
 	fd: int
@@ -142,8 +135,7 @@ error InvalidArgument (reason: string)
 # The store cannot answer now (its database)
 error Unavailable (reason: string)
 
-# The store has nothing to give: no such image, or one that is not for
-# the peers; for `Index` and `Profile`: no file, because the layer or
-# the image is not shareable, the store has none for it, or it is
+# The store has nothing to give: no such image; for `Index` and
+# `Profile`: no file, because the store has none for it, or it is
 # larger than `max`
 error NotFound (reason: string)

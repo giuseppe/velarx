@@ -98,10 +98,6 @@ pub struct Link {
     /// Its name in `[pull] sources`
     pub name: String,
     pub conn: FetchConn,
-    /// The user's own (a directory, a cache of this machine), not one that
-    /// asks the network: what it gives is like what the store had, not told
-    /// nor given to the peers
-    pub own: bool,
     /// How long it may be silent in a call (`idle_timeout_secs`)
     pub idle: std::time::Duration,
 }
@@ -112,8 +108,6 @@ pub const REGISTRY_IDLE: std::time::Duration = std::time::Duration::from_secs(12
 /// One fetcher of the list of a pull: the connection that has its scope.
 struct Fetcher {
     name: String,
-    /// The user's own ([`Link::own`])
-    own: bool,
     /// Calls with replies to come go on connections it gives
     control: tokio::sync::Mutex<FetchConn>,
     /// How long it may be silent in a call
@@ -276,12 +270,6 @@ impl Reuses {
         Ok(self)
     }
 
-    /// How many files have hints: what may come from the store and not
-    /// from a fetcher (nothing proves which it was).
-    pub fn files(&self) -> u64 {
-        self.by_key.len() as u64
-    }
-
     /// The hints of the files `keys` and the one descriptor they name.
     fn of(&self, keys: &[String]) -> io::Result<(Vec<Reuse>, Vec<OwnedFd>)> {
         let hints: Vec<Reuse> = keys
@@ -357,7 +345,6 @@ impl StagedFetch {
         for Link {
             name,
             mut conn,
-            own,
             idle,
         } in before
         {
@@ -378,7 +365,6 @@ impl StagedFetch {
             match opened.await {
                 Ok(info) => fetchers.push(Fetcher {
                     name,
-                    own,
                     control: tokio::sync::Mutex::new(conn),
                     idle,
                     max_objects: info.limit("max_objects").unwrap_or(1).max(1) as usize,
@@ -432,7 +418,6 @@ impl StagedFetch {
         .map_err(|e| fetcher_error("registry", e))?;
         fetchers.push(Fetcher {
             name: "registry".into(),
-            own: false,
             control: tokio::sync::Mutex::new(end),
             idle: REGISTRY_IDLE,
             max_objects: info.limit("max_objects").unwrap_or(1).max(1) as usize,
@@ -459,7 +444,6 @@ impl StagedFetch {
         let info = end.get_info().await.map_err(|e| fetcher_error(name, e))?;
         fetchers.push(Fetcher {
             name: name.into(),
-            own: false,
             control: tokio::sync::Mutex::new(end),
             idle: REGISTRY_IDLE,
             max_objects: info.limit("max_objects").unwrap_or(1).max(1) as usize,
@@ -860,7 +844,6 @@ impl StagedFetch {
         let bytes = std::sync::atomic::AtomicU64::new(0);
         let sourced = Sourced {
             each: self.fetchers.iter().map(|_| Default::default()).collect(),
-            own: Default::default(),
         };
         {
             use futures::{StreamExt, TryStreamExt};
@@ -900,7 +883,6 @@ impl StagedFetch {
                     files: files.into_inner(),
                 })
                 .collect(),
-            own_files: sourced.own.into_inner(),
         })
     }
 
@@ -1191,9 +1173,6 @@ impl StagedFetch {
                 if at != last {
                     use std::sync::atomic::Ordering::Relaxed;
                     sourced.each[at].1.fetch_add(1, Relaxed);
-                    if fetcher.own {
-                        sourced.own.fetch_add(1, Relaxed);
-                    }
                 }
             };
             // (a file handed over was taken in, or not)
@@ -1334,16 +1313,10 @@ impl StagedFetch {
                                         let key = batch[i].clone();
                                         let (layer, sink) = (layer.clone(), sink.clone());
                                         let name = names.get(&key).cloned();
-                                        let (own, verity) = (fetcher.own, self.verity);
+                                        let verity = self.verity;
                                         let placed = (layer.clone(), key.clone());
                                         let gave = tokio::task::spawn_blocking(move || {
-                                            give(
-                                                &layer,
-                                                &key,
-                                                name.as_deref(),
-                                                &sink,
-                                                (own, verity),
-                                            )
+                                            give(&layer, &key, name.as_deref(), &sink, verity)
                                         })
                                         .await
                                         .map_err(|e| {
@@ -1518,8 +1491,6 @@ pub struct Walked {
     /// they fetched, the files they staged), by name, in the order of the
     /// walk
     pub sources: Vec<velarx_proto::workload::BySource>,
-    /// The files of those the user's own fetchers staged
-    pub own_files: u64,
 }
 
 impl Walked {
@@ -1535,7 +1506,6 @@ impl Walked {
                 None => self.sources.push(s),
             }
         }
-        self.own_files += other.own_files;
     }
 }
 
@@ -1544,7 +1514,6 @@ struct Sourced {
     /// The bytes and files of each fetcher before the registry fetcher, by
     /// its place in the list
     each: Vec<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>,
-    own: std::sync::atomic::AtomicU64,
 }
 
 /// What the batches of a walk count in.
@@ -1702,14 +1671,12 @@ fn give(
     key: &str,
     name: Option<&str>,
     sink: &Arc<dyn Sink>,
-    (own, verity): (bool, bool),
+    verity: bool,
 ) -> ImageResult<()> {
     // (measured, not believed: what the kernel does not measure is read by
     // the replay or the commit, once)
     let file = check_staged(&layer.dir, key, verity)?;
-    // (a file of the user's own fetcher is like one the store had: a copy,
-    // not told nor given)
-    sink.adopt_staged(layer, &file, key, own, name)?;
+    sink.adopt_staged(layer, &file, key, name)?;
     Ok(())
 }
 
@@ -1981,7 +1948,6 @@ mod tests {
             .map(|(name, f)| Link {
                 name: name.to_string(),
                 conn: FetchConn::new(f.connect().unwrap()).unwrap(),
-                own: false,
                 idle: REGISTRY_IDLE,
             })
             .collect();
@@ -2387,7 +2353,6 @@ mod tests {
             links.push(Link {
                 name: name.into(),
                 conn: FetchConn::new(f.connect().unwrap()).unwrap(),
-                own: false,
                 idle,
             });
             keep.push(f);

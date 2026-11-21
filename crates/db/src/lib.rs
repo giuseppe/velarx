@@ -38,7 +38,7 @@ pub use build_cache::SCRATCH as BUILD_SCRATCH;
 pub use leases::{Lease, LEASE_IMAGE, LEASE_LAYER};
 pub use manifests::ManifestListRecord;
 pub use schema::*;
-pub use staged::{StagedImageCommit, StagedLayerCommit};
+pub use staged::StagedImageCommit;
 
 /// What a change of a container's state writes elsewhere (its event) while
 /// the change is not committed yet.
@@ -1018,14 +1018,15 @@ impl Database {
             .map_err(DbError::Sqlite)
     }
 
-    /// The blob of the descriptor each layer of this store was pulled for,
-    /// by the layer's key: the key of a layer pulled through its table of
-    /// contents is not the digest of its blob, which is what a puller names
-    /// the layer by.
+    /// The blob of the descriptor each complete layer of this store (one with
+    /// a tar-split) was pulled for, by the layer's key: the key of a layer
+    /// pulled through its table of contents is not the digest of its blob,
+    /// which is what a puller names the layer by.
     pub async fn layer_blobs(&self) -> DbResult<std::collections::HashMap<LayerKey, String>> {
         self.conn
             .call(move |conn| {
-                let mut stmt = conn.prepare("SELECT id, blob FROM layers")?;
+                let mut stmt =
+                    conn.prepare("SELECT id, blob FROM layers WHERE tarsplit IS NOT NULL")?;
                 let rows = stmt
                     .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<Result<_, _>>()?;
@@ -1622,56 +1623,16 @@ impl Database {
             .map_err(DbError::Sqlite)
     }
 
-    /// Where the chunk can be found (the file digest and offset): in a file of
-    /// a layer that may be given to peers when there is one, else in any file
+    /// Where the chunk can be found (the file digest and offset): in a file
     /// that has it.
     pub async fn get_chunk_location(
         &self,
         chunk_digest: &Digest,
     ) -> DbResult<Option<ChunkLocation>> {
         Ok(self
-            .get_chunk_locations(std::slice::from_ref(chunk_digest))
+            .get_chunk_locations_batch(std::slice::from_ref(chunk_digest))
             .await?
-            .pop()
-            .flatten())
-    }
-
-    /// Where each of `chunk_digests` can be found, as
-    /// [`Database::get_chunk_location`] says, in one call.
-    pub async fn get_chunk_locations(
-        &self,
-        chunk_digests: &[Digest],
-    ) -> DbResult<Vec<Option<ChunkLocation>>> {
-        let chunk_digests = chunk_digests.to_vec();
-        self.conn
-            .call(move |conn| {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT c.chunk_digest, c.file_digest, c.offset, c.size FROM chunk_locations c
-                     WHERE c.chunk_digest = ?1
-                     ORDER BY EXISTS(
-                         SELECT 1 FROM file_refs f JOIN shared_layers s ON s.layer_id = f.layer_id
-                         WHERE f.file_digest = c.file_digest AND s.proven = 1
-                     ) DESC
-                     LIMIT 1",
-                )?;
-                chunk_digests
-                    .iter()
-                    .map(|chunk_digest| {
-                        stmt.query_row([chunk_digest], |row| {
-                            Ok(ChunkLocation {
-                                chunk_digest: row.get(0)?,
-                                file_digest: row.get(1)?,
-                                offset: row.get::<_, i64>(2)? as u64,
-                                size: row.get::<_, i64>(3)? as u64,
-                            })
-                        })
-                        .optional()
-                    })
-                    .collect::<Result<_, _>>()
-                    .map_err(Into::into)
-            })
-            .await
-            .map_err(DbError::Sqlite)
+            .remove(chunk_digest))
     }
 
     /// Batch get chunk locations (much faster than individual calls)
@@ -1716,113 +1677,20 @@ impl Database {
             .map_err(DbError::Sqlite)
     }
 
-    /// The pull of the image `image_id` may be shared: in one transaction,
-    /// the image and these names of it may be announced to peers, the layers
-    /// `public` may have their files asked of the content sources, and the
-    /// layers `proven` (every byte of them came, checked, from the registry
-    /// or the sources) may be given.  A lazy layer is public and not proven
-    /// until its image is completed.
-    pub async fn share_pull(
-        &self,
-        image_id: &str,
-        names: Vec<(String, String)>,
-        public: Vec<LayerKey>,
-        proven: Vec<LayerKey>,
-    ) -> DbResult<()> {
-        let id = image_id.to_string();
-        self.conn
-            .call(move |conn| {
-                let tx = conn.transaction()?;
-                for (keys, proven) in [(&public, false), (&proven, true)] {
-                    for k in keys {
-                        tx.execute(
-                            "INSERT INTO shared_layers (layer_id, proven)
-                             SELECT id, ?2 FROM layers WHERE id = ?1
-                             ON CONFLICT(layer_id) DO UPDATE SET proven = MAX(proven, ?2)",
-                            rusqlite::params![k.to_string(), proven as i64],
-                        )?;
-                    }
-                }
-                for (repository, tag) in
-                    std::iter::once(("".to_string(), "".to_string())).chain(names)
-                {
-                    tx.execute(
-                        "INSERT OR IGNORE INTO shared_images (image_id, repository, tag)
-                         SELECT id, ?2, ?3 FROM images WHERE id = ?1",
-                        rusqlite::params![id, repository, tag],
-                    )?;
-                }
-                tx.commit()?;
-                Ok(())
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// The images that may be announced, with the names they may be
-    /// announced under.
-    pub async fn shared_images(
-        &self,
-    ) -> DbResult<std::collections::HashMap<String, std::collections::HashSet<(String, String)>>>
-    {
-        Ok(self
-            .conn
-            .call(move |conn| {
-                let mut stmt =
-                    conn.prepare("SELECT image_id, repository, tag FROM shared_images")?;
-                let mut out: std::collections::HashMap<String, std::collections::HashSet<_>> =
-                    Default::default();
-                for row in stmt.query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                })? {
-                    let (id, repository, tag) = row?;
-                    let names = out.entry(id).or_default();
-                    if !repository.is_empty() {
-                        names.insert((repository, tag));
-                    }
-                }
-                Ok(out)
-            })
-            .await?)
-    }
-
-    /// Whether a pull that may be shared recorded the image `id`: it may be
-    /// named to the content sources of other nodes (asked for its startup
-    /// profile) and its profile given to them.
-    pub async fn is_image_shared(&self, id: &str) -> DbResult<bool> {
-        let id = id.to_string();
-        Ok(self
-            .conn
-            .call(move |conn| {
-                Ok(conn
-                    .prepare("SELECT 1 FROM shared_images WHERE image_id = ?1 LIMIT 1")?
-                    .exists([&id])?)
-            })
-            .await?)
-    }
-
-    /// The bytes of the manifest or of the configuration of a shared image
-    /// that each of `digests` names, or of a kept index that lists a shared
-    /// image (as the store keeps them), in one call.
-    pub async fn shared_image_metadata(&self, digests: &[Digest]) -> DbResult<Vec<Option<String>>> {
+    /// The bytes of the manifest or of the configuration of an image that
+    /// each of `digests` names, or of a kept index (as the store keeps
+    /// them), in one call.
+    pub async fn image_metadata(&self, digests: &[Digest]) -> DbResult<Vec<Option<String>>> {
         let digests = digests.to_vec();
         Ok(self
             .conn
             .call(move |conn| {
                 use rusqlite::OptionalExtension;
                 let mut stmt = conn.prepare_cached(
-                    "SELECT CASE WHEN i.manifest_digest = ?1 THEN i.manifest ELSE i.config END
-                     FROM images i JOIN shared_images s ON s.image_id = i.id
-                     WHERE i.manifest_digest = ?1 OR i.config_digest = ?1
+                    "SELECT CASE WHEN manifest_digest = ?1 THEN manifest ELSE config END
+                     FROM images WHERE manifest_digest = ?1 OR config_digest = ?1
                      UNION ALL
-                     SELECT k.value FROM store_settings k
-                     WHERE k.key = 'index:' || ?1 AND EXISTS (
-                         SELECT 1 FROM images i JOIN shared_images s ON s.image_id = i.id
-                         WHERE instr(k.value, i.manifest_digest) > 0)
+                     SELECT value FROM store_settings WHERE key = 'index:' || ?1
                      LIMIT 1",
                 )?;
                 digests
@@ -1834,91 +1702,9 @@ impl Database {
             .await?)
     }
 
-    /// The layers that came from pulls that may be shared.
-    pub async fn public_layers(&self) -> DbResult<std::collections::HashSet<LayerKey>> {
-        Ok(self
-            .conn
-            .call(move |conn| {
-                let mut stmt = conn.prepare("SELECT layer_id FROM shared_layers")?;
-                let rows = stmt
-                    .query_map([], |r| r.get(0))?
-                    .collect::<Result<_, _>>()?;
-                Ok(rows)
-            })
-            .await?)
-    }
-
     /// The file of the database (none in memory).
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref().map(|p| p.as_path())
-    }
-
-    /// Whether the layer may be given to peers.
-    pub async fn is_layer_shareable(&self, key: &LayerKey) -> DbResult<bool> {
-        let key = *key;
-        Ok(self
-            .conn
-            .call(move |conn| {
-                Ok(conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM shared_layers WHERE layer_id = ?1 AND proven = 1)",
-                    [&key],
-                    |r| r.get::<_, bool>(0),
-                )?)
-            })
-            .await?)
-    }
-
-    /// Whether the file or chunk `digest` belongs to a layer that may be
-    /// given to peers: a file of one, or a chunk of such a file.
-    pub async fn is_content_shareable(&self, digest: &str) -> DbResult<bool> {
-        Ok(self
-            .are_contents_shareable(&[digest.to_string()])
-            .await?
-            .first()
-            .copied()
-            .unwrap_or(false))
-    }
-
-    /// [`Database::is_content_shareable`] for each of `digests`, in one
-    /// call of the database.
-    pub async fn are_contents_shareable(&self, digests: &[String]) -> DbResult<Vec<bool>> {
-        let digests = digests.to_vec();
-        Ok(self
-            .conn
-            .call(move |conn| {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM file_refs f JOIN shared_layers s ON s.layer_id = f.layer_id
-                        WHERE f.file_digest = ?1 AND s.proven = 1
-                     ) OR EXISTS(
-                        SELECT 1 FROM chunk_locations c
-                        JOIN file_refs f ON f.file_digest = c.file_digest
-                        JOIN shared_layers s ON s.layer_id = f.layer_id
-                        WHERE c.chunk_digest = ?1 AND s.proven = 1
-                     )",
-                )?;
-                let mut out = Vec::with_capacity(digests.len());
-                for d in &digests {
-                    out.push(stmt.query_row([d], |r| r.get::<_, bool>(0))?);
-                }
-                Ok(out)
-            })
-            .await?)
-    }
-
-    /// The layers that may be given to peers.
-    pub async fn shareable_layers(&self) -> DbResult<std::collections::HashSet<LayerKey>> {
-        Ok(self
-            .conn
-            .call(move |conn| {
-                let mut stmt =
-                    conn.prepare("SELECT layer_id FROM shared_layers WHERE proven = 1")?;
-                let rows = stmt
-                    .query_map([], |r| r.get(0))?
-                    .collect::<Result<_, _>>()?;
-                Ok(rows)
-            })
-            .await?)
     }
 
     /// The objects of the files `digests` that are recorded, asked by
@@ -3120,7 +2906,6 @@ mod tests {
         db.commit_layers(
             vec![commit("kept", Some(b"sent".to_vec())), commit("none", None)],
             vec![],
-            vec![],
         )
         .await
         .unwrap();
@@ -3131,12 +2916,9 @@ mod tests {
         assert_eq!(db.kept_toc(&sha("none")).await.unwrap(), None);
     }
 
-    /// A chunk that two files have is found, and may be given to peers, as
-    /// long as one of them is a file of a layer that may be given: the
-    /// layer committed last (a newer version of the file, made of what the
-    /// store had, so not to be given) does not take the chunk away.
+    /// A chunk that two files have is found while one of them is there.
     #[tokio::test]
-    async fn a_chunk_of_two_files_is_given_while_a_file_of_it_may_be() {
+    async fn a_chunk_of_two_files_is_found_while_one_is_there() {
         use crate::{ChunkLocation, LayerCommit, LayerKey};
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("db.sqlite")).await.unwrap();
@@ -3177,7 +2959,6 @@ mod tests {
             blob_checked: false,
             kept_toc: None,
         };
-        let (old, new) = (LayerKey::Whole(sha("old")), LayerKey::Whole(sha("new")));
         // the old file is c1 c2; the new one c1 c3, committed after it
         db.commit_layers(
             vec![
@@ -3185,28 +2966,17 @@ mod tests {
                 commit("new", "fsverity-sha256-12:new", &["c1", "c3"]),
             ],
             vec![],
-            vec![(old, true), (new, false)],
         )
         .await
         .unwrap();
-        let chunk = |c: &str| sha(c).to_string();
-        let shareable = db
-            .are_contents_shareable(&[chunk("c1"), chunk("c2"), chunk("c3")])
-            .await
-            .unwrap();
-        // c1 is in both files, one of them to be given; c3 only in the other
-        assert_eq!(shareable, [true, true, false]);
-        // c1 is found in the file that may be given
-        let at = db.get_chunk_location(&sha("c1")).await.unwrap().unwrap();
-        assert_eq!(at.file_digest, "fsverity-sha256-12:old");
-        // several in one call, in their order, the missing as none
+        // several in one call, the missing as none
         let found = db
-            .get_chunk_locations(&[sha("c3"), sha("c9"), sha("c1")])
+            .get_chunk_locations_batch(&[sha("c3"), sha("c9"), sha("c2")])
             .await
             .unwrap();
-        let files: Vec<Option<&str>> = found
+        let files: Vec<Option<&str>> = [sha("c3"), sha("c9"), sha("c2")]
             .iter()
-            .map(|l| l.as_ref().map(|l| l.file_digest.as_str()))
+            .map(|d| found.get(d).map(|l| l.file_digest.as_str()))
             .collect();
         assert_eq!(
             files,
@@ -3216,7 +2986,7 @@ mod tests {
                 Some("fsverity-sha256-12:old")
             ]
         );
-        // the file that may not is forgotten: c1 stays where the other has it
+        // a file is forgotten: c1 stays where the other has it
         db.delete_files(vec!["fsverity-sha256-12:new".into()])
             .await
             .unwrap();
@@ -3778,45 +3548,76 @@ mod tests {
             "/run/a"
         );
     }
-    /// A peer is served the manifest and the configuration of a shared
-    /// image, and a kept index that lists one; nothing of an image that is
-    /// not shared.
+    /// The manifest and the configuration of an image, and a kept index,
+    /// are found by their digests.
     #[tokio::test]
-    async fn only_the_metadata_of_shared_images_is_served() {
+    async fn the_metadata_of_an_image_is_found_by_its_digests() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("db.sqlite")).await.unwrap();
-        let (shared, private) = (record("s"), record("p"));
-        for image in [&shared, &private] {
-            db.insert_image(&ImageRecord {
-                manifest: format!("manifest {}", image.id),
-                config: format!("config {}", image.id),
-                ..image.clone()
+        let image = record("s");
+        db.insert_image(&ImageRecord {
+            manifest: "manifest s".into(),
+            config: "config s".into(),
+            ..image.clone()
+        })
+        .await
+        .unwrap();
+        let index = Digest::of(Algorithm::Sha256, b"s");
+        db.set_index(&index, "an index").await.unwrap();
+        let db = &db;
+        let found =
+            |d: Digest| async move { db.image_metadata(&[d]).await.unwrap().pop().unwrap() };
+        assert_eq!(found(image.manifest_digest).await.unwrap(), "manifest s");
+        assert_eq!(found(image.config_digest).await.unwrap(), "config s");
+        assert_eq!(found(index).await.unwrap(), "an index");
+        assert_eq!(found(Digest::of(Algorithm::Sha256, b"p")).await, None);
+    }
+
+    /// A store of version 1, with the two tables of what could be given to
+    /// peers, loses them when it is opened, and is then of this version.
+    #[tokio::test]
+    async fn a_store_with_the_old_tables_loses_them_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let db = Database::open(&path).await.unwrap();
+        db.insert_image(&record("a")).await.unwrap();
+        db.conn()
+            .call(|conn| {
+                Ok(conn.execute_batch(
+                    "CREATE TABLE shared_layers (
+                         layer_id TEXT PRIMARY KEY REFERENCES layers(id) ON DELETE CASCADE,
+                         proven INTEGER NOT NULL DEFAULT 0
+                     );
+                     CREATE TABLE shared_images (
+                         image_id TEXT NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+                         repository TEXT NOT NULL DEFAULT '',
+                         tag TEXT NOT NULL DEFAULT '',
+                         PRIMARY KEY (image_id, repository, tag)
+                     );
+                     INSERT INTO shared_images VALUES ('a', '', '');
+                     PRAGMA user_version = 1;",
+                )?)
             })
             .await
             .unwrap();
-            let index = format!(
-                r#"{{"manifests":[{{"digest":"{}"}}]}}"#,
-                image.manifest_digest
-            );
-            db.set_index(&Digest::of(Algorithm::Sha256, image.id.as_bytes()), &index)
-                .await
-                .unwrap();
-        }
-        db.share_pull("s", vec![], vec![], vec![]).await.unwrap();
-        let served = |d: Digest| {
-            let db = &db;
-            async move { db.shared_image_metadata(&[d]).await.unwrap().pop().unwrap() }
-        };
-        assert_eq!(served(shared.manifest_digest).await.unwrap(), "manifest s");
-        assert_eq!(served(shared.config_digest).await.unwrap(), "config s");
-        assert!(served(Digest::of(Algorithm::Sha256, b"s")).await.is_some());
-        for d in [
-            private.manifest_digest,
-            private.config_digest,
-            Digest::of(Algorithm::Sha256, b"p"),
-        ] {
-            assert_eq!(served(d).await, None);
-        }
+        db.close().await.unwrap();
+        let db = Database::open(&path).await.unwrap();
+        let (tables, version): (i64, i64) = db
+            .conn()
+            .call(|conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE name LIKE 'shared_%'",
+                        [],
+                        |r| r.get(0),
+                    )?,
+                    conn.query_row("PRAGMA user_version", [], |r| r.get(0))?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!((tables, version), (0, SCHEMA_VERSION));
+        assert_eq!(db.list_images().await.unwrap().len(), 1);
     }
 
     fn record(id: &str) -> ImageRecord {

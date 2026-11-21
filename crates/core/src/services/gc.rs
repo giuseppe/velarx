@@ -1361,7 +1361,6 @@ mod engine_copy_tests {
                 size: 1,
                 registry_ref: None,
                 reach: Default::default(),
-                public: false,
                 erofs: "sha256:ee".into(),
                 owners: String::new(),
                 created_at: String::new(),

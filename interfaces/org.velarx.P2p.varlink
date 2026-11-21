@@ -201,8 +201,7 @@ type RemoteImage (
 	image: ImageInfo
 )
 
-# An image that may be announced: the digests of what it is made of, and
-# the names a shared pull gave it when the configuration shares them.
+# An image of the store: the digests of what it is made of, and its names.
 type ImageInfo (
 	# Its id (the digest of its manifest without its algorithm: 64 hex
 	# digits for a sha256, 128 for a sha512)
@@ -211,9 +210,9 @@ type ImageInfo (
 	manifest_digest: string,
 	# The digest of its configuration
 	config_digest: string,
-	# `repository:tag`; empty unless the names are shared
+	# `repository:tag`
 	tags: []string,
-	# `repository@manifest digest`; empty unless the names are shared
+	# `repository@manifest digest`
 	repo_digests: []string,
 	# The layers, in order, by their keys (`sha256:<hex>`, the blob of a
 	# layer pulled whole; `toc:sha256:<hex>`, the TOC of a layer pulled
@@ -223,10 +222,7 @@ type ImageInfo (
 	# The sizes of the layers, together
 	size: int,
 	# When it was made, as its configuration says (RFC 3339)
-	created_at: string,
-	# Every layer is proven and every file is in the store: the image is
-	# given whole.  False for a lazy image, until its completion.
-	complete: bool
+	created_at: string
 )
 
 # Who serves this interface and what it can do.  The first call of a
@@ -316,9 +312,8 @@ method BeliefList(layer: ?string) -> (belief: ?Belief)
 
 # Why the pulls asked the peers they did: the recent decisions
 # about `target` (a digest or the start of one, a layer, a chunk
-# or an image id; the name of an image the store has whole and
-# shares), the last first, one a reply; all of them when `target`
-# is empty.
+# or an image id; the name of an image the store has), the last
+# first, one a reply; all of them when `target` is empty.
 method Explain(target: string) -> (decision: ?Decision)
 
 # What the node moved, in all.

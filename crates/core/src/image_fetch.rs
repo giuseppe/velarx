@@ -489,7 +489,6 @@ mod tests {
             layers: vec![format!("toc:{}", digest("toc"))],
             tags: Vec::new(),
             digest_names: Vec::new(),
-            shareable: false,
             pulls: Vec::new(),
             registry_ref: None,
             started_at: "2026-01-01T00:00:00+00:00".into(),

@@ -389,12 +389,10 @@ EOF
 	else
 		cat > "$root/$n.sources.toml" <<EOF
 [pull]
-share_registries = ["$reg"]
 sources = ["peers", "registry"]
 [[sources.external]]
 name = "peers"
 socket = "$sock/p2p-fetcher.sock"
-peer = true
 idle_timeout_secs = 30
 EOF
 	fi

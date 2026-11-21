@@ -376,7 +376,6 @@ fn an_image_being_pulled_is_served_by_the_image_server() {
                     layers: a.layers.iter().map(|l| l.key.to_string()).collect(),
                     tags: vec![],
                     digest_names: vec![],
-                    shareable: false,
                     pulls: vec![],
                     registry_ref: None,
                     started_at: String::new(),

@@ -97,8 +97,8 @@ pub trait ChunkProvider: Send + Sync + 'static {
     fn get_index(&self, _layer: &str) -> std::io::Result<Option<Vec<u8>>> {
         Ok(None)
     }
-    /// The startup profile of the image `image` (`sha256:` and its id),
-    /// one that may be given ([`velarx_content::fetcher::Kind::Profile`])
+    /// The startup profile of the image `image` (`sha256:` and its id)
+    /// ([`velarx_content::fetcher::Kind::Profile`])
     fn get_profile(&self, _image: &str) -> std::io::Result<Option<Vec<u8>>> {
         Ok(None)
     }

@@ -23,16 +23,9 @@ impl StorageChunkProvider {
         Self { file_store, db }
     }
 
-    /// The file that holds `digest` (a cached chunk, a file, or a chunk of a
-    /// file), if the stores have it and it is small enough to serve.
-    #[cfg(test)]
-    pub async fn open(&self, digest: &str) -> Option<ChunkFile> {
-        let parsed = velarx_types::digest::Digest::parse_key(digest).ok()?;
-        self.open_all(vec![parsed]).await.pop().flatten()
-    }
-
-    /// The files that hold `digests`, as [`StorageChunkProvider::open`]
-    /// says, one for each: one call to the database for where the chunks
+    /// The files that hold `digests` (a file, or a chunk of a file), if the
+    /// stores have them and they are small enough to serve, one for each:
+    /// one call to the database for where the chunks
     /// are, and the files opened on one blocking thread (the files of a wave
     /// a peer asks for are a round trip, not one for each).
     pub async fn open_all(&self, digests: Vec<Digest>) -> Vec<Option<ChunkFile>> {
@@ -42,18 +35,19 @@ impl StorageChunkProvider {
             .filter(|d| !d.is_fsverity())
             .copied()
             .collect();
-        let mut located = match self.db.get_chunk_locations(&chunks).await {
-            Ok(located) => located.into_iter(),
-            Err(e) => {
+        let located = self
+            .db
+            .get_chunk_locations_batch(&chunks)
+            .await
+            .unwrap_or_else(|e| {
                 tracing::warn!("The places of {} chunks are not known: {e}", chunks.len());
-                vec![None; chunks.len()].into_iter()
-            }
-        };
+                Default::default()
+            });
         let wanted: Vec<(Digest, Option<ChunkLocation>)> = digests
             .into_iter()
-            .map(|d| match d.is_fsverity() {
-                true => (d, None),
-                false => (d, located.next().flatten()),
+            .map(|d| {
+                let location = located.get(&d).cloned();
+                (d, location)
             })
             .collect();
         let files = self.file_store.clone();
@@ -104,9 +98,15 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom};
     use tempfile::tempdir;
 
+    /// The file that holds `digest`.
+    async fn open(provider: &StorageChunkProvider, digest: &str) -> Option<ChunkFile> {
+        let parsed = Digest::parse_key(digest).ok()?;
+        provider.open_all(vec![parsed]).await.pop().flatten()
+    }
+
     /// The bytes `open` gives for `digest`.
     async fn read(provider: &StorageChunkProvider, digest: &str) -> Option<Vec<u8>> {
-        let mut found = provider.open(digest).await?;
+        let mut found = open(provider, digest).await?;
         found.file.seek(SeekFrom::Start(found.offset)).ok()?;
         let mut bytes = vec![0u8; found.len as usize];
         found.file.read_exact(&mut bytes).ok()?;
@@ -160,7 +160,7 @@ mod tests {
             "é",
             "sha256:é",
         ] {
-            assert!(provider.open(bad).await.is_none(), "{bad:?}");
+            assert!(open(&provider, bad).await.is_none(), "{bad:?}");
         }
     }
 
@@ -174,7 +174,7 @@ mod tests {
         let in_store = file_store
             .put(velarx_types::digest::Algorithm::Sha256, &big)
             .unwrap();
-        assert!(provider.open(&in_store).await.is_none());
+        assert!(open(&provider, &in_store).await.is_none());
         let ok = file_store
             .put(
                 velarx_types::digest::Algorithm::Sha256,

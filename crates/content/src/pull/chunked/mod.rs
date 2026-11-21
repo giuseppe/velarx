@@ -67,8 +67,6 @@ pub const METADATA_TOGETHER: u64 = 8 * 1024 * 1024;
 pub(crate) const RETRIES: usize = 3;
 
 pub struct Pulled {
-    /// Files and chunks the store had before the pull
-    pub from_store: u64,
     pub toc: Toc,
     pub files: Vec<FileUse>,
     pub chunks: Vec<ChunkLocationRecord>,
@@ -1388,7 +1386,7 @@ pub(crate) fn take_handed(
             name.unwrap_or(key)
         )));
     }
-    sink.adopt_measured(&copied.path, key, &copied.verity, copied.size, false)?;
+    sink.adopt_measured(&copied.path, key, &copied.verity, copied.size)?;
     Ok(())
 }
 
@@ -1781,7 +1779,6 @@ pub async fn complete_layer(
     let mut ctx = std::borrow::Cow::Borrowed(ctx);
     let mut sourced = super::staged_fetch::Walked::default();
     let mut staged_files = (0u64, 0u64);
-    let mut hinted = 0u64;
     if let (Some(staged), Some(_), true) = (&ctx.staged, target, staged_sink) {
         // (an eager pull holds the lease of the layer since before its plan of
         // what the store has, so that another engine that pulled it is
@@ -1819,9 +1816,6 @@ pub async fn complete_layer(
             drop(mine);
             if !claim.keys().is_empty() {
                 let reuse = reuse_hints(&ctx, &plan, staging.dir()).await?;
-                // (a file a fetcher may have made of chunks of the store is
-                // not proven to come from the registry)
-                hinted = reuse.files();
                 sourced = staged
                     .fetch_files(
                         &staging,
@@ -1880,8 +1874,7 @@ pub async fn complete_layer(
         staged.forget(&layer.digest.to_string()).await;
     }
     let mut pulled = verified?;
-    // (what the fetchers before the registry fetcher staged; what the
-    // user's own gave is like what the store had)
+    // (what the fetchers before the registry fetcher staged)
     for s in std::mem::take(&mut sourced.sources) {
         pulled.report.sources.push(s);
     }
@@ -1889,7 +1882,6 @@ pub async fn complete_layer(
     report.fetched_files += staged_files.0;
     report.reused_files = report.reused_files.saturating_sub(staged_files.0);
     report.reused_bytes = report.reused_bytes.saturating_sub(staged_files.1);
-    pulled.from_store += sourced.own_files + hinted;
     Ok(pulled)
 }
 
@@ -1930,11 +1922,7 @@ pub async fn pull_whole(
         Some(unpacked) => unpacked,
         None => unpack_whole(ctx, layer, expected_diff_id, progress).await?,
     };
-    let Unpacked {
-        mut ingested,
-        from_store,
-        ..
-    } = unpacked;
+    let Unpacked { mut ingested, .. } = unpacked;
     let sink = ctx.sink.clone();
     let files: Vec<String> = ingested.files.iter().map(|f| f.digest.clone()).collect();
     let stored = std::mem::take(&mut ingested.stored);
@@ -1957,7 +1945,7 @@ pub async fn pull_whole(
             let Some((path, size, verity)) = copies.remove(&key) else {
                 return Err(ImageError::Layer(format!("{key} was not handed over")));
             };
-            let (known, added) = sink.adopt_measured(&path, &key, &verity, size, false)?;
+            let (known, added) = sink.adopt_measured(&path, &key, &verity, size)?;
             match (known == key, added) {
                 (true, true) => {
                     kept += 1;
@@ -2004,7 +1992,6 @@ pub async fn pull_whole(
     report.reused_files = reused.saturating_sub(ingested.fetched);
     Ok((
         Pulled {
-            from_store,
             toc,
             files,
             chunks,
@@ -2023,9 +2010,6 @@ pub async fn pull_whole(
 /// headers say.
 pub struct Unpacked {
     pub ingested: Whole,
-    /// The files that are the store's as it was before the pull, or the
-    /// user's own: what made the layer is not all the pull's
-    pub from_store: u64,
     /// The staging of the layer: the copies of a sink with no files of the
     /// engine's are in it, and last as long as it does
     pub staging: Arc<super::staged_fetch::LayerStaging>,
@@ -2118,11 +2102,7 @@ pub async fn unpack_whole(
         stored,
         fetched: 0,
     };
-    Ok(Unpacked {
-        ingested,
-        from_store: 0,
-        staging,
-    })
+    Ok(Unpacked { ingested, staging })
 }
 
 /// Replay the claim `toc`: the stream recreated from `tarsplit` and the
@@ -2272,21 +2252,15 @@ async fn unpack_by_index(
         expected_diff_id,
     )
     .await?;
-    // (what is not the store's as it was before this pull, nor the user's
-    // own, is asked of the scratch area before the transfer empties it)
     let (sink, objects) = (
         ctx.sink.clone(),
         stored.values().cloned().collect::<Vec<_>>(),
     );
-    let (from_store, moved) = tokio::task::spawn_blocking(move || {
-        let from_store = objects
-            .iter()
-            .filter(|o| scratch.existed(o) && sink.existed(o))
-            .count() as u64;
+    let moved = tokio::task::spawn_blocking(move || {
         let keep: HashSet<&str> = objects.iter().map(String::as_str).collect();
         scratch
             .transfer_into(&*sink, &keep)
-            .map(|moved| (from_store, moved.len() as u64))
+            .map(|moved| moved.len() as u64)
     })
     .await
     .map_err(|e| fail(format!("the files of a layer: {e}")))??;
@@ -2303,11 +2277,7 @@ async fn unpack_by_index(
         stored,
         fetched: moved,
     };
-    Ok(Some(Unpacked {
-        ingested,
-        from_store: from_store + walked.own_files,
-        staging,
-    }))
+    Ok(Some(Unpacked { ingested, staging }))
 }
 
 /// The files for a replay of a claim, by their key: those the origin handed
@@ -2420,11 +2390,6 @@ async fn verify_layer(
         layer.digest,
         started.elapsed()
     );
-    let from_store = plan
-        .skipped
-        .iter()
-        .filter(|(d, _)| ctx.sink.existed(d))
-        .count() as u64;
     // (the entries are those of the verified table, as a lazy layer records
     // them)
     let toc = if meta.toc.is_canonical() {
@@ -2449,7 +2414,6 @@ async fn verify_layer(
         sources: Vec::new(),
     };
     Ok(Pulled {
-        from_store,
         toc,
         files,
         chunks,

@@ -167,12 +167,10 @@ store_service = true
 [storage]
 root = "$d/store"
 [pull]
-share_registries = ["$REG"]
 sources = $sources
 [[sources.external]]
 name = "peers"
 socket = "$d/services/p2p-fetcher.sock"
-peer = true
 idle_timeout_secs = 30
 EOT
     [ -n "${ENGINE_EXTRA:-}" ] && cat "$ENGINE_EXTRA" >> "$d/engine.toml"

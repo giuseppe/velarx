@@ -794,7 +794,6 @@ impl ImageService {
             lazy: false,
             sources: None,
             reach: Default::default(),
-            shareable: false,
             seal: true,
             states: true,
             // leased before it is recorded, under the store lock: there is

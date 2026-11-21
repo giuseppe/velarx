@@ -550,30 +550,6 @@ async fn a_large_log_is_written_back_and_truncated() {
     assert_eq!(Database::open_in_memory().await.unwrap().wal_size(), 0);
 }
 
-/// Whether a file may be given to peers is a lookup by file, not a scan of
-/// every layer's files.
-#[tokio::test]
-async fn test_the_files_of_a_layer_are_found_by_file() {
-    let db = velarx_db::Database::open_in_memory().await.unwrap();
-    let plan: Vec<String> = db
-        .conn()
-        .call(|c| {
-            let mut stmt = c.prepare(
-                "EXPLAIN QUERY PLAN SELECT 1 FROM file_refs f JOIN shared_layers s
-                 ON s.layer_id = f.layer_id WHERE f.file_digest = ?1",
-            )?;
-            let rows = stmt
-                .query_map(["sha256:x"], |r| r.get::<_, String>(3))?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })
-        .await
-        .unwrap();
-    let text = plan.join("\n");
-    assert!(text.contains("idx_file_refs_file"), "{text}");
-    assert!(!text.contains("SCAN f"), "{text}");
-}
-
 fn object(c: char, checked: bool) -> velarx_storage::Object {
     velarx_storage::Object::new(
         &format!("fsverity-sha256-12:{}", c.to_string().repeat(64)),

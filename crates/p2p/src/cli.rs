@@ -122,7 +122,7 @@ pub enum Command {
     /// did not give went to the next source (the registry)
     Explain {
         /// A layer or chunk digest (or the start of one), an image id, or the
-        /// name of an image the store shares; the last decisions of all when
+        /// name of an image the store has; the last decisions of all when
         /// not given
         target: Option<String>,
         /// Print the records as JSON

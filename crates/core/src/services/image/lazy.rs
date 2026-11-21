@@ -77,14 +77,6 @@ pub struct CompletionProgress {
     pub layers_total: u64,
 }
 
-/// A layer being completed: the files it still waits for (its own, and
-/// those another layer fetches for it).
-struct Waiting {
-    files: std::collections::HashSet<String>,
-    /// The store had files of it.
-    from_store: bool,
-}
-
 /// The files of a layer that neither the store nor the staging has, in
 /// groups; and the files they have, and the bytes those took in the blob.
 struct Wanted {
@@ -94,9 +86,6 @@ struct Wanted {
     bytes_wanted: u64,
     reused_files: u64,
     reused_bytes: u64,
-    /// Files of the layer (also those another layer has first) that the
-    /// store has, not counting the staging
-    in_store: u64,
 }
 
 /// For each layer (a content once, in the first layer that has it), the
@@ -113,15 +102,13 @@ fn wanted_groups(
     layers
         .iter()
         .map(|layer| {
-            let (mut reused_files, mut reused_bytes, mut in_store) = (0, 0, 0);
+            let (mut reused_files, mut reused_bytes) = (0, 0);
             let (mut files_wanted, mut bytes_wanted) = (0u64, 0u64);
             let groups = velarx_content::pull::window::groups(&layer.toc, files, bytes, |d, e| {
-                let stored = store.get_path(d).is_some();
-                in_store += u64::from(stored);
                 if !seen.insert(d.to_string()) {
                     return false;
                 }
-                if stored || staged(d) {
+                if store.get_path(d).is_some() || staged(d) {
                     reused_files += 1;
                     reused_bytes += e.end_offset.saturating_sub(e.offset);
                     return false;
@@ -141,7 +128,6 @@ fn wanted_groups(
                 bytes_wanted,
                 reused_files,
                 reused_bytes,
-                in_store,
             })
         })
         .collect()
@@ -194,27 +180,19 @@ fn profile_groups(
 impl ImageService {
     /// The startup profile of the image of the pull `id` from the sources
     /// that have one: at most `max` digests of files, empty when nobody has
-    /// one.  The sources of other nodes are asked only for a pull that may
-    /// be shared.  Only an order of files: what is fetched in it is checked
-    /// as any file is.
+    /// one.  Only an order of files: what is fetched in it is checked as any
+    /// file is.
     pub async fn peer_profile(&self, id: &str, max: usize) -> Vec<String> {
-        let Ok(Some(pull)) = self.staging_area().pull(id) else {
-            return Vec::new();
-        };
         let Ok(names) = self.sources_of(None) else {
             return Vec::new();
         };
-        self.profile_from(id, (&names, pull.shareable), max).await
+        self.profile_from(id, &names, max).await
     }
 
     /// The startup profile of the image `id` for a pull that starts: the
     /// one this node recorded, else the one of the sources (the peers) if
     /// the settings ask them.  Empty when there is none.
-    pub(super) async fn pull_profile(
-        &self,
-        id: &str,
-        (sources, shareable): (&[String], bool),
-    ) -> Vec<String> {
+    pub(super) async fn pull_profile(&self, id: &str, sources: &[String]) -> Vec<String> {
         let config = &self.pull_config;
         if config.lazy_profile_secs == 0 {
             return Vec::new();
@@ -227,19 +205,14 @@ impl ImageService {
         if !local.is_empty() || !config.lazy_profile_peers {
             return local;
         }
-        let asked = self.profile_from(id, (sources, shareable), max);
+        let asked = self.profile_from(id, sources, max);
         tokio::time::timeout(PROFILE_WAIT, asked)
             .await
             .unwrap_or_default()
     }
 
     /// The profile of the image `id` from the fetchers `sources`.
-    async fn profile_from(
-        &self,
-        id: &str,
-        (names, shareable): (&[String], bool),
-        max: usize,
-    ) -> Vec<String> {
+    async fn profile_from(&self, id: &str, names: &[String], max: usize) -> Vec<String> {
         let Ok(image) = velarx_types::digest::Digest::from_id(id) else {
             return Vec::new();
         };
@@ -248,7 +221,7 @@ impl ImageService {
             velarx_content::fetcher::fetch::PROFILE_MAX_BYTES,
         );
         let mut text = None;
-        for mut link in self.source_links(names, shareable).await {
+        for mut link in self.source_links(names).await {
             let got = async {
                 link.conn
                     .open(velarx_content::fetcher::fetch_client::Scoping::bare(
@@ -598,7 +571,6 @@ impl ImageService {
                 size: record.size,
                 registry_ref: record.registry_ref,
                 reach: Default::default(),
-                public: false,
                 erofs,
                 owners,
                 created_at: record.created_at,
@@ -654,14 +626,7 @@ impl ImageService {
         .await
         .map_err(|e| ImageError::Storage(e.to_string()))??;
         // each layer: what it waits for, and what it has fetched so far
-        let mut waiting: Vec<Waiting> = left
-            .into_iter()
-            .zip(&wanted)
-            .map(|(files, w)| Waiting {
-                files,
-                from_store: w.in_store > 0,
-            })
-            .collect();
+        let mut waiting = left;
         for w in &wanted {
             stats.add(
                 velarx_proto::workload::SOURCE_STORE,
@@ -727,14 +692,9 @@ impl ImageService {
             });
         }
         // (what needed no fetch is complete now)
-        for (layer, w) in layers
-            .iter()
-            .zip(&waiting)
-            .filter(|(_, w)| w.files.is_empty())
-        {
+        for (layer, _) in layers.iter().zip(&waiting).filter(|(_, w)| w.is_empty()) {
             if commit {
-                self.commit_layer(layer, layers, Vec::new(), w.from_store, stats)
-                    .await?;
+                self.commit_layer(layer, layers, Vec::new(), stats).await?;
             }
             done.layers_done += 1;
             report(&done);
@@ -757,15 +717,14 @@ impl ImageService {
             for (layer, w) in layers
                 .iter()
                 .zip(waiting.iter_mut())
-                .filter(|(_, w)| !w.files.is_empty())
+                .filter(|(_, w)| !w.is_empty())
             {
                 for d in &group {
-                    w.files.remove(d);
+                    w.remove(d);
                 }
-                if w.files.is_empty() {
+                if w.is_empty() {
                     if commit {
-                        self.commit_layer(layer, layers, Vec::new(), w.from_store, stats)
-                            .await?;
+                        self.commit_layer(layer, layers, Vec::new(), stats).await?;
                     }
                     done.layers_done += 1;
                 }
@@ -889,13 +848,7 @@ impl ImageService {
             (commit.record.blob, commit.record.size) =
                 (layer.meta.blob.parse().ok(), layer.meta.size);
             commit.kept_toc = layer.toc_z.as_deref().map(<[u8]>::to_vec);
-            self.db
-                .commit_staged_layer(velarx_db::StagedLayerCommit {
-                    layer: commit,
-                    public: layer.meta.public,
-                    proven: false,
-                })
-                .await?;
+            self.db.commit_layers(vec![commit], Vec::new()).await?;
             debug!("Layer {} pulled into the storage driver", layer.key);
         }
         for layer in layers.iter() {
@@ -925,7 +878,6 @@ impl ImageService {
         layer: &LazyLayer,
         all: &[LazyLayer],
         chunks: Vec<velarx_db::ChunkLocation>,
-        from_store: bool,
         stats: &mut TransferStats,
     ) -> ImageResult<()> {
         // The files and the image of the layer are verified first, with no
@@ -986,7 +938,6 @@ impl ImageService {
                 tarsplit: layer.tarsplit.clone(),
                 toc_z: layer.toc_z.clone(),
                 lazy: false,
-                proven: false,
                 blob_checked: false,
                 checked,
             },
@@ -997,15 +948,7 @@ impl ImageService {
             Some(layer.meta.erofs.clone()),
             Some(layer.meta.owners.clone()),
         );
-        // given to peers from now on (when they are public): what the store
-        // did not have before, and the proof checked
-        self.db
-            .commit_staged_layer(velarx_db::StagedLayerCommit {
-                layer: commit,
-                public: layer.meta.public,
-                proven: layer.meta.public && !from_store,
-            })
-            .await?;
+        self.db.commit_layers(vec![commit], Vec::new()).await?;
         debug!("Layer {} committed to the store", layer.key);
         drop((store, one));
         self.release_layer(&layer.key).await;
@@ -1077,12 +1020,6 @@ impl ImageService {
             .iter()
             .filter_map(|(r, d)| Some((r.clone(), d.parse().ok()?)))
             .collect();
-        let shared = pull.shareable.then(|| {
-            pull.tags
-                .iter()
-                .map(|t| (t.repository.clone(), t.tag.clone()))
-                .collect()
-        });
         self.db
             .commit_staged_image(velarx_db::StagedImageCommit {
                 pull: velarx_db::PullCommit {
@@ -1099,7 +1036,6 @@ impl ImageService {
                         .collect(),
                 },
                 started_at: pull.started_at.clone(),
-                shared,
             })
             .await?;
         Ok(())
@@ -1431,7 +1367,7 @@ fn commit_staged(
     fsverity: velarx_storage::VerityMode,
     images: &[StagedImageOf],
     objects: &Path,
-) -> ImageResult<(Vec<velarx_storage::Object>, Vec<ImageStep>, Vec<Refused>)> {
+) -> ImageResult<Placed> {
     let verified = verify_staged(dirs, wanted, store, fsverity, images, objects)?;
     place_staged(verified, dirs, wanted, store, images, objects)
 }
@@ -1483,6 +1419,10 @@ fn stagings_of<'a>(
         .collect()
 }
 
+/// What [`place_staged`] did: the objects in the store, the steps of the
+/// images, the files it refused, and the files the store had already.
+type Placed = (Vec<velarx_storage::Object>, Vec<ImageStep>, Vec<Refused>);
+
 /// The locked phase of [`commit_staged`]: the names, and nothing that reads,
 /// hashes or copies.
 fn place_staged(
@@ -1492,7 +1432,7 @@ fn place_staged(
     store: &velarx_storage::FileStore,
     images: &[StagedImageOf],
     objects: &Path,
-) -> ImageResult<(Vec<velarx_storage::Object>, Vec<ImageStep>, Vec<Refused>)> {
+) -> ImageResult<Placed> {
     use velarx_content::pull::commit::{commit_verified, Refusal};
     let stagings = stagings_of(dirs, wanted, images, objects);
     let linked = commit_verified(&stagings, verified, store, None)
@@ -1577,7 +1517,6 @@ mod tests {
                 size: 0,
                 registry_ref: None,
                 reach: Default::default(),
-                public: false,
                 erofs: String::new(),
                 owners: String::new(),
                 created_at: String::new(),
@@ -2095,7 +2034,6 @@ mod tests {
                 vec![Link {
                     name: "first".into(),
                     conn: FetchConn::new(first.connect().unwrap()).unwrap(),
-                    own: false,
                     idle: velarx_content::pull::staged_fetch::REGISTRY_IDLE,
                 }],
                 FetchConn::new(end.connect().unwrap()).unwrap(),
@@ -2126,7 +2064,6 @@ mod tests {
                         creds: false,
                         certs: false,
                     },
-                    public: false,
                     erofs: String::new(),
                     owners: String::new(),
                     created_at: String::new(),
@@ -2295,9 +2232,9 @@ mod tests {
         let file = format!("fsverity-sha256-12:{}", "b".repeat(64));
         std::fs::write(&path, format!(r#"{{"v":1,"files":["{file}"]}}"#)).unwrap();
         let names = ["peers".to_string()];
-        assert_eq!(service.pull_profile(&id, (&names, true)).await, [file]);
+        assert_eq!(service.pull_profile(&id, &names).await, [file]);
         service.pull_config.lazy_profile_secs = 0;
-        assert!(service.pull_profile(&id, (&names, true)).await.is_empty());
+        assert!(service.pull_profile(&id, &names).await.is_empty());
     }
 
     #[test]
@@ -2354,7 +2291,6 @@ mod tests {
                 blob_checked: false,
                 kept_toc: None,
             }],
-            vec![],
             vec![],
         )
         .await
@@ -2432,7 +2368,6 @@ mod tests {
                 size: 4,
                 registry_ref: None,
                 reach: velarx_db::LayerReach::default(),
-                public: false,
                 erofs: "sha256:ee".into(),
                 owners: "[[],[]]".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
@@ -2501,7 +2436,6 @@ mod tests {
                 kept_toc: None,
             }],
             vec![],
-            vec![],
         )
         .await
         .unwrap();
@@ -2565,6 +2499,5 @@ mod tests {
         assert_eq!(layers[0].meta.erofs, "sha256:ee");
         assert_eq!(layers[0].diff_id, sha("diff"));
         assert_eq!(&layers[0].tarsplit[..], b"ts");
-        assert!(!layers[0].meta.public, "not given to peers on its account");
     }
 }

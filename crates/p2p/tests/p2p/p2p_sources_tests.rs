@@ -53,6 +53,8 @@ struct Opts {
     /// The registry of the nodes that hold the image serves no range: they
     /// pull its layers whole
     whole: bool,
+    /// The nodes that hold the image pulled it with credentials
+    credentials: bool,
 }
 
 impl Default for Opts {
@@ -63,6 +65,7 @@ impl Default for Opts {
             policy: Policy::default(),
             a_delay: Duration::ZERO,
             whole: false,
+            credentials: false,
         }
     }
 }
@@ -137,14 +140,29 @@ async fn server(
     (layers, media): (&[&Built], &[&str]),
     shared: Option<Arc<velarx_core::services::checkpoint::SharedCheckpoints>>,
     ip: [u8; 4],
-    whole: bool,
+    opts: Opts,
 ) -> (Env, Arc<P2PNode>, std::path::PathBuf, StoreServer) {
-    let a = env_sharing().await;
+    let a = env().await;
     a.publish(layers, media);
-    if whole {
+    if opts.whole {
         *a.reg.mode.lock().unwrap() = RangeMode::Refuse;
     }
-    a.pull().await.unwrap();
+    if opts.credentials {
+        use velarx_registry::auth::{Credentials, RegistryAccess};
+        let client = a.client().with_access(&RegistryAccess {
+            creds: Some(Credentials::basic("alice", "secret")),
+            ..Default::default()
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let image = format!("{}/test:latest", a.host);
+        a.service
+            .pull_with_client(&client, &image, tx)
+            .await
+            .unwrap();
+    } else {
+        a.pull().await.unwrap();
+    }
     let service = match shared {
         Some(shared) => StoreService::with_checkpoints(a.db.clone(), a.store.clone(), shared)
             .await
@@ -159,9 +177,9 @@ async fn server(
     node_a
         .set_chunk_provider(Arc::new(StoreContent::new(socket.clone())))
         .unwrap();
-    // (what the service tells its peers of the layers the store service
-    // lets be shared: the follower of the store does it in the service)
-    let announcement = velarx_core::store_service::Announcement::from_database(&a.db, false)
+    // (what the service tells its peers of the layers of the store: the
+    // follower of the store does it in the service)
+    let announcement = velarx_core::store_service::Announcement::from_database(&a.db)
         .await
         .unwrap();
     node_a.announce_layers(announcement.layers).await.unwrap();
@@ -194,16 +212,8 @@ async fn swarm_with(
         ip[3] += i as u8;
         ip
     };
-    let (a, node_a, store, served) = server(
-        dir.path(),
-        "a",
-        &key,
-        (layers, media),
-        shared,
-        ip(0),
-        opts.whole,
-    )
-    .await;
+    let (a, node_a, store, served) =
+        server(dir.path(), "a", &key, (layers, media), shared, ip(0), opts).await;
     servers.push(Box::new(served));
     let mut others = Vec::new();
     for i in 1..opts.servers {
@@ -214,7 +224,7 @@ async fn swarm_with(
             (layers, media),
             None,
             ip(i),
-            opts.whole,
+            opts,
         )
         .await;
         servers.push(Box::new(served));
@@ -228,7 +238,7 @@ async fn swarm_with(
         connect(&node_b, other).await;
     }
     // (what the servers told of their layers is known before the first pull)
-    let keys = velarx_core::store_service::Announcement::from_database(&a.db, false)
+    let keys = velarx_core::store_service::Announcement::from_database(&a.db)
         .await
         .unwrap()
         .layers;
@@ -425,7 +435,7 @@ async fn add_peer(s: &Swarm, provider: Arc<dyn ChunkProvider>, delay: Duration) 
 /// B its filter, as the service of a node that pulled the image does.
 async fn add_holder(s: &Swarm, delay: Duration) -> Arc<P2PNode> {
     let peer = add_peer(s, Arc::new(StoreContent::new(s.store.clone())), delay).await;
-    let layers = velarx_core::store_service::Announcement::from_database(&s.a.db, false)
+    let layers = velarx_core::store_service::Announcement::from_database(&s.a.db)
         .await
         .unwrap()
         .layers;
@@ -536,40 +546,6 @@ async fn pulled_from_a(s: &Swarm, layer: &Built, size: usize) {
     );
     assert_eq!(b.reg.ranged.load(Ordering::SeqCst), 0);
     assert_eq!(b.db.get_layer(&layer.key()).await.unwrap().status, "ready");
-}
-
-/// A's layer of a newer version of a file (its chunks mostly the old
-/// version's) is one it may not give: it was made of what A's store had.
-/// The chunks the two versions share are still given for the old one,
-/// whichever of the layers was committed last.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_the_chunks_of_two_versions_of_a_file_are_given_for_the_one_that_may_be() {
-    let old = noise(200_000, 11);
-    let mut newer = old.clone();
-    newer[100_000..100_016].copy_from_slice(b"sixteen changed!");
-    let (old_layer, new_layer) = (data_layer(old.clone()), data_layer(newer));
-    let s = swarm(&[&old_layer, &new_layer], &[ZSTD, ZSTD]).await;
-    let key = new_layer.key().to_string();
-    s.a.db
-        .conn()
-        .call(move |c| {
-            Ok(c.execute(
-                "UPDATE shared_layers SET proven = 0 WHERE layer_id = ?1",
-                [key],
-            )?)
-        })
-        .await
-        .unwrap();
-    // (the store gives a chunk the two have: the first one)
-    let content = Arc::new(StoreContent::new(s.store.clone()));
-    let shared = [sha(&old[..4096]).to_string()];
-    let found = tokio::task::spawn_blocking(move || content.open_chunks(&shared))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(found[0].is_some(), "a chunk of both versions is not given");
-    pulled_from_a(&s, &old_layer, 200_000).await;
-    drop(s);
 }
 
 /// A has the file, but not by the chunks B's layer names (it cut the file
@@ -781,7 +757,7 @@ async fn test_a_gzip_layer_taken_from_a_peer_is_served_by_its_node() {
     b.pull().await.unwrap();
     let digest = sha(&layer.blob).to_string();
     // (B is a node of the swarm of its own, which tells its layers)
-    let announcement = velarx_core::store_service::Announcement::from_database(&b.db, false)
+    let announcement = velarx_core::store_service::Announcement::from_database(&b.db)
         .await
         .unwrap();
     assert!(announcement.layers.contains(&digest), "{announcement:?}");
@@ -985,33 +961,37 @@ async fn test_a_shared_checkpoint_comes_from_a_peer() {
     drop(s);
 }
 
-/// The layers of a private pull (not shareable) are not given: neither
-/// the index of a gzip layer nor its files, nor the chunks of a
-/// zstd:chunked one.
+/// A node that pulled an image with credentials gives it to the peers as any
+/// other: a node whose registry does not have the image pulls it by its
+/// digest from them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_a_private_layer_is_not_given_to_peers() {
-    for (layer, media) in [
-        (build_gzip(&sample()), GZIP),
-        (build_chunked(&sample()), ZSTD),
-    ] {
-        let s = swarm(&[&layer], &[media]).await;
-        s.a.db
-            .conn()
-            .call(|c| Ok(c.execute("DELETE FROM shared_layers", [])?))
-            .await
-            .unwrap();
-        let b = env_with_sources(&[&s.b_source]).await;
-        b.publish(&[&layer], &[media]);
-        let result = b.pull().await.unwrap();
-        assert_eq!(
-            result.stats.from("source0").0,
-            0,
-            "{media}: {:?}",
-            result.stats
-        );
-        assert!(b.store.contains(&vid(b"hello\n")));
-        drop(s);
-    }
+async fn test_a_pull_with_credentials_is_given_to_and_taken_from_the_peers() {
+    use velarx_registry::auth::{Credentials, RegistryAccess};
+    let layer = build_gzip(&sample());
+    let opts = Opts {
+        credentials: true,
+        ..Opts::default()
+    };
+    let s = swarm_with(&[&layer], &[GZIP], None, opts).await;
+    let record = s.a.db.list_images().await.unwrap().remove(0);
+    // (B's registry has nothing: the peers have the image)
+    let b = env_with_sources(&[&s.b_source]).await;
+    let client = b.client().with_access(&RegistryAccess {
+        creds: Some(Credentials::basic("bob", "secret")),
+        ..Default::default()
+    });
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let image = format!("{}/test@{}", b.host, record.manifest_digest);
+    let result = b
+        .service
+        .pull_with_client(&client, &image, tx)
+        .await
+        .unwrap();
+    assert!(result.stats.from("source0").0 > 0, "{:?}", result.stats);
+    assert_eq!(b.reg.hits.lock().unwrap().get(&sha(&layer.blob)), None);
+    assert!(b.store.contains(&vid(b"hello\n")));
+    drop(s);
 }
 
 /// A layer of `n` files of `size` bytes in one directory, and their digests.
@@ -1038,7 +1018,7 @@ async fn lazy_b(s: &Swarm, layer: &Built, window_files: usize) -> Env {
         PullConfig {
             lazy_window_files: window_files,
             lazy_window_kib: 1024,
-            ..sharing()
+            ..PullConfig::default()
         },
         velarx_config::PushConfig::default(),
         chain_of(&[&s.b_source]),
@@ -1583,14 +1563,6 @@ async fn test_a_profile_comes_from_a_peer_that_has_the_image() {
     );
     // a profile that is not one is not given
     std::fs::write(&path, b"{\"v\":1,\"files\":[\"junk\"]}").unwrap();
-    assert!(profile_of(image.clone(), PROFILE_MAX_BYTES).await.is_none());
-    // nor the profile of an image whose layers may not be given
-    std::fs::write(&path, doc.to_string()).unwrap();
-    s.a.db
-        .conn()
-        .call(|c| Ok(c.execute("DELETE FROM shared_layers", [])?))
-        .await
-        .unwrap();
     assert!(profile_of(image.clone(), PROFILE_MAX_BYTES).await.is_none());
     drop(s);
 }

@@ -747,7 +747,6 @@ impl ContentFeed {
                         report: w.report,
                         diff_id: w.diff_id,
                         tarsplit: w.tarsplit,
-                        from_local_source: false,
                     };
                     (
                         Arc::new(HandedContent {
@@ -835,7 +834,7 @@ impl ContentFeed {
         // records the layer from it, a driver in another process was given
         // them with `Index` and takes only the report)
         let ingested = held.ingested.clone();
-        let mut done = pull::whole_done(self.source.as_ref(), &layer.descriptor, ingested);
+        let mut done = pull::whole_done(&layer.descriptor, ingested);
         done.blob_checked = held.blob_checked;
         done.report = pull::LayerReport {
             fetched_bytes: bytes,
@@ -1212,7 +1211,6 @@ async fn copy_wanted(
                 key: key.clone(),
                 name: key.clone(),
                 size: *size,
-                copy: false,
                 verity_keyed: false,
             })?;
             files += 1;
@@ -1300,7 +1298,6 @@ impl PullFeed for StagedFeed {
             },
             tarsplit: index.tarsplit.clone(),
             lazy: false,
-            proven: false,
             blob_checked: false,
             checked: Default::default(),
             toc_z: None,

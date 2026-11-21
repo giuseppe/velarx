@@ -86,14 +86,12 @@ root_dir = "$WORKDIR/$n/root"
 [storage]
 root = "$WORKDIR/$n/store"
 [pull]
-share_registries = ["$E2E_REGISTRY"]
 sources = ["peers", "registry"]
 # (no background completion: a pull stays a pull, its containers lazy)
 lazy_completers = 0
 [[sources.external]]
 name = "peers"
 socket = "$WORKDIR/$n/services/p2p-fetcher.sock"
-peer = true
 idle_timeout_secs = 30
 EOT
     cat > "$WORKDIR/$n.p2p.toml" <<EOT

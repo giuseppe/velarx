@@ -359,9 +359,7 @@ async fn store_layer(s: &Subject, tar: Vec<u8>) -> Stored {
     let mut commit = layer_commit(&done, None).unwrap();
     commit.record.erofs = Some(artifact.image_digest.clone());
     commit.record.owners = Some(artifact.owners.clone());
-    s.db.commit_layers(vec![commit], vec![], vec![])
-        .await
-        .unwrap();
+    s.db.commit_layers(vec![commit], vec![]).await.unwrap();
     Stored {
         key: done.key,
         diff_id: done.diff_id,
@@ -722,7 +720,6 @@ fn publish_pull(s: &Subject, id: &str, layers: &[String]) {
             layers: layers.to_vec(),
             tags: vec![],
             digest_names: vec![],
-            shareable: false,
             pulls: vec![],
             registry_ref: None,
             started_at: String::new(),
@@ -2178,7 +2175,7 @@ pub async fn the_diff_id_is_proved_by_reading_back_from_the_driver(f: &Factory) 
 /// (some in a pack file at an offset, some in a file of their own), with no
 /// staging session of the engine's: every byte that arrives is checked against
 /// the table of contents, the diff id is not proved by the fetch (the layer
-/// comes back claimed, not `proven`), and the layer read back from the files
+/// comes back claimed), and the layer read back from the files
 /// is the layer.
 pub async fn a_feed_writes_into_the_files_a_driver_hands_over(f: &Factory) {
     use std::os::unix::fs::FileExt;
@@ -2262,7 +2259,6 @@ pub async fn a_feed_writes_into_the_files_a_driver_hands_over(f: &Factory) {
         let size = places[key].2;
         places.insert(key.clone(), (file.try_clone().unwrap(), 0, size));
     }
-    assert!(!done.proven, "nothing proved the layer: it is read back");
     assert_eq!(done.diff_id, layer.diff_id);
     let mut got = told.lock().unwrap().clone();
     got.sort();
@@ -3381,9 +3377,7 @@ pub async fn has_layers_does_not_report_what_is_not_committed(f: &Factory) {
     let mut commit = layer_commit(&done, None).unwrap();
     commit.record.erofs = Some(pulled.artifacts[&done.key].image_digest.clone());
     commit.record.owners = Some(pulled.artifacts[&done.key].owners.clone());
-    s.db.commit_layers(vec![commit], vec![], vec![])
-        .await
-        .unwrap();
+    s.db.commit_layers(vec![commit], vec![]).await.unwrap();
     assert_eq!(s.driver.has_layers(&asked).await.unwrap(), [true]);
 }
 
@@ -3455,9 +3449,7 @@ pub async fn has_layers_does_not_report_a_layer_it_cannot_serve(f: &Factory) {
     let mut commit = layer_commit(&done, None).unwrap();
     commit.record.erofs = Some(artifact.image_digest);
     commit.record.owners = Some(artifact.owners);
-    s.db.commit_layers(vec![commit], vec![], vec![])
-        .await
-        .unwrap();
+    s.db.commit_layers(vec![commit], vec![]).await.unwrap();
     assert_eq!(s.driver.has_layers(&both).await.unwrap(), [true, true]);
 }
 
@@ -3565,7 +3557,6 @@ pub async fn a_lazy_layer_waits_and_is_completed(f: &Factory) {
         (&done, &serde_json::to_string(&*done.toc).unwrap()),
         None,
         velarx_db::LayerReach::default(),
-        false,
         (&artifact.image_digest, &artifact.owners),
     )
     .unwrap();
@@ -3579,7 +3570,6 @@ pub async fn a_lazy_layer_waits_and_is_completed(f: &Factory) {
         layers: vec![done.key.to_string()],
         tags: vec![],
         digest_names: vec![],
-        shareable: false,
         pulls: vec![],
         registry_ref: None,
         started_at: String::new(),
@@ -3597,7 +3587,6 @@ pub async fn a_lazy_layer_waits_and_is_completed(f: &Factory) {
             size: done.size,
             registry_ref: None,
             reach: velarx_db::LayerReach::default(),
-            public: false,
             erofs: "sha256:00".into(),
             owners: artifact.owners.clone(),
             created_at: String::new(),
@@ -6516,7 +6505,7 @@ async fn record(s: &Subject, pulled: &Pulled) {
         commit.record.owners = Some(artifact.owners.clone());
         commits.push(commit);
     }
-    s.db.commit_layers(commits, vec![], vec![]).await.unwrap();
+    s.db.commit_layers(commits, vec![]).await.unwrap();
 }
 
 /// The chain ids of `diffs` computed here, with no code of the engine: the

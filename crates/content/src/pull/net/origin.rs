@@ -634,7 +634,6 @@ mod tests {
         let link = Link {
             name: "peer".into(),
             conn,
-            own: false,
             idle: REGISTRY_IDLE,
         };
         (MetadataSources::open(vec![link]).await, fetcher)

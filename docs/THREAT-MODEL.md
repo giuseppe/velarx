@@ -19,7 +19,9 @@ limit, not a guarantee.
   container with `--privileged` or a host bind mount is the host).
 * **Secrets in transit and at rest**: registry credentials, `secret`
   values, the swarm key of the peer-to-peer network.
-* **What the user pulls and runs** (privacy toward peers and sources).
+* **What the user pulls and runs** (privacy toward the sources; toward the
+  members of the swarm a digest is the capability, see "The peer-to-peer
+  swarm").
 
 ## Who is trusted
 
@@ -30,7 +32,7 @@ limit, not a guarantee.
 | the configuration files (`config.toml`, `registries.conf`, `policy.json`, hooks, credential helpers, runtime path) | all of it | they name programs the engine runs with its privileges; they are the administrator's, and are read as such |
 | the OCI runtime (`crun`) and the kernel | the isolation of containers | velarx sets up the specification; the runtime and the kernel enforce it |
 | the processes of velarx of the same user (daemon, monitors, fetchers, the peer-to-peer service) | each other, through private sockets | a socket directory of mode 0700 and `SO_PEERCRED` of both ends: `crates/base/src/ipc.rs`, `crates/proto/src/serving.rs` |
-| the members of the peer-to-peer swarm (the holders of the swarm key, or the nodes with a certificate of the authority) | not to misbehave: there is no defence against a member that floods, hoards or claims what it does not have | admission is the boundary ("The peer-to-peer swarm"); what a member sends is still checked by digest, and a member is removed by revocation or a new key |
+| the members of the peer-to-peer swarm (the holders of the swarm key, or the nodes with a certificate of the authority) | to ask only for what it needs and not to misbehave: it is served any object whose digest it names, and there is no defence against a member that floods, hoards or claims what it does not have | admission is the boundary ("The peer-to-peer swarm"); what a member sends is still checked by digest, and a member is removed by revocation or a new key |
 | the storage service of `[storage] driver = "varlink"` | what the files of a container's root file system are, and keeping what it was given, like the OCI runtime | it is run by the user of the engine or by root (`SO_PEERCRED` on every connection) and is chosen by the administrator in `config.toml`; everything else it says is checked ("A storage service") |
 
 Not trusted: images (content, configuration, labels, annotations), registries
@@ -78,10 +80,8 @@ lengths before allocating and verifies every digest.
   hash to the diff id of the configuration before anything of the layer is
   named or recorded; its blob is never hashed (recorded so), and a wrong
   index is asked for once more, of another peer, and then costs the pull of
-  the blob.  The files are asked for before the claim is judged, so whoever
-  gives an index learns which of the files it names the store holds, as the
-  publisher of a table of contents does.  A source cannot make a pull
-  wrong, only slower, and a circuit breaker skips one that fails.
+  the blob.  A source cannot make a pull wrong, only slower, and a circuit
+  breaker skips one that fails.
 * **The chain of trust of a pull** starts at what the user names: a digest
   (`name@digest`) is checked against the manifest or index it names, and
   each step against the one above it (the platform's manifest against the
@@ -89,12 +89,12 @@ lengths before allocating and verifies every digest.
   zstd:chunked layer against the table its annotation names, every file
   against the fs-verity digest the engine measured).  A tag is taken only
   from its registry; the peers serve what a digest names.  What is off the
-  chain is recorded as a claim and never names, serves or shares anything:
-  the diff id of a zstd:chunked layer, the content digest of a file the
-  table also gives an fs-verity digest, the blob of a layer made from an
-  index, and the places of chunks, which whoever copies one checks.  The
-  file a record names is the one the engine opened or measured, never one a
-  claim names.
+  chain is recorded as a claim and never names anything: the diff id of a
+  zstd:chunked layer, the content digest of a file the table also gives an
+  fs-verity digest, the blob of a layer made from an index (a node that asks
+  for the layer by that blob checks it against its own diff id), and the
+  places of chunks, which whoever copies one checks.  The file a record
+  names is the one the engine opened or measured, never one a claim names.
 * **A dual view image** has a layer whose table of contents (zstd:chunked),
   which the manifest vouches for, and whose tar stream describe different
   filesystems: other names, modes or contents, a file only in one of them.
@@ -218,23 +218,33 @@ member:
     again when they change, with no restart.  A node whose certificate
     expired is refused by the others and disconnected at their next sweep;
     it never falls back to anything weaker.
-* **One swarm is one trust domain**, with the key and with an authority:
-  there is no per-image access control.  A member may be served any layer,
-  chunk, file, layer index or table of contents, and the manifest, index
-  and configuration of any image, that a node holds and shares (the pulls
-  without credentials, and those of `share_registries`), may test whether a node
-  holds a digest it already knows (a probe, or offline in the filter of the
-  layers that `advertise_layers`, on by default, tells every member), and,
-  when a node sets `announce_images = true`, may list its images.
-  Certificates say who a node is, not what it may see.  **Do not put nodes of
-  different trust in one swarm**: an image that must not reach every member
-  needs a swarm of its own (its own key or authority), or no peer-to-peer
-  source.  A node that pulls through the peers also gives them the files it
-  has staged so far (each checked by its chunk digests and its fs-verity
-  name, as everything the peers get, and by the asker again), before the
-  layer is complete and in the store; they are the files of pulls the peers
-  may take (never one with credentials), and the layer is told in the filter
-  from the first file.
+* **A digest is the capability.**  One swarm is one trust domain, with the
+  key and with an authority, and a member is trusted as another process of
+  the node is: it may ask for anything, and it is served every object the
+  node holds, in its store or in its read-only stores, that it names by
+  digest (a file by its fs-verity digest, a chunk, the index of a layer, a
+  manifest, an index, a configuration, a startup profile), whatever brought
+  it: a pull with credentials or without, a build, a commit.  There is no
+  per-image or per-layer rule.  What keeps an image to the nodes that have
+  it is that its digests are not known: the fs-verity digest of a file and
+  the digest of a chunk or a layer are known to whoever has the content, its
+  manifest or its table of contents, and the digest of a manifest to whoever
+  was given it.  A member learns a digest when a pull asks the peers for it
+  (with credentials or not), when the image is public, when the user gives
+  it, or when a node lists its images (`announce_images`).  With a manifest
+  it can fetch the whole image from any node that holds it.  It can also
+  test whether a node holds a digest it knows, in a probe or in the filter
+  of the layers (`advertise_layers`, on by default, which is not a list), and
+  so learn what the node pulled.  Certificates say who a node is, not what it
+  may see.  **Do not put nodes of different trust in one swarm**: an image
+  that must not reach every member needs a swarm of its own, or a node that
+  does not run `velarx-p2p` (with an authority, a `pull` certificate: the
+  node asks and is not asked).  Everything a member sends is still checked on
+  the node that receives it, as what any source sends.  A node that pulls
+  through the peers also gives them the files it has staged so far (each
+  checked by its chunk digests and its fs-verity name, and by the asker
+  again), before the layer is complete and in the store, and the layer is
+  told in the filter from the first file.
 * **The peer layer**: wrong bytes are refused by digest.  Every dial goes
   through one filter that refuses addresses that can
   never be a peer's: loopback, link-local, multicast, reserved addresses and
@@ -285,10 +295,10 @@ once more when the completion commits it.
 | `[storage] vfs_ignore_chown_errors = true` | the files of a container of the vfs driver are all owned by the user of the engine where it may not give them the image's owners, so a container that relies on the owners of its files (a service that checks the owner of its configuration) sees none of them |
 | `[storage] fsverity_best_effort = true` | a driver that checks fs-verity at pull only (vfs) is run with the settings that enforce it at run time: the pull is strict, and nothing is checked after it |
 | `[api] allow_unauthenticated` | an API without authentication on its TCP port (a loopback port unless another address is named) |
-| starting `velarx-p2p`, `mdns` (p2p.toml), `share_registries`, `share_image_names` | what is shared with, and visible to, the holders of the swarm key, or the nodes with a certificate of the authority (the names of the images only with the last) |
+| starting `velarx-p2p`, `mdns` (p2p.toml) | every object of the store is served by digest to the holders of the swarm key, or the nodes with a certificate of the authority, and the pulls tell them the digests they ask for |
 | `ca_path` and `certificate_path` (p2p.toml) | admission by certificates instead of the shared key; `private_key_path` may be left out; the key of the authority (`velarx-p2p ca init`) is the root of trust of the swarm and must stay off the nodes; the revocation list and the sweep decide how fast a node is removed |
 | `allow_names`, `allow_peers`, `revocation_max_age_secs` (p2p.toml) | who of the authority's nodes is admitted at all, and when a stale revocation list stops admissions |
-| `announce_images = true` (p2p.toml) | the node announces its images and its layers in the DHT: every member of the swarm, and anyone with the swarm key, can list what it has; off (the default), only the digests a peer already knows can be tested (in a probe, or in the filter of the layers) |
+| `announce_images = true` (p2p.toml) | the node lists all its images with their names, and publishes its layers in the DHT: every member, and anyone with the swarm key, can walk and fetch everything the node holds; off (the default), only the digests a peer already knows can be asked for or tested |
 | `advertise_layers = false` (p2p.toml; on by default) | the node tells no filter of its layers: the peers cannot test them offline, and probe the node instead |
 | `--privileged`, `--security-opt seccomp=unconfined`, host namespaces, devices | the container is as powerful as the host allows |
 | `[build] insecure_entitlements` (`network.host`, `security.insecure`) | a build step may use the host network or run privileged when the request allows it too (`velarx build --allow`); the REST build routes cannot say `allow`, so there the list alone decides |

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The store service (`org.velarx.Store`): what may be given to peers,
-//! by digest, as read-only descriptors; the changes of what may be
+//! The store service (`org.velarx.Store`): what the store holds, given
+//! by digest as read-only descriptors; the changes of what may be
 //! announced; and the service started by a socket on descriptor 3, with
 //! no daemon.
 
@@ -60,20 +60,19 @@ fn read_only(fd: &OwnedFd) -> bool {
         .is_ok_and(|f| !f.intersects(rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::RDWR))
 }
 
-/// A layer pulled by a pull that may be shared: its files are given, as
-/// read-only descriptors with their place; what is not in the store, or is
-/// larger than asked, is not; more than a batch is refused.
+/// A layer pulled: its files are given, as read-only descriptors with
+/// their place; what is not in the store, or is larger than asked, is not;
+/// more than a batch is refused.
 #[tokio::test]
-async fn test_what_may_be_shared_is_given_read_only() {
+async fn test_what_the_store_holds_is_given_read_only() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let layer = build_chunked(&sample());
-            let e = env_sharing().await;
+            let e = env().await;
             e.publish(&[&layer], &[ZSTD]);
             e.pull().await.unwrap();
             let hello = vid(b"hello\n");
-            assert!(e.db.is_content_shareable(&hello).await.unwrap());
 
             let service = StoreService::new(e.db.clone(), e.store.clone())
                 .await
@@ -121,16 +120,18 @@ async fn test_what_may_be_shared_is_given_read_only() {
         .await;
 }
 
-/// What a pull with credentials brought is private: nothing of it is given,
-/// even asked by its digest, and nothing is announced.
+/// What a pull with credentials brought is given like the rest: its file by
+/// its fs-verity digest, a chunk, its manifest, configuration, kept index,
+/// the index of its layer and its startup profile, each by its digest, and
+/// what the store does not have is not.
 #[tokio::test]
-async fn test_a_private_image_is_absent() {
+async fn test_every_object_of_the_store_is_given_by_its_digest() {
     use velarx_registry::auth::{Credentials, RegistryAccess};
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let layer = build_chunked(&sample());
-            let e = env_sharing().await;
+            let e = env().await;
             e.publish(&[&layer], &[ZSTD]);
             let client = e.client().with_access(&RegistryAccess {
                 creds: Some(Credentials::basic("alice", "secret")),
@@ -138,12 +139,18 @@ async fn test_a_private_image_is_absent() {
             });
             let (tx, mut rx) = tokio::sync::mpsc::channel(8);
             tokio::spawn(async move { while rx.recv().await.is_some() {} });
-            e.service
+            let result = e
+                .service
                 .pull_with_client(&client, &format!("{}/test:latest", e.host), tx)
                 .await
                 .unwrap();
-            let hello = vid(b"hello\n");
-            assert!(e.store.get_path(&hello).is_some(), "the store has it");
+            let record = e.service.get(&result.id).await.unwrap();
+            let index = sha(b"a kept index");
+            e.db.set_index(&index, "an index").await.unwrap();
+            let profile = velarx_fuse::composefs::profile_path(e.store.root(), &result.id);
+            let text = format!(r#"{{"v":1,"files":["{}"]}}"#, vid(b"hello\n"));
+            std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+            std::fs::write(&profile, &text).unwrap();
 
             let service = StoreService::new(e.db.clone(), e.store.clone())
                 .await
@@ -151,55 +158,131 @@ async fn test_a_private_image_is_absent() {
             let dir = tempfile::tempdir().unwrap();
             let socket = serve(dir.path(), service).await;
             let mut conn = store_service::connect(&socket).await.unwrap();
-            let (reply, fds) = conn.lookup(vec![want(&hello)]).await.unwrap();
-            assert!(reply.unwrap().items[0].fd.is_none());
-            assert!(fds.is_empty());
+
+            let given = [
+                (vid(b"hello\n"), b"hello\n".to_vec()),
+                (sha(b"hello\n").to_string(), b"hello\n".to_vec()),
+                (
+                    record.manifest_digest.to_string(),
+                    record.manifest.clone().into_bytes(),
+                ),
+                (
+                    record.config_digest.to_string(),
+                    record.config.clone().into_bytes(),
+                ),
+                (index.to_string(), b"an index".to_vec()),
+            ];
+            let mut wants: Vec<Want> = given.iter().map(|(d, _)| want(d)).collect();
+            wants.push(want(&sha(b"not in the store")));
+            let (reply, fds) = conn.lookup(wants).await.unwrap();
+            let items = reply.unwrap().items;
+            for (item, (digest, data)) in items.iter().zip(&given) {
+                let fd = &fds[item.fd.unwrap_or_else(|| panic!("{digest} not given")) as usize];
+                assert_eq!(&bytes_of(fd, item.offset, item.length), data, "{digest}");
+            }
+            assert!(items[given.len()].fd.is_none());
+
+            let (reply, fds) = conn.index(&layer.key().to_string(), 1 << 20).await.unwrap();
+            assert!(velarx_content::pull::index::decode(
+                &whole(&fds[reply.unwrap().fd as usize]),
+                1 << 20
+            )
+            .is_ok());
             let (reply, fds) = conn
-                .index(&sha(&layer.blob).to_string(), 1 << 20)
+                .index(&sha(b"no layer").to_string(), 1 << 20)
                 .await
                 .unwrap();
             assert!(not_found(reply) && fds.is_empty());
+            let (reply, fds) = conn
+                .profile(&format!("sha256:{}", result.id), 1 << 20)
+                .await
+                .unwrap();
+            assert_eq!(whole(&fds[reply.unwrap().file as usize]), text.as_bytes());
 
-            use futures::StreamExt;
-            let stream = conn.subscribe().await.unwrap();
-            futures::pin_mut!(stream);
-            let first = stream.next().await.unwrap().unwrap().unwrap();
-            assert_eq!(first.kind, ChangeKind::Snapshot);
-            assert!(first.layers.is_empty() && first.images.is_empty());
+            // announced too
+            let a = announced(&e).await;
+            assert_eq!(a.layers, layer.announced_names());
+            assert_eq!(a.images.len(), 1);
+        })
+        .await;
+}
+
+/// A file only a read-only store has (`additional_image_stores`) is given
+/// by its digest as any other.
+#[tokio::test]
+async fn test_an_object_of_a_read_only_store_is_given() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let ro = velarx_storage::FileStore::new(dir.path().join("ro-objects")).unwrap();
+            let held = ro
+                .put(
+                    velarx_types::digest::Algorithm::Sha256,
+                    b"of the read-only store",
+                )
+                .unwrap();
+            let e = env_sources_over(
+                velarx_config::PullConfig::default(),
+                velarx_config::PushConfig::default(),
+                Fetchers::default(),
+                Some(dir.path().join("ro-objects")),
+            )
+            .await;
+            assert!(!e.store.contains_local(&held));
+            let service = StoreService::new(e.db.clone(), e.store.clone())
+                .await
+                .unwrap();
+            let socket = serve(dir.path(), service).await;
+            let mut conn = store_service::connect(&socket).await.unwrap();
+            let (reply, fds) = conn.lookup(vec![want(&held)]).await.unwrap();
+            let item = &reply.unwrap().items[0];
+            let fd = &fds[item.fd.expect("given") as usize];
+            assert!(read_only(fd));
+            assert_eq!(
+                bytes_of(fd, item.offset, item.length),
+                b"of the read-only store"
+            );
         })
         .await;
 }
 
 /// What the store may announce now.
 async fn announced(e: &Env) -> store_service::Announcement {
-    store_service::Announcement::from_database(&e.db, true)
+    store_service::Announcement::from_database(&e.db)
         .await
         .unwrap()
 }
 
-/// A node that shares its registry's images, pulling lazily.
-async fn lazy_sharing() -> Env {
+/// A node that pulls lazily.
+async fn lazy_env() -> Env {
     env_with(velarx_config::PullConfig {
         lazy_window_files: 0,
-        ..sharing()
+        ..velarx_config::PullConfig::default()
     })
     .await
 }
 
-/// A lazily pulled image is not announced: it is not in the store.  It is,
-/// with its layers, in the commit that completes it, and not before.
+/// A lazy layer is neither announced nor indexed before its completion: it
+/// is not in the store.  It is, with its image, in the commit that
+/// completes it; a layer marked incomplete (its tar-split gone) is not
+/// again.
 #[tokio::test]
-async fn test_a_lazy_image_is_announced_when_its_completion_commits() {
-    let e = lazy_sharing().await;
+async fn test_a_lazy_layer_is_neither_announced_nor_indexed_before_its_completion() {
+    let e = lazy_env().await;
     let layer = build_chunked(&sample());
     e.publish(&[&layer], &[ZSTD]);
-    let digest = sha(&layer.blob);
     let result = e.pull_lazy().await.unwrap();
     assert!(e.service.get(&result.id).await.is_err());
+    let service = StoreService::new(e.db.clone(), e.store.clone())
+        .await
+        .unwrap();
+    let key = layer.key().to_string();
     // (nothing of it is listed, nothing is given)
     let before = announced(&e).await;
     assert!(before.layers.is_empty());
     assert!(before.images.is_empty());
+    assert!(service.index_of(&key, 1 << 20).await.unwrap().is_none());
 
     // a container read a file: it is the layer's own, fetched and checked
     e.service
@@ -207,61 +290,73 @@ async fn test_a_lazy_image_is_announced_when_its_completion_commits() {
         .await
         .unwrap();
     assert!(announced(&e).await.images.is_empty());
-    let _ = digest;
+    assert!(service.index_of(&key, 1 << 20).await.unwrap().is_none());
 
     e.service
         .complete_image(&format!("{}/test:latest", e.host))
         .await
         .unwrap();
-    assert!(e.db.is_layer_shareable(&layer.key()).await.unwrap());
     let after = announced(&e).await;
     assert_eq!(after.layers, layer.announced_names());
     assert_eq!(after.images.len(), 1);
     assert_eq!(after.images[0].id, result.id);
-    assert!(after.images[0].complete);
-    // the files are in the store, to be given
-    assert!(e.db.is_content_shareable(&vid(b"hello\n")).await.unwrap());
+    assert!(service.index_of(&key, 1 << 20).await.unwrap().is_some());
     assert!(e.store.contains(&vid(b"hello\n")));
+
+    // a layer whose tar-split went is not complete
+    e.db.mark_layer_incomplete(&layer.key()).await.unwrap();
+    assert!(announced(&e).await.layers.is_empty());
+    assert!(service.index_of(&key, 1 << 20).await.unwrap().is_none());
 }
 
-/// A lazy layer the store had files of before (a private pull brought them)
-/// is complete after its completion, and is not given: nothing says that
-/// the registry has what the store did.
+/// A layer made partly of files the store had (an image of a new version
+/// pulled over the old one) is announced as any other, and its index and
+/// all its files are given.
 #[tokio::test]
-async fn test_a_completed_layer_that_used_the_store_is_not_given() {
-    use velarx_registry::auth::{Credentials, RegistryAccess};
-    let e = lazy_sharing().await;
-    let private = build_chunked(&sample());
-    e.publish(&[&private], &[ZSTD]);
-    let client = e.client().with_access(&RegistryAccess {
-        creds: Some(Credentials::basic("alice", "secret")),
-        ..Default::default()
-    });
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    e.service
-        .pull_with_client(&client, &format!("{}/test:latest", e.host), tx)
-        .await
-        .unwrap();
+async fn test_a_layer_made_partly_of_store_files_is_announced_and_given() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let e = lazy_env().await;
+            let v1 = build_chunked(&sample());
+            e.publish(&[&v1], &[ZSTD]);
+            e.pull().await.unwrap();
 
-    let mut items = sample();
-    items.push(Item::File {
-        name: "etc/other",
-        data: b"other\n".to_vec(),
-        chunk: 4096,
-    });
-    let public = build_chunked(&items);
-    e.publish(&[&public], &[ZSTD]);
-    let result = e.pull_lazy().await.unwrap();
-    e.service
-        .complete_image(&format!("{}/test:latest", e.host))
-        .await
-        .unwrap();
-    assert!(!e.service.get(&result.id).await.unwrap().is_lazy);
-    let a = announced(&e).await;
-    assert!(a.layers.is_empty(), "{a:?}");
-    assert!(a.images.iter().all(|i| !i.complete), "{a:?}");
-    assert!(!e.db.is_content_shareable(&vid(b"hello\n")).await.unwrap());
+            let mut items = sample();
+            items.push(Item::File {
+                name: "etc/other",
+                data: b"other\n".to_vec(),
+                chunk: 4096,
+            });
+            let v2 = build_chunked(&items);
+            e.publish(&[&v2], &[ZSTD]);
+            e.pull_lazy().await.unwrap();
+            e.service
+                .complete_image(&format!("{}/test:latest", e.host))
+                .await
+                .unwrap();
+
+            let a = announced(&e).await;
+            for name in v2.announced_names() {
+                assert!(a.layers.contains(&name), "{name} not announced");
+            }
+            let service = StoreService::new(e.db.clone(), e.store.clone())
+                .await
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let socket = serve(dir.path(), service).await;
+            let mut conn = store_service::connect(&socket).await.unwrap();
+            let (reply, fds) = conn.index(&v2.key().to_string(), 1 << 20).await.unwrap();
+            assert!(!fds.is_empty() && reply.is_ok());
+            // the file of the old version and the new one
+            let (reply, fds) = conn
+                .lookup(vec![want(&vid(b"hello\n")), want(&vid(b"other\n"))])
+                .await
+                .unwrap();
+            let items = reply.unwrap().items;
+            assert!(items.iter().all(|i| i.fd.is_some()) && fds.len() == 2);
+        })
+        .await;
 }
 
 /// The next change of a stream, within a few seconds.
@@ -280,13 +375,12 @@ where
         .unwrap()
 }
 
-/// The store lists its images with what they are made of, partial while
-/// lazy; one image is asked for by id, digest, name or the start of its id;
-/// the stream tells that an image appeared, that it became complete (as
-/// added again, never as removed) and that it went; a local name of it is
-/// not given.
+/// The store lists its images with what they are made of, none while a lazy
+/// pull is in progress; one image is asked for by id, digest, name or the
+/// start of its id; the stream tells that an image appeared and that it
+/// went; a local name of it is given too.
 #[tokio::test]
-async fn test_the_store_lists_its_images_and_tells_when_one_is_complete() {
+async fn test_the_store_lists_its_images_and_tells_when_one_appears() {
     use store_service::StoreError;
     let local = tokio::task::LocalSet::new();
     local
@@ -298,7 +392,7 @@ async fn test_the_store_lists_its_images_and_tells_when_one_is_complete() {
                 writer,
                 velarx_config::PullConfig {
                     lazy_window_files: 0,
-                    ..sharing()
+                    ..velarx_config::PullConfig::default()
                 },
                 velarx_config::PushConfig::default(),
                 Fetchers::default(),
@@ -306,9 +400,7 @@ async fn test_the_store_lists_its_images_and_tells_when_one_is_complete() {
             )
             .await;
             let reader = velarx_db::Database::open(&db_path).await.unwrap();
-            let service = StoreService::with_names(reader, e.store.clone())
-                .await
-                .unwrap();
+            let service = StoreService::new(reader, e.store.clone()).await.unwrap();
             let socket = serve(dir.path(), service).await;
             let mut conn = store_service::connect(&socket).await.unwrap();
             let info = conn.get_info().await.unwrap().unwrap();
@@ -351,7 +443,6 @@ async fn test_the_store_lists_its_images_and_tells_when_one_is_complete() {
             };
             assert_eq!(layers_in, layer.announced_names());
             assert_eq!(appeared.images.len(), 1);
-            assert!(appeared.images[0].complete);
             let listed = store_service::image_list(&mut conn).await.unwrap();
             assert_eq!(listed, appeared.images);
             let image = &listed[0];
@@ -390,18 +481,23 @@ async fn test_the_store_lists_its_images_and_tells_when_one_is_complete() {
                 }
             }
 
-            // a local name is not one the pull gave
+            // a local name is listed and found like the others
             e.service.tag(&name, "localhost/mine:1").await.unwrap();
             let listed = store_service::image_list(&mut conn).await.unwrap();
-            assert_eq!(listed[0].tags, vec![name.clone()]);
-            assert!(matches!(
-                conn.image_inspect("localhost/mine:1").await.unwrap(),
-                Err(StoreError::NotFound { .. })
-            ));
+            assert!(listed[0].tags.contains(&"localhost/mine:1".to_string()));
+            assert_eq!(
+                conn.image_inspect("localhost/mine:1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .image
+                    .id,
+                image.id
+            );
 
             e.service.remove(&result.id, true).await.unwrap();
-            // (the local name above may be announced as the image changed,
-            // or in the one change of what follows)
+            // (the local name above is announced as the image changed, or in
+            // the one change of what follows)
             let gone = loop {
                 let change = next_change(&mut stream).await;
                 if change.kind == ChangeKind::Removed {
@@ -419,19 +515,55 @@ async fn test_the_store_lists_its_images_and_tells_when_one_is_complete() {
         .await;
 }
 
-/// Without `[pull] share_image_names` the store gives digests only; and
-/// what a pull with credentials brought is not listed nor found by its id.
+/// The list has every image of the store with its names: one pulled with
+/// credentials, a local commit and its local tag.
 #[tokio::test]
-async fn test_names_are_not_given_and_a_private_image_is_not_listed() {
-    use store_service::StoreError;
+async fn test_the_list_has_every_image_and_its_names() {
     use velarx_registry::auth::{Credentials, RegistryAccess};
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let layer = build_chunked(&sample());
-            let e = env_sharing().await;
+            let e = env().await;
             e.publish(&[&layer], &[ZSTD]);
-            let result = e.pull().await.unwrap();
+            let client = e.client().with_access(&RegistryAccess {
+                creds: Some(Credentials::basic("alice", "secret")),
+                ..Default::default()
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            let name = format!("{}/test:latest", e.host);
+            let pulled = e
+                .service
+                .pull_with_client(&client, &name, tx)
+                .await
+                .unwrap();
+
+            // a commit: another image of the same layers, with a local name
+            let mut record = e.db.list_images().await.unwrap()[0].clone();
+            let committed = "c".repeat(64);
+            record.id = committed.clone();
+            record.manifest_digest = sha(b"another manifest");
+            e.db.insert_image(&record).await.unwrap();
+            for (i, l) in
+                e.db.get_image_layers(&pulled.id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+            {
+                e.db.insert_image_layer(&committed, &l.key, i as i32)
+                    .await
+                    .unwrap();
+            }
+            e.db.insert_image_tag(&velarx_db::ImageTag {
+                repository: "localhost/committed".into(),
+                tag: "latest".into(),
+                image_id: committed.clone(),
+            })
+            .await
+            .unwrap();
+
             let service = StoreService::new(e.db.clone(), e.store.clone())
                 .await
                 .unwrap();
@@ -439,46 +571,18 @@ async fn test_names_are_not_given_and_a_private_image_is_not_listed() {
             let socket = serve(dir.path(), service).await;
             let mut conn = store_service::connect(&socket).await.unwrap();
             let listed = store_service::image_list(&mut conn).await.unwrap();
-            assert_eq!(listed.len(), 1);
-            assert!(listed[0].complete);
-            assert!(listed[0].tags.is_empty() && listed[0].repo_digests.is_empty());
-            let name = format!("{}/test:latest", e.host);
-            assert!(matches!(
-                conn.image_inspect(&name).await.unwrap(),
-                Err(StoreError::NotFound { .. })
-            ));
-            assert_eq!(
-                conn.image_inspect(&result.id).await.unwrap().unwrap().image,
-                listed[0]
-            );
-
-            // another image, pulled with credentials: private
-            let mut items = sample();
-            items.push(Item::File {
-                name: "etc/private",
-                data: b"private\n".to_vec(),
-                chunk: 4096,
-            });
-            let private = build_chunked(&items);
-            e.publish(&[&private], &[ZSTD]);
-            let client = e.client().with_access(&RegistryAccess {
-                creds: Some(Credentials::basic("alice", "secret")),
-                ..Default::default()
-            });
-            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-            tokio::spawn(async move { while rx.recv().await.is_some() {} });
-            let secret = e
-                .service
-                .pull_with_client(&client, &name, tx)
-                .await
-                .unwrap();
-            assert_ne!(secret.id, result.id);
-            let listed = store_service::image_list(&mut conn).await.unwrap();
-            assert_eq!(listed.len(), 1);
-            assert!(matches!(
-                conn.image_inspect(&secret.id).await.unwrap(),
-                Err(StoreError::NotFound { .. })
-            ));
+            assert_eq!(listed.len(), 2);
+            for (id, tag) in [
+                (&pulled.id, name.as_str()),
+                (&committed, "localhost/committed:latest"),
+            ] {
+                let image = listed.iter().find(|i| &i.id == id).unwrap();
+                assert_eq!(image.tags, vec![tag.to_string()]);
+                assert_eq!(
+                    conn.image_inspect(tag).await.unwrap().unwrap().image,
+                    *image
+                );
+            }
         })
         .await;
 }
@@ -492,22 +596,17 @@ fn assert_read_only_file(fd: &OwnedFd) {
         .is_file());
 }
 
-/// The index of a shareable gzip layer comes in a file with no name.
+/// The index of a gzip layer comes in a file with no name.
 #[tokio::test]
-async fn test_the_index_of_a_shared_layer_is_a_file_with_no_name() {
+async fn test_the_index_of_a_layer_is_a_file_with_no_name() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let layer = build_gzip(&sample());
-            let e = env_sharing().await;
+            let e = env().await;
             e.publish(&[&layer], &[GZIP]);
             e.pull().await.unwrap();
             let digest = sha(&layer.blob);
-            assert!(e
-                .db
-                .is_layer_shareable(&stored_key(&e.db, &digest).await)
-                .await
-                .unwrap());
 
             let service = StoreService::new(e.db.clone(), e.store.clone())
                 .await
@@ -541,7 +640,7 @@ async fn test_subscribers_learn_what_another_process_commits() {
             let writer = velarx_db::Database::open(&db_path).await.unwrap();
             let e = env_on(
                 writer,
-                sharing(),
+                velarx_config::PullConfig::default(),
                 velarx_config::PushConfig::default(),
                 Fetchers::default(),
                 None,
@@ -779,7 +878,7 @@ async fn test_the_pieces_of_a_shared_checkpoint_are_given_and_announced() {
     local
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
-            let e = env_sharing().await;
+            let e = env().await;
             let shared = std::sync::Arc::new(SharedCheckpoints::new(dir.path()).unwrap());
             let archive = |name: &str, data: &[u8]| {
                 let path = dir.path().join(name);
@@ -848,71 +947,42 @@ async fn test_the_pieces_of_a_shared_checkpoint_are_given_and_announced() {
         .await;
 }
 
-/// The startup profile of an image a shareable pull recorded, whose layers
-/// may all be given, is a read-only file; a private image's is not given,
-/// nor asked of the peers.
+/// The startup profile of an image is a read-only file of the store, when
+/// it is at most what the asker takes.
 #[tokio::test]
-async fn test_the_profile_of_a_shared_image_is_given() {
+async fn test_the_profile_of_an_image_is_given() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            for (shared, given) in [(true, true), (false, false)] {
-                let layer = build_chunked(&sample());
-                let e = if shared {
-                    env_sharing().await
-                } else {
-                    env().await
-                };
-                e.publish(&[&layer], &[ZSTD]);
-                e.pull().await.unwrap();
-                let id = e.db.list_images().await.unwrap()[0].id.clone();
-                let profile = velarx_fuse::composefs::profile_path(e.store.root(), &id);
-                let text = format!(r#"{{"v":1,"files":["{}"]}}"#, vid(b"hello\n"));
-                std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
-                std::fs::write(&profile, &text).unwrap();
+            let layer = build_chunked(&sample());
+            let e = env().await;
+            e.publish(&[&layer], &[ZSTD]);
+            e.pull().await.unwrap();
+            let id = e.db.list_images().await.unwrap()[0].id.clone();
+            let profile = velarx_fuse::composefs::profile_path(e.store.root(), &id);
+            let text = format!(r#"{{"v":1,"files":["{}"]}}"#, vid(b"hello\n"));
+            std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+            std::fs::write(&profile, &text).unwrap();
 
-                let service = StoreService::new(e.db.clone(), e.store.clone())
-                    .await
-                    .unwrap();
-                let dir = tempfile::tempdir().unwrap();
-                let socket = serve(dir.path(), service).await;
-                let mut conn = store_service::connect(&socket).await.unwrap();
-                let image = format!("sha256:{id}");
-                let (reply, fds) = conn.profile(&image, 1 << 20).await.unwrap();
-                assert_eq!(reply.is_ok(), given, "shared: {shared}");
-                if let Ok(reply) = reply {
-                    assert_read_only_file(&fds[reply.file as usize]);
-                    assert_eq!(whole(&fds[reply.file as usize]), text.as_bytes());
-                    // bigger than the asker takes: nothing to give
-                    let (small, _) = conn.profile(&image, 4).await.unwrap();
-                    assert!(not_found(small));
-                } else {
-                    assert!(not_found(reply));
-                }
-                let (reply, _) = conn
-                    .profile(&sha(b"no image").to_string(), 1 << 20)
-                    .await
-                    .unwrap();
-                assert!(not_found(reply));
-
-                // the same layers in an image no shareable pull recorded (a
-                // commit that adds only settings): not given
-                let copy = "c".repeat(64);
-                let mut record = e.db.list_images().await.unwrap()[0].clone();
-                record.id = copy.clone();
-                record.manifest_digest = sha(b"another manifest");
-                e.db.insert_image(&record).await.unwrap();
-                for (i, l) in e.db.get_image_layers(&id).await.unwrap().iter().enumerate() {
-                    e.db.insert_image_layer(&copy, &l.key, i as i32)
-                        .await
-                        .unwrap();
-                }
-                let copy_profile = velarx_fuse::composefs::profile_path(e.store.root(), &copy);
-                std::fs::write(&copy_profile, &text).unwrap();
-                let copy = format!("sha256:{copy}");
-                let (reply, _) = conn.profile(&copy, 1 << 20).await.unwrap();
-                assert!(not_found(reply), "shared: {shared}");
-            }
+            let service = StoreService::new(e.db.clone(), e.store.clone())
+                .await
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let socket = serve(dir.path(), service).await;
+            let mut conn = store_service::connect(&socket).await.unwrap();
+            let image = format!("sha256:{id}");
+            let (reply, fds) = conn.profile(&image, 1 << 20).await.unwrap();
+            let reply = reply.unwrap();
+            assert_read_only_file(&fds[reply.file as usize]);
+            assert_eq!(whole(&fds[reply.file as usize]), text.as_bytes());
+            // bigger than the asker takes: nothing to give
+            let (small, _) = conn.profile(&image, 4).await.unwrap();
+            assert!(not_found(small));
+            let (reply, _) = conn
+                .profile(&sha(b"no image").to_string(), 1 << 20)
+                .await
+                .unwrap();
+            assert!(not_found(reply));
         })
         .await;
 }
