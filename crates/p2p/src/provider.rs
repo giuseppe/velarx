@@ -1489,7 +1489,7 @@ impl PeerSource {
                 reason,
             });
             // (the engine goes on to its next source)
-            tracing::info!(parent: &span, missing, reason, "left to the next source");
+            tracing::debug!(parent: &span, missing, reason, "left to the next source");
         }
         result
     }
