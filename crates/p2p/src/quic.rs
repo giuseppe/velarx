@@ -31,6 +31,20 @@
 //! endpoint is known ([`Quic::warm`]) and kept while both ends live, so a
 //! request is one round trip.
 //!
+//! One connection is driven by one task (packets, encryption, acknowledgements)
+//! and a UDP socket is received from by one task: on a fast link those, not
+//! the link or the windows, bound what a peer gets.  So the lanes of a big
+//! request ([`SPREAD_MIN_BYTES`]) go over up to [`EXTRAS_PER_PEER`] extra
+//! connections to the same peer as well, each from a socket of its own
+//! ([`Quic::vias`]): made when such a request comes, with the same handshake
+//! and proofs, kept while requests use them and closed after
+//! [`Limits::extra_idle`] without one.  An extra
+//! connection names the server [`EXTRA_NAME`] in its handshake, and the server
+//! admits one only while it holds less than half of its connections, and at
+//! most [`EXTRAS_PER_PEER`] from an address: what the swarm may take of its
+//! connections for the primary ones stays.  A lane whose extra connection
+//! cannot be made or fails asks the primary connection instead.
+//!
 //! A request is a bidirectional stream: an operation (u8), its urgency (u8:
 //! 0 background, 1 ahead, 2 wait, 3 on demand), a count (u16),
 //! that many algorithm bytes (1 for a sha256, 2 for a sha512) and then the
@@ -168,6 +182,25 @@ const CONNECT: Duration = Duration::from_secs(3);
 /// at once (one attempt of [`CONNECT`] seconds, not one for each).
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-velarx-chunks";
+/// The server name a connection gives in its handshake (the certificates
+/// are not checked against it).
+const SERVER_NAME: &str = "velarx";
+/// The server name of an extra connection: the server tells it from the
+/// primary one by it (a server that does not know it serves it as any).
+const EXTRA_NAME: &str = "bulk.velarx";
+/// The code a server closes an extra connection with when it has no place
+/// for it.
+const NO_PLACE: u32 = 2;
+/// A request for chunks of at least this many bytes spreads its lanes over
+/// extra connections to the peer.
+pub const SPREAD_MIN_BYTES: u64 = 4 << 20;
+/// The bytes of a spread request a connection carries, at least.
+const SPREAD_SHARE: u64 = 2 << 20;
+/// The extra connections to one peer, at most (and what a server admits
+/// from one address).
+pub const EXTRAS_PER_PEER: usize = 3;
+/// The extra connections a node has open to all its peers, at most.
+const EXTRAS_IN_ALL: usize = 32;
 const CLIENT: &[u8] = b"client";
 const SERVER: &[u8] = b"server";
 
@@ -191,6 +224,8 @@ pub struct Limits {
     /// on one stream that it has not read yet (four times that on all the
     /// streams of a connection).  A connection moves a window a round trip.
     pub window: u64,
+    /// How long an extra connection that no request uses is kept.
+    pub extra_idle: Duration,
 }
 
 impl Default for Limits {
@@ -202,6 +237,7 @@ impl Default for Limits {
             idle: Duration::from_secs(30),
             grace: Duration::from_secs(10),
             window: 8 << 20,
+            extra_idle: Duration::from_secs(5),
         }
     }
 }
@@ -328,6 +364,15 @@ pub struct Quic {
     /// The address the endpoint was bound to
     addr: SocketAddr,
     connections: Mutex<HashMap<SocketAddr, Slot>>,
+    /// The extra connections to each peer, for the lanes of big requests
+    extras: Mutex<HashMap<SocketAddr, Arc<Mutex<Extras>>>>,
+    /// The extra connections the node may still make, to all peers
+    extra_places: Arc<Semaphore>,
+    /// What an extra connection is made with
+    extra_client: ClientConfig,
+    extra_idle: Duration,
+    /// The window of a connection (`Limits::window`)
+    window: u64,
     /// The addresses no connection could be made to, when and why
     unreachable: Mutex<HashMap<SocketAddr, (tokio::time::Instant, String)>>,
     served: Arc<std::sync::atomic::AtomicU64>,
@@ -344,6 +389,83 @@ pub struct Quic {
     dial: Arc<crate::dial_filter::DialFilter>,
     #[cfg(test)]
     held: Arc<Held>,
+    /// The connections the server holds, of how many
+    #[cfg(test)]
+    server_connections: (Arc<Semaphore>, usize),
+}
+
+/// The extra connections to one peer.
+#[derive(Default)]
+struct Extras {
+    open: Vec<Extra>,
+    /// When one could not be made: none is tried for [`Limits::extra_idle`]
+    failed: Option<tokio::time::Instant>,
+    /// Some are being made ([`Quic::make_extras`])
+    making: bool,
+}
+
+impl Extras {
+    fn close(&self, why: &[u8]) {
+        for extra in &self.open {
+            extra.connection.close(0u32.into(), why);
+        }
+    }
+}
+
+/// An extra connection to a peer.
+#[derive(Clone)]
+struct Extra {
+    connection: quinn::Connection,
+    /// Its endpoint: a socket of its own ([`Quic::connect_extra`])
+    _endpoint: Endpoint,
+    /// The lanes on it now, and when the last one ended
+    used: Arc<Mutex<(usize, tokio::time::Instant)>>,
+    /// Its place among the extra connections of the node
+    _place: Arc<OwnedSemaphorePermit>,
+}
+
+/// The connection a lane of a request goes over.
+pub enum Via {
+    /// The connection to the peer
+    Primary,
+    /// An extra connection, used while this is held
+    Extra(Lane),
+}
+
+/// A lane on an extra connection.
+pub struct Lane(Extra);
+
+impl Lane {
+    fn on(extra: &Extra) -> Self {
+        extra.used.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+        Lane(extra.clone())
+    }
+}
+
+impl Drop for Lane {
+    fn drop(&mut self) {
+        let mut used = self.0.used.lock().unwrap_or_else(|e| e.into_inner());
+        *used = (used.0 - 1, tokio::time::Instant::now());
+    }
+}
+
+/// The extra connections a request for `bytes` bytes in `lanes` lanes is
+/// spread over: none below [`SPREAD_MIN_BYTES`], else a connection for each
+/// [`SPREAD_SHARE`], at most one a lane and the primary and
+/// [`EXTRAS_PER_PEER`] extra ones.  A request that is `waited` for uses the
+/// primary connection too; one nobody waits for leaves it to those that are.
+fn extras_for(bytes: u64, lanes: usize, waited: bool) -> usize {
+    if bytes < SPREAD_MIN_BYTES {
+        return 0;
+    }
+    let connections = usize::try_from(bytes / SPREAD_SHARE)
+        .unwrap_or(usize::MAX)
+        .min(1 + EXTRAS_PER_PEER)
+        .min(lanes);
+    match waited {
+        true => connections - 1,
+        false => connections.min(EXTRAS_PER_PEER),
+    }
 }
 
 /// The bytes of chunks the server has read from its store and not yet
@@ -587,6 +709,15 @@ impl Reply {
     pub fn later(self) -> Vec<(String, Option<u64>)> {
         self.later
     }
+
+    /// What did not come of an answer that failed: what the server had no
+    /// room for, the chunk it was sending and the ones after it.
+    fn unanswered(self) -> Vec<(String, Option<u64>)> {
+        let from = self.next.saturating_sub(1);
+        let mut left = self.later;
+        left.extend(self.asked.into_iter().skip(from));
+        left
+    }
 }
 
 impl Quic {
@@ -670,14 +801,21 @@ impl Quic {
 
         let client = client_config(client_transport_of(&limits), &auth)?;
         endpoint.set_default_client_config(client);
+        let extra_client = client_config(extra_transport(&limits), &auth)?;
 
         let addr = endpoint.local_addr()?;
         let port = addr.port();
+        let connections = Arc::new(Semaphore::new(limits.connections));
         let this = Arc::new(Self {
             endpoint: endpoint.clone(),
             port,
             addr,
             connections: Mutex::new(HashMap::new()),
+            extras: Mutex::default(),
+            extra_places: Arc::new(Semaphore::new(EXTRAS_IN_ALL)),
+            extra_client,
+            extra_idle: limits.extra_idle,
+            window: limits.window,
             unreachable: Mutex::default(),
             served: Arc::default(),
             slots: Slots::new(limits.serving),
@@ -688,6 +826,8 @@ impl Quic {
             received: Arc::default(),
             #[cfg(test)]
             held: Arc::default(),
+            #[cfg(test)]
+            server_connections: (connections.clone(), limits.connections),
         });
         let server = Arc::new(Server {
             provider,
@@ -695,7 +835,8 @@ impl Quic {
             served: this.served.clone(),
             auth,
             limits,
-            connections: Arc::new(Semaphore::new(limits.connections)),
+            connections,
+            extras: Arc::default(),
             admission,
             #[cfg(test)]
             held: this.held.clone(),
@@ -718,6 +859,18 @@ impl Quic {
                             return;
                         }
                     };
+                    let _extra = match is_extra(&connection) {
+                        true => match server.admit_extra(ip) {
+                            Some(place) => Some(place),
+                            None => {
+                                debug!("Extra QUIC connection from {ip} refused: no place");
+                                connection
+                                    .close(NO_PLACE.into(), b"no place for an extra connection");
+                                return;
+                            }
+                        },
+                        false => None,
+                    };
                     server.connection(connection, ip).await;
                 });
             }
@@ -739,6 +892,21 @@ impl Quic {
     /// more and lets go of its socket.
     pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"shutdown");
+        // (the extra connections have endpoints of their own: closed too,
+        // so that the peers do not hold them for a node that has gone)
+        let extras: Vec<_> = self
+            .extras
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, extras)| extras)
+            .collect();
+        for extras in extras {
+            extras
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .close(b"shutdown");
+        }
     }
 
     /// The UDP port the endpoint listens on.
@@ -753,11 +921,24 @@ impl Quic {
 
     /// Ask the peer at `addr` for the chunks `digests` (with their sizes,
     /// when known): what it has comes in the order asked.
+    #[cfg(test)]
     pub async fn request(
         self: &Arc<Self>,
         addr: SocketAddr,
         digests: &[(String, Option<u64>)],
         urgency: Urgency,
+    ) -> io::Result<Reply> {
+        self.request_via(addr, digests, urgency, &Via::Primary)
+            .await
+    }
+
+    /// [`Quic::request`] over the connection `via`.
+    async fn request_via(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        digests: &[(String, Option<u64>)],
+        urgency: Urgency,
+        via: &Via,
     ) -> io::Result<Reply> {
         if digests.is_empty() || digests.len() > MAX_REQUEST_DIGESTS {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -766,7 +947,7 @@ impl Quic {
         head.extend_from_slice(&[OP_CHUNKS, urgency as u8]);
         head.extend_from_slice(&(digests.len() as u16).to_be_bytes());
         head.extend_from_slice(&digests_wire(digests.iter().map(|(d, _)| d.as_str()))?);
-        let (send, recv) = self.open(addr, &head).await?;
+        let (send, recv) = self.open(addr, &head, via).await?;
         Ok(Reply {
             _send: send,
             recv,
@@ -788,16 +969,18 @@ impl Quic {
 
     /// The chunks `digests` the peer at `addr` has, with their bytes (not
     /// yet checked against their digests), in as many requests as it takes,
-    /// into `out` as each arrives; how many came.  A peer that could not
-    /// read its store for any of them and sent none is an error
-    /// ([`store_failed`]), not an answer without chunks; so is one that sent
-    /// none and had no room for some ([`no_room`]).
+    /// over the connection `via`, into `out` as each arrives; how many came.
+    /// A peer that could not read its store for any of them and sent none is
+    /// an error ([`store_failed`]), not an answer without chunks; so is one
+    /// that sent none and had no room for some ([`no_room`]).  When an extra
+    /// connection fails, what did not come is asked over the primary one.
     pub async fn fetch_into(
         self: &Arc<Self>,
         addr: SocketAddr,
         digests: &[(String, Option<u64>)],
         urgency: Urgency,
         out: crate::ChunkTx,
+        mut via: Via,
     ) -> io::Result<usize> {
         if digests.is_empty() || digests.len() > MAX_REQUEST_DIGESTS {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -808,12 +991,35 @@ impl Quic {
         // an answer that brings nothing ends it
         while !asked.is_empty() {
             let before = found;
-            let mut reply = self.request(addr, &asked, urgency).await?;
-            while let Some(chunk) = reply.next().await? {
-                out.send(chunk)
-                    .await
-                    .map_err(|_| io::Error::other("nobody takes the chunks"))?;
-                found += 1;
+            let mut reply = match self.request_via(addr, &asked, urgency, &via).await {
+                Ok(reply) => reply,
+                Err(e) if matches!(via, Via::Extra(_)) => {
+                    debug!("An extra QUIC connection to {addr} failed: {e}");
+                    via = Via::Primary;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let ended = loop {
+                match reply.next().await {
+                    Ok(Some(chunk)) => {
+                        out.send(chunk)
+                            .await
+                            .map_err(|_| io::Error::other("nobody takes the chunks"))?;
+                        found += 1;
+                    }
+                    Ok(None) => break None,
+                    Err(e) => break Some(e),
+                }
+            };
+            if let Some(e) = ended {
+                if matches!(via, Via::Primary) {
+                    return Err(e);
+                }
+                debug!("An extra QUIC connection to {addr} failed: {e}");
+                via = Via::Primary;
+                asked = reply.unanswered();
+                continue;
             }
             failed |= reply.failed;
             let later = reply.later();
@@ -840,7 +1046,7 @@ impl Quic {
     ) -> io::Result<Vec<(String, Vec<u8>)>> {
         let (tx, mut rx) = tokio::sync::mpsc::channel(crate::CHUNKS_IN_FLIGHT);
         let (done, found) = futures::join!(
-            self.fetch_into(addr, digests, Urgency::Wait, tx),
+            self.fetch_into(addr, digests, Urgency::Wait, tx, Via::Primary),
             async move {
                 let mut found = Vec::new();
                 while let Some(chunk) = rx.recv().await {
@@ -894,7 +1100,7 @@ impl Quic {
         let mut head = vec![op, Urgency::Wait as u8, 0, 1];
         head.extend_from_slice(&digests_wire(std::iter::once(layer))?);
         head.extend_from_slice(&max.to_be_bytes());
-        let (_send, mut recv) = self.open(addr, &head).await?;
+        let (_send, mut recv) = self.open(addr, &head, &Via::Primary).await?;
         let mut status = [0u8; 1];
         read(&mut recv, &mut status, self.idle).await?;
         if status[0] == ABSENT {
@@ -923,7 +1129,7 @@ impl Quic {
     pub async fn has(self: &Arc<Self>, addr: SocketAddr, digest: &str) -> io::Result<Presence> {
         let mut head = vec![OP_PROBE, Urgency::Wait as u8, 0, 1];
         head.extend_from_slice(&digests_wire(std::iter::once(digest))?);
-        let (_send, mut recv) = self.open(addr, &head).await?;
+        let (_send, mut recv) = self.open(addr, &head, &Via::Primary).await?;
         let mut status = [0u8; 1];
         read(&mut recv, &mut status, self.idle).await?;
         match status[0] {
@@ -935,15 +1141,20 @@ impl Quic {
         }
     }
 
-    /// A stream to the peer at `addr` with the request `head` sent; a
-    /// connection that has gone is made again once.
+    /// A stream to the peer at `addr` over the connection `via` with the
+    /// request `head` sent; a primary connection that has gone is made
+    /// again once.
     async fn open(
         self: &Arc<Self>,
         addr: SocketAddr,
         head: &[u8],
+        via: &Via,
     ) -> io::Result<(quinn::SendStream, quinn::RecvStream)> {
         for attempt in 0..2 {
-            let connection = self.connection(addr).await?;
+            let connection = match via {
+                Via::Primary => self.connection(addr).await?,
+                Via::Extra(lane) => lane.0.connection.clone(),
+            };
             // (a peer that holds all the streams it allows, its requests
             // stuck, gives no place for another: that is no wait for ever)
             let opened = tokio::time::timeout(self.idle, async {
@@ -956,7 +1167,11 @@ impl Quic {
             .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "QUIC open")));
             match opened {
                 Ok(streams) => return Ok(streams),
-                Err(e) if attempt == 0 && connection.close_reason().is_some() => {
+                Err(e)
+                    if attempt == 0
+                        && matches!(via, Via::Primary)
+                        && connection.close_reason().is_some() =>
+                {
                     debug!("QUIC connection to {addr} was closed: {e}");
                 }
                 Err(e) => return Err(e),
@@ -993,6 +1208,171 @@ impl Quic {
                 }
             }
         }
+        let extras = self
+            .extras
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&addr);
+        if let Some(extras) = extras {
+            extras
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .close(b"gone");
+        }
+    }
+
+    /// The connections the `lanes` lanes of a request for `bytes` bytes of
+    /// `urgency` to the peer at `addr` go over, one for each lane in turn:
+    /// the primary connection, and for a big request the extra ones there
+    /// are ([`extras_for`]); those that are missing are made in the
+    /// background for the requests that follow.  A request nobody waits for
+    /// goes over the extra connections only, when there are.
+    pub fn vias(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        bytes: u64,
+        urgency: Urgency,
+        lanes: usize,
+    ) -> Vec<Via> {
+        let waited = urgency >= Urgency::Wait;
+        let wanted = extras_for(bytes, lanes, waited);
+        if wanted == 0 {
+            return (0..lanes).map(|_| Via::Primary).collect();
+        }
+        let of_peer = self
+            .extras
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(addr)
+            .or_default()
+            .clone();
+        let mut extras = of_peer.lock().unwrap_or_else(|e| e.into_inner());
+        // (a server that had no place for one closes it at once, also when
+        // no proof is exchanged: not tried again for a while either)
+        if extras.open.iter().any(|e| refused(&e.connection)) {
+            extras.failed = Some(tokio::time::Instant::now());
+        }
+        extras
+            .open
+            .retain(|e| e.connection.close_reason().is_none());
+        let tried_lately = extras
+            .failed
+            .is_some_and(|at| at.elapsed() < self.extra_idle);
+        if !extras.making && !tried_lately {
+            let places: Vec<OwnedSemaphorePermit> = (extras.open.len()..wanted)
+                .map_while(|_| self.extra_places.clone().try_acquire_owned().ok())
+                .collect();
+            if !places.is_empty() {
+                extras.making = true;
+                self.make_extras(addr, of_peer.clone(), places);
+            }
+        }
+        let mut ways: Vec<Option<&Extra>> = extras.open.iter().take(wanted).map(Some).collect();
+        if waited || ways.is_empty() {
+            ways.insert(0, None);
+        }
+        (0..lanes)
+            .map(|lane| match ways[lane % ways.len()] {
+                Some(extra) => Via::Extra(Lane::on(extra)),
+                None => Via::Primary,
+            })
+            .collect()
+    }
+
+    /// Make an extra connection to `addr` for each of `places`, into
+    /// `extras` (the peer's, while it is not forgotten nor the node closed).
+    fn make_extras(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        extras: Arc<Mutex<Extras>>,
+        places: Vec<OwnedSemaphorePermit>,
+    ) {
+        let quic = self.clone();
+        tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            let made = futures::future::join_all(places.into_iter().map(|place| {
+                let quic = &quic;
+                async move {
+                    let (endpoint, connection) = quic.connect_extra(addr).await?;
+                    Ok::<_, io::Error>(Extra {
+                        connection,
+                        _endpoint: endpoint,
+                        used: Arc::new(Mutex::new((0, tokio::time::Instant::now()))),
+                        _place: Arc::new(place),
+                    })
+                }
+            }))
+            .await;
+            let mut of_peer = extras.lock().unwrap_or_else(|e| e.into_inner());
+            of_peer.making = false;
+            let kept = quic
+                .extras
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&addr)
+                .is_some_and(|e| Arc::ptr_eq(e, &extras));
+            for extra in made {
+                match extra {
+                    Ok(extra) if kept => {
+                        quic.retire(addr, extra.clone());
+                        of_peer.open.push(extra);
+                    }
+                    Ok(extra) => extra.connection.close(0u32.into(), b"gone"),
+                    Err(e) => {
+                        debug!("No extra QUIC connection to {addr}: {e}");
+                        of_peer.failed = Some(tokio::time::Instant::now());
+                    }
+                }
+            }
+            debug!(
+                "{} extra QUIC connections to {addr}, made in {} us",
+                of_peer.open.len(),
+                started.elapsed().as_micros()
+            );
+        });
+    }
+
+    /// Close the extra connection `extra` to `addr` once it has been
+    /// without a lane for [`Limits::extra_idle`], or when it is closed.
+    fn retire(self: &Arc<Self>, addr: SocketAddr, extra: Extra) {
+        let quic = Arc::downgrade(self);
+        let idle = self.extra_idle;
+        tokio::spawn(async move {
+            loop {
+                let (lanes, last) = *extra.used.lock().unwrap_or_else(|e| e.into_inner());
+                let due = last + idle;
+                let closed = extra.connection.close_reason().is_some();
+                if !closed && (lanes > 0 || due > tokio::time::Instant::now()) {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(due.max(tokio::time::Instant::now() + idle / 4)) => {}
+                        _ = extra.connection.closed() => {}
+                    }
+                    continue;
+                }
+                let Some(quic) = quic.upgrade() else {
+                    return;
+                };
+                let extras = quic
+                    .extras
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&addr)
+                    .cloned();
+                if let Some(extras) = extras {
+                    // (a lane is put on it under this lock: it is idle or
+                    // closed here, or taken again)
+                    let mut extras = extras.lock().unwrap_or_else(|e| e.into_inner());
+                    let (lanes, last) = *extra.used.lock().unwrap_or_else(|e| e.into_inner());
+                    if !closed && (lanes > 0 || last + idle > tokio::time::Instant::now()) {
+                        continue;
+                    }
+                    let id = extra.connection.stable_id();
+                    extras.open.retain(|e| e.connection.stable_id() != id);
+                }
+                extra.connection.close(0u32.into(), b"idle");
+                return;
+            }
+        });
     }
 
     /// The connection to `addr`, made (and both proofs exchanged) if there
@@ -1020,7 +1400,7 @@ impl Quic {
         // peer costs one attempt, not one for each round.
         let this = self.clone();
         tokio::spawn(async move {
-            match this.connect(addr).await {
+            match this.connect(addr, None).await {
                 Ok(connection) => {
                     this.unreachable
                         .lock()
@@ -1102,14 +1482,43 @@ impl Quic {
             .insert(addr, peer);
     }
 
-    /// One attempt to connect to `addr`, and the proofs.
-    async fn connect(&self, addr: SocketAddr) -> io::Result<quinn::Connection> {
+    /// An extra connection to `addr`, from an endpoint of its own: one task
+    /// receives from a UDP socket, which on a fast link bounds the
+    /// connections that share it.
+    async fn connect_extra(&self, addr: SocketAddr) -> io::Result<(Endpoint, quinn::Connection)> {
+        let socket = std::net::UdpSocket::bind(SocketAddr::new(self.addr.ip(), 0))?;
+        rustix::net::sockopt::set_socket_recv_buffer_size(
+            &socket,
+            usize::try_from(self.window).unwrap_or(usize::MAX),
+        )?;
+        let endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?;
+        let connection = self.connect(addr, Some(&endpoint)).await?;
+        Ok((endpoint, connection))
+    }
+
+    /// One attempt to connect to `addr`, and the proofs; from `extra`, an
+    /// extra connection, which names itself to the server as one
+    /// ([`EXTRA_NAME`]).
+    async fn connect(
+        &self,
+        addr: SocketAddr,
+        extra: Option<&Endpoint>,
+    ) -> io::Result<quinn::Connection> {
         // (the same filter as the TCP transport's: where the node dials is
         // not for a peer to say)
         if let Err(refused) = self.dial.check_ip(addr.ip()) {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, refused));
         }
-        let connecting = self.endpoint.connect(addr, "velarx").map_err(other)?;
+        let connecting = match extra {
+            Some(endpoint) => endpoint.connect_with(self.extra_client.clone(), addr, EXTRA_NAME),
+            None => self.endpoint.connect(addr, SERVER_NAME),
+        }
+        .map_err(other)?;
         let connection = tokio::time::timeout(CONNECT, connecting)
             .await
             .map_err(|_| {
@@ -1194,6 +1603,32 @@ fn client_transport_of(limits: &Limits) -> TransportConfig {
     // (the requests are a few bytes)
     t.send_window(64 << 10);
     t
+}
+
+/// What the client side of an extra connection accepts: as the primary one,
+/// with the window of one stream for all its streams (it carries a lane or
+/// two of a request: what a peer may have sent unread grows by little).
+fn extra_transport(limits: &Limits) -> TransportConfig {
+    let mut t = client_transport_of(limits);
+    t.receive_window(window(limits.window));
+    t
+}
+
+/// Whether the server closed `connection` because it had no place for it.
+fn refused(connection: &quinn::Connection) -> bool {
+    matches!(
+        connection.close_reason(),
+        Some(quinn::ConnectionError::ApplicationClosed(c)) if c.error_code == NO_PLACE.into()
+    )
+}
+
+/// Whether `connection` is an extra connection of its peer ([`EXTRA_NAME`]).
+fn is_extra(connection: &quinn::Connection) -> bool {
+    connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.server_name)
+        .is_some_and(|name| name == EXTRA_NAME)
 }
 
 /// What the server side accepts: the client's proof and its requests,
@@ -1353,6 +1788,22 @@ impl Drop for Place {
     }
 }
 
+/// The place of an extra connection of an address, given back when it is
+/// dropped.
+struct ExtraPlace(Arc<Mutex<HashMap<IpAddr, usize>>>, IpAddr);
+
+impl Drop for ExtraPlace {
+    fn drop(&mut self) {
+        let mut extras = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = extras.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                extras.remove(&self.1);
+            }
+        }
+    }
+}
+
 /// The state of the serving side.
 struct Server {
     provider: SharedProvider,
@@ -1361,6 +1812,8 @@ struct Server {
     auth: Auth,
     limits: Limits,
     connections: Arc<Semaphore>,
+    /// The extra connections of each address
+    extras: Arc<Mutex<HashMap<IpAddr, usize>>>,
     /// What each address may ask for, and what all may take
     admission: Arc<Admission>,
     #[cfg(test)]
@@ -1372,6 +1825,20 @@ impl Server {
     /// all taken.
     fn admit(&self) -> Option<OwnedSemaphorePermit> {
         self.connections.clone().try_acquire_owned().ok()
+    }
+
+    /// The place of an extra connection from `ip` (admitted, [`Server::admit`]):
+    /// there is one while the server holds at most half of its connections,
+    /// and fewer than [`EXTRAS_PER_PEER`] extra ones of `ip`.
+    fn admit_extra(&self, ip: IpAddr) -> Option<ExtraPlace> {
+        let held = self.limits.connections - self.connections.available_permits();
+        let mut extras = self.extras.lock().unwrap_or_else(|e| e.into_inner());
+        let of_ip = extras.get(&ip).copied().unwrap_or(0);
+        if held > self.limits.connections / 2 || of_ip >= EXTRAS_PER_PEER {
+            return None;
+        }
+        extras.insert(ip, of_ip + 1);
+        Some(ExtraPlace(self.extras.clone(), ip))
     }
 
     /// The proofs, then the streams of a connection from `ip` (its prefix),
@@ -1645,32 +2112,113 @@ impl Server {
                     wave.iter().map(|_| Err(())).collect()
                 }
             };
+            // The files of the store that fit in a piece of credit are sent
+            // in runs: the credit, one read and one write for all the
+            // chunks of a run; the others one by one.
+            let piece = self.admission.piece();
+            let mut run: Vec<ChunkFile> = Vec::new();
             for (digest, file) in wave.iter().zip(opened) {
-                let sent = match file {
-                    _ if full => Sent::No,
-                    Ok(file) => {
-                        self.chunk(
-                            answer,
-                            provider,
-                            digest,
-                            (file, by_bytes),
-                            &mut payload,
-                            &mut full,
-                        )
-                        .await?
-                    }
-                    Err(()) => Sent::Failed,
+                let joins = |c: &ChunkFile, payload: u64| {
+                    !full
+                        && c.len > 0
+                        && c.len <= piece
+                        && (payload == 0 || payload + c.len <= MAX_RESPONSE_PAYLOAD as u64)
                 };
-                match sent {
-                    Sent::Yes => {
-                        self.served
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match file {
+                    Ok(Some(c)) if joins(&c, payload) => {
+                        if run.iter().map(|r| r.len).sum::<u64>() + c.len > piece {
+                            self.send_run(answer, std::mem::take(&mut run), &mut full)
+                                .await?;
+                        }
+                        if full {
+                            answer.write(&[NO_ROOM]).await?;
+                            continue;
+                        }
+                        payload += c.len;
+                        run.push(c);
                     }
-                    Sent::No => answer.write(&[if full { NO_ROOM } else { ABSENT }]).await?,
-                    Sent::Failed => answer.write(&[FAILED]).await?,
+                    file => {
+                        self.send_run(answer, std::mem::take(&mut run), &mut full)
+                            .await?;
+                        let sent = match file {
+                            _ if full => Sent::No,
+                            Ok(file) => {
+                                self.chunk(
+                                    answer,
+                                    provider,
+                                    digest,
+                                    (file, by_bytes),
+                                    &mut payload,
+                                    &mut full,
+                                )
+                                .await?
+                            }
+                            Err(()) => Sent::Failed,
+                        };
+                        match sent {
+                            Sent::Yes => {
+                                self.served
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Sent::No => {
+                                answer.write(&[if full { NO_ROOM } else { ABSENT }]).await?
+                            }
+                            Sent::Failed => answer.write(&[FAILED]).await?,
+                        }
+                    }
                 }
             }
+            self.send_run(answer, run, &mut full).await?;
             drop(slot);
+        }
+        Ok(())
+    }
+
+    /// Send the chunks of `run`, files of the store of a piece of credit at
+    /// most in all, in the order of the request: the credit for all of
+    /// them, one read, one write.  No credit when the next byte is due marks
+    /// the answer `full`, and they have no room.  A file that cannot be read
+    /// is answered "failed" (nothing of it was sent) and the rest of the run
+    /// goes on.
+    async fn send_run(
+        &self,
+        answer: &mut Answer<'_>,
+        mut run: Vec<ChunkFile>,
+        full: &mut bool,
+    ) -> io::Result<()> {
+        if run.is_empty() {
+            return Ok(());
+        }
+        let bytes = run.iter().map(|c| c.len).sum();
+        if !answer.pace(bytes, Some(answer.due(self.limits.idle))).await {
+            *full = true;
+            return answer.write(&vec![NO_ROOM; run.len()]).await;
+        }
+        while !run.is_empty() {
+            let (left, wire, sent, failed) = tokio::task::spawn_blocking(move || {
+                let (wire, sent, failed) = read_run(&run);
+                (run, wire, sent, failed)
+            })
+            .await
+            .map_err(other)?;
+            run = left;
+            #[cfg(test)]
+            self.held.read(run[..sent].iter().map(|c| c.len).sum());
+            if sent > 0 {
+                answer.write_bytes(wire.into()).await?;
+                self.served
+                    .fetch_add(sent as u64, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(test)]
+                self.held.written(run[..sent].iter().map(|c| c.len).sum());
+            }
+            match failed {
+                Some(e) => {
+                    warn!("QUIC: the store cannot give a chunk: {e}");
+                    answer.write(&[FAILED]).await?;
+                    run.drain(..=sent);
+                }
+                None => run.clear(),
+            }
         }
         Ok(())
     }
@@ -1714,7 +2262,7 @@ impl Server {
                     .await
                     .map_err(other)?;
                 match data {
-                    Ok(Some(data)) => (data.len() as u64, Source::Bytes(data)),
+                    Ok(Some(data)) => (data.len() as u64, Source::Bytes(data.into())),
                     Ok(None) => return Ok(Sent::No),
                     Err(e) => {
                         warn!("QUIC: the store cannot give {digest}: {e}");
@@ -1737,16 +2285,14 @@ impl Server {
             *full = true;
             return Ok(Sent::No);
         }
-        let mut source = source;
         let mut at = 0;
         while at < len {
             let n = (len - at).min(piece);
             if at > 0 {
                 answer.pace(n, None).await;
             }
-            let read;
-            let bytes: &[u8] = match &mut source {
-                Source::Bytes(data) => &data[at as usize..(at + n) as usize],
+            let bytes = match &source {
+                Source::Bytes(data) => data.slice(at as usize..(at + n) as usize),
                 Source::File(file, offset) => {
                     let (f, offset) = (file.clone(), *offset + at);
                     let got = tokio::task::spawn_blocking(move || {
@@ -1756,11 +2302,11 @@ impl Server {
                     })
                     .await
                     .map_err(other)?;
-                    read = match got {
+                    match got {
                         Ok(buf) => {
                             #[cfg(test)]
                             self.held.read(n);
-                            buf
+                            buf.into()
                         }
                         Err(e) => {
                             warn!("QUIC: the store cannot give {digest}: {e}");
@@ -1770,8 +2316,7 @@ impl Server {
                             answer.store_failed();
                             return Err(e);
                         }
-                    };
-                    &read
+                    }
                 }
             };
             if at == 0 {
@@ -1780,7 +2325,7 @@ impl Server {
                 head.extend_from_slice(&len.to_be_bytes());
                 answer.write(&head).await?;
             }
-            answer.write(bytes).await?;
+            answer.write_bytes(bytes).await?;
             #[cfg(test)]
             if matches!(source, Source::File(..)) {
                 self.held.written(n);
@@ -1792,11 +2337,31 @@ impl Server {
     }
 }
 
+/// The chunks of `run` as they go on the wire (each its status, its length
+/// and its bytes), read from their files; how many were read, and why the
+/// next one could not be (the bytes are those of the chunks before it).
+/// Blocking.
+fn read_run(run: &[ChunkFile]) -> (Vec<u8>, usize, Option<io::Error>) {
+    use std::os::unix::fs::FileExt;
+    let mut wire = Vec::with_capacity(run.iter().map(|c| 9 + c.len as usize).sum());
+    for (n, c) in run.iter().enumerate() {
+        let at = wire.len();
+        wire.push(HERE);
+        wire.extend_from_slice(&c.len.to_be_bytes());
+        wire.resize(at + 9 + c.len as usize, 0);
+        if let Err(e) = c.file.read_exact_at(&mut wire[at + 9..], c.offset) {
+            wire.truncate(at);
+            return (wire, n, Some(e));
+        }
+    }
+    (wire, run.len(), None)
+}
+
 /// Where the bytes of a chunk being sent come from: a file of the store
 /// (from an offset), or bytes the provider handed over (checked).
 enum Source {
     File(Arc<std::fs::File>, u64),
-    Bytes(Vec<u8>),
+    Bytes(bytes::Bytes),
 }
 
 /// The answer to one request as it is written: at the node's upload limit.
@@ -1860,6 +2425,17 @@ impl<'a> Answer<'a> {
     async fn write(&mut self, buf: &[u8]) -> io::Result<()> {
         self.sent += buf.len() as u64;
         let written = write(self.send, buf, self.grace).await;
+        self.answered = tokio::time::Instant::now();
+        written
+    }
+
+    /// [`Answer::write`] of bytes the stream takes as they are (no copy).
+    async fn write_bytes(&mut self, buf: bytes::Bytes) -> io::Result<()> {
+        self.sent += buf.len() as u64;
+        let written = tokio::time::timeout(self.grace, self.send.write_chunk(buf))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "QUIC write"))
+            .and_then(|w| w.map_err(other));
         self.answered = tokio::time::Instant::now();
         written
     }
@@ -2468,7 +3044,7 @@ mod tests {
             asking.push(tokio::spawn(async move {
                 let (tx, _chunks) = tokio::sync::mpsc::channel(1);
                 client
-                    .fetch_into(addr, &[(asked, None)], urgency, tx)
+                    .fetch_into(addr, &[(asked, None)], urgency, tx, Via::Primary)
                     .await
                     .unwrap();
                 answered.lock().unwrap().push(urgency);
@@ -2562,6 +3138,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found, [(d[1].clone(), b"after".to_vec())]);
+    }
+
+    /// The chunks of a run are read and sent together: one whose file cannot
+    /// be read is answered "failed", in its place, and the chunks around it
+    /// still come.
+    #[tokio::test]
+    async fn a_chunk_that_cannot_be_read_fails_alone_in_its_run() {
+        struct Three(std::path::PathBuf);
+        impl ChunkProvider for Three {
+            fn get_chunk(&self, _: &str) -> std::io::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn open_chunks(&self, d: &[String]) -> std::io::Result<Vec<Option<ChunkFile>>> {
+                let at = |offset, read| ChunkFile {
+                    file: std::fs::OpenOptions::new()
+                        .read(read)
+                        .write(!read)
+                        .open(&self.0)
+                        .unwrap(),
+                    offset,
+                    len: 4,
+                };
+                let mut files = vec![Some(at(0, true)), Some(at(4, false)), Some(at(8, true))];
+                files.truncate(d.len());
+                Ok(files)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chunks");
+        std::fs::write(&path, b"aaaabbbbcccc").unwrap();
+        let (server, addr) = bind_with(served(Arc::new(Three(path))), Limits::default());
+        let client = Quic::bind("127.0.0.1:0".parse().unwrap(), Arc::default(), KEY).unwrap();
+        let asked: Vec<_> = [b"aaaa", b"bbbb", b"cccc"]
+            .iter()
+            .map(|c| (digest_of(*c), Some(4)))
+            .collect();
+        let mut reply = client.request(addr, &asked, Urgency::Wait).await.unwrap();
+        assert_eq!(reply.next().await.unwrap().unwrap().1, b"aaaa");
+        assert_eq!(reply.next().await.unwrap().unwrap().1, b"cccc");
+        assert!(reply.next().await.unwrap().is_none());
+        assert!(reply.failed);
+        assert_eq!(server.served(), 2);
     }
 
     /// A provider that hands over files and has none of what is asked is not
@@ -3667,5 +4285,208 @@ mod tests {
         assert!(client.has(addr, &d[0]).await.is_err());
         tokio::time::advance(RETRY_AFTER).await;
         assert_eq!(client.has(addr, &d[0]).await.unwrap(), Presence::Has);
+    }
+
+    /// The connections the server of `quic` holds now.
+    fn held(quic: &Quic) -> usize {
+        let (connections, total) = &quic.server_connections;
+        total - connections.available_permits()
+    }
+
+    /// `n` chunks of 1 MiB, with their sizes.
+    fn mebibytes(n: u8) -> (SharedProvider, Vec<(String, Option<u64>)>) {
+        let items: Vec<Vec<u8>> = (0..n).map(|i| vec![i; 1 << 20]).collect();
+        let (provider, digests) = chunks(&items);
+        (
+            provider,
+            digests.into_iter().map(|d| (d, Some(1 << 20))).collect(),
+        )
+    }
+
+    /// The chunks `asked` from `addr` in `lanes` lanes over the connections
+    /// [`Quic::vias`] gives, as the node asks for them.
+    async fn spread(
+        client: &Arc<Quic>,
+        addr: SocketAddr,
+        asked: &[(String, Option<u64>)],
+        urgency: Urgency,
+        lanes: usize,
+    ) -> Vec<String> {
+        let parts = crate::lanes(asked, lanes);
+        let bytes = asked.iter().filter_map(|(_, s)| *s).sum();
+        let vias = client.vias(addr, bytes, urgency, parts.len());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(crate::CHUNKS_IN_FLIGHT);
+        let fetched = futures::future::join_all(
+            parts
+                .iter()
+                .zip(vias)
+                .map(|(part, via)| client.fetch_into(addr, part, urgency, tx.clone(), via)),
+        );
+        drop(tx);
+        let (done, got) = tokio::join!(fetched, async move {
+            let mut got = Vec::new();
+            while let Some((digest, data)) = rx.recv().await {
+                assert_eq!(digest, digest_of(&data));
+                got.push(digest);
+            }
+            got
+        });
+        assert!(done.iter().all(|d| d.is_ok()));
+        got
+    }
+
+    fn kinds(vias: &[Via]) -> Vec<bool> {
+        vias.iter().map(|v| matches!(v, Via::Extra(_))).collect()
+    }
+
+    /// Have the extra connections of a big request to `addr` made (or
+    /// tried): the first big request starts them for the next ones.
+    async fn warm(client: &Arc<Quic>, addr: SocketAddr) {
+        drop(client.vias(addr, 8 << 20, Urgency::Wait, 4));
+        let making = || {
+            let extras = client.extras.lock().unwrap().get(&addr).cloned();
+            extras.is_some_and(|e| e.lock().unwrap().making)
+        };
+        while making() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A big request goes over the primary connection and three extra
+    /// ones; a small one over the primary only; one nobody waits for over
+    /// the extra ones only.
+    #[tokio::test]
+    async fn the_lanes_of_a_big_request_go_over_extra_connections() {
+        let (provider, asked) = mebibytes(8);
+        let (server, addr) = bind_with(provider, Limits::default());
+        let client = Quic::bind("127.0.0.1:0".parse().unwrap(), Arc::default(), KEY).unwrap();
+        let small = client.vias(addr, SPREAD_MIN_BYTES - 1, Urgency::Wait, 4);
+        assert_eq!(kinds(&small), [false; 4]);
+        // (the first big request finds none: they are made for the next)
+        let first = client.vias(addr, 8 << 20, Urgency::Wait, 4);
+        assert_eq!(kinds(&first), [false; 4]);
+        drop(first);
+        warm(&client, addr).await;
+        let mut got = spread(&client, addr, &asked, Urgency::Wait, 4).await;
+        got.sort();
+        let mut want: Vec<String> = asked.iter().map(|(d, _)| d.clone()).collect();
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(held(&server), 1 + EXTRAS_PER_PEER);
+        let waited = client.vias(addr, 8 << 20, Urgency::OnDemand, 4);
+        assert_eq!(kinds(&waited), [false, true, true, true]);
+        let unwaited = client.vias(addr, 8 << 20, Urgency::Background, 4);
+        assert_eq!(kinds(&unwaited), [true, true, true, true]);
+        // (the extra connections were made once)
+        assert_eq!(held(&server), 1 + EXTRAS_PER_PEER);
+        // a request of 4 MiB in 4 lanes: two connections
+        let two = client.vias(addr, SPREAD_MIN_BYTES, Urgency::Wait, 4);
+        assert_eq!(kinds(&two), [false, true, false, true]);
+    }
+
+    /// A server admits an extra connection while it holds at most half of
+    /// its connections, and at most [`EXTRAS_PER_PEER`] from an address;
+    /// the lanes go over the primary connection then.
+    #[tokio::test]
+    async fn a_server_has_a_bounded_room_for_extra_connections() {
+        let (provider, asked) = mebibytes(8);
+        let (small, addr) = bind_with(
+            provider.clone(),
+            Limits {
+                connections: 4,
+                ..Limits::default()
+            },
+        );
+        let client = Quic::bind("127.0.0.1:0".parse().unwrap(), Arc::default(), KEY).unwrap();
+        assert_eq!(client.has(addr, &asked[0].0).await.unwrap(), Presence::Has);
+        let one = client.connect_extra(addr).await.unwrap();
+        assert!(client.connect_extra(addr).await.is_err());
+        assert_eq!(held(&small), 2);
+        drop(one);
+        let (large, addr) = bind_with(provider, Limits::default());
+        let mut extras = Vec::new();
+        for _ in 0..EXTRAS_PER_PEER {
+            extras.push(client.connect_extra(addr).await.unwrap());
+        }
+        assert!(client.connect_extra(addr).await.is_err());
+        assert_eq!(held(&large), EXTRAS_PER_PEER);
+        // a client that cannot make its extra connections asks over the
+        // primary one
+        warm(&client, addr).await;
+        let mut got = spread(&client, addr, &asked, Urgency::Wait, 4).await;
+        got.sort();
+        assert_eq!(got.len(), asked.len());
+        assert_eq!(held(&large), EXTRAS_PER_PEER + 1);
+        let vias = client.vias(addr, 8 << 20, Urgency::Background, 4);
+        assert_eq!(kinds(&vias), [false; 4]);
+    }
+
+    /// What a lane did not get when its extra connection failed is asked
+    /// over the primary connection.
+    #[tokio::test]
+    async fn a_lane_whose_extra_connection_fails_goes_on_over_the_primary() {
+        let (provider, asked) = mebibytes(16);
+        let (_server, addr) = bind_with(provider, Limits::default());
+        let client = Quic::bind("127.0.0.1:0".parse().unwrap(), Arc::default(), KEY).unwrap();
+        warm(&client, addr).await;
+        let mut vias = client.vias(addr, 16 << 20, Urgency::Background, 1);
+        let via = vias.pop().unwrap();
+        let Via::Extra(lane) = &via else {
+            panic!("no extra connection");
+        };
+        let extra = lane.0.connection.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let fetched = client.fetch_into(addr, &asked, Urgency::Background, tx, via);
+        let (done, got) = tokio::join!(fetched, async move {
+            let mut got = Vec::new();
+            while let Some((digest, data)) = rx.recv().await {
+                assert_eq!(digest, digest_of(&data));
+                got.push(digest);
+                if got.len() == 2 {
+                    extra.close(0u32.into(), b"gone");
+                }
+            }
+            got
+        });
+        assert_eq!(done.unwrap(), asked.len());
+        let want: Vec<String> = asked.iter().map(|(d, _)| d.clone()).collect();
+        assert_eq!(got, want);
+    }
+
+    /// An extra connection no request uses is closed after the idle time.
+    #[tokio::test]
+    async fn an_extra_connection_without_requests_is_closed() {
+        let (provider, asked) = mebibytes(8);
+        let (server, addr) = bind_with(provider, Limits::default());
+        let client = Quic::bind_with(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::default(),
+            KEY,
+            Limits {
+                extra_idle: Duration::from_millis(300),
+                ..Limits::default()
+            },
+            Arc::default(),
+        )
+        .unwrap();
+        warm(&client, addr).await;
+        spread(&client, addr, &asked, Urgency::Wait, 4).await;
+        assert_eq!(held(&server), 1 + EXTRAS_PER_PEER);
+        let started = tokio::time::Instant::now();
+        while held(&server) > 1 {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        // (made again for the next big request)
+        warm(&client, addr).await;
+        spread(&client, addr, &asked, Urgency::Wait, 4).await;
+        assert_eq!(held(&server), 1 + EXTRAS_PER_PEER);
+        // a node that stops closes them all
+        client.close();
+        while held(&server) > 0 {
+            assert!(started.elapsed() < Duration::from_secs(10));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }

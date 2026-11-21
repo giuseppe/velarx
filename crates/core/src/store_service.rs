@@ -760,14 +760,16 @@ impl StoreService {
                 reason: format!("at most {MAX_LOOKUP} digests in a lookup"),
             });
         }
-        if let Some(w) = wants
+        let parsed = wants
             .iter()
-            .find(|w| velarx_types::digest::Digest::parse_key(&w.digest).is_err())
-        {
-            return Err(StoreError::InvalidArgument {
-                reason: format!("not a digest: {:?}", short(&w.digest)),
-            });
-        }
+            .map(|w| {
+                velarx_types::digest::Digest::parse_key(&w.digest).map_err(|_| {
+                    StoreError::InvalidArgument {
+                        reason: format!("not a digest: {:?}", short(&w.digest)),
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let digests: Vec<String> = wants.iter().map(|w| w.digest.clone()).collect();
         let shareable = self
             .inner
@@ -778,36 +780,55 @@ impl StoreService {
                 reason: e.to_string(),
             })?;
         let shareable = |i: usize| shareable.get(i).copied().unwrap_or(false);
-        let mut opened = futures::future::join_all(wants.iter().enumerate().map(|(i, want)| {
-            async move {
-                match shareable(i) {
-                    true => match self.inner.chunks() {
-                        Some(chunks) => chunks.open(&want.digest).await,
-                        None => None,
-                    },
-                    // (not a file of the store: a piece of a checkpoint, or
-                    // the manifest, index or configuration of an image this
-                    // node shares, looked up below)
-                    false => self.piece(&want.digest).await,
+        // the files of the store, together; the others: a piece of a
+        // checkpoint, or the manifest, index or configuration of an image
+        // this node shares (looked up together; an fs-verity key names none)
+        let of_store = async {
+            match self.inner.chunks() {
+                Some(chunks) => {
+                    let digests = (0..wants.len())
+                        .filter(|&i| shareable(i))
+                        .map(|i| parsed[i])
+                        .collect();
+                    chunks.open_all(digests).await
                 }
+                None => Vec::new(),
             }
-        }))
-        .await;
-        // (the metadata of the images, together; an fs-verity key names none)
-        let (asked, digests): (Vec<usize>, Vec<_>) = (0..wants.len())
-            .filter(|&i| !shareable(i) && opened[i].is_none())
-            .filter_map(|i| {
-                let digest = velarx_types::digest::Digest::parse_key(&wants[i].digest).ok()?;
-                (!digest.is_fsverity()).then_some((i, digest))
-            })
-            .unzip();
-        for (i, found) in asked.into_iter().zip(self.image_metadata(digests).await?) {
-            opened[i] = found;
-        }
-        let opened = opened
-            .into_iter()
-            .zip(wants)
-            .map(|(found, want)| found.filter(|f| want.size.is_none_or(|size| size == f.len)));
+        };
+        let others = async {
+            let unshared: Vec<usize> = (0..wants.len()).filter(|&i| !shareable(i)).collect();
+            let pieces =
+                futures::future::join_all(unshared.iter().map(|&i| self.piece(&wants[i].digest)))
+                    .await;
+            let asks: Vec<bool> = pieces
+                .iter()
+                .zip(&unshared)
+                .map(|(piece, &i)| piece.is_none() && !parsed[i].is_fsverity())
+                .collect();
+            let asked = unshared
+                .iter()
+                .zip(&asks)
+                .filter(|(_, &ask)| ask)
+                .map(|(&i, _)| parsed[i])
+                .collect();
+            let mut found = self.image_metadata(asked).await?.into_iter();
+            Ok::<_, StoreError>(
+                pieces
+                    .into_iter()
+                    .zip(asks)
+                    .map(|(piece, ask)| if ask { found.next().flatten() } else { piece })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (of_store, others) = futures::join!(of_store, others);
+        let (mut of_store, mut others) = (of_store.into_iter(), others?.into_iter());
+        let opened = wants.iter().enumerate().map(|(i, want)| {
+            let found = match shareable(i) {
+                true => of_store.next().flatten(),
+                false => others.next().flatten(),
+            };
+            found.filter(|f| want.size.is_none_or(|size| size == f.len))
+        });
         let mut items = Vec::with_capacity(wants.len());
         let mut fds = Vec::new();
         for (want, found) in wants.iter().zip(opened) {

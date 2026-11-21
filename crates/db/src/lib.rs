@@ -1629,10 +1629,23 @@ impl Database {
         &self,
         chunk_digest: &Digest,
     ) -> DbResult<Option<ChunkLocation>> {
-        let chunk_digest = *chunk_digest;
+        Ok(self
+            .get_chunk_locations(std::slice::from_ref(chunk_digest))
+            .await?
+            .pop()
+            .flatten())
+    }
+
+    /// Where each of `chunk_digests` can be found, as
+    /// [`Database::get_chunk_location`] says, in one call.
+    pub async fn get_chunk_locations(
+        &self,
+        chunk_digests: &[Digest],
+    ) -> DbResult<Vec<Option<ChunkLocation>>> {
+        let chunk_digests = chunk_digests.to_vec();
         self.conn
             .call(move |conn| {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT c.chunk_digest, c.file_digest, c.offset, c.size FROM chunk_locations c
                      WHERE c.chunk_digest = ?1
                      ORDER BY EXISTS(
@@ -1641,19 +1654,21 @@ impl Database {
                      ) DESC
                      LIMIT 1",
                 )?;
-                let result = stmt.query_row([&chunk_digest], |row| {
-                    Ok(ChunkLocation {
-                        chunk_digest: row.get(0)?,
-                        file_digest: row.get(1)?,
-                        offset: row.get::<_, i64>(2)? as u64,
-                        size: row.get::<_, i64>(3)? as u64,
+                chunk_digests
+                    .iter()
+                    .map(|chunk_digest| {
+                        stmt.query_row([chunk_digest], |row| {
+                            Ok(ChunkLocation {
+                                chunk_digest: row.get(0)?,
+                                file_digest: row.get(1)?,
+                                offset: row.get::<_, i64>(2)? as u64,
+                                size: row.get::<_, i64>(3)? as u64,
+                            })
+                        })
+                        .optional()
                     })
-                });
-                match result {
-                    Ok(loc) => Ok(Some(loc)),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                    Err(e) => Err(e.into()),
-                }
+                    .collect::<Result<_, _>>()
+                    .map_err(Into::into)
             })
             .await
             .map_err(DbError::Sqlite)
@@ -3184,6 +3199,23 @@ mod tests {
         // c1 is found in the file that may be given
         let at = db.get_chunk_location(&sha("c1")).await.unwrap().unwrap();
         assert_eq!(at.file_digest, "fsverity-sha256-12:old");
+        // several in one call, in their order, the missing as none
+        let found = db
+            .get_chunk_locations(&[sha("c3"), sha("c9"), sha("c1")])
+            .await
+            .unwrap();
+        let files: Vec<Option<&str>> = found
+            .iter()
+            .map(|l| l.as_ref().map(|l| l.file_digest.as_str()))
+            .collect();
+        assert_eq!(
+            files,
+            [
+                Some("fsverity-sha256-12:new"),
+                None,
+                Some("fsverity-sha256-12:old")
+            ]
+        );
         // the file that may not is forgotten: c1 stays where the other has it
         db.delete_files(vec!["fsverity-sha256-12:new".into()])
             .await

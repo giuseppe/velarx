@@ -7,8 +7,9 @@
 //! 2. Database chunk_locations (extract chunk from stored file at offset)
 
 use std::sync::Arc;
-use velarx_db::Database;
+use velarx_db::{ChunkLocation, Database};
 use velarx_storage::{ChunkFile, FileStore, MAX_SERVED_BYTES};
+use velarx_types::digest::Digest;
 
 /// The chunks and files of the stores, as the store service gives them
 pub struct StorageChunkProvider {
@@ -24,13 +25,57 @@ impl StorageChunkProvider {
 
     /// The file that holds `digest` (a cached chunk, a file, or a chunk of a
     /// file), if the stores have it and it is small enough to serve.
+    #[cfg(test)]
     pub async fn open(&self, digest: &str) -> Option<ChunkFile> {
         let parsed = velarx_types::digest::Digest::parse_key(digest).ok()?;
+        self.open_all(vec![parsed]).await.pop().flatten()
+    }
+
+    /// The files that hold `digests`, as [`StorageChunkProvider::open`]
+    /// says, one for each: one call to the database for where the chunks
+    /// are, and the files opened on one blocking thread (the files of a wave
+    /// a peer asks for are a round trip, not one for each).
+    pub async fn open_all(&self, digests: Vec<Digest>) -> Vec<Option<ChunkFile>> {
+        // (the fs-verity digest of a file names an object, never a chunk)
+        let chunks: Vec<Digest> = digests
+            .iter()
+            .filter(|d| !d.is_fsverity())
+            .copied()
+            .collect();
+        let mut located = match self.db.get_chunk_locations(&chunks).await {
+            Ok(located) => located.into_iter(),
+            Err(e) => {
+                tracing::warn!("The places of {} chunks are not known: {e}", chunks.len());
+                vec![None; chunks.len()].into_iter()
+            }
+        };
+        let wanted: Vec<(Digest, Option<ChunkLocation>)> = digests
+            .into_iter()
+            .map(|d| match d.is_fsverity() {
+                true => (d, None),
+                false => (d, located.next().flatten()),
+            })
+            .collect();
         let files = self.file_store.clone();
-        let d = digest.to_string();
-        let whole = tokio::task::spawn_blocking(move || {
-            let max = MAX_SERVED_BYTES as u64;
-            let path = files.get_path(&d)?;
+        tokio::task::spawn_blocking(move || {
+            wanted
+                .into_iter()
+                .map(|(digest, location)| Self::opened(&files, &digest, location))
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// The file of `digest`: the whole file the file store has by that
+    /// digest, else the piece of a file `location` says.  Blocking.
+    fn opened(
+        files: &FileStore,
+        digest: &Digest,
+        location: Option<ChunkLocation>,
+    ) -> Option<ChunkFile> {
+        let max = MAX_SERVED_BYTES as u64;
+        let whole = files.get_path(&digest.to_string()).and_then(|path| {
             let file = std::fs::File::open(path).ok()?;
             let len = file.metadata().ok()?.len();
             (len <= max).then_some(ChunkFile {
@@ -38,31 +83,18 @@ impl StorageChunkProvider {
                 offset: 0,
                 len,
             })
-        })
-        .await
-        .ok()
-        .flatten();
-        if whole.is_some() || parsed.is_fsverity() {
-            // (the fs-verity digest of a file names an object, never a chunk)
+        });
+        if whole.is_some() {
             return whole;
         }
-        let loc = self.db.get_chunk_location(&parsed).await.ok().flatten()?;
-        if loc.size > MAX_SERVED_BYTES as u64 {
-            return None;
-        }
-        let path = self.file_store.get_path(&loc.file_digest)?;
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(path).ok()?;
-            let end = loc.offset.checked_add(loc.size)?;
-            (file.metadata().ok()?.len() >= end).then_some(ChunkFile {
-                file,
-                offset: loc.offset,
-                len: loc.size,
-            })
+        let loc = location.filter(|loc| loc.size <= max)?;
+        let file = std::fs::File::open(files.get_path(&loc.file_digest)?).ok()?;
+        let end = loc.offset.checked_add(loc.size)?;
+        (file.metadata().ok()?.len() >= end).then_some(ChunkFile {
+            file,
+            offset: loc.offset,
+            len: loc.size,
         })
-        .await
-        .ok()
-        .flatten()
     }
 }
 

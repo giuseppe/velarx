@@ -1236,7 +1236,9 @@ impl P2PNode {
 
     /// The chunks `digests` from `peer` over QUIC, unchecked, as they come
     /// into `out`, asked as `urgency` says.  The digests are spread over
-    /// [`P2PConfig::quic_streams`] streams, answered at the same time.  A
+    /// [`P2PConfig::quic_streams`] streams, answered at the same time, and
+    /// those of a big request over extra connections too
+    /// ([`quic::Quic::vias`]).  A
     /// peer that could not read its store for any of them is an error
     /// ([`P2PError::StoreFailed`]), a peer with no room for any is
     /// [`P2PError::Busy`]; with no QUIC path to it the error says so
@@ -1253,12 +1255,18 @@ impl P2PNode {
             return Ok(());
         }
         let parts = lanes(digests, self.config.quic_streams);
-        let answers = futures::future::join_all(
-            parts
-                .iter()
-                .map(|part| quic.fetch_into(addr, part, urgency, out.clone())),
-        )
-        .await;
+        let bytes = digests.iter().filter_map(|(_, size)| *size).sum();
+        let vias = quic.vias(addr, bytes, urgency, parts.len());
+        // (a task each: the lanes are read on as many threads; they end
+        // with this call)
+        let mut running = tokio::task::JoinSet::new();
+        for (part, via) in parts.into_iter().zip(vias) {
+            let (quic, out) = (quic.clone(), out.clone());
+            running.spawn(tracing::Instrument::in_current_span(async move {
+                quic.fetch_into(addr, &part, urgency, out, via).await
+            }));
+        }
+        let answers = running.join_all().await;
         lanes_answer(peer, answers)
     }
 
