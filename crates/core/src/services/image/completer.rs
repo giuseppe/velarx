@@ -284,9 +284,9 @@ impl ImageService {
         }
     }
 
-    /// Complete the open pulls nobody completes: after a reboot, a kill or
-    /// a crash, the engine service does this at its start, and any command
-    /// that finds such a pull starts the service.
+    /// Complete the open pulls nobody completes: after a kill or a crash of
+    /// the engine (a reboot discards them), the engine service does this at
+    /// its start, and any command that finds such a pull starts the service.
     pub fn resume_pulls(&self) {
         if matches!(self.owner, Owner::Caller) {
             return;

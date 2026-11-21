@@ -190,7 +190,8 @@ teardown () {
     sh_ system check --repair > /dev/null 2>&1
     check "they are repaired" 0 $?
     # (the staging root keeps `incoming` where the fetchers write files with
-    # no name, `layers` and `meta`: only the stale pull directory goes)
-    check "the staging directory is gone" 0 "$(ls "$WORKDIR/store/staging" | grep -cv '^\(incoming\|layers\|meta\)$')"
+    # no name, `layers`, `meta` and the `boot` of its lazy pulls: only the
+    # stale pull directory goes)
+    check "the staging directory is gone" 0 "$(ls "$WORKDIR/store/staging" | grep -cv '^\(incoming\|layers\|meta\|boot\)$')"
     check "and the temporary file" 0 "$(ls -A "$WORKDIR/store/objects/ab" | grep -c tmpleft)"
 }

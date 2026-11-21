@@ -244,7 +244,7 @@ lease_held () {
     sh_ image pull --lazy --tls-verify=false "$IMAGE" > /dev/null 2>&1
     id=$(sh_ image pulls -q --no-trunc)
     check "the service holds the pull" held "$(lease_held)"
-    # as a reboot: the service is killed, its lease goes with it
+    # as a crash: the service is killed, its lease goes with it
     kill -KILL "$DAEMON_PID" 2> /dev/null
     e2e_wait_exit "$DAEMON_PID" 10
     check "nobody holds the pull" free "$(flock -n "$PULLS/$id/lease" true && echo free || echo held)"
@@ -254,6 +254,23 @@ lease_held () {
     sh_ image complete "$IMAGE" > /dev/null 2>&1
     check "image complete" 0 $?
     check "the image is in the store" 1 "$(db 'SELECT count(*) FROM images')"
+}
+
+@test "a reboot discards a lazy pull: nothing of it was made durable" {
+    fresh_store
+    sh_ image pull --lazy --tls-verify=false "$IMAGE" > /dev/null 2>&1
+    check "a pull in progress" 1 "$(sh_ image pulls -q | wc -l)"
+    kill -KILL "$DAEMON_PID" 2> /dev/null
+    e2e_wait_exit "$DAEMON_PID" 10
+    # (the staging says it is of another boot)
+    printf 'an earlier boot\n' > "$BASE/boot"
+    start_daemon
+    check "no pull is left" "" "$(sh_ image pulls -q)"
+    check "no layer is staged" 0 "$(staged_layers)"
+    check "the store has no image" 0 "$(db 'SELECT count(*) FROM images')"
+    sh_ image pull --lazy --tls-verify=false "$IMAGE" > /dev/null 2>&1
+    check "it is pulled again" 1 "$(sh_ image pulls -q | wc -l)"
+    check "the staging is of this boot" "$(cat /proc/sys/kernel/random/boot_id)" "$(cat "$BASE/boot")"
 }
 
 @test "an error that retrying cannot mend stops the completion, keeps the staging and image pulls says why" {

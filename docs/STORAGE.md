@@ -17,7 +17,9 @@ layers) or a FUSE file system of the image server puts the objects behind it.
 Per-file work (hashing, fs-verity, the EROFS images) is done when the pull
 ends, so that running an image costs the same however big it is. A lazy pull
 (zstd:chunked) fetches only the TOC to start a container; files come on
-demand. Names appear only for whole, checked files and the database is written
+demand. It is transient until it is complete: nothing of its staging is made
+durable and a reboot discards it; its completion makes the layers and the
+image durable before they are named in the store. Names appear only for whole, checked files and the database is written
 after the names are durable.
 
 The EROFS image of a layer is made from its table of contents alone, so it

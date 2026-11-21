@@ -105,7 +105,9 @@ mod tests {
     }
 
     /// The files of a pull are made durable by one `syncfs` of the whole
-    /// session, after fs-verity: no file is synced on its own.
+    /// session, after fs-verity: no file is synced on its own; and nothing
+    /// of the staging area of lazy pulls is synced (a lazy pull is made
+    /// durable when it is complete).
     #[test]
     fn no_file_of_a_pull_is_synced_on_its_own() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -114,6 +116,7 @@ mod tests {
             "crates/content/src/pull/stream.rs",
             "crates/content/src/pull/chunked/mod.rs",
             "crates/content/src/pull/staged_fetch.rs",
+            "crates/content/src/pull/staged.rs",
             "crates/content/src/stager.rs",
             "crates/registry-lib/src/registry_fetch.rs",
             "crates/content/src/dir_fetch.rs",

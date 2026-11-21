@@ -357,9 +357,15 @@ impl ImageService {
         // sweeps otherwise), and not the sessions of the pulls that hold
         // their lease: a pull holds the lock of the store only to start and
         // to commit, not through its download.  The stagings of the layers
-        // of a process that died with them go too.
+        // of a process that died with them go too, and the lazy pulls of an
+        // earlier boot (the first process of a boot is alone).
         match StorageLock::try_exclusive(&StorageLock::path_of_staging(&staging_dir)) {
             Ok(Some(_alone)) => {
+                if let Err(e) =
+                    velarx_content::pull::staged::Staging::new(&staging_dir).forget_earlier_boots()
+                {
+                    warn!("Cannot remove the lazy pulls of an earlier boot: {e}");
+                }
                 velarx_content::pull::session::Session::sweep(&staging_dir, |s| {
                     db.lease_is_held(s)
                 });

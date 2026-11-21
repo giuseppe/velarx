@@ -3558,15 +3558,18 @@ pub async fn a_lazy_layer_waits_and_is_completed(f: &Factory) {
     // the layer is staged with the pull the engine publishes: the driver
     // makes it again, and it is the one the pull recorded
     let area = velarx_content::pull::staged::Staging::new(&s.staging);
+    let mut barrier = velarx_content::pull::staged::Barrier::default();
     velarx_content::pull::stage_layer(
         &area,
-        &done,
+        &mut barrier,
+        (&done, &serde_json::to_string(&*done.toc).unwrap()),
         None,
         velarx_db::LayerReach::default(),
         false,
         (&artifact.image_digest, &artifact.owners),
     )
     .unwrap();
+    barrier.commit().unwrap();
     let staged_pull = |id: &str| velarx_content::pull::staged::StagedPull {
         id: id.to_string(),
         manifest_digest: img_digest(),

@@ -665,34 +665,38 @@ pub async fn pull_layer_lazy(
     pull_layer(ctx, source, layer, diff_id, progress).await
 }
 
-/// Publish a lazy layer in the staging area: its table of contents and
-/// tar-split, and what its fetches need to reach its registry.  `erofs`
-/// and `owners` are those of the image made of its table of contents.
+/// Publish the lazy layer `done` in the staging area: its table of contents
+/// (`toc`, the JSON of `done.toc`) and tar-split, and what its fetches need to reach
+/// its registry.  `erofs` and `owners` are those of the image made of its
+/// table of contents.  It is durable and named when `barrier` commits.
 pub fn stage_layer(
     area: &staged::Staging,
-    done: &LayerDone,
+    barrier: &mut staged::Barrier,
+    (done, toc): (&LayerDone, &str),
     registry_ref: Option<&str>,
     reach: velarx_db::LayerReach,
     public: bool,
     (erofs, owners): (&str, &str),
 ) -> ImageResult<()> {
-    let toc = serde_json::to_string(&*done.toc)?;
-    area.publish_layer(&staged::NewLayer {
-        meta: staged::StagedLayerMeta {
-            key: done.key.to_string(),
-            blob: done.blob.to_string(),
-            size: done.size,
-            registry_ref: registry_ref.map(str::to_string),
-            reach,
-            public,
-            erofs: erofs.to_string(),
-            owners: owners.to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
+    area.publish_layer_in(
+        &staged::NewLayer {
+            meta: staged::StagedLayerMeta {
+                key: done.key.to_string(),
+                blob: done.blob.to_string(),
+                size: done.size,
+                registry_ref: registry_ref.map(str::to_string),
+                reach,
+                public,
+                erofs: erofs.to_string(),
+                owners: owners.to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            },
+            toc,
+            tarsplit: &done.tarsplit,
+            toc_z: done.toc_z.as_deref(),
         },
-        toc: &toc,
-        tarsplit: &done.tarsplit,
-        toc_z: done.toc_z.as_deref(),
-    })
+        barrier,
+    )
     .map_err(ImageError::Io)
 }
 

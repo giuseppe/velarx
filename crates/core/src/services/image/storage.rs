@@ -396,23 +396,7 @@ pub(super) fn identities_of(
     std::thread::scope(|s| {
         let handles: Vec<_> = layers
             .iter()
-            .map(|(key, toc)| {
-                s.spawn(move || {
-                    let fail =
-                        |e: String| ImageError::Layer(format!("the identity of layer {key}: {e}"));
-                    let image =
-                        velarx_fuse::layer_erofs::layer_image(&toc.entries).map_err(fail)?;
-                    let id = image.identity(key.digest().alg()).map_err(fail)?;
-                    Ok::<_, ImageError>((
-                        *(*key),
-                        LayerArtifact {
-                            image_digest: id.erofs,
-                            owners: id.owners,
-                        },
-                        image,
-                    ))
-                })
-            })
+            .map(|(key, toc)| s.spawn(move || identity_of(key, toc)))
             .collect();
         let mut artifacts = HashMap::new();
         let mut images = HashMap::new();
@@ -425,6 +409,29 @@ pub(super) fn identities_of(
         }
         Ok((artifacts, images))
     })
+}
+
+/// The identity of the layer `key` from its table of contents, and the EROFS
+/// image it was made from (blocking).
+pub(super) fn identity_of(
+    key: &LayerKey,
+    toc: &Toc,
+) -> ImageResult<(
+    LayerKey,
+    LayerArtifact,
+    velarx_fuse::layer_erofs::LayerImage,
+)> {
+    let fail = |e: String| ImageError::Layer(format!("the identity of layer {key}: {e}"));
+    let image = velarx_fuse::layer_erofs::layer_image(&toc.entries).map_err(fail)?;
+    let id = image.identity(key.digest().alg()).map_err(fail)?;
+    Ok((
+        *key,
+        LayerArtifact {
+            image_digest: id.erofs,
+            owners: id.owners,
+        },
+        image,
+    ))
 }
 
 /// The artifacts a driver recorded must be the engine's identity: a driver

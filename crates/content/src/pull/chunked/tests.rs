@@ -1205,6 +1205,30 @@ fn test_a_table_of_version_1_without_the_fs_verity_digest_of_a_file_is_an_error(
     );
 }
 
+/// A tar-split that describes another file than the table is refused by
+/// the pull that commits the layer, not by the check of a lazy pull (its
+/// completion replays it before the commit).
+#[test]
+fn test_a_tar_split_the_table_contradicts_is_refused_by_the_pull() {
+    let layer = crate::sha256(b"layer");
+    let file = canonical_layer().entries[3].clone();
+    let ts = tarsplit_of(std::slice::from_ref(&file));
+    let mut other = file.clone();
+    other.name = format!("{}.other", file.name);
+    let toc = Toc {
+        version: 1,
+        entries: vec![other.clone()],
+        tar_split_digest: Some(crate::sha256(&ts).to_string()),
+    };
+    let (z, info) = vouched(&toc, Some((0, ts.len() as u64, 0)));
+    assert!(verify_table(&info, &z, ts.clone(), &layer, u64::MAX).is_ok());
+    let e = verify_metadata(&info, &z, ts, &layer, u64::MAX)
+        .err()
+        .unwrap();
+    assert!(matches!(e, ImageError::Contradicted(_)), "{e}");
+    assert!(e.to_string().contains(".other`"), "{e}");
+}
+
 /// `file` again under `name`, 4096 bytes larger (the last chunk too).
 fn bigger_copy(file: &TocEntry, name: &str) -> TocEntry {
     let mut copy = file.clone();

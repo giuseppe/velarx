@@ -615,7 +615,8 @@ impl GcService {
     /// their staging directories) no live pull names; what an interrupted
     /// publish left.
     /// A pull that is not committed is never removed because nobody holds
-    /// it (after a reboot nobody does, and it is resumed).
+    /// it (one whose engine stopped is resumed; a reboot discards the pulls
+    /// at the start of the next engine: `Staging::forget_earlier_boots`).
     async fn collect_lazy_staging(&self, report: &mut GcReport) -> GcResult<()> {
         let area = self.staging();
         if !area.exists() {

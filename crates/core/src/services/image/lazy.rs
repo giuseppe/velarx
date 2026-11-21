@@ -417,6 +417,7 @@ impl ImageService {
         // which of them the store has is the driver's answer, once for all
         let have = self.stored_layers(keys, config).await?;
         let mut layers = Vec::new();
+        let mut replays = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for (((desc, diff_id), key), have) in manifest
             .layers
@@ -465,15 +466,28 @@ impl ImageService {
                 )));
             };
             let toc: Toc = serde_json::from_str(&staged.toc_text()?)?;
+            let (toc, tarsplit) = (Arc::new(toc), bytes::Bytes::from(staged.tarsplit()?));
+            replays.push(tokio::task::spawn_blocking({
+                let (toc, tarsplit, layer) = (toc.clone(), tarsplit.clone(), desc.digest);
+                move || velarx_content::pull::lazy::replay(&toc, tarsplit, &layer)
+            }));
             layers.push(LazyLayer {
                 key: *key,
                 desc: desc.clone(),
                 diff_id: *diff_id,
-                toc: Arc::new(toc),
-                tarsplit: staged.tarsplit()?.into(),
+                toc,
+                tarsplit,
                 toc_z: staged.toc_z()?.map(bytes::Bytes::from),
                 meta: staged.meta,
             });
+        }
+        // (what the pull staged was checked against the digests of the table;
+        // that the tar-split says what the table says is checked before the
+        // layers are committed)
+        for replay in replays {
+            replay
+                .await
+                .map_err(|e| ImageError::Layer(format!("the replay task: {e}")))??;
         }
         Ok(layers)
     }
@@ -789,6 +803,7 @@ impl ImageService {
             seal: false,
             states: false,
             progress: &progress,
+            made: Default::default(),
         });
         let velarx_graph::Pulled {
             layers: driven,
@@ -2325,6 +2340,66 @@ mod tests {
             "{e}"
         );
     }
+    /// The completion replays the tar-split of each staged layer against its
+    /// table before it commits any: a tar-split that describes another
+    /// filesystem than the table the pull checked stops it.
+    #[tokio::test]
+    async fn a_staged_layer_whose_tar_split_contradicts_its_table_is_refused() {
+        use velarx_content::pull::staged::{NewLayer, StagedLayerMeta};
+        use velarx_content::pull::{tar::TarReader, tarsplit::Recorder};
+        let tmp = tempfile::tempdir().unwrap();
+        let sha = |t: &str| Digest::of(Algorithm::Sha256, t.as_bytes());
+        let key = LayerKey::Toc(sha("toc"));
+        let db = velarx_db::Database::open_in_memory().await.unwrap();
+        let store = Arc::new(FileStore::new(tmp.path().join("objects")).unwrap());
+        let service =
+            ImageService::new(db, store, tmp.path().join("pulls"), VerityMode::Off).unwrap();
+        // (a table of one file, a tar-split of an empty tar)
+        let file = format!("sha256-12:{}", "cd".repeat(32));
+        let toc = serde_json::json!({"version": 1, "entries": [
+            {"name": "f", "type": "reg", "size": 4, "fsverity": file}
+        ]});
+        let mut r = TarReader::with_sink(&[0u8; 1024][..], Recorder::new().unwrap());
+        while r.next_entry().unwrap().is_some() {}
+        let tarsplit = r.finish().unwrap().1.finish().unwrap().compressed;
+        let area = service.staging_area();
+        area.publish_layer(&NewLayer {
+            meta: StagedLayerMeta {
+                key: key.to_string(),
+                blob: sha("blob").to_string(),
+                size: 4,
+                registry_ref: None,
+                reach: velarx_db::LayerReach::default(),
+                public: false,
+                erofs: "sha256:ee".into(),
+                owners: "[[],[]]".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            },
+            toc: &toc.to_string(),
+            tarsplit: &tarsplit,
+            toc_z: None,
+        })
+        .unwrap();
+        let manifest: OciManifest = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"mediaType": "", "digest": sha("config").to_string(), "size": 1},
+            "layers": [{"mediaType": "", "digest": sha("blob").to_string(), "size": 1}],
+        }))
+        .unwrap();
+        let mut config: OciConfig = serde_json::from_str(
+            r#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#,
+        )
+        .unwrap();
+        config.rootfs.diff_ids = vec![sha("diff")];
+        let e = service
+            .lazy_layers(&area, &manifest, &config, &[key], false)
+            .await
+            .map(|l| l.len())
+            .unwrap_err();
+        assert!(matches!(e, ImageError::Contradicted(_)), "{e}");
+        assert!(e.to_string().contains("differ at `f`"), "{e}");
+    }
+
     /// A layer that an earlier completion released from the staging area and
     /// that the driver lost since is staged again from the engine's copy of
     /// it when every file of it is there; with a file missing, or for a driver

@@ -85,8 +85,11 @@ lengths before allocating and verifies every digest.
   (annotations that name no table this reads, no tar-split, no fs-verity
   digest for a file, a tar-split or bytes that are not the table's, a source
   without ranges such as an archive) is refused with an error that names it,
-  and nothing of it is stored.  Only a layer without the annotations is read
-  as a stream.
+  and nothing of it is stored.  A lazy pull stages a layer and runs
+  containers on it once every byte is checked against the table, and
+  replays its tar-split at the completion, which commits nothing of a pull
+  whose tar-split is not the table's.  Only a layer without the annotations
+  is read as a stream.
 * **A node outside the peer-to-peer swarm**: see "The peer-to-peer swarm"
   below.
 * **A storage service** (`[storage] driver = "varlink"`) is chosen by the

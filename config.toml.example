@@ -235,6 +235,8 @@ check_leftover_age_secs = 86400
 #             leave names and rows of files whose data is not on the disk
 #             (the store may need `system check --repair`).  For tests,
 #             caches, CI, tmpfs and benchmarks
+# (a lazy pull is made durable when it is complete: what it staged
+# before is not, and a reboot discards it)
 sync = "syncfs"
 # The fs-verity digests of the EROFS images of the layers that a manifest
 # states, one annotation of each layer descriptor

@@ -61,6 +61,9 @@ pub const LAYERS: &str = "layers";
 /// `meta/<stem>` (its lease, and what a lazy pull knows of it), never
 /// handed to a fetcher.
 pub const META: &str = "meta";
+/// The boot the area was last used in (the kernel's boot id), below the
+/// staging directory of the store.
+const BOOT: &str = "boot";
 
 /// The state of a pull that is not committed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,15 +301,84 @@ pub struct Staging {
     base: PathBuf,
 }
 
+/// What a publish writes, named once all of it is written:
+///
+/// 1. the files of a directory nothing reads yet (those of a pull before
+///    its directory has its name, the table and the tar-split of a layer
+///    before its `layer.json`) are written in place;
+/// 2. then the publish points (`layer.json`), written aside, are renamed
+///    into place.
+///
+/// A publish point names files of step 1 only: one that names another
+/// publish point (a pull, which names its layers) is named after the
+/// commit.  Nothing of the staging area is made durable: a lazy pull is
+/// transient until it is complete, a reboot discards it
+/// ([`Staging::forget_earlier_boots`]), and its completion makes the
+/// layers and the image durable before it names them in the store.
+#[derive(Default)]
+pub struct Barrier {
+    /// Written aside, renamed to the path in step 2
+    points: Vec<(tempfile::NamedTempFile, PathBuf)>,
+    /// Held until the points are named
+    leases: Vec<Lease>,
+}
+
+impl Barrier {
+    /// Write the file `path` of a directory nothing reads before a publish
+    /// point of this barrier names it (what it had is replaced).
+    fn write(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        write_private(path, bytes)?;
+        Ok(())
+    }
+
+    /// Write `bytes` aside, to be the publish point `path` in step 2.
+    fn publish(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".tmp")
+            .tempfile_in(parent(path)?)?;
+        tmp.write_all(bytes)?;
+        self.points.push((tmp, path.to_path_buf()));
+        Ok(())
+    }
+
+    /// Hold `lease` until the commit.
+    fn hold(&mut self, lease: Lease) {
+        self.leases.push(lease);
+    }
+
+    /// Step 2.
+    pub fn commit(self) -> io::Result<()> {
+        for (tmp, path) in self.points {
+            tmp.persist(path).map_err(|e| e.error)?;
+        }
+        Ok(())
+    }
+}
+
+/// Write the file `path` (mode 0600), replacing what it had.
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)
+}
+
+fn parent(path: &Path) -> io::Result<&Path> {
+    path.parent()
+        .ok_or_else(|| io::Error::other("a path without a directory"))
+}
+
+/// Replace the file `path` by a rename (not durable: see [`Barrier`]).
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| io::Error::other("a path without a directory"))?;
-    let mut tmp = tempfile::Builder::new().prefix(".tmp").tempfile_in(dir)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".tmp")
+        .tempfile_in(parent(path)?)?;
     tmp.write_all(bytes)?;
-    tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
-    File::open(dir)?.sync_all()
+    Ok(())
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<Option<T>> {
@@ -336,6 +408,67 @@ impl Staging {
             velarx_base::ipc::create_private_dirs(&self.base.join(d))?;
         }
         Ok(())
+    }
+
+    /// What the area holds of an earlier boot goes: nothing of it was made
+    /// durable ([`Barrier`]), so a lazy pull does not outlive a reboot (one
+    /// whose engine stopped is resumed by the next).  Called by the process
+    /// that is alone in the store at its start: the pulls and the layers a
+    /// process holds stay (a process of this boot), everything else of the
+    /// pulls, the layers and their EROFS images goes, read or not.
+    pub fn forget_earlier_boots(&self) -> io::Result<()> {
+        let now = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        let boot = self.base.join(BOOT);
+        if std::fs::read_to_string(&boot).is_ok_and(|b| b == now) {
+            return Ok(());
+        }
+        let names = |dir: &str| -> Vec<String> {
+            std::fs::read_dir(self.base.join(dir))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        // (what is gone meanwhile is gone)
+        let removed = |r: io::Result<()>| match r {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+        for id in names(PULLS) {
+            if id.starts_with('.') {
+                removed(velarx_base::tree::remove_dir_all(
+                    self.images_dir().join(&id),
+                ))?;
+            } else if !self.lease_held(&id) {
+                self.remove_pull(&id)?;
+            }
+        }
+        let mut stems: BTreeSet<String> = names(META).into_iter().collect();
+        stems.extend(names(LAYERS));
+        let mut kept = BTreeSet::new();
+        for stem in stems {
+            let Some(_lease) = self.lease_stem_if(&stem, false)? else {
+                kept.insert(stem);
+                continue;
+            };
+            for dir in [META, LAYERS] {
+                removed(velarx_base::tree::remove_dir_all(
+                    self.base.join(dir).join(&stem),
+                ))?;
+            }
+        }
+        // (an image is `layer-<stem>.<format>`)
+        for name in names(COMPOSEFS) {
+            let stem = name
+                .strip_prefix("layer-")
+                .and_then(|n| n.split('.').next());
+            if !stem.is_some_and(|stem| kept.contains(stem)) {
+                removed(std::fs::remove_file(self.base.join(COMPOSEFS).join(&name)))?;
+            }
+        }
+        velarx_base::ipc::create_private_dirs(&self.base)?;
+        write_atomic(&boot, now.as_bytes())
     }
 
     /// The staging directory of the store.
@@ -468,13 +601,21 @@ impl Staging {
     /// (its key names its table of contents) and is kept, as a completer
     /// may be reading it, with the blob and reach of this pull.
     pub fn publish_layer(&self, layer: &NewLayer<'_>) -> io::Result<()> {
+        let mut barrier = Barrier::default();
+        self.publish_layer_in(layer, &mut barrier)?;
+        barrier.commit()
+    }
+
+    /// [`Self::publish_layer`], durable and named when `barrier` commits
+    /// (before the pull that names the layer is published).
+    pub fn publish_layer_in(&self, layer: &NewLayer<'_>, barrier: &mut Barrier) -> io::Result<()> {
         self.create()?;
         let key = LayerKey::parse(&layer.meta.key)
             .ok_or_else(|| io::Error::other(format!("{:?} is no layer key", layer.meta.key)))?;
         let dir = self.layer_dir(&key);
         // (under the lease of the layer, as its removal is: a publish does
         // not meet a removal half made, nor a commit that takes it away)
-        let _lease = self.lease_layer(&key)?;
+        barrier.hold(self.lease_layer(&key)?);
         // (the directory may be there with only the lease of a fetch)
         velarx_base::ipc::create_private_dirs(&dir)?;
         if let Some(there) = read_json::<StagedLayerMeta>(&dir.join("layer.json"))? {
@@ -490,21 +631,21 @@ impl Staging {
                 ..layer.meta.clone()
             };
             if meta != there {
-                write_atomic(
+                barrier.publish(
                     &dir.join("layer.json"),
                     &serde_json::to_vec(&meta).map_err(io::Error::other)?,
                 )?;
             }
             return Ok(());
         }
-        // (`layer.json` last: the publish point; two pulls that publish at
-        // once write the same table and tar-split)
-        write_atomic(&dir.join("toc.json"), layer.toc.as_bytes())?;
-        write_atomic(&dir.join("tarsplit.zst"), layer.tarsplit)?;
+        // (`layer.json` is the publish point: without it, nothing reads the
+        // table and the tar-split, which a publish cut short left)
+        barrier.write(&dir.join("toc.json"), layer.toc.as_bytes())?;
+        barrier.write(&dir.join("tarsplit.zst"), layer.tarsplit)?;
         if let Some(toc_z) = layer.toc_z {
-            write_atomic(&dir.join("toc.zst"), toc_z)?;
+            barrier.write(&dir.join("toc.zst"), toc_z)?;
         }
-        write_atomic(
+        barrier.publish(
             &dir.join("layer.json"),
             &serde_json::to_vec(&layer.meta).map_err(io::Error::other)?,
         )
@@ -571,21 +712,36 @@ impl Staging {
     /// that is there already, under its lease.  Returns the pull as it is
     /// published.
     pub fn publish_pull(&self, pull: &StagedPull) -> io::Result<StagedPull> {
+        self.publish_pull_after(pull, Barrier::default())
+    }
+
+    /// [`Self::publish_pull`] once `barrier`, which holds what the pull
+    /// names (its layers), is committed together with the files of the pull,
+    /// which are named after it.
+    pub fn publish_pull_after(
+        &self,
+        pull: &StagedPull,
+        barrier: Barrier,
+    ) -> io::Result<StagedPull> {
         self.create()?;
         let dir = self.image_dir(&pull.id);
         if dir.join("pull.json").is_file() {
             // (read under the lock: two pulls that join at once keep both
             // their names)
             let _lock = match self.lock_pull_file(&pull.id) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return self.publish_new(pull),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return self.publish_new(pull, barrier)
+                }
                 other => other?,
             };
             let Some(mut there) = read_json::<StagedPull>(&dir.join("pull.json"))? else {
                 // (removed meanwhile: committed or cancelled; published anew)
                 drop(_lock);
-                return self.publish_new(pull);
+                return self.publish_new(pull, barrier);
             };
             there.join(pull);
+            // (the layers it names first)
+            barrier.commit()?;
             write_atomic(
                 &dir.join("pull.json"),
                 &serde_json::to_vec(&there).map_err(io::Error::other)?,
@@ -596,21 +752,21 @@ impl Staging {
             }
             return Ok(there);
         }
-        self.publish_new(pull)
+        self.publish_new(pull, barrier)
     }
 
     /// Publish a pull that is not there by the rename of a directory made
     /// aside; one published meanwhile by another command is joined.
-    fn publish_new(&self, pull: &StagedPull) -> io::Result<StagedPull> {
+    fn publish_new(&self, pull: &StagedPull, mut barrier: Barrier) -> io::Result<StagedPull> {
         let dir = self.image_dir(&pull.id);
         let new = tempfile::Builder::new()
             .prefix(".new-")
             .tempdir_in(self.images_dir())?;
-        write_atomic(
+        barrier.write(
             &new.path().join("pull.json"),
             &serde_json::to_vec(pull).map_err(io::Error::other)?,
         )?;
-        write_atomic(
+        barrier.write(
             &new.path().join("state.json"),
             &serde_json::to_vec(&StateFile {
                 state: PullState::Queued,
@@ -620,16 +776,14 @@ impl Staging {
             .map_err(io::Error::other)?,
         )?;
         // (the token of its image servers: `Self::token`)
-        write_atomic(
+        barrier.write(
             &new.path().join("token"),
             velarx_base::random::token().as_bytes(),
         )?;
+        barrier.commit()?;
         let new = new.keep();
         match std::fs::rename(&new, &dir) {
-            Ok(()) => {
-                File::open(self.images_dir())?.sync_all()?;
-                Ok(pull.clone())
-            }
+            Ok(()) => Ok(pull.clone()),
             // (published meanwhile by another command: join it)
             Err(_) if dir.join("pull.json").is_file() => {
                 let _ = velarx_base::tree::remove_dir_all(&new);
@@ -977,6 +1131,111 @@ mod tests {
             },
             key,
         )
+    }
+
+    #[test]
+    fn a_layer_in_a_barrier_is_named_when_it_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let area = Staging::new(tmp.path());
+        let mut barrier = Barrier::default();
+        let keys: Vec<LayerKey> = (1..4)
+            .map(|n| {
+                let (meta, key) = layer(n);
+                area.publish_layer_in(
+                    &NewLayer {
+                        meta,
+                        toc: "{}",
+                        tarsplit: b"ts",
+                        toc_z: None,
+                    },
+                    &mut barrier,
+                )
+                .unwrap();
+                key
+            })
+            .collect();
+        assert!(keys.iter().all(|k| area.layer(k).unwrap().is_none()));
+        let p = pull(1, "latest");
+        area.publish_pull_after(&p, barrier).unwrap();
+        for k in &keys {
+            assert_eq!(area.layer(k).unwrap().unwrap().tarsplit().unwrap(), b"ts");
+        }
+        assert_eq!(area.pull(&p.id).unwrap().unwrap(), p);
+        assert!(area.token(&p.id).is_ok());
+    }
+
+    /// The table, the tar-split and the table as sent are written before
+    /// `layer.json` names them, which is when the barrier commits.
+    #[test]
+    fn the_files_of_a_layer_are_written_before_it_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let area = Staging::new(tmp.path());
+        let (meta, key) = layer(1);
+        let mut barrier = Barrier::default();
+        area.publish_layer_in(
+            &NewLayer {
+                meta,
+                toc: "{}",
+                tarsplit: b"ts",
+                toc_z: Some(b"tz"),
+            },
+            &mut barrier,
+        )
+        .unwrap();
+        let dir = area.layer_dir(&key);
+        for (name, bytes) in [
+            ("toc.json", &b"{}"[..]),
+            ("tarsplit.zst", b"ts"),
+            ("toc.zst", b"tz"),
+        ] {
+            assert_eq!(std::fs::read(dir.join(name)).unwrap(), bytes);
+        }
+        assert!(area.layer(&key).unwrap().is_none());
+        barrier.commit().unwrap();
+        assert!(area.layer(&key).unwrap().is_some());
+    }
+
+    /// What the area holds of an earlier boot goes at the start of the
+    /// next, read or not, but what a process holds; what this boot staged
+    /// stays.
+    #[test]
+    fn a_reboot_discards_the_pulls_and_their_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let area = Staging::new(tmp.path());
+        let (meta, key) = layer(1);
+        area.publish_layer(&NewLayer {
+            meta,
+            toc: "{}",
+            tarsplit: b"ts",
+            toc_z: None,
+        })
+        .unwrap();
+        let old = pull(1, "old");
+        area.publish_pull(&old).unwrap();
+        let held = pull(2, "held");
+        area.publish_pull(&held).unwrap();
+        let _lease = area.take_lease(&held.id).unwrap().unwrap();
+        // (one a crash left unreadable, and its EROFS image)
+        std::fs::create_dir_all(area.image_dir("cut")).unwrap();
+        std::fs::write(area.image_dir("cut").join("pull.json"), b"").unwrap();
+        let image = tmp
+            .path()
+            .join(COMPOSEFS)
+            .join(format!("layer-{}.v1.erofs", key.file_stem()));
+        std::fs::write(&image, b"erofs").unwrap();
+        std::fs::write(tmp.path().join(BOOT), b"an earlier boot\n").unwrap();
+        area.forget_earlier_boots().unwrap();
+        assert!(area.pull(&old.id).unwrap().is_none());
+        assert!(area.pull(&held.id).unwrap().is_some());
+        assert!(!area.image_dir("cut").exists());
+        assert!(area.layer(&key).unwrap().is_none());
+        assert!(!image.exists());
+        // the same boot: nothing goes
+        area.publish_pull(&old).unwrap();
+        drop(_lease);
+        area.forget_earlier_boots().unwrap();
+        assert!(area.pull(&old.id).unwrap().is_some());
+        assert!(area.pull(&held.id).unwrap().is_some());
     }
 
     #[test]

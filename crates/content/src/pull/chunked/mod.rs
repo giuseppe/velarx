@@ -263,7 +263,15 @@ pub async fn layer_index(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<Op
     };
     let by_table = async {
         let (toc_z, ts_z) = metadata(ctx, layer).await?;
-        verified(&info, toc_z, ts_z, layer.digest, ctx.limits.max_layer_bytes).await
+        verified(
+            &info,
+            toc_z,
+            ts_z,
+            layer.digest,
+            ctx.limits.max_layer_bytes,
+            false,
+        )
+        .await
     };
     by_table
         .await
@@ -271,16 +279,20 @@ pub async fn layer_index(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<Op
         .map_err(|e| naming(&layer.digest, e))
 }
 
-/// [`verify_metadata`] of what the fetchers found.
+/// [`verify_metadata`] of what the fetchers found, or [`verify_table`] for
+/// a `lazy` layer, whose completion replays the tar-split before the layer
+/// is committed.
 pub(super) async fn verified(
     info: &Info,
     toc_z: Vec<u8>,
     ts_z: Vec<u8>,
     layer: Digest,
     max_tar: u64,
+    lazy: bool,
 ) -> ImageResult<Metadata> {
     let info = info.clone();
-    tokio::task::spawn_blocking(move || verify_metadata(&info, &toc_z, ts_z, &layer, max_tar))
+    let verify = if lazy { verify_table } else { verify_metadata };
+    tokio::task::spawn_blocking(move || verify(&info, &toc_z, ts_z, &layer, max_tar))
         .await
         .map_err(|e| fail(e.to_string()))?
 }
@@ -331,8 +343,25 @@ fn invalid_canonical(layer: &Digest, reason: impl std::fmt::Display) -> ImageErr
 /// `version` is 2, whatever the annotations say: it must be one, and then
 /// it is all the layer has.  A layer with a table is pulled by it or not at
 /// all: one that has no tar-split and no table of version 2, or whose table
-/// gives a file no fs-verity digest, is an error naming the layer.
+/// gives a file no fs-verity digest, is an error naming the layer.  The
+/// tar-split must describe the entries of the table
+/// ([`super::lazy::replay`]).
 pub fn verify_metadata(
+    info: &Info,
+    toc_z: &[u8],
+    ts_z: Vec<u8>,
+    layer: &Digest,
+    max_tar: u64,
+) -> ImageResult<Metadata> {
+    let meta = verify_table(info, toc_z, ts_z, layer, max_tar)?;
+    super::lazy::replay(&meta.stored, meta.tarsplit_z.clone(), layer)?;
+    Ok(meta)
+}
+
+/// [`verify_metadata`] but the replay: every byte is checked against the
+/// digests the descriptor vouches for (the tar-split against the one the
+/// table gives), and the table is what a lazy layer is served by.
+pub fn verify_table(
     info: &Info,
     toc_z: &[u8],
     ts_z: Vec<u8>,
@@ -428,7 +457,7 @@ fn vouched_metadata(
         });
     }
     let ts_z = bytes::Bytes::from(ts_z);
-    let stored = super::lazy::toc_view(&toc, info.checksum.alg(), ts_z.clone(), layer)?;
+    let stored = super::lazy::toc_view(&toc, info.checksum.alg(), layer)?;
     Ok(Metadata {
         toc: Arc::new(toc),
         stored: Arc::new(stored),
@@ -1574,7 +1603,15 @@ async fn pull_by_table(
         started.elapsed()
     );
     let metadata_bytes = (toc_z.len() + ts_z.len()) as u64;
-    let meta = verified(info, toc_z, ts_z, layer.digest, ctx.limits.max_layer_bytes).await?;
+    let meta = verified(
+        info,
+        toc_z,
+        ts_z,
+        layer.digest,
+        ctx.limits.max_layer_bytes,
+        false,
+    )
+    .await?;
 
     debug!(
         "Layer {}: metadata verified after {:?}",

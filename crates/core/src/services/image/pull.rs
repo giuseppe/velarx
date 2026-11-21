@@ -846,7 +846,8 @@ impl ImageService {
         stored: &[bool],
         image: &str,
         max_tar: u64,
-    ) -> ImageResult<std::collections::HashMap<String, pull::lazy::Found>> {
+        db: &velarx_db::Database,
+    ) -> ImageResult<Accepted> {
         let missing: Vec<u32> = stored
             .iter()
             .enumerate()
@@ -855,20 +856,58 @@ impl ImageService {
             .collect();
         let mut replies = staged.probe_all(&missing).await?;
         velarx_base::trace::point("pull probed");
-        let mut found = std::collections::HashMap::new();
+        let mut accepted = Accepted::default();
         let mut refused = Vec::new();
-        for at in missing {
+        // (the layers are checked at once, and what the pull needs of each
+        // is made as soon as its table is: the last does not wait for the
+        // others)
+        let answers = missing.into_iter().map(|at| {
             let layer = &manifest.layers[at as usize];
-            let answer = match replies.iter().position(|(r, _)| r.layer == at) {
-                Some(i) => {
-                    let (reply, metadata) = replies.swap_remove(i);
-                    pull::lazy::accept(layer, &reply, metadata, max_tar).await?
+            let reply = replies
+                .iter()
+                .position(|(r, _)| r.layer == at)
+                .map(|i| replies.swap_remove(i));
+            async move {
+                let answer = match reply {
+                    Some((reply, metadata)) => {
+                        pull::lazy::accept(layer, &reply, metadata, max_tar).await?
+                    }
+                    None => Err(velarx_proto::transfer::NotLazy::Unreachable),
+                };
+                let made = match &answer {
+                    Ok((_, lazy)) => Some(Self::made_of_table(layer, &lazy.toc, db).await?),
+                    Err(_) => None,
+                };
+                Ok::<_, ImageError>((at, layer, answer, made))
+            }
+        });
+        // (a file of the image has one size: in every table of it and in
+        // the store)
+        let mut listed: HashMap<String, u64> = HashMap::new();
+        for (at, layer, answer, made) in
+            futures::future::try_join_all(answers.collect::<Vec<_>>()).await?
+        {
+            if let Some(m) = made {
+                let conflict = m
+                    .files
+                    .into_iter()
+                    .find_map(|(digest, size)| {
+                        let first = *listed.entry(digest.clone()).or_insert(size);
+                        (first != size).then_some((digest, first, size))
+                    })
+                    .or(m.stored_conflict);
+                if let Some((digest, held, size)) = conflict {
+                    return Err(ImageError::Contradicted(format!(
+                        "layer {}: its table of contents lists {digest} with {size} bytes, another table or the store has it with {held}",
+                        layer.digest
+                    )));
                 }
-                None => Err(velarx_proto::transfer::NotLazy::Unreachable),
-            };
+                accepted.made.insert(m.key, (m.artifact, m.image));
+                accepted.tocs.insert(m.key, m.toc);
+            }
             match answer {
                 Ok(f) => {
-                    found.insert(layer.digest.to_string(), f);
+                    accepted.found.insert(layer.digest.to_string(), f);
                 }
                 Err(reason) => refused.push(velarx_types::NotLazyLayer {
                     index: at,
@@ -885,7 +924,45 @@ impl ImageService {
                 layers: refused,
             });
         }
-        Ok(found)
+        Ok(accepted)
+    }
+
+    /// What the pull of the lazy `layer` needs of its verified table `toc`,
+    /// made at once: the identity and the EROFS image of the layer, the
+    /// JSON of the table its staging keeps, and its files, with the first
+    /// that the store has with another size.
+    async fn made_of_table(
+        layer: &OciDescriptor,
+        toc: &Arc<velarx_storage::Toc>,
+        db: &velarx_db::Database,
+    ) -> ImageResult<MadeOfTable> {
+        let key = LayerKey::expected(layer);
+        let identity = tokio::task::spawn_blocking({
+            let toc = toc.clone();
+            move || storage::identity_of(&key, &toc)
+        });
+        let json = tokio::task::spawn_blocking({
+            let toc = toc.clone();
+            move || serde_json::to_string(&*toc)
+        });
+        let files: Vec<(String, u64)> = toc
+            .entries
+            .iter()
+            .filter(|e| e.entry_type == velarx_storage::TocEntryType::Reg && e.size > 0)
+            .filter_map(|e| Some((e.verity()?, e.size)))
+            .collect();
+        let stored_conflict = db.file_size_conflict(files.clone()).await?;
+        let task = |e: tokio::task::JoinError| ImageError::Layer(format!("layer {key}: {e}"));
+        let (key, artifact, image) = identity.await.map_err(task)??;
+        let toc = json.await.map_err(task)??;
+        Ok(MadeOfTable {
+            key,
+            artifact,
+            image,
+            toc,
+            files,
+            stored_conflict,
+        })
     }
 
     /// How a call about the repository `repository` (`registry/name`) of a
@@ -1459,43 +1536,29 @@ impl ImageService {
         // (`ImageNotLazy`): every layer the store lacks must have a table of
         // contents with the fs-verity digest of each file, which a fetcher
         // can serve on demand.  What the fetchers gave is what the pull keeps.
-        let lazy_found = match (&staged, lazy) {
-            (Some(staged), true) => {
-                let image = registry_ref.clone().unwrap_or_default();
-                Self::accept_lazy(staged, &manifest, &stored, &image, limits.max_layer_bytes)
-                    .await?
-            }
-            _ => std::collections::HashMap::new(),
-        };
         // (a lazy layer fetches no file: its table is compared with what the
         // store has recorded of the files it lists, and with the other
         // layers of the image)
-        let mut listed: HashMap<String, u64> = HashMap::new();
-        for (layer, (_, found)) in &lazy_found {
-            let files: Vec<(String, u64)> = found
-                .toc
-                .entries
-                .iter()
-                .filter(|e| e.entry_type == velarx_storage::TocEntryType::Reg && e.size > 0)
-                .filter_map(|e| Some((e.verity()?, e.size)))
-                .collect();
-            let mut conflict = None;
-            for (digest, size) in &files {
-                let first = *listed.entry(digest.clone()).or_insert(*size);
-                if first != *size {
-                    conflict = Some((digest.clone(), first, *size));
-                    break;
-                }
+        let accepted = match (&staged, lazy) {
+            (Some(staged), true) => {
+                let image = registry_ref.clone().unwrap_or_default();
+                Self::accept_lazy(
+                    staged,
+                    &manifest,
+                    &stored,
+                    &image,
+                    limits.max_layer_bytes,
+                    &self.db,
+                )
+                .await?
             }
-            if conflict.is_none() {
-                conflict = self.db.file_size_conflict(files).await?;
-            }
-            if let Some((digest, held, size)) = conflict {
-                return Err(ImageError::Contradicted(format!(
-                    "layer {layer}: its table of contents lists {digest} with {size} bytes, another table or the store has it with {held}"
-                )));
-            }
-        }
+            _ => Accepted::default(),
+        };
+        let Accepted {
+            found: lazy_found,
+            made: made_early,
+            tocs: mut staged_tocs,
+        } = accepted;
         let mut content = match source {
             Some(source) => ContentFeed::new(net, source, self.db.clone(), limits),
             None => ContentFeed::made(self.db.clone(), limits, &made),
@@ -1547,6 +1610,7 @@ impl ImageService {
             seal,
             states,
             progress: &progress_tx,
+            made: made_early,
         });
 
         let driver_feed: Arc<dyn PullFeed> = feed.clone();
@@ -1663,13 +1727,25 @@ impl ImageService {
                 .await?;
             velarx_base::trace::point("pull rows committed");
             let area = self.staging_area();
-            for d in done_layers.values().filter(|d| d.lazy) {
+            let mut barrier = velarx_content::pull::staged::Barrier::default();
+            // (the barrier holds the leases of the layers until it commits:
+            // taken in the order `lock_layers` takes them)
+            let mut lazy: Vec<&LayerDone> = done_layers.values().filter(|d| d.lazy).collect();
+            lazy.sort_unstable_by_key(|d| d.key.file_stem());
+            for d in lazy {
                 let m = made.get(&d.key).ok_or_else(|| {
                     ImageError::Layer(format!("no EROFS image was made for layer {}", d.key))
                 })?;
+                // (a layer the storage driver holds already was not probed:
+                // its table is the one the feed checked)
+                let toc = match staged_tocs.remove(&d.key) {
+                    Some(toc) => toc,
+                    None => serde_json::to_string(&*d.toc)?,
+                };
                 pull::stage_layer(
                     &area,
-                    d,
+                    &mut barrier,
+                    (d, &toc),
                     registry_ref.as_deref(),
                     reach,
                     shareable,
@@ -1709,7 +1785,7 @@ impl ImageService {
             };
             // the publish point: from here on the pull is visible, and its
             // layers are pinned by it
-            area.publish_pull(&staged)?;
+            area.publish_pull_after(&staged, barrier)?;
             if let Err(e) = lease.release().await {
                 warn!("Cannot remove the lease of the pull: {e}");
             }
@@ -1855,7 +1931,40 @@ pub(super) struct Settling<'a> {
     /// The pull states the digests of the EROFS images in the manifest.
     pub states: bool,
     pub progress: &'a mpsc::Sender<TransferProgress>,
+    /// The identities and images already made, by layer (the lazy layers:
+    /// made as their tables were checked); the others are made when the
+    /// driver is done.
+    pub made: Made,
 }
+
+/// The lazy layers [`ImageService::accept_lazy`] accepted, by blob digest,
+/// with what was made of their tables by layer: their identities and EROFS
+/// images, and the JSON of the tables their staging keeps.
+#[derive(Default)]
+struct Accepted {
+    found: HashMap<String, pull::lazy::Found>,
+    made: Made,
+    tocs: HashMap<LayerKey, String>,
+}
+
+/// [`ImageService::made_of_table`].
+struct MadeOfTable {
+    key: LayerKey,
+    artifact: crate::storage_driver::LayerArtifact,
+    image: velarx_fuse::layer_erofs::LayerImage,
+    toc: String,
+    files: Vec<(String, u64)>,
+    stored_conflict: Option<(String, u64, u64)>,
+}
+
+/// The identity of layers and the EROFS image it was made from.
+pub(super) type Made = HashMap<
+    LayerKey,
+    (
+        crate::storage_driver::LayerArtifact,
+        velarx_fuse::layer_erofs::LayerImage,
+    ),
+>;
 
 impl ImageService {
     /// What the engine makes of the layers once the driver verified them,
@@ -1875,6 +1984,7 @@ impl ImageService {
             let (db, mode) = (self.db.clone(), self.composefs_digests());
             let (progress_tx, handle) = (s.progress.clone(), tokio::runtime::Handle::current());
             let manifest_alg = s.manifest_digest.alg();
+            let mut early = s.made;
             let holds_objects = self.storage.holds_objects();
             Box::new(move |pulled: &mut Vec<LayerDone>, objects| {
                 // (each layer of the image is under the key it was asked by)
@@ -1927,9 +2037,20 @@ impl ImageService {
                         stored_erofs.insert(*d, stored(d)?.erofs);
                     }
                 }
-                let tocs: Vec<(&LayerKey, &velarx_storage::Toc)> =
-                    pulled.iter().map(|p| (&p.key, &*p.toc)).collect();
-                let (ours, images) = storage::identities_of(&tocs)?;
+                let (mut ours, mut images) = (HashMap::new(), HashMap::new());
+                let mut tocs: Vec<(&LayerKey, &velarx_storage::Toc)> = Vec::new();
+                for p in pulled.iter() {
+                    match early.remove(&p.key) {
+                        Some((artifact, image)) => {
+                            ours.insert(p.key, artifact);
+                            images.insert(p.key, image);
+                        }
+                        None => tocs.push((&p.key, &*p.toc)),
+                    }
+                }
+                let (artifacts, made) = storage::identities_of(&tocs)?;
+                ours.extend(artifacts);
+                images.extend(made);
                 if !states {
                     let theirs: Vec<Option<String>> = layer_keys
                         .iter()

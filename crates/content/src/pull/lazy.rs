@@ -56,27 +56,37 @@ impl Contents for Zeros {
 /// The TOC the layer `layer` pulled by its table of contents is stored by:
 /// the entries of the table the descriptor vouches for.  Each file needs an
 /// fs-verity digest or the digest of its content (see [`without_verity`]).
-/// The tar-split (`tarsplit_z`, verified against the table) makes the tar of
-/// the layer again, so it must describe the same entries in the same order,
-/// contents aside: a table and a tar stream that describe two filesystems
-/// are refused.
-pub fn toc_view(
-    registry: &Toc,
-    alg: Algorithm,
-    tarsplit_z: bytes::Bytes,
-    layer: &Digest,
-) -> ImageResult<Toc> {
-    let refused =
-        |e: &dyn std::fmt::Display| ImageError::Contradicted(format!("layer {layer}: {e}"));
+pub fn toc_view(registry: &Toc, alg: Algorithm, layer: &Digest) -> ImageResult<Toc> {
     let entries = registry
         .entries
         .iter()
         .map(|e| entry::from_toc(e, alg))
         .collect::<io::Result<Vec<_>>>()
-        .map_err(|e| refused(&e))?;
+        .map_err(|e| ImageError::Contradicted(format!("layer {layer}: {e}")))?;
+    Ok(Toc {
+        version: TOC_VERSION,
+        entries,
+        tar_split_digest: registry.tar_split_digest.clone(),
+    })
+}
+
+/// The tar-split (`tarsplit_z`, verified against the table) makes the tar of
+/// the layer again, so it must describe the same entries as the stored `toc`
+/// of `layer` in the same order, contents aside: a table and a tar stream
+/// that describe two filesystems are refused.  A lazy layer is replayed
+/// before it is committed to the store, not before it is served: a lazy run
+/// serves files by the digests of the table alone.  A canonical table has
+/// no tar-split: it is the tar.
+pub fn replay(toc: &Toc, tarsplit_z: bytes::Bytes, layer: &Digest) -> ImageResult<()> {
+    if toc.is_canonical() {
+        return Ok(());
+    }
+    let refused =
+        |e: &dyn std::fmt::Display| ImageError::Contradicted(format!("layer {layer}: {e}"));
     let input = tarsplit::decoder(tarsplit_z, tarsplit::MAX_SIZE).map_err(|e| refused(&e))?;
     let mut tar = TarReader::new(Replay::new(Entries::new(input), Zeros));
-    let mut table = entries
+    let mut table = toc
+        .entries
         .iter()
         .filter(|e| e.entry_type != TocEntryType::Chunk);
     loop {
@@ -86,7 +96,7 @@ pub fn toc_view(
             .transpose()
             .map_err(|e| refused(&e))?;
         match (header, table.next()) {
-            (None, None) => break,
+            (None, None) => return Ok(()),
             (Some(h), Some(t)) if entry::same_entry(&h, t) => {}
             (h, t) => {
                 let name = t.or(h.as_ref()).map_or("", |e| e.name.as_str());
@@ -96,11 +106,6 @@ pub fn toc_view(
             }
         }
     }
-    Ok(Toc {
-        version: TOC_VERSION,
-        entries,
-        tar_split_digest: registry.tar_split_digest.clone(),
-    })
 }
 
 /// The metadata of a layer that can be pulled lazily, with the zstd:chunked
@@ -134,7 +139,7 @@ async fn found_of(
     max_tar: u64,
 ) -> ImageResult<Found> {
     let fetched = (toc_z.len() + ts_z.len()) as u64;
-    let meta = chunked::verified(&info, toc_z, ts_z, layer_digest, max_tar).await?;
+    let meta = chunked::verified(&info, toc_z, ts_z, layer_digest, max_tar, true).await?;
     let lazy = LazyLayer {
         toc: meta.stored,
         tarsplit: meta.tarsplit_z,
@@ -242,12 +247,10 @@ mod tests {
     }
 
     fn view(table: &Toc) -> ImageResult<Toc> {
-        toc_view(
-            table,
-            Algorithm::Sha256,
-            tarsplit(),
-            &Digest::empty(Algorithm::Sha256),
-        )
+        let layer = Digest::empty(Algorithm::Sha256);
+        let toc = toc_view(table, Algorithm::Sha256, &layer)?;
+        replay(&toc, tarsplit(), &layer)?;
+        Ok(toc)
     }
 
     #[test]
