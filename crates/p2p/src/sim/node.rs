@@ -10,7 +10,7 @@ use crate::dial_filter::{DialFilter, Rules};
 use crate::entropy::Entropy;
 use crate::gossip::{GossipDiscovery, GossipMessage};
 use crate::peer_exchange::{self, Directory, Pacing};
-use crate::provider::{NodePeers, PeerSource, Policy, Strikes};
+use crate::provider::{NodePeers, PeerSource, Policy};
 use crate::serve::{Admission, Serving};
 use libp2p::PeerId;
 use std::collections::{BTreeMap, BTreeSet};
@@ -130,7 +130,6 @@ pub struct Live {
     pub advertisement: Arc<crate::filter::Advertisement>,
     pub admission: Arc<Admission>,
     pub(super) quic_slots: Arc<Semaphore>,
-    pub strikes: Arc<Strikes>,
     pub source: Arc<PeerSource>,
     pub(super) providers: crate::shared::ProviderCache,
     pub(super) quic_failed: Mutex<std::collections::HashMap<PeerId, Instant>>,
@@ -791,7 +790,6 @@ impl Live {
         let dial_counters: Arc<crate::stats::Counters> = Arc::default();
         let id = super::peer_id(world.seed, index, identity);
         let entropy = Entropy::seeded(world.seed ^ ((index as u64) << 20) ^ (epoch << 8) ^ 0x5eed);
-        let strikes: Arc<Strikes> = Arc::default();
         let knowledge = Arc::new(crate::knowledge::Knowledge::with_entropy(entropy.clone()));
         let bootstrap_addresses = cfg.bootstrap.iter().map(|&i| world.address_of(i)).collect();
         Arc::new(Self {
@@ -828,14 +826,10 @@ impl Live {
             ),
             admission: Arc::new(Admission::new(&cfg.serving)),
             quic_slots: Arc::new(Semaphore::new(cfg.serving.quic_slots)),
-            strikes: strikes.clone(),
             source: Arc::new(
-                PeerSource::with_peers(
-                    Arc::new(NodePeers(Arc::new(super::transport::SimTransport::new(
-                        me.clone(),
-                    )))),
-                    strikes,
-                )
+                PeerSource::with_peers(Arc::new(NodePeers(Arc::new(
+                    super::transport::SimTransport::new(me.clone()),
+                ))))
                 .with_policy(cfg.policy)
                 .with_knowledge(knowledge),
             ),

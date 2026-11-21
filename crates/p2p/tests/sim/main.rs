@@ -12,7 +12,6 @@ mod exchange;
 mod faulty;
 mod filter;
 mod herd;
-mod identity;
 mod introspection;
 mod lookup;
 mod partition;

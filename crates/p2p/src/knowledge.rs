@@ -36,10 +36,6 @@ use tokio::time::Instant;
 pub const HAS_TTL: Duration = Duration::from_secs(600);
 /// How long a peer that had nothing of a layer is not asked for it again.
 pub const MISS_TTL: Duration = Duration::from_secs(60);
-/// How long a peer that sent bytes that were not the chunks asked of it is
-/// not asked for that layer again, and then ranks after the others.  It
-/// decays: nothing is held against a peer for good.
-pub const LIE_TTL: Duration = Duration::from_secs(600);
 /// How long the round-trip time of a peer is kept without a new sample.
 pub const RTT_TTL: Duration = Duration::from_secs(1800);
 /// Layers remembered, and peers for each of them, and peers in all.
@@ -61,7 +57,6 @@ const HEDGE_FACTOR: u32 = 3;
 struct Entry {
     served: Option<Instant>,
     missed: Option<Instant>,
-    lied: Option<Instant>,
 }
 
 struct Layer {
@@ -78,9 +73,6 @@ struct Timing {
     failures: u32,
     /// When the last of them did (an answer that is no chunks does not renew it)
     failed_at: Instant,
-    /// When it last sent bytes that were not the chunks asked of it (until
-    /// it serves again: what it says of itself does not undo it)
-    lied: Option<Instant>,
 }
 
 impl Timing {
@@ -346,7 +338,7 @@ impl Knowledge {
 
     /// `peer` said, in `took`, that it has a chunk of `layer`: as
     /// [`Self::served`] for what is believed of the layer and its time, but a
-    /// word does not undo a lie or failures (it ranks last until it serves).
+    /// word does not undo failures (it ranks last until it serves).
     pub fn said_has(&self, layer: Option<&str>, peer: PeerId, took: Duration) {
         self.answered_at(layer, peer, took, Instant::now(), false)
     }
@@ -361,10 +353,9 @@ impl Knowledge {
     ) {
         let mut inner = self.lock();
         inner.timing(peer, now, |t| {
-            // (only chunks that were right undo a lie or failures: saying
-            // it has a chunk costs a peer nothing)
+            // (only chunks that were right undo failures: saying it has a
+            // chunk costs a peer nothing)
             if served {
-                t.lied = None;
                 t.failures = 0;
             }
             t.rtt = match t.rtt {
@@ -400,28 +391,6 @@ impl Knowledge {
                 if !e.served_live(now) {
                     e.missed = Some(now);
                 }
-            });
-        }
-    }
-
-    /// `peer` sent bytes for `layer` that were not the chunks asked of it:
-    /// it is not asked for the layer again for [`LIE_TTL`], what it served
-    /// of it is forgotten, and it ranks with the peers that keep failing
-    /// until it serves again.
-    pub fn lied(&self, layer: Option<&str>, peer: PeerId) {
-        self.lied_at(layer, peer, Instant::now())
-    }
-
-    pub fn lied_at(&self, layer: Option<&str>, peer: PeerId, now: Instant) {
-        let mut inner = self.lock();
-        inner.timing(peer, now, |t| {
-            t.lied = Some(now);
-            t.at = now;
-        });
-        if let Some(layer) = layer {
-            inner.entry(layer, peer, now, |e| {
-                e.served = None;
-                e.lied = Some(now);
             });
         }
     }
@@ -604,7 +573,7 @@ impl Knowledge {
                         layer: name.clone(),
                         peer: *peer,
                         has: false,
-                        age: since(e.missed.max(e.lied)).unwrap_or_default(),
+                        age: since(e.missed).unwrap_or_default(),
                     });
                 } else if e.served_live(now) {
                     out.push(Belief {
@@ -663,9 +632,8 @@ impl Entry {
     }
 
     fn lacking(&self, now: Instant) -> bool {
-        let within =
-            |at: Option<Instant>, ttl| at.is_some_and(|at| now.saturating_duration_since(at) < ttl);
-        within(self.missed, MISS_TTL) || within(self.lied, LIE_TTL)
+        self.missed
+            .is_some_and(|at| now.saturating_duration_since(at) < MISS_TTL)
     }
 
     fn live(&self, now: Instant) -> bool {
@@ -689,7 +657,6 @@ impl Inner {
             at: now,
             failures: 0,
             failed_at: now,
-            lied: None,
         }));
     }
 
@@ -724,21 +691,14 @@ impl Inner {
         update(l.peers.entry(peer).or_insert(Entry {
             served: None,
             missed: None,
-            lied: None,
         }));
     }
 
-    /// What orders `peer`: the ones that keep failing or lied last, then the
+    /// What orders `peer`: the ones that keep failing last, then the
     /// quickest, the ones never measured (or not lately) first.
     fn key(&self, peer: &PeerId, now: Instant) -> (u8, Duration) {
         match self.peers.get(peer) {
-            Some(t)
-                if t.failures >= Timing::FAILING
-                    || t.lied
-                        .is_some_and(|at| now.saturating_duration_since(at) < LIE_TTL) =>
-            {
-                (1, Duration::ZERO)
-            }
+            Some(t) if t.failures >= Timing::FAILING => (1, Duration::ZERO),
             Some(t) if !t.rtt.is_zero() && now.saturating_duration_since(t.at) <= RTT_TTL => {
                 (0, t.rtt)
             }
@@ -847,54 +807,21 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_that_lied_is_not_asked_for_the_layer_for_a_while_and_ranks_last() {
+    fn a_failing_peer_ranks_last_until_it_serves_whatever_it_says() {
         let k = Knowledge::default();
-        let (liar, other) = (peer(), peer());
-        let t0 = Instant::now();
-        k.served_at(Some("l"), liar, Duration::from_millis(1), t0);
-        k.served_at(Some("l"), other, Duration::from_millis(9), t0);
-        k.lied_at(Some("l"), liar, t0);
-        assert!(k.lacks_at("l", &liar, t0 + Duration::from_secs(1)));
-        assert!(!k.lacks_at("l", &other, t0));
-        assert_eq!(
-            k.providers_at("l", t0 + Duration::from_secs(1)),
-            vec![other]
-        );
-        // (its other layers are not held against it: only its rank)
-        let mut peers = [liar, other];
-        k.lock().rank(&mut peers, t0);
-        assert_eq!(peers, [other, liar]);
-        // it decays
-        assert!(!k.lacks_at("l", &liar, t0 + LIE_TTL));
-    }
-
-    #[test]
-    fn a_peer_that_lied_ranks_last_until_it_serves_whatever_it_says() {
-        let k = Knowledge::default();
-        let (liar, other) = (peer(), peer());
+        let (failing, other) = (peer(), peer());
         let t0 = Instant::now();
         k.served_at(Some("l"), other, Duration::from_millis(9), t0);
-        k.lied_at(Some("l"), liar, t0);
-        // (it says it has a chunk of another layer, quickly)
-        k.answered_at(Some("m"), liar, Duration::from_micros(1), t0, false);
-        let mut peers = [liar, other];
-        k.lock().rank(&mut peers, t0);
-        assert_eq!(peers, [other, liar]);
-        // nor does it undo a failure
-        let failing = peer();
         k.failed(failing);
+        // (it says it has a chunk of another layer, quickly)
         k.answered_at(Some("m"), failing, Duration::from_micros(1), t0, false);
-        let mut two = [failing, other];
-        k.lock().rank(&mut two, t0);
-        assert_eq!(two, [other, failing]);
-        // it serves: it is believed again
-        k.served_at(Some("m"), liar, Duration::from_micros(1), t0);
+        let mut peers = [failing, other];
         k.lock().rank(&mut peers, t0);
-        assert_eq!(peers, [liar, other]);
-        // and a lie is not held against it for ever
-        k.lied_at(Some("l"), liar, t0);
-        k.lock().rank(&mut peers, t0 + LIE_TTL);
-        assert_eq!(peers, [liar, other]);
+        assert_eq!(peers, [other, failing]);
+        // it serves: it is believed again
+        k.served_at(Some("m"), failing, Duration::from_micros(1), t0);
+        k.lock().rank(&mut peers, t0);
+        assert_eq!(peers, [failing, other]);
     }
 
     #[test]

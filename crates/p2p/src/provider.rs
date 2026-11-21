@@ -31,52 +31,6 @@ const MAX_PROVIDERS: usize = 3;
 /// (the answers that came by then count).
 const QUERY_WAIT: Duration = Duration::from_secs(2);
 
-/// Peers that sent bytes that were not what they were asked for: after a few
-/// of them in a short time the peer is not asked for chunks for a while.
-#[derive(Default)]
-pub struct Strikes {
-    peers: std::sync::Mutex<std::collections::HashMap<PeerId, (u32, tokio::time::Instant)>>,
-}
-
-impl Strikes {
-    const LIMIT: u32 = 3;
-    const WINDOW: Duration = Duration::from_secs(600);
-    const BAN: Duration = Duration::from_secs(900);
-
-    pub fn banned(&self, peer: &PeerId) -> bool {
-        let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
-        match peers.get(peer) {
-            Some((n, at)) if *n >= Self::LIMIT && at.elapsed() < Self::BAN => true,
-            Some((n, at)) if *n >= Self::LIMIT || at.elapsed() >= Self::WINDOW => {
-                peers.remove(peer);
-                false
-            }
-            _ => false,
-        }
-    }
-
-    pub fn strike(&self, peer: PeerId) {
-        let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
-        // Peers are few; keep the table small anyway
-        if peers.len() > 1024 {
-            peers.retain(|_, (_, at)| at.elapsed() < Self::BAN);
-        }
-        let entry = peers
-            .entry(peer)
-            .or_insert((0, tokio::time::Instant::now()));
-        if entry.0 < Self::LIMIT {
-            entry.0 += 1;
-        }
-        entry.1 = tokio::time::Instant::now();
-        if entry.0 >= Self::LIMIT {
-            warn!(
-                "P2P: peer {} sent wrong chunks {} times, not asking it for a while",
-                peer, entry.0
-            );
-        }
-    }
-}
-
 /// An error of the node asking a peer, as the source of a pull tells it.
 fn peer_error(e: crate::P2PError) -> PeerError {
     match e {
@@ -621,7 +575,6 @@ struct Began {
 /// What the peers have, as a content source.
 pub struct PeerSource {
     pub(crate) peers: Arc<dyn Peers>,
-    strikes: Arc<Strikes>,
     knowledge: Arc<Knowledge>,
     decisions: Arc<Decisions>,
     policy: Policy,
@@ -641,15 +594,14 @@ pub struct PeerSource {
 }
 
 impl PeerSource {
-    pub fn new(node: Arc<P2PNode>, strikes: Arc<Strikes>) -> Self {
+    pub fn new(node: Arc<P2PNode>) -> Self {
         let knowledge = node.knowledge().clone();
-        Self::with_peers(Arc::new(NodePeers(node)), strikes).with_knowledge(knowledge)
+        Self::with_peers(Arc::new(NodePeers(node))).with_knowledge(knowledge)
     }
 
-    pub fn with_peers(peers: Arc<dyn Peers>, strikes: Arc<Strikes>) -> Self {
+    pub fn with_peers(peers: Arc<dyn Peers>) -> Self {
         Self {
             peers,
-            strikes,
             knowledge: Arc::new(Knowledge::default()),
             decisions: Arc::default(),
             policy: Policy::default(),
@@ -760,11 +712,6 @@ impl PeerSource {
         for peer in peers {
             self.knowledge.failed(*peer);
         }
-    }
-
-    /// The peers that are in disgrace for sending wrong bytes.
-    pub fn strikes(&self) -> &Arc<Strikes> {
-        &self.strikes
     }
 }
 
@@ -885,8 +832,8 @@ impl Asked {
 
 impl PeerSource {
     /// The next peers to ask for the chunks of `layer`, the best first, when
-    /// the ones asked did not give or are slow: never a peer of `got`, in
-    /// disgrace, or known to have none of the layer.  Each source in its
+    /// the ones asked did not give or are slow: never a peer of `got` or
+    /// one known to have none of the layer.  Each source in its
     /// turn, the first that has a peer gives it (see [`SOURCES`]): the peers
     /// that served the layer lately (no lookup), the ones whose filter says
     /// they may hold it, the connected peers that have no filter that is
@@ -954,7 +901,6 @@ impl PeerSource {
             connected.contains(p)
                 && !got.taken.contains(p)
                 && !got.denied.contains(p)
-                && !self.strikes.banned(p)
                 && !self.knowledge.failing(p)
                 && !layer.is_some_and(|l| self.knowledge.lacks(l, p))
         };
@@ -1228,8 +1174,8 @@ impl PeerSource {
 
     /// The index of each layer of `items` from the first of its providers
     /// that has one `well_formed`.  It is not named by its digest: the
-    /// puller proves it; a peer that sends one that is not an index gets a
-    /// strike and the next provider is asked.
+    /// puller proves it; when a peer sends one that is not an index the
+    /// next provider is asked.
     pub(crate) async fn fetch_indexes(
         &self,
         items: &[Item],
@@ -1285,7 +1231,6 @@ impl PeerSource {
             providers = self.peers.connected().await;
             providers.retain(|p| !filtered.no.contains(p));
         }
-        providers.retain(|p| !self.strikes.banned(p));
         providers.truncate(MAX_PROVIDERS);
         note(|| Event::Candidates(providers.iter().map(|p| (*p, why)).collect()));
         for provider in providers {
@@ -1297,7 +1242,6 @@ impl PeerSource {
                         outcome: Outcome::Failed("not an index".into()),
                         took: started.elapsed(),
                     });
-                    self.strikes.strike(provider);
                 }
                 Ok(Some(index)) => {
                     note(|| Event::Asked {
@@ -1416,7 +1360,7 @@ impl PeerSource {
         self.knowledge.rank(&mut every);
         peers.extend(every.into_iter().map(|p| (p, Why::Connected)));
         let mut asked = HashSet::new();
-        peers.retain(|(p, _)| !self.strikes.banned(p) && asked.insert(*p));
+        peers.retain(|(p, _)| asked.insert(*p));
         peers.truncate(MAX_PROVIDERS);
         note(|| Event::Candidates(peers.clone()));
         for (peer, _) in peers {
@@ -1645,7 +1589,7 @@ impl PeerSource {
                 biased;
                 // (the chunks of an answer are taken before it is done with)
                 Some(received) = answers.rx.recv() => {
-                    self.accept(items, sent, layer, &mut answers, received, out).await?;
+                    self.accept(items, sent, &mut answers, received, out).await?;
                     continue;
                 }
                 attempt = futures::StreamExt::next(&mut running), if !running.is_empty() => attempt,
@@ -1705,15 +1649,12 @@ impl PeerSource {
 
     /// The peers that have chunks of `layer`, for striping: the ones that
     /// served it lately, then the ones whose filter says maybe (no walk of the
-    /// DHT), the best first, at most `stripe_peers`; never the ones in
-    /// disgrace or known to have none of it.
+    /// DHT), the best first, at most `stripe_peers`; never the ones known
+    /// to have none of it.
     async fn holders(&self, layer: &str) -> Vec<PeerId> {
         let connected: HashSet<PeerId> = self.peers.connected().await.into_iter().collect();
         let usable = |p: &PeerId| {
-            connected.contains(p)
-                && !self.strikes.banned(p)
-                && !self.knowledge.failing(p)
-                && !self.knowledge.lacks(layer, p)
+            connected.contains(p) && !self.knowledge.failing(p) && !self.knowledge.lacks(layer, p)
         };
         let mut found: Vec<PeerId> = self
             .knowledge
@@ -1903,7 +1844,7 @@ impl PeerSource {
                 // with it, and the chunks of an answer before it is done with)
                 biased;
                 Some(received) = answers.rx.recv() => {
-                    self.accept(items, sent, Some(layer), &mut answers, received, out).await?;
+                    self.accept(items, sent, &mut answers, received, out).await?;
                     continue;
                 }
                 done = futures::StreamExt::next(&mut running) => match done {
@@ -1949,10 +1890,10 @@ impl PeerSource {
                     stop.abort();
                 }
             }
-            // a peer that failed, lied, had no room or had nothing of what
+            // a peer that failed, sent wrong bytes, had no room or had nothing of what
             // it was asked is not asked again here (a busy one is by the
             // next group: it is not remembered as without the layer)
-            if !matches!(taken, Taken::Sent(valid) if valid > 0) || self.strikes.banned(&peer) {
+            if !matches!(taken, Taken::Sent(valid) if valid > 0) {
                 active.retain(|p| *p != peer);
             }
             // what it did not send is for the others, when nobody else has
@@ -1975,7 +1916,6 @@ impl PeerSource {
         &self,
         items: &[Item],
         sent: &mut [bool],
-        layer: Option<&str>,
         answers: &mut Answers,
         received: Received,
         out: &mut dyn Sink,
@@ -1993,8 +1933,6 @@ impl PeerSource {
                 peer,
                 short(&wanted),
             );
-            self.strikes.strike(peer);
-            self.knowledge.lied(layer, peer);
             return Ok(());
         }
         let mut asked = false;
@@ -2032,8 +1970,7 @@ impl PeerSource {
         out: &mut dyn Sink,
     ) -> Result<Taken, String> {
         while let Ok(received) = answers.rx.try_recv() {
-            self.accept(items, sent, layer, answers, received, out)
-                .await?;
+            self.accept(items, sent, answers, received, out).await?;
         }
         let Attempt {
             request,
@@ -2328,13 +2265,11 @@ mod tests {
     }
 
     fn source(fake: &Arc<Fake>, hedge_ms: Option<u64>) -> PeerSource {
-        PeerSource::with_peers(Arc::new(fake.clone()), Arc::new(Strikes::default())).with_policy(
-            Policy {
-                hedge: hedge_ms.is_some(),
-                hedge_delay: hedge_ms.map(Duration::from_millis),
-                ..Policy::default()
-            },
-        )
+        PeerSource::with_peers(Arc::new(fake.clone())).with_policy(Policy {
+            hedge: hedge_ms.is_some(),
+            hedge_delay: hedge_ms.map(Duration::from_millis),
+            ..Policy::default()
+        })
     }
 
     /// What the filters of `peers` say: they hold `layer`.
@@ -2364,12 +2299,10 @@ mod tests {
     }
 
     fn querying(fake: &Arc<Fake>, query_peers: usize) -> PeerSource {
-        PeerSource::with_peers(Arc::new(fake.clone()), Arc::new(Strikes::default())).with_policy(
-            Policy {
-                query_peers,
-                ..Policy::default()
-            },
-        )
+        PeerSource::with_peers(Arc::new(fake.clone())).with_policy(Policy {
+            query_peers,
+            ..Policy::default()
+        })
     }
 
     /// No filter says who holds the layer: the peers are asked whether they have the
@@ -2605,12 +2538,11 @@ mod tests {
         fake.honest.lock().unwrap().insert(busy);
         fake.honest.lock().unwrap().insert(other);
         fake.busy.lock().unwrap().insert(busy, 1);
-        let s = PeerSource::with_peers(Arc::new(fake.clone()), Arc::new(Strikes::default()))
-            .with_policy(Policy {
-                hedge: false,
-                query_peers: 0,
-                ..Policy::default()
-            });
+        let s = PeerSource::with_peers(Arc::new(fake.clone())).with_policy(Policy {
+            hedge: false,
+            query_peers: 0,
+            ..Policy::default()
+        });
         // (the peers are asked in the order they rank: the busy one first)
         s.knowledge()
             .served(Some(LAYER), busy, Duration::from_millis(1));
@@ -2822,7 +2754,7 @@ mod tests {
             chunks: c.clone(),
             passed: passed.clone(),
         };
-        let s = PeerSource::with_peers(Arc::new(peers), Arc::new(Strikes::default()));
+        let s = PeerSource::with_peers(Arc::new(peers));
         let mut out = Passing(Collect::default(), passed);
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -2881,10 +2813,10 @@ mod tests {
     #[tokio::test]
     async fn a_request_waited_for_has_a_place_beside_the_background() {
         let c = chunks(9);
-        let s = Arc::new(PeerSource::with_peers(
-            Arc::new(Holding(PeerId::random(), c.clone())),
-            Arc::new(Strikes::default()),
-        ));
+        let s = Arc::new(PeerSource::with_peers(Arc::new(Holding(
+            PeerId::random(),
+            c.clone(),
+        ))));
         let mut background = Vec::new();
         for chunk in &c[..8] {
             let (s, items) = (s.clone(), items(std::slice::from_ref(chunk)));
@@ -3028,7 +2960,6 @@ mod tests {
             .unwrap();
         assert_eq!(fake.asked.lock().unwrap().clone(), [blocked, good]);
         assert_eq!(digests_of(&out), sorted(&c));
-        assert!(!s.strikes().banned(&blocked));
         assert!(!s.knowledge().lacks(LAYER, &blocked));
         let asked: Vec<Outcome> = s
             .decisions()
@@ -3192,35 +3123,24 @@ mod tests {
         assert!((2..=5).contains(&asked), "{asked} peers asked");
     }
 
-    /// A peer that sent wrong bytes is not asked for the layer again by the
-    /// next groups (one wrong chunk is no ban), and ranks after the others
-    /// until it serves again.
+    /// The chunk a peer sent wrong bytes for is taken from the next peer.
     #[tokio::test]
-    async fn a_peer_that_sent_wrong_bytes_is_not_asked_again_for_the_layer() {
+    async fn a_chunk_of_wrong_bytes_is_taken_from_the_next_peer() {
         let fake = Arc::new(Fake::default());
-        let c = chunks(4);
+        let c = chunks(1);
         let liar = fake.peer(0, Ok(vec![(c[0].0.clone(), b"lies".to_vec())]));
         let good = fake.peer(0, Ok(c.clone()));
         let s = source(&fake, None);
         tell_maybe(&s, &[liar, good], LAYER);
-        // (the liar served the layer before: a miss would not count against
-        // it, the lie does)
         s.knowledge()
             .served(Some(LAYER), liar, Duration::from_micros(1));
         s.knowledge()
             .served(Some(LAYER), good, Duration::from_micros(2));
         let mut out = Collect::default();
-        s.fetch_group(&items(&c[..1]), Some(LAYER), &mut out)
+        s.fetch_group(&items(&c), Some(LAYER), &mut out)
             .await
             .unwrap();
         assert_eq!(fake.asked.lock().unwrap().clone(), [liar, good]);
-        assert!(!s.strikes().banned(&liar), "one wrong chunk is not a ban");
-        assert!(s.knowledge().lacks(LAYER, &liar));
-        fake.asked.lock().unwrap().clear();
-        s.fetch_group(&items(&c[1..]), Some(LAYER), &mut out)
-            .await
-            .unwrap();
-        assert_eq!(fake.asked.lock().unwrap().clone(), [good]);
         assert_eq!(digests_of(&out), sorted(&c));
     }
 
@@ -3606,11 +3526,10 @@ mod tests {
         // striping off
         let big = big_chunks(8);
         let fake = Arc::new(Fake::default());
-        let off = PeerSource::with_peers(Arc::new(fake.clone()), Arc::new(Strikes::default()))
-            .with_policy(Policy {
-                stripe_peers: 1,
-                ..Policy::default()
-            });
+        let off = PeerSource::with_peers(Arc::new(fake.clone())).with_policy(Policy {
+            stripe_peers: 1,
+            ..Policy::default()
+        });
         two_holders(&fake, &off, (0, big.clone()), (0, big.clone()));
         let mut out = Collect::default();
         off.fetch_group(&items(&big), Some(LAYER), &mut out)
@@ -3640,8 +3559,7 @@ mod tests {
     async fn a_profile_comes_from_the_first_peer_that_has_one_that_looks_right() {
         let fake = Arc::new(Fake::default());
         let s = source(&fake, None);
-        let (garbage, empty, good, banned) = (
-            fake.peer(0, Ok(Vec::new())),
+        let (garbage, empty, good) = (
             fake.peer(0, Ok(Vec::new())),
             fake.peer(0, Ok(Vec::new())),
             fake.peer(0, Ok(Vec::new())),
@@ -3656,13 +3574,7 @@ mod tests {
             p.insert(garbage, b"not a profile".to_vec());
             p.insert(empty, br#"{"v":1,"files":["x"]}"#.to_vec());
             p.insert(good, doc.clone().into_bytes());
-            p.insert(banned, doc.clone().into_bytes());
         }
-        let strikes = Arc::new(Strikes::default());
-        for _ in 0..3 {
-            strikes.strike(banned);
-        }
-        let s = PeerSource { strikes, ..s };
         // the peers of the layer first
         s.knowledge()
             .served(Some(LAYER), garbage, Duration::from_millis(1));
@@ -3758,13 +3670,12 @@ mod tests {
         let told = outcomes(&s, &layer.digest);
         assert_eq!(told[0], (busy, Outcome::Busy), "{told:?}");
         assert!(!s.knowledge().lacks(LAYER, &busy));
-        assert!(!s.strikes().banned(&busy));
     }
 
-    /// A peer whose index is not one gets a strike and the next provider
-    /// is asked.
+    /// When a peer sends an index that is not one the next provider is
+    /// asked.
     #[tokio::test]
-    async fn a_lying_index_is_struck_and_the_next_provider_asked() {
+    async fn a_lying_index_is_passed_over_for_the_next_provider() {
         let fake = Arc::new(Fake::default());
         let (liar, honest) = (fake.peer(0, Ok(vec![])), fake.peer(0, Ok(vec![])));
         fake.indexes
@@ -3795,10 +3706,6 @@ mod tests {
         .unwrap();
         assert_eq!(out.0, [(layer.digest.clone(), b"an index".to_vec())]);
         assert_eq!(*fake.index_asked.lock().unwrap(), [liar, honest]);
-        for _ in 0..2 {
-            s.strikes().strike(liar);
-        }
-        assert!(s.strikes().banned(&liar), "the first strike counted");
     }
 
     /// A table of contents is taken from a peer only when it has the
@@ -3839,23 +3746,5 @@ mod tests {
             assert_eq!(got, honest.then(|| (toc_z.clone(), tarsplit.clone())));
             assert_eq!(*fake.index_asked.lock().unwrap(), peers);
         }
-    }
-
-    #[tokio::test]
-    async fn a_peer_in_disgrace_is_not_asked() {
-        let fake = Arc::new(Fake::default());
-        let c = chunks(1);
-        let bad = fake.peer(0, Ok(c.clone()));
-        let strikes = Arc::new(Strikes::default());
-        for _ in 0..3 {
-            strikes.strike(bad);
-        }
-        let s = PeerSource::with_peers(Arc::new(fake.clone()), strikes);
-        let mut out = Collect::default();
-        s.fetch_group(&items(&c), Some(LAYER), &mut out)
-            .await
-            .unwrap();
-        assert!(out.0.is_empty());
-        assert!(fake.asked.lock().unwrap().is_empty());
     }
 }

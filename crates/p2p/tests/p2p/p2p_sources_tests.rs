@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use velarx_config::PullConfig;
 use velarx_core::store_service::StoreService;
-use velarx_p2p::provider::{NodePeers, PeerSource, Peers, Policy, Strikes};
+use velarx_p2p::provider::{NodePeers, PeerSource, Peers, Policy};
 use velarx_p2p::store::StoreContent;
 use velarx_p2p::ChunkProvider;
 use velarx_p2p::{P2PConfig, P2PNode};
@@ -261,15 +261,12 @@ async fn swarm_with(
         .unwrap()
         .insert(node_a.peer_id(), opts.a_delay);
     let peer_source = Arc::new(
-        PeerSource::with_peers(
-            Arc::new(Noting(
-                NodePeers(node_b.clone()),
-                requests.clone(),
-                delays.clone(),
-                faults.clone(),
-            )),
-            Arc::new(Strikes::default()),
-        )
+        PeerSource::with_peers(Arc::new(Noting(
+            NodePeers(node_b.clone()),
+            requests.clone(),
+            delays.clone(),
+            faults.clone(),
+        )))
         .with_policy(opts.policy)
         .with_knowledge(node_b.knowledge().clone()),
     );
@@ -1066,7 +1063,7 @@ async fn test_a_peer_that_loses_requests_or_sends_wrong_bytes_is_replaced_by_one
             ranged,
             "{name}: the registry was asked"
         );
-        // the one that did not fail gave the chunks; the one that lied is in disgrace after a few
+        // the one that did not fail gave the chunks; the wrong bytes of the other were refused
         let traffic = s.source.knowledge().traffic();
         let from_quick = traffic
             .iter()

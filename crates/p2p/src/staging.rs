@@ -903,7 +903,7 @@ impl StagingFetcher for PeerSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{PeerError, Peers, Strikes};
+    use crate::provider::{PeerError, Peers};
     use crate::Presence;
     use libp2p::PeerId;
     use std::sync::Arc;
@@ -994,13 +994,10 @@ mod tests {
                 ),
             })
             .collect();
-        let source = PeerSource::with_peers(
-            Arc::new(Together(
-                tokio::sync::Barrier::new(layers.len()),
-                PeerId::random(),
-            )),
-            Arc::new(Strikes::default()),
-        );
+        let source = PeerSource::with_peers(Arc::new(Together(
+            tokio::sync::Barrier::new(layers.len()),
+            PeerId::random(),
+        )));
         let scope = Scope {
             verity: false,
             source: None,
@@ -1077,14 +1074,11 @@ mod tests {
                 )
             })
             .collect();
-        let source = PeerSource::with_peers(
-            Arc::new(Meeting(
-                tokio::sync::Barrier::new(2),
-                PeerId::random(),
-                bytes.clone(),
-            )),
-            Arc::new(Strikes::default()),
-        );
+        let source = PeerSource::with_peers(Arc::new(Meeting(
+            tokio::sync::Barrier::new(2),
+            PeerId::random(),
+            bytes.clone(),
+        )));
         let (tx, mut events) = tokio::sync::mpsc::channel(1024);
         let out = Out::new(tx);
         let mut files = Files::new(&staging, false, &out);

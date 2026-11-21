@@ -166,8 +166,6 @@ pub struct Peer {
     /// lacks (it did not when asked lately)
     pub believed_has: u64,
     pub believed_lacks: u64,
-    /// It sent wrong bytes too often: it is not asked for a while
-    pub banned: bool,
     /// What its certificate says of it, when the swarm has an authority
     pub certificate: Option<Certificate>,
     /// What the pulls of this node fetched from it

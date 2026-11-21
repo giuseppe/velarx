@@ -208,8 +208,8 @@ member:
   layer is complete and in the store; they are the files of pulls the peers
   may take (never one with credentials), and the layer is told in the filter
   from the first file.
-* **The peer layer**: wrong bytes are refused by digest and the peer is ranked
-  last.  Every dial goes through one filter that refuses addresses that can
+* **The peer layer**: wrong bytes are refused by digest.  Every dial goes
+  through one filter that refuses addresses that can
   never be a peer's: loopback, link-local, multicast, reserved addresses and
   the node's own interfaces; private ranges
   are allowed (`dial_allow` lets through, the bootstrap peers are exempt).  The

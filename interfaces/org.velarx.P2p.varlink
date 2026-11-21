@@ -107,8 +107,6 @@ type Peer (
 	# lacks (it did not when asked lately)
 	believed_has: int,
 	believed_lacks: int,
-	# It sent wrong bytes too often: it is not asked for a while
-	banned: bool,
 	# What its certificate says of it, when the swarm has an authority
 	certificate: ?Certificate,
 	# What the pulls of this node fetched from it

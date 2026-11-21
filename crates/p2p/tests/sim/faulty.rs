@@ -171,7 +171,6 @@ fn a_slow_honest_holder_is_not_punished_for_being_slow() {
             );
             assert_eq!((r.peer_chunks, r.registry_chunks), (32, 0));
             assert!(!k.lacks(&layer, &holder.id()));
-            assert!(!asker.live().strikes.banned(&holder.id()));
             assert!(
                 rtt.is_some_and(|t| t < Duration::from_millis(1200)),
                 "the holder's time is taken as {rtt:?}"

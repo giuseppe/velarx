@@ -12,7 +12,7 @@
 //! socket (`org.velarx.P2p`, [`crate::control`]).  The overlay network of the
 //! containers is another process ([`crate::overlay_service`]).
 
-use super::provider::{PeerSource, Policy, Strikes};
+use super::provider::{PeerSource, Policy};
 use super::staged::{Given, Staged};
 use super::store::{follow_store_on_thread, StoreContent};
 use super::{P2PConfig as NodeConfig, P2PNode};
@@ -36,8 +36,7 @@ struct Service {
     node: Arc<P2PNode>,
     /// What the pulls of this node fetched from each peer
     knowledge: Arc<super::knowledge::Knowledge>,
-    /// The peers in disgrace, and the recent decisions of the pulls
-    strikes: Arc<Strikes>,
+    /// The recent decisions of the pulls
     decisions: Arc<super::explain::Decisions>,
     /// The store service: the images whose layers an `Explain` names
     store_socket: PathBuf,
@@ -274,7 +273,6 @@ mod control {
                     }),
                     believed_has: has as u64,
                     believed_lacks: lacks as u64,
-                    banned: svc.strikes.banned(&p.peer_id),
                     certificate: svc
                         .node
                         .authority()
@@ -711,9 +709,8 @@ pub async fn run_with(
     };
 
     // The peers as a fetcher of the pulls
-    let strikes = Arc::new(Strikes::default());
     let peer_source = Arc::new(
-        PeerSource::new(Arc::clone(&node), strikes.clone())
+        PeerSource::new(Arc::clone(&node))
             .with_staged(staged)
             .with_policy(Policy {
                 hedge: p2p.hedge,
@@ -730,7 +727,6 @@ pub async fn run_with(
     let svc = Arc::new(Service {
         node: Arc::clone(&node),
         knowledge,
-        strikes,
         decisions,
         store_socket,
     });
@@ -819,7 +815,6 @@ mod tests {
             filter: None,
             believed_has: 0,
             believed_lacks: 0,
-            banned: false,
             certificate: None,
             traffic: None,
         })
