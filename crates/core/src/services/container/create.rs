@@ -1428,8 +1428,9 @@ impl ContainerService {
     /// more recent (a `pull --lazy` over an older image of the store makes
     /// `run --lazy` run the new one).  A container without `--lazy` does not
     /// run on a pull in progress: the pull is completed first, as fast as
-    /// it goes, and the container runs from the store.  An image the store
-    /// does not have is pulled lazily with `--lazy`.
+    /// it goes, and the container runs from the store.  An image that is
+    /// neither is the client's to pull (with its options: `--lazy` pulls
+    /// lazily).
     async fn image_for_create(
         &self,
         req: &CreateContainerRequest,
@@ -1439,7 +1440,7 @@ impl ContainerService {
     )> {
         use velarx_types::ImageError;
         let images = &self.image_service;
-        for round in 0..2 {
+        for _ in 0..2 {
             let stored = match images.get_with_tags(&req.image).await {
                 Ok((image, _)) => Some(image),
                 Err(ImageError::NotFound(_) | ImageError::Pulling(_)) => None,
@@ -1455,13 +1456,6 @@ impl ContainerService {
             match (stored, staged) {
                 (Some(image), Some(pull)) if !newer(&pull.started_at, &image.created_at) => {
                     return Ok((image, None))
-                }
-                (None, None) if req.lazy && round == 0 => {
-                    info!("Image not found, performing lazy pull for {}", req.image);
-                    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(10);
-                    tokio::spawn(async move { while progress_rx.recv().await.is_some() {} });
-                    images.pull(&req.image, true, progress_tx).await?;
-                    continue;
                 }
                 (None, None) => return Err(ContainerError::ImageNotFound(req.image.clone())),
                 (Some(image), None) => return Ok((image, None)),

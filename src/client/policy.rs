@@ -63,12 +63,14 @@ pub struct EnsureImage<'a> {
     pub pull: PullOptions<'a>,
     pub quiet: bool,
     pub show: Option<&'a ShowPull>,
+    /// Pull lazily (`run --lazy`)
+    pub lazy: bool,
 }
 
 /// Make sure the image is there as the pull policy says, pulling it when it
 /// is not (the engine tries a failed pull again as `pull.retry` says);
 /// `quiet`: with nothing said of the pull; `show`: how the pull is shown
-/// (the progress bars of a terminal).
+/// (the progress bars of a terminal); `lazy`: pulled lazily.
 pub fn ensure_image_with(client: &EngineClient, ask: &EnsureImage<'_>) -> ClientResult<()> {
     let EnsureImage {
         image,
@@ -76,6 +78,7 @@ pub fn ensure_image_with(client: &EngineClient, ask: &EnsureImage<'_>) -> Client
         pull,
         quiet,
         show,
+        lazy,
     } = *ask;
     let present = match policy {
         PullPolicy::Always => false,
@@ -104,6 +107,9 @@ pub fn ensure_image_with(client: &EngineClient, ask: &EnsureImage<'_>) -> Client
             eprintln!("Trying to pull {image}...");
         }
         match show {
+            _ if lazy => {
+                client.pull_image_lazy(image, &pull)?;
+            }
             Some(show) => show(client, image, &pull, quiet)?,
             None => {
                 client.pull_image(image, &pull)?;

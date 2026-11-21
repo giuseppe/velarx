@@ -893,6 +893,7 @@ pub fn run_container(
         },
         quiet: args.quiet,
         show: shown.as_deref(),
+        lazy: args.lazy,
     };
     if !args.rootfs && !pull_when_missing {
         client::policy::ensure_image_with(daemon_client, &ask)?;
