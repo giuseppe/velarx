@@ -913,6 +913,9 @@ async fn test_a_layer_pulled_with_verification_is_verified_by_its_completion() {
         .await
         .unwrap();
     edit_layer(&e, &digest, |v| v["reach"]["tls_verify"] = true.into());
+    // (the completion of another process: the list of fetchers the pull
+    // opened is not at hand)
+    let service = strict_service(&e);
     let err = service.complete_image(&reference).await.unwrap_err();
     let text = err.to_string().to_lowercase();
     assert!(
@@ -964,6 +967,7 @@ async fn test_tls_verification_off_for_one_registry_is_not_off_for_another() {
         })
     };
     set_b(true);
+    let service = strict_service(&e);
     let err = service.complete_image(&reference).await.unwrap_err();
     let text = err.to_string().to_lowercase();
     assert!(
@@ -981,7 +985,7 @@ async fn test_tls_verification_off_for_one_registry_is_not_off_for_another() {
 
 /// `--creds` at the pull: the secret is nowhere in the database, the row
 /// says only that credentials were used; the completion without them fails
-/// naming the layer and the flag, and with them it works.
+/// naming the registry and the flag, and with them it works.
 #[tokio::test]
 async fn test_a_layer_pulled_with_creds_needs_them_again() {
     let (e, digest, _) = lazy_env().await;
@@ -1019,10 +1023,7 @@ async fn test_a_layer_pulled_with_creds_needs_them_again() {
         "{err:?}"
     );
     let text = err.to_string();
-    assert!(
-        text.contains(&digest.to_string()) && text.contains("--creds"),
-        "{text}"
-    );
+    assert!(text.contains(&e.host) && text.contains("--creds"), "{text}");
     assert!(text.contains("image complete"), "{text}");
     assert_eq!(lazy_requests(&e), before, "no request without them");
     assert!(service.get(&pulled.id).await.is_err());
@@ -1066,7 +1067,7 @@ async fn test_a_layer_pulled_with_a_cert_dir_needs_it_again() {
     let err = service.complete_image(&reference).await.unwrap_err();
     let text = err.to_string();
     assert!(
-        text.contains(&digest.to_string()) && text.contains("--cert-dir"),
+        text.contains(&front.host) && text.contains("--cert-dir"),
         "{text}"
     );
     assert!(service.get(&pulled.id).await.is_err());

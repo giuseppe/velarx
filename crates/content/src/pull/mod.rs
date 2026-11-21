@@ -25,6 +25,7 @@ pub mod ranges;
 pub mod session;
 pub mod sink;
 pub mod staged_fetch;
+pub mod start_set;
 pub mod stream;
 #[cfg(test)]
 pub(crate) mod testnames;

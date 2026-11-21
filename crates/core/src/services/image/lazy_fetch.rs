@@ -21,11 +21,12 @@
 //!   once and kept; one whose call failed is opened again by the next fetch.
 
 use super::*;
-use futures::future::{BoxFuture, FutureExt, Shared};
+use futures::future::{BoxFuture, FutureExt, RemoteHandle, Shared};
 use std::collections::HashMap;
 use std::sync::{Mutex as StdMutex, Weak};
 use velarx_content::fetcher::fetch::Urgency;
 use velarx_content::pull::staged_fetch::StagedFetch;
+use velarx_content::pull::start_set;
 use velarx_registry::auth::RegistryAccess;
 
 /// How long after its last fetch a start is left alone by the completion:
@@ -38,6 +39,15 @@ use velarx_content::pull::staged_fetch::Walked;
 /// What a list of fetchers was opened for: the repository, its TLS
 /// verification, whether its pull had credentials, and certificates.
 type WalkKey = (String, bool, bool, bool);
+
+/// The walker of the layers of `repository` reached as `reach` says.
+fn walk_key(repository: String, reach: &velarx_db::LayerReach) -> WalkKey {
+    (repository, reach.tls_verify, reach.creds, reach.certs)
+}
+
+/// A list of fetchers a pull opened, and the number of the credentials it
+/// was opened with.
+type OpenedWalker = Option<(u64, Arc<StagedFetch>)>;
 /// The lease of a layer this process holds while it fetches into it.
 type LeaseSlot = Arc<tokio::sync::Mutex<Weak<velarx_content::pull::staged::Lease>>>;
 /// A file in a fetch in flight, which the requests of the file join.
@@ -49,6 +59,40 @@ struct InFlight {
     /// True once the file is staged or the fetch ended
     staged: tokio::sync::watch::Receiver<bool>,
     fetch: Shared<BoxFuture<'static, Outcome>>,
+}
+
+/// A layer of a pull the start set is fetched from: its key, its descriptor
+/// as it was staged, and its table.
+pub(super) type StartLayer = (LayerKey, OciDescriptor, Arc<Toc>);
+
+/// The files of the start set of an image (`start_set`), in each of its
+/// layers (the lowest first): the engine's files and the program.
+pub(super) fn plan_start_set(
+    layers: &[StartLayer],
+    config: &velarx_types::OciImageConfig,
+) -> Vec<Vec<String>> {
+    let tocs: Vec<&Toc> = layers.iter().map(|(.., toc)| &**toc).collect();
+    let mut sets = vec![Vec::new(); layers.len()];
+    for (at, digest) in start_set::Layers::new(&tocs).start_set(config) {
+        sets[at].push(digest);
+    }
+    sets
+}
+
+/// What a pull tells the funnel of the layers it staged.
+#[derive(Clone)]
+pub(super) struct PulledFrom {
+    pub repository: String,
+    pub reach: velarx_db::LayerReach,
+    pub shareable: bool,
+    /// The bytes of the manifest
+    pub manifest: Vec<u8>,
+}
+
+impl PulledFrom {
+    fn walk(&self) -> WalkKey {
+        walk_key(self.repository.clone(), &self.reach)
+    }
 }
 
 /// The fetches of a start in a layer: how many are in flight, and when the
@@ -100,17 +144,63 @@ impl Drop for StartGuard {
     }
 }
 
+/// A start set being fetched into a layer: the window of the layer waits
+/// until it is there.
+struct SetGuard {
+    funnel: Arc<LazyFunnel>,
+    key: LayerKey,
+}
+
+impl SetGuard {
+    fn new(funnel: &Arc<LazyFunnel>, key: &LayerKey) -> Self {
+        *funnel
+            .setting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(*key)
+            .or_default() += 1;
+        Self {
+            funnel: funnel.clone(),
+            key: *key,
+        }
+    }
+}
+
+impl Drop for SetGuard {
+    fn drop(&mut self) {
+        let mut setting = self
+            .funnel
+            .setting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = setting.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                setting.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// What a fetch of a file of a staged layer needs: its descriptor, its
 /// table, and the repository and the list of fetchers it comes through.
 struct LayerCtx {
     desc: OciDescriptor,
-    toc: Toc,
+    toc: Arc<Toc>,
     /// The position of each regular file in `toc`, by its fs-verity digest
-    files: HashMap<String, usize>,
+    /// (made when a miss asks for it)
+    files: std::sync::OnceLock<HashMap<String, usize>>,
     /// The repository, its TLS verification, whether its pull had credentials
     walk: WalkKey,
     shareable: bool,
     manifest: Vec<u8>,
+}
+
+impl LayerCtx {
+    fn files(&self) -> &HashMap<String, usize> {
+        self.files
+            .get_or_init(|| velarx_content::pull::window::file_positions(&self.toc))
+    }
 }
 
 /// The fetches of lazy files of this process.
@@ -131,6 +221,8 @@ pub(crate) struct LazyFunnel {
     fetches: std::sync::atomic::AtomicU64,
     /// The windows fetched after the misses of each layer
     windows: StdMutex<HashMap<LayerKey, u32>>,
+    /// The start sets being fetched, by layer: how many
+    setting: StdMutex<HashMap<LayerKey, usize>>,
     /// The fetches of the starts, by layer
     starting: StdMutex<HashMap<LayerKey, Starting>>,
     /// Told when a fetch of a start ends
@@ -322,6 +414,88 @@ impl ImageService {
         .boxed()
     }
 
+    /// Fetch the files a start of the image reads (`start_set`) from the
+    /// layers `layers` (the lazy ones, the lowest first, each with its
+    /// table), in the background: they are staged while the container is
+    /// made, and what asks for one meanwhile joins the fetch.  A hint: what
+    /// cannot be fetched is fetched when it is read.
+    pub(super) async fn fetch_start_set(
+        &self,
+        (layers, pulled): (Vec<StartLayer>, PulledFrom),
+        opened: impl std::future::Future<Output = OpenedWalker>,
+        first: Vec<Vec<String>>,
+    ) {
+        // (what a fetch of the layers needs is what the pull has in hand:
+        // it is not read from the staging and parsed again)
+        let walk = pulled.walk();
+        if let Some(opened) = opened.await {
+            let mut walkers = self.funnel.walkers.lock().await;
+            if self.kept_walker(&walkers, &walk).is_none() {
+                walkers.insert(walk.clone(), opened);
+            }
+        }
+        {
+            let mut kept = self.funnel.layers.lock().unwrap_or_else(|e| e.into_inner());
+            for (key, desc, toc) in &layers {
+                let ctx = LayerCtx {
+                    desc: desc.clone(),
+                    files: std::sync::OnceLock::new(),
+                    toc: toc.clone(),
+                    walk: walk.clone(),
+                    shareable: pulled.shareable,
+                    manifest: pulled.manifest.clone(),
+                };
+                kept.insert(*key, Arc::new(ctx));
+            }
+        }
+        // (the fetches are in the table of those in flight when this
+        // returns: a read of one of the files joins it)
+        let first = self.begin_set(&layers, first);
+        tokio::spawn(async move {
+            for failed in first.await.into_iter().filter_map(Result::err) {
+                debug!("The start set of the image: {failed}");
+            }
+        });
+    }
+
+    /// The fetches of the files `sets` of `layers`, each layer's in one
+    /// request, begun now: the window of a layer waits until its fetch
+    /// ends.
+    fn begin_set(
+        &self,
+        layers: &[StartLayer],
+        sets: Vec<Vec<String>>,
+    ) -> impl std::future::Future<Output = Vec<ImageResult<Walked>>> {
+        let fetches: Vec<_> = layers
+            .iter()
+            .zip(sets)
+            .filter(|(_, files)| !files.is_empty())
+            .map(|((key, ..), files)| {
+                let guard = SetGuard::new(&self.funnel, key);
+                self.stage_begin(key, files, Urgency::Wait)
+                    .inspect(move |_| drop(guard))
+            })
+            .collect();
+        futures::future::join_all(fetches)
+    }
+
+    /// Open the list of fetchers the layers of a pull will be fetched
+    /// through while the pull goes on: [`ImageService::fetch_start_set`]
+    /// keeps it, and it goes with the pull when the pull ends otherwise.
+    pub(super) fn open_walker(&self, pulled: &PulledFrom) -> RemoteHandle<OpenedWalker> {
+        let (this, pulled) = (self.clone(), pulled.clone());
+        let (open, opened) = async move {
+            let walk = pulled.walk();
+            this.open_lazy_walker((&walk, pulled.shareable, &pulled.manifest))
+                .await
+                .map_err(|e| debug!("The fetchers of the pull are not opened: {e}"))
+                .ok()
+        }
+        .remote_handle();
+        tokio::spawn(open);
+        opened
+    }
+
     /// Wait until no start fetches in `layers` (those of one image) and
     /// none did for [`QUIET`]: the completion of a pull sends its fetches
     /// after that, it never competes with the container being started.
@@ -387,7 +561,10 @@ impl ImageService {
             return Ok(Walked::default());
         }
         let mut stale = false;
-        let staged = match self.lazy_walker(key, &ctx).await {
+        let staged = match self
+            .lazy_walker((&ctx.walk, ctx.shareable, &ctx.manifest))
+            .await
+        {
             Ok(walker) => {
                 let staged = walker
                     .stage_files(&key.file_stem(), &ctx.desc, &ctx.toc, left, (urgency, told))
@@ -579,17 +756,12 @@ impl ImageService {
                 .clone()
                 .or_else(|| pull.registry_ref.clone())
                 .ok_or_else(|| ImageError::Layer(format!("layer {k} names no repository")))?;
-            let toc: Toc = serde_json::from_str(&layer.toc_text()?)?;
+            let toc: Arc<Toc> = Arc::new(serde_json::from_str(&layer.toc_text()?)?);
             Ok::<_, ImageError>(LayerCtx {
                 desc,
-                files: velarx_content::pull::window::file_positions(&toc),
+                files: std::sync::OnceLock::new(),
                 toc,
-                walk: (
-                    repository,
-                    layer.meta.reach.tls_verify,
-                    layer.meta.reach.creds,
-                    layer.meta.reach.certs,
-                ),
+                walk: walk_key(repository, &layer.meta.reach),
                 shareable: pull.shareable,
                 manifest: pull.manifest.into_bytes(),
             })
@@ -604,24 +776,52 @@ impl ImageService {
         Ok(ctx)
     }
 
-    /// The list of fetchers of the repository of `ctx`, opened on first use:
-    /// the credentials of a command only to a layer that was pulled with
-    /// some, and the stored ones of the registry.
-    async fn lazy_walker(&self, key: &LayerKey, ctx: &LayerCtx) -> ImageResult<Arc<StagedFetch>> {
+    /// The list of fetchers `walk` of this process, opened on first use.
+    async fn lazy_walker(
+        &self,
+        (walk, shareable, manifest): (&WalkKey, bool, &[u8]),
+    ) -> ImageResult<Arc<StagedFetch>> {
         let mut walkers = self.funnel.walkers.lock().await;
-        // (a list whose connection failed lost its scopes: a peer that
-        // restarted is reached again by a list opened anew)
+        if let Some(w) = self.kept_walker(&walkers, walk) {
+            return Ok(w);
+        }
+        let (epoch, walker) = self.open_lazy_walker((walk, shareable, manifest)).await?;
+        walkers.insert(walk.clone(), (epoch, walker.clone()));
+        Ok(walker)
+    }
+
+    /// The list `walk` of `walkers` if it was opened with the credentials of
+    /// now and its connections work (a list whose connection failed lost
+    /// its scopes: a peer that restarted is reached again by a list opened
+    /// anew).
+    fn kept_walker(
+        &self,
+        walkers: &HashMap<WalkKey, (u64, Arc<StagedFetch>)>,
+        walk: &WalkKey,
+    ) -> Option<Arc<StagedFetch>> {
         let epoch = self
             .funnel
             .access_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
-        if let Some((_, w)) = walkers
-            .get(&ctx.walk)
+        walkers
+            .get(walk)
             .filter(|(opened_with, w)| *opened_with == epoch && !w.stale())
-        {
-            return Ok(w.clone());
-        }
-        let (repository, tls_verify, creds, _) = &ctx.walk;
+            .map(|(_, w)| w.clone())
+    }
+
+    /// A list of fetchers of the repository of `walk`, and the number of the
+    /// credentials it was opened with: the credentials of a command only to
+    /// layers that were pulled with some, and the stored ones of the
+    /// registry.
+    async fn open_lazy_walker(
+        &self,
+        (walk, shareable, manifest): (&WalkKey, bool, &[u8]),
+    ) -> ImageResult<(u64, Arc<StagedFetch>)> {
+        let epoch = self
+            .funnel
+            .access_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (repository, tls_verify, creds, _) = walk;
         let given = self
             .funnel
             .access
@@ -635,14 +835,14 @@ impl ImageService {
         if *creds && given.creds.is_none() && given.auths.is_empty() {
             missing.push("--creds or --authfile");
         }
-        if ctx.walk.3 && given.certs.is_none() {
+        if walk.3 && given.certs.is_none() {
             missing.push("--cert-dir");
         }
         if !missing.is_empty() {
             return Err(ImageError::Unauthorized(format!(
-                "layer {key} was pulled from {repository} with {}, which are not stored: \
+                "the layers pulled from {repository} were pulled with {}, which are not stored: \
                  run `velarx image complete {} IMAGE`",
-                match (*creds, ctx.walk.3) {
+                match (*creds, walk.3) {
                     (true, true) => "credentials and certificates",
                     (true, false) => "credentials",
                     _ => "certificates",
@@ -657,7 +857,7 @@ impl ImageService {
             } else {
                 Default::default()
             },
-            certs: given.certs.filter(|_| ctx.walk.3),
+            certs: given.certs.filter(|_| walk.3),
         };
         let access = velarx_content::pull::access::access_for(
             &self.resolver,
@@ -667,14 +867,13 @@ impl ImageService {
         )?;
         let walker = self
             .staged_fetch(
-                (repository, None, ctx.shareable),
+                (repository, None, shareable),
                 *tls_verify,
                 Some(&access),
-                &ctx.manifest,
+                manifest,
             )
             .await?;
-        walkers.insert(ctx.walk.clone(), (epoch, walker.clone()));
-        Ok(walker)
+        Ok((epoch, walker))
     }
 
     /// A miss of the file `file_digest` of the staged layer `layer`: staged
@@ -713,7 +912,7 @@ impl ImageService {
     /// contents of the staged layer `key`.
     pub async fn is_file_of_lazy_layer(&self, key: &LayerKey, digest: &str) -> ImageResult<bool> {
         let ctx = self.lazy_layer_ctx(key).await?;
-        Ok(ctx.files.contains_key(digest))
+        Ok(ctx.files().contains_key(digest))
     }
 
     /// The files of its directory that follow `digest` in the staged layer
@@ -727,7 +926,13 @@ impl ImageService {
     async fn read_ahead(&self, key: &LayerKey, digest: &str) {
         use velarx_content::pull::window;
         let ahead = window::Window::from_config(&self.pull_config);
-        if ahead.is_off() {
+        let setting = self
+            .funnel
+            .setting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(key);
+        if ahead.is_off() || setting {
             return;
         }
         let misses = {
@@ -744,14 +949,15 @@ impl ImageService {
         let Ok(ctx) = self.lazy_layer_ctx(key).await else {
             return;
         };
-        let Some(&at) = ctx.files.get(digest) else {
+        let Some(&at) = ctx.files().get(digest) else {
             return;
         };
         let staged = velarx_storage::FileStore::new(self.staging_area().layer_files(key)).ok();
-        let positions = window::select(&ctx.toc, at, ahead, |d| {
+        let wanted = |d: &str| {
             !self.file_store.contains(d)
                 && !staged.as_ref().is_some_and(|s| s.get_path(d).is_some())
-        });
+        };
+        let positions = window::select(&ctx.toc, at, ahead, wanted);
         let files: Vec<String> = positions
             .iter()
             .filter_map(|&i| ctx.toc.entries[i].verity())
@@ -799,8 +1005,8 @@ impl ImageService {
                 *key,
                 Arc::new(LayerCtx {
                     desc,
-                    files: velarx_content::pull::window::file_positions(&toc),
-                    toc,
+                    files: std::sync::OnceLock::new(),
+                    toc: Arc::new(toc),
                     walk: walk.clone(),
                     shareable: false,
                     manifest: Vec::new(),
@@ -887,5 +1093,102 @@ mod tests {
         waiting.await.unwrap();
         service.forget_lazy(&key).await;
         assert_eq!(inflight(&service), None);
+    }
+
+    /// The files a start reads are staged in the background while the
+    /// layer's window waits for them.
+    #[tokio::test]
+    async fn the_start_set_is_staged_and_the_window_waits_for_it() {
+        use velarx_content::fakes::{Fake, Stages};
+        use velarx_content::fetcher::fetch_client::FetchConn;
+        use velarx_content::serve_fetch::LocalFetcher;
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service(tmp.path()).await;
+        let area = service.staging_area();
+        area.create().unwrap();
+        let key = LayerKey::Whole(Digest::of(Algorithm::Sha256, b"blob"));
+        std::fs::create_dir_all(area.layer_dir(&key)).unwrap();
+        std::fs::write(area.layer_dir(&key).join("layer.json"), b"{}").unwrap();
+        let body = b"root:x:0:0".to_vec();
+        let file = velarx_storage::fsverity_digest_of(Algorithm::Sha256, &body);
+        let file = Digest::parse_key(&file).unwrap().to_string();
+        let toc: Toc = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "entries": [{"name": "etc/", "type": "dir"}, {
+                "name": "etc/passwd", "type": "reg", "size": body.len(),
+                "fsverity": velarx_storage::toc_value(&velarx_storage::to_toc(&file).unwrap()),
+            }],
+        }))
+        .unwrap();
+        let desc: OciDescriptor = serde_json::from_value(serde_json::json!({
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "digest": key.digest().to_string(),
+            "size": 1,
+        }))
+        .unwrap();
+        let registry = LocalFetcher::start(
+            Arc::new(Fake::new(Stages::Right, &file, &body, Default::default())),
+            velarx_content::activation::Limits::default(),
+        )
+        .unwrap();
+        let manifest = br#"{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","size":2},"layers":[]}"#;
+        let walker = StagedFetch::open(
+            Vec::new(),
+            FetchConn::new(registry.connect().unwrap()).unwrap(),
+            &service.staging_dir,
+            false,
+            ("localhost/a", true),
+            Some(b"{}"),
+            manifest,
+        )
+        .await
+        .unwrap();
+        service
+            .with_lazy_walker(&key, (desc.clone(), toc.clone()), walker)
+            .await;
+        assert!(service.lazy_file_path(&key, &file).is_none());
+        let layers = vec![(key, desc, Arc::new(toc))];
+        let config = velarx_types::OciImageConfig::default();
+        let first = plan_start_set(&layers, &config);
+        assert_eq!(first, [[file.clone()]]);
+        service
+            .fetch_start_set(
+                (
+                    layers,
+                    PulledFrom {
+                        repository: "localhost/a".into(),
+                        reach: velarx_db::LayerReach {
+                            tls_verify: true,
+                            creds: false,
+                            certs: false,
+                        },
+                        shareable: false,
+                        manifest: Vec::new(),
+                    },
+                ),
+                async { None },
+                first,
+            )
+            .await;
+        // (a read of the file joins the fetch begun above)
+        assert!(service
+            .funnel
+            .inflight
+            .lock()
+            .unwrap()
+            .contains_key(&(key, file.clone())));
+        assert!(service.funnel.setting.lock().unwrap().contains_key(&key));
+        service
+            .stage_lazy(&key, vec![file.clone()], Urgency::OnDemand)
+            .await
+            .unwrap();
+        assert!(service.lazy_file_path(&key, &file).is_some());
+        for _ in 0..100 {
+            if service.funnel.setting.lock().unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the start set never ended");
     }
 }

@@ -1547,6 +1547,16 @@ impl ImageService {
         // (a lazy layer fetches no file: its table is compared with what the
         // store has recorded of the files it lists, and with the other
         // layers of the image)
+        // (the list of fetchers of the layers is opened while they are probed)
+        let from = registry_ref.as_ref().filter(|_| lazy).map(|repository| {
+            super::lazy_fetch::PulledFrom {
+                repository: repository.clone(),
+                reach,
+                shareable,
+                manifest: manifest_bytes.to_vec(),
+            }
+        });
+        let walker = from.as_ref().map(|from| self.open_walker(from));
         let accepted = match (&staged, lazy) {
             (Some(staged), true) => {
                 let image = registry_ref.clone().unwrap_or_default();
@@ -1734,6 +1744,28 @@ impl ImageService {
                 )
                 .await?;
             velarx_base::trace::point("pull rows committed");
+            // (the files a start reads are planned while the barrier waits)
+            let set = from.zip(walker).map(|(from, walker)| {
+                let layers: Vec<super::lazy_fetch::StartLayer> = layer_keys
+                    .iter()
+                    .zip(&manifest.layers)
+                    .filter_map(|(k, l)| Some((done_layers.get(k).filter(|d| d.lazy)?, l)))
+                    .map(|(d, l)| {
+                        // (the blob and the size the layer was staged with)
+                        let desc = OciDescriptor {
+                            digest: d.blob,
+                            size: d.size,
+                            ..l.clone()
+                        };
+                        (d.key, desc, d.toc.clone())
+                    })
+                    .collect();
+                let (tocs, config) = (layers.clone(), config.config.clone());
+                let planned = tokio::task::spawn_blocking(move || {
+                    super::lazy_fetch::plan_start_set(&tocs, &config)
+                });
+                (from, layers, walker, planned)
+            });
             let area = self.staging_area();
             let mut barrier = velarx_content::pull::staged::Barrier::default();
             // (the barrier holds the leases of the layers until it commits:
@@ -1798,6 +1830,10 @@ impl ImageService {
                 warn!("Cannot remove the lease of the pull: {e}");
             }
             velarx_base::trace::point("pull layers staged");
+            if let Some((from, layers, walker, planned)) = set {
+                let first = planned.await.unwrap_or_default();
+                self.fetch_start_set((layers, from), walker, first).await;
+            }
             debug!("Pull staged after {:?}", start.elapsed());
         } else {
             let tags_shared = if shareable { tags.clone() } else { Vec::new() };
