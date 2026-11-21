@@ -106,13 +106,10 @@ async fn test_what_a_peer_sends_is_not_recorded_as_what_it_announced() {
 
     // (a request records nothing: the table holds the layers a peer
     // announced, and a chunk it sent is not one)
-    // (a chunk whose bytes are not what it is named by is not even sent: the
-    // store of the peer is told damaged)
+    // (a chunk whose bytes are not what it is named by goes as the store of
+    // the peer holds it: the asker checks it, and records nothing either)
     for d in [&d_lie, &d_batch_lie] {
-        assert!(matches!(
-            fetch(&b, &a, std::slice::from_ref(d)).await,
-            Err(P2PError::StoreFailed)
-        ));
+        fetch(&b, &a, std::slice::from_ref(d)).await.unwrap();
         assert!(b.knowledge().filtered(d).maybe.is_empty());
     }
     fetch(&b, &a, std::slice::from_ref(&d_good)).await.unwrap();

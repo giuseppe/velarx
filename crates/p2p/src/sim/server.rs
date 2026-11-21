@@ -169,7 +169,7 @@ impl Node {
         let piece = live.admission.piece() as usize;
         let mut sent = Vec::new();
         for digest in digests {
-            let mut data = match serve::read_checked(self.store.as_ref(), digest) {
+            let mut data = match serve::read(self.store.as_ref(), digest) {
                 Ok(Some(data)) => data,
                 Ok(None) => continue,
                 Err(_) => return Err(io::Error::other(crate::quic::StoreFailed)),

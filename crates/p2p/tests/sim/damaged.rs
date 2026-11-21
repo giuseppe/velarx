@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-//! A peer whose store is damaged is not a peer without the layer.
+//! A peer whose store is damaged sends what it holds: the asker's checks
+//! refuse it.
 
 use crate::common::*;
 use velarx_p2p::explain::{Event, Outcome};
 use velarx_p2p::sim::{self, NodeConfig};
 
-/// A peer that announced a layer and finds, when it reads its store, that
-/// the chunks are not what they are named by, answers with a failure of its
-/// store: the asker does not remember it as one
-/// without the layer, and the chunks come from the other peer that has it.
+/// A peer that announced a layer whose chunks in its store are not what
+/// they are named by sends them as it holds them: the asker's check of each
+/// chunk refuses them, and the chunks come from the other peer that has it.
 #[test]
-fn a_peer_whose_store_is_damaged_is_not_taken_for_one_without_the_layer() {
+fn the_chunks_of_a_damaged_store_are_refused_by_the_asker() {
     for seed in sim::seeds(&[1, 2]) {
         {
             sim::run(seed, |world| async move {
@@ -62,15 +62,12 @@ fn a_peer_whose_store_is_damaged_is_not_taken_for_one_without_the_layer() {
                     !outcomes.is_empty(),
                     "the damaged peer was not asked: the scenario shows nothing"
                 );
+                // (it sent none that matched)
                 assert!(
-                    outcomes.iter().all(|o| matches!(o, Outcome::Failed(_))),
-                    "a store that failed was taken for something else: {outcomes:?}"
+                    outcomes.iter().all(|o| matches!(o, Outcome::Lacks)),
+                    "a damaged chunk was taken: {outcomes:?}"
                 );
                 assert_eq!(r.wrong, 0);
-                assert!(
-                    !asker.live().source.knowledge().lacks(&layer, &damaged.id()),
-                    "a peer whose store failed was remembered as one without the layer"
-                );
                 assert_eq!(
                     (r.peer_chunks, r.registry_chunks),
                     (32, 0),

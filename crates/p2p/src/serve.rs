@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! What a node serves its peers with, whatever carries the requests (QUIC
-//! and the simulator): the upload pacing, the slots and the
-//! checks of the bytes read from the stores.
+//! and the simulator): the upload pacing, the slots and the bounds of what
+//! is read from the stores.  The bytes go as the stores hold them: the asker
+//! checks every chunk.
 //!
 //! A peer names chunks by digest and nothing else: the digest is checked to
 //! be one before it reaches the stores, and the number of chunks, their size
@@ -11,7 +12,7 @@ use super::limits::{short, MAX_ITEM_BYTES};
 use super::ChunkProvider;
 use serde::{Deserialize, Serialize};
 use std::io;
-use tracing::{error, warn};
+use tracing::warn;
 use velarx_storage::ChunkFile;
 
 /// Chunks read from the stores at the same time, and whose files are asked
@@ -50,34 +51,11 @@ pub fn open_wave(
 }
 
 /// The bytes of the chunk `digest` from the provider (one that hands over no
-/// files), only if a peer may take them.  An error when the store could not
-/// be read, or holds bytes that do not have the digest ([`corrupt`]): the
-/// asker is told the store failed (it asks another peer), not that the chunk
-/// is not here.  Blocking.
-pub fn read_checked(provider: &dyn ChunkProvider, digest: &str) -> io::Result<Option<Vec<u8>>> {
-    let Some(data) = read(provider, digest)? else {
-        return Ok(None);
-    };
-    if !crate::limits::names(digest, &data) {
-        return Err(corrupt(digest));
-    }
-    Ok(Some(data))
-}
-
-/// The error of a chunk whose bytes in the store do not have its digest: the
-/// store of this node is damaged, which is logged as an error (never hidden,
-/// never served as the chunk).
-pub fn corrupt(digest: &str) -> io::Error {
-    error!("The store holds bytes for {digest} that do not match it: it is damaged");
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        "the store holds bytes that do not match the digest",
-    )
-}
-
-/// The chunk `digest` if it is a valid digest of something we have that a
-/// peer may take.
-fn read(provider: &dyn ChunkProvider, digest: &str) -> io::Result<Option<Vec<u8>>> {
+/// files), as its store holds them (the asker checks them), if `digest` is
+/// one and they fit in an answer.  An error when the store could not be
+/// read: the asker is told the store failed (it asks another peer), not that
+/// the chunk is not here.  Blocking.
+pub fn read(provider: &dyn ChunkProvider, digest: &str) -> io::Result<Option<Vec<u8>>> {
     if !crate::limits::is_digest(digest) {
         return Ok(None);
     }
@@ -86,7 +64,7 @@ fn read(provider: &dyn ChunkProvider, digest: &str) -> io::Result<Option<Vec<u8>
     };
     if data.len() > MAX_ITEM_BYTES {
         warn!(
-            "Not serving {}: {} bytes are more than a peer may take",
+            "Not serving {}: {} bytes are more than an answer holds",
             short(digest),
             data.len()
         );
@@ -96,7 +74,7 @@ fn read(provider: &dyn ChunkProvider, digest: &str) -> io::Result<Option<Vec<u8>
 }
 
 /// Whether the chunk `digest` is here, as a request for it would find it: one
-/// valid digest, handed over as a file or as bytes that a peer may take.
+/// valid digest, handed over as a file or as bytes that fit in an answer.
 /// Blocking.
 pub fn has(provider: &dyn ChunkProvider, digest: &str) -> io::Result<bool> {
     if !crate::limits::is_digest(digest) {

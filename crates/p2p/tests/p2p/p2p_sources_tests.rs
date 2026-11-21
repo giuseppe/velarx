@@ -1740,8 +1740,8 @@ impl ChunkProvider for Items {
 /// Two nodes give each other the content of a layer of SHA-512 digests: a
 /// chunk by its sha512 and a file by its SHA-512 fs-verity digest, over QUIC
 /// (`velarx-chunks/5`); the SHA-256 name of the same bytes is another item the
-/// peer has not got, and bytes that are not what their key names are not
-/// given.
+/// peer has not got, and bytes that are not what their key names go as the
+/// peer holds them (the asker checks them).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sha512_chunks_and_files_go_from_a_peer() {
     use velarx_types::digest::{Algorithm, Digest};
@@ -1791,11 +1791,8 @@ async fn test_sha512_chunks_and_files_go_from_a_peer() {
     assert_eq!(got.get(&chunk), Some(&data));
     assert_eq!(got.get(&file), Some(&data));
     // (the other algorithm's name of the bytes, and a lie)
-    assert!(
-        !got.contains_key(&file256) && !got.contains_key(&lie),
-        "{:?}",
-        got.keys()
-    );
+    assert!(!got.contains_key(&file256), "{:?}", got.keys());
+    assert_eq!(got.get(&lie).map(|d| &d[..]), Some(&b"something else"[..]));
     // the items came over QUIC, whose frames carry the kind and the
     // algorithm of each digest
     let found = super::support::fetch_from(&b, a.peer_id(), &asked[..2])

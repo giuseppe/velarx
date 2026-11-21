@@ -2255,10 +2255,10 @@ impl Server {
             // not held by a provider that hands over files
             None if !by_bytes => return Ok(Sent::No),
             // a provider that hands over bytes, not a file: read to tell
-            // their size, and checked
+            // their size
             None => {
                 let (p, d) = (provider.clone(), digest.to_string());
-                let data = tokio::task::spawn_blocking(move || serve::read_checked(p.as_ref(), &d))
+                let data = tokio::task::spawn_blocking(move || serve::read(p.as_ref(), &d))
                     .await
                     .map_err(other)?;
                 match data {
