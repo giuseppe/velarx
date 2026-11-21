@@ -540,7 +540,7 @@ impl ContainerService {
         }
         out.pid_ns = self.ns_mode("pid", &req.pid_mode).await?;
         out.ipc_ns = self.ipc_mode(&req.ipc_mode, rootless).await?;
-        // (shareable is podman's default: any container's /dev/shm can be
+        // (shareable is the default: any container's /dev/shm can be
         // joined with --ipc container:ID; `none` has no /dev/shm at all)
         out.shm_shareable = matches!(req.ipc_mode, NsMode::Default | NsMode::Shareable);
         out.no_shm = req.ipc_mode == NsMode::Off;

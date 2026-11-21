@@ -169,7 +169,7 @@ BEGIN
 END;
 
 -- What the store was first used with (`runroot`: the state directory of
--- its engine; another one is refused, as podman refuses another run root),
+-- its engine; another one is refused: it would not see these containers),
 -- the indexes (`index:<digest>`) that images were pulled by, and the
 -- compressed table of contents of a zstd:chunked layer as the registry sent
 -- it, a blob under the key of its layer (`toc:<digest>`), which the
