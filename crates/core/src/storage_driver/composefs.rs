@@ -1398,10 +1398,13 @@ impl ComposefsDriver {
 
     /// The EROFS image `l` of the layer `record`, opened as a name that is no
     /// link and measured on that descriptor (`mount`), with the digest it
-    /// measured: against the lists of the manifest strictly when the digests
-    /// are enforced (`enforced`; the link of the layer, or the one that broke,
-    /// is said on the chain of trust), else against the digest the engine
-    /// recorded for it.
+    /// measured: against the lists of the manifest when the digests are
+    /// enforced (`enforced`; the link of the layer, or the one that broke, is
+    /// said on the chain of trust), else against the digest the engine
+    /// recorded for it.  Strictly (an image without fs-verity is refused)
+    /// when the digests are enforced or the store requires fs-verity: the
+    /// overlay then requires the digests of the files the image names, which
+    /// are only as good as the image.
     fn measured_image(
         &self,
         image_id: &str,
@@ -1418,7 +1421,7 @@ impl ComposefsDriver {
                     .erofs
                     .clone()
                     .ok_or_else(|| missing_image(image_id, &record.key, "is not recorded"))?];
-                (&recorded[..], false)
+                (&recorded[..], self.fsverity == VerityMode::Require)
             }
         };
         let broken = |file: Option<&std::fs::File>| {
@@ -2968,6 +2971,27 @@ mod tests {
                 && said.contains("digests are enforced"),
             "{said}"
         );
+    }
+
+    /// Where the store requires fs-verity, an image without it is refused
+    /// with no enforced digest too: the overlay requires the digests of the
+    /// files it names, and nobody measured it.  A store that does not
+    /// require it takes the image unmeasured.
+    #[tokio::test]
+    async fn an_image_without_fs_verity_is_refused_where_the_store_requires_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut d = driver(tmp.path()).await;
+        let (_, record, layer) = a_layer(&d, "an image with no fs-verity");
+        let (_, unmeasured) = d
+            .measured_image("1234", 100, &layer, &record, None)
+            .unwrap();
+        assert_eq!(unmeasured, None);
+        d.fsverity = VerityMode::Require;
+        let e = d
+            .measured_image("1234", 100, &layer, &record, None)
+            .unwrap_err();
+        assert!(matches!(e.kind, DriverErrorKind::Corrupt { .. }), "{e:?}");
+        assert!(e.to_string().contains("cannot be measured"), "{e}");
     }
 
     /// A layer that measures differently from every digest the engine gave is

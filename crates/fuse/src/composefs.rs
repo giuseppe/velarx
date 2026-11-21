@@ -243,9 +243,9 @@ pub fn layer_image_digest(file: &std::fs::File) -> Option<String> {
 /// kernel gives its digest in constant time.  Not `strict`, a file without it
 /// (a file system without fs-verity) or with fs-verity made otherwise than
 /// the digests (blocks of other than 4096 bytes, a salt) passes unmeasured
-/// (`system check` reads such a file whole); `strict`, which the enforcement
-/// of the digests of a manifest is, makes both an error, and so is an empty
-/// list.  Gives the digest it measured (none: the image passed unmeasured).
+/// (`system check` reads such a file whole); `strict` (the digests of a
+/// manifest are enforced, or the store requires fs-verity) makes both an
+/// error, and so is an empty list.  Gives the digest it measured (none: the image passed unmeasured).
 pub fn measure_layer_image(
     file: &std::fs::File,
     path: &Path,
@@ -260,7 +260,8 @@ pub fn measure_layer_image(
     }
     let unmeasured = |why: &str| match strict {
         true => Err(std::io::Error::other(format!(
-            "the EROFS image {} cannot be measured ({why}) and the digests are enforced",
+            "the EROFS image {} cannot be measured ({why}) and the digests are enforced \
+             or fs-verity is required",
             path.display()
         ))),
         false => Ok(None),
