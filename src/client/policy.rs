@@ -70,7 +70,9 @@ pub struct EnsureImage<'a> {
 /// Make sure the image is there as the pull policy says, pulling it when it
 /// is not (the engine tries a failed pull again as `pull.retry` says);
 /// `quiet`: with nothing said of the pull; `show`: how the pull is shown
-/// (the progress bars of a terminal); `lazy`: pulled lazily.
+/// (the progress bars of a terminal); `lazy`: pulled lazily.  A pull in
+/// progress of the image is there for `--pull=never`: the engine runs on
+/// it (`--lazy`) or completes it first.
 pub fn ensure_image_with(client: &EngineClient, ask: &EnsureImage<'_>) -> ClientResult<()> {
     let EnsureImage {
         image,
@@ -90,7 +92,9 @@ pub fn ensure_image_with(client: &EngineClient, ask: &EnsureImage<'_>) -> Client
                         && (policy != PullPolicy::Newer || !newer_in_registry(client, image, &pull))
                 }
                 // (a reference podman refuses is not an image to pull)
-                Err(e) if e.is_not_found() && !crate::cli::report::refused_image(&e) => false,
+                Err(e) if e.is_not_found() && !crate::cli::report::refused_image(&e) => {
+                    policy == PullPolicy::Never && pulling(client, image)?
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -117,6 +121,27 @@ pub fn ensure_image_with(client: &EngineClient, ask: &EnsureImage<'_>) -> Client
         }
     }
     Ok(())
+}
+
+/// Whether a pull in progress has the name or the id `image` (as the
+/// engine records names: `ImageReference::name`).
+fn pulling(client: &EngineClient, image: &str) -> ClientResult<bool> {
+    let names = match velarx_types::reference::ImageReference::parse(image) {
+        Ok(r) => {
+            let name = r.name();
+            [
+                r.tag.map(|t| format!("{name}:{t}")),
+                r.digest.map(|d| format!("{name}@{d}")),
+            ]
+        }
+        Err(_) => [None, None],
+    };
+    let id = image.strip_prefix("sha256:").unwrap_or(image);
+    let id = (!id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id);
+    Ok(client.image_pulls()?.iter().any(|p| {
+        id.is_some_and(|id| p.id.starts_with(id))
+            || p.names.iter().any(|n| names.contains(&Some(n.clone())))
+    }))
 }
 
 /// Whether the image (its inspect) is for `OS/ARCH[/VARIANT]`.
