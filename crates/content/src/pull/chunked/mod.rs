@@ -701,18 +701,23 @@ impl TocChunks {
 /// Plan the chunks of the file at `i` of the TOC, followed by its chunk
 /// entries.  The compressed range of a chunk goes from its offset to the
 /// offset of the next chunk, or to the end of the file for the last one.
+/// `blob_size`: the blob the offsets are of (none: the table is not of a blob
+/// and has no offsets, as that of a layer without a table of contents).
 fn plan_file(
     plan: &mut Plan,
     entries: &[TocEntry],
     i: usize,
-    blob_size: i64,
+    blob_size: Option<i64>,
     max_chunk: u64,
 ) -> ImageResult<()> {
     let e = &entries[i];
     let digest_str = e.content_key().unwrap_or_default();
     let alg = plan.alg;
-    if e.end_offset <= e.offset || (blob_size >= 0 && e.end_offset > blob_size as u64) {
-        return Err(fail(format!("invalid offsets for `{}`", e.name)));
+    let placed = blob_size.is_some();
+    if let Some(size) = blob_size {
+        if e.end_offset <= e.offset || (size >= 0 && e.end_offset > size as u64) {
+            return Err(fail(format!("invalid offsets for `{}`", e.name)));
+        }
     }
     let job = plan.jobs.len();
     let first = plan.chunks.len();
@@ -736,7 +741,7 @@ fn plan_file(
                 e.name
             )));
         }
-        if e.end_offset - e.offset > compressed_bound(e.size) {
+        if placed && e.end_offset - e.offset > compressed_bound(e.size) {
             return Err(fail(format!(
                 "the compressed range of `{}` is too big",
                 e.name
@@ -795,10 +800,10 @@ fn plan_file(
                 }
                 holes.push((file_off, size));
             } else {
-                if c.offset < e.offset || end <= c.offset || end > e.end_offset {
+                if placed && (c.offset < e.offset || end <= c.offset || end > e.end_offset) {
                     return Err(fail(format!("invalid chunk offsets for `{}`", e.name)));
                 }
-                if end - c.offset > compressed_bound(size) {
+                if placed && end - c.offset > compressed_bound(size) {
                     return Err(fail(format!(
                         "the compressed range of a chunk of `{}` is too big",
                         e.name
@@ -907,7 +912,7 @@ pub(crate) fn make_plan(
         }
         // (the holes are bounded on their own: no byte of them is fetched)
         let zeros = plan.zeros;
-        plan_file(&mut plan, &toc.entries, i, blob_size, max_chunk)?;
+        plan_file(&mut plan, &toc.entries, i, Some(blob_size), max_chunk)?;
         plan.planned += e.size - (plan.zeros - zeros);
         if plan.planned > cap {
             return Err(unsupported("the files to fetch are too big for the layer"));
@@ -1472,6 +1477,86 @@ impl io::Write for Content {
     }
 }
 
+/// The size of the pieces a file too big to be asked of a peer whole is cut
+/// in, for a layer that has no table of contents: a peer that has the layer
+/// has the file by them.
+const PIECE: u64 = 4 << 20;
+
+/// The digests of the pieces of a file, as its content is read.
+struct Pieces {
+    alg: Algorithm,
+    hasher: DigestWriter,
+    filled: u64,
+    done: Vec<(u64, Digest)>,
+}
+
+impl Pieces {
+    fn new(alg: Algorithm) -> Self {
+        Self {
+            alg,
+            hasher: DigestWriter::new(alg),
+            filled: 0,
+            done: Vec::new(),
+        }
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            let (now, rest) = data.split_at(data.len().min((PIECE - self.filled) as usize));
+            self.hasher.update(now);
+            self.filled += now.len() as u64;
+            data = rest;
+            if self.filled == PIECE {
+                self.close();
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        let hasher = std::mem::replace(&mut self.hasher, DigestWriter::new(self.alg));
+        self.done
+            .push((std::mem::take(&mut self.filled), hasher.finalize()));
+    }
+
+    /// The pieces, in order, with their sizes.
+    fn finish(mut self) -> Vec<(u64, Digest)> {
+        if self.filled > 0 {
+            self.close();
+        }
+        self.done
+    }
+}
+
+impl velarx_types::digest::Absorb for Pieces {
+    fn absorb(&mut self, data: &[u8]) {
+        self.update(data);
+    }
+}
+
+/// Cut the entry of a file in `pieces`: the first is the file's own chunk,
+/// and the entries that follow it are the others, as a table of contents
+/// has the chunks of a file.
+fn cut(file: &mut TocEntry, pieces: Vec<(u64, Digest)>) -> Vec<TocEntry> {
+    let mut pieces = pieces.into_iter();
+    if let Some((size, digest)) = pieces.next() {
+        file.chunk_size = size;
+        file.chunk_digest = Some(digest.to_string());
+    }
+    let mut offset = file.chunk_size;
+    pieces
+        .map(|(size, digest)| {
+            let chunk = TocEntry {
+                chunk_digest: Some(digest.to_string()),
+                chunk_size: size,
+                chunk_offset: offset,
+                ..TocEntry::new(file.name.clone(), TocEntryType::Chunk)
+            };
+            offset += size;
+            chunk
+        })
+        .collect()
+}
+
 /// Replay a tar-split over the files of `source`: the table of contents is
 /// a fetcher's claim (of a layer it unpacked), not one the descriptor names:
 /// the content of each file is hashed here and must be the digest the claim
@@ -1497,6 +1582,7 @@ fn replay_of(
             return Err(fail("the layer has too many entries"));
         }
         let mut claimed_object = None;
+        let mut cut_in = None;
         let digest = if h.kind == Kind::Regular {
             if h.size == 0 {
                 Some(Digest::empty(alg).to_string())
@@ -1513,6 +1599,9 @@ fn replay_of(
                 // (the hash of a long file runs beside the read of it; a
                 // file that was hashed as it was copied is not hashed again)
                 let mut content = None;
+                // (and so do the pieces of a file too big to be served whole)
+                let mut pieces = (h.size > velarx_storage::MAX_SERVED_BYTES as u64)
+                    .then(|| Offloaded::new(Pieces::new(alg)));
                 while left > 0 {
                     let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
                     let n = tar.read(&mut buf[..want]).map_err(io_fail)?;
@@ -1535,8 +1624,12 @@ fn replay_of(
                     if let Some(c) = &mut content {
                         c.update(&buf[..n]);
                     }
+                    if let Some(p) = &mut pieces {
+                        p.update(&buf[..n]);
+                    }
                     left -= n as u64;
                 }
+                cut_in = pieces.map(|p| p.finish().finish());
                 let mut opened = tar
                     .get_mut()
                     .inner
@@ -1581,7 +1674,9 @@ fn replay_of(
         if claimed_object.is_some() {
             e.fsverity = claimed_object;
         }
+        let chunks = cut_in.map(|pieces| cut(&mut e, pieces));
         entries.push(e);
+        entries.extend(chunks.into_iter().flatten());
     }
     let mut rest = tar.into_inner();
     io::copy(&mut rest, &mut io::sink()).map_err(io_fail)?;
@@ -1899,6 +1994,10 @@ pub async fn pull_whole(
             f.digest = object.clone();
         }
     }
+    // (the pieces of the big files, where a peer finds them)
+    let chunks = located_chunks_where(&toc, |i| {
+        toc.entries[i].size > velarx_storage::MAX_SERVED_BYTES as u64
+    });
     let mut report = ingested.report;
     report.fetched_files = kept + ingested.fetched;
     report.reused_files = reused.saturating_sub(ingested.fetched);
@@ -1907,7 +2006,7 @@ pub async fn pull_whole(
             from_store,
             toc,
             files,
-            chunks: Vec::new(),
+            chunks,
             report,
             diff_id: ingested.diff_id,
             tarsplit: ingested.tarsplit,
@@ -2493,15 +2592,16 @@ pub struct FileChunks {
 }
 
 /// The chunks of the regular file at `at` of `toc`, with the checks of a
-/// pull (offsets inside the blob of `blob_size` bytes, chunks of at most
-/// `max_chunk` bytes that cover the file): what a process that fetches the
-/// files of a lazy layer one by one asks the fetchers for.  Pure: it
-/// reads neither a store nor the network.
+/// pull (offsets inside the blob of `blob_size` bytes, none for a table
+/// that is not of a blob; chunks of at most `max_chunk` bytes that cover
+/// the file): what a process that fetches the files of a lazy layer one by
+/// one asks the fetchers for.  Pure: it reads neither a store nor the
+/// network.
 pub fn file_chunks(
     toc: &Toc,
     alg: Algorithm,
     at: usize,
-    blob_size: i64,
+    blob_size: Option<i64>,
     max_chunk: u64,
 ) -> ImageResult<FileChunks> {
     let e = toc

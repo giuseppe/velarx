@@ -265,7 +265,7 @@ fn chunks_of(toc: &Toc, at: usize) -> Option<(u64, Vec<PeerChunk>)> {
         toc,
         velarx_types::digest::Algorithm::Sha256,
         at,
-        i64::MAX,
+        None,
         MAX_ITEM_BYTES as u64,
     )
     .ok()?;

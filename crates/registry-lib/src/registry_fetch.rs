@@ -1121,7 +1121,7 @@ impl StagingFetcher for RegistryFetch {
                 &indexed.toc,
                 digest.alg(),
                 at,
-                size,
+                Some(size),
                 self.service.limits.max_chunk_bytes,
             )
             .map_err(failed)?;

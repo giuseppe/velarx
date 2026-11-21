@@ -530,3 +530,135 @@ async fn a_layer_nobody_has_an_index_of_comes_from_the_origin() {
     assert!(done.proven && done.blob_checked);
     assert!(rig.asked().is_empty());
 }
+
+/// A file of `len` bytes that does not repeat.
+fn noise(len: usize) -> Vec<u8> {
+    let mut x = 88172645463325252u64;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+/// The pieces of a file too big for a peer to give whole (a layer that has
+/// no table of contents has none for it): the replay cuts it in 4 MiB
+/// pieces whichever way the layer comes, the table has them as the chunks of
+/// the file, and they are recorded where a peer finds them.  What the table
+/// says of the rest of the layer is what it said.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_pieces_of_a_big_file_are_in_the_table() {
+    let big = noise(40 << 20);
+    let layer = made(&[("a", b"small".to_vec()), ("big", big.clone())]);
+    let (from_origin, from_index) = (
+        rig(&layer, None, HashMap::new()).await,
+        rig(&layer, Some(layer.index()), layer.bodies.clone()).await,
+    );
+    let mut tables = Vec::new();
+    for rig in [&from_origin, &from_index] {
+        let done = rig.pull(&layer).await.unwrap();
+        assert_eq!(done.diff_id, layer.diff);
+        let at = done
+            .toc
+            .entries
+            .iter()
+            .position(|e| e.name.ends_with("big"))
+            .unwrap();
+        let pieces: Vec<&TocEntry> = std::iter::once(&done.toc.entries[at])
+            .chain(
+                done.toc.entries[at + 1..]
+                    .iter()
+                    .take_while(|e| e.entry_type == TocEntryType::Chunk),
+            )
+            .collect();
+        assert_eq!(pieces.len(), 10);
+        for (i, (piece, bytes)) in pieces.iter().zip(big.chunks(PIECE as usize)).enumerate() {
+            assert_eq!(piece.chunk_size, PIECE, "{i}");
+            assert_eq!(piece.chunk_offset, i as u64 * PIECE);
+            assert_eq!(
+                piece.chunk_digest.as_deref(),
+                Some(Digest::of(Algorithm::Sha256, bytes).to_string().as_str())
+            );
+        }
+        // (the file itself is the digest of all of it, and a small one has
+        // no pieces)
+        assert_eq!(
+            done.toc.entries[at].digest.as_deref(),
+            Some(Digest::of(Algorithm::Sha256, &big).to_string().as_str())
+        );
+        assert_eq!(done.toc.entries.len(), at + 10);
+        let small = done
+            .toc
+            .entries
+            .iter()
+            .find(|e| e.name.ends_with("a"))
+            .unwrap();
+        assert_eq!(small.chunk_size, 5);
+        // (recorded for a peer: the pieces, by the key of the file, which
+        // the commit makes its fs-verity digest where the origin gave it)
+        let key = done.toc.entries[at].content_key().unwrap();
+        assert_eq!(done.chunks.len(), 10);
+        assert!(done
+            .chunks
+            .iter()
+            .all(|c| c.file_digest == key && c.size == PIECE));
+        // (the same stream whatever the pieces)
+        let mut without = (*done.toc).clone();
+        without
+            .entries
+            .retain(|e| e.entry_type != TocEntryType::Chunk);
+        assert_eq!(
+            crate::layer::reproduce::stream_size(&done.toc, &done.tarsplit).unwrap(),
+            crate::layer::reproduce::stream_size(&without, &done.tarsplit).unwrap()
+        );
+        // (the objects of the files the origin handed over are known at the
+        // commit)
+        let mut table = (*done.toc).clone();
+        for e in &mut table.entries {
+            e.fsverity = None;
+        }
+        tables.push(serde_json::to_string(&table).unwrap());
+    }
+    // (the table is the stream's, the same from the origin and from an index)
+    assert!(tables[0] == tables[1]);
+}
+
+/// A table with no offsets (that of a layer without a table of contents)
+/// gives the pieces of a file to the fetchers, which ask for them by digest;
+/// the table of a blob is still refused with the offsets it has not.
+#[test]
+fn the_pieces_of_a_table_without_a_blob_are_given_to_the_fetchers() {
+    let mut file = TocEntry {
+        size: 10 << 20,
+        digest: Some(crate::sha256_text(b"file")),
+        chunk_digest: Some(crate::sha256_text(b"one")),
+        chunk_size: 4 << 20,
+        ..TocEntry::new("f", TocEntryType::Reg)
+    };
+    file.fsverity = velarx_storage::to_toc(&verity(b"file"));
+    let chunk = |offset: u64, size: u64, text: &[u8]| TocEntry {
+        chunk_digest: Some(crate::sha256_text(text)),
+        chunk_size: size,
+        chunk_offset: offset,
+        ..TocEntry::new("f", TocEntryType::Chunk)
+    };
+    let toc = Toc {
+        version: TOC_VERSION,
+        entries: vec![
+            file,
+            chunk(4 << 20, 4 << 20, b"two"),
+            chunk(8 << 20, 2 << 20, b"three"),
+        ],
+        tar_split_digest: None,
+    };
+    let got = file_chunks(&toc, Algorithm::Sha256, 0, None, 16 << 20).unwrap();
+    let places: Vec<(u64, u64)> = got.chunks.iter().map(|c| (c.offset, c.size)).collect();
+    assert_eq!(
+        places,
+        [(0, 4 << 20), (4 << 20, 4 << 20), (8 << 20, 2 << 20)]
+    );
+    assert!(file_chunks(&toc, Algorithm::Sha256, 0, Some(1 << 30), 16 << 20).is_err());
+}

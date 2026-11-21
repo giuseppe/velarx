@@ -151,7 +151,7 @@ fn stage_file(
         &indexed.toc,
         velarx_types::digest::Algorithm::Sha256,
         at,
-        i64::MAX,
+        None,
         MAX_ITEM,
     ) else {
         return Ok(false);

@@ -767,6 +767,32 @@ pub(crate) mod tests {
         e
     }
 
+    /// The chunks of a file are not entries of the layer: its image and its
+    /// identity are those of the table without them.
+    #[test]
+    fn the_chunks_of_a_file_change_nothing_of_the_image() {
+        let mut entries = sample();
+        let at = entries
+            .iter()
+            .position(|e| e.name == "usr/bin/busybox")
+            .unwrap();
+        entries[at].chunk_digest = Some(format!("sha256:{}", "1".repeat(64)));
+        entries[at].chunk_size = 600;
+        let mut chunked = entries.clone();
+        for i in 1..3u64 {
+            let mut chunk = entry("usr/bin/busybox", TocEntryType::Chunk);
+            chunk.chunk_digest = Some(format!("sha256:{}", format!("{i}").repeat(64)));
+            (chunk.chunk_size, chunk.chunk_offset) = (200, 600 + 200 * (i - 1));
+            chunked.insert(at + i as usize, chunk);
+        }
+        let alg = velarx_types::digest::Algorithm::Sha256;
+        let (plain, cut) = (
+            layer_image(&entries).unwrap(),
+            layer_image(&chunked).unwrap(),
+        );
+        assert_eq!(plain.identity(alg).unwrap(), cut.identity(alg).unwrap());
+    }
+
     #[test]
     fn a_symlink_with_no_target_is_refused() {
         let link = entry("usr/l", TocEntryType::Symlink);

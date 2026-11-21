@@ -910,26 +910,41 @@ async fn test_a_gzip_layer_from_a_peer_that_sends_wrong_bytes_comes_from_the_reg
     drop(s);
 }
 
-/// A file of a gzip layer too big to be asked of a peer makes the peer
-/// unavailable for the layer: the pull goes on with the registry.
+/// A file of a gzip layer too big for a peer to give whole (16 MiB) comes in
+/// the pieces the layer's table cuts it in: the registry is not asked for
+/// the layer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_a_gzip_layer_with_a_huge_file_goes_to_the_registry() {
+async fn test_a_gzip_layer_with_a_huge_file_comes_from_a_peer() {
+    let huge = noise(40 << 20, 9);
     let mut items = sample();
     items.push(Item::File {
         name: "usr/huge",
-        data: noise(17 << 20, 9),
+        data: huge.clone(),
         chunk: 1 << 20,
     });
     let layer = build_gzip(&items);
     let s = swarm(&[&layer], &[GZIP]).await;
     let b = env_with_sources(&[&s.b_source]).await;
     b.publish(&[&layer], &[GZIP]);
-    b.pull().await.unwrap();
-    assert!(
-        b.reg.hits.lock().unwrap().get(&sha(&layer.blob)).copied() >= Some(1),
-        "the registry gave the layer"
+    let result = b.pull().await.unwrap();
+    assert_eq!(
+        b.reg
+            .hits
+            .lock()
+            .unwrap()
+            .get(&sha(&layer.blob))
+            .copied()
+            .unwrap_or(0),
+        0,
+        "the registry was not asked for the layer"
     );
-    assert_eq!(b.db.get_layer(&layer.key()).await.unwrap().status, "ready");
+    assert!(result.stats.from("source0").0 >= huge.len() as u64);
+    let rec = b.db.get_layer(&layer.key()).await.unwrap();
+    assert_eq!(
+        (rec.status.as_str(), rec.diff_id.as_ref()),
+        ("ready", Some(&layer.diff_id))
+    );
+    assert!(b.store.contains(&vid(&huge)));
     drop(s);
 }
 
