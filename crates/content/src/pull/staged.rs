@@ -983,24 +983,25 @@ impl Staging {
                 return Some(p);
             }
         }
-        // (a name without a tag is the `latest` of it)
-        let named = match reference.rsplit_once(':') {
-            Some((_, tag)) if !tag.contains('/') && !reference.contains('@') => {
-                reference.to_string()
-            }
-            _ if reference.contains('@') => reference.to_string(),
-            _ => format!("{reference}:latest"),
-        };
-        pulls.into_iter().rfind(|p| {
-            p.pull.tags.iter().any(|t| {
-                format!("{}:{}", t.repository, t.tag) == named
-                    || docker_short(&t.repository, &t.tag) == named
-            }) || p
-                .pull
-                .digest_names
-                .iter()
-                .any(|(r, d)| format!("{r}@{d}") == reference)
-        })
+        // (a name as the pull recorded it: `ImageReference::name`, the
+        // `latest` of a name without a tag)
+        let wanted = velarx_types::reference::ImageReference::parse(reference).ok()?;
+        let name = wanted.name();
+        pulls
+            .into_iter()
+            .rfind(|p| match (&wanted.tag, &wanted.digest) {
+                (Some(tag), _) => {
+                    (p.pull.tags.iter()).any(|t| t.repository == name && t.tag == *tag)
+                }
+                // (a pull by tag is also found by its repository and the
+                // digest of its manifest, as the store finds an image)
+                (None, Some(d)) => {
+                    (p.pull.digest_names.iter()).any(|(r, x)| *r == name && *x == d.to_string())
+                        || (p.pull.manifest_digest == *d
+                            && p.pull.tags.iter().any(|t| t.repository == name))
+                }
+                (None, None) => false,
+            })
     }
 
     /// Remove a pull (its layers are the caller's to remove: another pull
@@ -1069,14 +1070,6 @@ impl Staging {
     }
 }
 
-fn docker_short(repository: &str, tag: &str) -> String {
-    let short = repository
-        .strip_prefix("docker.io/library/")
-        .or_else(|| repository.strip_prefix("docker.io/"))
-        .unwrap_or(repository);
-    format!("{short}:{tag}")
-}
-
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -1098,7 +1091,7 @@ mod tests {
             config: "{}".into(),
             layers: vec![format!("toc:{}", digest(n + 1))],
             tags: vec![StagedTag {
-                repository: "docker.io/library/nginx".into(),
+                repository: "library/nginx".into(),
                 tag: tag.into(),
             }],
             digest_names: Vec::new(),
@@ -1330,6 +1323,22 @@ mod tests {
         }
         assert_eq!(area.find(&old.id[..12]).unwrap().pull.id, old.id);
         assert!(area.find("alpine").is_none());
+        // a pull by digest, found by that digest with or without a tag
+        let mut by_digest = pull(3, "latest");
+        by_digest.tags.clear();
+        by_digest.digest_names = vec![("quay.io/a/b".into(), digest(3).to_string())];
+        area.publish_pull(&by_digest).unwrap();
+        for name in [
+            format!("quay.io/a/b@{}", digest(3)),
+            format!("quay.io/a/b:v1@{}", digest(3)),
+        ] {
+            assert_eq!(area.find(&name).unwrap().pull.id, by_digest.id, "{name}");
+        }
+        assert!(area.find(&format!("quay.io/a/c@{}", digest(3))).is_none());
+        // a pull by tag, found by its repository and manifest digest
+        let by_manifest = format!("docker.io/library/nginx@{}", digest(1));
+        assert_eq!(area.find(&by_manifest).unwrap().pull.id, old.id);
+        assert!(area.find(&format!("alpine@{}", digest(1))).is_none());
     }
 
     #[test]
