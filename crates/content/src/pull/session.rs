@@ -51,6 +51,20 @@ pub struct Session {
     verified: Mutex<HashMap<String, String>>,
 }
 
+/// Copy what `from` knows of `key` to `to`.
+fn carry<V: Clone>(from: &Mutex<HashMap<String, V>>, to: &Mutex<HashMap<String, V>>, key: &str) {
+    let value = from
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .cloned();
+    if let Some(value) = value {
+        to.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), value);
+    }
+}
+
 /// A file that waits in a session.
 struct Staged {
     size: u64,
@@ -215,6 +229,10 @@ impl Session {
                 None => other.adopt_path(&path, &digest, (size, copy), own)?,
             };
             if kept {
+                // (and what the commit checks it against)
+                carry(&self.by_verity, &other.by_verity, &digest);
+                carry(&self.by_content, &other.by_content, &digest);
+                carry(&self.verified, &other.verified, &digest);
                 moved.push(digest);
             }
         }
@@ -1443,6 +1461,26 @@ mod tests {
             velarx_types::digest::Algorithm::Sha256,
             b"something else"
         )));
+    }
+
+    /// A file moved in from a scratch session is checked against what the
+    /// scratch knew it by: one whose content has another fs-verity digest
+    /// is not committed.
+    #[test]
+    fn a_file_moved_from_a_scratch_keeps_its_check() {
+        let (_tmp, s) = session();
+        let lie = velarx_storage::fsverity_digest_of(
+            velarx_types::digest::Algorithm::Sha256,
+            b"what it should be",
+        );
+        let scratch = s.scratch().unwrap();
+        scratch.put(&lie, b"something else").unwrap();
+        scratch.known_by_verity(&lie, "a/file");
+        let keep: std::collections::HashSet<&str> = [lie.as_str()].into();
+        assert_eq!(scratch.transfer_into(&s, &keep).unwrap(), [lie.as_str()]);
+        let err = s.commit(None).unwrap_err();
+        assert!(err.to_string().contains("a/file"), "{err}");
+        assert!(!s.store().contains(&lie));
     }
 
     /// A file waits in the session under a name that is no digest, whatever

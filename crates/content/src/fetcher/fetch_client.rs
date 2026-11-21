@@ -492,10 +492,15 @@ impl FetchConn {
         file_at(fds, item.file, image)
     }
 
-    /// What the fetcher can do for `layers`.
-    pub async fn probe(&mut self, layers: &[Blob]) -> Result<Replies<'_, ProbeReply>, CallError> {
+    /// What the fetcher can do for `layers` (`again`: the index it carried
+    /// for one of them in the last probe was wrong).
+    pub async fn probe(
+        &mut self,
+        layers: &[Blob],
+        again: bool,
+    ) -> Result<Replies<'_, ProbeReply>, CallError> {
         let (conn, busy) = self.begin().await?;
-        match conn.probe(layers.to_vec()).await {
+        match conn.probe(layers.to_vec(), again.then_some(true)).await {
             Ok(stream) => Ok(replies_fds(stream, &busy)),
             Err(e) => {
                 busy.store(false, Ordering::Release);
@@ -806,10 +811,10 @@ mod tests {
             }
         });
         let mut conn = FetchConn::new(ours).unwrap();
-        let mut replies = conn.probe(&[]).await.unwrap();
+        let mut replies = conn.probe(&[], false).await.unwrap();
         assert!(replies.probed().await.unwrap().is_none());
         drop(replies);
-        let mut replies = conn.probe(&[]).await.unwrap();
+        let mut replies = conn.probe(&[], false).await.unwrap();
         let broken = replies.probed().await.unwrap_err();
         assert!(matches!(broken, CallError::Protocol(_)), "{broken:?}");
         server.await.unwrap();

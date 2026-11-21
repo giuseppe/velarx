@@ -249,7 +249,7 @@ pub(super) async fn metadata(
         .as_ref()
         .ok_or_else(|| fail("no fetcher for the layer"))?;
     staged
-        .probe(layer)
+        .probe(layer, false)
         .await?
         .ok_or_else(|| fail("no fetcher gave its table of contents"))
 }
@@ -1797,12 +1797,14 @@ pub async fn complete_layer(
     Ok(pulled)
 }
 
-/// Pull `layer`, which has no table of contents, through the fetchers
-/// ([`unpack_whole`]), and give the files the replay used to the session:
-/// those the store has are not taken again.  Also whether the registry
-/// fetcher unpacked it (its workers hashed the blob).  `registry_only`: only
-/// the registry fetcher is asked (the store has a layer of the blob for
-/// another diff id: the blob, hashed, says which is right).
+/// Pull `layer`, which has no table of contents: from the index of the
+/// sources and the files the store lacks ([`unpack_by_index`]; when the
+/// index does not replay, once more from the index of another source), else
+/// from the origin ([`unpack_whole`]); give the files the replay used to the
+/// session: those the store has are not taken again.  Also whether the
+/// layer was not from the origin, whose workers hashed the blob.
+/// `registry_only`: only the origin is asked (the store has a layer of the
+/// blob for another diff id: the blob, hashed, says which is right).
 pub async fn pull_whole(
     ctx: &PullCtx,
     registry_only: bool,
@@ -1810,15 +1812,36 @@ pub async fn pull_whole(
     expected_diff_id: &Digest,
     progress: impl Fn(u64) + Send + Sync + 'static,
 ) -> ImageResult<(Pulled, bool)> {
-    let unpacked = unpack_whole(ctx, layer, expected_diff_id, registry_only, progress).await?;
+    no_table(layer)?;
+    let mut by_index = None;
+    for again in [false, true].into_iter().filter(|_| !registry_only) {
+        match unpack_by_index(ctx, layer, expected_diff_id, again, &progress).await {
+            Ok(unpacked) => {
+                by_index = unpacked;
+                break;
+            }
+            // (a failure of this end is no reason to pass over the source
+            // of the index: the origin is asked)
+            Err(e) if of_this_end(&e) => {
+                debug!("Layer {}: not from its sources: {e}", layer.digest);
+                break;
+            }
+            Err(e) => debug!("Layer {}: not from its sources: {e}", layer.digest),
+        }
+    }
+    let by_registry = by_index.is_none();
+    let unpacked = match by_index {
+        Some(unpacked) => unpacked,
+        None => unpack_whole(ctx, layer, expected_diff_id, progress).await?,
+    };
     let Unpacked {
         mut ingested,
-        by_registry,
+        from_store,
         ..
     } = unpacked;
     let sink = ctx.sink.clone();
     let files: Vec<String> = ingested.files.iter().map(|f| f.digest.clone()).collect();
-    let from_store = std::mem::take(&mut ingested.stored);
+    let stored = std::mem::take(&mut ingested.stored);
     let mut copies = std::mem::take(&mut ingested.copies);
     let (objects, kept, reused) = tokio::task::spawn_blocking(move || {
         let (mut objects, mut kept, mut reused) = (HashMap::new(), 0u64, 0u64);
@@ -1828,7 +1851,7 @@ pub async fn pull_whole(
                 reused += 1;
                 continue;
             }
-            if let Some(object) = from_store.get(&key) {
+            if let Some(object) = stored.get(&key) {
                 objects.insert(key, Some(object.clone()));
                 reused += 1;
                 continue;
@@ -1877,11 +1900,11 @@ pub async fn pull_whole(
         }
     }
     let mut report = ingested.report;
-    report.fetched_files = kept;
-    report.reused_files = reused;
+    report.fetched_files = kept + ingested.fetched;
+    report.reused_files = reused.saturating_sub(ingested.fetched);
     Ok((
         Pulled {
-            from_store: 0,
+            from_store,
             toc,
             files,
             chunks: Vec::new(),
@@ -1894,14 +1917,15 @@ pub async fn pull_whole(
     ))
 }
 
-/// A layer with no table of contents that one of the fetchers unpacked whole,
-/// checked: the stream recreated from the tar-split and the files it handed
-/// over hashes to the diff id, each file is the digest it is known by, and
-/// the table of contents is what the verified headers say.
+/// A layer with no table of contents, checked: the stream recreated from
+/// the tar-split and the files hashes to the diff id, each file is the
+/// digest it is known by, and the table of contents is what the verified
+/// headers say.
 pub struct Unpacked {
     pub ingested: Whole,
-    /// The registry fetcher unpacked it (its workers hashed the blob)
-    pub by_registry: bool,
+    /// The files that are the store's as it was before the pull, or the
+    /// user's own: what made the layer is not all the pull's
+    pub from_store: u64,
     /// The staging of the layer: the copies of a sink with no files of the
     /// engine's are in it, and last as long as it does
     pub staging: Arc<super::staged_fetch::LayerStaging>,
@@ -1914,12 +1938,14 @@ pub struct Whole {
     pub report: LayerReport,
     pub diff_id: Digest,
     pub tarsplit: bytes::Bytes,
-    /// The files the fetcher handed over, as the engine holds them
+    /// The files the origin handed over, as the engine holds them
     /// ([`Replayed::copies`])
     pub copies: HashMap<String, (PathBuf, u64, String)>,
-    /// The files the store had and the fetcher left out, by their key: the
-    /// object of the store each is
+    /// The files the replay read from the store or the pull's session, by
+    /// their key: the object each is
     pub stored: HashMap<String, String>,
+    /// Those of `stored` that the sources brought
+    pub fetched: u64,
 }
 
 /// An error unless `layer` is one without a table of contents: the only
@@ -1935,49 +1961,20 @@ pub fn no_table(layer: &OciDescriptor) -> ImageResult<()> {
     }
 }
 
-/// Pull `layer`, which has no table of contents, through the fetchers and
-/// check it ([`Unpacked`]).  A fetcher before the
-/// registry fetcher may leave out the files the claim names that it has not
-/// got: the replay takes them from the store, by the object the claim says
-/// (a word it checks: the content must be the digest the claim names the
-/// file by).  A claim of such a fetcher that does not replay to the diff id
-/// is given up for the registry fetcher's.
+/// Pull `layer`, which has no table of contents, from the origin and
+/// check it ([`Unpacked`]): it hands over every file.
 pub async fn unpack_whole(
     ctx: &PullCtx,
     layer: &OciDescriptor,
     expected_diff_id: &Digest,
-    registry_only: bool,
     progress: impl Fn(u64) + Send + Sync + 'static,
 ) -> ImageResult<Unpacked> {
     no_table(layer)?;
-    match unpack_from(ctx, layer, expected_diff_id, registry_only, &progress).await {
-        Err((e, true)) if !registry_only => {
-            debug!("Layer {}: not from its fetchers: {e}", layer.digest);
-            unpack_from(ctx, layer, expected_diff_id, true, &progress)
-                .await
-                .map_err(|(e, _)| e)
-        }
-        r => r.map_err(|(e, _)| e),
-    }
-}
-
-/// One try of [`unpack_whole`]; an error says whether a fetcher before the
-/// registry fetcher made the claim.
-async fn unpack_from(
-    ctx: &PullCtx,
-    layer: &OciDescriptor,
-    expected_diff_id: &Digest,
-    registry_only: bool,
-    progress: &(dyn Fn(u64) + Send + Sync),
-) -> Result<Unpacked, (ImageError, bool)> {
     let staged = ctx
         .staged
         .as_ref()
-        .ok_or_else(|| (fail("no fetcher for the layer"), false))?;
-    let staging = staged
-        .open_layer_as(LayerKey::Whole(layer.digest))
-        .await
-        .map_err(|e| (e, false))?;
+        .ok_or_else(|| fail("no fetcher for the layer"))?;
+    let staging = staged.open_layer_as(LayerKey::Whole(layer.digest)).await?;
     let alg = LayerKey::expected(layer).digest().alg();
     // (a sink of a storage driver has no file of the engine's for a copy:
     // the copies are made in the staging of the layer, and go with it)
@@ -1987,39 +1984,73 @@ async fn unpack_from(
             let dir = staging
                 .path()
                 .join(format!("copies-{}", velarx_base::random::token()));
-            std::fs::create_dir(&dir).map_err(|e| (e.into(), false))?;
+            std::fs::create_dir(&dir)?;
             Intake::in_dir(dir, alg, ctx.limits.workers)
         }
     };
     let whole = match staged
-        .fetch_whole(&staging, layer, registry_only, progress, &intake)
+        .fetch_whole(&staging, layer, &progress, &intake)
         .await
     {
         Ok(whole) => whole,
         Err(e) => {
             // (the files handed over until then are still being taken in)
             let _ = intake.finish().await;
-            return Err((e, false));
+            return Err(e);
         }
     };
-    let sourced = !whole.by_registry;
-    let diff_alg = expected_diff_id.alg();
     let tarsplit = bytes::Bytes::from(whole.tarsplit);
-    let handed = intake.finish().await.map_err(|e| (e.into(), false))?;
-    // (the objects the claim says its files are: a hint for those the
-    // fetcher left out, nothing more)
-    let mut toc = whole.toc;
-    let mut hints = HashMap::new();
-    for e in &mut toc.entries {
-        if let (Some(d), Some(object)) = (e.digest.clone(), e.verity()) {
-            hints.insert(d, object);
-        }
-        e.fsverity = None;
-    }
-    let store = sourced.then(|| (ctx.sink.clone(), hints));
-    let z = tarsplit.clone();
-    let replayed = tokio::task::spawn_blocking(
-        move || -> ImageResult<(Replayed, HashMap<String, String>)> {
+    let handed = intake.finish().await?;
+    let (replayed, stored, toc) =
+        replay_claim(whole.toc, (handed, None), &tarsplit, alg, expected_diff_id).await?;
+    let fetched_files = replayed.files.len() as u64;
+    let ingested = Whole {
+        toc: Arc::new(toc),
+        report: LayerReport {
+            fetched_bytes: whole.bytes,
+            fetched_files,
+            ..LayerReport::default()
+        },
+        files: replayed.files,
+        diff_id: replayed.diff_id,
+        tarsplit,
+        copies: replayed.copies,
+        stored,
+        fetched: 0,
+    };
+    Ok(Unpacked {
+        ingested,
+        from_store: 0,
+        staging,
+    })
+}
+
+/// Replay the claim `toc`: the stream recreated from `tarsplit` and the
+/// files `handed` over or, with `store`, those of the pull's session and the
+/// store by the object the claim says each is, which must hash to
+/// `expected_diff_id`.  Also the files read from the store, by their key,
+/// and the table of contents of the stream.
+async fn replay_claim(
+    mut toc: Toc,
+    (handed, store): (HashMap<String, Copied>, Option<Arc<dyn super::sink::Sink>>),
+    tarsplit: &bytes::Bytes,
+    alg: Algorithm,
+    expected_diff_id: &Digest,
+) -> ImageResult<(Replayed, HashMap<String, String>, Toc)> {
+    let (z, diff_alg) = (tarsplit.clone(), expected_diff_id.alg());
+    let (mut replayed, stored, tar_split_digest) =
+        tokio::task::spawn_blocking(move || -> ImageResult<_> {
+            let store = store.map(|sink| {
+                let hints = toc
+                    .entries
+                    .iter()
+                    .filter_map(|e| Some((e.digest.clone()?, e.verity()?)))
+                    .collect();
+                (sink, hints)
+            });
+            for e in &mut toc.entries {
+                e.fsverity = None;
+            }
             let mut source = StagedFiles {
                 index: tarsplit::content_index(&toc),
                 store,
@@ -2028,70 +2059,162 @@ async fn unpack_from(
                 stored: HashMap::new(),
                 last: None,
             };
-            let input = tarsplit::decoder(z, MAX_TARSPLIT).map_err(data_fail)?;
+            let input = tarsplit::decoder(z.clone(), MAX_TARSPLIT).map_err(data_fail)?;
             let replayed = replay_of(input, &mut source, alg, diff_alg)?;
-            Ok((replayed, source.stored))
-        },
-    )
-    .await
-    .map_err(|e| (fail(format!("the replay of the layer: {e}")), sourced))?;
-    let (replayed, stored) = replayed.map_err(|e| (e, sourced))?;
+            Ok((replayed, source.stored, Digest::of(alg, &z)))
+        })
+        .await
+        .map_err(|e| fail(format!("the replay of the layer: {e}")))??;
     if replayed.diff_id != *expected_diff_id {
-        return Err((
-            ImageError::DigestMismatch {
-                expected: expected_diff_id.to_string(),
-                actual: replayed.diff_id.to_string(),
-            },
-            sourced,
-        ));
+        return Err(ImageError::DigestMismatch {
+            expected: expected_diff_id.to_string(),
+            actual: replayed.diff_id.to_string(),
+        });
     }
-    let staged_files: Vec<&FileUse> = replayed
-        .files
-        .iter()
-        .filter(|f| !stored.contains_key(&f.digest))
-        .collect();
-    // (what the fetcher that unpacked it said it brought)
-    let (fetched_bytes, sources) = match sourced {
-        true => (
-            0,
-            vec![velarx_proto::workload::BySource {
-                name: whole.source.clone(),
-                bytes: whole.bytes,
-                files: staged_files.len() as u64,
-            }],
-        ),
-        false => (whole.bytes, Vec::new()),
+    let toc = Toc {
+        version: TOC_VERSION,
+        entries: std::mem::take(&mut replayed.entries),
+        tar_split_digest: Some(tar_split_digest.to_string()),
     };
+    Ok((replayed, stored, toc))
+}
+
+/// Whether `e` is a failure of this end (its disk, its store), not of what
+/// the sources sent.
+fn of_this_end(e: &ImageError) -> bool {
+    match e {
+        ImageError::Io(_) | ImageError::Storage(_) | ImageError::Database(_) => true,
+        ImageError::Transfer { failure, .. } => failure.class == FailureClass::NoSpace,
+        _ => false,
+    }
+}
+
+/// Pull `layer`, which has no table of contents, from the index a source
+/// gives for its blob (the table and tar-split another node recorded: a
+/// claim) and the files of it the store lacks, which the sources before
+/// the origin bring into a scratch area.  The stream recreated from the
+/// tar-split and the files must hash to the diff id, each file to the
+/// digest the claim gives it: nothing of the claim is named before that,
+/// and a claim that is wrong is an error, for the origin.  None: no source
+/// has an index.  `again`: the index the last call had was wrong.
+async fn unpack_by_index(
+    ctx: &PullCtx,
+    layer: &OciDescriptor,
+    expected_diff_id: &Digest,
+    again: bool,
+    progress: &(dyn Fn(u64) + Send + Sync),
+) -> ImageResult<Option<Unpacked>> {
+    let Some(staged) = ctx.staged.as_ref() else {
+        return Ok(None);
+    };
+    let Some((toc_z, ts_z)) = staged.probe(layer, again).await? else {
+        return Ok(None);
+    };
+    let (have, cap) = (ctx.have_fn(), ctx.limits.inflate_cap(layer.size));
+    let json_cap = super::index::json_cap(layer.size);
+    let (claimed, tarsplit, missing) = tokio::task::spawn_blocking(move || {
+        let bad = |why: &str| ImageError::Contradicted(format!("the index of the layer: {why}"));
+        let (toc, tarsplit) =
+            super::index::decode_parts(&toc_z, ts_z, json_cap).map_err(|e| bad(&e))?;
+        if toc.is_canonical() {
+            return Err(bad("a canonical table has no tar-split to replay"));
+        }
+        if let Some(problem) = super::entry::toc_problem(&toc.entries) {
+            return Err(bad(problem));
+        }
+        // (what the claim makes this pull fetch is bounded, before anything
+        // is asked: by what a layer of this blob may inflate to), and the
+        // files the store, the session of the pull and its parent lack
+        let (mut total, mut seen, mut missing) = (0u64, HashSet::new(), Vec::new());
+        for e in &toc.entries {
+            if e.entry_type != TocEntryType::Reg || e.size == 0 {
+                continue;
+            }
+            let (Some(_), Some(object)) = (&e.digest, e.verity()) else {
+                return Err(bad("a file without its digests"));
+            };
+            total = total.saturating_add(e.size);
+            if seen.insert(object.clone()) && !have(&object, e.size) {
+                missing.push(object);
+            }
+        }
+        if total > cap {
+            return Err(bad("the files are larger than the layer may be"));
+        }
+        Ok((toc, tarsplit, missing))
+    })
+    .await
+    .map_err(|e| fail(format!("planning the layer: {e}")))??;
+    let staging = staged.open_layer_as(LayerKey::Whole(layer.digest)).await?;
+    let scratch = ctx.sink.clone().scratch()?;
+    let walked = match missing.is_empty() {
+        true => Default::default(),
+        false => {
+            staged
+                .fetch_from_sources(
+                    &staging,
+                    layer,
+                    &claimed,
+                    missing,
+                    (&scratch, &ctx.workers),
+                    progress,
+                )
+                .await?
+        }
+    };
+    let alg = LayerKey::expected(layer).digest().alg();
+    let tarsplit = bytes::Bytes::from(tarsplit);
+    let (replayed, stored, toc) = replay_claim(
+        claimed,
+        (HashMap::new(), Some(scratch.clone())),
+        &tarsplit,
+        alg,
+        expected_diff_id,
+    )
+    .await?;
+    // (what is not the store's as it was before this pull, nor the user's
+    // own, is asked of the scratch area before the transfer empties it)
+    let (sink, objects) = (
+        ctx.sink.clone(),
+        stored.values().cloned().collect::<Vec<_>>(),
+    );
+    let (from_store, moved) = tokio::task::spawn_blocking(move || {
+        let from_store = objects
+            .iter()
+            .filter(|o| scratch.existed(o) && sink.existed(o))
+            .count() as u64;
+        let keep: HashSet<&str> = objects.iter().map(String::as_str).collect();
+        scratch
+            .transfer_into(&*sink, &keep)
+            .map(|moved| (from_store, moved.len() as u64))
+    })
+    .await
+    .map_err(|e| fail(format!("the files of a layer: {e}")))??;
     let ingested = Whole {
-        toc: Arc::new(Toc {
-            version: TOC_VERSION,
-            entries: replayed.entries,
-            tar_split_digest: Some(Digest::of(alg, &tarsplit).to_string()),
-        }),
+        toc: Arc::new(toc),
         report: LayerReport {
-            fetched_bytes,
-            fetched_files: staged_files.len() as u64,
-            reused_bytes: 0,
-            reused_files: stored.len() as u64,
-            sources,
+            sources: walked.sources,
+            ..LayerReport::default()
         },
         files: replayed.files,
         diff_id: replayed.diff_id,
         tarsplit,
-        copies: replayed.copies,
+        copies: HashMap::new(),
         stored,
+        fetched: moved,
     };
-    Ok(Unpacked {
+    Ok(Some(Unpacked {
         ingested,
-        by_registry: whole.by_registry,
+        from_store: from_store + walked.own_files,
         staging,
-    })
+    }))
 }
 
-/// The files a fetcher handed over for a layer, by their key, for a replay of
-/// its claim: each read from the engine's own copy of it; with `store`, a file
-/// the fetcher left out from the store, by the object the claim says it is
-/// (`stored`: those taken so).
+/// The files for a replay of a claim, by their key: those the origin handed
+/// over, each read from the engine's own copy of it; with `store`, the others
+/// from the pull's session (the sources' files are in a scratch area of it)
+/// and the store, by the object the claim says each is (`stored`: those
+/// taken so).
 struct StagedFiles {
     index: ContentIndex,
     store: Option<(Arc<dyn super::sink::Sink>, HashMap<String, String>)>,
@@ -2397,5 +2520,7 @@ pub fn file_chunks(
     })
 }
 
+#[cfg(test)]
+mod index_tests;
 #[cfg(test)]
 mod tests;

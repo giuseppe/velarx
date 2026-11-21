@@ -760,11 +760,11 @@ async fn test_a_public_image_does_not_make_a_private_layer_shareable() {
         .unwrap());
 }
 
-/// A layer made from an index is not shareable: its blob was never seen.
-/// A peer offers a fake gzip layer (a digest of its own) with the diff id,
-/// TOC and tar-split of a private layer of the victim; the victim's public
-/// pull rebuilds it from its private files: neither the layer nor those
-/// files become shareable.
+/// A layer made from an index and files the store had is not shareable: its
+/// blob was never seen.  A peer offers a fake gzip layer (a digest of its
+/// own) with the diff id, TOC and tar-split of a private layer of the
+/// victim; the victim's public pull rebuilds it from its private files:
+/// neither the layer nor those files become shareable.
 #[tokio::test]
 async fn test_a_layer_rebuilt_from_an_index_is_not_shareable() {
     use velarx_registry::auth::{Credentials, RegistryAccess};

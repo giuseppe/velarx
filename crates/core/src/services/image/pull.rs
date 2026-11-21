@@ -854,7 +854,15 @@ impl ImageService {
             .filter(|(_, ok)| !**ok)
             .map(|(i, _)| i as u32)
             .collect();
-        let mut replies = staged.probe_all(&missing).await?;
+        // (a layer with no table of contents is not lazy: the sources are
+        // not asked for what they know of it)
+        let mut tabled = Vec::new();
+        for at in &missing {
+            if pull::chunked::parse_info(&manifest.layers[*at as usize])?.is_some() {
+                tabled.push(*at);
+            }
+        }
+        let mut replies = staged.probe_all(&tabled, false).await?;
         velarx_base::trace::point("pull probed");
         let mut accepted = Accepted::default();
         let mut refused = Vec::new();
@@ -872,7 +880,7 @@ impl ImageService {
                     Some((reply, metadata)) => {
                         pull::lazy::accept(layer, &reply, metadata, max_tar).await?
                     }
-                    None => Err(velarx_proto::transfer::NotLazy::Unreachable),
+                    None => Err(velarx_proto::transfer::NotLazy::NoToc),
                 };
                 let made = match &answer {
                     Ok((_, lazy)) => Some(Self::made_of_table(layer, &lazy.toc, db).await?),

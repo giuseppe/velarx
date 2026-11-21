@@ -212,11 +212,13 @@ pub trait StagingFetcher: Send + Sync + 'static {
     }
 
     /// What can this fetcher do for `layers`?  One reply for each, in any
-    /// order.
+    /// order.  `again`: the index it carried for a layer without a table of
+    /// contents in the last probe of the scope was wrong.
     async fn probe(
         &self,
         _scope: &Scope,
         layers: Vec<Blob>,
+        _again: bool,
         out: &Out<Probed>,
     ) -> Result<(), FetcherError> {
         for (at, _) in layers.iter().enumerate() {
@@ -1194,11 +1196,16 @@ mod service {
 
         /// What can this fetcher do for `layers`?  Called with `more`: one
         /// `probed` a reply, in any order, then a last reply without one.
+        /// `again`: the index this fetcher carried for a layer without a
+        /// table of contents in the last `Probe` of the scope was wrong (its
+        /// replay failed): it carries one from another of its providers, or
+        /// none.
         #[zlink(more, return_fds)]
         pub async fn probe(
             &self,
             more: bool,
             layers: Vec<Blob>,
+            again: Option<bool>,
         ) -> impl Stream<Item = (Result<Reply<ProbeReply>, FetcherError>, Vec<OwnedFd>)> + Unpin
         {
             let scope = match self.scope() {
@@ -1221,7 +1228,7 @@ mod service {
             let task = self.runtime.spawn(async move {
                 let out = Out { tx };
                 tokio::select! {
-                    got = api.probe(&scope, layers, &out) => got,
+                    got = api.probe(&scope, layers, again.unwrap_or(false), &out) => got,
                     () = gone.cancelled() => Ok(()),
                 }
             });
@@ -2079,10 +2086,10 @@ pub fn definition() -> String {
          # may take (`reuse` of Fetch, only for a fetcher that announces the word\n\
          # reuse) come in one file the engine made of exactly those bytes, read-only.\n\
          #\n\
-         # UNPACK.  A layer with no table of contents is read whole, and its regular files\n\
-         # are handed over, not named: each is a descriptor of a reply of `Unpack`, a\n\
-         # complete file with no name (a small one may be a file in memory) that has\n\
-         # fs-verity when the scope says verity.  Then the fetcher gives `toc.claim` and\n\
+         # UNPACK.  The origin reads a layer with no table of contents whole, and its\n\
+         # regular files are handed over, not named: each is a descriptor of a reply of\n\
+         # `Unpack`, a complete file with no name (a small one may be a file in memory)\n\
+         # that has fs-verity when the scope says verity.  Then it gives `toc.claim` and\n\
          # `tarsplit` their names in the staging directory.  A file of two names is handed\n\
          # over once.\n\
          #\n\
@@ -2399,7 +2406,7 @@ mod tests {
             annotations: None,
         };
         let s = e
-            .probe(true, vec![blob("sha256:aa"), blob("sha256:bb")])
+            .probe(true, vec![blob("sha256:aa"), blob("sha256:bb")], None)
             .await;
         let got: Vec<ProbeReply> = s
             .filter_map(|(r, _)| async move { r.ok().and_then(|r| r.into_parameters()) })

@@ -738,7 +738,7 @@ mod tests {
         };
         refused(ingest(&ctx, None, &layer, &diff, |_| {}).await.map(drop));
         refused(
-            super::super::chunked::unpack_whole(&ctx, &layer, &diff, true, |_| {})
+            super::super::chunked::unpack_whole(&ctx, &layer, &diff, |_| {})
                 .await
                 .map(drop),
         );

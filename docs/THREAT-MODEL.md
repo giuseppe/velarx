@@ -70,7 +70,17 @@ lengths before allocating and verifies every digest.
   chunks by their hash, files by fs-verity digest.  A layer with a table of
   contents (zstd:chunked) is held to that table, which the manifest vouches
   for, and never to the diff id: the diff id the image gives is recorded as
-  its claim and is checked only if the stream of the layer is made again. A source cannot make a pull
+  its claim and is checked only if the stream of the layer is made again.
+  A layer without a table of contents may come from the sources as an index
+  (the table and tar-split a node recorded) and the files the store lacks: the
+  index is a claim, each file is checked against the fs-verity digest it is
+  asked by, and the stream made again from the tar-split and the files must
+  hash to the diff id of the configuration before anything of the layer is
+  named or recorded; its blob is never hashed (recorded so), and a wrong
+  index is asked for once more, of another peer, and then costs the pull of
+  the blob.  The files are asked for before the claim is judged, so whoever
+  gives an index learns which of the files it names the store holds, as the
+  publisher of a table of contents does.  A source cannot make a pull
   wrong, only slower, and a circuit breaker skips one that fails.
 * **A dual view image** has a layer whose table of contents (zstd:chunked),
   which the manifest vouches for, and whose tar stream describe different

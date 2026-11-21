@@ -1389,3 +1389,21 @@ fn test_a_table_is_parsed_to_the_same_entries_whichever_the_way() {
         assert!(parse_toc(bad.as_bytes()).is_err(), "{bad:.200}");
     }
 }
+
+/// A disk that is full is a failure of this end: the source of an index is
+/// not passed over for it, as it is for an index that does not replay.
+#[test]
+fn a_full_disk_is_no_fault_of_the_index() {
+    let full = ImageError::Io(io::Error::from_raw_os_error(libc::ENOSPC));
+    assert!(of_this_end(&full));
+    assert!(of_this_end(&ImageError::transfer(
+        "store",
+        FailureClass::NoSpace,
+        "full"
+    )));
+    assert!(!of_this_end(&ImageError::Contradicted("wrong".into())));
+    assert!(!of_this_end(&ImageError::DigestMismatch {
+        expected: "a".into(),
+        actual: "b".into(),
+    }));
+}

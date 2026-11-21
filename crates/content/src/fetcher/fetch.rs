@@ -176,7 +176,9 @@ pub struct Probed {
     pub reason: Option<NotLazy>,
     /// With `toc` carried: the table of contents and the tar-split, sealed
     /// memory files among the descriptors of this reply (a layer whose table
-    /// of contents has `"version": 2` has no tar-split)
+    /// of contents has `"version": 2` has no tar-split).  For a layer with no
+    /// table of contents, with `no_toc`: the index another node recorded, a
+    /// claim the engine replays and checks
     pub toc_file: Option<u32>,
     pub tarsplit_file: Option<u32>,
 }
@@ -455,6 +457,7 @@ mod proxy {
         async fn probe(
             &mut self,
             layers: Vec<Blob>,
+            again: Option<bool>,
         ) -> zlink::Result<
             impl futures::Stream<Item = zlink::Result<(Result<ProbeReply, FetcherError>, Vec<OwnedFd>)>>,
         >;

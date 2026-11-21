@@ -6,9 +6,9 @@
 //! its content, or from the items of its chunks, by the object contract
 //! ([`crate::stager`]): every chunk is checked against the sha256 the table
 //! gives it, the file against its name.  A layer without a table of
-//! contents is staged from its index (its table and tar-split, a claim the
-//! engine replays) and the items of its files.  It answers only for itself;
-//! what it lacks is `unavailable`.
+//! contents is answered to `Probe` with its index (its table and tar-split, a
+//! claim the engine replays), and its files are staged as those of a table.
+//! It answers only for itself; what it lacks is `unavailable`.
 //!
 //! The engine serves a `dir` of `[[sources.external]]` with a confined
 //! process of its own (`velarx-dir`: it reads the directory, writes the
@@ -17,19 +17,16 @@
 
 use crate::fetcher::fetch::{
     Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, NotLazy, Probed,
-    TocSource, TARSPLIT, TOC_CLAIM,
+    TocSource,
 };
-use crate::serve_fetch::{
-    Described, FetchCall, LayerScope, Out, Scope, StagingFetcher, UnpackCall,
-};
-use crate::stager::{self, content_of, name_of, LayerToc, Name, Unnamed};
+use crate::serve_fetch::{Described, FetchCall, LayerScope, Out, Scope, StagingFetcher};
+use crate::stager::{self, content_of, name_of, LayerToc, Unnamed};
 use async_trait::async_trait;
 use std::io::Read;
 use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use velarx_storage::TocEntryType;
 use velarx_types::digest::Digest;
 
 /// The most objects of one `Fetch`.
@@ -108,25 +105,12 @@ impl<I: Items + 'static> ItemFetch<I> {
 /// [`Items`] that count the bytes they gave.
 struct Counted<'a>(&'a dyn Items, std::sync::atomic::AtomicU64);
 
-impl Counted<'_> {
-    /// The bytes given since the start, as a `progress` event of the blob
-    /// of the layer.
-    fn progress(&self) -> Option<Event> {
-        let bytes = self.1.load(std::sync::atomic::Ordering::Relaxed);
-        (bytes > 0).then(|| Event::progress(None, bytes))
-    }
-}
-
 impl Items for Counted<'_> {
     fn item(&self, name: &str, size: Option<u64>, max: u64) -> Option<Vec<u8>> {
         let data = self.0.item(name, size, max)?;
         self.1
             .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Some(data)
-    }
-
-    fn index(&self, layer: &str) -> Option<Vec<u8>> {
-        self.0.index(layer)
     }
 }
 
@@ -191,69 +175,6 @@ fn stage_file(
     Ok(true)
 }
 
-/// Unpack the layer of the blob `layer` from its index and the items of its
-/// files it has, handing the files over to `files`: whether it did
-/// (`toc.claim` and `tarsplit` named last).
-fn stage_whole(
-    items: &dyn Items,
-    layer: &str,
-    blob_size: Option<u64>,
-    (staging, verity): (&std::fs::File, bool),
-    files: &mut crate::unpack::Files,
-) -> Result<bool, stager::StageError> {
-    let Some(index) = items.index(layer) else {
-        return Ok(false);
-    };
-    let cap = blob_size.map_or(i64::MAX, |s| i64::try_from(s).unwrap_or(i64::MAX));
-    let Ok((toc, tarsplit)) = crate::pull::index::decode(&index, crate::pull::index::json_cap(cap))
-    else {
-        return Ok(false);
-    };
-    // (what an index makes this fetcher stage is bounded, before anything
-    // is asked: each file by what a source may give, all of them by the
-    // layer when its size is known)
-    let regular = toc
-        .entries
-        .iter()
-        .filter(|e| e.entry_type == TocEntryType::Reg);
-    if regular.clone().any(|e| e.size > MAX_ITEM) {
-        return Ok(false);
-    }
-    let total = regular.map(|e| e.size).fold(0, u64::saturating_add);
-    if blob_size.is_some_and(|s| total > s.saturating_mul(4).max(64 << 20)) {
-        return Ok(false);
-    }
-    let mut seen = std::collections::HashSet::new();
-    for e in &toc.entries {
-        if e.entry_type != TocEntryType::Reg || e.size == 0 {
-            continue;
-        }
-        let Some(content) = e.digest.as_deref().and_then(|d| d.parse::<Digest>().ok()) else {
-            return Ok(false);
-        };
-        if !seen.insert(content) {
-            continue;
-        }
-        let asked = e.verity().unwrap_or_else(|| content.to_string());
-        // (a file it has not got is left out: the claim names it, the
-        // engine may have it)
-        let Some(data) = items
-            .item(&asked, Some(e.size), MAX_ITEM)
-            .or_else(|| items.item(&content.to_string(), Some(e.size), MAX_ITEM))
-        else {
-            continue;
-        };
-        let file = Unnamed::for_handover(staging.as_fd(), e.size, verity)?;
-        file.write_chunk(0, &data, None)?;
-        files.give(file.sealed(&Name::Content(content), verity)?, e.size)?;
-    }
-    files.send()?;
-    let json = serde_json::to_vec(&toc).map_err(std::io::Error::other)?;
-    stager::put_named(staging.as_fd(), TOC_CLAIM, &json)?;
-    stager::put_named(staging.as_fd(), TARSPLIT, &tarsplit)?;
-    Ok(true)
-}
-
 impl<I: Items + 'static> ItemFetch<I> {
     /// The item `name` (of exactly `size` bytes when it says) as a sealed
     /// memory file, or `unavailable`.
@@ -279,24 +200,26 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
     fn described(&self) -> Described {
         Described {
             name: self.name.clone(),
-            capabilities: vec!["objects".into(), "unpack".into()],
+            capabilities: vec!["objects".into()],
             max_objects: MAX_OBJECTS,
         }
     }
 
     /// The index of each layer without a table of contents that the items
-    /// keep (a claim, `no_toc`: not lazy); the others are `unreachable`.
+    /// keep (a claim, `no_toc`: not lazy); the others are `unreachable`, and
+    /// all of them `again` (the items have one index of a layer).
     async fn probe(
         &self,
         _scope: &Scope,
         layers: Vec<Blob>,
+        again: bool,
         out: &Out<Probed>,
     ) -> Result<(), FetcherError> {
         let gone = |_| FetcherError::failed("the asker is gone".to_string());
         for (at, blob) in layers.iter().enumerate() {
             let (items, layer) = (self.items.clone(), blob.digest.clone());
             let cap = crate::pull::index::json_cap(i64::try_from(blob.size).unwrap_or(i64::MAX));
-            let whole = blob.toc_checksum().is_none();
+            let whole = blob.toc_checksum().is_none() && !again;
             let index = tokio::task::spawn_blocking(move || {
                 whole
                     .then(|| items.index(&layer))
@@ -351,50 +274,6 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
         max: u64,
     ) -> Result<std::fs::File, FetcherError> {
         self.item_file(image, None, max).await
-    }
-
-    async fn unpack(
-        &self,
-        scope: &Scope,
-        layer: &LayerScope,
-        _call: UnpackCall,
-        out: &Out<Event>,
-    ) -> Result<(), FetcherError> {
-        let failed = |e: String| FetcherError::failed(e);
-        let staging = layer
-            .staging
-            .try_clone()
-            .map_err(|e| failed(e.to_string()))?;
-        let (items, verity) = (self.items.clone(), scope.verity);
-        let mut files = crate::unpack::Files::new(out.clone());
-        let (name, blob_size) = (layer.layer.clone(), layer.blob.as_ref().map(|b| b.size));
-        let (staged, progress) = tokio::task::spawn_blocking(move || {
-            let counted = Counted(&*items, Default::default());
-            let staged = stage_whole(&counted, &name, blob_size, (&staging, verity), &mut files);
-            // (only the bytes of what it staged count)
-            let progress = match staged {
-                Ok(true) => counted.progress(),
-                _ => None,
-            };
-            (staged, progress)
-        })
-        .await
-        .map_err(|e| failed(e.to_string()))?;
-        if let Some(event) = progress {
-            out.send(event)
-                .await
-                .map_err(|_| failed("the asker is gone".into()))?;
-        }
-        match staged {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(FetcherError::unavailable("no such blob")),
-            Err(e) => Err(FetcherError::Failed {
-                failure: Failure {
-                    class: FailureClass::Invalid,
-                    reason: e.to_string(),
-                },
-            }),
-        }
     }
 
     async fn fetch(
@@ -552,7 +431,10 @@ mod tests {
             blob("sha256:cc"),
             chunked,
         ];
-        fetch.probe(&scope, layers, &Out::new(tx)).await.unwrap();
+        fetch
+            .probe(&scope, layers, false, &Out::new(tx))
+            .await
+            .unwrap();
         let mut got = Vec::new();
         while let Ok((reply, fds)) = rx.try_recv() {
             got.push((reply.toc, reply.on_demand, reply.reason, fds.len()));

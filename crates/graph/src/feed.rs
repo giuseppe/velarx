@@ -731,14 +731,12 @@ impl ContentFeed {
         let (spool, ingested, blob_checked): (Arc<dyn LocalContent>, _, _) =
             match (&self.source, &ctx.staged) {
                 (Some(Source::Registry(_) | Source::Path), Some(_)) => {
-                    // (only the registry fetcher: the files a driver
-                    // lacks are copied from the staging, where a fetcher
-                    // before it may have left out those of the store)
+                    // (the origin hands over every file: a driver copies
+                    // the ones it lacks from the staging)
                     let unpacked = pull::chunked::unpack_whole(
                         ctx,
                         &layer.descriptor,
                         &layer.diff_id,
-                        true,
                         move |n| report(n),
                     )
                     .await?;
@@ -757,7 +755,8 @@ impl ContentFeed {
                             _staging: unpacked.staging,
                         }),
                         ingested,
-                        unpacked.by_registry,
+                        // (the workers of the origin hashed the blob)
+                        true,
                     )
                 }
                 _ => {

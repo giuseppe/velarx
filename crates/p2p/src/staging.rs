@@ -27,14 +27,11 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsFd;
 use velarx_content::fetcher::fetch::{
-    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, Urgency, TARSPLIT,
-    TOC_CLAIM,
+    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, Urgency,
 };
-use velarx_content::serve_fetch::{
-    Described, FetchCall, LayerScope, Out, Scope, StagingFetcher, UnpackCall,
-};
+use velarx_content::serve_fetch::{Described, FetchCall, LayerScope, Out, Scope, StagingFetcher};
 use velarx_content::stager::{self, name_of, LayerToc, Name, Unnamed};
-use velarx_storage::{Toc, TocEntryType};
+use velarx_storage::Toc;
 use velarx_types::digest::Digest;
 
 /// The most objects of one `Fetch`.
@@ -97,19 +94,13 @@ struct Files<'a> {
     places: HashMap<(String, u64), Vec<Place>>,
     staged: Vec<u32>,
     failures: Vec<(Vec<u32>, String)>,
-    /// A file could not be written
-    failed: bool,
     /// The files whose `moved` changed since the last flush
     changed: std::collections::BTreeSet<usize>,
     out: &'a Out<Event>,
     /// Where the files that were named are kept for the peers, and how many
     /// came since it was looked at
-    kept_in: Option<(std::sync::Arc<crate::staged::Staged>, Option<String>)>,
+    kept_in: Option<(std::sync::Arc<crate::staged::Staged>, String)>,
     kept: usize,
-    /// A layer unpacked whole: the files that are complete are handed over
-    /// to the engine, not named in the staging
-    handing: bool,
-    handed: Vec<File>,
 }
 
 impl<'a> Files<'a> {
@@ -121,26 +112,16 @@ impl<'a> Files<'a> {
             places: HashMap::new(),
             staged: Vec::new(),
             failures: Vec::new(),
-            failed: false,
             changed: Default::default(),
             out,
             kept_in: None,
             kept: 0,
-            handing: false,
-            handed: Vec::new(),
         }
-    }
-
-    /// The files it makes are handed over to the engine (a layer unpacked
-    /// whole), each as a file with no name.
-    fn handing(mut self) -> Self {
-        self.handing = true;
-        self
     }
 
     /// The same, giving the files it names to the peers through `staged`.
     fn keeping(mut self, staged: &std::sync::Arc<crate::staged::Staged>, layer: &str) -> Self {
-        self.kept_in = Some((staged.clone(), Some(layer.to_string())));
+        self.kept_in = Some((staged.clone(), layer.to_string()));
         self
     }
 }
@@ -167,20 +148,13 @@ impl Files<'_> {
             if f.left == 0 {
                 f.done = true;
                 let file = f.file.take().expect("begun");
-                let (made, kept) = match self.handing {
-                    true => {
-                        let kept = file.sealed(&f.name, self.verity)?;
-                        self.handed.push(velarx_sys::fd::reopen_read_only(&kept)?);
-                        (true, kept)
-                    }
-                    false => file.finish_kept(self.staging.as_fd(), &f.name, self.verity)?,
-                };
+                let (made, kept) = file.finish_kept(self.staging.as_fd(), &f.name, self.verity)?;
                 // (a file that was there already is not this copy: it is not
                 // kept)
                 if let (Some((staged, layer)), true, false) =
                     (&self.kept_in, made, f.held.is_empty())
                 {
-                    staged.add(layer.as_deref(), kept, std::mem::take(&mut f.held));
+                    staged.add(Some(layer), kept, std::mem::take(&mut f.held));
                     self.kept += 1;
                 }
                 self.staged.extend(&f.positions);
@@ -190,7 +164,6 @@ impl Files<'_> {
         if let Err(e) = result {
             f.done = true;
             f.file = None;
-            self.failed = true;
             self.failures.push((f.positions.clone(), e.to_string()));
         }
     }
@@ -244,28 +217,6 @@ impl Sink for Files<'_> {
                     objects,
                     ..Event::of(EventKind::Staged)
                 })
-                .await
-                .map_err(|_| "the asker is gone".to_string())?;
-        }
-        while !self.handed.is_empty() {
-            let files: Vec<std::os::fd::OwnedFd> = self
-                .handed
-                .drain(
-                    ..self
-                        .handed
-                        .len()
-                        .min(velarx_content::fetcher::fetch::MAX_FDS),
-                )
-                .map(Into::into)
-                .collect();
-            self.out
-                .send_with(
-                    Event {
-                        objects: (0..files.len() as u32).collect(),
-                        ..Event::of(EventKind::Staged)
-                    },
-                    files,
-                )
                 .await
                 .map_err(|_| "the asker is gone".to_string())?;
         }
@@ -331,13 +282,13 @@ fn chunks_of(toc: &Toc, at: usize) -> Option<(u64, Vec<PeerChunk>)> {
 impl PeerSource {
     /// Ask the peers for every place of `files` and write what they send.
     /// What is left (the positions of the files no peer gave) is for the
-    /// caller to tell the engine, and whether no file failed to be written.
+    /// caller to tell the engine.
     async fn assemble(
         &self,
         layer: Option<&str>,
         urgency: Urgency,
         files: &mut Files<'_>,
-    ) -> Result<(bool, Vec<u32>), FetcherError> {
+    ) -> Result<Vec<u32>, FetcherError> {
         // the files with no chunk (zeros only) are complete already
         for job in 0..files.files.len() {
             if files.files[job].left == 0 {
@@ -391,7 +342,7 @@ impl PeerSource {
             .filter(|f| !f.done)
             .flat_map(|f| f.positions.clone())
             .collect();
-        Ok((!files.failed, left))
+        Ok(left)
     }
 
     /// The chunks of `group` into `files`, which the groups under way share.
@@ -437,117 +388,6 @@ impl PeerSource {
         .await
         .map_err(gone)
     }
-
-    /// The files of a layer without a table of contents: the index of a
-    /// peer (its table and tar-split, a claim), then its files by digest.
-    async fn unpack_whole(
-        &self,
-        scope: &Scope,
-        layer: &LayerScope,
-        urgency: Urgency,
-        out: &Out<Event>,
-    ) -> Result<(), FetcherError> {
-        let mut index = One(None);
-        let item = [Item {
-            digest: layer.layer.clone(),
-            size: Some(velarx_content::pull::index::MAX_INDEX),
-        }];
-        let max_json = layer
-            .blob
-            .as_ref()
-            .map_or(i64::MAX, |b| i64::try_from(b.size).unwrap_or(i64::MAX));
-        let cap = velarx_content::pull::index::json_cap(max_json);
-        self.fetch_indexes(
-            &item,
-            false,
-            &|bytes| velarx_content::pull::index::decode(bytes, cap).is_ok(),
-            &mut index,
-        )
-        .await
-        .map_err(failed)?;
-        let Some(index) = index.0 else {
-            return Err(FetcherError::unavailable(
-                self.nobody("no peer has the index of the layer").await,
-            ));
-        };
-        let (toc, tarsplit) = velarx_content::pull::index::decode(&index, cap).map_err(failed)?;
-        // each file once, by the digest of its content (what the engine
-        // knows it by), asked of the peers by the digest they serve it by
-        let mut files = Files::new(&layer.staging, scope.verity, out)
-            .keeping(&self.staged, &layer.layer)
-            .handing();
-        let mut seen = std::collections::HashSet::new();
-        let mut total = 0u64;
-        for e in &toc.entries {
-            if e.entry_type != TocEntryType::Reg || e.size == 0 {
-                continue;
-            }
-            let Some(content) = e.digest.as_deref().and_then(|d| d.parse::<Digest>().ok()) else {
-                return Err(FetcherError::unavailable(
-                    "the index of the layer names a file without a digest",
-                ));
-            };
-            if !seen.insert(content) {
-                continue;
-            }
-            let asked = e.verity().unwrap_or_else(|| content.to_string());
-            if e.size > MAX_ITEM_BYTES as u64 || !crate::limits::is_digest(&asked) {
-                return Err(FetcherError::unavailable(
-                    "the index of the layer names a file that cannot be had",
-                ));
-            }
-            total = total.saturating_add(e.size);
-            files
-                .places
-                .entry((asked, e.size))
-                .or_default()
-                .push((files.files.len(), 0));
-            files.files.push(Assembling {
-                positions: Vec::new(),
-                name: Name::Content(content),
-                size: e.size,
-                file: None,
-                left: 1,
-                done: false,
-                moved: 0,
-                held: Vec::new(),
-            });
-        }
-        // (what an index makes this node fetch is bounded by the layer)
-        let cap = layer
-            .blob
-            .as_ref()
-            .map_or(u64::MAX, |b| b.size.saturating_mul(4).max(64 << 20));
-        if total > cap {
-            tracing::debug!("P2P: the index of {} asks for too much", layer.layer);
-            return Err(FetcherError::unavailable(
-                "the index of the layer asks for too much",
-            ));
-        }
-        // (the claim is named last; the files no peer had are left out: the
-        // claim names them, the engine may have them)
-        let (sound, left) = self
-            .assemble(Some(&layer.layer), urgency, &mut files)
-            .await?;
-        Self::unavailable(out, left).await?;
-        let json = serde_json::to_vec(&toc).map_err(failed)?;
-        if !sound {
-            return Err(failed("a file of the layer could not be written"));
-        }
-        let staging = layer.staging.as_fd();
-        for (name, bytes) in [
-            (TOC_CLAIM, json.as_slice()),
-            (TARSPLIT, tarsplit.as_slice()),
-        ] {
-            stager::put_named(staging, name, bytes).map_err(|e| FetcherError::Failed {
-                failure: Failure {
-                    class: FailureClass::Failed,
-                    reason: e.to_string(),
-                },
-            })?;
-        }
-        Ok(())
-    }
 }
 
 /// The first item the peers send.
@@ -561,24 +401,46 @@ impl Sink for One {
     }
 }
 
+/// The peers that gave the index of a layer without a table of contents to
+/// the probes of a scope: the last one, and those whose index the engine
+/// said was wrong (`again`), which are not asked again in the scope.
+#[derive(Default)]
+struct IndexGivers {
+    last: Option<libp2p::PeerId>,
+    refused: Vec<libp2p::PeerId>,
+}
+
+/// The [`IndexGivers`] of the layer `digest` in `scope`, kept with the
+/// layer.
+fn index_givers(scope: &Scope, digest: &str) -> std::sync::Arc<std::sync::Mutex<IndexGivers>> {
+    let mut kept = scope.kept.lock().unwrap_or_else(|e| e.into_inner());
+    kept.entry(digest.to_string())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(IndexGivers::default())))
+        .clone()
+        .downcast()
+        .unwrap_or_default()
+}
+
 impl PeerSource {
     /// The compressed table of contents and the tar-split of the index
     /// named `digest`: the checksum of the table of a zstd:chunked layer
-    /// (`toc`), or the blob of a layer without one.  An index whose table
-    /// is not the one `digest` names, or whose tar-split is not the one the
-    /// table names, is not taken (`cap`: the largest JSON of the table).
+    /// (`toc`), or the blob of a layer without one, from a peer not of
+    /// `not`, and that peer.  An index whose table is not the one `digest`
+    /// names, or whose tar-split is not the one the table names, is not
+    /// taken (`cap`: the largest JSON of the table).
     pub(crate) async fn index_of(
         &self,
         digest: &Digest,
         toc: bool,
         cap: u64,
-    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        not: &[libp2p::PeerId],
+    ) -> Option<((Vec<u8>, Vec<u8>), libp2p::PeerId)> {
         use velarx_content::pull::index;
         let mut one = One(None);
-        let item = [Item {
+        let item = Item {
             digest: digest.to_string(),
             size: Some(index::MAX_INDEX),
-        }];
+        };
         let well_formed = |bytes: &[u8]| {
             let Ok((toc_z, _)) = index::split(bytes) else {
                 return false;
@@ -586,12 +448,13 @@ impl PeerSource {
             (!toc || Digest::of(digest.alg(), toc_z) == *digest)
                 && index::is_well_formed(bytes, cap)
         };
-        self.fetch_indexes(&item, toc, &well_formed, &mut one)
+        let giver = self
+            .fetch_index(&item, toc, not, &well_formed, &mut one)
             .await
-            .ok()?;
+            .ok()??;
         let index = one.0?;
         let (toc, tarsplit) = index::split(&index).ok()?;
-        Some((toc.to_vec(), tarsplit.to_vec()))
+        Some(((toc.to_vec(), tarsplit.to_vec()), giver))
     }
 
     /// What the peers gave for `name` as a sealed memory file, or
@@ -613,7 +476,7 @@ impl StagingFetcher for PeerSource {
     fn described(&self) -> Described {
         Described {
             name: "p2p".into(),
-            capabilities: vec!["objects".into(), "unpack".into()],
+            capabilities: vec!["objects".into()],
             max_objects: MAX_OBJECTS,
         }
     }
@@ -639,11 +502,14 @@ impl StagingFetcher for PeerSource {
     /// and the index of the layers without one (a claim, `no_toc`: not
     /// lazy); what no peer has is `unreachable`, for the next fetcher.  A
     /// peer's bytes are used only when they have the checksum (the engine
-    /// checks them against the descriptor again).
+    /// checks them against the descriptor again).  The index of a layer
+    /// without a table is a claim the engine replays: `again` (it did not
+    /// replay), the peer that gave it is not asked for it again in the scope.
     async fn probe(
         &self,
-        _scope: &Scope,
+        scope: &Scope,
         layers: Vec<Blob>,
+        again: bool,
         out: &Out<velarx_content::fetcher::fetch::Probed>,
     ) -> Result<(), FetcherError> {
         use futures::StreamExt;
@@ -658,10 +524,24 @@ impl StagingFetcher for PeerSource {
                 );
                 let checksum = blob.toc_checksum();
                 let found = match (&checksum, blob.digest.parse()) {
-                    (Some(checksum), _) => self.index_of(checksum, true, cap).await,
-                    (None, Ok(digest)) => self.index_of(&digest, false, cap).await,
+                    (Some(checksum), _) => self.index_of(checksum, true, cap, &[]).await,
+                    (None, Ok(digest)) => {
+                        let givers = index_givers(scope, &blob.digest);
+                        let not = {
+                            let mut g = givers.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(liar) = g.last.take().filter(|_| again) {
+                                g.refused.push(liar);
+                            }
+                            g.refused.clone()
+                        };
+                        let found = self.index_of(&digest, false, cap, &not).await;
+                        givers.lock().unwrap_or_else(|e| e.into_inner()).last =
+                            found.as_ref().map(|(_, giver)| *giver);
+                        found
+                    }
                     (None, Err(_)) => None,
-                };
+                }
+                .map(|(index, _)| index);
                 (at, found, checksum.is_none())
             })
             .collect();
@@ -735,16 +615,6 @@ impl StagingFetcher for PeerSource {
             .await
             .map_err(failed)?;
         self.given(one, image).await
-    }
-
-    async fn unpack(
-        &self,
-        scope: &Scope,
-        layer: &LayerScope,
-        call: UnpackCall,
-        out: &Out<Event>,
-    ) -> Result<(), FetcherError> {
-        self.unpack_whole(scope, layer, call.urgency, out).await
     }
 
     async fn fetch(
@@ -837,7 +707,7 @@ impl StagingFetcher for PeerSource {
                     .map_err(gone)?;
                 }
             }
-            let (_, mut left) = self
+            let mut left = self
                 .assemble(Some(&layer.layer), urgency, &mut files)
                 .await?;
             // the files whose chunks the peers lack, by their fs-verity
@@ -876,7 +746,7 @@ impl StagingFetcher for PeerSource {
                 left.retain(|p| !again.contains(p));
                 // (no layer: the peers that lacked its chunks may have the
                 // file)
-                let (_, more) = self.assemble(None, urgency, &mut whole_files).await?;
+                let more = self.assemble(None, urgency, &mut whole_files).await?;
                 left.extend(more);
             }
             Self::unavailable(out, left).await
@@ -998,7 +868,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            source.probe(&scope, layers, &Out::new(tx)),
+            source.probe(&scope, layers, false, &Out::new(tx)),
         )
         .await
         .expect("the layers are asked at once")
@@ -1083,14 +953,14 @@ mod tests {
                 held: Vec::new(),
             });
         }
-        let (sound, left) = tokio::time::timeout(
+        let left = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             source.assemble(None, Urgency::Wait, &mut files),
         )
         .await
         .expect("the groups were asked one after the other")
         .unwrap();
-        assert!(sound && left.is_empty());
+        assert!(left.is_empty());
         let mut staged = 0;
         while let Ok((event, _)) = events.try_recv() {
             if event.kind == EventKind::Staged {

@@ -524,8 +524,13 @@ impl StagedFetch {
 
     /// The compressed table of contents and tar-split of `layer` as the
     /// fetchers found them (for the caller to verify against the descriptor),
-    /// or none when it has no table of contents for it.
-    pub async fn probe(&self, layer: &OciDescriptor) -> ImageResult<Option<(Vec<u8>, Vec<u8>)>> {
+    /// or none when it has no table of contents for it.  `again`: the index
+    /// the last probe carried for it was wrong.
+    pub async fn probe(
+        &self,
+        layer: &OciDescriptor,
+        again: bool,
+    ) -> ImageResult<Option<(Vec<u8>, Vec<u8>)>> {
         let Some(at) = self.layers.iter().position(|d| *d == layer.digest) else {
             return Err(ImageError::Layer(format!(
                 "{} is not a layer of the image",
@@ -534,7 +539,7 @@ impl StagedFetch {
         };
         let at = at as u32;
         let mut found = None;
-        for (reply, metadata) in self.probe_all(&[at]).await? {
+        for (reply, metadata) in self.probe_all(&[at], again).await? {
             if reply.layer == at {
                 found = metadata;
             }
@@ -547,11 +552,12 @@ impl StagedFetch {
     /// next while none brought its table of contents or can unpack it; a
     /// reply for each layer, once, with the table of contents and the
     /// tar-split it carries.  A layer nobody answered is `none`,
-    /// `unreachable`.
+    /// `unreachable`.  `again`: [`StagedFetch::probe`].
     #[allow(clippy::type_complexity)]
     pub async fn probe_all(
         &self,
         at: &[u32],
+        again: bool,
     ) -> ImageResult<Vec<(Probed, Option<(Vec<u8>, Vec<u8>)>)>> {
         self.probed
             .lock()
@@ -571,7 +577,7 @@ impl StagedFetch {
             if left.is_empty() {
                 break;
             }
-            let answered = match self.probe_one(fetcher, &left).await {
+            let answered = match self.probe_one(fetcher, &left, again).await {
                 Ok(a) => a,
                 Err(e) if refused(&e) => return Err(fetcher_error(&fetcher.name, e)),
                 Err(e) => {
@@ -623,6 +629,7 @@ impl StagedFetch {
         &self,
         fetcher: &Fetcher,
         at: &[u32],
+        again: bool,
     ) -> Result<ImageResult<Vec<(Probed, Option<(Vec<u8>, Vec<u8>)>)>>, CallError> {
         // (the call carries the layers asked for, in order: a reply names
         // its layer by its position in the call)
@@ -631,7 +638,7 @@ impl StagedFetch {
             .filter_map(|i| self.blobs.get(*i as usize).cloned())
             .collect();
         let (mut conn, _connected) = fetcher.connection().await?;
-        let mut replies = crate::idle::within(fetcher.idle, conn.probe(&asked)).await?;
+        let mut replies = crate::idle::within(fetcher.idle, conn.probe(&asked, again)).await?;
         let mut found: Vec<(Probed, Option<(Vec<u8>, Vec<u8>)>)> = Vec::new();
         while let Some((mut reply, fds)) =
             crate::idle::within(fetcher.idle, replies.probed()).await?
@@ -751,7 +758,32 @@ impl StagedFetch {
             (keys, reuse),
             &staging.dir,
             Some((sink, staging, taking)),
-            Urgency::Wait,
+            (Urgency::Wait, true),
+            (progress, &|_| {}),
+        )
+        .await
+    }
+
+    /// [`StagedFetch::fetch_files`] of the fetchers before the origin
+    /// only: the origin is not told of the layer, and what no other
+    /// fetcher has is an error.  `toc` is a claim of one of them (the
+    /// origin could not read ranges of the blob at its offsets).
+    pub async fn fetch_from_sources(
+        &self,
+        staging: &Arc<LayerStaging>,
+        layer: &OciDescriptor,
+        toc: &Toc,
+        keys: Vec<String>,
+        (sink, taking): (&Arc<dyn Sink>, &Arc<tokio::sync::Semaphore>),
+        progress: &(dyn Fn(u64) + Send + Sync),
+    ) -> ImageResult<Walked> {
+        self.walk(
+            layer,
+            toc,
+            (keys, &Reuses::default()),
+            &staging.dir,
+            Some((sink, staging, taking)),
+            (Urgency::Wait, false),
             (progress, &|_| {}),
         )
         .await
@@ -788,7 +820,7 @@ impl StagedFetch {
             (keys, &Reuses::default()),
             &dir,
             None,
-            urgency,
+            (urgency, true),
             (&|_| {}, staged),
         )
         .await
@@ -797,7 +829,7 @@ impl StagedFetch {
     /// Tell the fetchers of `layer` once, then walk the list for the files
     /// `keys` in batches: each staged file is given to the sink (and its
     /// name taken away from the staging unless it is `kept`), or left where
-    /// it is staged.
+    /// it is staged.  The origin, the last of the list, only `with_origin`.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     async fn walk(
         &self,
@@ -806,12 +838,13 @@ impl StagedFetch {
         (keys, reuse): (Vec<String>, &Reuses),
         dir: &File,
         sink: Option<Eager<'_>>,
-        urgency: Urgency,
+        (urgency, with_origin): (Urgency, bool),
         (progress, staged): (&(dyn Fn(u64) + Send + Sync), &(dyn Fn(&str) + Send + Sync)),
     ) -> ImageResult<Walked> {
         let name = layer.digest.to_string();
         let breaker = Breaker::new(self.fetchers.len());
-        self.tell(layer, (dir, Some(toc)), &breaker).await?;
+        self.tell(layer, (dir, Some(toc)), &breaker, with_origin)
+            .await?;
         // (the names the files of a session are staged by: a lazy pull's
         // files stay where they are staged, and a table of 120,000 entries
         // is not walked for each group of files it asks for)
@@ -845,6 +878,7 @@ impl StagedFetch {
                         sourced,
                         staged,
                         breaker,
+                        with_origin,
                     };
                     self.fetch_batch(name, (&batch, reuse), dir, names, sink, urgency, counts)
                         .await
@@ -935,12 +969,14 @@ impl StagedFetch {
     }
 
     /// Tell the fetchers of `layer` (whose verified table of contents is
-    /// `toc`, if it has one) and its staging directory `dir`, once.
+    /// `toc`, if it has one) and its staging directory `dir`, once; the
+    /// origin only `with_origin`.
     async fn tell(
         &self,
         layer: &OciDescriptor,
         (dir, toc): (&File, Option<&Toc>),
         breaker: &Breaker,
+        with_origin: bool,
     ) -> ImageResult<()> {
         let _telling = self.telling.lock().await;
         let name = layer.digest.to_string();
@@ -976,7 +1012,7 @@ impl StagedFetch {
             // registry fetcher)
             let last = self.fetchers.len() - 1;
             for (i, fetcher) in self.fetchers.iter().enumerate() {
-                if !missed[i] || !breaker.usable(i) {
+                if !missed[i] || !breaker.usable(i) || (!with_origin && i == last) {
                     continue;
                 }
                 let toc = toc_fd
@@ -1009,9 +1045,8 @@ impl StagedFetch {
         Ok(())
     }
 
-    /// Bring the whole of `layer`, which has no table of contents: the list
-    /// walked until a fetcher unpacked it (`indexed`), only the registry
-    /// fetcher when `registry_only`; the files it hands over go to `intake`
+    /// Bring the whole of `layer`, which has no table of contents, from the
+    /// origin: it unpacks the layer, the files it hands over go to `intake`
     /// as they come, and the table of contents it claims and the tar-split
     /// are read from the staging `staging` at the end.  Nothing of it is
     /// believed: the caller recreates the stream from the tar-split and the
@@ -1020,119 +1055,74 @@ impl StagedFetch {
         &self,
         staging: &LayerStaging,
         layer: &OciDescriptor,
-        registry_only: bool,
         progress: &(dyn Fn(u64) + Send + Sync),
         intake: &Intake,
     ) -> ImageResult<Whole> {
         use crate::fetcher::fetch::{TARSPLIT, TOC_CLAIM};
         let name = layer.digest.to_string();
         let breaker = Breaker::new(self.fetchers.len());
-        self.tell(layer, (&staging.dir, None), &breaker).await?;
+        self.tell(layer, (&staging.dir, None), &breaker, true)
+            .await?;
+        let at = self.fetchers.len() - 1;
+        let fetcher = &self.fetchers[at];
         let mut bytes = 0u64;
-        let mut indexed = false;
-        let mut failure: Option<ImageError> = None;
         let mut fatal: Option<ImageError> = None;
-        let last = self.fetchers.len() - 1;
-        let mut by_registry = false;
-        let mut indexer = String::new();
-        let asked = self
-            .fetchers
-            .iter()
-            .enumerate()
-            .filter(|(at, _)| breaker.usable(*at) && (!registry_only || *at == last));
-        // (what the fetcher that unpacked the layer said it fetched: not
-        // what one before it sent and failed to finish)
-        let mut theirs = 0u64;
-        for (at, fetcher) in asked {
-            theirs = 0;
-            let walked = async {
-                let (mut conn, _connected) = fetcher.connection().await?;
-                let mut replies =
-                    crate::idle::within(fetcher.idle, conn.unpack(&name, Urgency::Wait)).await?;
-                loop {
-                    match crate::idle::within(fetcher.idle, replies.unpacking()).await {
-                        // (cumulative bytes of the blob; a beat repeats
-                        // what was said or says none)
-                        Ok(Some(Unpacking::Bytes(said))) => {
-                            theirs = theirs.max(said);
-                            bytes = bytes.max(said);
-                            progress(bytes);
-                        }
-                        Ok(Some(Unpacking::Files(files))) => {
-                            // (a file that cannot be taken in is the
-                            // engine's failure, not the fetcher's)
-                            for file in files {
-                                if let Err(e) = intake.give(file).await {
-                                    fatal.get_or_insert(e.into());
-                                    break;
-                                }
-                            }
-                            if fatal.is_some() {
+        let walked = async {
+            let (mut conn, _connected) = fetcher.connection().await?;
+            let mut replies =
+                crate::idle::within(fetcher.idle, conn.unpack(&name, Urgency::Wait)).await?;
+            loop {
+                match crate::idle::within(fetcher.idle, replies.unpacking()).await {
+                    // (cumulative bytes of the blob; a beat repeats what was
+                    // said or says none)
+                    Ok(Some(Unpacking::Bytes(said))) => {
+                        bytes = bytes.max(said);
+                        progress(bytes);
+                    }
+                    Ok(Some(Unpacking::Files(files))) => {
+                        // (a file that cannot be taken in is the engine's
+                        // failure, not the fetcher's)
+                        for file in files {
+                            if let Err(e) = intake.give(file).await {
+                                fatal.get_or_insert(e.into());
                                 break;
                             }
                         }
-                        // (the last reply: the names are given)
-                        Ok(None) => {
-                            indexed = true;
+                        if fatal.is_some() {
                             break;
                         }
-                        Err(CallError::Fetcher(crate::fetcher::fetch::FetcherError::Failed {
-                            failure: said,
-                        })) => {
-                            let (err, step) = failure_step(&fetcher.name, at == last, said);
-                            match step {
-                                Step::Next => failure = Some(err),
-                                Step::Renew | Step::Fail => {
-                                    fatal.get_or_insert(err);
-                                }
-                            }
-                            break;
-                        }
-                        Err(e) => return Err(e),
                     }
-                }
-                Ok::<_, CallError>(())
-            };
-            let walked = walked.await;
-            if let Some(e) = fatal.take() {
-                return Err(e);
-            }
-            match walked {
-                Ok(()) => {}
-                Err(e) if refused(&e) && at == last => return Err(fetcher_error(&fetcher.name, e)),
-                Err(e) => {
-                    self.untell(&name, at, &e);
-                    breaker.trip(at, fetcher, &e);
-                    failure.get_or_insert_with(|| fetcher_error(&fetcher.name, e));
+                    // (the last reply: the names are given)
+                    Ok(None) => break,
+                    Err(CallError::Fetcher(crate::fetcher::fetch::FetcherError::Failed {
+                        failure: said,
+                    })) => {
+                        fatal.get_or_insert(failure_step(&fetcher.name, true, said).0);
+                        break;
+                    }
+                    Err(e) => return Err(e),
                 }
             }
-            if indexed {
-                by_registry = at == last;
-                indexer = fetcher.name.clone();
-                break;
-            }
+            Ok::<_, CallError>(())
+        };
+        let walked = walked.await;
+        if let Some(e) = fatal.take() {
+            return Err(e);
         }
-        if !indexed {
-            return Err(failure.unwrap_or_else(|| {
-                ImageError::transfer_of(
-                    self.origin_name(),
-                    name.to_string(),
-                    FailureClass::Unavailable,
-                    "no fetcher has the layer",
-                )
-            }));
+        if let Err(e) = walked {
+            self.untell(&name, at, &e);
+            return Err(fetcher_error(&fetcher.name, e));
         }
-        let dir = staging.dir.try_clone()?;
-        let layer = name.to_string();
+        let (dir, indexer) = (staging.dir.try_clone()?, fetcher.name.clone());
         tokio::task::spawn_blocking(move || {
             let claim = read_beneath(&dir, TOC_CLAIM, super::chunked::MAX_TOC_JSON)
-                .map_err(|e| by(&indexer, &layer, e))?;
+                .map_err(|e| by(&indexer, &name, e))?;
             let tarsplit = read_beneath(&dir, TARSPLIT, super::chunked::MAX_METADATA_COMPRESSED)
-                .map_err(|e| by(&indexer, &layer, e))?;
+                .map_err(|e| by(&indexer, &name, e))?;
             let toc: Toc = serde_json::from_slice(&claim).map_err(|e| {
                 ImageError::transfer_of(
                     &indexer,
-                    layer.clone(),
+                    name.clone(),
                     FailureClass::Invalid,
                     format!("the table of contents it made: {e}"),
                 )
@@ -1140,7 +1130,7 @@ impl StagedFetch {
             if let Some(problem) = crate::pull::entry::toc_problem(&toc.entries) {
                 return Err(ImageError::transfer_of(
                     &indexer,
-                    layer,
+                    name,
                     FailureClass::Invalid,
                     problem,
                 ));
@@ -1148,9 +1138,7 @@ impl StagedFetch {
             Ok::<_, ImageError>(Whole {
                 toc,
                 tarsplit,
-                bytes: theirs,
-                by_registry,
-                source: indexer,
+                bytes,
             })
         })
         .await
@@ -1176,6 +1164,7 @@ impl StagedFetch {
             sourced,
             staged,
             breaker,
+            with_origin,
         } = counts;
         let mut given = vec![false; batch.len()];
         let mut failure: Option<ImageError> = None;
@@ -1185,7 +1174,7 @@ impl StagedFetch {
             .fetchers
             .iter()
             .enumerate()
-            .filter(|(at, _)| breaker.usable(*at))
+            .filter(|(at, _)| breaker.usable(*at) && (with_origin || *at != last))
         {
             let left: Vec<usize> = (0..batch.len()).filter(|i| !given[*i]).collect();
             if left.is_empty() {
@@ -1567,24 +1556,19 @@ struct Counts<'a> {
     /// Told the key of each file as soon as it is staged
     staged: &'a (dyn Fn(&str) + Send + Sync),
     breaker: &'a Breaker,
+    /// The origin is asked too
+    with_origin: bool,
 }
 
-/// A layer a fetcher unpacked whole, as [`StagedFetch::fetch_whole`] took
-/// it: its files are in the layer's staging, by the digest of their content
-/// (a fetcher before the registry fetcher may leave out those it has not
-/// got: the claim names them, the engine may have them).
+/// A layer the origin unpacked whole, as [`StagedFetch::fetch_whole`] took
+/// it: its files went to the intake.
 pub struct Whole {
-    /// The table of contents the fetcher claims
+    /// The table of contents the origin claims
     pub toc: Toc,
     /// The compressed tar-split
     pub tarsplit: Vec<u8>,
     /// The compressed bytes fetched
     pub bytes: u64,
-    /// The registry fetcher unpacked it (its workers hashed the blob to
-    /// the digest of the descriptor), not a fetcher before it
-    pub by_registry: bool,
-    /// The name of the fetcher that unpacked it
-    pub source: String,
 }
 
 /// The staging of a layer, removed when it is dropped, before its lease is
@@ -1935,6 +1919,7 @@ mod tests {
             &self,
             _scope: &Scope,
             layers: Vec<Blob>,
+            _again: bool,
             out: &Out<Probed>,
         ) -> Result<(), FetcherError> {
             if self.refuse {
@@ -2024,7 +2009,7 @@ mod tests {
         let staged = pull(&[("peers", &peers), ("cache", &cache)], &registry).await;
         assert_eq!(staged.sources(), ["peers", "cache", "registry"]);
         let mut got: Vec<(u32, TocSource)> = staged
-            .probe_all(&[0, 1, 2, 3])
+            .probe_all(&[0, 1, 2, 3], false)
             .await
             .unwrap()
             .into_iter()
@@ -2051,10 +2036,10 @@ mod tests {
         let registry = local(&[0], false);
         let staged = pull(&[("peers", &peers)], &registry).await;
         assert!(!staged.stale());
-        staged.probe_all(&[0]).await.unwrap();
+        staged.probe_all(&[0], false).await.unwrap();
         assert!(!staged.stale());
         drop(peers);
-        staged.probe_all(&[0]).await.unwrap();
+        staged.probe_all(&[0], false).await.unwrap();
         assert!(staged.stale(), "the peer is gone");
     }
 
@@ -2065,7 +2050,7 @@ mod tests {
         let peers = local(&[], true);
         let registry = local(&[0], false);
         let staged = pull(&[("peers", &peers)], &registry).await;
-        assert!(staged.probe_all(&[0]).await.is_err());
+        assert!(staged.probe_all(&[0], false).await.is_err());
     }
 
     /// Stage each file of `call` where the contract has it, with the bytes
@@ -2362,7 +2347,7 @@ mod tests {
         let registry = local(&[0], false);
         let staged = pull(&[("peers", &peers)], &registry).await;
         drop(peers);
-        let got = staged.probe_all(&[0]).await.unwrap();
+        let got = staged.probe_all(&[0], false).await.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0.toc, TocSource::Unpack);
     }
@@ -2952,7 +2937,7 @@ mod tests {
         let (staged, _keep) = walk_of(vec![], Arc::new(hands), root.path()).await;
         let (intake, staging, desc) = intake_of(&staged, root.path()).await;
         let whole = staged
-            .fetch_whole(&staging, &desc, true, &|_| {}, &intake)
+            .fetch_whole(&staging, &desc, &|_| {}, &intake)
             .await
             .unwrap();
         assert_eq!(whole.tarsplit, b"split");
@@ -2979,7 +2964,7 @@ mod tests {
         let (staged, _keep) = walk_of(vec![], Arc::new(hands), root.path()).await;
         let (intake, staging, desc) = intake_of(&staged, root.path()).await;
         let e = staged
-            .fetch_whole(&staging, &desc, true, &|_| {}, &intake)
+            .fetch_whole(&staging, &desc, &|_| {}, &intake)
             .await
             .err()
             .expect("a refusal");
@@ -3014,7 +2999,7 @@ mod tests {
             let (staged, _keep) = walk_of(vec![], Arc::new(hands), root.path()).await;
             let (intake, staging, desc) = intake_of(&staged, root.path()).await;
             let e = staged
-                .fetch_whole(&staging, &desc, true, &|_| {}, &intake)
+                .fetch_whole(&staging, &desc, &|_| {}, &intake)
                 .await
                 .err()
                 .expect("a refusal");

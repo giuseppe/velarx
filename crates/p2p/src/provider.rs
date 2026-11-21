@@ -1172,42 +1172,40 @@ impl PeerSource {
         maybe
     }
 
-    /// The index of each layer of `items` from the first of its providers
-    /// that has one `well_formed`.  It is not named by its digest: the
-    /// puller proves it; when a peer sends one that is not an index the
-    /// next provider is asked.
-    pub(crate) async fn fetch_indexes(
-        &self,
-        items: &[Item],
-        toc: bool,
-        well_formed: &(dyn Fn(&[u8]) -> bool + Sync),
-        out: &mut dyn Sink,
-    ) -> Result<(), String> {
-        for item in items.iter().take(MAX_REQUEST_DIGESTS) {
-            if !crate::limits::is_digest(&item.digest) {
-                continue;
-            }
-            let log = self
-                .decisions
-                .start(Kind::Index, Some(&item.digest), &item.digest, 1);
-            let span =
-                tracing::info_span!("pull_index", group = log.id(), layer = short(&item.digest));
-            tracing::Instrument::instrument(
-                log.scope(self.fetch_index(item, toc, well_formed, out)),
-                span,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn fetch_index(
+    /// The index of the layer `item` from the first of its providers, not
+    /// one of `not`, that has one `well_formed`, and that provider.  It is
+    /// not named by its digest: the puller proves it; when a peer sends one
+    /// that is not an index the next provider is asked.
+    pub(crate) async fn fetch_index(
         &self,
         item: &Item,
         toc: bool,
+        not: &[PeerId],
         well_formed: &(dyn Fn(&[u8]) -> bool + Sync),
         out: &mut dyn Sink,
-    ) -> Result<(), String> {
+    ) -> Result<Option<PeerId>, String> {
+        if !crate::limits::is_digest(&item.digest) {
+            return Ok(None);
+        }
+        let log = self
+            .decisions
+            .start(Kind::Index, Some(&item.digest), &item.digest, 1);
+        let span = tracing::info_span!("pull_index", group = log.id(), layer = short(&item.digest));
+        tracing::Instrument::instrument(
+            log.scope(self.ask_index(item, toc, not, well_formed, out)),
+            span,
+        )
+        .await
+    }
+
+    async fn ask_index(
+        &self,
+        item: &Item,
+        toc: bool,
+        not: &[PeerId],
+        well_formed: &(dyn Fn(&[u8]) -> bool + Sync),
+        out: &mut dyn Sink,
+    ) -> Result<Option<PeerId>, String> {
         let max = item
             .size
             .unwrap_or(MAX_ITEM_BYTES as u64)
@@ -1221,15 +1219,17 @@ impl PeerSource {
             false => item.digest.clone(),
         };
         let mut providers = self.knowledge.providers(&layer);
+        providers.retain(|p| !not.contains(p));
         let filtered = self.knowledge.filtered(&layer);
         if providers.is_empty() {
             why = Why::Filter;
             providers = self.maybe_of(&filtered).await;
+            providers.retain(|p| !not.contains(p));
         }
         if providers.is_empty() {
             why = Why::Connected;
             providers = self.peers.connected().await;
-            providers.retain(|p| !filtered.no.contains(p));
+            providers.retain(|p| !filtered.no.contains(p) && !not.contains(p));
         }
         providers.truncate(MAX_PROVIDERS);
         note(|| Event::Candidates(providers.iter().map(|p| (*p, why)).collect()));
@@ -1250,7 +1250,7 @@ impl PeerSource {
                         took: started.elapsed(),
                     });
                     out.put(&item.digest, &index).await?;
-                    return Ok(());
+                    return Ok(Some(provider));
                 }
                 Ok(None) => note(|| Event::Asked {
                     peer: provider,
@@ -1297,7 +1297,7 @@ impl PeerSource {
             items: 1,
             reason: "no peer sent an index",
         });
-        Ok(())
+        Ok(None)
     }
 
     /// The startup profile of each image of `items` (by its id as a
@@ -3663,7 +3663,7 @@ mod tests {
                 .served(Some(&layer.digest), peer, Duration::from_millis(rtt));
         }
         let mut out = Collect::default();
-        s.fetch_indexes(std::slice::from_ref(&layer), false, &|_| true, &mut out)
+        s.fetch_index(&layer, false, &[], &|_| true, &mut out)
             .await
             .unwrap();
         assert_eq!(out.0, [(layer.digest.clone(), b"an index".to_vec())]);
@@ -3696,16 +3696,27 @@ mod tests {
                 .served(Some(&layer.digest), peer, Duration::from_millis(rtt));
         }
         let mut out = Collect::default();
-        s.fetch_indexes(
-            std::slice::from_ref(&layer),
-            false,
-            &|bytes| bytes.starts_with(b"an "),
-            &mut out,
-        )
-        .await
-        .unwrap();
+        let given = s
+            .fetch_index(
+                &layer,
+                false,
+                &[],
+                &|bytes| bytes.starts_with(b"an "),
+                &mut out,
+            )
+            .await
+            .unwrap();
         assert_eq!(out.0, [(layer.digest.clone(), b"an index".to_vec())]);
+        assert_eq!(given, Some(honest));
         assert_eq!(*fake.index_asked.lock().unwrap(), [liar, honest]);
+        // (a provider the puller refused the index of is not asked)
+        let mut out = Collect::default();
+        let given = s
+            .fetch_index(&layer, false, &[honest], &|_| true, &mut out)
+            .await
+            .unwrap();
+        assert_eq!((given, out.0.len()), (Some(liar), 1));
+        assert_eq!(*fake.index_asked.lock().unwrap(), [liar, honest, liar]);
     }
 
     /// A table of contents is taken from a peer only when it has the
@@ -3742,7 +3753,10 @@ mod tests {
                 s.knowledge()
                     .served(Some(&key), *peer, Duration::from_millis(rtt as u64 + 1));
             }
-            let got = s.index_of(&checksum, true, index::json_cap(1 << 20)).await;
+            let got = s
+                .index_of(&checksum, true, index::json_cap(1 << 20), &[])
+                .await
+                .map(|(index, _)| index);
             assert_eq!(got, honest.then(|| (toc_z.clone(), tarsplit.clone())));
             assert_eq!(*fake.index_asked.lock().unwrap(), peers);
         }
@@ -3815,7 +3829,9 @@ mod tests {
             s.knowledge()
                 .served(Some(&key), peer, Duration::from_millis(1));
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-            s.probe(&scope, vec![blob], &Out::new(tx)).await.unwrap();
+            s.probe(&scope, vec![blob], false, &Out::new(tx))
+                .await
+                .unwrap();
             let (reply, fds) = rx.recv().await.unwrap();
             assert_eq!(reply.toc == TocSource::Carried, carried, "{key}");
             assert_eq!(reply.on_demand, carried && lazy);
@@ -3827,5 +3843,60 @@ mod tests {
                 assert_eq!(reply.reason, Some(NotLazy::Unreachable));
             }
         }
+    }
+
+    /// The index of a whole layer that did not replay (`again`) is asked of
+    /// the other peers, the one that gave it is not asked again in the
+    /// scope; another scope (another pull) asks it.
+    #[tokio::test]
+    async fn a_probe_again_passes_over_the_peer_that_gave_the_index() {
+        use velarx_content::fetcher::fetch::{Blob, TocSource};
+        use velarx_content::pull::index;
+        use velarx_content::serve_fetch::{Out, Scope, StagingFetcher};
+        let tarsplit = b"a tar-split".to_vec();
+        let toc = format!(
+            r#"{{"version":1,"entries":[],"tarSplitDigest":"{}"}}"#,
+            digest_of(&tarsplit)
+        );
+        let toc_z = zstd::encode_all(toc.as_bytes(), 19).unwrap();
+        let index = index::encode_compressed(&toc_z, &tarsplit).unwrap();
+        let blob = Blob {
+            digest: digest_of(b"a layer"),
+            size: 1 << 20,
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            annotations: None,
+        };
+        let fake = Arc::new(Fake::default());
+        let (first, second) = (fake.peer(0, Ok(vec![])), fake.peer(0, Ok(vec![])));
+        for peer in [first, second] {
+            fake.indexes.lock().unwrap().insert(peer, index.clone());
+        }
+        let s = source(&fake, None);
+        for (peer, rtt) in [(first, 1), (second, 2)] {
+            s.knowledge()
+                .served(Some(&blob.digest), peer, Duration::from_millis(rtt));
+        }
+        let scope = || Scope {
+            verity: false,
+            source: None,
+            tls_verify: None,
+            target: None,
+            access: None,
+            idle: Duration::from_secs(30),
+            kept: Arc::default(),
+        };
+        async fn carried(s: &PeerSource, scope: &Scope, blob: &Blob, again: bool) -> bool {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            s.probe(scope, vec![blob.clone()], again, &Out::new(tx))
+                .await
+                .unwrap();
+            rx.recv().await.unwrap().0.toc == TocSource::Carried
+        }
+        let (one, other) = (scope(), scope());
+        assert!(carried(&s, &one, &blob, false).await);
+        assert!(carried(&s, &one, &blob, true).await);
+        assert!(!carried(&s, &one, &blob, true).await, "both were refused");
+        assert!(carried(&s, &other, &blob, false).await);
+        assert_eq!(*fake.index_asked.lock().unwrap(), [first, second, first]);
     }
 }

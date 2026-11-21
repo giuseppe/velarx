@@ -1005,6 +1005,7 @@ impl StagingFetcher for RegistryFetch {
         &self,
         scope: &Scope,
         layers: Vec<Blob>,
+        _again: bool,
         out: &Out<Probed>,
     ) -> Result<(), FetcherError> {
         let (pool, host) = self.pool(scope)?;

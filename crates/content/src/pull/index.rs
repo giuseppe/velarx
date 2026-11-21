@@ -117,8 +117,17 @@ pub fn split(data: &[u8]) -> Result<(&[u8], &[u8]), String> {
 /// sizes and their form only: its TOC decodes to at most `max_json` bytes
 /// of JSON, its entries are counted as they are read.
 pub fn decode(data: &[u8], max_json: u64) -> Result<(Toc, Vec<u8>), String> {
-    let max_json = max_json.min(MAX_TOC_JSON);
     let (toc_z, tarsplit_z) = split(data)?;
+    decode_parts(toc_z, tarsplit_z.to_vec(), max_json)
+}
+
+/// [`decode`] of the two parts of an index, as [`split`] gives them.
+pub fn decode_parts(
+    toc_z: &[u8],
+    tarsplit_z: Vec<u8>,
+    max_json: u64,
+) -> Result<(Toc, Vec<u8>), String> {
+    let max_json = max_json.min(MAX_TOC_JSON);
     let mut json = Vec::new();
     super::zstd_decoder(toc_z)
         .map_err(|e| format!("the TOC of the index: {e}"))?
@@ -139,7 +148,7 @@ pub fn decode(data: &[u8], max_json: u64) -> Result<(Toc, Vec<u8>), String> {
     if toc.is_canonical() != tarsplit_z.is_empty() {
         return Err("an index with a tar-split that does not match its table".into());
     }
-    Ok((toc, tarsplit_z.to_vec()))
+    Ok((toc, tarsplit_z))
 }
 
 /// Whether `data` is an index of the form [`decode`] accepts whose tar-split

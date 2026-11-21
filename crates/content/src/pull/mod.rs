@@ -532,7 +532,7 @@ pub async fn pull_layer(
     progress: Arc<dyn Fn(u64) + Send + Sync>,
 ) -> ImageResult<LayerDone> {
     let whole = LayerKey::Whole(layer.digest);
-    // (a source that is not a registry gives no ranges: `unpack_whole` and
+    // (a source that is not a registry gives no ranges: `pull_whole` and
     // `stream::ingest` refuse the layers that have a table)
     if let (Source::Registry(target), Some(info)) = (source, chunked::parse_info(layer)?) {
         let p = progress.clone();
@@ -556,11 +556,12 @@ pub async fn pull_layer(
         let p = progress.clone();
         let (pulled, by_registry) =
             chunked::pull_whole(ctx, registry_only, layer, diff_id, move |n| p(n)).await?;
-        // (every file came from a fetcher's staging, measured here; the
-        // blob was hashed by the registry fetcher's workers, which a fetcher
-        // before it is not: what such a fetcher gave proves nothing of the
-        // registry nor of the blob)
-        let mut done = layer_done(layer, whole, pulled, by_registry);
+        // (every file was measured here; the blob was hashed by the
+        // origin's workers, which the index of a source did not: it is not
+        // the blob's proof, and it is a proof of the layer only when no
+        // byte of it was the store's as it was, nor the user's own)
+        let proven = pulled.from_store == 0;
+        let mut done = layer_done(layer, whole, pulled, proven);
         done.blob_checked = by_registry;
         return Ok(done);
     }

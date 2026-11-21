@@ -769,6 +769,147 @@ async fn test_a_gzip_layer_comes_from_a_peer() {
     drop(s);
 }
 
+/// A node that took a gzip layer from a peer serves it in turn: a third node
+/// takes it from that one, with the first one not reachable and the registry
+/// never asked for the layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_a_gzip_layer_taken_from_a_peer_is_served_by_its_node() {
+    let layer = build_gzip(&sample());
+    let s = swarm(&[&layer], &[GZIP]).await;
+    let b = env_with_sources(&[&s.b_source]).await;
+    b.publish(&[&layer], &[GZIP]);
+    b.pull().await.unwrap();
+    let digest = sha(&layer.blob).to_string();
+    // (B is a node of the swarm of its own, which tells its layers)
+    let announcement = velarx_core::store_service::Announcement::from_database(&b.db, false)
+        .await
+        .unwrap();
+    assert!(announcement.layers.contains(&digest), "{announcement:?}");
+    let socket = s._dir.path().join("b-store").join("store.sock");
+    let service = StoreService::new(b.db.clone(), b.store.clone())
+        .await
+        .unwrap();
+    let _served = serve_store(service, &socket).await;
+    let node_b = node(&s.key, [127, 0, 0, 1]).await;
+    node_b
+        .set_chunk_provider(Arc::new(StoreContent::new(socket)))
+        .unwrap();
+    node_b.announce_layers(announcement.layers).await.unwrap();
+    // C knows B and nobody else
+    let node_c = node(&s.key, [127, 0, 0, 1]).await;
+    connect(&node_c, &node_b).await;
+    assert!(
+        heard_within(&node_c, Duration::from_secs(10), || async {
+            node_c
+                .knowledge()
+                .filtered(&digest)
+                .maybe
+                .contains(&node_b.peer_id())
+        })
+        .await,
+        "the layer of B was not told"
+    );
+    let source_c = s
+        ._dir
+        .path()
+        .join("c")
+        .join("services")
+        .join("p2p-fetcher.sock");
+    let peers = Arc::new(
+        PeerSource::with_peers(Arc::new(NodePeers(node_c.clone())))
+            .with_knowledge(node_c.knowledge().clone()),
+    );
+    let listener = velarx_base::ipc::bind_private(&source_c).unwrap();
+    let _fetcher = velarx_content::serve_fetch::serve_in_thread(
+        listener,
+        peers,
+        velarx_content::activation::Limits::default(),
+    )
+    .unwrap();
+    let c = env_with_sources(&[&source_c]).await;
+    c.publish(&[&layer], &[GZIP]);
+    let result = c.pull().await.unwrap();
+    assert_eq!(
+        c.reg
+            .hits
+            .lock()
+            .unwrap()
+            .get(&sha(&layer.blob))
+            .copied()
+            .unwrap_or(0),
+        0,
+        "the registry was not asked for the layer"
+    );
+    assert!(result.stats.from("source0").0 > 0, "{:?}", result.stats);
+    let rec = c.db.get_layer(&layer.key()).await.unwrap();
+    assert_eq!(rec.diff_id.as_ref(), Some(&layer.diff_id));
+    assert!(c.store.contains(&vid(b"hello\n")));
+    drop(s);
+}
+
+/// A layer that shares files with one the node has takes from the peers the
+/// files it lacks and no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_a_new_version_of_a_gzip_layer_takes_only_the_files_it_lacks() {
+    let v1 = build_gzip(&sample());
+    let mut items = sample();
+    items.push(Item::File {
+        name: "usr/new",
+        data: noise(50_000, 5),
+        chunk: 4096,
+    });
+    let v2 = build_gzip(&items);
+    let s = swarm(&[&v1, &v2], &[GZIP, GZIP]).await;
+    let b = env_with_sources(&[&s.b_source]).await;
+    b.publish(&[&v1], &[GZIP]);
+    b.pull().await.unwrap();
+    b.publish(&[&v2], &[GZIP]);
+    let result = b.pull().await.unwrap();
+    assert_eq!(
+        b.reg
+            .hits
+            .lock()
+            .unwrap()
+            .get(&sha(&v2.blob))
+            .copied()
+            .unwrap_or(0),
+        0,
+        "the registry was not asked for the layer"
+    );
+    // (the file of v2 that v1 does not have)
+    assert_eq!(result.stats.from("source0").1, 1, "{:?}", result.stats);
+    assert_eq!(b.db.get_layer(&v2.key()).await.unwrap().status, "ready");
+    drop(s);
+}
+
+/// What a peer sends that is not the file asked for is not taken: the
+/// registry gives the layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_a_gzip_layer_from_a_peer_that_sends_wrong_bytes_comes_from_the_registry() {
+    let layer = build_gzip(&sample());
+    let s = swarm(&[&layer], &[GZIP]).await;
+    s.faults.lock().unwrap().insert(
+        s.node_a.peer_id(),
+        Fault {
+            drop: 0,
+            corrupt: true,
+        },
+    );
+    let b = env_with_sources(&[&s.b_source]).await;
+    b.publish(&[&layer], &[GZIP]);
+    b.pull().await.unwrap();
+    assert!(
+        b.reg.hits.lock().unwrap().get(&sha(&layer.blob)).copied() >= Some(1),
+        "the registry gave the layer"
+    );
+    let rec = b.db.get_layer(&layer.key()).await.unwrap();
+    assert_eq!(
+        (rec.status.as_str(), rec.diff_id.as_ref()),
+        ("ready", Some(&layer.diff_id))
+    );
+    drop(s);
+}
+
 /// A file of a gzip layer too big to be asked of a peer makes the peer
 /// unavailable for the layer: the pull goes on with the registry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
