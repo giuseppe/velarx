@@ -41,6 +41,25 @@ fn failed(e: impl std::fmt::Display) -> FetcherError {
     FetcherError::failed(e.to_string())
 }
 
+/// What a file that could not be written is: `no_space` when the disk is
+/// full (this end's, whatever source is asked), `failed` otherwise.
+fn unwritten(e: &stager::StageError) -> Failure {
+    let full = matches!(
+        e,
+        stager::StageError::Io(io) if matches!(
+            io.kind(),
+            std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+        )
+    );
+    Failure {
+        class: match full {
+            true => FailureClass::NoSpace,
+            false => FailureClass::Failed,
+        },
+        reason: e.to_string(),
+    }
+}
+
 /// `items` in groups of what one request answers: at most
 /// [`MAX_REQUEST_DIGESTS`] of them and [`MAX_RESPONSE_PAYLOAD`] bytes (a
 /// group is all in memory until it is checked and written).
@@ -93,7 +112,7 @@ struct Files<'a> {
     /// The places (file, offset) of each digest and size asked
     places: HashMap<(String, u64), Vec<Place>>,
     staged: Vec<u32>,
-    failures: Vec<(Vec<u32>, String)>,
+    failures: Vec<(Vec<u32>, Failure)>,
     /// The files whose `moved` changed since the last flush
     changed: std::collections::BTreeSet<usize>,
     out: &'a Out<Event>,
@@ -164,7 +183,7 @@ impl Files<'_> {
         if let Err(e) = result {
             f.done = true;
             f.file = None;
-            self.failures.push((f.positions.clone(), e.to_string()));
+            self.failures.push((f.positions.clone(), unwritten(&e)));
         }
     }
 }
@@ -220,15 +239,9 @@ impl Sink for Files<'_> {
                 .await
                 .map_err(|_| "the asker is gone".to_string())?;
         }
-        for (objects, reason) in std::mem::take(&mut self.failures) {
+        for (objects, failure) in std::mem::take(&mut self.failures) {
             self.out
-                .send(Event::failed(
-                    objects,
-                    Failure {
-                        class: FailureClass::Failed,
-                        reason,
-                    },
-                ))
+                .send(Event::failed(objects, failure))
                 .await
                 .map_err(|_| "the asker is gone".to_string())?;
         }
@@ -775,6 +788,16 @@ mod tests {
                 size: Some(*s),
             })
             .collect()
+    }
+
+    /// A file that could not be written for a full disk is `no_space`:
+    /// the pull fails for it instead of asking another source.
+    #[test]
+    fn a_full_disk_is_no_space() {
+        let full = stager::StageError::Io(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        assert_eq!(unwritten(&full).class, FailureClass::NoSpace);
+        let wrong = stager::StageError::Wrong("sha256:00".into());
+        assert_eq!(unwritten(&wrong).class, FailureClass::Failed);
     }
 
     /// What a group holds is bounded by the bytes one request answers as
