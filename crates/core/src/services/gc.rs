@@ -99,8 +99,8 @@ const UNREFERENCED_LAYERS: &str = "SELECT l.id, l.stream_size FROM layers l
 
 /// Forget a layer (`?1`, its key): its files, and the repositories of its
 /// blob when no other layer is of that blob (a layer of its TOC and one
-/// pulled whole may be).  Its directory goes after its row
-/// ([`GcService::remove_layer_files`]).
+/// pulled whole may be).  Its directory goes with the sweep of
+/// [`GcService::collect_storage`], which every removal of layers ends in.
 const FORGET_LAYER: [&str; 3] = [
     "DELETE FROM file_refs WHERE layer_id = ?1",
     "DELETE FROM blob_sources WHERE digest = (SELECT blob FROM layers WHERE id = ?1)
@@ -182,20 +182,6 @@ impl GcService {
             file_store,
             staging_dir: staging.to_path_buf(),
             lock_path: StorageLock::path_of_staging(staging),
-        }
-    }
-
-    /// Remove the directories (the table of contents and the tar-split) of
-    /// the layers `keys`, whose rows are gone.
-    fn remove_layer_files<'a>(&self, keys: impl Iterator<Item = &'a str>, report: &mut GcReport) {
-        let root = self.objects_dir.parent().unwrap_or(&self.objects_dir);
-        for key in keys.filter_map(velarx_types::LayerKey::parse) {
-            if let Err(e) = velarx_db::layer_files::remove_layer(root, &key) {
-                warn!("Failed to remove the files of the layer {key}: {e}");
-                report.errors.push(format!(
-                    "Failed to remove the files of the layer {key}: {e}"
-                ));
-            }
         }
     }
 
@@ -407,7 +393,6 @@ impl GcService {
                 Ok(files.into_iter().collect())
             })
             .await?;
-        self.remove_layer_files(layers.iter().map(|(d, _)| d.as_str()), report);
         for (digest, size) in &layers {
             debug!("Released the layer {}", digest);
             report.layers_removed += 1;
@@ -815,7 +800,6 @@ impl GcService {
                     .push(format!("Failed to remove {} layers: {}", batch.len(), e));
                 continue;
             }
-            self.remove_layer_files(batch.iter().map(|(d, _)| d.as_str()), report);
             for (digest, size) in &batch {
                 debug!("Removed unreferenced layer: {}", digest);
                 report.layers_removed += 1;
@@ -925,10 +909,18 @@ impl GcService {
     }
 
     /// Remove the images of the layers the store does not have any more,
-    /// the startup profiles of the images it does not have, and what an
-    /// interrupted pull left.
+    /// the startup profiles of the images it does not have, the files of
+    /// the layers no row names, and what an interrupted pull left.
     async fn collect_storage(&self, report: &mut GcReport) -> GcResult<()> {
         let layers = self.db.layer_digests().await?;
+        let named = layers
+            .iter()
+            .map(velarx_types::LayerKey::file_stem)
+            .collect();
+        report.add_freed(velarx_db::layer_files::sweep(
+            velarx_db::layer_files::root_of(&self.objects_dir),
+            &named,
+        )?);
         let pulls = self.staging().pulls().into_iter().map(|p| p.pull.id);
         let image_records = self.db.list_images().await?;
         // the chains of a driver whose layers are chained: those of every
@@ -1222,6 +1214,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(free, 0, "free pages stay in the file");
+    }
+
+    /// A collection removes the directories of the layers no row names (a
+    /// pull that wrote its files and did not commit) and the temporary file
+    /// of a writer that died, and leaves the files a row names; so does the
+    /// sweep of a store nobody holds, which a busy store leaves alone.
+    #[tokio::test]
+    async fn a_collection_removes_the_layer_files_no_row_names() {
+        use velarx_db::layer_files::{self, TOC};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("db")).await.unwrap();
+        let store = Arc::new(FileStore::new(dir.path().join("objects")).unwrap());
+        let staging = dir.path().join("staging");
+        let driver: Arc<dyn StorageDriver> = Arc::new(ComposefsDriver::new(
+            db.clone(),
+            store.clone(),
+            staging.clone(),
+            velarx_storage::VerityMode::Off,
+            crate::storage_driver::composefs::options_for_tests(&staging),
+        ));
+        let image = crate::services::ImageService::new(
+            db.clone(),
+            store.clone(),
+            staging.clone(),
+            velarx_storage::VerityMode::Off,
+        )
+        .unwrap();
+        let gc = GcService::of_store(driver, db.clone(), store, &staging);
+        let layer = |n: u8| {
+            let d: velarx_types::digest::Digest =
+                format!("sha256:{}", format!("{n:02x}").repeat(32))
+                    .parse()
+                    .unwrap();
+            velarx_types::LayerKey::Whole(d)
+        };
+        let (named, orphan) = (layer(1), layer(2));
+        let record = |key: velarx_types::LayerKey| velarx_db::LayerRecord {
+            stream_size: Some(0),
+            key,
+            blob: Some(*key.digest()),
+            diff_id: Some(*key.digest()),
+            other_diff_id: None,
+            size: 1,
+            status: "ready".into(),
+            created_at: String::new(),
+            registry_ref: None,
+            erofs: None,
+            owners: None,
+        };
+        db.insert_layer_with_toc(dir.path(), &record(named), b"table")
+            .await
+            .unwrap();
+        let table = velarx_types::digest::Digest::of(named.digest().alg(), b"table");
+        layer_files::write(dir.path(), &orphan, TOC, b"table").unwrap();
+        // (what another store has, a read-only one, is not this store's)
+        let other = tempfile::tempdir().unwrap();
+        layer_files::write(other.path(), &orphan, TOC, b"table").unwrap();
+        let temporary = layer_files::layers_dir(dir.path()).join(".tmpdead");
+        std::fs::write(&temporary, b"half").unwrap();
+        // a store that a pull holds is left alone
+        let busy = StorageLock::shared(&StorageLock::path_of_staging(&staging))
+            .await
+            .unwrap();
+        image.sweep_layer_files().await;
+        assert!(layer_files::layer_dir(dir.path(), &orphan).exists());
+        drop(busy);
+        image.sweep_layer_files().await;
+        assert!(layer_files::file(dir.path(), &named, TOC, &table).is_file());
+        assert!(!layer_files::layer_dir(dir.path(), &orphan).exists());
+        assert!(!temporary.exists());
+        // and the collection does the same
+        layer_files::write(dir.path(), &orphan, TOC, b"table").unwrap();
+        let report = gc.collect(GcOptions::default()).await.unwrap();
+        assert!(report.bytes_freed >= 5, "{report:?}");
+        assert!(!layer_files::layer_dir(dir.path(), &orphan).exists());
+        // (no image uses the layer: it goes with its row)
+        assert!(!layer_files::layer_dir(dir.path(), &named).exists());
+        assert!(layer_files::layer_dir(other.path(), &orphan).exists());
     }
 }
 

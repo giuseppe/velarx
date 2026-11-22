@@ -542,10 +542,19 @@ fn collect_store(
             }
         }))
         .map_err(failed)?;
-    let root = velarx_db::layer_files::root_of(store.files.root());
-    for k in gone.iter().filter_map(|k| velarx_types::LayerKey::parse(k)) {
-        velarx_db::layer_files::remove_layer(root, &k).map_err(failed)?;
-    }
+    // (the files of the layers the rows of which are gone, those of a pull
+    // that was not committed, and what a writer that died left; a layer of
+    // a live pull is kept.  The engine asks for a collection holding the
+    // lock of the store exclusive: no writer is between its files and its
+    // row)
+    let named = kept
+        .iter()
+        .filter_map(|k| velarx_types::LayerKey::parse(k))
+        .map(|k| k.file_stem())
+        .collect();
+    let swept =
+        velarx_db::layer_files::sweep(velarx_db::layer_files::root_of(store.files.root()), &named)
+            .map_err(failed)?;
     let mut recorded: HashSet<String> = HashSet::new();
     for l in rows.iter().filter(|l| kept.contains(&l.key.to_string())) {
         let refs = store
@@ -563,7 +572,7 @@ fn collect_store(
             }
         }
     }
-    let mut freed = 0u64;
+    let mut freed = swept;
     let mut errors = Vec::new();
     let found = velarx_graph::objects::objects(store.files.root(), &recorded, keep.grace)
         .map_err(failed)?;

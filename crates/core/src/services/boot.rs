@@ -120,6 +120,8 @@ impl ContainerService {
         if let Err(e) = self.sweep_unowned().await {
             warn!("Cannot remove what no container record names: {e}");
         }
+        // (the files of the layers a crash left that no row names)
+        self.image_service.sweep_layer_files().await;
         // (a container that cannot be set right is reported and left as it
         // is; it does not keep the others as they are, nor this boot
         // unreconciled)

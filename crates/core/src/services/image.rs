@@ -1187,6 +1187,40 @@ impl ImageService {
         }
     }
 
+    /// Remove the directories of the layers no row names and the files of a
+    /// writer that died ([`velarx_db::layer_files::sweep`]) when no process
+    /// holds the lock of the store (a busy store is left to the next
+    /// collection, which does it too).
+    pub async fn sweep_layer_files(&self) {
+        let lock = StorageLock::path_of_staging(&self.staging_dir);
+        let _alone = match StorageLock::try_exclusive(&lock) {
+            Ok(Some(alone)) => alone,
+            Ok(None) => return,
+            Err(e) => {
+                warn!("Cannot lock the store: {e}");
+                return;
+            }
+        };
+        let named = match self.db.layer_digests().await {
+            Ok(keys) => keys.iter().map(LayerKey::file_stem).collect(),
+            Err(e) => {
+                warn!("Cannot list the layers: {e}");
+                return;
+            }
+        };
+        let objects = self.file_store.root().to_path_buf();
+        let swept = tokio::task::spawn_blocking(move || {
+            velarx_db::layer_files::sweep(velarx_db::layer_files::root_of(&objects), &named)
+        })
+        .await;
+        match swept {
+            Ok(Ok(freed)) if freed > 0 => debug!("{freed} bytes of the files of layers removed"),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!("Cannot remove the files of the layers no row names: {e}"),
+            Err(e) => warn!("Cannot remove the files of the layers no row names: {e}"),
+        }
+    }
+
     /// The layers of images a monitor removed (`--rmi`: it cannot collect
     /// them) are released, once.
     pub async fn release_removed(&self) {

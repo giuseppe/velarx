@@ -37,7 +37,10 @@ image durable before they are named in the store. Names appear only for whole, c
 after the names are durable: the files of a layer are written with the images
 of the layers, before the barrier of the store that makes them durable, and the
 row that names the layer comes after it. The collection removes the directory
-of a layer with its row.
+of a layer with its row, and the directories no row names (a pull that wrote
+its files and did not commit) and the temporary files of a writer that died,
+which the start of the daemon, the first start of a boot and the storage
+service at its start remove too, when no pull holds the store.
 
 The EROFS image of a layer is made from its table of contents alone, so it
 is the same file in every image that has the layer, whatever is below it.

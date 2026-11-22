@@ -682,6 +682,7 @@ async fn run_daemon(
         }
     }
 
+    state.image_service.sweep_layer_files().await;
     state.image_service.resume_pulls();
 
     let gc_handle = if config.storage.gc_interval_secs > 0 {

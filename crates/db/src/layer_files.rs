@@ -11,6 +11,7 @@
 //! `layers.tarsplit_digest`), and a file is checked against its digest
 //! whenever it is read.
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use velarx_types::digest::Digest;
@@ -55,7 +56,10 @@ pub fn write(root: &Path, key: &LayerKey, kind: &str, bytes: &[u8]) -> io::Resul
     let digest = Digest::of(key.digest().alg(), bytes);
     let dir = layer_dir(root, key);
     velarx_base::ipc::create_private_dirs(&dir)?;
-    let mut tmp = tempfile::Builder::new().prefix(".tmp").tempfile_in(&dir)?;
+    // (made in `layers/`, where `sweep` finds what a writer that died left)
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".tmp")
+        .tempfile_in(layers_dir(root))?;
     tmp.write_all(bytes)?;
     tmp.persist(file(root, key, kind, &digest))
         .map_err(|e| e.error)?;
@@ -102,18 +106,66 @@ pub fn checked(bytes: Vec<u8>, expected: &Digest) -> io::Result<Vec<u8>> {
     }
 }
 
-/// Remove the directory of the layer `key`, if it is there.
-pub fn remove_layer(root: &Path, key: &LayerKey) -> io::Result<()> {
-    match velarx_base::tree::remove_dir_all(layer_dir(root, key)) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
+/// Remove what `<store>/layers/` has that no layer of `keep` (the names of
+/// the directories of the layers the store has rows for) owns: a directory
+/// of a layer that no row names (a pull that wrote its files and was not
+/// committed) and the temporary file of a writer that died.  Returns the
+/// bytes freed.  The caller holds the lock of the store exclusive: no pull is
+/// between writing the files of a layer and committing its row.
+pub fn sweep(root: &Path, keep: &HashSet<String>) -> io::Result<u64> {
+    let entries = match std::fs::read_dir(layers_dir(root)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut freed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if keep.contains(&name) {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            for file in std::fs::read_dir(&path)? {
+                freed += file?.metadata()?.len();
+            }
+            velarx_base::tree::remove_dir_all(&path)?;
+        } else {
+            freed += entry.metadata()?.len();
+            std::fs::remove_file(&path)?;
+        }
     }
+    Ok(freed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use velarx_types::digest::Algorithm;
+
+    /// What no row names, and a writer's temporary file, go; what a row
+    /// names stays; a store with no `layers/` has nothing to sweep.
+    #[test]
+    fn the_sweep_removes_what_no_row_names() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(sweep(root.path(), &HashSet::new()).unwrap(), 0);
+        let key = |s: &str| LayerKey::Whole(Digest::of(Algorithm::Sha256, s.as_bytes()));
+        let (named, orphan) = (key("named"), key("orphan"));
+        let table = write(root.path(), &named, TOC, b"table").unwrap();
+        write(root.path(), &orphan, TOC, b"table").unwrap();
+        write(root.path(), &orphan, TARSPLIT, b"tar-split").unwrap();
+        std::fs::write(layers_dir(root.path()).join(".tmpabc"), b"half").unwrap();
+        let keep = HashSet::from([named.file_stem()]);
+        assert_eq!(sweep(root.path(), &keep).unwrap(), 5 + 9 + 4);
+        assert!(file(root.path(), &named, TOC, &table).is_file());
+        assert!(!layer_dir(root.path(), &orphan).exists());
+        assert_eq!(
+            std::fs::read_dir(layers_dir(root.path())).unwrap().count(),
+            1
+        );
+        assert_eq!(sweep(root.path(), &keep).unwrap(), 0);
+    }
 
     #[test]
     fn a_file_is_read_only_with_its_digest() {
@@ -133,9 +185,6 @@ mod tests {
         let wrong = Digest::of(Algorithm::Sha256, b"other");
         let e = read(&wrong).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
-        remove_layer(root.path(), &key).unwrap();
-        assert!(!layer_dir(root.path(), &key).exists());
-        remove_layer(root.path(), &key).unwrap();
     }
 
     /// A layer committed again with other bytes (another build encodes the

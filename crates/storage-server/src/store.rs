@@ -212,6 +212,15 @@ impl Store {
             .map_err(io)?;
         let db = rt.block_on(Database::open(dir.join("db"))).map_err(io)?;
         let files = Arc::new(FileStore::new(dir.join("objects")).map_err(io)?);
+        // (no pull exists yet: what no row names is left by a crash)
+        let named = rt
+            .block_on(db.layer_digests())
+            .map_err(io)?
+            .iter()
+            .map(velarx_types::LayerKey::file_stem)
+            .collect();
+        velarx_db::layer_files::sweep(velarx_db::layer_files::root_of(files.root()), &named)
+            .map_err(io)?;
 
         let vfs = VfsDriver::new(DriverParts {
             db: db.clone(),
