@@ -1694,17 +1694,17 @@ fn common_transport() -> TransportConfig {
 
 const READ_PIECE: usize = 1 << 20;
 
-/// Fills `buf`; `idle` is for a piece of it, not for all of it (a slow seed
+/// Fills `buf`; `idle` is for each read, not for all of it (a slow seed
 /// that keeps sending is not one that is silent).
 async fn read(recv: &mut quinn::RecvStream, buf: &mut [u8], idle: Duration) -> io::Result<()> {
-    for piece in buf.chunks_mut(READ_PIECE) {
-        match tokio::time::timeout(idle, recv.read_exact(piece)).await {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match tokio::time::timeout(idle, recv.read(&mut buf[filled..])).await {
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "QUIC read")),
-            Ok(Ok(())) => {}
+            Ok(Ok(Some(n))) => filled += n,
+            Ok(Ok(None)) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
             // the store of the server failed while it answered
-            Ok(Err(quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code))))
-                if code == quinn::VarInt::from(FAILED) =>
-            {
+            Ok(Err(quinn::ReadError::Reset(code))) if code == quinn::VarInt::from(FAILED) => {
                 return Err(store_failure())
             }
             Ok(Err(e)) => return Err(other(e)),
@@ -3768,11 +3768,11 @@ mod tests {
     }
 
     /// A chunk that takes longer than the idle time to arrive, at the pace
-    /// of a rate-limited seed, is fetched: the time is for a piece of it, not
-    /// for the chunk.
+    /// of a rate-limited seed, is fetched: the time is for each read, not
+    /// for the chunk or a MiB of it.
     #[tokio::test]
     async fn a_chunk_slower_than_the_idle_time_is_fetched_whole() {
-        let (provider, digests) = chunks(&[vec![5u8; 4 << 20]]);
+        let (provider, digests) = chunks(&[vec![5u8; 2 << 20]]);
         let serving = Serving {
             upload_limit_mbit: 8,
             ..Serving::default()
@@ -3783,7 +3783,7 @@ mod tests {
             Arc::default(),
             KEY,
             Limits {
-                idle: Duration::from_secs(2),
+                idle: Duration::from_millis(500),
                 ..Limits::default()
             },
             Arc::default(),
@@ -3795,9 +3795,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].1.len(), 4 << 20);
+        assert_eq!(found[0].1.len(), 2 << 20);
         assert!(
-            start.elapsed() > Duration::from_secs(2),
+            start.elapsed() > Duration::from_secs(1),
             "{:?}",
             start.elapsed()
         );
