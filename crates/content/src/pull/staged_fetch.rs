@@ -1419,7 +1419,7 @@ impl StagedFetch {
                                 Step::Next => failure = Some(err),
                                 // (the call is read to its end: the fetcher
                                 // has stopped writing when the pull fails)
-                                Step::Renew | Step::Fail => {
+                                Step::Fail => {
                                     fatal.get_or_insert(err);
                                 }
                             }

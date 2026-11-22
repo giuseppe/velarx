@@ -95,8 +95,6 @@ impl NotLazy {
 pub enum Step {
     /// Ask the next party
     Next,
-    /// Renew the credentials once and ask again; then fail
-    Renew,
     /// The operation fails, naming this party
     Fail,
 }
@@ -107,8 +105,8 @@ pub fn next(class: FailureClass, is_origin: bool) -> Step {
     use FailureClass::*;
     match class {
         Unavailable | Transient | NotFound | Failed if !is_origin => Step::Next,
-        Unauthorized => Step::Renew,
-        Unavailable | Transient | NotFound | Failed | Invalid | Forbidden | NoSpace => Step::Fail,
+        Unavailable | Transient | NotFound | Failed | Unauthorized | Invalid | Forbidden
+        | NoSpace => Step::Fail,
     }
 }
 
@@ -164,7 +162,7 @@ mod tests {
             (Transient, Step::Next),
             (Invalid, Step::Fail),
             (NotFound, Step::Next),
-            (Unauthorized, Step::Renew),
+            (Unauthorized, Step::Fail),
             (Forbidden, Step::Fail),
             (NoSpace, Step::Fail),
             (Failed, Step::Next),

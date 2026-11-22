@@ -424,14 +424,6 @@ impl FetchConn {
         Ok(FetchConn::new(std::os::unix::net::UnixStream::from(fd))?)
     }
 
-    /// Replace the credentials of the scope.
-    pub async fn renew(&mut self, access: OwnedFd) -> Result<(), CallError> {
-        let (conn, busy) = self.begin().await?;
-        let got = conn.renew(vec![access], 0).await;
-        busy.store(false, Ordering::Release);
-        done(got).map(|_| ())
-    }
-
     /// Tell the fetcher of a layer: its staging directory, its table of
     /// contents as the engine verified it.
     pub async fn layer(

@@ -401,7 +401,7 @@ impl StagedPush {
                                 Step::Next => {
                                     failed.get_or_insert(failure.reason);
                                 }
-                                Step::Renew | Step::Fail => {
+                                Step::Fail => {
                                     return Err(failure_error(&sink.name, failure));
                                 }
                             },
