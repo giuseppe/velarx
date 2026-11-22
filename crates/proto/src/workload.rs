@@ -803,6 +803,9 @@ pub struct ImageRecord {
     /// Of an additional, read-only image store
     pub read_only: bool,
     pub manifest_list: bool,
+    /// `ImageList`: a pull in progress (`ImagePulls`), whose files are
+    /// fetched as they are read; listed for the filter `lazy` alone
+    pub lazy: bool,
     pub os: String,
     pub architecture: String,
     pub variant: String,
@@ -1946,7 +1949,7 @@ deserialize_members! {
     }
     ImageRecord {
         id, names, digest_names, names_history, digests, digest, size, created_ns, stored_ns,
-        parent_id, has_children, containers, read_only, manifest_list, os, architecture,
+        parent_id, has_children, containers, read_only, manifest_list, lazy, os, architecture,
         variant, author, comment, labels, annotations, manifest_type, config, history, layers,
         composefs, graph_driver,
     }

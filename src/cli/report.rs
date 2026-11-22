@@ -39,6 +39,9 @@ pub struct ImagesArgs {
     /// Show the names each image had
     #[arg(long)]
     pub history: bool,
+    /// List the pulls in progress too, with a LAZY column
+    #[arg(long)]
+    pub lazy: bool,
     /// Sort by created, id, repository, size or tag
     #[arg(long, value_name = "FIELD")]
     pub sort: Option<String>,
@@ -845,21 +848,51 @@ pub fn images(
     if let Some(image) = &args.image {
         filters.push(format!("reference={image}"));
     }
+    // (both values of the filter: the images of the store and the pulls)
+    if args.lazy
+        && !filters
+            .iter()
+            .any(|f| f.starts_with("lazy=") || f.starts_with("lazy!="))
+    {
+        filters.extend(["lazy=true".into(), "lazy=false".into()]);
+    }
     let records = client.list_images(all, &filters)?;
-    let mut list = Value::Array(
+    let (list, items, default) = image_rows(&records, out, args)?;
+    print_list(out, &list, &items, &default, &image_headers(), "ID")
+}
+
+/// The headers of the columns of `images` that are not their field's name.
+fn image_headers() -> HashMap<&'static str, &'static str> {
+    HashMap::from([
+        ("ID", "IMAGE ID"),
+        ("CreatedSince", "CREATED"),
+        ("LazyColumn", "LAZY"),
+    ])
+}
+
+/// The list of `images` for `--format json`, its rows for a template and
+/// its default template.
+fn image_rows(
+    records: &[velarx_proto::workload::ImageRecord],
+    out: &ListOutput,
+    args: &ImagesArgs,
+) -> anyhow::Result<(Value, Vec<Value>, String)> {
+    let list = Value::Array(
         records
             .iter()
-            .map(velarx_shape::image::libpod_summary)
+            .map(|r| {
+                let mut i = velarx_shape::image::libpod_summary(r);
+                let created = i["Created"].as_i64().unwrap_or(0);
+                i["CreatedAt"] = json!(chrono::DateTime::from_timestamp(created, 0)
+                    .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                    .unwrap_or_default());
+                // what velarx knows of its images and podman does not: a
+                // pull in progress (`--format '{{.Lazy}}'`)
+                i["Lazy"] = json!(r.lazy);
+                i
+            })
             .collect(),
     );
-    if let Some(a) = list.as_array_mut() {
-        for i in a.iter_mut() {
-            let created = i["Created"].as_i64().unwrap_or(0);
-            i["CreatedAt"] = json!(chrono::DateTime::from_timestamp(created, 0)
-                .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-                .unwrap_or_default());
-        }
-    }
     let mut rows: Vec<(Value, i64, i64)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for img in list.as_array().into_iter().flatten() {
@@ -904,6 +937,8 @@ pub fn images(
             v.insert("Repository".into(), json!(repo));
             v.insert("Tag".into(), json!(tag));
             v.insert("Source".into(), json!(source));
+            let lazy = img["Lazy"].as_bool().unwrap_or(false);
+            v.insert("LazyColumn".into(), json!(if lazy { "yes" } else { "no" }));
             // (podman's template prints the names it had joined)
             let history: Vec<&str> = img["History"]
                 .as_array()
@@ -950,7 +985,6 @@ pub fn images(
         ),
     }
     let items: Vec<Value> = rows.into_iter().map(|r| r.0).collect();
-    let headers = HashMap::from([("ID", "IMAGE ID"), ("CreatedSince", "CREATED")]);
     let mut default = String::from("table {{.Repository}}\t{{.Tag}}");
     if args.digests {
         default.push_str("\t{{.Digest}}");
@@ -959,7 +993,10 @@ pub fn images(
     if args.history {
         default.push_str("\t{{if .History}}{{.History}}{{else}}<none>{{end}}");
     }
-    print_list(out, &list, &items, &default, &headers, "ID")
+    if args.lazy {
+        default.push_str("\t{{.LazyColumn}}");
+    }
+    Ok((list, items, default))
 }
 
 /// `volume ls`.
@@ -1838,6 +1875,52 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn images_tell_the_pulls_in_progress_with_lazy() {
+        let image = |id: &str, name: &str, lazy| velarx_proto::workload::ImageRecord {
+            id: id.repeat(64),
+            names: vec![name.into()],
+            lazy,
+            ..Default::default()
+        };
+        let records = [
+            image("a", "x/stored:1", false),
+            image("b", "x/pulling:2", true),
+        ];
+        let table = |args: &ImagesArgs| {
+            let (_, items, default) = image_rows(&records, &ListOutput::default(), args).unwrap();
+            template::format_list(&default, &items, &image_headers()).unwrap()
+        };
+        let columns = |line: &str| -> Vec<String> {
+            line.split("  ")
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let plain = table(&ImagesArgs::default());
+        assert_eq!(
+            columns(plain.lines().next().unwrap()),
+            ["REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"]
+        );
+        let lazy = table(&ImagesArgs {
+            lazy: true,
+            ..Default::default()
+        });
+        let rows: Vec<Vec<String>> = lazy.lines().map(columns).collect();
+        assert_eq!(rows[0].last().unwrap(), "LAZY", "{lazy}");
+        let last = |name: &str| rows.iter().find(|r| r[0] == name).unwrap().last().cloned();
+        assert_eq!(last("x/stored").unwrap(), "no", "{lazy}");
+        assert_eq!(last("x/pulling").unwrap(), "yes", "{lazy}");
+        // the field of a template and of `--format json`: a bool
+        let (list, items, _) =
+            image_rows(&records, &ListOutput::default(), &ImagesArgs::default()).unwrap();
+        assert_eq!(list[0]["Lazy"], json!(false));
+        assert_eq!(list[1]["Lazy"], json!(true));
+        let lazies = template::format_list("{{.Repository}} {{.Lazy}}", &items, &image_headers());
+        assert_eq!(lazies.unwrap(), "x/stored false\nx/pulling true\n");
+    }
 
     #[test]
     fn human_forms() {

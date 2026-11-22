@@ -10,6 +10,7 @@ use crate::api::AppState;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use velarx_content::pull::staged::StagedPull;
 use velarx_core::services::PullOptions;
 use velarx_db::{ImageRecord, ImageTag};
 use velarx_types::ImageReference;
@@ -89,7 +90,11 @@ pub(super) async fn resolve_image(state: &AppState, name: &str) -> ApiResult<Ima
 /// Everything the shapes are made of.
 /// The size of the uncompressed tar of a layer (podman's sizes are those
 /// of its layers so), as recorded at the pull: every row of a layer has it.
+/// A layer of a pull in progress has no tar yet: the size of its blob.
 pub(super) fn layer_size(layer: &velarx_db::LayerRecord) -> ApiResult<i64> {
+    if layer.status == "lazy" {
+        return Ok(layer.size);
+    }
     layer
         .stream_size
         .ok_or_else(|| ApiError::internal(format!("layer {} has no recorded size", layer.key)))
@@ -219,11 +224,45 @@ impl View {
             return Ok(None);
         };
         let read_only = state.db.read_only_store_of(&rec.id).await.is_some();
+        Self::new(rec, names, names_history, digest_names, layers, read_only).map(Some)
+    }
+
+    /// The image of a pull in progress.
+    async fn of_pull(state: &AppState, pull: &StagedPull) -> ApiResult<Self> {
+        let layers = state.image_service.layers_of_pull(pull, false).await?;
+        let names: Vec<String> = pull
+            .tags
+            .iter()
+            .map(|t| velarx_wire::events::display_name(&t.repository, &t.tag))
+            .collect();
+        let digest_names = pull
+            .digest_names
+            .iter()
+            .map(|(r, d)| display_digest_name(r, d))
+            .collect();
+        Self::new(
+            pull.image_record(),
+            names.clone(),
+            names,
+            digest_names,
+            layers,
+            false,
+        )
+    }
+
+    fn new(
+        rec: ImageRecord,
+        names: Vec<String>,
+        names_history: Vec<String>,
+        digest_names: Vec<String>,
+        layers: Vec<velarx_db::LayerRecord>,
+        read_only: bool,
+    ) -> ApiResult<Self> {
         let mut size = rec.manifest.len() as i64 + rec.config.len() as i64;
         for l in &layers {
             size += layer_size(l)?;
         }
-        Ok(Some(Self {
+        Ok(Self {
             id: image_id(&rec),
             config: serde_json::from_str(&rec.config).unwrap_or(Value::Null),
             manifest: serde_json::from_str(&rec.manifest).unwrap_or(Value::Null),
@@ -234,7 +273,7 @@ impl View {
             size,
             layers,
             read_only,
-        }))
+        })
     }
 
     /// When the configuration says the image was made (0: it says not).
@@ -555,6 +594,29 @@ pub(crate) async fn list_of(
         }
         out.push(r);
     }
+    // the pulls in progress, which the filter `lazy` lists
+    if filters
+        .0
+        .iter()
+        .any(|(k, _)| k.trim_end_matches('!') == "lazy")
+    {
+        let stored: HashSet<&str> = records.iter().map(|r| r.id.as_str()).collect();
+        for pull in state.image_service.staged_pulls() {
+            // (a pull that was completed since the list is listed there)
+            if stored.contains(pull.id.as_str()) {
+                continue;
+            }
+            let mut r = View::of_pull(state, &pull).await?.record();
+            r.lazy = true;
+            if !filter_match(filters, &r, &bounds) {
+                continue;
+            }
+            if let [one] = filters.get("reference") {
+                narrow_names(&mut r.names, one);
+            }
+            out.push(r);
+        }
+    }
     // in the order they were stored, as podman's
     out.sort_by_key(|r| r.stored_ns);
     Ok(out)
@@ -848,6 +910,9 @@ mod tests {
         layer.stream_size = None;
         assert!(db.insert_layer(&layer).await.is_err());
         assert!(layer_size(&layer).is_err());
+        // (a layer of a pull in progress: the size of its blob)
+        layer.status = "lazy".into();
+        assert_eq!(layer_size(&layer).unwrap(), layer.size);
     }
 
     #[tokio::test]

@@ -4,11 +4,11 @@
 # engine service's of the store (`velarx varlink`, found or started by the
 # command that pulls): it fetches the files nobody reads and commits each
 # layer to the store and the image with the last, `image pulls` lists the
-# pull, a container with --lazy attaches to it, a run without --lazy
-# completes it first, a service that is killed is replaced by the next one,
-# an error that retrying cannot mend stops the completion with the reason in
-# `image pulls`, rmi cancels the pull, and `system df -v` counts it.  With a
-# daemon (the service), and without one (the command starts the service,
+# pull (`image list --lazy` too), a container with --lazy attaches to it, a
+# run without --lazy completes it first, a service that is killed is
+# replaced by the next one, an error that retrying cannot mend stops the
+# completion with the reason in `image pulls`, rmi cancels the pull, and
+# `system df -v` counts it.  With a daemon (the service), and without one (the command starts the service,
 # which outlives it; the next command starts another after a kill); a pull
 # made with `--creds` keeps them in memory only.  Rootless and root.
 #
@@ -134,6 +134,11 @@ lease_held () {
     check "no image is in the store" 0 "$(db 'SELECT count(*) FROM images')"
     check "no layer is in the store" 0 "$(db 'SELECT count(*) FROM layers')"
     check "images does not list it" "" "$(sh_ image list -q)"
+    check "its table is podman's" "REPOSITORY TAG IMAGE ID CREATED SIZE" "$(sh_ image list | tr -s ' ' | sed 's/ $//')"
+    check_match "images --lazy lists it, LAZY yes" "^${IMAGE%:*} .* yes$" "$(sh_ image list --lazy | tail -n +2 | tr -s ' ')"
+    check_match "with its column" " SIZE +LAZY$" "$(sh_ image list --lazy | head -1)"
+    check "the filter lazy=true lists it, {{.Lazy}} is true" true "$(sh_ image list --filter lazy=true --format '{{.Lazy}}')"
+    check_match "and so does --format json" '"Lazy": true' "$(sh_ image list --filter lazy=true --format json)"
     check_match "image pulls lists it" "^queued$" "$(pulls)"
     check_match "system df -v counts it in the store's usage" "^Pulling +1 +[0-9.]+[kMG]?B " \
         "$(sh_ system df -v 2>&1 | grep '^Pulling')"
@@ -211,6 +216,7 @@ lease_held () {
     check "image complete" 0 $?
     check "no pull is left" "" "$(sh_ image pulls -q)"
     check_match "the image is listed" "$(basename "${IMAGE%:*}")" "$(sh_ image list --format '{{.Repository}}')"
+    check "as an image that is not lazy" "false no" "$(sh_ image list --lazy --format '{{.Lazy}} {{.LazyColumn}}')"
     files=$(files_in_store)
     check_match "the files are in the store" "^[1-9][0-9]*$" "$files"
     check "the staging area is empty" "0 0" "$(files_in_pool) $(( $(staged_layers) + $(find "$PULLS" -mindepth 1 2> /dev/null | wc -l) ))"

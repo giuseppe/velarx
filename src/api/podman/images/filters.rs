@@ -137,6 +137,7 @@ pub(super) fn filter_match(
                 "intermediate" => flag() == intermediate,
                 "readonly" => flag() == r.read_only,
                 "manifest" => flag() == r.manifest_list,
+                "lazy" => flag() == r.lazy,
                 // (no container of another tool is known: external is true
                 // of an image no container uses)
                 "containers" => match want {
@@ -174,7 +175,9 @@ pub(super) fn filter_match(
                 _ => true,
             }
         };
-        let ok = if name == "reference" && !negate {
+        // (`lazy=true` and `lazy=false`: the pulls in progress and the
+        // images of the store)
+        let ok = if matches!(name, "reference" | "lazy") && !negate {
             values.is_empty() || values.iter().any(|v| one(v))
         } else {
             values.iter().all(|v| one(v) != negate)
@@ -234,7 +237,7 @@ pub(super) fn fully_qualified(r: &str) -> Option<(&str, bool)> {
 /// The filters of an image list libimage knows; another is refused with
 /// its message.
 pub(super) fn check_image_filters(filters: &Filters) -> ApiResult<()> {
-    const KNOWN: [&str; 14] = [
+    const KNOWN: [&str; 15] = [
         "after",
         "since",
         "before",
@@ -244,6 +247,7 @@ pub(super) fn check_image_filters(filters: &Filters) -> ApiResult<()> {
         "id",
         "intermediate",
         "label",
+        "lazy",
         "manifest",
         "readonly",
         "reference",
@@ -259,7 +263,7 @@ pub(super) fn check_image_filters(filters: &Filters) -> ApiResult<()> {
         }
         for v in values {
             let bad = match name {
-                "dangling" | "intermediate" | "readonly" | "manifest" => {
+                "dangling" | "intermediate" | "readonly" | "manifest" | "lazy" => {
                     // (libimage's words, with the key and the value as it
                     // says them)
                     parse_filter_bool(v).is_none().then(|| {
@@ -293,4 +297,39 @@ pub(super) fn check_image_filters(filters: &Filters) -> ApiResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_filter_lazy_tells_the_pulls_in_progress() {
+        let f = |key: &str, values: &[&str]| {
+            Filters(vec![(
+                key.to_string(),
+                values.iter().map(|v| v.to_string()).collect(),
+            )])
+        };
+        let bounds = Bounds {
+            before: None,
+            since: None,
+        };
+        let matches = |filters: Filters, lazy| {
+            let image = velarx_proto::workload::ImageRecord {
+                lazy,
+                ..Default::default()
+            };
+            filter_match(&filters, &image, &bounds)
+        };
+        assert!(matches(f("lazy", &["true"]), true));
+        assert!(!matches(f("lazy", &["true"]), false));
+        assert!(matches(f("lazy", &["false"]), false));
+        assert!(!matches(f("lazy!", &["true"]), true));
+        // both values: either
+        assert!(matches(f("lazy", &["true", "false"]), true));
+        assert!(matches(f("lazy", &["true", "false"]), false));
+        assert!(check_image_filters(&f("lazy", &["true"])).is_ok());
+        assert!(check_image_filters(&f("lazy", &["maybe"])).is_err());
+    }
 }

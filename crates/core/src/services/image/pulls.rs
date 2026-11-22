@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The pulls in progress: images whose layers are not all in the store.
-//! They are not images of the store (`images` lists only complete ones);
+//! They are not images of the store (`images` lists them with `--lazy`);
 //! they are listed by `image pulls`, finished by `image complete`, cancelled
 //! by `rmi`, and a container made with `--lazy` runs on one.
 
@@ -186,13 +186,33 @@ impl ImageService {
         }
     }
 
+    /// The pulls in progress that are not cancelled, the oldest first.
+    pub fn staged_pulls(&self) -> Vec<StagedPull> {
+        self.staging_area()
+            .pulls()
+            .into_iter()
+            .filter(|e| e.state.state != PullState::Cancelled)
+            .map(|e| e.pull)
+            .collect()
+    }
+
     /// The layers of the image being pulled `id`, in order: a layer the
     /// store has is its record, the others are staged (`status` `lazy`).
     pub async fn staged_layers(&self, id: &str, toc: bool) -> ImageResult<Vec<LayerRecord>> {
-        let area = self.staging_area();
-        let pull = area
+        let pull = self
+            .staging_area()
             .pull(id)?
             .ok_or_else(|| ImageError::NotFound(format!("the pull of image {id}")))?;
+        self.layers_of_pull(&pull, toc).await
+    }
+
+    /// The layers of the pull `pull`, as [`Self::staged_layers`].
+    pub async fn layers_of_pull(
+        &self,
+        pull: &StagedPull,
+        toc: bool,
+    ) -> ImageResult<Vec<LayerRecord>> {
+        let area = self.staging_area();
         let mut out = Vec::with_capacity(pull.layers.len());
         for key in &pull.layers {
             let key = LayerKey::parse(key)

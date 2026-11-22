@@ -1494,6 +1494,9 @@ type ImageRecord (
 	# Of an additional, read-only image store
 	read_only: bool,
 	manifest_list: bool,
+	# `ImageList`: a pull in progress (`ImagePulls`), whose files are
+	# fetched as they are read; listed for the filter `lazy` alone
+	lazy: bool,
 	os: string,
 	architecture: string,
 	variant: string,

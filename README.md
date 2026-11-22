@@ -48,7 +48,12 @@ contents, lazily or not, and one that cannot be is refused):
 ```sh
 velarx image pull --lazy registry.example/app:chunked
 velarx run --lazy registry.example/app:chunked
+velarx image list --lazy
 ```
+
+`image list --lazy` lists the images still being pulled too, with a `LAZY`
+column (`{{.Lazy}}` of `--format`, the filter `lazy=true` lists those
+alone).
 
 A registry that does not serve range requests gives the blob whole, and the
 files are still those of the table. If a layer does not qualify, the pull

@@ -465,6 +465,7 @@ mod tests {
             containers: 3,
             read_only: true,
             manifest_list: true,
+            lazy: true,
             os: "linux".into(),
             architecture: "amd64".into(),
             variant: "v".into(),
