@@ -151,16 +151,47 @@ pub fn decode_parts(
     Ok((toc, tarsplit_z))
 }
 
-/// Whether `data` is an index of the form [`decode`] accepts whose tar-split
-/// is the one its table names.  It filters junk: nothing in an index is
-/// trusted for that.
+/// The fields of a TOC an index is checked by: its entries are skipped,
+/// not built.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TocHead {
+    version: i32,
+    #[allow(
+        dead_code,
+        reason = "a TOC has entries: only their presence is checked"
+    )]
+    entries: serde::de::IgnoredAny,
+    #[serde(default)]
+    tar_split_digest: Option<String>,
+}
+
+/// Whether `data` is an index whose tar-split is the one its table names
+/// (a canonical table has none), its table at most `max_json` bytes of
+/// JSON.  It filters junk, and reads the table for those fields alone:
+/// nothing in an index is trusted, the puller verifies all of it.
 pub fn is_well_formed(data: &[u8], max_json: u64) -> bool {
-    decode(data, max_json).is_ok_and(|(toc, tarsplit_z)| match toc.tar_split_digest {
+    let Ok((toc_z, tarsplit_z)) = split(data) else {
+        return false;
+    };
+    let max_json = max_json.min(MAX_TOC_JSON);
+    let mut json = Vec::new();
+    let read = super::zstd_decoder(toc_z).and_then(|d| d.take(max_json + 1).read_to_end(&mut json));
+    if read.is_err() || json.len() as u64 > max_json {
+        return false;
+    }
+    let Ok(head) = serde_json::from_slice::<TocHead>(&json) else {
+        return false;
+    };
+    if (head.version == velarx_storage::TOC_VERSION_CANONICAL) != tarsplit_z.is_empty() {
+        return false;
+    }
+    match head.tar_split_digest {
         Some(d) => d
             .parse::<velarx_types::digest::Digest>()
-            .is_ok_and(|d| velarx_types::digest::Digest::of(d.alg(), &tarsplit_z) == d),
+            .is_ok_and(|d| velarx_types::digest::Digest::of(d.alg(), tarsplit_z) == d),
         None => tarsplit_z.is_empty(),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -217,6 +248,40 @@ mod tests {
         assert!(decode(&index, 1000).is_err());
         assert_eq!(json_cap(1), 4 * 1024 * 1024);
         assert_eq!(json_cap(i64::MAX), MAX_TOC_JSON);
+    }
+
+    #[test]
+    fn an_index_is_well_formed_when_its_table_names_its_tar_split() {
+        let ts = b"tarsplit";
+        let named = velarx_types::digest::Digest::of(velarx_types::digest::Algorithm::Sha256, ts);
+        let toc = format!(
+            r#"{{"version":1,"entries":[{{"type":"dir","name":"a"}}],"tarSplitDigest":"{named}"}}"#
+        );
+        assert!(is_well_formed(
+            &encode(toc.as_bytes(), ts).unwrap(),
+            MAX_TOC_JSON
+        ));
+        assert!(!is_well_formed(
+            &encode(toc.as_bytes(), b"another").unwrap(),
+            MAX_TOC_JSON
+        ));
+        assert!(!is_well_formed(&encode(toc.as_bytes(), ts).unwrap(), 10));
+        let canonical = r#"{"version":2,"entries":[]}"#;
+        assert!(is_well_formed(
+            &encode(canonical.as_bytes(), b"").unwrap(),
+            MAX_TOC_JSON
+        ));
+        assert!(!is_well_formed(
+            &encode(canonical.as_bytes(), ts).unwrap(),
+            MAX_TOC_JSON
+        ));
+        for junk in [r#"{"version":1}"#, "[1, 2]", "not json"] {
+            assert!(!is_well_formed(
+                &encode(junk.as_bytes(), ts).unwrap(),
+                MAX_TOC_JSON
+            ));
+        }
+        assert!(!is_well_formed(b"garbage", MAX_TOC_JSON));
     }
 
     /// The layer index travels between nodes: its bytes must not change.

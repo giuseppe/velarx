@@ -366,6 +366,9 @@ async fn checked(wanted: String, data: Vec<u8>) -> (String, Vec<u8>, bool) {
     .unwrap_or((digest, Vec::new(), false))
 }
 
+/// Whether the bytes a peer sent for an index are one worth handing on.
+pub(crate) type WellFormed = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
 /// What a fetch asks for: a digest, and its size if the asker knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
@@ -1179,7 +1182,7 @@ impl PeerSource {
         item: &Item,
         toc: bool,
         not: &[PeerId],
-        well_formed: &(dyn Fn(&[u8]) -> bool + Sync),
+        well_formed: &WellFormed,
         out: &mut dyn Sink,
     ) -> Result<Option<PeerId>, String> {
         if !crate::limits::is_digest(&item.digest) {
@@ -1201,7 +1204,7 @@ impl PeerSource {
         item: &Item,
         toc: bool,
         not: &[PeerId],
-        well_formed: &(dyn Fn(&[u8]) -> bool + Sync),
+        well_formed: &WellFormed,
         out: &mut dyn Sink,
     ) -> Result<Option<PeerId>, String> {
         let max = item
@@ -1233,8 +1236,19 @@ impl PeerSource {
         note(|| Event::Candidates(providers.iter().map(|p| (*p, why)).collect()));
         for provider in providers {
             let started = tokio::time::Instant::now();
-            match self.peers.index(provider, &item.digest, max).await {
-                Ok(Some(index)) if !well_formed(&index) => {
+            // (checked on the blocking pool: the indexes of the layers of a
+            // probe are checked at the same time)
+            let asked = match self.peers.index(provider, &item.digest, max).await {
+                Ok(Some(index)) => {
+                    let check = well_formed.clone();
+                    let checked = tokio::task::spawn_blocking(move || (check(&index), index));
+                    Ok(Some(checked.await.map_err(|e| e.to_string())?))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            };
+            match asked {
+                Ok(Some((false, _))) => {
                     note(|| Event::Asked {
                         peer: provider,
                         outcome: Outcome::Failed("not an index".into()),
@@ -1243,7 +1257,7 @@ impl PeerSource {
                     self.knowledge.failed(provider);
                     self.knowledge.count(provider, started.elapsed(), None);
                 }
-                Ok(Some(index)) => {
+                Ok(Some((true, index))) => {
                     let took = started.elapsed();
                     note(|| Event::Asked {
                         peer: provider,
@@ -2060,6 +2074,11 @@ impl PeerSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A check that takes any index.
+    fn any() -> WellFormed {
+        Arc::new(|_: &[u8]| true)
+    }
 
     fn digest_of(data: &[u8]) -> String {
         velarx_types::digest::Digest::of(velarx_types::digest::Algorithm::Sha256, data).to_string()
@@ -3680,7 +3699,7 @@ mod tests {
                 .served(Some(&layer.digest), peer, Duration::from_millis(rtt));
         }
         let mut out = Collect::default();
-        s.fetch_index(&layer, false, &[], &|_| true, &mut out)
+        s.fetch_index(&layer, false, &[], &any(), &mut out)
             .await
             .unwrap();
         assert_eq!(out.0, [(layer.digest.clone(), b"an index".to_vec())]);
@@ -3718,7 +3737,7 @@ mod tests {
                 &layer,
                 false,
                 &[],
-                &|bytes| bytes.starts_with(b"an "),
+                &(Arc::new(|bytes: &[u8]| bytes.starts_with(b"an ")) as WellFormed),
                 &mut out,
             )
             .await
@@ -3735,7 +3754,7 @@ mod tests {
         // (a provider the puller refused the index of is not asked)
         let mut out = Collect::default();
         let given = s
-            .fetch_index(&layer, false, &[honest], &|_| true, &mut out)
+            .fetch_index(&layer, false, &[honest], &any(), &mut out)
             .await
             .unwrap();
         assert_eq!((given, out.0.len()), (Some(liar), 1));

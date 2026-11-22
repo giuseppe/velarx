@@ -454,13 +454,16 @@ impl PeerSource {
             digest: digest.to_string(),
             size: Some(index::MAX_INDEX),
         };
-        let well_formed = |bytes: &[u8]| {
-            let Ok((toc_z, _)) = index::split(bytes) else {
-                return false;
-            };
-            (!toc || Digest::of(digest.alg(), toc_z) == *digest)
-                && index::is_well_formed(bytes, cap)
-        };
+        // (the digests alone: the engine verifies the rest)
+        let pinned = *digest;
+        let well_formed: crate::provider::WellFormed =
+            std::sync::Arc::new(move |bytes: &[u8]| {
+                let Ok((toc_z, _)) = index::split(bytes) else {
+                    return false;
+                };
+                (!toc || Digest::of(pinned.alg(), toc_z) == pinned)
+                    && index::is_well_formed(bytes, cap)
+            });
         let giver = self
             .fetch_index(&item, toc, not, &well_formed, &mut one)
             .await
