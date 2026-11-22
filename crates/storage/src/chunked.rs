@@ -86,8 +86,18 @@ pub struct TocEntry {
     pub dev_major: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "devMinor")]
     pub dev_minor: Option<u32>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    /// (written sorted by name: a table of contents has one JSON, and the
+    /// blob of a layer is the same at every push)
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        serialize_with = "sorted"
+    )]
     pub xattrs: HashMap<String, String>,
+}
+
+fn sorted<S: serde::Serializer>(map: &HashMap<String, String>, s: S) -> Result<S::Ok, S::Error> {
+    s.collect_map(map.iter().collect::<std::collections::BTreeMap<_, _>>())
 }
 
 impl TocEntry {
@@ -714,6 +724,21 @@ mod tests {
         };
         let json_with_zeros = serde_json::to_string(&entry_with_zeros).unwrap();
         assert!(json_with_zeros.contains("\"chunkType\":\"zeros\""));
+    }
+
+    /// The JSON of an entry is one: its extended attributes sorted.
+    #[test]
+    fn test_the_json_of_an_entry_is_one() {
+        let mut e = TocEntry::new("f", TocEntryType::Reg);
+        for k in ["user.c", "user.a", "security.b", "user.b", "trusted.z"] {
+            e.xattrs.insert(k.to_string(), "eA==".to_string());
+        }
+        let json = serde_json::to_string(&e).unwrap();
+        let keys: Vec<usize> = ["security.b", "trusted.z", "user.a", "user.b", "user.c"]
+            .iter()
+            .map(|k| json.find(k).unwrap())
+            .collect();
+        assert!(keys.is_sorted(), "{json}");
     }
 
     /// Test get_file_chunks returns all chunks including zeros chunks
