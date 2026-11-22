@@ -11,7 +11,8 @@
 //! pull fall back to the registry, nothing else.
 //!
 //! The encoding: `SHIDX1\n`, the length of the compressed TOC (8 bytes,
-//! little endian), the TOC (JSON, zstd), the tar-split (zstd).
+//! little endian), the TOC (JSON, or the binary table of a layer that has
+//! one, as its descriptor vouches for it; zstd), the tar-split (zstd).
 
 use super::entry::MAX_ENTRIES;
 use std::io::Read;
@@ -168,8 +169,9 @@ struct TocHead {
 
 /// Whether `data` is an index whose tar-split is the one its table names
 /// (a canonical table has none), its table at most `max_json` bytes of
-/// JSON.  It filters junk, and reads the table for those fields alone:
-/// nothing in an index is trusted, the puller verifies all of it.
+/// JSON or a binary table of at most that many bytes.  It filters junk,
+/// and reads the table for those fields alone: nothing in an index is
+/// trusted, the puller verifies all of it.
 pub fn is_well_formed(data: &[u8], max_json: u64) -> bool {
     let Ok((toc_z, tarsplit_z)) = split(data) else {
         return false;
@@ -179,6 +181,12 @@ pub fn is_well_formed(data: &[u8], max_json: u64) -> bool {
     let read = super::zstd_decoder(toc_z).and_then(|d| d.take(max_json + 1).read_to_end(&mut json));
     if read.is_err() || json.len() as u64 > max_json {
         return false;
+    }
+    if json.starts_with(velarx_storage::table::MAGIC) {
+        return velarx_storage::table::head(&json).is_ok_and(|head| match head.tarsplit {
+            Some(d) => velarx_types::digest::Digest::of(d.alg(), tarsplit_z) == d,
+            None => tarsplit_z.is_empty(),
+        });
     }
     let Ok(head) = serde_json::from_slice::<TocHead>(&json) else {
         return false;
@@ -307,5 +315,30 @@ mod tests {
         assert_eq!(&index[15 + len..], b"TARSPLIT");
         let json = zstd::decode_all(&index[15..15 + len]).unwrap();
         assert_eq!(json, br#"{"version":1,"entries":[]}"#);
+    }
+
+    /// The index of a layer with a binary table carries the table: it is
+    /// well formed when the table's header names its tar-split (or none,
+    /// canonical), whatever the algorithm.
+    #[test]
+    fn an_index_of_a_binary_table_is_well_formed_when_its_table_names_its_tar_split() {
+        use velarx_types::digest::{Algorithm, Digest};
+        for alg in Algorithm::ALL {
+            let ts = b"tar-split".to_vec();
+            for canonical in [true, false] {
+                let toc = Toc {
+                    version: if canonical { 2 } else { 1 },
+                    entries: Vec::new(),
+                    tar_split_digest: (!canonical).then(|| Digest::of(alg, &ts).to_string()),
+                };
+                let table = velarx_storage::table::encode(&toc, alg).unwrap();
+                let table_z = zstd::encode_all(&table[..], 3).unwrap();
+                let good: &[u8] = if canonical { b"" } else { &ts };
+                let index = encode_compressed(&table_z, good).unwrap();
+                assert!(is_well_formed(&index, 1 << 20), "{alg} {canonical}");
+                let other = encode_compressed(&table_z, b"other").unwrap();
+                assert!(!is_well_formed(&other, 1 << 20), "{alg} {canonical}");
+            }
+        }
     }
 }
