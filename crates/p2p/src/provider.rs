@@ -774,17 +774,17 @@ const MAX_ASKED: usize = 8;
 /// The rounds of probes a group makes at most (`Policy::query_peers` each).
 const PROBE_ROUNDS: usize = 2;
 
-/// Where the candidates of a group come from.  The sources take turns, each
-/// with at most so many peers at a time, so that the peers asked together
-/// are not all of one origin (a filter is a peer's word: many identities can
-/// give it, and one that lies costs the others nothing).
-const SOURCES: [(Source, usize); 5] = [
-    (Source::Served, 3),
-    (Source::Filter, 3),
-    (Source::Probed, 3),
-    (Source::Dht, 3),
-    (Source::Connected, 3),
+/// Where the candidates of a group come from, the best first.
+const SOURCES: [Source; 5] = [
+    Source::Served,
+    Source::Filter,
+    Source::Probed,
+    Source::Dht,
+    Source::Connected,
 ];
+
+/// The candidates a source gives at a time.
+const FOUND_AT_ONCE: usize = 3;
 
 #[derive(Clone, Copy)]
 enum Source {
@@ -820,8 +820,6 @@ struct Asked {
     dht: bool,
     /// What the filters said was noted
     said: bool,
-    /// The source whose turn it is
-    turn: usize,
     /// No source has a peer left
     done: bool,
 }
@@ -836,8 +834,8 @@ impl Asked {
 impl PeerSource {
     /// The next peers to ask for the chunks of `layer`, the best first, when
     /// the ones asked did not give or are slow: never a peer of `got` or
-    /// one known to have none of the layer.  Each source in its
-    /// turn, the first that has a peer gives it (see [`SOURCES`]): the peers
+    /// one known to have none of the layer.  The first source that has a
+    /// peer gives it (see [`SOURCES`]): the peers
     /// that served the layer lately (no lookup), the ones whose filter says
     /// they may hold it, the connected peers that have no filter that is
     /// believed and say they have the first chunk (asked at the same time
@@ -852,15 +850,12 @@ impl PeerSource {
             return Vec::new();
         }
         let room = MAX_ASKED - got.taken.len();
-        for i in 0..SOURCES.len() {
-            let at = (got.turn + i) % SOURCES.len();
-            let (source, most) = SOURCES[at];
+        for source in SOURCES {
             let mut found = self.from(source, layer, first, got).await;
-            found.truncate(most.min(room));
+            found.truncate(FOUND_AT_ONCE.min(room));
             if found.is_empty() {
                 continue;
             }
-            got.turn = (at + 1) % SOURCES.len();
             got.taken.extend(found.iter().map(|(p, _)| *p));
             debug!(
                 candidates = ?found
