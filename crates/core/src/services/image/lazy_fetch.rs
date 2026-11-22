@@ -513,14 +513,34 @@ impl ImageService {
     /// Open the list of fetchers the layers of a pull will be fetched
     /// through while the pull goes on: [`ImageService::fetch_start_set`]
     /// keeps it, and it goes with the pull when the pull ends otherwise.
-    pub(super) fn open_walker(&self, pulled: &PulledFrom) -> RemoteHandle<OpenedWalker> {
+    /// The fetchers are told of each layer of `accepted` (its descriptor
+    /// and its table as the layer has it) as soon as the pull accepted it,
+    /// each layer at once: the first fetch of a layer does not wait for it.
+    pub(super) fn open_walker(
+        &self,
+        pulled: &PulledFrom,
+        accepted: futures::channel::mpsc::UnboundedReceiver<(OciDescriptor, bytes::Bytes)>,
+    ) -> RemoteHandle<OpenedWalker> {
+        use futures::StreamExt;
         let (this, pulled) = (self.clone(), pulled.clone());
         let (open, opened) = async move {
             let walk = pulled.walk();
-            this.open_lazy_walker((&walk, &pulled.manifest))
+            let opened = this
+                .open_lazy_walker((&walk, &pulled.manifest))
                 .await
                 .map_err(|e| debug!("The fetchers of the pull are not opened: {e}"))
-                .ok()
+                .ok();
+            if let Some((_, walker)) = &opened {
+                accepted
+                    .for_each_concurrent(None, |(desc, toc_z)| async move {
+                        let stem = LayerKey::expected(&desc).file_stem();
+                        if let Err(e) = walker.tell_layer(&stem, &desc, &toc_z).await {
+                            debug!("The fetchers are not told of {}: {e}", desc.digest);
+                        }
+                    })
+                    .await;
+            }
+            opened
         }
         .remote_handle();
         tokio::spawn(open);

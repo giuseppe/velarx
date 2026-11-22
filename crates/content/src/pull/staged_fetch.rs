@@ -332,9 +332,10 @@ pub struct StagedFetch {
     /// last forgotten: what a fetcher keeps for a blob it read to answer
     /// goes with `Forget`, told or not
     probed: Mutex<std::collections::HashSet<String>>,
-    /// Held while a layer is told: a second walk of the layer, at the same
-    /// time, waits for the `Layer` call of the first, not for nothing
-    telling: tokio::sync::Mutex<()>,
+    /// Held while a layer is told, one for each layer by its blob: a second
+    /// walk of the layer, at the same time, waits for the `Layer` call of
+    /// the first, not for nothing; other layers are told meanwhile
+    telling: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// The fetchers but the origin whose `Layer` failed (the place in
     /// `fetchers`): not asked again by this pull, so that no call waits for
     /// one that is silent
@@ -505,7 +506,7 @@ impl StagedFetch {
             max_objects,
             told: Mutex::default(),
             probed: Mutex::default(),
-            telling: tokio::sync::Mutex::default(),
+            telling: Mutex::default(),
             unwilling,
             open: Arc::default(),
         }))
@@ -826,6 +827,21 @@ impl StagedFetch {
         .await
     }
 
+    /// Tell the fetchers of the lazily staged `layer` (its table `toc_z` as
+    /// the layer has it) and of the staging directory of the layer of
+    /// `stem`, made if it is not there, ahead of its first fetch, which
+    /// then does not wait for it.
+    pub async fn tell_layer(
+        &self,
+        stem: &str,
+        layer: &OciDescriptor,
+        toc_z: &[u8],
+    ) -> ImageResult<()> {
+        let dir = self.lazy_staging(stem).await?;
+        let breaker = Breaker::new(self.fetchers.len());
+        self.tell(layer, (&dir, Some(toc_z)), &breaker, true).await
+    }
+
     /// The staging directory of the layer of `stem` of a lazy pull, open
     /// (made if it is not there).
     async fn lazy_staging(&self, stem: &str) -> ImageResult<File> {
@@ -945,6 +961,10 @@ impl StagedFetch {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|(l, _), _| l != layer);
+        self.telling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(layer);
         let told = self
             .told
             .lock()
@@ -998,13 +1018,17 @@ impl StagedFetch {
         breaker: &Breaker,
         with_origin: bool,
     ) -> ImageResult<()> {
-        let _telling = self.telling.lock().await;
+        let name = layer.digest.to_string();
+        let telling = (self.telling.lock().unwrap_or_else(|e| e.into_inner()))
+            .entry(name.clone())
+            .or_default()
+            .clone();
+        let _telling = telling.lock().await;
         for (i, fetcher) in self.fetchers.iter().enumerate() {
             if self.unwilling(i) {
                 breaker.distrust(i, fetcher, "a layer it was told of failed");
             }
         }
-        let name = layer.digest.to_string();
         let staging = dir.metadata().map(|m| (m.dev(), m.ino()))?;
         let missed: Vec<bool> = {
             let told = self.told.lock().unwrap_or_else(|e| e.into_inner());
@@ -2504,6 +2528,47 @@ mod tests {
             );
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// A layer told ahead of its fetches is known to the fetchers with its
+    /// staging, and its first fetch stages into that staging.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_layer_told_ahead_is_fetched_into_the_staging_it_was_told() {
+        let registry = LocalFetcher::start(Arc::new(Stages), Limits::default()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let staged = StagedFetch::open(
+            (
+                Vec::new(),
+                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Vec::new(),
+            ),
+            root.path(),
+            false,
+            ("localhost/a", true),
+            Some(b"{}"),
+            &manifest(),
+        )
+        .await
+        .unwrap();
+        let (desc, toc) = layer_and_toc();
+        let sent = toc_z(&toc);
+        staged.tell_layer("stem", &desc, &sent).await.unwrap();
+        let dir = root.path().join(LAYERS).join("stem");
+        let made = std::fs::metadata(&dir).unwrap();
+        let told = staged.told.lock().unwrap()[&desc.digest.to_string()].clone();
+        assert_eq!(told, [Some((made.dev(), made.ino()))]);
+        let name = key_of(1);
+        staged
+            .stage_files(
+                "stem",
+                &desc,
+                (&toc, &sent),
+                vec![name.clone()],
+                (Urgency::OnDemand, &|_| {}),
+            )
+            .await
+            .unwrap();
+        assert!(dir.join(crate::stager::staged_rel(&name).unwrap()).exists());
     }
 
     /// Each fetch of files of a lazy layer costs what the files cost, not

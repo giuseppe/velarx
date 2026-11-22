@@ -764,14 +764,16 @@ impl ImageService {
     /// The lazy layers of the pull of `manifest` (those the store lacks, as
     /// `stored` says), as the fetchers of `staged` found them (`Probe`)
     /// and the engine verified them; `ImageNotLazy` with every layer that
-    /// cannot be lazy, before anything of the pull exists.
+    /// cannot be lazy, before anything of the pull exists.  Each layer is
+    /// sent to `accepted` (its descriptor and its table as the layer has it)
+    /// as soon as it is verified.
     async fn accept_lazy(
         staged: &velarx_content::pull::staged_fetch::StagedFetch,
         manifest: &OciManifest,
         stored: &[bool],
-        image: &str,
-        max_tar: u64,
+        (image, max_tar): (&str, u64),
         db: &velarx_db::Database,
+        accepted_tx: &futures::channel::mpsc::UnboundedSender<(OciDescriptor, bytes::Bytes)>,
     ) -> ImageResult<Accepted> {
         let missing: Vec<u32> = stored
             .iter()
@@ -808,7 +810,11 @@ impl ImageService {
                     None => Err(velarx_proto::transfer::NotLazy::NoToc),
                 };
                 let made = match &answer {
-                    Ok((_, lazy)) => Some(Self::made_of_table(layer, &lazy.toc, db).await?),
+                    Ok((_, lazy)) => {
+                        // (nobody may listen: the pull tells nobody then)
+                        let _ = accepted_tx.unbounded_send((layer.clone(), lazy.toc_z.clone()));
+                        Some(Self::made_of_table(layer, &lazy.toc, db).await?)
+                    }
                     Err(_) => None,
                 };
                 Ok::<_, ImageError>((at, layer, answer, made))
@@ -1494,7 +1500,10 @@ impl ImageService {
                 manifest: manifest_bytes.to_vec(),
             }
         });
-        let walker = from.as_ref().map(|from| self.open_walker(from));
+        let (accepted_tx, accepted_rx) = futures::channel::mpsc::unbounded();
+        let walker = from
+            .as_ref()
+            .map(|from| self.open_walker(from, accepted_rx));
         // (the profile of the image comes while the layers are probed)
         let profile = match &from {
             Some(_) => {
@@ -1515,14 +1524,15 @@ impl ImageService {
                     staged,
                     &manifest,
                     &stored,
-                    &image,
-                    limits.max_layer_bytes,
+                    (&image, limits.max_layer_bytes),
                     &self.db,
+                    &accepted_tx,
                 )
                 .await?
             }
             _ => Accepted::default(),
         };
+        drop(accepted_tx);
         let Accepted {
             found: lazy_found,
             made: made_early,
