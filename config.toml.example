@@ -945,12 +945,6 @@ announce_images = false
 # chunks first, the ones that say no are not asked for a minute.  0: the
 # chunks are asked of the first peers, without the question (1 to 64).
 query_peers = 8
-# The largest file the service writes, in MiB: the chunks of one request (at
-# most 256).  A source that keeps the descriptor of the file of a call and
-# writes to it later cannot make it larger than this (and the engine empties
-# it when it is next used); a request that needs more is served by the next
-# source.
-max_incoming_mib = 256
 
 [sources.external.settings.serving]
 # What the node serves to the peers over QUIC, at most.

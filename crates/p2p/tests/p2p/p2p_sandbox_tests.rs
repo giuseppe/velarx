@@ -20,6 +20,7 @@ fn child(dir: &Path) {
     };
     let mut config = velarx_config::Config::default();
     config.server.socket = dir.join("api.sock");
+    config.pull.max_layer_gib = 1;
     let conf_path = dir.join("config.toml");
     std::fs::write(&conf_path, "").unwrap();
     let key = dir.join("swarm.key");
@@ -27,7 +28,6 @@ fn child(dir: &Path) {
     std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     let settings = velarx_p2p::settings::Settings {
         private_key_path: Some(key.clone()),
-        max_incoming_mib: 1,
         ..Default::default()
     };
     // (started as a shell or a user unit starts it: a soft limit of open
@@ -87,16 +87,14 @@ fn child(dir: &Path) {
             read.unwrap_or(false),
         );
     }
-    // a file it was given and kept cannot be grown past `max_incoming_mib`
-    // (the signal that would end the process is ignored)
+    // a file it was given and kept cannot be grown past a layer (the
+    // signal that would end the process is ignored)
     if !overlay {
         use std::os::unix::fs::FileExt;
         probe(
             "a kept file is bounded",
-            kept.write_all_at(&vec![1u8; 512 * 1024], 0).is_ok()
-                && kept
-                    .write_all_at(&vec![1u8; 1024 * 1024], 512 * 1024)
-                    .is_err(),
+            kept.write_all_at(&[1u8], (1 << 30) - 1).is_ok()
+                && kept.write_all_at(&[1u8; 2], (1 << 30) - 1).is_err(),
         );
     }
     probe("read the configuration", std::fs::read(&conf_path).is_ok());

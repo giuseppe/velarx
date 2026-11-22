@@ -23,7 +23,7 @@
 //!   DNS binds its own.  UDP (QUIC, mDNS, the DNS of the overlay) is not
 //!   covered by Landlock at all: seccomp lets it make IPv4 and IPv6
 //!   sockets, and nothing narrows their addresses.  No file it
-//!   writes can grow beyond `max_incoming_mib` (`RLIMIT_FSIZE`);
+//!   writes can grow beyond a layer (`[pull] max_layer_gib`, `RLIMIT_FSIZE`);
 //! * seccomp: an allow-list of the calls the service makes (the runtime,
 //!   files, sockets, the stager's `openat2`, `linkat` and fs-verity
 //!   requests, the sealed memory files of its replies), `clone` for
@@ -279,7 +279,7 @@ pub fn enter_role_thread(
     .map_err(|e| format!("RLIMIT_CORE: {e}"))?;
     // (the overlay node writes no file: Landlock grants it no write)
     if role == Role::Content {
-        velarx_base::hardening::limit_file_size(settings.max_file_bytes(&config.pull))
+        velarx_base::hardening::limit_file_size(config.pull.max_file_bytes())
             .map_err(|e| format!("RLIMIT_FSIZE: {e}"))?;
     }
     // (the overlay's DNS keeps for each container its sockets, its TCP

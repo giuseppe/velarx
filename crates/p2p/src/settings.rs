@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use velarx_config::{Config, PullConfig};
+use velarx_config::Config;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -109,9 +109,6 @@ pub struct Settings {
     /// The peers a big group of chunks is spread over (0 or 1: one at a time)
     #[serde(default = "default_stripe_peers")]
     pub stripe_peers: usize,
-    /// The largest file the service writes (MiB)
-    #[serde(default = "default_max_incoming_mib")]
-    pub max_incoming_mib: u64,
     /// Tell the peers the images this node has (they can list them) and
     /// publish its layers in the DHT; off, a peer can only test a layer in
     /// the filter or ask for one digest
@@ -254,10 +251,6 @@ fn default_idle_timeout_secs() -> u64 {
     24 * 3600
 }
 
-fn default_max_incoming_mib() -> u64 {
-    256
-}
-
 fn default_cidr() -> String {
     "10.192.0.0/10".to_string()
 }
@@ -305,7 +298,6 @@ impl Default for Settings {
             hedge: true,
             hedge_ms: 0,
             stripe_peers: default_stripe_peers(),
-            max_incoming_mib: default_max_incoming_mib(),
             announce_images: false,
             advertise_layers: true,
             filter_fpr: default_filter_fpr(),
@@ -387,9 +379,6 @@ impl Settings {
             anyhow::bail!("ca_sweep_secs must be 1 to 3600");
         }
         self.serving.validate().map_err(|e| anyhow::anyhow!(e))?;
-        if self.max_incoming_mib == 0 {
-            anyhow::bail!("max_incoming_mib must not be 0");
-        }
         for (key, addresses) in [
             ("listen_addresses", &self.listen_addresses),
             ("bootstrap_peers", &self.bootstrap_peers),
@@ -524,14 +513,6 @@ impl Settings {
             None => config.services_dir().join(name),
         }
     }
-
-    /// The largest file the service writes (`max_incoming_mib`), never more
-    /// than a layer.
-    pub fn max_file_bytes(&self, pull: &PullConfig) -> u64 {
-        self.max_incoming_mib
-            .saturating_mul(1 << 20)
-            .min(pull.max_file_bytes())
-    }
 }
 
 #[cfg(test)]
@@ -621,10 +602,9 @@ mod tests {
     }
 
     #[test]
-    fn quic_streams_and_the_incoming_file_are_checked() {
+    fn quic_streams_are_checked() {
         assert!(parse("quic_streams = 0\n").is_err());
         assert!(parse("quic_streams = 9\n").is_err());
-        assert!(parse("max_incoming_mib = 0\n").is_err());
         assert_eq!(parse("quic_streams = 2\n").unwrap().quic_streams, 2);
         assert!(parse("query_peers = 65\n").is_err());
         assert!(parse("announce_images = true\n").unwrap().announce_images);
