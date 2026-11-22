@@ -459,25 +459,11 @@ fn vouched_metadata(
     layer: &Digest,
     (max_tar, keep): (u64, bool),
 ) -> ImageResult<Metadata> {
-    let toc = match info.table {
-        true => {
-            let bytes = decompress_bounded(toc_z, MAX_TOC_JSON, info.toc.2, "table")?;
-            let alg = table::head(&bytes)
-                .map_err(|e| fail(format!("invalid table: {e}")))?
-                .alg;
-            if alg != info.checksum.alg() {
-                return Err(fail(format!(
-                    "the digests of its table are {alg}, its checksum is {}",
-                    info.checksum.alg()
-                )));
-            }
-            table::decode(&bytes, info.toc.0).map_err(|e| fail(format!("invalid table: {e}")))?
-        }
-        false => {
-            let json = decompress_bounded(toc_z, MAX_TOC_JSON, info.toc.2, "TOC")?;
-            parse_toc(&json).map_err(|e| fail(format!("invalid TOC: {e}")))?
-        }
-    };
+    if info.table {
+        return table_metadata(info, toc_z, ts_z, layer, (max_tar, keep));
+    }
+    let json = decompress_bounded(toc_z, MAX_TOC_JSON, info.toc.2, "TOC")?;
+    let toc = parse_toc(&json).map_err(|e| fail(format!("invalid TOC: {e}")))?;
     if let Some(problem) = entry::toc_problem(&toc.entries) {
         return Err(fail(problem));
     }
@@ -535,6 +521,67 @@ fn vouched_metadata(
         stored,
         toc_z: bytes::Bytes::copy_from_slice(toc_z),
         tarsplit_z: ts_z,
+        tarsplit_size: tarsplit.2,
+    })
+}
+
+/// [`vouched_metadata`] of a binary table: [`table::Table::open`] checks
+/// what the checks of a JSON table of contents test (one path once, in
+/// order, one size for a digest, an fs-verity digest for each file), so the
+/// table of contents is only made, in the form the layer is stored by.
+fn table_metadata(
+    info: &Info,
+    toc_z: &[u8],
+    ts_z: Vec<u8>,
+    layer: &Digest,
+    (max_tar, keep): (u64, bool),
+) -> ImageResult<Metadata> {
+    let bytes = decompress_bounded(toc_z, MAX_TOC_JSON, info.toc.2, "table")?;
+    let table =
+        table::Table::open(&bytes, info.toc.0).map_err(|e| fail(format!("invalid table: {e}")))?;
+    let alg = table.head().alg;
+    if alg != info.checksum.alg() {
+        return Err(fail(format!(
+            "the digests of its table are {alg}, its checksum is {}",
+            info.checksum.alg()
+        )));
+    }
+    let toc_z = bytes::Bytes::copy_from_slice(toc_z);
+    let Some(expected) = table.head().tarsplit else {
+        if info.tarsplit.is_some() {
+            return Err(invalid_canonical(layer, "the layer has a tar-split"));
+        }
+        let toc = Arc::new(table.toc());
+        canonical::validate_within(&toc.entries, max_tar)
+            .map_err(|e| invalid_canonical(layer, e))?;
+        return Ok(Metadata {
+            stored: toc.clone(),
+            toc,
+            toc_z,
+            tarsplit_z: bytes::Bytes::new(),
+            tarsplit_size: 0,
+        });
+    };
+    let Some(tarsplit) = info.tarsplit else {
+        return Err(ImageError::Contradicted(format!(
+            "layer {layer}: its table of contents has no tar-split and is not of version 2"
+        )));
+    };
+    if table.file_bytes() > max_tar {
+        return Err(fail(format!(
+            "the files of the layer are more than {max_tar} bytes"
+        )));
+    }
+    // (a lazy start may come without the tar-split: what comes is checked)
+    if keep || !ts_z.is_empty() {
+        same_tarsplit(&expected, &ts_z)?;
+    }
+    let toc = Arc::new(table.toc());
+    Ok(Metadata {
+        stored: toc.clone(),
+        toc,
+        toc_z,
+        tarsplit_z: ts_z.into(),
         tarsplit_size: tarsplit.2,
     })
 }

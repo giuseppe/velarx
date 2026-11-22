@@ -1631,6 +1631,14 @@ fn test_a_layer_is_pulled_by_its_binary_table() {
                     .iter()
                     .all(|e| e.fsverity.is_none_or(|v| v.alg() == alg)));
                 assert_eq!(by_table.toc_z.len() as u64, info.toc.1);
+                // (the table gives the entries in the form a layer keeps)
+                let kept =
+                    super::super::lazy::toc_view((*by_table.stored).clone(), alg, &desc.digest)
+                        .unwrap();
+                let value = |t: &Toc| serde_json::to_value(t).unwrap();
+                if !canonical {
+                    assert_eq!(value(&kept), value(&by_table.stored));
+                }
             }
         }
     }

@@ -75,6 +75,11 @@ const MAX_NAME: usize = 255;
 const MAX_PATH: usize = 4096;
 const MAX_XATTRS: usize = 1024;
 const MAX_XATTR_VALUE: usize = 65536;
+/// The most bytes of the names and values of the extended attributes of an
+/// entry, as a tar header has (`velarx_tarsplit`).
+const MAX_XATTR_BYTES: usize = 1 << 20;
+/// The most components of a path, as a tar header has (`velarx_tarsplit`).
+pub const MAX_DEPTH: usize = 512;
 const MAX_DEVICE: u32 = 0o7_777_777;
 const FIRST_TIME: i64 = -62_135_596_800; // 0001-01-01T00:00:00Z
 const LAST_TIME: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
@@ -271,56 +276,73 @@ fn is_overlay_xattr(name: &str) -> bool {
         })
 }
 
-/// The sets of extended attributes of section 5, each a map of the table
-/// of contents (values in base64), checked: sorted, distinct, of names a
-/// layer keeps.
-fn xattr_sets(mut b: &[u8]) -> Result<Vec<HashMap<String, String>>, String> {
+/// The sets of extended attributes of section 5, checked: sorted, distinct,
+/// of names a layer keeps, of at most `MAX_XATTR_BYTES` of names and
+/// values each.  The extent of each in the section.
+fn xattr_sets(b: &[u8]) -> Result<Vec<(usize, usize)>, String> {
     let bad = |why: &str| Err(format!("extended attributes: {why}"));
     let mut sets = Vec::new();
     let mut seen = BTreeSet::new();
-    while !b.is_empty() {
-        let start = b;
-        if b.len() < 2 {
+    let mut at = 0;
+    while at < b.len() {
+        let start = at;
+        if b.len() - at < 2 {
             return bad("a truncated set");
         }
-        let count = u16_at(b, 0) as usize;
-        b = &b[2..];
+        let count = u16_at(b, at) as usize;
+        at += 2;
         if count == 0 || count > MAX_XATTRS {
             return bad("a set of no attribute or of too many");
         }
-        let mut set = HashMap::with_capacity(count);
-        let mut last: Option<&[u8]> = None;
+        let (mut last, mut bytes): (Option<&[u8]>, usize) = (None, 0);
         for _ in 0..count {
-            if b.len() < 6 {
+            if b.len() - at < 6 {
                 return bad("a truncated attribute");
             }
-            let (n, v) = (u16_at(b, 0) as usize, u32_at(b, 2) as usize);
-            if n == 0 || n > MAX_NAME || v > MAX_XATTR_VALUE || b.len() - 6 < n + v {
+            let (n, v) = (u16_at(b, at) as usize, u32_at(b, at + 2) as usize);
+            if n == 0 || n > MAX_NAME || v > MAX_XATTR_VALUE || b.len() - at - 6 < n + v {
                 return bad("an attribute of an invalid length");
             }
-            let (name, value) = (&b[6..6 + n], &b[6 + n..6 + n + v]);
-            b = &b[6 + n + v..];
+            let name = &b[at + 6..at + 6 + n];
+            at += 6 + n + v;
+            bytes += n + v;
             if last.is_some_and(|l| l >= name) {
                 return bad("the names of a set are not sorted");
             }
             last = Some(name);
-            let name = std::str::from_utf8(name)
-                .ok()
-                .filter(|n| !n.contains('\0') && !is_overlay_xattr(n));
-            let Some(name) = name else {
+            let kept =
+                std::str::from_utf8(name).is_ok_and(|n| !n.contains('\0') && !is_overlay_xattr(n));
+            if !kept {
                 return bad("an attribute a layer does not have");
-            };
-            set.insert(
-                name.to_string(),
-                base64::engine::general_purpose::STANDARD.encode(value),
-            );
+            }
         }
-        if !seen.insert(&start[..start.len() - b.len()]) {
+        if bytes > MAX_XATTR_BYTES {
+            return bad("a set of too many bytes");
+        }
+        if !seen.insert(&b[start..at]) {
             return bad("a set is there twice");
         }
-        sets.push(set);
+        sets.push((start, at));
     }
     Ok(sets)
+}
+
+/// A set of extended attributes that [`xattr_sets`] checked, as a table of
+/// contents has it (values in base64).
+fn xattr_map(b: &[u8]) -> HashMap<String, String> {
+    let count = u16_at(b, 0) as usize;
+    let mut set = HashMap::with_capacity(count);
+    let mut at = 2;
+    for _ in 0..count {
+        let (n, v) = (u16_at(b, at) as usize, u32_at(b, at + 2) as usize);
+        let (name, value) = (&b[at + 6..at + 6 + n], &b[at + 6 + n..at + 6 + n + v]);
+        at += 6 + n + v;
+        set.insert(
+            utf8(name).to_string(),
+            base64::engine::general_purpose::STANDARD.encode(value),
+        );
+    }
+    set
 }
 
 /// The text of bytes the table checked to be UTF-8.
@@ -336,357 +358,442 @@ fn component_ok(name: &[u8]) -> bool {
         && !name.iter().any(|&c| c == b'/' || c == 0)
 }
 
-/// The table of contents `table` describes, checked (see the module), for a
-/// blob whose data ends at `data_end` (where its metadata starts): every
-/// range of a file is before it.  The entries are in the order of their
-/// paths (a directory before what it holds), named as a canonical tar names
-/// them (`./` and the path, a directory with a final `/`), the directories
-/// that the layer does not have left out.  A file has its fs-verity digest
-/// and no content digest.
-pub fn decode(table: &[u8], data_end: u64) -> Result<Toc, String> {
-    let (head, s) = sections(table)?;
-    let alg = head.alg;
-    let (fr, cr) = (file_record(alg), chunk_record(alg));
-    let records = [(0, ENTRY), (3, OWNER), (4, TIME), (6, fr), (7, cr)];
-    if let Some((i, _)) = records.iter().find(|(i, n)| s[*i].len() % n != 0) {
-        return Err(format!("section {i} of the table is not whole records"));
-    }
-    let n = s[0].len() / ENTRY;
-    if n == 0 || n > MAX_ENTRIES {
-        return Err("the table has no entries or too many".into());
-    }
-    let names = s[1];
-    let targets = s[2];
-    let owners: Vec<(u32, u32)> = s[3]
-        .as_chunks::<OWNER>()
-        .0
-        .iter()
-        .map(|o| (u32_at(o, 0), u32_at(o, 4)))
-        .collect();
-    let times: Vec<(i64, u32)> = s[4]
-        .as_chunks::<TIME>()
-        .0
-        .iter()
-        .map(|t| (u64_at(t, 0) as i64, u32_at(t, 8)))
-        .collect();
-    if owners.len() > 1 << 16 || owners.windows(2).any(|w| w[0] >= w[1]) {
-        return Err("the owners are not sorted or too many".into());
-    }
-    if times.windows(2).any(|w| w[0] >= w[1])
-        || times
-            .iter()
-            .any(|&(s, ns)| !(FIRST_TIME..=LAST_TIME).contains(&s) || ns >= 1_000_000_000)
-    {
-        return Err("the times are not sorted or out of range".into());
-    }
-    let sets = xattr_sets(s[5])?;
-    let files: Vec<File> = s[6]
-        .chunks_exact(fr)
-        .map(|f| {
-            let d = alg.len();
-            File {
-                verity: &f[..d],
-                size: u64_at(f, d),
-                blob: (u64_at(f, d + 8), u64_at(f, d + 16)),
-                chunks: (u32_at(f, d + 24), u32_at(f, d + 28)),
+/// A table that [`Table::open`] checked, read where it is.
+pub struct Table<'a> {
+    head: Head,
+    s: [&'a [u8]; SECTIONS],
+    /// Where each set of extended attributes is in section 5.
+    sets: Vec<(usize, usize)>,
+    /// The entries in the order of their paths: depth first, the children
+    /// of a directory in their order.
+    order: Vec<u32>,
+    /// The bytes of the files of the entries (of a file once per entry).
+    file_bytes: u64,
+}
+
+impl<'a> Table<'a> {
+    /// `table` checked (see the module), for a blob whose data ends at
+    /// `data_end` (where its metadata starts): every range of a file is
+    /// before it.  Nothing is allocated by a count the table claims, and
+    /// nothing of it is used before all of it is checked.
+    pub fn open(table: &'a [u8], data_end: u64) -> Result<Self, String> {
+        let (head, s) = sections(table)?;
+        let alg = head.alg;
+        let (fr, cr) = (file_record(alg), chunk_record(alg));
+        let records = [(0, ENTRY), (3, OWNER), (4, TIME), (6, fr), (7, cr)];
+        if let Some((i, _)) = records.iter().find(|(i, n)| s[*i].len() % n != 0) {
+            return Err(format!("section {i} of the table is not whole records"));
+        }
+        let n = s[0].len() / ENTRY;
+        if n == 0 || n > MAX_ENTRIES {
+            return Err("the table has no entries or too many".into());
+        }
+        let (n_owners, n_times) = (s[3].len() / OWNER, s[4].len() / TIME);
+        let owner = |i: usize| (u32_at(s[3], i * OWNER), u32_at(s[3], i * OWNER + 4));
+        let time = |i: usize| (u64_at(s[4], i * TIME) as i64, u32_at(s[4], i * TIME + 8));
+        if n_owners > 1 << 16 || (1..n_owners).any(|i| owner(i - 1) >= owner(i)) {
+            return Err("the owners are not sorted or too many".into());
+        }
+        if (1..n_times).any(|i| time(i - 1) >= time(i))
+            || (0..n_times)
+                .map(time)
+                .any(|(s, ns)| !(FIRST_TIME..=LAST_TIME).contains(&s) || ns >= 1_000_000_000)
+        {
+            return Err("the times are not sorted or out of range".into());
+        }
+        let mut t = Table {
+            sets: xattr_sets(s[5])?,
+            head,
+            s,
+            order: Vec::new(),
+            file_bytes: 0,
+        };
+        let n_files = s[6].len() / fr;
+        t.check_files(data_end)?;
+        let n_sets = t.sets.len();
+        let (names, targets) = (s[1], s[2]);
+
+        // The tree: every entry but the root is in the run of children of a
+        // directory before it, so each has one parent, before it, and the
+        // runs tile the entries (no loop, no orphan).
+        let mut parent = vec![ROOT_PARENT; n];
+        // (the length of the path of each entry, `/` before each
+        // component, and the number of its components)
+        let mut path_len = vec![0usize; n];
+        let mut depth = vec![0usize; n];
+        let mut next = 1usize;
+        let (mut name_at, mut target_at) = (0usize, 0usize);
+        let (mut owner_used, mut time_used) = (vec![false; n_owners], vec![false; n_times]);
+        let mut file_used = vec![false; n_files];
+        let mut sets_used = 0usize;
+        let mut prev_name: &[u8] = &[];
+        for i in 0..n {
+            let e = t.entry(i);
+            let bad = |why: &str| Err(format!("entry {i} of the table: {why}"));
+            if i > 0 && i >= next {
+                return bad("it is in no directory");
             }
-        })
-        .collect();
-    let chunks: Vec<Chunk> = s[7]
-        .chunks_exact(cr)
-        .map(|c| Chunk {
+            if e.parent != parent[i] {
+                return bad("its parent is not the directory it is in");
+            }
+            let (off, len) = (e.name.0 as usize, e.name.1 as usize);
+            if off != name_at || names.len() - name_at < len {
+                return bad("its name is not the next one of the names");
+            }
+            let name = &names[off..off + len];
+            name_at += len;
+            if i == 0 {
+                if len != 0 || e.kind != 0 {
+                    return bad("the root is a directory without a name");
+                }
+            } else {
+                if !component_ok(name) {
+                    return bad("an invalid name");
+                }
+                if std::str::from_utf8(name).is_err() {
+                    return bad("a name that is not UTF-8");
+                }
+                let p = parent[i] as usize;
+                if parent[i - 1] == parent[i] && prev_name >= name {
+                    return bad("the names of a directory are not sorted");
+                }
+                path_len[i] = path_len[p] + 1 + len;
+                depth[i] = depth[p] + 1;
+                // (the name of the table of contents: `./`, the path
+                // without its first `/`, and `/` for a directory)
+                if path_len[i] + 1 + usize::from(e.kind == 0) > MAX_PATH {
+                    return bad("its path is too long");
+                }
+                if depth[i] > MAX_DEPTH {
+                    return bad("its path is too deep");
+                }
+            }
+            prev_name = name;
+            let implied = e.flags == IMPLIED;
+            if e.flags & !IMPLIED != 0 || (implied && e.kind != 0) {
+                return bad("invalid flags");
+            }
+            if implied {
+                if (e.mode, e.owner, e.time, e.xattrs) != (0, 0, 0, 0) || (e.b == 0 && i > 0) {
+                    return bad(
+                        "a directory the layer does not have has attributes or no children",
+                    );
+                }
+            } else {
+                if e.mode > 0o7777 {
+                    return bad("a mode with more than the permission bits");
+                }
+                let (o, tm) = (e.owner as usize, e.time as usize);
+                if o >= n_owners || tm >= n_times {
+                    return bad("an owner or a time that is not in the table");
+                }
+                owner_used[o] = true;
+                time_used[tm] = true;
+                match e.xattrs as usize {
+                    0 => {}
+                    x if x <= sets_used => {}
+                    x if x == sets_used + 1 && x <= n_sets => sets_used = x,
+                    _ => return bad("extended attributes out of order or not in the table"),
+                }
+            }
+            let (a, b) = (e.a as usize, e.b as usize);
+            match e.kind {
+                0 if b == 0 && a == 0 => {}
+                0 if b > 0 && a == next && b <= n - next => {
+                    parent[a..a + b].fill(i as u32);
+                    next += b;
+                }
+                1 if b == 0 && a == 0 => {}
+                1 if b == 0 && a <= n_files => file_used[a - 1] = true,
+                2 if a == target_at && (1..=MAX_PATH).contains(&b) && targets.len() - a >= b => {
+                    let target = &targets[a..a + b];
+                    if target.contains(&0) {
+                        return bad("an invalid symlink target");
+                    }
+                    if std::str::from_utf8(target).is_err() {
+                        return bad("a symlink target that is not UTF-8");
+                    }
+                    target_at += b;
+                }
+                3 if a < n && b == 0 => {}
+                4 | 5 if e.a <= MAX_DEVICE && e.b <= MAX_DEVICE => {}
+                6 if a == 0 && b == 0 => {}
+                _ => return bad("an invalid kind or fields of its kind"),
+            }
+        }
+        if next != n || name_at != names.len() || target_at != targets.len() {
+            return Err("the table has entries, names or targets that no entry has".into());
+        }
+        if owner_used.contains(&false) || time_used.contains(&false) || sets_used != n_sets {
+            return Err("the table has owners, times or attributes that no entry has".into());
+        }
+        if file_used.contains(&false) {
+            return Err("the table has files that no entry has".into());
+        }
+
+        // The order of the paths.  A hard link is to an entry before it in
+        // that order that is not a directory nor a hard link.
+        let mut order = Vec::with_capacity(n);
+        let mut stack = vec![0u32];
+        while let Some(i) = stack.pop() {
+            order.push(i);
+            let e = t.entry(i as usize);
+            if e.kind == 0 {
+                stack.extend((e.a..e.a + e.b).rev());
+            }
+        }
+        let mut position = vec![0u32; n];
+        for (p, &i) in order.iter().enumerate() {
+            position[i as usize] = p as u32;
+        }
+        // (and what the table of contents of the table holds: its entries
+        // and the bytes of their names, which a layer bounds)
+        let (mut out_entries, mut out_names) = (0usize, 0usize);
+        for i in 0..n {
+            let e = t.entry(i);
+            let path = path_len[i] + 3;
+            let (entries, names) = match e.kind {
+                0 if e.flags == IMPLIED => (0, 0),
+                1 if e.a > 0 => {
+                    let f = t.file(e.a as usize - 1);
+                    t.file_bytes = t.file_bytes.saturating_add(f.size);
+                    let chunks = (f.chunks.1 as usize).max(1);
+                    (chunks, path * chunks)
+                }
+                2 => (1, path + e.b as usize),
+                3 => {
+                    let target = e.a as usize;
+                    let kind = t.entry(target).kind;
+                    if kind == 0 || kind == 3 || position[target] >= position[i] {
+                        return Err(format!(
+                            "entry {i} of the table: a hard link to a directory, a hard link \
+                             or an entry after it"
+                        ));
+                    }
+                    (1, path + path_len[target] + 3)
+                }
+                _ => (1, path),
+            };
+            out_entries += entries;
+            out_names += names;
+            if out_entries > MAX_ENTRIES || out_names > MAX_NAMES {
+                return Err("the table has too many entries or bytes of names".into());
+            }
+        }
+        t.order = order;
+        Ok(t)
+    }
+
+    /// What the header of the table says.
+    pub fn head(&self) -> &Head {
+        &self.head
+    }
+
+    /// The bytes of the files of the entries, a file counted once for each
+    /// entry that has it (as many as a tar of the layer holds).
+    pub fn file_bytes(&self) -> u64 {
+        self.file_bytes
+    }
+
+    fn entry(&self, i: usize) -> Raw {
+        Raw::read(&self.s[0][i * ENTRY..])
+    }
+
+    fn name(&self, e: &Raw) -> &'a str {
+        utf8(&self.s[1][e.name.0 as usize..][..e.name.1 as usize])
+    }
+
+    fn file(&self, i: usize) -> File<'a> {
+        let d = self.head.alg.len();
+        let f = &self.s[6][i * file_record(self.head.alg)..];
+        File {
+            verity: &f[..d],
+            size: u64_at(f, d),
+            blob: (u64_at(f, d + 8), u64_at(f, d + 16)),
+            chunks: (u32_at(f, d + 24), u32_at(f, d + 28)),
+        }
+    }
+
+    fn chunk(&self, i: usize) -> Chunk<'a> {
+        let c = &self.s[7][i * chunk_record(self.head.alg)..][..chunk_record(self.head.alg)];
+        Chunk {
             blob: u64_at(c, 0),
             length: u64_at(c, 8) & !ZEROS,
             zeros: u64_at(c, 8) & ZEROS != 0,
             digest: &c[16..],
-        })
-        .collect();
-    check_files(&files, &chunks, data_end)?;
-
-    // The tree: every entry but the root is in the run of children of a
-    // directory before it, so each has one parent, before it, and the
-    // runs tile the entries (no loop, no orphan).
-    let raw: Vec<Raw> = s[0]
-        .as_chunks::<ENTRY>()
-        .0
-        .iter()
-        .map(|r| Raw::read(r))
-        .collect();
-    let mut parent = vec![ROOT_PARENT; n];
-    let mut path_len = vec![0usize; n];
-    let mut next = 1usize;
-    let (mut name_at, mut target_at) = (0usize, 0usize);
-    let (mut owner_used, mut time_used) = (vec![false; owners.len()], vec![false; times.len()]);
-    let mut file_used = vec![false; files.len()];
-    let mut sets_used = 0usize;
-    for (i, e) in raw.iter().enumerate() {
-        let bad = |why: &str| Err(format!("entry {i} of the table: {why}"));
-        if i > 0 && i >= next {
-            return bad("it is in no directory");
         }
-        if e.parent != parent[i] {
-            return bad("its parent is not the directory it is in");
-        }
-        let (off, len) = (e.name.0 as usize, e.name.1 as usize);
-        if off != name_at || names.len() - name_at < len {
-            return bad("its name is not the next one of the names");
-        }
-        let name = &names[off..off + len];
-        name_at += len;
-        if i == 0 {
-            if len != 0 || e.kind != 0 {
-                return bad("the root is a directory without a name");
-            }
-        } else {
-            if !component_ok(name) || std::str::from_utf8(name).is_err() {
-                return bad("an invalid name");
-            }
-            let p = parent[i] as usize;
-            let prev = &raw[i - 1];
-            if parent[i - 1] == parent[i] {
-                let (po, pl) = (prev.name.0 as usize, prev.name.1 as usize);
-                if &names[po..po + pl] >= name {
-                    return bad("the names of a directory are not sorted");
-                }
-            }
-            path_len[i] = path_len[p] + 1 + len;
-            if path_len[i] > MAX_PATH {
-                return bad("its path is too long");
-            }
-        }
-        let implied = e.flags == IMPLIED;
-        if e.flags & !IMPLIED != 0 || (implied && e.kind != 0) {
-            return bad("invalid flags");
-        }
-        if implied {
-            if (e.mode, e.owner, e.time, e.xattrs) != (0, 0, 0, 0) || (e.b == 0 && i > 0) {
-                return bad("a directory the layer does not have has attributes or no children");
-            }
-        } else {
-            if e.mode > 0o7777 {
-                return bad("a mode with more than the permission bits");
-            }
-            let (o, t) = (e.owner as usize, e.time as usize);
-            if o >= owners.len() || t >= times.len() {
-                return bad("an owner or a time that is not in the table");
-            }
-            owner_used[o] = true;
-            time_used[t] = true;
-            match e.xattrs as usize {
-                0 => {}
-                x if x <= sets_used => {}
-                x if x == sets_used + 1 && x <= sets.len() => sets_used = x,
-                _ => return bad("extended attributes out of order or not in the table"),
-            }
-        }
-        let (a, b) = (e.a as usize, e.b as usize);
-        match e.kind {
-            0 if b == 0 && a == 0 => {}
-            0 if b > 0 && a == next && b <= n - next => {
-                parent[a..a + b].fill(i as u32);
-                next += b;
-            }
-            1 if b == 0 && a == 0 => {}
-            1 if b == 0 && a <= files.len() => file_used[a - 1] = true,
-            2 if a == target_at && (1..=MAX_PATH).contains(&b) && targets.len() - a >= b => {
-                let t = &targets[a..a + b];
-                if t.contains(&0) || std::str::from_utf8(t).is_err() {
-                    return bad("an invalid symlink target");
-                }
-                target_at += b;
-            }
-            3 if a < n && b == 0 => {}
-            4 | 5 if e.a <= MAX_DEVICE && e.b <= MAX_DEVICE => {}
-            6 if a == 0 && b == 0 => {}
-            _ => return bad("an invalid kind or fields of its kind"),
-        }
-    }
-    if next != n || name_at != names.len() || target_at != targets.len() {
-        return Err("the table has entries, names or targets that no entry has".into());
-    }
-    if owner_used.contains(&false) || time_used.contains(&false) || sets_used != sets.len() {
-        return Err("the table has owners, times or attributes that no entry has".into());
-    }
-    if file_used.contains(&false) {
-        return Err("the table has files that no entry has".into());
     }
 
-    // The order of the paths: depth first, the children of a directory in
-    // their order.  A hard link is to an entry before it in that order
-    // that is not a directory nor a hard link.
-    let mut order = Vec::with_capacity(n);
-    let mut stack = vec![0usize];
-    while let Some(i) = stack.pop() {
-        order.push(i);
-        let e = &raw[i];
-        if e.kind == 0 {
-            stack.extend((e.a as usize..e.a as usize + e.b as usize).rev());
-        }
-    }
-    let mut position = vec![0usize; n];
-    for (p, &i) in order.iter().enumerate() {
-        position[i] = p;
-    }
-    let mut out_names = 0usize;
-    for (i, e) in raw.iter().enumerate() {
-        let path = |i: usize| path_len[i] + 3;
-        out_names += match e.kind {
-            0 if e.flags == IMPLIED => 0,
-            1 if e.a > 0 => path(i) * (1 + files[e.a as usize - 1].chunks.1 as usize),
-            2 => path(i) + e.b as usize,
-            3 => {
-                let t = e.a as usize;
-                if raw[t].kind == 0 || raw[t].kind == 3 || position[t] >= position[i] {
-                    return Err(format!(
-                        "entry {i} of the table: a hard link to a directory, a hard link or an \
-                         entry after it"
-                    ));
-                }
-                path(i) + path(t)
+    /// The files and their chunks: sorted and distinct, in the data of the
+    /// blob, the chunks of each in order inside its range and adding up to
+    /// it.
+    fn check_files(&self, data_end: u64) -> Result<(), String> {
+        let n_files = self.s[6].len() / file_record(self.head.alg);
+        let n_chunks = self.s[7].len() / chunk_record(self.head.alg);
+        let mut at = 0usize;
+        for i in 0..n_files {
+            let bad = |why: &str| Err(format!("file {i} of the table: {why}"));
+            let f = self.file(i);
+            if i > 0 && self.file(i - 1).verity >= f.verity {
+                return bad("the files are not sorted by digest");
             }
-            _ => path(i),
+            let end = f.blob.0.checked_add(f.blob.1);
+            if f.size == 0 || f.blob.1 == 0 || end.is_none_or(|e| e > data_end) {
+                return bad("an empty file or a range outside of the data of the blob");
+            }
+            let end = f.blob.0 + f.blob.1;
+            let (first, count) = (f.chunks.0 as usize, f.chunks.1 as usize);
+            if first != at || count == 1 || count > n_chunks - at {
+                return bad("its chunks are not the next ones");
+            }
+            at += count;
+            let (mut size, mut last) = (0u64, 0u64);
+            for k in first..first + count {
+                let c = self.chunk(k);
+                let in_order = match k == first {
+                    true => c.blob == f.blob.0,
+                    false => c.blob > last && c.blob < end,
+                };
+                last = c.blob;
+                size = size
+                    .checked_add(c.length)
+                    .filter(|_| c.length > 0 && in_order)
+                    .ok_or(format!(
+                        "file {i} of the table: its chunks are not in order in its range"
+                    ))?;
+            }
+            if count > 0 && size != f.size {
+                return bad("its chunks do not add up to it");
+            }
+        }
+        if at != n_chunks {
+            return Err("the table has chunks that no file has".into());
+        }
+        Ok(())
+    }
+
+    /// The table of contents of the table, as a layer pulled by it is
+    /// stored: the entries in the order of their paths (a directory before
+    /// what it holds), the directories that the layer does not have left
+    /// out, a file with its fs-verity digest and no content digest.  The
+    /// names of a canonical tar are those of its headers (`./` and the
+    /// path, a directory with a final `/`); the others are the paths, the
+    /// root `./`, and an empty file has the digest of no bytes (as
+    /// `velarx_content`'s `toc_view` keeps a table of contents).
+    pub fn toc(&self) -> Toc {
+        let alg = self.head.alg;
+        let canonical = self.head.tarsplit.is_none();
+        // (what the names of the entries of each directory start with: the
+        // directories come before what they hold)
+        let mut dirs = vec![String::new(); self.order.len()];
+        if canonical {
+            dirs[0] = "./".to_string();
+        }
+        for &i in &self.order[1..] {
+            let e = self.entry(i as usize);
+            if e.kind == 0 {
+                dirs[i as usize] = format!("{}{}/", dirs[e.parent as usize], self.name(&e));
+            }
+        }
+        let path = |i: usize| {
+            let e = self.entry(i);
+            match (i, e.kind) {
+                (0, _) => "./".to_string(),
+                (_, 0) if canonical => dirs[i].clone(),
+                _ => format!("{}{}", dirs[e.parent as usize], self.name(&e)),
+            }
         };
-        if out_names > MAX_NAMES {
-            return Err("the table has too many bytes of names".into());
-        }
-    }
-
-    // The table of contents: the paths of the directories first, which
-    // the other entries are named after, then the entries on all the
-    // threads (they are freed on all the threads as well).
-    let name = |i: usize| {
-        let (o, l) = (raw[i].name.0 as usize, raw[i].name.1 as usize);
-        utf8(&names[o..o + l])
-    };
-    let mut dirs = vec![String::new(); n];
-    dirs[0] = "./".to_string();
-    for &i in &order[1..] {
-        if raw[i].kind == 0 {
-            dirs[i] = format!("{}{}/", dirs[raw[i].parent as usize], name(i));
-        }
-    }
-    let path = |i: usize| match raw[i].kind {
-        0 => dirs[i].clone(),
-        _ => format!("{}{}", dirs[raw[i].parent as usize], name(i)),
-    };
-    let time_text: Vec<String> = times
-        .iter()
-        .map(|&t| rfc3339(t).unwrap_or_default())
-        .collect();
-    let digest = |r: &[u8]| Digest::from_bytes(alg, r).expect("a digest of the algorithm");
-    let entry_of = |i: usize| {
-        let e = &raw[i];
-        let (uid, gid) = owners[e.owner as usize];
-        let mut entry = TocEntry {
-            mode: e.mode.into(),
-            uid,
-            gid,
-            mod_time: Some(time_text[e.time as usize].clone()),
-            ..TocEntry::new(path(i), KINDS[e.kind as usize])
-        };
-        if e.xattrs > 0 {
-            entry.xattrs = sets[e.xattrs as usize - 1].clone();
-        }
-        let mut chunk_entries = Vec::new();
-        match e.kind {
-            1 if e.a > 0 => {
-                let f = &files[e.a as usize - 1];
-                entry.size = f.size;
-                entry.fsverity = Digest::fsverity(alg, f.verity).ok();
-                entry.offset = f.blob.0;
-                entry.end_offset = f.blob.0 + f.blob.1;
-                let (first, count) = (f.chunks.0 as usize, f.chunks.1 as usize);
-                let mut at = 0;
-                for (k, c) in chunks[first..first + count].iter().enumerate() {
-                    let kind = c.zeros.then(|| crate::CHUNK_TYPE_ZEROS.to_string());
-                    let d = Some(digest(c.digest).to_string());
-                    if k == 0 {
-                        (entry.chunk_size, entry.chunk_digest, entry.chunk_type) =
-                            (c.length, d, kind);
-                    } else {
-                        chunk_entries.push(TocEntry {
-                            offset: c.blob,
-                            chunk_digest: d,
-                            chunk_size: c.length,
-                            chunk_offset: at,
-                            chunk_type: kind,
-                            ..TocEntry::new(entry.name.clone(), TocEntryType::Chunk)
-                        });
+        let times: Vec<String> = (0..self.s[4].len() / TIME)
+            .map(|i| {
+                let t = &self.s[4][i * TIME..];
+                rfc3339((u64_at(t, 0) as i64, u32_at(t, 8))).unwrap_or_default()
+            })
+            .collect();
+        let digest = |r: &[u8]| Digest::from_bytes(alg, r).expect("a digest of the algorithm");
+        let entry_of = |i: usize| {
+            let e = self.entry(i);
+            let o = &self.s[3][e.owner as usize * OWNER..];
+            let mut entry = TocEntry {
+                mode: e.mode.into(),
+                uid: u32_at(o, 0),
+                gid: u32_at(o, 4),
+                mod_time: Some(times[e.time as usize].clone()),
+                ..TocEntry::new(path(i), KINDS[e.kind as usize])
+            };
+            if e.xattrs > 0 {
+                let (from, to) = self.sets[e.xattrs as usize - 1];
+                entry.xattrs = xattr_map(&self.s[5][from..to]);
+            }
+            let mut chunk_entries = Vec::new();
+            match e.kind {
+                1 if e.a > 0 => {
+                    let f = self.file(e.a as usize - 1);
+                    entry.size = f.size;
+                    entry.fsverity = Digest::fsverity(alg, f.verity).ok();
+                    entry.offset = f.blob.0;
+                    entry.end_offset = f.blob.0 + f.blob.1;
+                    let (first, count) = (f.chunks.0 as usize, f.chunks.1 as usize);
+                    let mut at = 0;
+                    for k in first..first + count {
+                        let c = self.chunk(k);
+                        let kind = c.zeros.then(|| crate::CHUNK_TYPE_ZEROS.to_string());
+                        let d = Some(digest(c.digest).to_string());
+                        if k == first {
+                            (entry.chunk_size, entry.chunk_digest, entry.chunk_type) =
+                                (c.length, d, kind);
+                        } else {
+                            chunk_entries.push(TocEntry {
+                                offset: c.blob,
+                                chunk_digest: d,
+                                chunk_size: c.length,
+                                chunk_offset: at,
+                                chunk_type: kind,
+                                ..TocEntry::new(entry.name.clone(), TocEntryType::Chunk)
+                            });
+                        }
+                        at += c.length;
                     }
-                    at += c.length;
                 }
+                1 if !canonical => {
+                    let empty = Digest::empty(alg).to_string();
+                    (entry.digest, entry.chunk_digest) = (Some(empty.clone()), Some(empty));
+                }
+                2 => {
+                    let at = e.a as usize..e.a as usize + e.b as usize;
+                    entry.link_name = Some(utf8(&self.s[2][at]).to_string());
+                }
+                3 => entry.link_name = Some(path(e.a as usize)),
+                4 | 5 => (entry.dev_major, entry.dev_minor) = (Some(e.a), Some(e.b)),
+                _ => {}
             }
-            2 => {
-                let (a, b) = (e.a as usize, e.b as usize);
-                entry.link_name = Some(utf8(&targets[a..a + b]).to_string());
-            }
-            3 => entry.link_name = Some(path(e.a as usize)),
-            4 | 5 => (entry.dev_major, entry.dev_minor) = (Some(e.a), Some(e.b)),
-            _ => {}
+            let mut out = Vec::with_capacity(1 + chunk_entries.len());
+            out.push(entry);
+            out.extend(chunk_entries);
+            out
+        };
+        // (the entries on all the threads, as they are freed)
+        let entries: Vec<TocEntry> = self
+            .order
+            .par_iter()
+            .with_min_len(256)
+            .filter(|&&i| self.entry(i as usize).flags != IMPLIED)
+            .flat_map_iter(|&i| entry_of(i as usize))
+            .collect();
+        Toc {
+            version: if canonical {
+                TOC_VERSION_CANONICAL
+            } else {
+                TOC_VERSION
+            },
+            entries,
+            tar_split_digest: self.head.tarsplit.map(|d| d.to_string()),
         }
-        let mut out = Vec::with_capacity(1 + chunk_entries.len());
-        out.push(entry);
-        out.extend(chunk_entries);
-        out
-    };
-    let entries: Vec<TocEntry> = order
-        .par_iter()
-        .with_min_len(256)
-        .filter(|&&i| raw[i].flags != IMPLIED)
-        .flat_map_iter(|&i| entry_of(i))
-        .collect();
-    let canonical = head.tarsplit.is_none();
-    Ok(Toc {
-        version: if canonical {
-            TOC_VERSION_CANONICAL
-        } else {
-            TOC_VERSION
-        },
-        entries,
-        tar_split_digest: head.tarsplit.map(|d| d.to_string()),
-    })
+    }
 }
 
-/// The files and their chunks: sorted and distinct, in the data of the
-/// blob, the chunks of each in order inside its range and adding up to it.
-fn check_files(files: &[File], chunks: &[Chunk], data_end: u64) -> Result<(), String> {
-    let mut at = 0usize;
-    for (i, f) in files.iter().enumerate() {
-        let bad = |why: &str| Err(format!("file {i} of the table: {why}"));
-        if i > 0 && files[i - 1].verity >= f.verity {
-            return bad("the files are not sorted by digest");
-        }
-        let end = f.blob.0.checked_add(f.blob.1);
-        if f.size == 0 || f.blob.1 == 0 || end.is_none_or(|e| e > data_end) {
-            return bad("an empty file or a range outside of the data of the blob");
-        }
-        let end = f.blob.0 + f.blob.1;
-        let (first, count) = (f.chunks.0 as usize, f.chunks.1 as usize);
-        if first != at || count == 1 || count > chunks.len() - at {
-            return bad("its chunks are not the next ones");
-        }
-        at += count;
-        let mut size = 0u64;
-        for (k, c) in chunks[first..first + count].iter().enumerate() {
-            let in_order = match k {
-                0 => c.blob == f.blob.0,
-                _ => c.blob > chunks[first + k - 1].blob && c.blob < end,
-            };
-            size = size
-                .checked_add(c.length)
-                .filter(|_| c.length > 0 && in_order)
-                .ok_or(format!(
-                    "file {i} of the table: its chunks are not in order in its range"
-                ))?;
-        }
-        if count > 0 && size != f.size {
-            return bad("its chunks do not add up to it");
-        }
-    }
-    if at != chunks.len() {
-        return Err("the table has chunks that no file has".into());
-    }
-    Ok(())
+/// The table of contents `table` describes ([`Table::open`], [`Table::toc`]).
+pub fn decode(table: &[u8], data_end: u64) -> Result<Toc, String> {
+    Table::open(table, data_end).map(|t| t.toc())
 }
 
 /// A node of the tree [`encode`] makes.
@@ -738,7 +845,9 @@ pub fn encode(toc: &Toc, alg: Algorithm) -> Result<Vec<u8>, String> {
             continue;
         }
         let parts = components(&e.name)?;
-        if parts.iter().map(|p| p.len() + 1).sum::<usize>() > MAX_PATH {
+        // (as `./`, the path and a `/` for a directory: see `Table::open`)
+        let dir = usize::from(e.entry_type == TocEntryType::Dir);
+        if parts.iter().map(|p| p.len() + 1).sum::<usize>() + 1 + dir > MAX_PATH {
             return Err(format!("`{}` is too long", e.name));
         }
         let mut node = 0;
@@ -1130,6 +1239,30 @@ mod tests {
         serde_json::to_string(toc).unwrap()
     }
 
+    /// `toc` as a layer is stored by it: a canonical one as it is, another
+    /// with the names of its paths and the digest of no bytes for an empty
+    /// file.
+    fn stored(alg: Algorithm, mut toc: Toc) -> Toc {
+        if toc.is_canonical() {
+            return toc;
+        }
+        let path = |n: &str| match n.trim_start_matches("./").trim_end_matches('/') {
+            "" => "./".to_string(),
+            p => p.to_string(),
+        };
+        for e in &mut toc.entries {
+            e.name = path(&e.name);
+            if e.entry_type == TocEntryType::Hardlink {
+                e.link_name = e.link_name.as_deref().map(path);
+            }
+            if e.entry_type == TocEntryType::Reg && e.size == 0 {
+                let empty = Some(Digest::empty(alg).to_string());
+                (e.digest, e.chunk_digest) = (empty.clone(), empty);
+            }
+        }
+        toc
+    }
+
     #[test]
     fn test_a_table_is_its_table_of_contents() {
         for alg in Algorithm::ALL {
@@ -1138,7 +1271,7 @@ mod tests {
                 let table = encode(&toc, alg).unwrap();
                 assert_eq!(table[20], alg_byte(alg));
                 let back = decode(&table, 300).unwrap();
-                assert_eq!(json(&back), json(&toc), "{alg} {canonical}");
+                assert_eq!(json(&back), json(&stored(alg, toc)), "{alg} {canonical}");
                 assert_eq!(encode(&back, alg).unwrap(), table);
                 let head = head(&table).unwrap();
                 assert_eq!(head.alg, alg);
@@ -1202,6 +1335,33 @@ mod tests {
         }
     }
 
+    /// What a layer bounds and the table can say: a path deeper than a tar
+    /// name, more bytes of extended attributes than a tar header holds.
+    #[test]
+    fn test_a_table_beyond_the_bounds_of_a_layer_is_refused() {
+        let alg = Algorithm::Sha256;
+        let mut deep = sample(alg, true);
+        let mut name = "./".to_string();
+        for _ in 0..=MAX_DEPTH {
+            name.push_str("x/");
+            deep.entries.push(e(&name, TocEntryType::Dir));
+        }
+        let table = encode(&deep, alg).unwrap();
+        assert!(decode(&table, 300).unwrap_err().contains("too deep"));
+        deep.entries.pop();
+        assert!(decode(&encode(&deep, alg).unwrap(), 300).is_ok());
+
+        let mut big = sample(alg, true);
+        let value = base64::engine::general_purpose::STANDARD.encode([7u8; MAX_XATTR_VALUE]);
+        for i in 0..MAX_XATTR_BYTES / MAX_XATTR_VALUE {
+            big.entries[1]
+                .xattrs
+                .insert(format!("user.k{i}"), value.clone());
+        }
+        let table = encode(&big, alg).unwrap();
+        assert!(decode(&table, 300).unwrap_err().contains("too many bytes"));
+    }
+
     /// Where field `at` of entry `i` is.
     fn entry_at(alg: Algorithm, i: usize, at: usize) -> usize {
         header_len(alg) + i * ENTRY + at
@@ -1244,6 +1404,7 @@ mod tests {
             ("name", Box::new(names(1)), b"/".to_vec()),
             ("name", Box::new(names(1)), b".".to_vec()),
             ("name", Box::new(names(1)), b"\0".to_vec()),
+            ("not UTF-8", Box::new(names(1)), vec![0xff]),
             (
                 "fields of its kind",
                 Box::new(ent(1, 20)),

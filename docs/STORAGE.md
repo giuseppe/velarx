@@ -291,7 +291,10 @@ object name.
   what it holds, with hard links to an earlier file: every layer velarx
   builds.  A pull of a layer that has one, lazy or not, fetches and checks
   the table instead of the JSON TOC (its checksum against the descriptor,
-  then every record, see `crates/storage/src/table.rs`), and never reads
+  then every record where it is, see `crates/storage/src/table.rs`, whose
+  rules hold what the checks of a JSON TOC test: each path once and in
+  order, one size for a digest, an fs-verity digest for each file), makes
+  the entries the layer is stored by from it in one pass, and never reads
   the JSON: a table that cannot be used is an error that names the layer.
   Its key is `toc:` and the table's checksum, so the layer is not the one
   a pull by its JSON TOC stored.

@@ -214,6 +214,16 @@ pub fn table(data: &[u8]) {
         again == data,
         "a table that is not its one encoding is accepted"
     );
+    // (its entries are in the form a layer keeps)
+    if !toc.is_canonical() {
+        let layer = velarx_types::digest::Digest::of(alg, data);
+        let kept = velarx_content::pull::lazy::toc_view(toc.clone(), alg, &layer)
+            .expect("the entries of a table are those of a layer");
+        assert!(
+            serde_json::to_value(&kept).ok() == serde_json::to_value(&toc).ok(),
+            "a table gives entries that a layer keeps otherwise"
+        );
+    }
 }
 
 /// A manifest or an index, and the choice of a platform.

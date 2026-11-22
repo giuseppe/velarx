@@ -1507,12 +1507,15 @@ mod tests {
                 let mut first = std::collections::HashMap::new();
                 for e in &mut toc.entries {
                     e.digest = None;
-                    // (the table names an entry as a canonical tar does)
-                    if !canonical {
-                        e.name = format!("./{}", e.name);
-                        if e.entry_type == TocEntryType::Hardlink {
-                            e.link_name = e.link_name.as_ref().map(|l| format!("./{l}"));
-                        }
+                    // (a layer with a tar-split keeps the paths of its
+                    // directories, and the digest of no bytes for an empty
+                    // file)
+                    if !canonical && e.entry_type == TocEntryType::Dir && e.name != "./" {
+                        e.name = e.name.trim_end_matches('/').to_string();
+                    }
+                    if !canonical && e.entry_type == TocEntryType::Reg && e.size == 0 {
+                        let empty = Some(Digest::empty(alg).to_string());
+                        (e.digest, e.chunk_digest) = (empty.clone(), empty);
                     }
                     if let Some(v) = e.fsverity {
                         let (off, end) = *first.entry(v).or_insert((e.offset, e.end_offset));
