@@ -14,10 +14,13 @@
 //! by a hash of the swarm key, of the TLS exporter of the connection (with
 //! the label of its side).  The exporter is different for every connection,
 //! so a proof cannot be replayed on another one and a man in the middle that
-//! makes two connections cannot pass it on.  The server serves no request
-//! before the client's proof, the client asks nothing before the server's:
-//! a peer without the key learns neither content nor what is asked.  A wrong proof
-//! closes the connection.
+//! makes two connections cannot pass it on.  The server checks the client's
+//! proof before it sends its own and serves no request before it, the client
+//! asks nothing before the server's: a peer without the key learns neither
+//! content nor what is asked.  A wrong proof closes the connection.  A
+//! connection holds one of the places of the server from its first packet,
+//! from an address that showed it receives what is sent to it (a retry), for
+//! [`Limits::grace`] at most until the client proved the key.
 //!
 //! In a swarm with a certificate authority ([`Auth::Authority`],
 //! [`crate::authority`]) none of that applies: the handshake is mutual TLS,
@@ -40,9 +43,9 @@
 //! and proofs, kept while requests use them and closed after
 //! [`Limits::extra_idle`] without one.  An extra
 //! connection names the server [`EXTRA_NAME`] in its handshake, and the server
-//! admits one only while it holds less than half of its connections, and at
-//! most [`EXTRAS_PER_PEER`] from an address: what the swarm may take of its
-//! connections for the primary ones stays.  A lane whose extra connection
+//! admits one, once it proved the key, only while it holds less than half of
+//! its connections, and at most [`EXTRAS_PER_PEER`] from an address: what the
+//! swarm may take of its connections for the primary ones stays.  A lane whose extra connection
 //! cannot be made or fails asks the primary connection instead.
 //!
 //! A request is a bidirectional stream: an operation (u8), its urgency (u8:
@@ -844,6 +847,14 @@ impl Quic {
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let ip = serve::prefix(incoming.remote_address().ip());
+                // (an address that sent no token back is asked to: a
+                // spoofed one takes no place)
+                if !incoming.remote_address_validated() {
+                    if let Err(e) = incoming.retry() {
+                        debug!("QUIC connection from {ip}: {e}");
+                    }
+                    continue;
+                }
                 let Some(admitted) = server.admit() else {
                     debug!("QUIC connection from {ip} refused: all places are taken");
                     incoming.refuse();
@@ -852,24 +863,24 @@ impl Quic {
                 let server = server.clone();
                 tokio::spawn(async move {
                     let _admitted = admitted;
-                    let connection = match incoming.await {
-                        Ok(connection) => connection,
-                        Err(e) => {
-                            debug!("QUIC handshake from {ip} failed: {e}");
+                    // (the handshake and the proofs in `grace`: one that is
+                    // not a member holds the place no longer)
+                    let proved = tokio::time::timeout(server.limits.grace, async {
+                        let connection = incoming.await.map_err(other)?;
+                        let extra = server.prove(&connection, ip).await?;
+                        Ok::<_, io::Error>((connection, extra))
+                    })
+                    .await;
+                    let (connection, _extra) = match proved {
+                        Ok(Ok(proved)) => proved,
+                        Ok(Err(e)) => {
+                            debug!("QUIC connection from {ip}: {e}");
                             return;
                         }
-                    };
-                    let _extra = match is_extra(&connection) {
-                        true => match server.admit_extra(ip) {
-                            Some(place) => Some(place),
-                            None => {
-                                debug!("Extra QUIC connection from {ip} refused: no place");
-                                connection
-                                    .close(NO_PLACE.into(), b"no place for an extra connection");
-                                return;
-                            }
-                        },
-                        false => None,
+                        Err(_) => {
+                            debug!("QUIC connection from {ip}: no proof in time");
+                            return;
+                        }
                     };
                     server.connection(connection, ip).await;
                 });
@@ -1854,29 +1865,47 @@ impl Server {
         Some(ExtraPlace(self.extras.clone(), ip))
     }
 
-    /// The proofs, then the streams of a connection from `ip` (its prefix),
-    /// as long as the peer keeps it.
-    async fn connection(self: &Arc<Self>, connection: quinn::Connection, ip: IpAddr) {
+    /// The proof that the peer of `connection`, from `ip`, is a member,
+    /// the place of an extra connection when it is one, then the proof of
+    /// this end: a connection that is not a member, or an extra one with no
+    /// place, is closed before it has the proof of this end.
+    async fn prove(
+        &self,
+        connection: &quinn::Connection,
+        ip: IpAddr,
+    ) -> io::Result<Option<ExtraPlace>> {
         let each = self.limits.grace;
-        let proved = match &self.auth {
-            Auth::Key(key) => {
-                async {
-                    send_proof(&connection, key, SERVER, each).await?;
-                    check_proof(&connection, key, CLIENT, each).await
-                }
-                .await
-            }
+        let checked = match &self.auth {
+            Auth::Key(key) => check_proof(connection, key, CLIENT, each).await,
             // (admitted by the handshake)
             Auth::Authority(authority) => authority
-                .admitted_quic(&connection)
+                .admitted_quic(connection)
                 .map(|_| ())
                 .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string())),
         };
-        if let Err(e) = proved {
-            debug!("QUIC connection from {}: {e}", connection.remote_address());
+        if let Err(e) = checked {
             connection.close(1u32.into(), b"not a member of the swarm");
-            return;
+            return Err(e);
         }
+        let extra = match is_extra(connection) {
+            true => match self.admit_extra(ip) {
+                Some(place) => Some(place),
+                None => {
+                    connection.close(NO_PLACE.into(), b"no place for an extra connection");
+                    return Err(io::Error::other("an extra connection, and no place for it"));
+                }
+            },
+            false => None,
+        };
+        if let Auth::Key(key) = &self.auth {
+            send_proof(connection, key, SERVER, each).await?;
+        }
+        Ok(extra)
+    }
+
+    /// The streams of a connection from `ip` (its prefix), proved a member,
+    /// as long as the peer keeps it.
+    async fn connection(self: &Arc<Self>, connection: quinn::Connection, ip: IpAddr) {
         let streams = Arc::new(Semaphore::new(self.limits.streams_per_connection));
         loop {
             let Ok(permit) = streams.clone().acquire_owned().await else {
