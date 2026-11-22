@@ -642,6 +642,16 @@ pub async fn run_with(
         None
     };
 
+    // (the store service started for this one leaves when nothing is
+    // connected to it, and cannot be started again once this one is
+    // confined: the follower holds a connection, or this one does)
+    let _store = match &follower {
+        Some(_) => None,
+        None => velarx_core::store_service::connect(&store_socket)
+            .await
+            .ok(),
+    };
+
     // The peers as a fetcher of the pulls
     let peer_source = Arc::new(
         PeerSource::new(Arc::clone(&node))
