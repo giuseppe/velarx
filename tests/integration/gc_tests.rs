@@ -8,7 +8,7 @@ use std::sync::Arc;
 use velarx_config::StorageConfig;
 use velarx_core::services::{GcOptions, GcService};
 use velarx_db::{Database, RecordState};
-use velarx_storage::{StorageLock, Toc};
+use velarx_storage::StorageLock;
 
 fn gc(e: &Env) -> GcService {
     let storage = StorageConfig {
@@ -39,7 +39,7 @@ async fn all_files_stored(db: &Database, store: &velarx_storage::FileStore, imag
     let layers = db.get_image_layers(image).await.unwrap();
     assert!(!layers.is_empty());
     for l in layers {
-        let toc: Toc = serde_json::from_str(l.toc.as_deref().unwrap()).unwrap();
+        let toc = crate::common::stored_toc(db, &l.key).await;
         for entry in &toc.entries {
             if let Some(d) = entry.verity() {
                 assert!(store.contains(&d), "{} of {} is gone", entry.name, l.key);

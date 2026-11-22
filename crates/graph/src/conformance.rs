@@ -356,7 +356,7 @@ async fn store_layer(s: &Subject, tar: Vec<u8>) -> Stored {
     let mut pulled = offer.pull(s, engine_check()).await.expect("pull");
     let done = pulled.layers.remove(0);
     let artifact = pulled.artifacts[&done.key].clone();
-    let mut commit = layer_commit(&done, None).unwrap();
+    let mut commit = commit_of(s, &done);
     commit.record.erofs = Some(artifact.image_digest.clone());
     commit.record.owners = Some(artifact.owners.clone());
     s.db.commit_layers(vec![commit], vec![]).await.unwrap();
@@ -3173,7 +3173,7 @@ pub async fn a_gzip_layer_of_a_registry_is_pulled_and_read_back(f: &Factory) {
         }
     };
     let staged = || {
-        std::fs::read_dir(s.dir.join(velarx_content::pull::staged_fetch::LAYERS))
+        std::fs::read_dir(s.staging.join(velarx_content::pull::staged_fetch::LAYERS))
             .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
             .unwrap_or_default()
     };
@@ -3375,7 +3375,7 @@ pub async fn has_layers_does_not_report_what_is_not_committed(f: &Factory) {
         );
     }
     // recorded: it is
-    let mut commit = layer_commit(&done, None).unwrap();
+    let mut commit = commit_of(&s, &done);
     commit.record.erofs = Some(pulled.artifacts[&done.key].image_digest.clone());
     commit.record.owners = Some(pulled.artifacts[&done.key].owners.clone());
     s.db.commit_layers(vec![commit], vec![]).await.unwrap();
@@ -3430,7 +3430,10 @@ pub async fn has_layers_does_not_report_a_layer_it_cannot_serve(f: &Factory) {
     let key = base.key.to_string();
     s.db.conn()
         .call(move |conn| {
-            conn.execute("UPDATE layers SET tarsplit = NULL WHERE id = ?1", [&key])?;
+            conn.execute(
+                "UPDATE layers SET tarsplit_digest = NULL WHERE id = ?1",
+                [&key],
+            )?;
             Ok(())
         })
         .await
@@ -3447,7 +3450,7 @@ pub async fn has_layers_does_not_report_a_layer_it_cannot_serve(f: &Factory) {
     let done = pulled.layers.remove(0);
     assert_eq!(done.key, base.key);
     let artifact = pulled.artifacts[&done.key].clone();
-    let mut commit = layer_commit(&done, None).unwrap();
+    let mut commit = commit_of(&s, &done);
     commit.record.erofs = Some(artifact.image_digest);
     commit.record.owners = Some(artifact.owners);
     s.db.commit_layers(vec![commit], vec![]).await.unwrap();
@@ -4243,6 +4246,7 @@ pub async fn a_lazy_pull_is_staged_by_the_engine_and_completed_into_the_driver(f
         key: done.key,
         toc: done.toc.clone(),
         tarsplit: done.tarsplit.clone(),
+        toc_z: done.toc_z.clone(),
     };
     let feed: Arc<dyn PullFeed> = Arc::new(StagedFeed::new(
         vec![index],
@@ -4322,6 +4326,7 @@ pub async fn a_staged_file_that_is_not_its_name_is_not_stored(f: &Factory) {
             key: done.key,
             toc: done.toc.clone(),
             tarsplit: done.tarsplit.clone(),
+            toc_z: done.toc_z.clone(),
         }],
         Arc::new(StoreContent(vec![pool])),
         2,
@@ -6519,12 +6524,19 @@ forward_storage_driver! {
     }
 }
 
+/// The commit of a layer a pull stored, as the engine makes it: the files of
+/// the layer are written before the row that names it.
+fn commit_of(s: &Subject, done: &LayerDone) -> velarx_db::LayerCommit {
+    done.write_files(s.db.root().unwrap()).unwrap();
+    layer_commit(done, None).unwrap()
+}
+
 /// Record what a pull stored, as the engine does after it.
 async fn record(s: &Subject, pulled: &Pulled) {
     let mut commits = Vec::new();
     for l in &pulled.layers {
         let artifact = &pulled.artifacts[&l.key];
-        let mut commit = layer_commit(l, None).unwrap();
+        let mut commit = commit_of(s, l);
         commit.record.erofs = Some(artifact.image_digest.clone());
         commit.record.owners = Some(artifact.owners.clone());
         commits.push(commit);

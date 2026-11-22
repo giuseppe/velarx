@@ -503,6 +503,11 @@ fn collect_store(
             }
         }))
         .map_err(failed)?;
+    if let Some(root) = store.db.root() {
+        for k in gone.iter().filter_map(|k| velarx_types::LayerKey::parse(k)) {
+            velarx_db::layer_files::remove_layer(root, &k).map_err(failed)?;
+        }
+    }
     let mut recorded: HashSet<String> = HashSet::new();
     for l in rows.iter().filter(|l| kept.contains(&l.key.to_string())) {
         let refs = store

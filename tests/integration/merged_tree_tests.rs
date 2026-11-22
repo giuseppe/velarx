@@ -739,7 +739,8 @@ fn from_tar(path: &Path) -> Vec<TocEntry> {
 }
 
 /// What the images a pull made in a store make of the layers of an image
-/// (`CFS_LAYERS`: a file of `[[digest, toc], ...]`, the lowest first; the
+/// (`CFS_LAYERS`: a file of `[[digest, toc file], ...]`, the file of the table
+/// of contents of each layer, the lowest first; the
 /// objects of the store in `CFS_FILES`), against the tar of `podman export`
 /// (`CFS_TAR`) of the same image.  Paths podman adds to a container
 /// (`CFS_IGNORE`, comma separated) are left out.
@@ -892,7 +893,11 @@ fn the_merged_image_has_the_id_composefs_rs_gives() {
         serde_json::from_slice(&std::fs::read(layers).unwrap()).unwrap();
     let tocs: Vec<Toc> = pairs
         .iter()
-        .map(|(_, t)| serde_json::from_str(t).unwrap())
+        .map(|(d, file)| {
+            let key = velarx_db::LayerKey::parse(d).unwrap();
+            let toc_z = std::fs::read(file).unwrap();
+            velarx_content::pull::stored::stored_view(&toc_z, &key).unwrap()
+        })
         .collect();
     let layers: Vec<&[TocEntry]> = tocs.iter().map(|t| t.entries.as_slice()).collect();
     let mut store = StoreFiles::read(files);

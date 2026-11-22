@@ -198,34 +198,26 @@ impl ImageService {
 
     /// The layers of the image being pulled `id`, in order: a layer the
     /// store has is its record, the others are staged (`status` `lazy`).
-    pub async fn staged_layers(&self, id: &str, toc: bool) -> ImageResult<Vec<LayerRecord>> {
+    pub async fn staged_layers(&self, id: &str) -> ImageResult<Vec<LayerRecord>> {
         let pull = self
             .staging_area()
             .pull(id)?
             .ok_or_else(|| ImageError::NotFound(format!("the pull of image {id}")))?;
-        self.layers_of_pull(&pull, toc).await
+        self.layers_of_pull(&pull).await
     }
 
     /// The layers of the pull `pull`, as [`Self::staged_layers`].
-    pub async fn layers_of_pull(
-        &self,
-        pull: &StagedPull,
-        toc: bool,
-    ) -> ImageResult<Vec<LayerRecord>> {
+    pub async fn layers_of_pull(&self, pull: &StagedPull) -> ImageResult<Vec<LayerRecord>> {
         let area = self.staging_area();
         let mut out = Vec::with_capacity(pull.layers.len());
         for key in &pull.layers {
             let key = LayerKey::parse(key)
                 .ok_or_else(|| ImageError::Layer(format!("{key:?} is no layer key")))?;
             if let Some(staged) = area.layer(&key)? {
-                out.push(staged.record(toc)?);
+                out.push(staged.record());
                 continue;
             }
-            let mut record = self.db.get_layer(&key).await?;
-            if !toc {
-                record.toc = None;
-            }
-            out.push(record);
+            out.push(self.db.get_layer(&key).await?);
         }
         Ok(out)
     }

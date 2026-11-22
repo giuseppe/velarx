@@ -34,7 +34,7 @@ struct LazyLayer {
     toc: Arc<Toc>,
     tarsplit: bytes::Bytes,
     /// The table as the registry sent it, recorded with the layer
-    toc_z: Option<bytes::Bytes>,
+    toc_z: bytes::Bytes,
     /// What the staging area says of it (`layer.json`)
     meta: velarx_content::pull::staged::StagedLayerMeta,
 }
@@ -492,13 +492,17 @@ impl ImageService {
                 let (toc, tarsplit, layer) = (toc.clone(), tarsplit.clone(), desc.digest);
                 move || velarx_content::pull::lazy::replay(&toc, tarsplit, &layer)
             }));
+            let toc_z = match staged.toc_z()? {
+                Some(toc_z) => toc_z.into(),
+                None => velarx_content::pull::stored::json_z(&toc),
+            };
             layers.push(LazyLayer {
                 key: *key,
                 desc: desc.clone(),
                 diff_id: *diff_id,
                 toc,
                 tarsplit,
-                toc_z: staged.toc_z()?.map(bytes::Bytes::from),
+                toc_z,
                 meta: staged.meta,
             });
         }
@@ -530,15 +534,22 @@ impl ImageService {
         let Ok(record) = self.db.get_own_layer(key).await else {
             return Ok(None);
         };
-        let (Some(toc), Some(erofs), Some(owners), Some(blob)) = (
-            record.toc.as_deref(),
-            record.erofs.clone(),
-            record.owners.clone(),
-            record.blob,
-        ) else {
+        let (Some(erofs), Some(owners), Some(blob)) =
+            (record.erofs.clone(), record.owners.clone(), record.blob)
+        else {
             return Ok(None);
         };
-        let toc: Toc = serde_json::from_str(toc)?;
+        let Some(toc_z) = self.db.get_layer_toc_z(key).await? else {
+            return Ok(None);
+        };
+        let toc = {
+            let (toc_z, key) = (toc_z.clone(), *key);
+            tokio::task::spawn_blocking(move || {
+                velarx_content::pull::stored::stored_view(&toc_z, &key)
+            })
+            .await
+            .map_err(|e| ImageError::Storage(e.to_string()))??
+        };
         // (a canonical layer has none: its table of contents has the tar)
         let Some(tarsplit) = self
             .db
@@ -570,8 +581,7 @@ impl ImageService {
             diff_id: *diff_id,
             toc,
             tarsplit: tarsplit.into(),
-            // (the engine's row keeps it already)
-            toc_z: None,
+            toc_z: toc_z.into(),
             meta: velarx_content::pull::staged::StagedLayerMeta {
                 key: key.to_string(),
                 blob: blob.to_string(),
@@ -785,6 +795,7 @@ impl ImageService {
                 key: l.key,
                 toc: l.toc.clone(),
                 tarsplit: l.tarsplit.clone(),
+                toc_z: l.toc_z.clone(),
             })
             .collect();
         // (the files are the engine's own objects now; one that is not, the
@@ -851,7 +862,7 @@ impl ImageService {
             );
             (commit.record.blob, commit.record.size) =
                 (layer.meta.blob.parse().ok(), layer.meta.size);
-            commit.kept_toc = layer.toc_z.as_deref().map(<[u8]>::to_vec);
+            self.write_layer_files([&pulled]).await?;
             self.db.commit_layers(vec![commit], Vec::new()).await?;
             debug!("Layer {} pulled into the storage driver", layer.key);
         }
@@ -916,7 +927,29 @@ impl ImageService {
                 layer.key
             )));
         }
-        let linked = self.link_verified(all, verified).await?;
+        // by its table: every file was measured against its entry, and
+        // nothing claims the stream (no diff id) before a recreation of it
+        // checks one
+        let mut done = LayerDone {
+            key: layer.key,
+            blob: layer.desc.digest,
+            diff_id: layer.diff_id,
+            size: layer.desc.size,
+            toc: layer.toc.clone(),
+            files: Vec::new(),
+            chunks,
+            report: Default::default(),
+            tarsplit: layer.tarsplit.clone(),
+            toc_z: layer.toc_z.clone(),
+            lazy: false,
+            blob_checked: false,
+            checked: Default::default(),
+        };
+        // (its files are written with the others, before the barrier that
+        // makes them durable: the row that names the layer comes after it)
+        let linked = self
+            .link_verified(all, verified, vec![done.clone()])
+            .await?;
         // (a file the link refused, or that went meanwhile, is not fetched
         // here: the layer stays staged)
         let one: Arc<[LazyLayer]> = vec![layer.clone()].into();
@@ -926,27 +959,8 @@ impl ImageService {
             .filter(|o| o.checked)
             .map(|o| o.verity.clone())
             .collect();
-        // by its table: every file was measured against its entry, and
-        // nothing claims the stream (no diff id) before a recreation of it
-        // checks one
-        let mut commit = layer_commit(
-            &LayerDone {
-                key: layer.key,
-                blob: layer.desc.digest,
-                diff_id: layer.diff_id,
-                size: layer.desc.size,
-                toc: layer.toc.clone(),
-                files: Vec::new(),
-                chunks,
-                report: Default::default(),
-                tarsplit: layer.tarsplit.clone(),
-                toc_z: layer.toc_z.clone(),
-                lazy: false,
-                blob_checked: false,
-                checked,
-            },
-            layer.meta.registry_ref.as_deref(),
-        )?;
+        done.checked = checked;
+        let mut commit = layer_commit(&done, layer.meta.registry_ref.as_deref())?;
         (commit.record.blob, commit.record.size) = (layer.meta.blob.parse().ok(), layer.meta.size);
         (commit.record.erofs, commit.record.owners) = (
             Some(layer.meta.erofs.clone()),
@@ -995,13 +1009,7 @@ impl ImageService {
             // (still there: it was looked for before the lock)
             self.db.get_image_by_digest(&read.manifest_digest).await?;
         } else if self.storage.holds_objects() && !super::seal::expected(manifest)?.is_empty() {
-            let mut tocs = Vec::with_capacity(layers.len());
-            for k in layers {
-                let toc = self.db.get_layer(k).await?.toc.ok_or_else(|| {
-                    ImageError::Layer(format!("layer {k} has no table of contents"))
-                })?;
-                tocs.push(serde_json::from_str::<Toc>(&toc)?);
-            }
+            let tocs = velarx_content::pull::stored::stored_tocs(&self.db, layers).await?;
             let (store, want) = (self.file_store.clone(), manifest.clone());
             let alg = read.manifest_digest.alg();
             let algs: Vec<Algorithm> = layers.iter().map(|k| k.digest().alg()).collect();
@@ -1132,7 +1140,7 @@ impl ImageService {
         images: Vec<&LazyLayer>,
     ) -> ImageResult<Vec<velarx_storage::Object>> {
         let verified = self.verify_files(layers, digests, images).await?;
-        self.link_verified(layers, verified).await
+        self.link_verified(layers, verified, Vec::new()).await
     }
 
     /// The staging phase of [`LazyEngine::link_files`]: every staged file
@@ -1181,6 +1189,7 @@ impl ImageService {
         &self,
         layers: &[LazyLayer],
         staged: StagedFiles,
+        keep: Vec<LayerDone>,
     ) -> ImageResult<Vec<velarx_storage::Object>> {
         let store = self.file_store.clone();
         let (done, steps, refused) = tokio::task::spawn_blocking(move || {
@@ -1191,7 +1200,7 @@ impl ImageService {
                 objects,
                 verified,
             } = staged;
-            place_staged(verified, &dirs, &wanted, &store, &images, &objects)
+            place_staged(verified, &dirs, &wanted, &store, &images, &objects, &keep)
         })
         .await
         .map_err(|e| ImageError::Storage(e.to_string()))??;
@@ -1393,7 +1402,7 @@ fn commit_staged(
     objects: &Path,
 ) -> ImageResult<Placed> {
     let verified = verify_staged(dirs, wanted, store, fsverity, images, objects)?;
-    place_staged(verified, dirs, wanted, store, images, objects)
+    place_staged(verified, dirs, wanted, store, images, objects, &[])
 }
 
 /// The staging phase of [`commit_staged`]: every file is checked and
@@ -1456,10 +1465,19 @@ fn place_staged(
     store: &velarx_storage::FileStore,
     images: &[StagedImageOf],
     objects: &Path,
+    keep: &[LayerDone],
 ) -> ImageResult<Placed> {
     use velarx_content::pull::commit::{commit_verified, Refusal};
     let stagings = stagings_of(dirs, wanted, images, objects);
-    let linked = commit_verified(&stagings, verified, store, None)
+    // (the files of the layers are written between the links and the barrier
+    // of the store, as the images are)
+    let mut write = |_: &[velarx_content::pull::commit::Linked]| {
+        for done in keep {
+            done.write_files(velarx_db::layer_files::root_of(store.root()))?;
+        }
+        Ok(!keep.is_empty())
+    };
+    let linked = commit_verified(&stagings, verified, store, Some(&mut write))
         .map_err(|e| ImageError::Storage(e.to_string()))?;
     let steps = linked.iter().filter_map(|l| l.image.clone()).collect();
     // (the files of fetchers the commit refused)
@@ -1545,7 +1563,7 @@ mod tests {
                 owners: String::new(),
                 created_at: String::new(),
             },
-            toc_z: None,
+            toc_z: bytes::Bytes::new(),
         }
     }
 
@@ -2095,7 +2113,7 @@ mod tests {
                     owners: String::new(),
                     created_at: String::new(),
                 },
-                toc_z: None,
+                toc_z: bytes::Bytes::new(),
             };
             service
                 .stage_lazy(&key, vec![file.clone()], Urgency::Background)
@@ -2307,7 +2325,6 @@ mod tests {
                     diff_id: Some(sha("diff")),
                     other_diff_id: None,
                     size: 1,
-                    toc: Some("{}".into()),
                     status: "ready".into(),
                     created_at: "2026-01-01T00:00:00Z".into(),
                     registry_ref: None,
@@ -2317,9 +2334,9 @@ mod tests {
                 files: vec![],
                 refs: vec![],
                 chunks: vec![],
-                tarsplit: Some(b"ts".to_vec()),
+                toc_digest: sha("{}"),
+                tarsplit: Some(sha("ts")),
                 blob_checked: false,
-                kept_toc: None,
             }],
             vec![],
         )
@@ -2441,7 +2458,15 @@ mod tests {
         let toc = serde_json::json!({"version": 1, "entries": [
             {"name": "f", "type": "reg", "size": 4, "fsverity": file}
         ]});
-        let db = velarx_db::Database::open_in_memory().await.unwrap();
+        let db = velarx_db::Database::open(tmp.path().join("db"))
+            .await
+            .unwrap();
+        // (the files of the layer, as its pull wrote them)
+        let toc_z = zstd::encode_all(toc.to_string().as_bytes(), 3).unwrap();
+        velarx_db::layer_files::write(tmp.path(), &key, velarx_db::layer_files::TOC, &toc_z)
+            .unwrap();
+        velarx_db::layer_files::write(tmp.path(), &key, velarx_db::layer_files::TARSPLIT, b"ts")
+            .unwrap();
         db.commit_layers(
             vec![velarx_db::LayerCommit {
                 record: velarx_db::LayerRecord {
@@ -2451,7 +2476,6 @@ mod tests {
                     diff_id: Some(sha("diff")),
                     other_diff_id: None,
                     size: 1,
-                    toc: Some(toc.to_string()),
                     status: "ready".into(),
                     created_at: "2026-01-01T00:00:00Z".into(),
                     registry_ref: None,
@@ -2461,9 +2485,9 @@ mod tests {
                 files: vec![],
                 refs: vec![],
                 chunks: vec![],
-                tarsplit: Some(b"ts".to_vec()),
+                toc_digest: Digest::of(Algorithm::Sha256, &toc_z),
+                tarsplit: Some(sha("ts")),
                 blob_checked: false,
-                kept_toc: None,
             }],
             vec![],
         )

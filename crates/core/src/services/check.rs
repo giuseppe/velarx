@@ -188,13 +188,6 @@ impl CheckService {
         let mut run = Run::default();
 
         let shared = StorageLock::shared(&self.lock_path()).await?;
-        // (a table of contents as text is never this build's: the store is
-        // of another build, no image of it is damaged by that)
-        if self.db.has_text_toc().await? {
-            return Err(CheckError::Other(
-                "the layers of this store are not in the form of this build of velarx: nothing is repaired; a store made by another build is not used: remove it".into(),
-            ));
-        }
         let mut images = self.own_images().await?;
         let times = self.db.image_check_times().await?;
         images.sort_by_key(|i| times.get(&i.id).copied().unwrap_or(0));
@@ -397,26 +390,26 @@ impl CheckService {
         // the files the layers name
         let mut files: BTreeMap<String, u64> = BTreeMap::new();
         for (i, layer) in layers.iter().enumerate() {
-            let Some(toc_json) = &layer.toc else {
-                add(
-                    "toc_missing",
-                    format!(
-                        "layer {i} ({}) has no table of contents",
-                        short_key(&layer.key)
-                    ),
-                    None,
-                    Fix::None,
-                    true,
-                );
-                continue;
-            };
-            let toc: Toc = match serde_json::from_str(toc_json) {
-                Ok(t) => t,
+            let toc = match velarx_content::pull::stored::stored_toc(&self.db, &layer.key).await {
+                Ok(Some(t)) => t,
+                Ok(None) => {
+                    add(
+                        "toc_missing",
+                        format!(
+                            "layer {i} ({}) has no table of contents",
+                            short_key(&layer.key)
+                        ),
+                        None,
+                        Fix::None,
+                        true,
+                    );
+                    continue;
+                }
                 Err(e) => {
                     add(
                         "bad_toc",
                         format!(
-                            "the table of contents of layer {i} ({}) does not parse: {e}",
+                            "the table of contents of layer {i} ({}) cannot be read: {e}",
                             short_key(&layer.key)
                         ),
                         None,

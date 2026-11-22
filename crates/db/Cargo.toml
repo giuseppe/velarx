@@ -27,7 +27,6 @@ velarx-sys = { path = "../sys", features = ["tokio"] }
 velarx-base = { path = "../base" }
 velarx-types = { path = "../types" }
 velarx-storage = { path = "../storage" }
-velarx-tarsplit = { path = "../tarsplit" }
 velarx-config = { path = "../config", features = ["engine"] }
 rusqlite.workspace = true
 tokio-rusqlite.workspace = true
@@ -39,7 +38,6 @@ tracing.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 rustix = { workspace = true, features = ["fs", "process"] }
 tempfile.workspace = true
-zstd.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

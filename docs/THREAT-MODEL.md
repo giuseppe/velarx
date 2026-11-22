@@ -12,7 +12,9 @@ limit, not a guarantee.
   a user, rootless) and is the most privileged code on the path of every
   byte that comes from outside.
 * **The store**: the files of the images (`<root>/objects`), the database
-  (`db.sqlite`), the containers' state, volumes, secrets and credentials.
+  (`db.sqlite`), the table of contents and the tar-split of each layer
+  (`<root>/layers`, checked against the digests of the database whenever they
+  are read), the containers' state, volumes, secrets and credentials.
   What is in the store is run as the container's root file system.
 * **The control of the engine**: whoever can send requests to the API
   controls the containers, and as root can run anything on the host (a

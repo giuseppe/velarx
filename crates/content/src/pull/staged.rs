@@ -234,23 +234,21 @@ impl StagedLayer {
         LayerKey::parse(&self.meta.key).expect("a staged layer has a key it was written with")
     }
 
-    /// The record as the engine's code sees a layer: marked as lazy, with the
-    /// table of contents when `toc` is asked for.
-    pub fn record(&self, toc: bool) -> io::Result<LayerRecord> {
-        Ok(LayerRecord {
+    /// The record as the engine's code sees a layer: marked as lazy.
+    pub fn record(&self) -> LayerRecord {
+        LayerRecord {
             key: self.key(),
             blob: self.meta.blob.parse().ok(),
             diff_id: None,
             other_diff_id: None,
             size: self.meta.size,
-            toc: if toc { Some(self.toc_text()?) } else { None },
             status: "lazy".to_string(),
             created_at: self.meta.created_at.clone(),
             registry_ref: self.meta.registry_ref.clone(),
             erofs: Some(self.meta.erofs.clone()),
             owners: Some(self.meta.owners.clone()),
             stream_size: None,
-        })
+        }
     }
 
     pub fn toc_text(&self) -> io::Result<String> {
@@ -1275,8 +1273,7 @@ mod tests {
         let got = area.layer(&key).unwrap().unwrap();
         assert_eq!(got.meta, meta);
         assert_eq!(got.tarsplit().unwrap(), b"ts");
-        assert_eq!(got.record(true).unwrap().status, "lazy");
-        assert!(got.record(false).unwrap().toc.is_none());
+        assert_eq!(got.record().status, "lazy");
         let p = pull(1, "latest");
         area.publish_pull(&p).unwrap();
         assert_eq!(area.pull(&p.id).unwrap().unwrap(), p);

@@ -141,7 +141,6 @@ fn layer_records() -> Vec<LayerRecord> {
             diff_id: Some(digest(n)),
             other_diff_id: None,
             size: 1,
-            toc: None,
             status: "ready".into(),
             created_at: String::new(),
             registry_ref: None,

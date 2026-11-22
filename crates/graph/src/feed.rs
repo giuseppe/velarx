@@ -101,6 +101,10 @@ pub struct LayerIndex {
     pub toc: Arc<Toc>,
     /// The zstd compressed tar-split.
     pub tarsplit: bytes::Bytes,
+    /// What the file `toc.zst` of the layer holds: the table as the registry
+    /// sent it, when the layer is pulled by it, else the zstd of the JSON of
+    /// `toc`.
+    pub toc_z: bytes::Bytes,
 }
 
 /// What the driver gives the feed to receive a pull: what it wants, and where
@@ -514,6 +518,8 @@ pub struct ContentFeed {
 struct Spooled {
     spool: Arc<dyn LocalContent>,
     ingested: pull::stream::Ingested,
+    /// What the file `toc.zst` of the layer holds
+    toc_z: bytes::Bytes,
     /// The blob was hashed to its digest (by the registry fetcher's workers,
     /// or as the engine read it)
     blob_checked: bool,
@@ -539,6 +545,7 @@ impl Spooled {
             .collect();
         Self {
             spool,
+            toc_z: pull::stored::json_z(&ingested.toc),
             ingested,
             blob_checked,
             keys,
@@ -777,6 +784,7 @@ impl ContentFeed {
             key: LayerKey::Whole(layer.descriptor.digest),
             toc: spooled.ingested.toc.clone(),
             tarsplit: spooled.ingested.tarsplit.clone(),
+            toc_z: spooled.toc_z.clone(),
         };
         self.spooled
             .lock()
@@ -943,6 +951,7 @@ impl PullFeed for ContentFeed {
                 key: LayerKey::Whole(layer.descriptor.digest),
                 toc: held.ingested.toc.clone(),
                 tarsplit: held.ingested.tarsplit.clone(),
+                toc_z: held.toc_z.clone(),
             }));
         }
         let chunked = match &self.source {
@@ -961,6 +970,7 @@ impl PullFeed for ContentFeed {
             key: layer.key,
             toc: m.stored.clone(),
             tarsplit: m.tarsplit_z.clone(),
+            toc_z: m.toc_z.clone(),
         };
         self.metadata
             .lock()
@@ -1300,7 +1310,7 @@ impl PullFeed for StagedFeed {
             lazy: false,
             blob_checked: false,
             checked: Default::default(),
-            toc_z: None,
+            toc_z: index.toc_z.clone(),
         })
     }
 
@@ -1467,10 +1477,16 @@ async fn pull_session<R: Send + 'static>(
             let Some(write) = write.take() else {
                 return Err(std::io::Error::other("the commit wrote the pull twice"));
             };
+            // (the table of contents and the tar-split of each layer, which
+            // the barrier of the store makes durable with what the driver
+            // writes: the rows that name the layers come after it)
+            for l in pulled.iter().filter(|l| !l.lazy) {
+                l.write_files(velarx_db::layer_files::root_of(store.root()))?;
+            }
             match write(&pulled, &mut settlement) {
                 Ok((r, wrote)) => {
                     written = Some(Ok(r));
-                    Ok(wrote)
+                    Ok(wrote || pulled.iter().any(|l| !l.lazy))
                 }
                 Err(e) => {
                     written = Some(Err(e));

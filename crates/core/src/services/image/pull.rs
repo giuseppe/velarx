@@ -390,7 +390,7 @@ impl ImageService {
     /// it is rebuilt as a stream from: push and archives need it); an image
     /// with a layer that is not is pulled again.
     async fn layers_stored(&self, image: &ImageRecord) -> bool {
-        let Ok(layers) = self.db.get_image_layers_without_toc(&image.id).await else {
+        let Ok(layers) = self.db.get_image_layers(&image.id).await else {
             return false;
         };
         let Ok(config) = serde_json::from_str::<OciConfig>(&image.config) else {
@@ -990,7 +990,7 @@ impl ImageService {
         // the image; the layers are those the image records)
         let ours: Vec<Option<String>> = self
             .db
-            .get_image_layers_without_toc(&image.id)
+            .get_image_layers(&image.id)
             .await?
             .into_iter()
             .map(|l| l.erofs)
@@ -1677,6 +1677,8 @@ impl ImageService {
                     .map(|c| super::storage::with_image(c, &made))
             })
             .collect::<ImageResult<Vec<velarx_db::LayerCommit>>>()?;
+        self.write_layer_files(done_layers.values().filter(|d| !d.lazy))
+            .await?;
         debug!("Rows prepared after {:?}", start.elapsed());
         let image = ImageRecord {
             id: image_id.clone(),
@@ -1709,11 +1711,7 @@ impl ImageService {
                             size: d.size,
                             ..l.clone()
                         };
-                        let toc_z = match &d.toc_z {
-                            Some(toc_z) => toc_z.clone(),
-                            None => zstd::bulk::compress(&serde_json::to_vec(&*d.toc)?, 1)?.into(),
-                        };
-                        Ok((d.key, desc, d.toc.clone(), toc_z))
+                        Ok((d.key, desc, d.toc.clone(), d.toc_z.clone()))
                     })
                     .collect::<ImageResult<Vec<super::lazy_fetch::StartLayer>>>()?;
                 let (tocs, config) = (layers.clone(), config.config.clone());
@@ -1982,10 +1980,12 @@ impl ImageService {
                         if stored_tocs.contains_key(d) {
                             continue;
                         }
-                        let toc = stored(d)?.toc.ok_or_else(|| {
-                            ImageError::Layer(format!("layer {d} has no table of contents"))
-                        })?;
-                        stored_tocs.insert(*d, serde_json::from_str::<velarx_storage::Toc>(&toc)?);
+                        let toc = handle
+                            .block_on(velarx_content::pull::stored::stored_toc(&db, d))?
+                            .ok_or_else(|| {
+                                ImageError::Layer(format!("layer {d} has no table of contents"))
+                            })?;
+                        stored_tocs.insert(*d, toc);
                     }
                     progress_tx.report(TransferProgress::phase("merging the layers (EROFS)"));
                     let tocs: Vec<&velarx_storage::Toc> = layer_keys
@@ -2284,7 +2284,7 @@ mod stored_tests {
         Digest::of(Algorithm::Sha256, text.as_bytes())
     }
 
-    fn commit(n: u8, toc: Option<&str>, tarsplit: Option<&[u8]>) -> LayerCommit {
+    fn commit(n: u8, toc: &str, tarsplit: &[u8]) -> LayerCommit {
         LayerCommit {
             record: velarx_db::LayerRecord {
                 stream_size: Some(0),
@@ -2293,19 +2293,18 @@ mod stored_tests {
                 diff_id: Some(digest(&format!("diff{n}"))),
                 other_diff_id: None,
                 size: 1,
-                toc: toc.map(String::from),
                 status: "ready".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
-                registry_ref: None,
+                registry_ref: Some("example.com/image:1".into()),
                 erofs: None,
                 owners: None,
             },
             files: vec![],
             refs: vec![],
             chunks: vec![],
-            tarsplit: tarsplit.map(<[u8]>::to_vec),
+            toc_digest: digest(toc),
+            tarsplit: Some(Digest::of(Algorithm::Sha256, tarsplit)),
             blob_checked: false,
-            kept_toc: None,
         }
     }
 
@@ -2317,17 +2316,27 @@ mod stored_tests {
         let db = velarx_db::Database::open_in_memory().await.unwrap();
         db.commit_layers(
             vec![
-                commit(1, Some("{}"), Some(b"ts")),
-                // no tar-split: pulled again
-                commit(2, Some("{}"), None),
-                // the driver has it, the engine has no table of contents to
-                // record an image from
-                commit(3, None, Some(b"ts")),
+                commit(1, "{}", b"ts"),
+                commit(2, "{}", b"ts"),
+                commit(3, "{}", b"ts"),
             ],
             vec![],
         )
         .await
         .unwrap();
+        // 2 has no tar-split: pulled again
+        db.mark_layer_incomplete(&commit(2, "{}", b"ts").record.key)
+            .await
+            .unwrap();
+        // 3: the driver has it, the engine has no table of contents to
+        // record an image from
+        let third = commit(3, "{}", b"ts").record.key;
+        db.conn()
+            .call(move |c| {
+                Ok(c.execute("UPDATE layers SET toc_digest = NULL WHERE id = ?1", [third])?)
+            })
+            .await
+            .unwrap();
         let store = Arc::new(velarx_storage::FileStore::new(tmp.path().join("objects")).unwrap());
         let service = ImageService::new(
             db,
@@ -2386,7 +2395,7 @@ mod stored_tests {
         kind: velarx_config::StorageDriverKind,
     ) -> ImageService {
         let db = velarx_db::Database::open_in_memory().await.unwrap();
-        db.commit_layers(vec![commit(1, Some("{}"), Some(b"ts"))], vec![])
+        db.commit_layers(vec![commit(1, "{}", b"ts")], vec![])
             .await
             .unwrap();
         let store = Arc::new(velarx_storage::FileStore::new(tmp.path().join("objects")).unwrap());

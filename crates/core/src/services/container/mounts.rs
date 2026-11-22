@@ -511,7 +511,7 @@ impl ContainerService {
                         .get(&image.image)
                         .await
                         .map_err(|_| ContainerError::ImageNotFound(image.image.clone()))?;
-                    let mut layers = self.image_layers(&record).await?;
+                    let layers = self.image_layers(&record).await?;
                     if let (Some(why), Some(d)) = (enforced, &image.digest) {
                         self.image_service
                             .verify_pinned(
@@ -604,9 +604,6 @@ impl ContainerService {
                         planned.idmap,
                         false,
                     );
-                    if layers.iter().any(|l| l.status == "lazy") {
-                        self.with_tocs(&record, &mut layers).await?;
-                    }
                     m.source = self
                         .prepare_image_mount(image_index, &image, &layers, bundle)?
                         .to_string_lossy()
@@ -844,32 +841,16 @@ impl ContainerService {
         Ok(dir.join(index.to_string()))
     }
 
-    /// Give `layers` (of `image_layers`) their tables of contents,
-    /// read from the database once.
-    pub(super) async fn with_tocs(
-        &self,
-        image: &velarx_db::ImageRecord,
-        layers: &mut Vec<LayerRecord>,
-    ) -> ContainerResult<()> {
-        if layers.iter().any(|l| l.toc.is_none()) {
-            *layers = self.layers_of(image, true).await?;
-        }
-        Ok(())
-    }
-
     pub(super) async fn layers_of(
         &self,
         image: &velarx_db::ImageRecord,
-        toc: bool,
     ) -> ContainerResult<Vec<LayerRecord>> {
         // (an image being pulled has its layers in the staging area, those
         // the store has already in the store)
         let layers = if image.is_lazy {
-            self.image_service.staged_layers(&image.id, toc).await?
-        } else if toc {
-            self.db.get_image_layers(&image.id).await?
+            self.image_service.staged_layers(&image.id).await?
         } else {
-            self.db.get_image_layers_without_toc(&image.id).await?
+            self.db.get_image_layers(&image.id).await?
         };
         Ok(layers)
     }

@@ -1021,17 +1021,14 @@ impl ComposefsDriver {
     /// layer with no row or no table of contents (it names no file of this
     /// store), an error when the row or the table of contents cannot be read.
     async fn toc_of(&self, key: &LayerKey) -> DriverResult<Option<Toc>> {
-        let record = match self.db.get_own_layer(key).await {
-            Ok(r) => r,
-            Err(velarx_types::DbError::NotFound(_)) => return Ok(None),
-            Err(e) => return Err(DriverError::storage(NAME, format!("layer {key}: {e}"))),
-        };
-        let Some(text) = record.toc else {
-            return Ok(None);
-        };
-        serde_json::from_str(&text).map(Some).map_err(|e| {
-            DriverError::storage(NAME, format!("the table of contents of layer {key}: {e}"))
-        })
+        match velarx_content::pull::stored::stored_toc(&self.db, key).await {
+            Ok(toc) => Ok(toc),
+            Err(velarx_types::ImageError::Database(e)) if e.is_not_found() => Ok(None),
+            Err(e) => Err(DriverError::storage(
+                NAME,
+                format!("the table of contents of layer {key}: {e}"),
+            )),
+        }
     }
 
     /// The objects of this store and of the read-only image stores there are.
@@ -1983,10 +1980,13 @@ impl StorageDriver for ComposefsDriver {
     ) -> DriverResult<Vec<Problem>> {
         let mut tocs = Vec::with_capacity(layers.len());
         for l in layers {
+            // (a table that cannot be read is no table: the layer's problems
+            // say so)
             tocs.push(
-                l.toc
-                    .as_deref()
-                    .and_then(|t| serde_json::from_str::<Toc>(t).ok()),
+                velarx_content::pull::stored::stored_toc(&self.db, &l.key)
+                    .await
+                    .ok()
+                    .flatten(),
             );
         }
         let mut dirs = self.objects_dirs();
@@ -2876,7 +2876,6 @@ mod tests {
             diff_id: None,
             other_diff_id: None,
             size: 1,
-            toc: None,
             status: "ready".into(),
             created_at: String::new(),
             registry_ref: None,
@@ -2945,7 +2944,6 @@ mod tests {
             diff_id: None,
             other_diff_id: None,
             size: 1,
-            toc: None,
             status: "ready".into(),
             created_at: String::new(),
             registry_ref: None,
@@ -3096,7 +3094,6 @@ mod tests {
             diff_id: None,
             other_diff_id: None,
             size: 1,
-            toc: None,
             status: "ready".into(),
             created_at: String::new(),
             registry_ref: None,

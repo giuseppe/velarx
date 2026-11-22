@@ -84,8 +84,8 @@ fn made(files: &[(&str, Vec<u8>)]) -> Made {
 
 impl Made {
     fn index(&self) -> Vec<u8> {
-        crate::pull::index::encode(&serde_json::to_vec(&self.toc).unwrap(), &self.tarsplit_z)
-            .unwrap()
+        let toc_z = zstd::encode_all(&serde_json::to_vec(&self.toc).unwrap()[..], 3).unwrap();
+        crate::pull::index::encode_compressed(&toc_z, &self.tarsplit_z).unwrap()
     }
 
     fn keys(&self) -> Vec<String> {

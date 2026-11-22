@@ -213,20 +213,17 @@ pub async fn tocs_of(
 ) -> DriverResult<Vec<(LayerKey, Toc)>> {
     let mut out = Vec::with_capacity(layers.len());
     for l in layers {
-        let record = db
-            .get_layer(&l.key)
+        let toc = velarx_content::pull::stored::stored_toc(db, &l.key)
             .await
-            .map_err(|e| DriverError::refused(driver, e.into()))?;
-        let toc = record.toc.as_deref().ok_or_else(|| {
-            DriverError::missing(
-                driver,
-                Some(&l.key),
-                format!("the layer {} has no table of contents", l.key),
-                Remedy::PullAgain,
-            )
-        })?;
-        let toc =
-            serde_json::from_str::<Toc>(toc).map_err(|e| DriverError::refused(driver, e.into()))?;
+            .map_err(|e| DriverError::refused(driver, e))?
+            .ok_or_else(|| {
+                DriverError::missing(
+                    driver,
+                    Some(&l.key),
+                    format!("the layer {} has no table of contents", l.key),
+                    Remedy::PullAgain,
+                )
+            })?;
         out.push((l.key, toc));
     }
     Ok(out)

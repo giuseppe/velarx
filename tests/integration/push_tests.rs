@@ -406,7 +406,7 @@ async fn test_layer_without_tarsplit_cannot_be_pushed() {
     pull(&a).await;
     a.db.conn()
         .call(|c| {
-            c.execute("UPDATE layers SET tarsplit = NULL", [])?;
+            c.execute("UPDATE layers SET tarsplit_digest = NULL", [])?;
             Ok(())
         })
         .await

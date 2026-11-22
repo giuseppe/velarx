@@ -3777,7 +3777,8 @@ mod tests {
         let toc_z = zstd::encode_all(toc.as_bytes(), 19).unwrap();
         let checksum: velarx_types::digest::Digest = digest_of(&toc_z).parse().unwrap();
         let wrong = [
-            index::encode(toc.as_bytes(), &tarsplit).unwrap(),
+            index::encode_compressed(&zstd::encode_all(toc.as_bytes(), 3).unwrap(), &tarsplit)
+                .unwrap(),
             index::encode_compressed(&toc_z, b"another tar-split").unwrap(),
         ];
         let right = index::encode_compressed(&toc_z, &tarsplit).unwrap();

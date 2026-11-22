@@ -85,13 +85,7 @@ async fn test_a_lazy_chunked_layer_is_its_toc_until_and_after_its_completion() {
     assert_eq!(keys_of(&e, &pulled.id).await, std::slice::from_ref(&toc));
     // (staged: the store has no layer of it)
     assert!(e.db.get_layer(&toc).await.is_err());
-    let record = e
-        .area()
-        .layer(&toc)
-        .unwrap()
-        .unwrap()
-        .record(false)
-        .unwrap();
+    let record = e.area().layer(&toc).unwrap().unwrap().record();
     assert_eq!(record.status, "lazy");
     assert_eq!(record.diff_id, None, "a claim is recorded as proven");
     assert_eq!(record.blob, Some(sha(&layer.blob)));
@@ -551,12 +545,7 @@ async fn test_one_toc_named_by_two_blobs_is_one_layer() {
     assert_eq!(keys(one.id.clone()), [first.key()]);
     assert_eq!(keys(two.id.clone()), [first.key()]);
     // (one staged layer: the last pull's blob and registry)
-    let record = area
-        .layer(&first.key())
-        .unwrap()
-        .unwrap()
-        .record(false)
-        .unwrap();
+    let record = area.layer(&first.key()).unwrap().unwrap().record();
     assert_eq!(record.blob, Some(sha(&second.blob)));
     assert_eq!(record.size, second.blob.len() as i64);
     assert!(
@@ -681,17 +670,10 @@ async fn toc_pulled(
         }
     };
     assert_eq!(keys_of(&e, &pulled.id).await, [layer.key()]);
-    let text = match lazy {
-        true => e
-            .area()
-            .layer(&layer.key())
-            .unwrap()
-            .unwrap()
-            .toc_text()
-            .unwrap(),
-        false => e.db.get_layer(&layer.key()).await.unwrap().toc.unwrap(),
-    };
-    Ok(serde_json::from_str(&text).unwrap())
+    Ok(match lazy {
+        true => staged_toc(&e.area().layer(&layer.key()).unwrap().unwrap()),
+        false => stored_toc(&e.db, &layer.key()).await,
+    })
 }
 
 /// `layer` with the entry `name` of its table of contents changed by `edit`.

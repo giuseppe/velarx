@@ -331,7 +331,12 @@ pub(super) async fn verified(
 }
 
 /// Decompress at most `max` bytes, and exactly `expected` if it is known.
-fn decompress_bounded(data: &[u8], max: u64, expected: u64, what: &str) -> ImageResult<Vec<u8>> {
+pub(crate) fn decompress_bounded(
+    data: &[u8],
+    max: u64,
+    expected: u64,
+    what: &str,
+) -> ImageResult<Vec<u8>> {
     let dec = super::zstd_decoder(data).map_err(data_fail)?;
     let mut out = Vec::with_capacity(expected.min(max) as usize);
     dec.take(max + 1).read_to_end(&mut out).map_err(data_fail)?;
@@ -351,7 +356,7 @@ fn decompress_bounded(data: &[u8], max: u64, expected: u64, what: &str) -> Image
 /// the document is scanned once for the extent of each entry (the parser
 /// tells where they are, there is no second reading of the format), and the
 /// entries, which are most of the work, are read apart.
-fn parse_toc(json: &[u8]) -> serde_json::Result<Toc> {
+pub(crate) fn parse_toc(json: &[u8]) -> serde_json::Result<Toc> {
     use rayon::prelude::*;
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]

@@ -7,6 +7,7 @@
 use super::*;
 use crate::storage_driver::{LayerArtifact, MountRequest, MountsRequest, Planned};
 use velarx_config::ComposefsDigests;
+use velarx_content::pull::stored::{stored_toc, stored_tocs};
 use velarx_db::{LayerKey, LayerRecord};
 
 /// The commit of a layer with the record of what the driver made of it.
@@ -22,6 +23,34 @@ pub(super) fn with_image(
 }
 
 impl ImageService {
+    /// Write the files of the layers `done` (their table of contents and
+    /// tar-split), before the rows that name them, unless the storage driver
+    /// wrote them with the barrier of its commit: one that keeps its objects
+    /// in another process does not, and its barrier is not the engine's.
+    pub(super) async fn write_layer_files<'a>(
+        &self,
+        done: impl IntoIterator<Item = &'a velarx_content::pull::LayerDone>,
+    ) -> ImageResult<()> {
+        if self.storage.holds_objects() {
+            return Ok(());
+        }
+        let done: Vec<velarx_content::pull::LayerDone> = done.into_iter().cloned().collect();
+        let store = self.file_store.clone();
+        tokio::task::spawn_blocking(move || {
+            let root = velarx_db::layer_files::root_of(store.root());
+            for d in &done {
+                d.write_files(root)?;
+            }
+            match done.is_empty() {
+                true => Ok(()),
+                false => store.barrier(&velarx_db::layer_files::layers_dir(root)),
+            }
+        })
+        .await
+        .map_err(|e| ImageError::Storage(e.to_string()))?
+        .map_err(|e| ImageError::Storage(format!("cannot write the files of the layers: {e}")))
+    }
+
     /// The mode of `[storage] composefs_digests` of this node.
     pub fn composefs_digests(&self) -> ComposefsDigests {
         self.storage_options.digests
@@ -257,11 +286,7 @@ impl ImageService {
             if l.key.digest().alg() != alg {
                 return Ok(None);
             }
-            let Some(toc) = l
-                .toc
-                .as_deref()
-                .and_then(|t| serde_json::from_str::<Toc>(t).ok())
-            else {
+            let Ok(Some(toc)) = stored_toc(&self.db, &l.key).await else {
                 return Ok(None);
             };
             tocs.push(toc);
@@ -351,13 +376,8 @@ impl ImageService {
     pub async fn remake_image(&self, image_id: &str) -> ImageResult<()> {
         let image = self.db.get_image(image_id).await?;
         let layers = self.db.get_image_layers(image_id).await?;
-        let mut tocs = Vec::with_capacity(layers.len());
-        for l in &layers {
-            let toc = l.toc.as_deref().ok_or_else(|| {
-                ImageError::Layer(format!("layer {} has no table of contents", l.key))
-            })?;
-            tocs.push((l.key, serde_json::from_str::<Toc>(toc)?));
-        }
+        let tocs = stored_tocs(&self.db, &layers.iter().map(|l| l.key).collect::<Vec<_>>()).await?;
+        let tocs: Vec<(LayerKey, Toc)> = layers.iter().map(|l| l.key).zip(tocs).collect();
         let _shared = self.lock_store().await?;
         let ours = identities(tocs).await?;
         let refs = self.layer_refs(&image, &layers)?;

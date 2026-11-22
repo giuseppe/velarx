@@ -58,13 +58,13 @@ async fn test_lazy_pull_stages_metadata_and_fetches_files_on_demand() {
     assert_eq!(pulls.len(), 1);
     assert_eq!(pulls[0].id, result.id);
     assert!(pulls[0].names[0].ends_with("/test:latest"));
-    let record = staged(&e, &layer_digest).record(true).unwrap();
+    let record = staged(&e, &layer_digest).record();
     assert_eq!(record.status, "lazy");
     assert_eq!(record.diff_id, None);
     assert!(!staged(&e, &layer_digest).tarsplit().unwrap().is_empty());
     assert!(!e.store.contains(&vid(b"hello\n")));
 
-    let toc: velarx_storage::Toc = serde_json::from_str(record.toc.as_deref().unwrap()).unwrap();
+    let toc = staged_toc(&staged(&e, &layer_digest));
     assert_eq!(
         toc.get_file_chunks("usr/big").len(),
         100_000usize.div_ceil(16 * 1024)
@@ -250,9 +250,7 @@ async fn test_a_toc_that_lies_about_a_file_is_caught_when_the_file_is_fetched() 
     e.publish(&[&layer], &[ZSTD]);
     let layer_digest = layer.key();
     e.pull_lazy().await.unwrap();
-    let record = staged(&e, &layer_digest).record(true).unwrap();
-    let mut toc: velarx_storage::Toc =
-        serde_json::from_str(record.toc.as_deref().unwrap()).unwrap();
+    let mut toc = staged_toc(&staged(&e, &layer_digest));
     // (no sha256: nothing checks the file before its fs-verity digest)
     let lie = vid(b"something else");
     for entry in toc.entries.iter_mut().filter(|e| e.name == "etc/small") {
@@ -443,8 +441,7 @@ async fn test_completion_retrieves_what_the_pool_lacks() {
 async fn test_a_failed_retrieval_links_nothing() {
     let (e, layer_digest, layer) = lazy_env().await;
     let result = e.pull_lazy().await.unwrap();
-    let record = staged(&e, &layer_digest).record(true).unwrap();
-    let toc: velarx_storage::Toc = serde_json::from_str(record.toc.as_deref().unwrap()).unwrap();
+    let toc = staged_toc(&staged(&e, &layer_digest));
     // the registry serves a damaged usr/holes: the one file that is missing
     let at = toc
         .entries

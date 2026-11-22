@@ -1607,7 +1607,7 @@ impl VarlinkDriver {
                 // layer is vouched for as coming from the registry)
                 blob_checked: false,
                 checked: Default::default(),
-                toc_z: None,
+                toc_z: index.toc_z,
             });
         }
         // the proof: what the driver stored, read back from it

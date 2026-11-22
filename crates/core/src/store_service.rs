@@ -200,7 +200,7 @@ impl Announcement {
             // (its layers as the store has them: a layer of a TOC is not
             // the layer of its blob)
             let layers: Vec<String> = db
-                .get_image_layers_without_toc(&img.id)
+                .get_image_layers(&img.id)
                 .await?
                 .into_iter()
                 .map(|l| l.key.to_string())
@@ -820,38 +820,49 @@ impl StoreService {
                 reason: format!("not a layer: {:?}", short(layer)),
             });
         };
-        let layer = &layer;
+        // (the digest of a table of contents asks for the index of the layer
+        // of that table, with the table as its descriptor vouched for it: the
+        // asker checks it against the descriptor)
+        let by_table = match layer {
+            velarx_db::LayerKey::Whole(checksum) => {
+                self.index_files(&velarx_db::LayerKey::Toc(checksum))
+                    .await?
+            }
+            velarx_db::LayerKey::Toc(_) => None,
+        };
+        let files = match by_table {
+            Some(files) => Some(files),
+            None => self.index_files(&layer).await?,
+        };
+        let Some((toc_z, tarsplit)) = files else {
+            return Ok(None);
+        };
+        let index = move || velarx_content::pull::index::encode_compressed(&toc_z, &tarsplit);
+        self.held(index, max).await
+    }
+
+    /// The files of the layer `key` as they are kept (checked against their
+    /// digests), if it is complete: its compressed table of contents and its
+    /// compressed tar-split (a complete canonical layer has an empty one).
+    async fn index_files(
+        &self,
+        key: &velarx_db::LayerKey,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, StoreError> {
         let db = &self.inner.db;
         let unavailable = |e: velarx_types::DbError| StoreError::Unavailable {
             reason: e.to_string(),
         };
-        // (the digest of a table of contents asks for the index of the layer
-        // of that table, with the table as its descriptor vouched for it: the
-        // asker checks it against the descriptor)
-        if let velarx_db::LayerKey::Whole(checksum) = layer {
-            let toc = velarx_db::LayerKey::Toc(*checksum);
-            if let Some(toc_z) = db.kept_toc(checksum).await.map_err(unavailable)? {
-                // (a layer whose tar-split was cleared is not complete; a
-                // complete canonical one has an empty tar-split)
-                let Some(tarsplit) = db.get_layer_tarsplit(&toc).await.map_err(unavailable)? else {
-                    return Ok(None);
-                };
-                let index =
-                    move || velarx_content::pull::index::encode_compressed(&toc_z, &tarsplit);
-                return self.held(index, max).await;
-            }
-        }
-        let Ok(record) = db.get_layer(layer).await else {
+        let toc_z = match db.get_layer_toc_z(key).await {
+            Ok(Some(toc_z)) => toc_z,
+            Ok(None) => return Ok(None),
+            Err(e) if e.is_not_found() => return Ok(None),
+            Err(e) => return Err(unavailable(e)),
+        };
+        // (a layer whose tar-split was dropped is not complete)
+        let Some(tarsplit) = db.get_layer_tarsplit(key).await.map_err(unavailable)? else {
             return Ok(None);
         };
-        let Some(toc) = record.toc else {
-            return Ok(None);
-        };
-        let Some(tarsplit) = db.get_layer_tarsplit(layer).await.map_err(unavailable)? else {
-            return Ok(None);
-        };
-        let index = move || velarx_content::pull::index::encode(toc.as_bytes(), &tarsplit);
-        self.held(index, max).await
+        Ok(Some((toc_z, tarsplit)))
     }
 
     /// The index `make` makes in a file with no name, opened read-only, if

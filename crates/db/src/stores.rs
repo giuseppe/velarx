@@ -108,6 +108,7 @@ impl Database {
         Ok(Self {
             conn: Arc::new(super::Conn::new(conn, false, None)),
             lease_dir: Arc::new(super::leases::lock_dir(Some(path))),
+            root: path.parent().map(|p| Arc::new(p.to_path_buf())),
             path: Some(Arc::new(path.to_path_buf())),
             more: Arc::new(Vec::new()),
         })
@@ -438,16 +439,6 @@ impl Database {
         }
     }
 
-    /// The layers of an image without their tables of contents (`toc` is
-    /// None): what a container needs when the image's own records of what
-    /// it needs exist.
-    pub async fn get_image_layers_without_toc(&self, image_id: &str) -> DbResult<Vec<LayerRecord>> {
-        match self.image_owner(image_id).await? {
-            Some(db) => db.image_layers_here(image_id, false).await,
-            None => self.image_layers_here(image_id, false).await,
-        }
-    }
-
     /// The store that has the layer: this one first.
     async fn layer_owner(&self, digest: &LayerKey) -> DbResult<&Database> {
         let first = self.get_layer_here(digest).await;
@@ -468,6 +459,18 @@ impl Database {
         self.layer_owner(digest).await?.get_layer_here(digest).await
     }
 
+    /// The compressed table of contents of the layer, checked against its
+    /// digest (none if the layer keeps none): for a layer of a TOC, the
+    /// table as the registry sent it.
+    pub async fn get_layer_toc_z(&self, digest: &LayerKey) -> DbResult<Option<Vec<u8>>> {
+        self.layer_owner(digest)
+            .await?
+            .get_layer_toc_z_here(digest)
+            .await
+    }
+
+    /// The compressed tar-split of the layer, checked against its digest:
+    /// none while the layer is not complete, empty for a layer that has none.
     pub async fn get_layer_tarsplit(&self, digest: &LayerKey) -> DbResult<Option<Vec<u8>>> {
         self.layer_owner(digest)
             .await?
@@ -512,6 +515,7 @@ fn columns_of(conn: &rusqlite::Connection, table: &str) -> rusqlite::Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layer_files;
     use crate::ImageTag;
 
     fn image(id: &str) -> ImageRecord {
@@ -554,38 +558,47 @@ mod tests {
                 format!("diff{n}").as_bytes(),
             )
         };
-        let commit = |n: u32, toc: Option<&str>, tarsplit: Option<&[u8]>| LayerCommit {
-            record: LayerRecord {
-                stream_size: Some(i64::from(n) * 10),
-                key: key(n),
-                blob: None,
-                diff_id: Some(diff(n)),
-                other_diff_id: None,
-                size: 1,
-                toc: toc.map(String::from),
-                status: "ready".into(),
-                created_at: "2026-01-01T00:00:00Z".into(),
-                registry_ref: None,
-                erofs: None,
-                owners: None,
-            },
-            files: vec![],
-            refs: vec![],
-            chunks: vec![],
-            tarsplit: tarsplit.map(<[u8]>::to_vec),
-            blob_checked: false,
-            kept_toc: None,
+        let sha = |b: &[u8]| Digest::of(velarx_types::digest::Algorithm::Sha256, b);
+        // (the files of a layer are written first, as a pull does)
+        let commit = |n: u32, toc: &[u8], tarsplit: &[u8]| {
+            let root = dir.path();
+            for (name, bytes) in [(layer_files::TOC, toc), (layer_files::TARSPLIT, tarsplit)] {
+                layer_files::write(root, &key(n), name, bytes).unwrap();
+            }
+            LayerCommit {
+                record: LayerRecord {
+                    stream_size: Some(i64::from(n) * 10),
+                    key: key(n),
+                    blob: None,
+                    diff_id: Some(diff(n)),
+                    other_diff_id: None,
+                    size: 1,
+                    status: "ready".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    registry_ref: Some("example.com/image:1".into()),
+                    erofs: None,
+                    owners: None,
+                },
+                files: vec![],
+                refs: vec![],
+                chunks: vec![],
+                toc_digest: sha(toc),
+                tarsplit: Some(sha(tarsplit)),
+                blob_checked: false,
+            }
         };
         db.commit_layers(
-            vec![
-                commit(1, Some("{}"), Some(b"ts")),
-                commit(2, Some("{}"), None),
-                commit(3, None, Some(b"ts")),
-            ],
+            vec![commit(1, b"table", b"ts"), commit(2, b"table", b"ts")],
             vec![],
         )
         .await
         .unwrap();
+        // (2 lost its tar-split, 3 has no files at all)
+        db.mark_layer_incomplete(&key(2)).await.unwrap();
+        let mut third = commit(3, b"", b"").record;
+        third.registry_ref = None;
+        third.blob = Some(diff(3));
+        db.insert_layer(&third).await.unwrap();
         // more keys than one query takes, most of them unknown
         let mut asked: Vec<LayerKey> = (1..=3).map(key).collect();
         asked.extend((100..1300).map(key));
@@ -595,23 +608,38 @@ mod tests {
         let by = |n: u32| states.iter().find(|s| s.key == key(n)).unwrap();
         assert!(by(1).has_tarsplit && by(1).has_toc && by(1).has_diff_id(&diff(1)));
         assert!(!by(2).has_tarsplit && by(2).has_toc);
-        assert!(by(3).has_tarsplit && !by(3).has_toc);
+        assert!(!by(3).has_tarsplit && !by(3).has_toc);
         assert!(!by(1).has_diff_id(&diff(2)));
         // (the size of the tar is kept with the row)
         assert_eq!(db.get_layer(&key(1)).await.unwrap().stream_size, Some(10));
         assert_eq!(db.get_layer(&key(2)).await.unwrap().stream_size, Some(20));
-        // (the table of contents is kept compressed and read back whole)
+        // (the files are read back whole, once their digests are checked)
         assert_eq!(
-            db.get_layer(&key(1)).await.unwrap().toc.as_deref(),
-            Some("{}")
+            db.get_layer_toc_z(&key(1)).await.unwrap().as_deref(),
+            Some(&b"table"[..])
         );
-        assert!(db.get_layer(&key(3)).await.unwrap().toc.is_none());
+        assert!(db.get_layer_toc_z(&key(3)).await.unwrap().is_none());
+        assert_eq!(
+            db.get_layer_tarsplit(&key(1)).await.unwrap().as_deref(),
+            Some(&b"ts"[..])
+        );
+        assert!(db.get_layer_tarsplit(&key(2)).await.unwrap().is_none());
+        // a file that is not the one the row names is refused
+        for (kind, bytes) in [
+            (layer_files::TOC, &b"table"[..]),
+            (layer_files::TARSPLIT, b"ts"),
+        ] {
+            let path = layer_files::file(dir.path(), &key(1), kind, &sha(bytes));
+            std::fs::write(path, b"other").unwrap();
+        }
+        assert!(db.get_layer_toc_z(&key(1)).await.is_err());
+        assert!(db.get_layer_tarsplit(&key(1)).await.is_err());
         assert!(db.get_own_layer_states(&[]).await.unwrap().is_empty());
         // a read-only store's layers are not this store's
         let ro_path = dir.path().join("ro.sqlite");
         {
             let ro = Database::open(&ro_path).await.unwrap();
-            ro.commit_layers(vec![commit(9, Some("{}"), Some(b"ts"))], vec![])
+            ro.commit_layers(vec![commit(9, b"table", b"ts")], vec![])
                 .await
                 .unwrap();
             ro.checkpoint().await.unwrap();
@@ -750,7 +778,6 @@ mod tests {
                 diff_id: Some(D1.parse().unwrap()),
                 other_diff_id: None,
                 size: 7,
-                toc: Some("{}".into()),
                 status: "ready".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 registry_ref: None,

@@ -1013,17 +1013,15 @@ impl StorageDriver for VfsDriver {
         layers: &[LayerRecord],
         full: bool,
     ) -> DriverResult<Vec<Problem>> {
-        let work: Vec<(LayerKey, PathBuf, bool, Option<String>)> = layers
-            .iter()
-            .map(|l| {
-                (
-                    l.key,
-                    self.layer_toc(&l.key),
-                    l.erofs.is_some(),
-                    l.toc.clone(),
-                )
-            })
-            .collect();
+        let mut work: Vec<(LayerKey, PathBuf, bool, Option<Toc>)> = Vec::new();
+        for l in layers {
+            // (a record whose table cannot be read is not compared with)
+            let recorded = velarx_content::pull::stored::stored_toc(&self.db, &l.key)
+                .await
+                .ok()
+                .flatten();
+            work.push((l.key, self.layer_toc(&l.key), l.erofs.is_some(), recorded));
+        }
         let (store, fsverity) = (self.store.clone(), self.fsverity);
         tokio::task::spawn_blocking(move || {
             let mut found = Vec::new();
@@ -1052,7 +1050,7 @@ impl StorageDriver for VfsDriver {
                 // the one kept is the one of the layer's record (a copy is
                 // made of it): one that differs is made again from the record,
                 // and the files the record names are the ones checked
-                if let Some(Ok(want)) = recorded_toc.map(|t| serde_json::from_str::<Toc>(&t)) {
+                if let Some(want) = recorded_toc {
                     let same = serde_json::to_value(&want).ok().is_some_and(|w| {
                         serde_json::to_value(&toc).ok().is_some_and(|t| t == w)
                     });
@@ -1572,7 +1570,6 @@ mod tests {
             diff_id: None,
             other_diff_id: None,
             size: 0,
-            toc: None,
             status: "ready".into(),
             created_at: String::new(),
             registry_ref: None,
@@ -1601,7 +1598,7 @@ mod tests {
             (e.uid, e.gid) = (uid, gid);
             e
         };
-        let mut entries = vec![own(velarx_fuse::dir_entry(""))];
+        let mut entries = vec![own(velarx_fuse::dir_entry("./"))];
         let mut dirs = std::collections::BTreeSet::new();
         for (name, data) in files {
             let mut p = String::new();
@@ -2434,8 +2431,25 @@ mod tests {
         let k = key("ac");
         layer(&d, &k, &[("etc/a", "1")]);
         let kept = std::fs::read_to_string(d.layer_toc(&k)).unwrap();
+        // the record of the layer, whose table is a file of its directory
+        let toc_z = zstd::encode_all(kept.as_bytes(), 3).unwrap();
+        velarx_db::layer_files::write(t.path(), &k, velarx_db::layer_files::TOC, &toc_z).unwrap();
         let mut rec = record(&k);
-        rec.toc = Some(kept.clone());
+        rec.diff_id = Some(*k.digest());
+        d.db.commit_layers(
+            vec![velarx_db::LayerCommit {
+                record: rec.clone(),
+                files: vec![],
+                refs: vec![],
+                chunks: vec![],
+                toc_digest: Digest::of(Algorithm::Sha256, &toc_z),
+                tarsplit: None,
+                blob_checked: false,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
         let none = d
             .check(&image(), std::slice::from_ref(&rec), false)
             .await

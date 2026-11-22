@@ -155,7 +155,7 @@ async fn stream_of(
 async fn assert_stored_without_tar_split(e: &Env, key: &velarx_db::LayerKey, lazy: bool) {
     let record = e.db.get_layer(key).await.unwrap();
     assert_eq!(record.status, "ready", "lazy: {lazy}");
-    let toc: Toc = serde_json::from_str(record.toc.as_deref().unwrap()).unwrap();
+    let toc = stored_toc(&e.db, key).await;
     assert!(toc.is_canonical() && toc.tar_split_digest.is_none());
     assert_eq!(
         e.db.get_layer_tarsplit(key).await.unwrap(),
@@ -174,9 +174,7 @@ async fn test_a_layer_of_version_2_is_pulled_without_a_tar_split() {
             // the table is staged as it is, and a file is fetched on demand
             let staged = e.area().layer(&layer.key()).unwrap().unwrap();
             assert!(staged.tarsplit().unwrap().is_empty());
-            let record = staged.record(true).unwrap();
-            let toc: Toc = serde_json::from_str(record.toc.as_deref().unwrap()).unwrap();
-            assert!(toc.is_canonical());
+            assert!(staged_toc(&staged).is_canonical());
             let path = e
                 .service
                 .fetch_lazy_file(&vid(b"hello\n"), &layer.key())
@@ -331,8 +329,7 @@ async fn test_a_stale_version_annotation_on_a_table_of_version_1_is_ignored() {
         .insert(format!("{PREFIX}version"), "2".into());
     e.publish(&[&v1], &[ZSTD]);
     e.pull().await.unwrap();
-    let record = e.db.get_layer(&v1.key()).await.unwrap();
-    let toc: Toc = serde_json::from_str(record.toc.as_deref().unwrap()).unwrap();
+    let toc = stored_toc(&e.db, &v1.key()).await;
     assert!(!toc.is_canonical());
     assert!(e
         .db

@@ -181,7 +181,7 @@ impl Rows {
             .iter()
             .map(display_name)
             .collect();
-        let layers = got!(db.get_image_layers_without_toc(&rec.id).await, "its layers");
+        let layers = got!(db.get_image_layers(&rec.id).await, "its layers");
         // (the rows of the layers go with the image: an image that has some
         // in its manifest and none in the store was removed meanwhile)
         if layers.is_empty() && manifest_has_layers(&rec.manifest) {
@@ -229,7 +229,7 @@ impl View {
 
     /// The image of a pull in progress.
     async fn of_pull(state: &AppState, pull: &StagedPull) -> ApiResult<Self> {
-        let layers = state.image_service.layers_of_pull(pull, false).await?;
+        let layers = state.image_service.layers_of_pull(pull).await?;
         let names: Vec<String> = pull
             .tags
             .iter()
@@ -874,7 +874,6 @@ mod tests {
             diff_id: Some(digest_of(4)),
             other_diff_id: None,
             size: 8_000_000,
-            toc: Some("{}".into()),
             status: "ready".into(),
             created_at: "2024-01-01T00:00:00Z".into(),
             registry_ref: None,
@@ -895,7 +894,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db, rec) = store_with_image(dir.path()).await;
         let rows = Rows::read(&db, &rec).await.unwrap().unwrap();
-        assert_eq!(rows.layers[0].toc, None);
         assert_eq!(layer_size(&rows.layers[0]).unwrap(), 1234);
     }
 

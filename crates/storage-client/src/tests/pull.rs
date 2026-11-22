@@ -179,7 +179,7 @@ impl PullFeed for TestFeed {
             lazy: false,
             blob_checked: false,
             checked: Default::default(),
-            toc_z: None,
+            toc_z: index.toc_z,
         })
     }
 
@@ -227,6 +227,7 @@ fn feed_of(built: &Built, keys: &[u8]) -> Arc<TestFeed> {
                         key: key(*n),
                         toc: Arc::new(built.toc.clone()),
                         tarsplit: built.tarsplit.clone().into(),
+                        toc_z: velarx_content::pull::stored::json_z(&built.toc),
                     },
                 )
             })
@@ -1122,6 +1123,7 @@ fn feed_connections_are_forgotten_when_they_end() {
         key: key(1),
         toc: Arc::new(b.toc.clone()),
         tarsplit: b.tarsplit.clone().into(),
+        toc_z: velarx_content::pull::stored::json_z(&b.toc),
     };
     let indexed = vec![(feed_layer(1, &b, false), index)];
     let engine = crate::feed::Engine {

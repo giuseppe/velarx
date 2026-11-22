@@ -99,11 +99,10 @@ const UNREFERENCED_LAYERS: &str = "SELECT l.id, l.stream_size FROM layers l
 
 /// Forget a layer (`?1`, its key): its files, and the repositories of its
 /// blob when no other layer is of that blob (a layer of its TOC and one
-/// pulled whole may be).
-const FORGET_LAYER: [&str; 4] = [
+/// pulled whole may be).  Its directory goes after its row
+/// ([`GcService::remove_layer_files`]).
+const FORGET_LAYER: [&str; 3] = [
     "DELETE FROM file_refs WHERE layer_id = ?1",
-    // (the table of contents kept for the peers is under the key)
-    "DELETE FROM store_settings WHERE key = ?1",
     "DELETE FROM blob_sources WHERE digest = (SELECT blob FROM layers WHERE id = ?1)
          AND NOT EXISTS (SELECT 1 FROM layers WHERE blob = blob_sources.digest AND id != ?1)",
     "DELETE FROM layers WHERE id = ?1",
@@ -183,6 +182,20 @@ impl GcService {
             file_store,
             staging_dir: staging.to_path_buf(),
             lock_path: StorageLock::path_of_staging(staging),
+        }
+    }
+
+    /// Remove the directories (the table of contents and the tar-split) of
+    /// the layers `keys`, whose rows are gone.
+    fn remove_layer_files<'a>(&self, keys: impl Iterator<Item = &'a str>, report: &mut GcReport) {
+        let root = self.objects_dir.parent().unwrap_or(&self.objects_dir);
+        for key in keys.filter_map(velarx_types::LayerKey::parse) {
+            if let Err(e) = velarx_db::layer_files::remove_layer(root, &key) {
+                warn!("Failed to remove the files of the layer {key}: {e}");
+                report.errors.push(format!(
+                    "Failed to remove the files of the layer {key}: {e}"
+                ));
+            }
         }
     }
 
@@ -394,6 +407,7 @@ impl GcService {
                 Ok(files.into_iter().collect())
             })
             .await?;
+        self.remove_layer_files(layers.iter().map(|(d, _)| d.as_str()), report);
         for (digest, size) in &layers {
             debug!("Released the layer {}", digest);
             report.layers_removed += 1;
@@ -801,6 +815,7 @@ impl GcService {
                     .push(format!("Failed to remove {} layers: {}", batch.len(), e));
                 continue;
             }
+            self.remove_layer_files(batch.iter().map(|(d, _)| d.as_str()), report);
             for (digest, size) in &batch {
                 debug!("Removed unreferenced layer: {}", digest);
                 report.layers_removed += 1;
@@ -1158,9 +1173,9 @@ mod tests {
     }
 
     /// The rows of the layers an `rmi` releases do not stay in the file as
-    /// free pages.
+    /// free pages, and their files (the table of contents) go with them.
     #[tokio::test]
-    async fn releasing_layers_gives_back_the_pages_of_their_rows() {
+    async fn releasing_layers_removes_their_rows_and_their_files() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("db")).await.unwrap();
         let store = Arc::new(FileStore::new(dir.path().join("objects")).unwrap());
@@ -1175,25 +1190,31 @@ mod tests {
         let gc = GcService::of_store(driver, db.clone(), store, &staging);
         let digest: velarx_types::digest::Digest =
             format!("sha256:{}", "ab".repeat(32)).parse().unwrap();
-        db.insert_layer(&velarx_db::LayerRecord {
-            stream_size: Some(0),
-            key: velarx_types::LayerKey::Whole(digest),
-            blob: Some(digest),
-            diff_id: Some(digest),
-            other_diff_id: None,
-            size: 1,
-            // (a table of contents of a big layer: many pages)
-            toc: Some("x".repeat(1 << 20)),
-            status: "ready".into(),
-            created_at: String::new(),
-            registry_ref: None,
-            erofs: None,
-            owners: None,
-        })
+        let key = velarx_types::LayerKey::Whole(digest);
+        // (a table of contents of a big layer: a file of its directory)
+        db.insert_layer_with_toc(
+            &velarx_db::LayerRecord {
+                stream_size: Some(0),
+                key,
+                blob: Some(digest),
+                diff_id: Some(digest),
+                other_diff_id: None,
+                size: 1,
+                status: "ready".into(),
+                created_at: String::new(),
+                registry_ref: None,
+                erofs: None,
+                owners: None,
+            },
+            &vec![7u8; 1 << 20],
+        )
         .await
         .unwrap();
+        let files = velarx_db::layer_files::layer_dir(dir.path(), &key);
+        assert!(files.is_dir());
         let report = gc.release_unused_layers().await.unwrap();
         assert_eq!(report.layers_removed, 1);
+        assert!(!files.exists(), "the files of the layer stay");
         let free: i64 = db
             .conn()
             .call(|conn| Ok(conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?))
@@ -1239,7 +1260,9 @@ mod engine_copy_tests {
     /// its object and its image in the engine's store.
     async fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let db = velarx_db::Database::open_in_memory().await.unwrap();
+        let db = velarx_db::Database::open(dir.path().join("db"))
+            .await
+            .unwrap();
         let store = Arc::new(FileStore::new(dir.path().join("objects")).unwrap());
         let staging = dir.path().join("staging");
         let local = Arc::new(ComposefsDriver::new(
@@ -1259,20 +1282,22 @@ mod engine_copy_tests {
         let toc = serde_json::json!({"version": 1, "entries": [
             {"name": "f", "type": "reg", "size": 4, "fsverity": file}
         ]});
-        db.insert_layer(&velarx_db::LayerRecord {
-            stream_size: Some(0),
-            key,
-            blob: Some(format!("sha256:{}", "ef".repeat(32)).parse().unwrap()),
-            diff_id: None,
-            other_diff_id: None,
-            size: 1,
-            toc: Some(toc.to_string()),
-            status: "ready".into(),
-            created_at: String::new(),
-            registry_ref: None,
-            erofs: Some("sha256:ee".into()),
-            owners: None,
-        })
+        db.insert_layer_with_toc(
+            &velarx_db::LayerRecord {
+                stream_size: Some(0),
+                key,
+                blob: Some(format!("sha256:{}", "ef".repeat(32)).parse().unwrap()),
+                diff_id: None,
+                other_diff_id: None,
+                size: 1,
+                status: "ready".into(),
+                created_at: String::new(),
+                registry_ref: None,
+                erofs: Some("sha256:ee".into()),
+                owners: None,
+            },
+            &zstd::encode_all(toc.to_string().as_bytes(), 3).unwrap(),
+        )
         .await
         .unwrap();
         let f = Fixture {
@@ -1480,7 +1505,9 @@ mod engine_copy_tests {
     #[tokio::test]
     async fn many_layers_are_collected_with_a_few_held_at_a_time() {
         let dir = tempfile::tempdir().unwrap();
-        let db = velarx_db::Database::open_in_memory().await.unwrap();
+        let db = velarx_db::Database::open(dir.path().join("db"))
+            .await
+            .unwrap();
         let store = Arc::new(FileStore::new(dir.path().join("objects")).unwrap());
         let staging = dir.path().join("staging");
         let counting = Arc::new(Counting {
@@ -1537,22 +1564,26 @@ mod engine_copy_tests {
                 .collect();
             serde_json::json!({"version": 1, "entries": entries}).to_string()
         });
-        db.insert_layer(&velarx_db::LayerRecord {
+        let record = velarx_db::LayerRecord {
             stream_size: Some(0),
             key,
             blob: Some(format!("sha256:{}", "ef".repeat(32)).parse().unwrap()),
             diff_id: None,
             other_diff_id: None,
             size: 1,
-            toc,
             status: "ready".into(),
             created_at: String::new(),
             registry_ref: None,
             erofs: files.map(|_| "sha256:ee".into()),
             owners: None,
-        })
-        .await
-        .unwrap();
+        };
+        match toc {
+            Some(toc) => db
+                .insert_layer_with_toc(&record, &zstd::encode_all(toc.as_bytes(), 3).unwrap())
+                .await
+                .unwrap(),
+            None => db.insert_layer(&record).await.unwrap(),
+        }
         let image = cfs::layer_image_path(store.root(), &key.file_stem());
         std::fs::create_dir_all(image.parent().unwrap()).unwrap();
         std::fs::write(image, b"image").unwrap();
@@ -1605,7 +1636,9 @@ mod engine_copy_tests {
         velarx_base::testing::in_child(|| {
             with_few_descriptors(async {
                 let dir = tempfile::tempdir().unwrap();
-                let db = velarx_db::Database::open_in_memory().await.unwrap();
+                let db = velarx_db::Database::open(dir.path().join("db"))
+                    .await
+                    .unwrap();
                 let store = Arc::new(FileStore::new(dir.path().join("objects")).unwrap());
                 let staging = dir.path().join("staging");
                 let driver = Arc::new(ComposefsDriver::new(
@@ -1726,7 +1759,9 @@ mod freed_tests {
 
     async fn store() -> Store {
         let dir = tempfile::tempdir().unwrap();
-        let db = velarx_db::Database::open_in_memory().await.unwrap();
+        let db = velarx_db::Database::open(dir.path().join("db"))
+            .await
+            .unwrap();
         let files = Arc::new(FileStore::new(dir.path().join("objects")).unwrap());
         let staging = dir.path().join("staging");
         let driver: Arc<dyn StorageDriver> = Arc::new(ComposefsDriver::new(
@@ -1774,7 +1809,6 @@ mod freed_tests {
                     diff_id: None,
                     other_diff_id: None,
                     size: 1,
-                    toc: None,
                     status: "ready".into(),
                     created_at: String::new(),
                     registry_ref: None,
@@ -2034,7 +2068,6 @@ mod chain_tests {
             diff_id: Some(a),
             other_diff_id: None,
             size: 1,
-            toc: None,
             status: "ready".into(),
             created_at: String::new(),
             registry_ref: None,

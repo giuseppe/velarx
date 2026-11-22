@@ -374,8 +374,9 @@ mod tests {
             r#"{{"version":1,"entries":[],"tarSplitDigest":"{}"}}"#,
             Digest::of(velarx_types::digest::Algorithm::Sha256, &tarsplit)
         );
-        let right = index::encode(toc.as_bytes(), &tarsplit).unwrap();
-        let wrong = index::encode(toc.as_bytes(), b"another tar-split").unwrap();
+        let toc_z = zstd::encode_all(toc.as_bytes(), 3).unwrap();
+        let right = index::encode_compressed(&toc_z, &tarsplit).unwrap();
+        let wrong = index::encode_compressed(&toc_z, b"another tar-split").unwrap();
         let chunked = Blob {
             digest: format!("sha256:{}", "d".repeat(64)),
             size: 1 << 20,

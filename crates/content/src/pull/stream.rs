@@ -678,6 +678,7 @@ mod tests {
             blob: layer.digest,
             diff_id: ingested.diff_id,
             size: layer.size,
+            toc_z: crate::pull::stored::json_z(&ingested.toc),
             toc: ingested.toc,
             files: ingested.files,
             chunks: Vec::new(),
@@ -686,7 +687,6 @@ mod tests {
             lazy: false,
             blob_checked: true,
             checked: Default::default(),
-            toc_z: None,
         }
     }
 

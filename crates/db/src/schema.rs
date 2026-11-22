@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 use rusqlite::{Connection, TransactionBehavior};
-use std::io::Read;
 
 /// The version of the schema, kept in `PRAGMA user_version`: a database of
 /// another version is not opened, and a new file (`user_version` 0, no table)
@@ -10,9 +9,7 @@ use std::io::Read;
 /// a read-only store of version 1 is read as it is (it only has those two
 /// tables more, which nothing reads).  Other changes edit the schema in
 /// place with no bump: a store made by another build is not told when it is
-/// opened, it fails at the first statement that needs the new shape, and
-/// `system check` stops on a table of contents of the old form and removes
-/// nothing.
+/// opened, it fails at the first statement that needs the new shape.
 pub const SCHEMA_VERSION: i64 = 2;
 
 /// The oldest version a read-only store is read at.
@@ -170,10 +167,7 @@ END;
 
 -- What the store was first used with (`runroot`: the state directory of
 -- its engine; another one is refused: it would not see these containers),
--- the indexes (`index:<digest>`) that images were pulled by, and the
--- compressed table of contents of a zstd:chunked layer as the registry sent
--- it, a blob under the key of its layer (`toc:<digest>`), which the
--- collection of the layer removes.
+-- and the indexes (`index:<digest>`) that images were pulled by.
 CREATE TABLE IF NOT EXISTS store_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -214,14 +208,17 @@ CREATE TABLE IF NOT EXISTS layers (
     -- at the pull so that a listing never decodes it (it stays when the
     -- tar-split of a layer marked incomplete is dropped)
     stream_size INTEGER NOT NULL,
-    -- The big columns last: SQLite reads a column after one that overflows
-    -- its page by walking that one's overflow pages (the table of contents of
-    -- a big image is megabytes: a read of `created_at` behind it cost ~1 ms).
-    -- The tar-split: NULL for a layer that is not complete, empty for a
-    -- layer that has none, whose table of contents is of version 2.
-    tarsplit BLOB,
-    -- the table of contents (JSON), compressed with zstd
-    toc BLOB
+    -- The table of contents and the tar-split are files of the layer
+    -- (`layers/<stem>/toc-<hex>.zst`, `tarsplit-<hex>.zst`, see `layer_files`), checked
+    -- against a digest whenever they are read.  The table of contents of a
+    -- layer pulled by its table (`toc:` key) is the table as the registry
+    -- sent it, whose digest is the checksum of the key; that of any other
+    -- layer is the zstd of its JSON.  NULL while the layer has none.
+    toc_digest TEXT,
+    -- The digest of the tar-split: NULL for a layer that is not complete,
+    -- empty for a layer that has none (and no file), whose table of
+    -- contents is of version 2.
+    tarsplit_digest TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_layers_diff_id ON layers(diff_id);
@@ -442,7 +439,6 @@ pub struct LayerRecord {
     /// configuration has that algorithm verified the layer against it.
     pub other_diff_id: Option<Digest>,
     pub size: i64,
-    pub toc: Option<String>,
     /// `ready` for a layer of the store, `lazy` for one that is being pulled
     /// (`staging/lazy`): not kept in the database, whose layers are complete.
     pub status: String,
@@ -460,18 +456,9 @@ pub struct LayerRecord {
 }
 
 impl LayerRecord {
-    /// The table of contents as the column keeps it: zstd, as the tar-split.
-    pub(super) fn toc_z(&self) -> rusqlite::Result<Option<Vec<u8>>> {
-        self.toc
-            .as_ref()
-            .map(|t| zstd::encode_all(t.as_bytes(), velarx_tarsplit::ZSTD_LEVEL))
-            .transpose()
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-    }
-
     /// The columns `from_row` reads, of the table `layers` as `l`.
     pub const COLUMNS: &'static str =
-        "l.id, l.diff_id, l.size, l.toc, l.created_at, l.registry_ref, l.erofs, l.owners, l.blob, l.diff_id_other, l.stream_size";
+        "l.id, l.diff_id, l.size, l.created_at, l.registry_ref, l.erofs, l.owners, l.blob, l.diff_id_other, l.stream_size";
 
     /// The diff id the layer was verified against in `alg`, if it was.
     pub fn diff_id_in(&self, alg: velarx_types::digest::Algorithm) -> Option<&Digest> {
@@ -502,43 +489,26 @@ impl LayerRecord {
             key: row.get(0)?,
             diff_id: row.get(1)?,
             size: row.get(2)?,
-            // (read as the tar-split is: the window and the size capped)
-            toc: row
-                .get::<_, Option<Vec<u8>>>(3)?
-                .map(|z| {
-                    let mut toc = String::new();
-                    velarx_tarsplit::decoder(z, velarx_tarsplit::MAX_SIZE)?
-                        .read_to_string(&mut toc)?;
-                    Ok::<_, std::io::Error>(toc)
-                })
-                .transpose()
-                .map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Blob,
-                        Box::new(e),
-                    )
-                })?,
             status: "ready".to_string(),
-            created_at: row.get(4)?,
-            registry_ref: row.get(5)?,
-            erofs: row.get(6)?,
-            owners: row.get(7)?,
+            created_at: row.get(3)?,
+            registry_ref: row.get(4)?,
+            erofs: row.get(5)?,
+            owners: row.get(6)?,
             blob: {
-                let text: String = row.get(8)?;
+                let text: String = row.get(7)?;
                 (!text.is_empty())
                     .then(|| text.parse())
                     .transpose()
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            8,
+                            7,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
                     })?
             },
-            other_diff_id: row.get(9)?,
-            stream_size: row.get(10)?,
+            other_diff_id: row.get(8)?,
+            stream_size: row.get(9)?,
         })
     }
 }
@@ -546,7 +516,7 @@ impl LayerRecord {
 /// What `Database::mark_layer_incomplete` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerMarking {
-    /// The tar-split is cleared: a pull fetches the layer again.
+    /// The tar-split is dropped: a pull fetches the layer again.
     Marked,
     /// Not marked: the layer was not pulled from a registry (made here), so
     /// a pull could not bring its tar-split back.
@@ -555,8 +525,8 @@ pub enum LayerMarking {
     NotHere,
 }
 
-/// What a layer row says of itself, without its table of contents or its
-/// tar-split (see `Database::get_own_layer_states`).
+/// What a layer row says of itself, without its files (see
+/// `Database::get_own_layer_states`).
 #[derive(Debug, Clone)]
 pub struct LayerState {
     pub key: LayerKey,
@@ -566,7 +536,7 @@ pub struct LayerState {
     pub other_diff_id: Option<Digest>,
     /// The layer has its tar-split (push and archives rebuild its stream from it).
     pub has_tarsplit: bool,
-    /// The layer has its table of contents.
+    /// The layer has its table of contents (a file the row names).
     pub has_toc: bool,
 }
 
@@ -614,13 +584,13 @@ pub struct LayerCommit {
     /// Files the layer holds and how many times.
     pub refs: Vec<(String, i64)>,
     pub chunks: Vec<ChunkLocation>,
-    /// The zstd compressed tar-split: with the files of the layer it gives
-    /// back the exact tar stream.
-    pub tarsplit: Option<Vec<u8>>,
-    /// The table of contents of a layer of a TOC as the registry sent it
-    /// (compressed, the bytes its descriptor's checksum covers): the peers
-    /// check it against the same descriptor ([`crate::Database::kept_toc`]).
-    pub kept_toc: Option<Vec<u8>>,
+    /// The digest of `toc.zst`, the table of contents the layer keeps (a
+    /// file of its directory, which the pull wrote).
+    pub toc_digest: Digest,
+    /// The digest of `tarsplit.zst`, the tar-split of the layer: with the
+    /// files of the layer it gives back the exact tar stream.  None for a
+    /// canonical layer, which has none (no file).
+    pub tarsplit: Option<Digest>,
     /// The blob was hashed to its digest (`layers.blob_checked`)
     pub blob_checked: bool,
 }

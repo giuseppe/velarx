@@ -1089,6 +1089,8 @@ pub async fn env_built(
     }
     let (host, reg) = start_registry().await;
     let tmp = tempfile::tempdir().unwrap();
+    // (the files of the layers are in the directory of the store)
+    let db = db.with_root(tmp.path());
     let store = Arc::new(
         FileStore::new(tmp.path().join("objects"))
             .unwrap()
@@ -1460,7 +1462,10 @@ pub async fn side() -> Side {
 /// (its client's and its registry fetcher's).
 pub async fn side_with(conf: Option<&str>) -> Side {
     let tmp = tempfile::tempdir().unwrap();
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory()
+        .await
+        .unwrap()
+        .with_root(tmp.path());
     let store = Arc::new(FileStore::new(tmp.path().join("objects")).unwrap());
     let service = ImageService::new(
         db.clone(),
@@ -2039,4 +2044,26 @@ pub async fn push_scope(
         requires,
     })
     .await
+}
+
+/// The table of contents a layer of the store is stored by.
+pub async fn stored_toc(db: &Database, key: &velarx_db::LayerKey) -> velarx_storage::Toc {
+    velarx_content::pull::stored::stored_toc(db, key)
+        .await
+        .unwrap()
+        .expect("the layer has a table of contents")
+}
+
+/// The tables of contents of the layers of an image, the lowest first.
+pub async fn image_tocs(db: &Database, image: &str) -> Vec<velarx_storage::Toc> {
+    let mut tocs = Vec::new();
+    for l in db.get_image_layers(image).await.unwrap() {
+        tocs.push(stored_toc(db, &l.key).await);
+    }
+    tocs
+}
+
+/// The table of contents of a staged layer.
+pub fn staged_toc(layer: &velarx_content::pull::staged::StagedLayer) -> velarx_storage::Toc {
+    serde_json::from_str(&layer.toc_text().unwrap()).unwrap()
 }

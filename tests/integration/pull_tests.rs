@@ -24,7 +24,7 @@ async fn test_chunked_layer_is_pulled_by_ranges_and_bound_to_the_diff_id() {
     // (a layer of a table of contents is verified by its table: no diff id
     // until a recreation of its stream checks one)
     assert_eq!(rec.diff_id, None);
-    let toc: velarx_storage::Toc = serde_json::from_str(rec.toc.as_deref().unwrap()).unwrap();
+    let toc = stored_toc(&e.db, &layer.key()).await;
     assert_eq!(
         names(&toc),
         [
@@ -90,17 +90,10 @@ async fn test_the_fs_verity_digests_of_the_toc_are_kept_and_checked() {
             e.pull().await.unwrap();
         }
         // (a lazy pull's layer is staged, not in the store)
-        let rec = match lazy {
-            true => e
-                .area()
-                .layer(&layer.key())
-                .unwrap()
-                .unwrap()
-                .record(true)
-                .unwrap(),
-            false => e.db.get_layer(&layer.key()).await.unwrap(),
+        let toc = match lazy {
+            true => staged_toc(&e.area().layer(&layer.key()).unwrap().unwrap()),
+            false => stored_toc(&e.db, &layer.key()).await,
         };
-        let toc: velarx_storage::Toc = serde_json::from_str(rec.toc.as_deref().unwrap()).unwrap();
         let regs: Vec<_> = toc
             .entries
             .iter()
@@ -370,7 +363,7 @@ async fn test_composefs_digests_require_applies_to_an_image_already_stored() {
 /// layers, and what `start_digests` says of it.
 async fn stored_image(e: &Env, id: &str) -> (velarx_db::ImageRecord, Vec<velarx_db::LayerRecord>) {
     let image = e.service.get(id).await.unwrap();
-    let layers = e.db.get_image_layers_without_toc(&image.id).await.unwrap();
+    let layers = e.db.get_image_layers(&image.id).await.unwrap();
     (image, layers)
 }
 
@@ -858,8 +851,7 @@ async fn test_gzip_layer_is_streamed() {
     let result = e.pull().await.unwrap();
     assert_eq!(e.reg.ranged.load(Ordering::SeqCst), 0);
     assert_eq!(result.stats.from("registry").0, layer.blob.len() as u64);
-    let rec = e.db.get_layer(&layer.key()).await.unwrap();
-    let toc: velarx_storage::Toc = serde_json::from_str(rec.toc.as_deref().unwrap()).unwrap();
+    let toc = stored_toc(&e.db, &layer.key()).await;
     assert_eq!(
         toc.find_by_name("etc/link").unwrap().link_name.as_deref(),
         Some("small")

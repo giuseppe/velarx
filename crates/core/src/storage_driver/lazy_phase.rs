@@ -661,14 +661,16 @@ mod tests {
                     diff_id: None,
                     other_diff_id: None,
                     size: 1,
-                    toc: Some(toc),
                     status: "ready".into(),
                     created_at: String::new(),
                     registry_ref: None,
                     erofs: Some("sha256:ee".into()),
                     owners: None,
                 };
-                self.db.insert_layer(&record).await.unwrap();
+                self.db
+                    .insert_layer_with_toc(&record, &zstd::encode_all(toc.as_bytes(), 3).unwrap())
+                    .await
+                    .unwrap();
                 for f in files {
                     let path = self.object(*f);
                     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -831,8 +833,9 @@ mod tests {
             let c = copy().await;
             let mut kept = c.layer(1, &[10, 11]).await;
             kept.key = key(2);
-            kept.toc = Some("{".into());
-            c.db.insert_layer(&kept).await.unwrap();
+            c.db.insert_layer_with_toc(&kept, &zstd::encode_all(&b"{"[..], 3).unwrap())
+                .await
+                .unwrap();
             c.phase.pin(&c.writable(C1), &[kept]).unwrap();
             let e = c.release(&[1], &[C1], &[], &[]).await.unwrap_err();
             assert!(e.to_string().contains("table of contents"), "{e}");

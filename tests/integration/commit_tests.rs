@@ -442,13 +442,7 @@ fn view(tree: &velarx_fuse::MergedTree) -> Vec<String> {
 }
 
 async fn tree_of(e: &Env, id: &str) -> velarx_fuse::MergedTree {
-    let tocs: Vec<velarx_storage::Toc> =
-        e.db.get_image_layers(id)
-            .await
-            .unwrap()
-            .iter()
-            .map(|l| serde_json::from_str(l.toc.as_deref().unwrap()).unwrap())
-            .collect();
+    let tocs = image_tocs(&e.db, id).await;
     velarx_fuse::MergedTree::build(&tocs.iter().collect::<Vec<_>>()).unwrap()
 }
 
@@ -1043,7 +1037,7 @@ async fn test_a_layer_built_here_is_a_version_2_layer_to_every_reader() {
         );
         let record = other.db.get_layer(&key).await.unwrap();
         assert_eq!(record.status, "ready", "lazy: {lazy}");
-        let stored: Toc = serde_json::from_str(record.toc.as_deref().unwrap()).unwrap();
+        let stored = stored_toc(&other.db, &key).await;
         assert!(stored.is_canonical());
         let rows = other.db.get_layer_tarsplit(&key).await.unwrap();
         assert_eq!(rows, Some(Vec::new()), "no tar-split, lazy: {lazy}");

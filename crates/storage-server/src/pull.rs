@@ -544,8 +544,11 @@ async fn publish(
     artifacts: std::collections::HashMap<LayerKey, LayerArtifact>,
 ) -> Result<(), String> {
     let mut commits = Vec::new();
+    let root = velarx_db::layer_files::root_of(store.files.root());
     for l in layers {
         let done: LayerDone = l;
+        // (the files of the layer, made durable before the row names it)
+        done.write_files(root).map_err(|e| e.to_string())?;
         let mut commit =
             velarx_content::pull::layer_commit(&done, None).map_err(|e| e.to_string())?;
         if let Some(a) = artifacts.get(&done.key) {
@@ -554,6 +557,10 @@ async fn publish(
         }
         commits.push(commit);
     }
+    store
+        .files
+        .barrier(&velarx_db::layer_files::layers_dir(root))
+        .map_err(|e| e.to_string())?;
     store
         .db
         .commit_layers(commits, vec![])

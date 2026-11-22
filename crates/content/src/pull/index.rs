@@ -72,14 +72,9 @@ where
     d.deserialize_seq(Entries)
 }
 
-/// The index of a layer whose TOC (JSON) and compressed tar-split are
-/// these; None when it would be larger than [`MAX_INDEX`].
-pub fn encode(toc_json: &[u8], tarsplit_z: &[u8]) -> Option<Vec<u8>> {
-    encode_compressed(&zstd::encode_all(toc_json, 3).ok()?, tarsplit_z)
-}
-
-/// [`encode`] of a TOC that is compressed already (the bytes of a
-/// descriptor's checksum, which the index gives back as they were).
+/// The index of a layer whose compressed TOC and compressed tar-split are
+/// these (the bytes of a descriptor's checksum, which the index gives back
+/// as they were); None when it would be larger than [`MAX_INDEX`].
 pub fn encode_compressed(toc_z: &[u8], tarsplit_z: &[u8]) -> Option<Vec<u8>> {
     let total = MAGIC.len() + 8 + toc_z.len() + tarsplit_z.len();
     if total as u64 > MAX_INDEX {
@@ -205,6 +200,11 @@ pub fn is_well_formed(data: &[u8], max_json: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The index of a TOC given as JSON.
+    fn encode(toc_json: &[u8], tarsplit_z: &[u8]) -> Option<Vec<u8>> {
+        encode_compressed(&zstd::encode_all(toc_json, 3).ok()?, tarsplit_z)
+    }
 
     #[test]
     fn a_compressed_table_comes_back_as_it_was_given() {

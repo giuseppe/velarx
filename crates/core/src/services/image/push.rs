@@ -702,7 +702,7 @@ impl ImageService {
         }
 
         // the layers the image records, one for each of the manifest
-        let records = self.db.get_image_layers_without_toc(&image.id).await?;
+        let records = self.db.get_image_layers(&image.id).await?;
         if records.len() != manifest.layers.len() {
             return Err(ImageError::Manifest(format!(
                 "the image has {} layers and its manifest {}",

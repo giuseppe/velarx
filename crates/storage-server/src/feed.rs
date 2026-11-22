@@ -322,6 +322,7 @@ impl WireFeed {
                 .ok_or_else(|| ImageError::Storage(format!("{key} is not the key of a layer")))?;
             Ok::<_, ImageError>(LayerIndex {
                 key,
+                toc_z: velarx_content::pull::stored::json_z(&toc),
                 toc: Arc::new(toc),
                 tarsplit: tarsplit.into(),
             })
@@ -655,7 +656,7 @@ impl WireFeed {
             lazy: false,
             blob_checked: false,
             checked: Default::default(),
-            toc_z: None,
+            toc_z: index.toc_z.clone(),
         })
     }
 }

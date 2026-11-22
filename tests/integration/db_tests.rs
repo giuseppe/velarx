@@ -182,7 +182,10 @@ async fn the_big_columns_are_last_and_the_levels_are_an_index() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert!(columns("layers").ends_with(&["tarsplit".into(), "toc".into()]));
+    // (the table of contents and the tar-split are files, not columns)
+    assert!(!columns("layers")
+        .iter()
+        .any(|c| c == "toc" || c == "tarsplit"));
     assert_eq!(
         columns("containers").last().map(String::as_str),
         Some("config")
@@ -327,7 +330,6 @@ async fn test_layer_operations() {
         diff_id: Some(digest_of(0xd)),
         other_diff_id: None,
         size: 512,
-        toc: Some("{\"entries\": []}".to_string()),
         status: "complete".to_string(),
         created_at: "2024-01-01T00:00:00Z".to_string(),
         registry_ref: None,
@@ -344,17 +346,7 @@ async fn test_layer_operations() {
     let layers = db.get_image_layers("img-for-layer").await.unwrap();
     assert_eq!(layers.len(), 1);
     assert_eq!(layers[0].key, key);
-    assert_eq!(layers[0].toc.as_deref(), Some("{\"entries\": []}"));
-
-    // the same layers without their tables of contents
-    let light = db
-        .get_image_layers_without_toc("img-for-layer")
-        .await
-        .unwrap();
-    assert_eq!(light.len(), 1);
-    assert_eq!(light[0].key, key);
-    assert_eq!(light[0].size, 512);
-    assert!(light[0].toc.is_none());
+    assert_eq!(layers[0].size, 512);
 }
 
 #[tokio::test]
@@ -437,27 +429,23 @@ async fn test_an_image_can_use_a_layer_twice() {
 async fn test_a_stored_layer_is_not_replaced() {
     let db = Database::open_in_memory().await.unwrap();
     let key = LayerKey::Toc(digest_of(3));
-    let layer = |toc: &str| LayerRecord {
+    let layer = |size: i64| LayerRecord {
         stream_size: Some(0),
         key,
         blob: Some(digest_of(4)),
         diff_id: Some(digest_of(0xd)),
         other_diff_id: None,
-        size: 1,
-        toc: Some(toc.to_string()),
+        size,
         status: "ready".to_string(),
         created_at: "2024-01-01T00:00:00Z".to_string(),
         registry_ref: None,
         erofs: None,
         owners: None,
     };
-    db.insert_layer(&layer("{\"entries\": [1]}")).await.unwrap();
-    db.insert_layer(&layer("{\"entries\": [2]}")).await.unwrap();
+    db.insert_layer(&layer(1)).await.unwrap();
+    db.insert_layer(&layer(2)).await.unwrap();
     let got = db.get_layer(&key).await.unwrap();
-    assert_eq!(
-        (got.status.as_str(), got.toc.as_deref()),
-        ("ready", Some("{\"entries\": [1]}"))
-    );
+    assert_eq!((got.status.as_str(), got.size), ("ready", 1));
 }
 
 #[tokio::test]
@@ -724,7 +712,6 @@ async fn test_a_layer_is_found_by_its_key_only() {
         diff_id,
         other_diff_id: None,
         size: 1,
-        toc: Some("{}".into()),
         status: status.into(),
         created_at: "now".into(),
         registry_ref: None,
@@ -737,9 +724,9 @@ async fn test_a_layer_is_found_by_its_key_only() {
             files: Vec::new(),
             refs: Vec::new(),
             chunks: Vec::new(),
+            toc_digest: digest_of(8),
             tarsplit: None,
             blob_checked,
-            kept_toc: None,
         }],
         image: ImageRecord {
             id: "i".into(),

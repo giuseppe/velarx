@@ -41,6 +41,7 @@ tokio = { workspace = true, features = ["rt"] }
 [dev-dependencies]
 velarx-graph = { path = "../graph", features = ["conformance"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
+zstd.workspace = true
 
 [lints]
 workspace = true

@@ -34,6 +34,7 @@ pub mod window;
 pub mod commit;
 pub mod entry;
 pub mod staged;
+pub mod stored;
 pub mod tarsplit;
 pub mod unnamed;
 
@@ -380,9 +381,11 @@ pub struct LayerDone {
     pub report: LayerReport,
     /// The zstd compressed tar-split.
     pub tarsplit: bytes::Bytes,
-    /// The table of a layer of a TOC as the registry sent it
-    /// ([`chunked::Metadata::toc_z`]), recorded with the layer.
-    pub toc_z: Option<bytes::Bytes>,
+    /// What the file `toc.zst` of the layer holds: the table of a layer of a
+    /// TOC as the registry sent it ([`chunked::Metadata::toc_z`]), the zstd of
+    /// the JSON of `toc` for any other (made again by [`LayerDone::settle`],
+    /// which changes `toc`).
+    pub toc_z: bytes::Bytes,
     /// Only the metadata was fetched: the files come on demand and the layer
     /// is not verified against its diff id yet.
     pub lazy: bool,
@@ -452,6 +455,9 @@ impl LayerDone {
                 c.file_digest = id.clone();
             }
         }
+        if !self.key.is_toc() {
+            self.toc_z = stored::json_z(&self.toc);
+        }
         Ok(())
     }
 }
@@ -486,6 +492,10 @@ impl ImageBudget {
 /// A layer that was pulled with its table of contents: the one of the
 /// descriptor (`key` is its TOC), or a peer's index (`key` is the blob).
 fn layer_done(layer: &OciDescriptor, key: LayerKey, p: chunked::Pulled) -> LayerDone {
+    let toc_z = match p.toc_z {
+        Some(toc_z) => toc_z,
+        None => stored::json_z(&p.toc),
+    };
     LayerDone {
         key,
         blob: layer.digest,
@@ -505,7 +515,7 @@ fn layer_done(layer: &OciDescriptor, key: LayerKey, p: chunked::Pulled) -> Layer
             .collect(),
         report: p.report,
         tarsplit: p.tarsplit,
-        toc_z: p.toc_z,
+        toc_z,
         lazy: false,
         blob_checked: false,
         checked: Default::default(),
@@ -565,7 +575,7 @@ pub fn whole_done(layer: &OciDescriptor, ingested: stream::Ingested) -> LayerDon
         blob: layer.digest,
         diff_id: ingested.diff_id,
         size: layer.size,
-        toc: ingested.toc,
+        toc: ingested.toc.clone(),
         files: ingested.files,
         chunks: Vec::new(),
         // the whole blob, checked against its digest; not what the user's
@@ -574,7 +584,7 @@ pub fn whole_done(layer: &OciDescriptor, ingested: stream::Ingested) -> LayerDon
         checked: Default::default(),
         report: ingested.report,
         tarsplit: ingested.tarsplit,
-        toc_z: None,
+        toc_z: stored::json_z(&ingested.toc),
         lazy: false,
     }
 }
@@ -638,7 +648,7 @@ pub async fn pull_layer_lazy(
             chunks: Vec::new(),
             report: l.report,
             tarsplit: l.tarsplit,
-            toc_z: Some(l.toc_z),
+            toc_z: l.toc_z,
             lazy: true,
             blob_checked: false,
             checked: Default::default(),
@@ -673,7 +683,7 @@ pub fn stage_layer(
             },
             toc,
             tarsplit: &done.tarsplit,
-            toc_z: done.toc_z.as_deref(),
+            toc_z: Some(&done.toc_z),
         },
         barrier,
     )
@@ -732,7 +742,6 @@ pub fn layer_commit(done: &LayerDone, registry_ref: Option<&str>) -> ImageResult
             diff_id: proven.then_some(done.diff_id),
             other_diff_id: None,
             size: done.size,
-            toc: serde_json::to_string(&*done.toc).ok(),
             status: "ready".to_string(),
             created_at: now,
             registry_ref: registry_ref.map(str::to_string),
@@ -743,8 +752,8 @@ pub fn layer_commit(done: &LayerDone, registry_ref: Option<&str>) -> ImageResult
         files,
         refs,
         chunks: done.chunks.clone(),
-        tarsplit: Some(done.tarsplit.to_vec()),
-        kept_toc: done.toc_z.as_deref().map(<[u8]>::to_vec),
+        toc_digest: done.toc_digest(),
+        tarsplit: done.tarsplit_digest(),
         blob_checked: done.blob_checked && proven,
     })
 }
@@ -769,7 +778,7 @@ mod layer_commit_tests {
             chunks: Vec::new(),
             report: Default::default(),
             tarsplit: bytes::Bytes::from(zstd::encode_all(&b""[..], 0).unwrap()),
-            toc_z: None,
+            toc_z: bytes::Bytes::from_static(b"table"),
             lazy: false,
             blob_checked: true,
             checked: Default::default(),
@@ -856,7 +865,7 @@ mod budget_tests {
             chunks: Vec::new(),
             report: LayerReport::default(),
             tarsplit: vec![0; tarsplit].into(),
-            toc_z: None,
+            toc_z: bytes::Bytes::new(),
             blob_checked: false,
             checked: Default::default(),
             lazy: false,

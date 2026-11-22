@@ -724,13 +724,7 @@ async fn test_squash_and_squash_all() {
         let image = e.service.get(&id).await.unwrap();
         let m: OciManifest = serde_json::from_str(&image.manifest).unwrap();
         let config: serde_json::Value = serde_json::from_str(&image.config).unwrap();
-        let tocs: Vec<velarx_storage::Toc> =
-            e.db.get_image_layers(&image.id)
-                .await
-                .unwrap()
-                .iter()
-                .map(|l| serde_json::from_str(l.toc.as_deref().unwrap()).unwrap())
-                .collect();
+        let tocs = common::image_tocs(&e.db, &image.id).await;
         let tree = velarx_fuse::MergedTree::build(&tocs.iter().collect::<Vec<_>>()).unwrap();
         let mut files = Vec::new();
         let mut todo = vec![(0usize, String::new())];
@@ -1193,13 +1187,7 @@ async fn test_a_build_reads_the_directory_of_its_descriptor_in_place() {
         .await
         .unwrap();
     let image = e.service.get(&id).await.unwrap();
-    let tocs: Vec<velarx_storage::Toc> =
-        e.db.get_image_layers(&image.id)
-            .await
-            .unwrap()
-            .iter()
-            .map(|l| serde_json::from_str(l.toc.as_deref().unwrap()).unwrap())
-            .collect();
+    let tocs = common::image_tocs(&e.db, &image.id).await;
     let tree = velarx_fuse::MergedTree::build(&tocs.iter().collect::<Vec<_>>()).unwrap();
     let mut files = Vec::new();
     let mut todo = vec![(0usize, String::new())];
@@ -1527,7 +1515,7 @@ async fn test_copy_from_an_image_that_cannot_be_read_fails_the_step() {
 
     let (e, id) = crate::check_tests::pulled().await;
     for l in e.db.get_image_layers(&id).await.unwrap() {
-        let toc: velarx_storage::Toc = serde_json::from_str(l.toc.as_deref().unwrap()).unwrap();
+        let toc = common::stored_toc(&e.db, &l.key).await;
         for entry in toc.entries.iter().filter(|x| x.name == "usr/big") {
             if let Some(v) = entry.verity() {
                 std::fs::remove_file(e.store.local_path(&v).unwrap()).unwrap();

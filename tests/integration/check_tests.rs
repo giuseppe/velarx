@@ -10,7 +10,7 @@ use velarx_core::services::{CheckService, ImageService};
 use velarx_db::{ContainerRecord, RecordState};
 use velarx_fuse::composefs as cfs;
 use velarx_proto::system::{CheckAction, CheckReport, CheckSpec};
-use velarx_storage::{StorageLock, Toc};
+use velarx_storage::StorageLock;
 
 /// An environment whose images get their composefs images, with one image
 /// pulled: its id.
@@ -60,7 +60,7 @@ fn kinds(r: &CheckReport) -> Vec<&str> {
 /// The object of the file `name` of the image.
 async fn object_of(e: &Env, image: &str, name: &str) -> PathBuf {
     for l in e.db.get_image_layers(image).await.unwrap() {
-        let toc: Toc = serde_json::from_str(l.toc.as_deref().unwrap()).unwrap();
+        let toc = stored_toc(&e.db, &l.key).await;
         if let Some(entry) = toc.entries.iter().find(|x| x.name == name) {
             return e.store.local_path(&entry.verity().unwrap()).unwrap();
         }
@@ -124,7 +124,7 @@ async fn a_layer_image_is_the_same_whatever_is_below_it() {
         let layers = e.db.get_image_layers(&id).await.unwrap();
         assert_eq!(layers.len(), 2);
         let layer = layers.last().unwrap();
-        let toc: Toc = serde_json::from_str(layer.toc.as_deref().unwrap()).unwrap();
+        let toc = stored_toc(&e.db, &layer.key).await;
         let path = cfs::layer_image_path(e.store.root(), &layer.key.file_stem());
         let image = std::fs::read(&path).unwrap();
         assert_eq!(
@@ -210,7 +210,7 @@ async fn a_file_without_a_row_is_found() {
     let path = object_of(&e, &id, "usr/big").await;
     e.db.delete_files(vec![{
         let layers = e.db.get_image_layers(&id).await.unwrap();
-        let toc: Toc = serde_json::from_str(layers[0].toc.as_deref().unwrap()).unwrap();
+        let toc = stored_toc(&e.db, &layers[0].key).await;
         toc.entries
             .iter()
             .find(|x| x.name == "usr/big")
@@ -411,43 +411,8 @@ async fn a_repair_removes_an_image_whose_objects_are_damaged() {
     assert_eq!(again.images_total, 0);
 }
 
-/// A store whose layer rows this build cannot read (a store of another build
-/// that kept the table of contents as text) is not repaired by removing its
-/// images: the check stops, says so, and changes nothing.
-#[tokio::test]
-async fn a_layer_row_that_cannot_be_read_stops_a_repair() {
-    let (e, id) = pulled().await;
-    let toc = e.db.get_image_layers(&id).await.unwrap()[0]
-        .toc
-        .clone()
-        .unwrap();
-    e.db.conn()
-        .call(move |c| Ok(c.execute("UPDATE layers SET toc = ?1", [toc])?))
-        .await
-        .unwrap();
-    let err = checker(&e)
-        .check(&request(false, true))
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("nothing is repaired"), "{err}");
-    assert!(e.db.get_image(&id).await.is_ok());
-    let text: i64 =
-        e.db.conn()
-            .call(|c| {
-                Ok(c.query_row(
-                    "SELECT count(*) FROM layers WHERE typeof(toc) = 'text'",
-                    [],
-                    |r| r.get(0),
-                )?)
-            })
-            .await
-            .unwrap();
-    assert_eq!(text, 1, "the row is as it was");
-}
-
-/// A layer row of this build that is damaged (a table of contents that does
-/// not decode) is the damage of its images alone: the check reports them,
+/// A layer whose table of contents is damaged (a file that is not the one its
+/// row names) is the damage of its images alone: the check reports them,
 /// goes on with the others, and a repair removes only them.
 #[tokio::test]
 async fn a_damaged_layer_row_is_reported_for_its_image_alone() {
@@ -460,11 +425,15 @@ async fn a_damaged_layer_row_is_reported_for_its_image_alone() {
     e.publish(&[&other], &[ZSTD]);
     let second = e.pull().await.unwrap().id;
     assert_ne!(id, second);
-    let layer = e.db.get_image_layers(&id).await.unwrap()[0].key.to_string();
-    e.db.conn()
-        .call(move |c| Ok(c.execute("UPDATE layers SET toc = x'00112233' WHERE id = ?1", [layer])?))
-        .await
-        .unwrap();
+    let layer = e.db.get_image_layers(&id).await.unwrap()[0].key;
+    let toc_z = e.db.get_layer_toc_z(&layer).await.unwrap().unwrap();
+    let toc = velarx_db::layer_files::file(
+        e.store.root().parent().unwrap(),
+        &layer,
+        velarx_db::layer_files::TOC,
+        &velarx_types::digest::Digest::of(layer.digest().alg(), &toc_z),
+    );
+    std::fs::write(toc, [0x00, 0x11, 0x22, 0x33]).unwrap();
     let r = check(&e, false, false).await;
     assert_eq!(kinds(&r), ["bad_toc"], "{:?}", r.problems);
     assert_eq!(r.problems[0].image.as_deref(), Some(id.as_str()));
@@ -728,7 +697,7 @@ async fn the_image_of_a_layer_is_the_same_in_every_store() {
                 // (the image of the staged layer is the same bytes as the
                 // store's it becomes)
                 let id = e.pull_lazy().await.unwrap().id;
-                let staged = e.service.staged_layers(&id, false).await.unwrap();
+                let staged = e.service.staged_layers(&id).await.unwrap();
                 let staged_bytes = std::fs::read(cfs::layer_image_path(
                     &e.area().objects_stand_in(),
                     &staged.last().unwrap().key.file_stem(),

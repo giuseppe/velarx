@@ -617,12 +617,7 @@ async fn test_a_layer_is_the_layer_of_its_table_whatever_serves_it() {
     assert_eq!(b.area().layer_keys(), [layer.key()]);
     let staged = b.area().layer(&layer.key()).unwrap().expect("staged");
     assert_eq!(staged.key(), layer.key());
-    assert!(b
-        .db
-        .get_image_layers_without_toc(&lazy.id)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(b.db.get_image_layers(&lazy.id).await.unwrap().is_empty());
     assert!(b.db.get_layer(&layer.key()).await.is_err());
     let big = sample()
         .into_iter()
@@ -645,7 +640,7 @@ async fn test_a_layer_is_the_layer_of_its_table_whatever_serves_it() {
     // the completion commits it: the image has the layer of its TOC, and
     // the staging area is empty
     let keys: Vec<velarx_db::LayerKey> =
-        b.db.get_image_layers_without_toc(&lazy.id)
+        b.db.get_image_layers(&lazy.id)
             .await
             .unwrap()
             .into_iter()
@@ -669,7 +664,7 @@ async fn test_a_layer_is_the_layer_of_its_table_whatever_serves_it() {
     *c.reg.mode.lock().unwrap() = RangeMode::Refuse;
     let pulled = c.pull().await.unwrap();
     let keys: Vec<velarx_db::LayerKey> =
-        c.db.get_image_layers_without_toc(&pulled.id)
+        c.db.get_image_layers(&pulled.id)
             .await
             .unwrap()
             .into_iter()

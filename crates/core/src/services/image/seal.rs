@@ -779,7 +779,6 @@ mod tests {
                 diff_id: None,
                 other_diff_id: None,
                 size: 1,
-                toc: None,
                 status: "complete".into(),
                 created_at: String::new(),
                 registry_ref: None,

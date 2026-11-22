@@ -17,6 +17,7 @@ use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use velarx_content::layer::dirtar;
 use velarx_content::pull::net::Net;
+use velarx_content::pull::stored::stored_tocs;
 
 const MEDIA_TYPE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 const MEDIA_TYPE_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
@@ -586,17 +587,8 @@ impl ImageService {
         image_id: &str,
     ) -> ImageResult<(Arc<velarx_fuse::MergedTree>, u64)> {
         let layers = self.db.get_image_layers(image_id).await?;
+        let tocs = stored_tocs(&self.db, &layers.iter().map(|l| l.key).collect::<Vec<_>>()).await?;
         tokio::task::spawn_blocking(move || {
-            let tocs: Vec<Toc> = layers
-                .iter()
-                .map(|l| {
-                    l.toc
-                        .as_deref()
-                        .ok_or_else(|| format!("the layer {} has no table of contents", l.key))
-                        .and_then(|t| serde_json::from_str(t).map_err(|e| e.to_string()))
-                })
-                .collect::<Result<_, _>>()
-                .map_err(ImageError::Layer)?;
             let tree = velarx_fuse::MergedTree::build(&tocs.iter().collect::<Vec<_>>())
                 .map_err(ImageError::Layer)?;
             let size = (0..tree.count())
@@ -662,7 +654,7 @@ impl ImageService {
             let config: OciConfig = serde_json::from_str(&image.config)?;
             recorded = self
                 .db
-                .get_image_layers_without_toc(&image.id)
+                .get_image_layers(&image.id)
                 .await?
                 .into_iter()
                 .map(|l| l.key)

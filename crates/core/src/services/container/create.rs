@@ -213,9 +213,8 @@ impl ContainerService {
             }
         }
 
-        // (without the tables of contents: the images of the layers say what
-        // a container needs; a lazy layer's is for its monitor's fetches)
-        let mut layers = if rootfs_dir.is_some() {
+        // (the images of the layers say what a container needs)
+        let layers = if rootfs_dir.is_some() {
             Vec::new()
         } else {
             self.image_layers(&image).await?
@@ -1204,11 +1203,6 @@ impl ContainerService {
         fs::create_dir_all(&rootfs_path)?;
 
         velarx_base::trace::point("create composefs");
-        // the tables of contents of the lazy layers, which the monitor
-        // fetches their files with
-        if layers.iter().any(|l| l.status == "lazy") {
-            self.with_tocs(&image, &mut layers).await?;
-        }
         // a --workdir the image lacks is not made (podman's), unless a
         // mount is there
         if !req.working_dir.is_empty() && rootfs_dir.is_none() {
@@ -1468,13 +1462,12 @@ impl ContainerService {
         Err(ContainerError::ImageNotFound(req.image.clone()))
     }
 
-    /// The layers of an image, without their tables of contents (those of a
-    /// lazy layer are [`ContainerService::with_tocs`]).
+    /// The layers of an image.
     pub async fn image_layers(
         &self,
         image: &velarx_db::ImageRecord,
     ) -> ContainerResult<Vec<LayerRecord>> {
-        self.layers_of(image, false).await
+        self.layers_of(image).await
     }
 
     /// The root file system of the image of `layers` as its containers see

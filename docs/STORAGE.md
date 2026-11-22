@@ -10,8 +10,22 @@ The files of all the layers of all the images live in one directory,
 `<store>/objects`, each regular file once, named by its **fs-verity digest**
 (`objects/ab/cdef...`): SHA-256 (SHA-512 for an image made with
 `--digest sha512`) over blocks of 4096 bytes, no salt. Layers are
-tables of contents (TOC) in the database (`<store>/db.sqlite`), not trees of
-files. A root file system is an EROFS image of metadata (`<store>/composefs/`)
+tables of contents (TOC), not trees of files: the database
+(`<store>/db.sqlite`) keeps a small row for each layer, and its TOC and
+tar-split are two files of a directory of the layer, `<store>/layers/<name>/`
+(`toc-<hex>.zst`, and `tarsplit-<hex>.zst` for a layer that is not canonical,
+`<hex>` the digest of the file). A file is written before the row that names
+it, and is never replaced by other bytes, since its name is its digest (a
+layer pulled again with other bytes has the new file beside the old one, which
+goes with the layer). The row has their digests, and a file is hashed against
+its digest whenever it is read: a file that is not the one its row names is
+refused. The table file of a layer pulled by its table (key `toc:`) is the
+table as the registry sent it, which is what the store service gives; that of
+any other layer is the zstd of the JSON of its TOC. A layer marked incomplete
+has a row that says it has no tar-split, and the next pull of it makes it
+complete.
+
+A root file system is an EROFS image of metadata (`<store>/composefs/`)
 whose regular files point to objects; the kernel (overlayfs with data-only
 layers) or a FUSE file system of the image server puts the objects behind it.
 Per-file work (hashing, fs-verity, the EROFS images) is done when the pull
@@ -20,7 +34,10 @@ ends, so that running an image costs the same however big it is. A lazy pull
 demand. It is transient until it is complete: nothing of its staging is made
 durable and a reboot discards it; its completion makes the layers and the
 image durable before they are named in the store. Names appear only for whole, checked files and the database is written
-after the names are durable.
+after the names are durable: the files of a layer are written with the images
+of the layers, before the barrier of the store that makes them durable, and the
+row that names the layer comes after it. The collection removes the directory
+of a layer with its row.
 
 The EROFS image of a layer is made from its table of contents alone, so it
 is the same file in every image that has the layer, whatever is below it.
@@ -215,7 +232,9 @@ What the design gives:
 
 What an attacker with write access to the store (the user, or root) can do:
 
-* Edit `files`, `layers.toc` or the images' records and sidecars (the
+* Edit `files`, the files of a layer's directory (`layers/<name>/`, whose
+  digests the rows keep: a change is found when the file is read, a change of
+  the row and the file together is not) or the images' records and sidecars (the
   `.verity`, `.id`, `*.json` files), and replace any file that has no
   fs-verity, or delete and recreate one that has.  The checks above compare
   what a file *is* with what the store *says*, and the store says what its

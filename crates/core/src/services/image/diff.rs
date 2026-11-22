@@ -6,6 +6,7 @@
 use super::*;
 use std::collections::BTreeSet;
 use velarx_content::layer::dirtar::Change;
+use velarx_content::pull::stored::stored_tocs;
 use velarx_storage::TocEntry;
 
 /// A path of a layer without `./`, `/` or a trailing slash.
@@ -222,14 +223,7 @@ impl ImageService {
     /// The tables of contents of the layers of an image, the lowest first.
     pub async fn layer_tocs(&self, image: &ImageRecord) -> ImageResult<Vec<Toc>> {
         let layers = self.db.get_image_layers(&image.id).await?;
-        let mut tocs = Vec::with_capacity(layers.len());
-        for rec in layers {
-            let toc = rec.toc.ok_or_else(|| {
-                ImageError::Layer(format!("the layer {} has no table of contents", rec.key))
-            })?;
-            tocs.push(serde_json::from_str(&toc)?);
-        }
-        Ok(tocs)
+        stored_tocs(&self.db, &layers.iter().map(|l| l.key).collect::<Vec<_>>()).await
     }
 
     /// What the image `reference` changes from the image `parent`.

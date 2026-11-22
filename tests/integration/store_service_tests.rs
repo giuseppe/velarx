@@ -627,6 +627,49 @@ async fn test_the_index_of_a_layer_is_a_file_with_no_name() {
         .await;
 }
 
+/// The index of a layer pulled by its table is the bytes the descriptor's
+/// checksum covers, as they were kept, and the tar-split: the digest of the
+/// table is what the layer is asked for.
+#[tokio::test]
+async fn test_the_index_of_a_layer_of_a_table_is_the_table_as_it_was_sent() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let layer = build_chunked(&sample());
+            let e = env().await;
+            e.publish(&[&layer], &[ZSTD]);
+            e.pull().await.unwrap();
+            let key = layer.key();
+            let checksum = *key.digest();
+
+            let service = StoreService::new(e.db.clone(), e.store.clone())
+                .await
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let socket = serve(dir.path(), service).await;
+            let mut conn = store_service::connect(&socket).await.unwrap();
+            // (the layer is asked for by the digest of its table)
+            let (reply, fds) = conn.index(&checksum.to_string(), 16 << 20).await.unwrap();
+            let reply = reply.unwrap();
+            let index = whole(&fds[reply.fd as usize]);
+            let (toc_z, tarsplit) = velarx_content::pull::index::split(&index).unwrap();
+            assert_eq!(
+                velarx_types::digest::Digest::of(checksum.alg(), toc_z),
+                checksum
+            );
+            assert_eq!(toc_z, e.db.get_layer_toc_z(&key).await.unwrap().unwrap());
+            assert_eq!(
+                tarsplit,
+                e.db.get_layer_tarsplit(&key).await.unwrap().unwrap()
+            );
+            // a layer whose tar-split is dropped is not complete: not given
+            e.db.mark_layer_incomplete(&key).await.unwrap();
+            let (reply, fds) = conn.index(&checksum.to_string(), 16 << 20).await.unwrap();
+            assert!(not_found(reply) && fds.is_empty());
+        })
+        .await;
+}
+
 /// A subscriber gets what may be announced, then what another connection
 /// to the database (another process) commits: the service watches it.
 #[tokio::test]

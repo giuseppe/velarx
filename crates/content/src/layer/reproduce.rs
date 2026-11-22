@@ -156,10 +156,10 @@ impl StoredLayer {
             .or(record.diff_id)
             .or_else(|| expected.copied().filter(|_| key.is_toc()))
             .ok_or_else(|| lacks(&"it has no diff id"))?;
-        let toc = record
-            .toc
+        let toc = crate::pull::stored::stored_toc(db, key)
+            .await
+            .map_err(|e| other(&e))?
             .ok_or_else(|| lacks(&"it has no table of contents"))?;
-        let toc: Toc = serde_json::from_str(&toc).map_err(|e| other(&e))?;
         let tarsplit = db
             .get_layer_tarsplit(key)
             .await

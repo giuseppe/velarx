@@ -426,17 +426,16 @@ async fn index_of(layer: &Built) -> Vec<u8> {
     a.pull().await.unwrap();
     let digest = sha(&layer.blob);
     let toc =
-        a.db.get_layer(&stored_key(&a.db, &digest).await)
+        a.db.get_layer_toc_z(&stored_key(&a.db, &digest).await)
             .await
             .unwrap()
-            .toc
             .unwrap();
     let tarsplit =
         a.db.get_layer_tarsplit(&stored_key(&a.db, &digest).await)
             .await
             .unwrap()
             .unwrap();
-    velarx_content::pull::index::encode(toc.as_bytes(), &tarsplit).unwrap()
+    velarx_content::pull::index::encode_compressed(&toc, &tarsplit).unwrap()
 }
 
 /// A gzip layer from its index and its files, from the sources, checked
@@ -488,11 +487,7 @@ async fn test_a_lying_or_incomplete_index_falls_back_to_the_registry() {
     // the TOC of the layer with the tar-split of the other
     let (toc, _) = velarx_content::pull::index::decode(&right, 32 << 20).unwrap();
     let (_, other_ts) = velarx_content::pull::index::decode(&wrong, 32 << 20).unwrap();
-    let lying = velarx_content::pull::index::encode(
-        serde_json::to_string(&toc).unwrap().as_bytes(),
-        &other_ts,
-    )
-    .unwrap();
+    let lying = index_of_toc(&toc, &other_ts);
     for (index, files) in [(lying, file_map(&sample())), (right, Default::default())] {
         let source = fake_source().await;
         let mut items: std::collections::HashMap<String, Vec<u8>> = files;
@@ -655,9 +650,7 @@ async fn test_what_an_index_adds_is_not_kept_nor_asked() {
     entry.fsverity = velarx_storage::to_toc(&vid(&junk));
     entry.size = junk.len() as u64;
     toc.entries.push(entry.clone());
-    let padded =
-        velarx_content::pull::index::encode(serde_json::to_string(&toc).unwrap().as_bytes(), &ts)
-            .unwrap();
+    let padded = index_of_toc(&toc, &ts);
     let source = fake_source().await;
     let mut items = file_map(&sample());
     items.insert(vid(&junk), junk.clone());
@@ -680,9 +673,7 @@ async fn test_what_an_index_adds_is_not_kept_nor_asked() {
     entry.fsverity = velarx_storage::to_toc(&vid(b"huge"));
     entry.size = 1 << 40;
     toc.entries.push(entry);
-    let huge =
-        velarx_content::pull::index::encode(serde_json::to_string(&toc).unwrap().as_bytes(), &ts)
-            .unwrap();
+    let huge = index_of_toc(&toc, &ts);
     let source = fake_source().await;
     let mut items = file_map(&sample());
     items.insert(format!("index:{}", sha(&layer.blob)), huge);
@@ -814,4 +805,10 @@ async fn test_a_store_with_the_old_tables_opens_and_pulls() {
             .unwrap();
     assert_eq!(tables, 0);
     assert!(e.store.contains(&vid(&sample_big())));
+}
+
+/// The index of the table of contents `toc` and the tar-split `ts`.
+fn index_of_toc(toc: &velarx_storage::Toc, ts: &[u8]) -> Vec<u8> {
+    let toc_z = zstd::encode_all(&serde_json::to_vec(toc).unwrap()[..], 3).unwrap();
+    velarx_content::pull::index::encode_compressed(&toc_z, ts).unwrap()
 }
