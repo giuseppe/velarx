@@ -4,10 +4,11 @@
 //! The zstd:chunked format of containers/storage: zstd frames for the tar
 //! headers between two files and one frame for each chunk of a file (cut by
 //! a rolling checksum, so that an edit of a file changes few chunks), then
-//! skippable frames with the zstd compressed TOC, the tar-split and the
-//! footer.  The output only depends on the tar stream: the same stream gives
-//! the same blob, so a layer can be regenerated from its tar-split and the
-//! files of the store with the digest it had.
+//! skippable frames with the zstd compressed binary table
+//! ([`velarx_storage::table`], when the TOC can have one), the TOC, the
+//! tar-split and the footer.  The output only depends on the tar stream: the
+//! same stream gives the same blob, so a layer can be regenerated from its
+//! tar-split and the files of the store with the digest it had.
 
 use crate::pull::entry;
 use crate::pull::tar::{Header, Kind, Sink, TarReader};
@@ -15,7 +16,8 @@ use crate::pull::tarsplit;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use velarx_storage::{
-    canonical, Toc, TocEntry, TocEntryType, TocVerityHasher, TOC_VERSION, TOC_VERSION_CANONICAL,
+    canonical, table, Toc, TocEntry, TocEntryType, TocVerityHasher, TOC_VERSION,
+    TOC_VERSION_CANONICAL,
 };
 use velarx_types::digest::{Algorithm, Digest, DigestWriter, Hashing};
 
@@ -768,8 +770,27 @@ impl<W: Write> Writer<W> {
         };
         let toc_json = self.toc_json(&toc)?;
         let toc_z = zstd::bulk::compress(&toc_json, METADATA_LEVEL)?;
+        // (a layer whose paths are not each once and in order has no table)
+        let table = table::encode(&toc, self.alg).ok();
+        let alg = self.alg;
 
         let backend = self.backend()?;
+        if let Some(table) = table {
+            // (the files end where the table starts: what the reader checks)
+            let offset = backend.size() + 8;
+            table::decode(&table, offset)
+                .map_err(|e| io::Error::other(format!("zstd:chunked table self-check: {e}")))?;
+            let table_z = zstd::bulk::compress(&table, METADATA_LEVEL)?;
+            backend.skippable(&table_z)?;
+            annotations.insert(
+                format!("{ANNOTATION_PREFIX}table-checksum"),
+                Digest::of(alg, &table_z).to_string(),
+            );
+            annotations.insert(
+                format!("{ANNOTATION_PREFIX}table-position"),
+                format!("{offset}:{}:{}", table_z.len(), table.len()),
+            );
+        }
         let toc_offset = backend.size() + 8;
         backend.skippable(&toc_z)?;
         let ts_offset = if canonical { 0 } else { backend.size() + 8 };
@@ -1409,6 +1430,110 @@ mod tests {
             }
             assert!(regular > 0);
         }
+    }
+
+    /// A tar in the order of its paths, with a directory it does not have
+    /// (`usr`), a hard link, a symlink, an empty file, chunks and holes.
+    fn ordered_tar() -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_mode(0o644);
+        h.set_mtime(1_700_000_000);
+        let mut add = |name: &str, kind: tar::EntryType, data: &[u8]| {
+            h.set_entry_type(kind);
+            h.set_size(data.len() as u64);
+            b.append_data(&mut h.clone(), name, data).unwrap();
+        };
+        let mut holey = vec![1u8; 5000];
+        holey.extend(vec![0u8; 20_000]);
+        holey.extend(vec![2u8; 5000]);
+        let random: Vec<u8> = (0..400_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        add("etc/", tar::EntryType::Directory, b"");
+        add("etc/a", tar::EntryType::Regular, b"hello\n");
+        add("etc/b", tar::EntryType::Regular, b"");
+        add("usr/holey", tar::EntryType::Regular, &holey);
+        add("usr/random", tar::EntryType::Regular, &random);
+        add("usr/same", tar::EntryType::Regular, b"hello\n");
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Link);
+        h.set_mtime(1_700_000_000);
+        h.set_mode(0o644);
+        b.append_link(&mut h, "usr/x", "etc/a").unwrap();
+        h.set_entry_type(tar::EntryType::Symlink);
+        b.append_link(&mut h, "usr/y", "../etc/a").unwrap();
+        b.into_inner().unwrap()
+    }
+
+    /// A zstd:chunked layer has its table in the algorithm of the layer,
+    /// before the TOC, and it is the TOC (the content digests of the files
+    /// aside, a file that is there twice by the place of its first copy).
+    #[test]
+    fn test_a_chunked_layer_has_its_table() {
+        for alg in Algorithm::ALL {
+            for canonical in [false, true] {
+                let tar = match canonical {
+                    true => canonical_tar(|_| {}),
+                    false => ordered_tar(),
+                };
+                let mut blob = Vec::new();
+                let c = Compression::ZstdChunked;
+                let w = match canonical {
+                    true => write_canonical_layer(&tar[..], alg, c, None, &mut blob),
+                    false => write_layer(&tar[..], alg, c, &mut blob),
+                }
+                .unwrap();
+                let a = |k: &str| w.annotations[&format!("{ANNOTATION_PREFIX}{k}")].clone();
+                let pos: Vec<usize> = a("table-position")
+                    .split(':')
+                    .map(|n| n.parse().unwrap())
+                    .collect();
+                let table_z = &blob[pos[0]..pos[0] + pos[1]];
+                assert_eq!(a("table-checksum"), Digest::of(alg, table_z).to_string());
+                let table = zstd::decode_all(table_z).unwrap();
+                assert_eq!(table.len(), pos[2]);
+                let back = velarx_storage::table::decode(&table, pos[0] as u64).unwrap();
+                let (mut toc, _) = toc_of(&blob, &w);
+                assert!(
+                    pos[0]
+                        < a("manifest-position")
+                            .split(':')
+                            .next()
+                            .unwrap()
+                            .parse()
+                            .unwrap()
+                );
+                let mut first = std::collections::HashMap::new();
+                for e in &mut toc.entries {
+                    e.digest = None;
+                    // (the table names an entry as a canonical tar does)
+                    if !canonical {
+                        e.name = format!("./{}", e.name);
+                        if e.entry_type == TocEntryType::Hardlink {
+                            e.link_name = e.link_name.as_ref().map(|l| format!("./{l}"));
+                        }
+                    }
+                    if let Some(v) = e.fsverity {
+                        let (off, end) = *first.entry(v).or_insert((e.offset, e.end_offset));
+                        (e.offset, e.end_offset) = (off, end);
+                    }
+                }
+                let json = |t: &Toc| serde_json::to_value(t).unwrap();
+                assert_eq!(json(&back), json(&toc), "{alg} {canonical}");
+            }
+        }
+    }
+
+    /// A layer whose paths are not in order has no table, and keeps its
+    /// TOC.
+    #[test]
+    fn test_a_layer_out_of_order_has_no_table() {
+        let (_, w) = write(&sample_tar(), Compression::ZstdChunked);
+        let key = |k: &str| format!("{ANNOTATION_PREFIX}{k}");
+        assert!(!w.annotations.contains_key(&key("table-position")));
+        assert!(!w.annotations.contains_key(&key("table-checksum")));
+        assert!(w.annotations.contains_key(&key("manifest-checksum")));
     }
 
     /// Without the sha256 of the files the layer only differs by the TOC.

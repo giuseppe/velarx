@@ -281,6 +281,15 @@ object name.
   digest; a file the store has is then not written, and not read again at the
   commit, and a file it lacks is measured once more by the kernel or by the
   commit.
+* **The binary table.**  A zstd:chunked layer that velarx writes has, beside
+  its JSON TOC, the same table of contents in records of fixed size: a
+  skippable frame before the TOC, named by the annotations `table-position`
+  and `table-checksum`, which other readers ignore.  Every digest of it is of
+  the algorithm of the layer (the one of `--digest` or `[build] digest` when
+  the image was made), `table-checksum` too.  A layer gets one when each of
+  its paths is there once and in the order of the paths, a directory before
+  what it holds, with hard links to an earlier file: every layer velarx
+  builds.
 * **Layers of other tools.**  A zstd:chunked layer is pulled through its
   TOC or not at all, lazily or not: one whose TOC gives no fs-verity digest
   for a file (containers/storage writes none unless asked) is refused with
