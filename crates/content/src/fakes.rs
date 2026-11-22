@@ -18,11 +18,11 @@ pub enum Stages {
     Wrong,
 }
 
-/// A fetcher of one file, `key` (its fs-verity key), with the bytes `body`.
+/// A fetcher of files by their fs-verity keys, with their bytes.
 pub struct Fake {
     how: Stages,
-    body: Vec<u8>,
-    key: String,
+    /// The files it has: key, bytes
+    files: Vec<(String, Vec<u8>)>,
     asked: Arc<AtomicUsize>,
 }
 
@@ -30,12 +30,12 @@ impl Fake {
     /// A fetcher that stages the file `key` as `how`; `asked` counts its
     /// calls to `fetch`.
     pub fn new(how: Stages, key: &str, body: &[u8], asked: Arc<AtomicUsize>) -> Self {
-        Self {
-            how,
-            body: body.to_vec(),
-            key: key.to_string(),
-            asked,
-        }
+        Self::of(how, vec![(key.to_string(), body.to_vec())], asked)
+    }
+
+    /// A fetcher that stages each file of `files` (key, bytes) as `how`.
+    pub fn of(how: Stages, files: Vec<(String, Vec<u8>)>, asked: Arc<AtomicUsize>) -> Self {
+        Self { how, files, asked }
     }
 }
 
@@ -60,9 +60,9 @@ impl StagingFetcher for Fake {
         self.asked.fetch_add(1, Ordering::SeqCst);
         let failed = |e: String| FetcherError::failed(e);
         for name in &call.objects {
-            if name != &self.key {
-                return Err(failed(format!("{name} is not the file of this fetcher")));
-            }
+            let Some((_, body)) = self.files.iter().find(|(k, _)| k == name) else {
+                return Err(failed(format!("{name} is not a file of this fetcher")));
+            };
             let rel = crate::stager::staged_rel(name).ok_or_else(|| failed("no key".into()))?;
             let (dir, _) = rel
                 .rsplit_once('/')
@@ -87,7 +87,7 @@ impl StagingFetcher for Fake {
             )
             .map_err(|e| failed(e.to_string()))?;
             let body: &[u8] = match self.how {
-                Stages::Right => &self.body,
+                Stages::Right => body,
                 Stages::Wrong => b"not it",
             };
             std::fs::File::from(file)

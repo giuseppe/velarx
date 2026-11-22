@@ -489,6 +489,100 @@ impl ImageService {
         });
     }
 
+    /// Fetch the program `command` (looked up in the `PATH` `path`) of a
+    /// container made on the pull `pull`, and what its loader reads, while
+    /// the container is made: the program and the cache of the loader, then
+    /// the interpreter and the libraries the program needs, then theirs,
+    /// each round in one request for each layer, the requests of a start.
+    /// A hint, in the background: what is not fetched here is fetched when
+    /// it is read.
+    pub(crate) fn fetch_program(
+        &self,
+        pull: &velarx_content::pull::staged::StagedPull,
+        command: String,
+        path: Option<String>,
+    ) {
+        /// The rounds of libraries: a program, its libraries, theirs.
+        const ROUNDS: usize = 4;
+        let (this, keys) = (self.clone(), pull.layers.clone());
+        tokio::spawn(async move {
+            // (the lazy layers of the pull, the lowest first)
+            let mut layers: Vec<(LayerKey, Arc<LayerCtx>)> = Vec::new();
+            for key in keys.iter().filter_map(|k| LayerKey::parse(k)) {
+                if let Ok(ctx) = this.lazy_layer_ctx(&key).await {
+                    layers.push((key, ctx));
+                }
+            }
+            let tocs: Vec<Arc<Toc>> = layers.iter().map(|(_, c)| c.toc.clone()).collect();
+            let keys: Vec<LayerKey> = layers.iter().map(|(k, _)| *k).collect();
+            let at = |files: Vec<(usize, &velarx_storage::TocEntry)>| -> Vec<(usize, String)> {
+                files
+                    .into_iter()
+                    .filter_map(|(l, e)| Some((l, e.verity()?)))
+                    .collect()
+            };
+            let (mut round, cache) = {
+                let all: Vec<&Toc> = tocs.iter().map(|t| &**t).collect();
+                let names = start_set::Layers::new(&all);
+                let program = names.program(&command, path.as_deref());
+                let cache = names.file(start_set::LOADER_CACHE);
+                (
+                    at(program.into_iter().collect()),
+                    at(cache.into_iter().collect()),
+                )
+            };
+            let mut seen = std::collections::HashSet::new();
+            for n in 0..ROUNDS {
+                round.retain(|f| seen.insert(f.clone()));
+                let mut fetch = round.clone();
+                if n == 0 {
+                    fetch.extend(cache.iter().cloned());
+                }
+                if fetch.is_empty() {
+                    break;
+                }
+                let mut sets = vec![Vec::new(); keys.len()];
+                for (l, d) in &fetch {
+                    sets[*l].push(d.clone());
+                }
+                let fetches = keys
+                    .iter()
+                    .zip(sets)
+                    .filter(|(_, files)| !files.is_empty())
+                    .map(|(key, files)| this.stage_begin(key, files, Urgency::Wait));
+                futures::future::join_all(fetches).await;
+                let path_of = |(l, d): &(usize, String)| this.lazy_file_path(&keys[*l], d);
+                let programs: Vec<PathBuf> = round.iter().filter_map(path_of).collect();
+                let cache_path = cache.first().and_then(path_of);
+                let tocs = tocs.clone();
+                round = tokio::task::spawn_blocking(move || {
+                    let all: Vec<&Toc> = tocs.iter().map(|t| &**t).collect();
+                    let names = start_set::Layers::new(&all);
+                    let cache = cache_path
+                        .and_then(|p| std::fs::File::open(p).ok())
+                        .map(|f| start_set::loader_cache(&f))
+                        .unwrap_or_default();
+                    let mut libraries = Vec::new();
+                    for p in programs {
+                        let Ok(file) = std::fs::File::open(p) else {
+                            continue;
+                        };
+                        let loader = start_set::loader_of(&file);
+                        libraries.extend(
+                            names
+                                .libraries(&loader, &cache)
+                                .into_iter()
+                                .filter_map(|(l, e)| Some((l, e.verity()?))),
+                        );
+                    }
+                    libraries
+                })
+                .await
+                .unwrap_or_default();
+            }
+        });
+    }
+
     /// The fetches of the files `sets` of `layers`, each layer's in one
     /// request, begun now: the window of a layer waits until its fetch
     /// ends.
@@ -1153,6 +1247,139 @@ mod tests {
         waiting.await.unwrap();
         service.forget_lazy(&key).await;
         assert_eq!(inflight(&service), None);
+    }
+
+    /// A minimal 64-bit ELF program with the interpreter `interp` that
+    /// needs the library `needed`.
+    fn elf(interp: &str, needed: &str) -> Vec<u8> {
+        let (interp_at, dyn_at) = (64 + 3 * 56, 64 + 3 * 56 + 32);
+        assert!(interp.len() < 32);
+        let str_at = dyn_at + 4 * 16;
+        let mut out = vec![0u8; 64];
+        out[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        out[32..40].copy_from_slice(&64u64.to_le_bytes());
+        out[54..56].copy_from_slice(&56u16.to_le_bytes());
+        out[56..58].copy_from_slice(&3u16.to_le_bytes());
+        let total = (str_at + needed.len() + 2) as u64;
+        for (kind, offset, size) in [
+            (1u32, 0u64, total),
+            (3, interp_at as u64, interp.len() as u64 + 1),
+            (2, dyn_at as u64, 64),
+        ] {
+            out.extend(kind.to_le_bytes());
+            out.extend(0u32.to_le_bytes());
+            for v in [offset, offset, offset, size, size, 0] {
+                out.extend(v.to_le_bytes());
+            }
+        }
+        out.resize(interp_at, 0);
+        out.extend(interp.bytes().chain([0]));
+        out.resize(dyn_at, 0);
+        let strsz = needed.len() as u64 + 2;
+        for (tag, value) in [(5u64, str_at as u64), (10, strsz), (1, 1), (0, 0)] {
+            out.extend(tag.to_le_bytes());
+            out.extend(value.to_le_bytes());
+        }
+        out.push(0);
+        out.extend(needed.bytes().chain([0]));
+        out
+    }
+
+    /// The program a container runs, its interpreter and its library are
+    /// staged while the container is made, before anything reads them.
+    #[tokio::test]
+    async fn the_program_of_a_container_and_its_loader_are_fetched() {
+        use velarx_content::fakes::{Fake, Stages};
+        use velarx_content::fetcher::fetch_client::FetchConn;
+        use velarx_content::serve_fetch::LocalFetcher;
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service(tmp.path()).await;
+        let area = service.staging_area();
+        area.create().unwrap();
+        let key = LayerKey::Whole(Digest::of(Algorithm::Sha256, b"blob"));
+        std::fs::create_dir_all(area.layer_dir(&key)).unwrap();
+        std::fs::write(area.layer_dir(&key).join("layer.json"), b"{}").unwrap();
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("usr/bin/prog", elf("/lib/ld.so", "libc.so.6")),
+            ("lib/ld.so", b"the loader".to_vec()),
+            ("lib/libc.so.6", b"the library".to_vec()),
+        ];
+        let keyed: Vec<(String, Vec<u8>)> = files
+            .iter()
+            .map(|(_, body)| {
+                let d = velarx_storage::fsverity_digest_of(Algorithm::Sha256, body);
+                (Digest::parse_key(&d).unwrap().to_string(), body.clone())
+            })
+            .collect();
+        let mut entries = vec![
+            serde_json::json!({"name": "usr/", "type": "dir"}),
+            serde_json::json!({"name": "usr/bin/", "type": "dir"}),
+            serde_json::json!({"name": "lib/", "type": "dir"}),
+        ];
+        for ((name, body), (d, _)) in files.iter().zip(&keyed) {
+            entries.push(serde_json::json!({
+                "name": name, "type": "reg", "size": body.len(),
+                "fsverity": velarx_storage::toc_value(&velarx_storage::to_toc(d).unwrap()),
+            }));
+        }
+        let toc: Toc =
+            serde_json::from_value(serde_json::json!({"version": 1, "entries": entries})).unwrap();
+        let desc: OciDescriptor = serde_json::from_value(serde_json::json!({
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "digest": key.digest().to_string(),
+            "size": 1,
+        }))
+        .unwrap();
+        let registry = LocalFetcher::start(
+            Arc::new(Fake::of(Stages::Right, keyed.clone(), Default::default())),
+            velarx_content::activation::Limits::default(),
+        )
+        .unwrap();
+        let manifest = br#"{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","size":2},"layers":[]}"#;
+        let walker = StagedFetch::open(
+            (
+                Vec::new(),
+                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Vec::new(),
+            ),
+            &service.staging_dir,
+            false,
+            ("localhost/a", true),
+            Some(b"{}"),
+            manifest,
+        )
+        .await
+        .unwrap();
+        service.with_lazy_walker(&key, (desc, toc), walker).await;
+        let pull = velarx_content::pull::staged::StagedPull {
+            id: "id".into(),
+            manifest_digest: Digest::of(Algorithm::Sha256, b"m"),
+            config_digest: Digest::of(Algorithm::Sha256, b"c"),
+            manifest: String::new(),
+            config: String::new(),
+            layers: vec![key.to_string()],
+            tags: Vec::new(),
+            digest_names: Vec::new(),
+            pulls: Vec::new(),
+            registry_ref: None,
+            started_at: String::new(),
+        };
+        service.fetch_program(&pull, "prog".into(), None);
+        let staged = || {
+            keyed
+                .iter()
+                .all(|(d, _)| service.lazy_file_path(&key, d).is_some())
+        };
+        for _ in 0..500 {
+            if staged() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            staged(),
+            "the program, its interpreter and its library are staged"
+        );
     }
 
     /// The files a start reads are staged in the background while the

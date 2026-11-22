@@ -20,14 +20,19 @@ use velarx_storage::{Toc, TocEntry, TocEntryType};
 pub const MAX_BYTES: u64 = 64 << 20;
 
 /// What the engine reads to make the container (the users and groups of
-/// the image) and what the spec mounts over (the files of the network).
-const FILES: [&str; 5] = [
+/// the image), what the spec mounts over (the files of the network) and
+/// the cache of the loader, which a dynamic program reads first.
+pub const FILES: [&str; 6] = [
     "/etc/passwd",
     "/etc/group",
     "/etc/hosts",
     "/etc/hostname",
     "/etc/resolv.conf",
+    LOADER_CACHE,
 ];
+
+/// The cache of the loader of a dynamic program.
+pub const LOADER_CACHE: &str = "/etc/ld.so.cache";
 
 /// Where a program is looked for when the image has no `PATH`: the `PATH`
 /// the engine gives such a container.
@@ -304,7 +309,7 @@ impl<'a> Layers<'a> {
     /// The program `command` is: the file of an absolute name, or the first
     /// of the `PATH` directories that has it (of the first [`MAX_PATH_DIRS`]:
     /// the configuration is the image's, and each costs a lookup).
-    fn program(&self, command: &str, path: Option<&str>) -> Option<(usize, &'a TocEntry)> {
+    pub fn program(&self, command: &str, path: Option<&str>) -> Option<(usize, &'a TocEntry)> {
         if command.contains('/') {
             return command.starts_with('/').then(|| self.file(command))?;
         }

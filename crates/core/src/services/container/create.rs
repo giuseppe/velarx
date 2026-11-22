@@ -173,6 +173,18 @@ impl ContainerService {
                 // in the background)
                 info!("Running with an image being pulled: files will be fetched on-demand");
             }
+            // (the program of the container and what its loader reads come
+            // while the container is made)
+            if let Some(pull) = &staged {
+                let config: velarx_types::OciConfig = serde_json::from_str(&image.config)?;
+                let (entrypoint, command) = process_args(&req, &config.config);
+                if let Some(program) = entrypoint.into_iter().chain(command).next() {
+                    let path = (req.env.iter().chain(&config.config.env))
+                        .find_map(|e| e.strip_prefix("PATH="))
+                        .map(str::to_string);
+                    self.image_service.fetch_program(pull, program, path);
+                }
+            }
             image
         };
 
@@ -394,21 +406,7 @@ impl ContainerService {
             ));
         }
 
-        // An entrypoint given drops the command of the image; `[""]` (as
-        // `--entrypoint ""` sends it) drops the entrypoint of the image.
-        let mut command = if !req.command.is_empty() {
-            req.command.clone()
-        } else if req.entrypoint.is_empty() {
-            image_config.config.cmd.clone().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let mut entrypoint = match req.entrypoint.as_slice() {
-            [] if req.reset_entrypoint => Vec::new(),
-            [] => image_config.config.entrypoint.clone().unwrap_or_default(),
-            [e] if e.is_empty() => Vec::new(),
-            e => e.to_vec(),
-        };
+        let (mut entrypoint, mut command) = process_args(&req, &image_config.config);
         if entrypoint.is_empty() && command.is_empty() {
             // (as podman's: the container is made, and the runtime says that
             // it cannot run it when it starts)
@@ -1745,6 +1743,30 @@ fn newer(a: &str, b: &str) -> bool {
         (Ok(a), Ok(b)) => a > b,
         _ => a > b,
     }
+}
+
+/// The entrypoint and the command of the process of a container: those of
+/// the request or of the image.  An entrypoint given drops the command of
+/// the image; `[""]` (as `--entrypoint ""` sends it) drops the entrypoint of
+/// the image.
+fn process_args(
+    req: &CreateContainerRequest,
+    config: &velarx_types::OciImageConfig,
+) -> (Vec<String>, Vec<String>) {
+    let command = if !req.command.is_empty() {
+        req.command.clone()
+    } else if req.entrypoint.is_empty() {
+        config.cmd.clone().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let entrypoint = match req.entrypoint.as_slice() {
+        [] if req.reset_entrypoint => Vec::new(),
+        [] => config.entrypoint.clone().unwrap_or_default(),
+        [e] if e.is_empty() => Vec::new(),
+        e => e.to_vec(),
+    };
+    (entrypoint, command)
 }
 
 #[cfg(test)]
