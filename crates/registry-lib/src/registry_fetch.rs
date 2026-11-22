@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use velarx_content::fetcher::fetch::{
-    Blob, EventKind, Failure, FetchEvent as Event, FetcherError, NotLazy, Probed, TocSource,
+    Blob, EventKind, Failure, FetchEvent as Event, FetcherError, NotLazy, Parts, Probed, TocSource,
     MAX_FDS,
 };
 use velarx_content::pull::chunked::{
@@ -309,13 +309,14 @@ impl RegistryFetch {
     }
 
     /// The compressed table of contents and tar-split of a zstd:chunked
-    /// layer, as the registry has them.
+    /// layer, as the registry has them: the `parts` asked for (empty: one
+    /// that was not, or that the layer has not).
     async fn metadata(
         &self,
         scope: &Scope,
         (pool, host): (&Arc<Pool>, &str),
         layer: &OciDescriptor,
-        info: &chunked::Info,
+        (info, parts): (&chunked::Info, Parts),
     ) -> Result<(Vec<u8>, Vec<u8>), ImageError> {
         let span = |(o, l): (u64, u64)| -> Result<Range<u64>, ImageError> {
             let end = o.checked_add(l).filter(|&e| {
@@ -326,23 +327,21 @@ impl RegistryFetch {
         };
         let toc = span((info.toc.0, info.toc.1))?;
         // (a canonical layer has no tar-split: its table of contents alone)
-        let Some(ts) = info.tarsplit.map(|t| span((t.0, t.1))).transpose()? else {
-            let mut got: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
-            self.ranges_into(
-                scope,
-                (pool, host),
-                layer,
-                std::slice::from_ref(&toc),
-                Some(0),
-                &mut got,
-            )
-            .await
-            .map_err(ranges_failed)?;
-            let [toc_z, _] = got;
-            if toc_z.len() as u64 != toc.end - toc.start {
-                return Err(ImageError::Layer("incomplete zstd:chunked metadata".into()));
+        let ts = info.tarsplit.map(|t| span((t.0, t.1))).transpose()?;
+        let (toc, ts) = match (parts, ts) {
+            (Parts::All, Some(ts)) => (toc, ts),
+            (Parts::Tarsplit, Some(ts)) => {
+                return Ok((
+                    Vec::new(),
+                    self.metadata_range(scope, (pool, host), layer, ts).await?,
+                ))
             }
-            return Ok((toc_z, Vec::new()));
+            _ => {
+                return Ok((
+                    self.metadata_range(scope, (pool, host), layer, toc).await?,
+                    Vec::new(),
+                ))
+            }
         };
         let mut wanted = vec![toc.clone(), ts.clone()];
         let swapped = ts.start < toc.start;
@@ -400,6 +399,33 @@ impl RegistryFetch {
             return Err(ImageError::Layer("incomplete zstd:chunked metadata".into()));
         }
         Ok(if swapped { (b, a) } else { (a, b) })
+    }
+
+    /// The bytes of the range `r` of the blob of `layer`: the table of
+    /// contents or the tar-split, on its own.
+    async fn metadata_range(
+        &self,
+        scope: &Scope,
+        (pool, host): (&Arc<Pool>, &str),
+        layer: &OciDescriptor,
+        r: Range<u64>,
+    ) -> Result<Vec<u8>, ImageError> {
+        let mut got: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+        self.ranges_into(
+            scope,
+            (pool, host),
+            layer,
+            std::slice::from_ref(&r),
+            Some(0),
+            &mut got,
+        )
+        .await
+        .map_err(ranges_failed)?;
+        let [bytes, _] = got;
+        if bytes.len() as u64 != r.end - r.start {
+            return Err(ImageError::Layer("incomplete zstd:chunked metadata".into()));
+        }
+        Ok(bytes)
     }
 
     /// One request of ranges: each chunk, as the worker decompresses it, is
@@ -1005,7 +1031,7 @@ impl StagingFetcher for RegistryFetch {
         &self,
         scope: &Scope,
         layers: Vec<Blob>,
-        _again: bool,
+        (_, parts): (bool, Parts),
         out: &Out<Probed>,
     ) -> Result<(), FetcherError> {
         let (pool, host) = self.pool(scope)?;
@@ -1038,21 +1064,26 @@ impl StagingFetcher for RegistryFetch {
             // is an error of the layer, which no fetcher after this one
             // makes right)
             let (toc_z, ts_z) = self
-                .metadata(scope, (&pool, &host), layer, &info)
+                .metadata(scope, (&pool, &host), layer, (&info, parts))
                 .await
                 .map_err(|e| FetcherError::Refused {
                     reason: format!("layer {}: its table of contents: {e}", layer.digest),
                 })?;
             // (the engine checks what it keeps against the descriptor, and
             // gives the error of a table it cannot use)
-            let mut fds = vec![velarx_base::sealed::sealed_memory(&toc_z).map_err(failed)?];
-            if info.tarsplit.is_some() {
-                fds.push(velarx_base::sealed::sealed_memory(&ts_z).map_err(failed)?);
-            }
+            let mut fds = Vec::new();
+            let mut carry = |bytes: Vec<u8>| -> Result<Option<u32>, FetcherError> {
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                fds.push(velarx_base::sealed::sealed_memory(&bytes).map_err(failed)?);
+                Ok(Some(fds.len() as u32 - 1))
+            };
+            let (toc_file, tarsplit_file) = (carry(toc_z)?, carry(ts_z)?);
             out.send_with(
                 Probed {
-                    toc_file: Some(0),
-                    tarsplit_file: info.tarsplit.map(|_| 1),
+                    toc_file,
+                    tarsplit_file,
                     ..reply(TocSource::Carried, true, None)
                 },
                 fds,

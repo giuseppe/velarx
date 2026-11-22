@@ -14,8 +14,8 @@
 use crate::activation;
 use crate::fetcher::fetch::{
     Ack, Blob, EventKind, Failure, FailureClass, FetchEvent, FetchReply, FetcherError, Item,
-    Manifest, NotLazy, ProbeReply, Probed, Reuse, TocSource, UnpackReply, Urgency, MAX_ACCESS,
-    MAX_FDS, PROTO,
+    Manifest, NotLazy, Parts, ProbeReply, Probed, Reuse, TocSource, UnpackReply, Urgency,
+    MAX_ACCESS, MAX_FDS, PROTO,
 };
 use crate::fetcher::proto::{
     Ack as RegistryAck, Downloaded, Found, Hit, RegistryError, Remote, Tagged, MAX_ANSWER,
@@ -213,13 +213,14 @@ pub trait StagingFetcher: Send + Sync + 'static {
     }
 
     /// What can this fetcher do for `layers`?  One reply for each, in any
-    /// order.  `again`: the index it carried for a layer without a table of
-    /// contents in the last probe of the scope was wrong.
+    /// order, that carries the `parts` of a table of contents.  `again`: the
+    /// index it carried for a layer without a table of contents in the last
+    /// probe of the scope was wrong.
     async fn probe(
         &self,
         _scope: &Scope,
         layers: Vec<Blob>,
-        _again: bool,
+        (_again, _parts): (bool, Parts),
         out: &Out<Probed>,
     ) -> Result<(), FetcherError> {
         for (at, _) in layers.iter().enumerate() {
@@ -945,7 +946,7 @@ mod service {
         /// Who the fetcher is and what it can do.
         #[zlink(
             interface = "org.velarx.Fetcher",
-            types = [Urgency, Blob, Reuse, TocSource, NotLazy, FailureClass, Failure, EventKind, FetchEvent, Probed]
+            types = [Urgency, Blob, Reuse, TocSource, Parts, NotLazy, FailureClass, Failure, EventKind, FetchEvent, Probed]
         )]
         pub async fn get_info(&self) -> Info {
             info_of(self.api.described(), PROTO)
@@ -1208,13 +1209,15 @@ mod service {
         /// `again`: the index this fetcher carried for a layer without a
         /// table of contents in the last `Probe` of the scope was wrong (its
         /// replay failed): it carries one from another of its providers, or
-        /// none.
+        /// none.  `parts`: what of a table of contents to carry (all of it
+        /// when not given).
         #[zlink(more, return_fds)]
         pub async fn probe(
             &self,
             more: bool,
             layers: Vec<Blob>,
             again: Option<bool>,
+            parts: Option<Parts>,
         ) -> impl Stream<Item = (Result<Reply<ProbeReply>, FetcherError>, Vec<OwnedFd>)> + Unpin
         {
             let scope = match self.scope() {
@@ -1237,7 +1240,7 @@ mod service {
             let task = self.runtime.spawn(async move {
                 let out = Out { tx };
                 tokio::select! {
-                    got = api.probe(&scope, layers, again.unwrap_or(false), &out) => got,
+                    got = api.probe(&scope, layers, (again.unwrap_or(false), parts.unwrap_or_default()), &out) => got,
                     () = gone.cancelled() => Ok(()),
                 }
             });
@@ -2415,7 +2418,7 @@ mod tests {
             annotations: None,
         };
         let s = e
-            .probe(true, vec![blob("sha256:aa"), blob("sha256:bb")], None)
+            .probe(true, vec![blob("sha256:aa"), blob("sha256:bb")], None, None)
             .await;
         let got: Vec<ProbeReply> = s
             .filter_map(|(r, _)| async move { r.ok().and_then(|r| r.into_parameters()) })

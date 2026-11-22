@@ -16,8 +16,8 @@
 //! socket.
 
 use crate::fetcher::fetch::{
-    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, NotLazy, Probed,
-    TocSource,
+    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, NotLazy, Parts,
+    Probed, TocSource,
 };
 use crate::serve_fetch::{Described, FetchCall, LayerScope, Out, Scope, StagingFetcher};
 use crate::stager::{self, content_of, name_of, LayerToc, Unnamed};
@@ -212,7 +212,7 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
         &self,
         _scope: &Scope,
         layers: Vec<Blob>,
-        again: bool,
+        (again, _): (bool, Parts),
         out: &Out<Probed>,
     ) -> Result<(), FetcherError> {
         let gone = |_| FetcherError::failed("the asker is gone".to_string());
@@ -425,7 +425,7 @@ mod tests {
             chunked,
         ];
         fetch
-            .probe(&scope, layers, false, &Out::new(tx))
+            .probe(&scope, layers, (false, Parts::All), &Out::new(tx))
             .await
             .unwrap();
         let mut got = Vec::new();

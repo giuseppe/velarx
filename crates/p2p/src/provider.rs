@@ -3810,7 +3810,7 @@ mod tests {
     /// was, from the index of its checksum.
     #[tokio::test]
     async fn a_probe_of_a_whole_layer_carries_its_index() {
-        use velarx_content::fetcher::fetch::{Blob, NotLazy, TocSource};
+        use velarx_content::fetcher::fetch::{Blob, NotLazy, Parts, TocSource};
         use velarx_content::pull::index;
         use velarx_content::serve_fetch::{Out, Scope, StagingFetcher};
         let tarsplit = b"a tar-split".to_vec();
@@ -3871,7 +3871,7 @@ mod tests {
             s.knowledge()
                 .served(Some(&key), peer, Duration::from_millis(1));
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-            s.probe(&scope, vec![blob], false, &Out::new(tx))
+            s.probe(&scope, vec![blob], (false, Parts::All), &Out::new(tx))
                 .await
                 .unwrap();
             let (reply, fds) = rx.recv().await.unwrap();
@@ -3892,7 +3892,7 @@ mod tests {
     /// scope; another scope (another pull) asks it.
     #[tokio::test]
     async fn a_probe_again_passes_over_the_peer_that_gave_the_index() {
-        use velarx_content::fetcher::fetch::{Blob, TocSource};
+        use velarx_content::fetcher::fetch::{Blob, Parts, TocSource};
         use velarx_content::pull::index;
         use velarx_content::serve_fetch::{Out, Scope, StagingFetcher};
         let tarsplit = b"a tar-split".to_vec();
@@ -3929,9 +3929,14 @@ mod tests {
         };
         async fn carried(s: &PeerSource, scope: &Scope, blob: &Blob, again: bool) -> bool {
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-            s.probe(scope, vec![blob.clone()], again, &Out::new(tx))
-                .await
-                .unwrap();
+            s.probe(
+                scope,
+                vec![blob.clone()],
+                (again, Parts::All),
+                &Out::new(tx),
+            )
+            .await
+            .unwrap();
             rx.recv().await.unwrap().0.toc == TocSource::Carried
         }
         let (one, other) = (scope(), scope());

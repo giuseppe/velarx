@@ -789,7 +789,11 @@ impl ImageService {
                 tabled.push(*at);
             }
         }
-        let mut replies = staged.probe_all(&tabled, false).await?;
+        // (a start needs the tables, not the tar-splits: those are the
+        // completion's)
+        let mut replies = staged
+            .probe_all(&tabled, false, velarx_content::fetcher::fetch::Parts::Toc)
+            .await?;
         velarx_base::trace::point("pull probed");
         let mut accepted = Accepted::default();
         let mut refused = Vec::new();

@@ -11,7 +11,7 @@
 //! what `Fetch` staged.
 
 use super::fetch::{
-    Blob, FetchEvent, FetchReply, FetcherError, FetcherProxy, ProbeReply, Probed, Reuse,
+    Blob, FetchEvent, FetchReply, FetcherError, FetcherProxy, Parts, ProbeReply, Probed, Reuse,
     UnpackReply, Urgency, INTERFACE, MAX_FDS, PROTO,
 };
 use super::proto::{
@@ -485,14 +485,20 @@ impl FetchConn {
     }
 
     /// What the fetcher can do for `layers` (`again`: the index it carried
-    /// for one of them in the last probe was wrong).
+    /// for one of them in the last probe was wrong; `parts`: what of a table
+    /// of contents to carry).
     pub async fn probe(
         &mut self,
         layers: &[Blob],
         again: bool,
+        parts: Parts,
     ) -> Result<Replies<'_, ProbeReply>, CallError> {
         let (conn, busy) = self.begin().await?;
-        match conn.probe(layers.to_vec(), again.then_some(true)).await {
+        let parts = (parts != Parts::All).then_some(parts);
+        match conn
+            .probe(layers.to_vec(), again.then_some(true), parts)
+            .await
+        {
             Ok(stream) => Ok(replies_fds(stream, &busy)),
             Err(e) => {
                 busy.store(false, Ordering::Release);
@@ -803,10 +809,10 @@ mod tests {
             }
         });
         let mut conn = FetchConn::new(ours).unwrap();
-        let mut replies = conn.probe(&[], false).await.unwrap();
+        let mut replies = conn.probe(&[], false, Parts::All).await.unwrap();
         assert!(replies.probed().await.unwrap().is_none());
         drop(replies);
-        let mut replies = conn.probe(&[], false).await.unwrap();
+        let mut replies = conn.probe(&[], false, Parts::All).await.unwrap();
         let broken = replies.probed().await.unwrap_err();
         assert!(matches!(broken, CallError::Protocol(_)), "{broken:?}");
         server.await.unwrap();

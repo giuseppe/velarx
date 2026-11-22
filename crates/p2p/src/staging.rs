@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsFd;
 use velarx_content::fetcher::fetch::{
-    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, Urgency,
+    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, Parts, Urgency,
 };
 use velarx_content::serve_fetch::{Described, FetchCall, LayerScope, Out, Scope, StagingFetcher};
 use velarx_content::stager::{self, name_of, LayerToc, Name, Unnamed};
@@ -525,7 +525,7 @@ impl StagingFetcher for PeerSource {
         &self,
         scope: &Scope,
         layers: Vec<Blob>,
-        again: bool,
+        (again, _): (bool, Parts),
         out: &Out<velarx_content::fetcher::fetch::Probed>,
     ) -> Result<(), FetcherError> {
         use futures::StreamExt;
@@ -894,7 +894,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            source.probe(&scope, layers, false, &Out::new(tx)),
+            source.probe(&scope, layers, (false, Parts::All), &Out::new(tx)),
         )
         .await
         .expect("the layers are asked at once")

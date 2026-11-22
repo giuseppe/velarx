@@ -137,6 +137,25 @@ pub enum TocSource {
 
 pub use velarx_proto::transfer::NotLazy;
 
+/// What a `Probe` asks a fetcher to carry for a layer with a table of
+/// contents.  A fetcher may carry more than it is asked for.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, introspect::CustomType,
+)]
+#[serde(rename_all = "lowercase")]
+#[zlink(rename_all = "lowercase")]
+pub enum Parts {
+    /// The table of contents: a lazy start, which does not need the
+    /// tar-split
+    Toc,
+    /// The tar-split: the completion of a lazy pull
+    Tarsplit,
+    /// Both (also what a value this side does not know is read as)
+    #[default]
+    #[serde(other)]
+    All,
+}
+
 /// The table of contents a fetcher made of a layer it unpacked whole (a
 /// claim the engine checks), in the layer's staging directory.
 pub const TOC_CLAIM: &str = "toc.claim";
@@ -174,9 +193,10 @@ pub struct Probed {
     pub on_demand: bool,
     /// Why not, when `on_demand` is false
     pub reason: Option<NotLazy>,
-    /// With `toc` carried: the table of contents and the tar-split, sealed
-    /// memory files among the descriptors of this reply (a layer whose table
-    /// of contents has `"version": 2` has no tar-split).  For a layer with no
+    /// With `toc` carried: the table of contents and the tar-split, as the
+    /// `parts` of the probe ask, sealed memory files among the descriptors of
+    /// this reply (a layer whose table of contents has `"version": 2` has no
+    /// tar-split).  For a layer with no
     /// table of contents, with `no_toc`: the index another node recorded, a
     /// claim the engine replays and checks
     pub toc_file: Option<u32>,
@@ -458,6 +478,7 @@ mod proxy {
             &mut self,
             layers: Vec<Blob>,
             again: Option<bool>,
+            parts: Option<Parts>,
         ) -> zlink::Result<
             impl futures::Stream<Item = zlink::Result<(Result<ProbeReply, FetcherError>, Vec<OwnedFd>)>>,
         >;

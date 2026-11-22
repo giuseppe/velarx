@@ -24,6 +24,7 @@ use super::stream::FileUse;
 use super::tar::{normalize_path, Kind, TarReader};
 use super::tarsplit::{self, ContentFile, ContentIndex, Contents, Entries, Replay};
 use super::{LayerReport, PullCtx};
+use crate::fetcher::fetch::Parts;
 use crate::fetcher::{BlobRange, ChunkId, ChunkRef};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -236,18 +237,19 @@ fn data_fail(e: io::Error) -> ImageError {
     ImageError::Layer(e.to_string())
 }
 
-/// The compressed TOC and tar-split of `layer`: what the fetchers of the
-/// pull find (`Probe`).  Not verified yet.
+/// The compressed TOC and tar-split of `layer` (the `parts` asked for):
+/// what the fetchers of the pull find (`Probe`).  Not verified yet.
 pub(super) async fn metadata(
     ctx: &PullCtx,
     layer: &OciDescriptor,
+    parts: Parts,
 ) -> ImageResult<(Vec<u8>, Vec<u8>)> {
     let staged = ctx
         .staged
         .as_ref()
         .ok_or_else(|| fail("no fetcher for the layer"))?;
     staged
-        .probe(layer, false)
+        .probe(layer, false, parts)
         .await?
         .ok_or_else(|| fail("no fetcher gave its table of contents"))
 }
@@ -260,7 +262,7 @@ pub async fn layer_index(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<Op
         return Ok(None);
     };
     let by_table = async {
-        let (toc_z, ts_z) = metadata(ctx, layer).await?;
+        let (toc_z, ts_z) = metadata(ctx, layer, Parts::All).await?;
         verified(
             &info,
             toc_z,
@@ -278,8 +280,9 @@ pub async fn layer_index(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<Op
 }
 
 /// [`verify_metadata`] of what the fetchers found, or [`verified_table`]
-/// for a `lazy` layer (the table is what it is served by), whose completion
-/// replays the tar-split before the layer is committed.
+/// for a `lazy` layer (the table is what it is served by), whose start
+/// needs no tar-split: its completion checks it ([`check_tarsplit`]) and
+/// replays it before the layer is committed.
 pub(super) async fn verified(
     info: &Info,
     toc_z: Vec<u8>,
@@ -473,21 +476,10 @@ fn vouched_metadata(
             "the files of the layer are more than {max_tar} bytes"
         )));
     }
-    let expected = toc
-        .tar_split_digest
-        .as_deref()
-        .ok_or_else(|| fail("the TOC has no tar-split digest"))?;
-    let expected: Digest = expected.parse().map_err(|e| {
-        fail(format!(
-            "invalid tar-split digest `{expected}` in the TOC: {e}"
-        ))
-    })?;
-    let actual = Digest::of(expected.alg(), &ts_z);
-    if actual != expected {
-        return Err(ImageError::DigestMismatch {
-            expected: expected.to_string(),
-            actual: actual.to_string(),
-        });
+    // (a lazy start may come without the tar-split: what comes is checked)
+    let expected = tarsplit_digest(&toc)?;
+    if keep || !ts_z.is_empty() {
+        same_tarsplit(&expected, &ts_z)?;
     }
     let ts_z = bytes::Bytes::from(ts_z);
     let vouched = keep.then(|| Arc::new(toc.clone()));
@@ -499,6 +491,37 @@ fn vouched_metadata(
         tarsplit_z: ts_z,
         tarsplit_size: tarsplit.2,
     })
+}
+
+/// The digest the table `toc` gives its tar-split.
+fn tarsplit_digest(toc: &Toc) -> ImageResult<Digest> {
+    let expected = toc
+        .tar_split_digest
+        .as_deref()
+        .ok_or_else(|| fail("the TOC has no tar-split digest"))?;
+    expected.parse().map_err(|e| {
+        fail(format!(
+            "invalid tar-split digest `{expected}` in the TOC: {e}"
+        ))
+    })
+}
+
+fn same_tarsplit(expected: &Digest, ts_z: &[u8]) -> ImageResult<()> {
+    let actual = Digest::of(expected.alg(), ts_z);
+    if actual != *expected {
+        return Err(ImageError::DigestMismatch {
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Check the compressed tar-split `ts_z` of a lazy layer against the
+/// digest its table `toc` gives it: the tar-split its start did without,
+/// fetched for its completion.
+pub fn check_tarsplit(toc: &Toc, ts_z: &[u8]) -> ImageResult<()> {
+    same_tarsplit(&tarsplit_digest(toc)?, ts_z)
 }
 
 #[derive(Debug)]
@@ -1727,7 +1750,7 @@ async fn pull_by_table(
     let started = std::time::Instant::now();
     // (what a fetcher found is verified below, as what the registry gives
     // is)
-    let (toc_z, ts_z) = metadata(ctx, layer).await?;
+    let (toc_z, ts_z) = metadata(ctx, layer, Parts::All).await?;
     debug!(
         "Layer {}: metadata fetched after {:?}",
         layer.digest,
@@ -2192,7 +2215,7 @@ async fn unpack_by_index(
     let Some(staged) = ctx.staged.as_ref() else {
         return Ok(None);
     };
-    let Some((toc_z, ts_z)) = staged.probe(layer, again).await? else {
+    let Some((toc_z, ts_z)) = staged.probe(layer, again, Parts::All).await? else {
         return Ok(None);
     };
     let (have, cap) = (ctx.have_fn(), ctx.limits.inflate_cap(layer.size));

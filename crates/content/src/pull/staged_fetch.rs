@@ -14,7 +14,9 @@
 
 use super::chunked::{self, Intake};
 use super::sink::Sink;
-use crate::fetcher::fetch::{Blob, EventKind, FetchEvent, Probed, Reuse, TocSource, Urgency};
+use crate::fetcher::fetch::{
+    Blob, EventKind, FetchEvent, Parts, Probed, Reuse, TocSource, Urgency,
+};
 use crate::fetcher::fetch_client::{files_at, CallError, FetchConn, Scoping, Unpacking};
 use crate::stager::staged_rel;
 use rustix::fs::{FlockOperation, Mode, OFlags, ResolveFlags};
@@ -533,12 +535,15 @@ impl StagedFetch {
 
     /// The compressed table of contents and tar-split of `layer` as the
     /// fetchers found them (for the caller to verify against the descriptor),
-    /// or none when it has no table of contents for it.  `again`: the index
-    /// the last probe carried for it was wrong.
+    /// or none when it has no table of contents for it; of a layer with a
+    /// table, the `parts` asked for (empty: one that was not, or that the
+    /// layer has not).  `again`: the index the last probe carried for it was
+    /// wrong.
     pub async fn probe(
         &self,
         layer: &OciDescriptor,
         again: bool,
+        parts: Parts,
     ) -> ImageResult<Option<(Vec<u8>, Vec<u8>)>> {
         let Some(at) = self.layers.iter().position(|d| *d == layer.digest) else {
             return Err(ImageError::Layer(format!(
@@ -548,7 +553,7 @@ impl StagedFetch {
         };
         let at = at as u32;
         let mut found = None;
-        for (reply, metadata) in self.probe_all(&[at], again).await? {
+        for (reply, metadata) in self.probe_all(&[at], again, parts).await? {
             if reply.layer == at {
                 found = metadata;
             }
@@ -561,12 +566,13 @@ impl StagedFetch {
     /// next while none brought its table of contents or can unpack it; a
     /// reply for each layer, once, with the table of contents and the
     /// tar-split it carries.  A layer nobody answered is `none`,
-    /// `unreachable`.  `again`: [`StagedFetch::probe`].
+    /// `unreachable`.  `again`, `parts`: [`StagedFetch::probe`].
     #[allow(clippy::type_complexity)]
     pub async fn probe_all(
         &self,
         at: &[u32],
         again: bool,
+        parts: Parts,
     ) -> ImageResult<Vec<(Probed, Option<(Vec<u8>, Vec<u8>)>)>> {
         self.probed
             .lock()
@@ -586,7 +592,7 @@ impl StagedFetch {
             if left.is_empty() {
                 break;
             }
-            let answered = match self.probe_one(fetcher, &left, again).await {
+            let answered = match self.probe_one(fetcher, &left, (again, parts)).await {
                 Ok(a) => a,
                 Err(e) if refused(&e) => return Err(fetcher_error(&fetcher.name, e)),
                 Err(e) => {
@@ -638,7 +644,7 @@ impl StagedFetch {
         &self,
         fetcher: &Fetcher,
         at: &[u32],
-        again: bool,
+        (again, parts): (bool, Parts),
     ) -> Result<ImageResult<Vec<(Probed, Option<(Vec<u8>, Vec<u8>)>)>>, CallError> {
         // (the call carries the layers asked for, in order: a reply names
         // its layer by its position in the call)
@@ -647,7 +653,8 @@ impl StagedFetch {
             .filter_map(|i| self.blobs.get(*i as usize).cloned())
             .collect();
         let (mut conn, _connected) = fetcher.connection().await?;
-        let mut replies = crate::idle::within(fetcher.idle, conn.probe(&asked, again)).await?;
+        let mut replies =
+            crate::idle::within(fetcher.idle, conn.probe(&asked, again, parts)).await?;
         let mut found: Vec<(Probed, Option<(Vec<u8>, Vec<u8>)>)> = Vec::new();
         while let Some((mut reply, fds)) =
             crate::idle::within(fetcher.idle, replies.probed()).await?
@@ -668,16 +675,24 @@ impl StagedFetch {
                 at.and_then(|at| files.get_mut(at as usize)?.take())
                     .map(File::from)
             };
-            // (a canonical layer has no tar-split)
+            // (a canonical layer has no tar-split; what was not asked for
+            // may be carried too)
             let toc = take(reply.toc_file);
             let ts = take(reply.tarsplit_file);
-            let (Some(toc), true) = (toc, ts.is_some() == reply.tarsplit_file.is_some()) else {
+            let asked = match parts {
+                Parts::Tarsplit => ts.is_some(),
+                Parts::All | Parts::Toc => toc.is_some(),
+            };
+            if !asked
+                || toc.is_some() != reply.toc_file.is_some()
+                || ts.is_some() != reply.tarsplit_file.is_some()
+            {
                 return Ok(Err(ImageError::transfer(
                     &fetcher.name,
                     FailureClass::Invalid,
                     "a table of contents without its files",
                 )));
-            };
+            }
             let max = super::chunked::MAX_METADATA_COMPRESSED;
             let read = |file: File| {
                 velarx_base::sealed::read_sealed_whole(&file, max).map_err(|w| {
@@ -688,7 +703,10 @@ impl StagedFetch {
                     )
                 })
             };
-            let metadata = match (read(toc), ts.map_or(Ok(Vec::new()), read)) {
+            let metadata = match (
+                toc.map_or(Ok(Vec::new()), read),
+                ts.map_or(Ok(Vec::new()), read),
+            ) {
                 (Ok(t), Ok(m)) => (t, m),
                 (Err(e), _) | (_, Err(e)) => return Ok(Err(e)),
             };
@@ -1960,7 +1978,7 @@ mod tests {
             &self,
             _scope: &Scope,
             layers: Vec<Blob>,
-            _again: bool,
+            _: (bool, Parts),
             out: &Out<Probed>,
         ) -> Result<(), FetcherError> {
             if self.refuse {
@@ -2052,7 +2070,7 @@ mod tests {
         let staged = pull(&[("peers", &peers), ("cache", &cache)], &registry).await;
         assert_eq!(staged.sources(), ["peers", "cache", "registry"]);
         let mut got: Vec<(u32, TocSource)> = staged
-            .probe_all(&[0, 1, 2, 3], false)
+            .probe_all(&[0, 1, 2, 3], false, Parts::All)
             .await
             .unwrap()
             .into_iter()
@@ -2068,6 +2086,86 @@ mod tests {
                 (3, TocSource::None)
             ]
         );
+    }
+
+    /// A fetcher that carries the table of contents and the tar-split of
+    /// every layer as `carry` says for the parts it is asked for.
+    struct Carries {
+        carry: fn(Parts) -> (bool, bool),
+    }
+
+    #[async_trait]
+    impl StagingFetcher for Carries {
+        fn described(&self) -> Described {
+            Described {
+                name: "carries".into(),
+                capabilities: vec!["objects".into(), "metadata".into()],
+                max_objects: 8,
+            }
+        }
+
+        async fn probe(
+            &self,
+            _scope: &Scope,
+            layers: Vec<Blob>,
+            (_, parts): (bool, Parts),
+            out: &Out<Probed>,
+        ) -> Result<(), FetcherError> {
+            let (toc, ts) = (self.carry)(parts);
+            for at in 0..layers.len() as u32 {
+                let mut fds = Vec::new();
+                let mut file = |yes: bool, bytes: &[u8]| {
+                    yes.then(|| {
+                        fds.push(velarx_base::sealed::sealed_memory(bytes).unwrap());
+                        fds.len() as u32 - 1
+                    })
+                };
+                let reply = Probed {
+                    layer: at,
+                    toc: TocSource::Carried,
+                    on_demand: true,
+                    reason: None,
+                    toc_file: file(toc, b"toc"),
+                    tarsplit_file: file(ts, b"ts"),
+                };
+                out.send_with(reply, fds).await.unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    /// A probe asks for the parts of a table of contents it needs, and what
+    /// a fetcher carries besides is taken too; a fetcher that replies without
+    /// what was asked for is not heard.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_gets_the_parts_it_asks_for() {
+        let carrying =
+            |carry| LocalFetcher::start(Arc::new(Carries { carry }), Limits::default()).unwrap();
+        let asked = carrying(|p| (p != Parts::Tarsplit, p != Parts::Toc));
+        let staged = pull(&[], &asked).await;
+        let got = |parts| {
+            let staged = staged.clone();
+            async move {
+                staged.probe_all(&[0], false, parts).await.unwrap()[0]
+                    .1
+                    .clone()
+            }
+        };
+        let (toc, ts) = (b"toc".to_vec(), b"ts".to_vec());
+        assert_eq!(got(Parts::All).await, Some((toc.clone(), ts.clone())));
+        assert_eq!(got(Parts::Toc).await, Some((toc.clone(), Vec::new())));
+        assert_eq!(got(Parts::Tarsplit).await, Some((Vec::new(), ts.clone())));
+        let both = carrying(|_| (true, true));
+        let staged = pull(&[], &both).await;
+        let got = staged.probe_all(&[0], false, Parts::Toc).await.unwrap();
+        assert_eq!(got[0].1, Some((toc, ts)));
+        let wrong = carrying(|_| (true, false));
+        let staged = pull(&[], &wrong).await;
+        let got = staged
+            .probe_all(&[0], false, Parts::Tarsplit)
+            .await
+            .unwrap();
+        assert_eq!((got[0].0.toc, &got[0].1), (TocSource::None, &None));
     }
 
     /// The list is walked as given: the registry fetcher where the sources
@@ -2097,7 +2195,7 @@ mod tests {
             .await
             .unwrap();
             let mut answered: Vec<u32> = staged
-                .probe_all(&[0, 1, 2], false)
+                .probe_all(&[0, 1, 2], false, Parts::All)
                 .await
                 .unwrap()
                 .into_iter()
@@ -2127,10 +2225,10 @@ mod tests {
         let registry = local(&[0], false);
         let staged = pull(&[("peers", &peers)], &registry).await;
         assert!(!staged.stale());
-        staged.probe_all(&[0], false).await.unwrap();
+        staged.probe_all(&[0], false, Parts::All).await.unwrap();
         assert!(!staged.stale());
         drop(peers);
-        staged.probe_all(&[0], false).await.unwrap();
+        staged.probe_all(&[0], false, Parts::All).await.unwrap();
         assert!(staged.stale(), "the peer is gone");
     }
 
@@ -2141,7 +2239,7 @@ mod tests {
         let peers = local(&[], true);
         let registry = local(&[0], false);
         let staged = pull(&[("peers", &peers)], &registry).await;
-        assert!(staged.probe_all(&[0], false).await.is_err());
+        assert!(staged.probe_all(&[0], false, Parts::All).await.is_err());
     }
 
     /// Stage each file of `call` where the contract has it, with the bytes
@@ -2432,7 +2530,7 @@ mod tests {
         }
         let probed = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            staged.probe_all(&[0], false),
+            staged.probe_all(&[0], false, Parts::All),
         )
         .await;
         assert!(probed.is_ok(), "the probe waits for the silent fetcher");
@@ -2635,7 +2733,7 @@ mod tests {
         let registry = local(&[0], false);
         let staged = pull(&[("peers", &peers)], &registry).await;
         drop(peers);
-        let got = staged.probe_all(&[0], false).await.unwrap();
+        let got = staged.probe_all(&[0], false, Parts::All).await.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0.toc, TocSource::Unpack);
     }

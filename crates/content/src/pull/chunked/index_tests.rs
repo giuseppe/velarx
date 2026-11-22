@@ -5,7 +5,7 @@
 use super::*;
 use crate::activation::Limits;
 use crate::fetcher::fetch::{Blob, EventKind, FetchEvent as Event, FetcherError, NotLazy};
-use crate::fetcher::fetch::{Probed, TocSource};
+use crate::fetcher::fetch::{Parts, Probed, TocSource};
 use crate::fetcher::fetch_client::FetchConn;
 use crate::pull::staged_fetch::{Link, StagedFetch, REGISTRY_IDLE};
 use crate::pull::{Limits as PullLimits, PullCtx, Source};
@@ -127,7 +127,7 @@ impl StagingFetcher for Source_ {
         &self,
         _scope: &Scope,
         layers: Vec<Blob>,
-        again: bool,
+        (again, _): (bool, Parts),
         out: &Out<Probed>,
     ) -> Result<(), FetcherError> {
         let gone = |_| FetcherError::failed("gone");

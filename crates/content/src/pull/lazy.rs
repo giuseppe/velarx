@@ -17,6 +17,7 @@ use super::entry;
 use super::tar::TarReader;
 use super::tarsplit::{self, Contents, Entries, Replay};
 use super::{LayerReport, PullCtx};
+use crate::fetcher::fetch::Parts;
 use rayon::prelude::*;
 use std::io::{self, Read};
 use std::sync::Arc;
@@ -28,7 +29,8 @@ use velarx_types::{ImageError, ImageResult, OciDescriptor};
 pub struct LazyLayer {
     /// The TOC to store: tar headers and chunk positions.
     pub toc: Arc<Toc>,
-    /// The verified, zstd compressed tar-split.
+    /// The verified, zstd compressed tar-split; empty when the start came
+    /// without it (the completion fetches it) or the layer is canonical.
     pub tarsplit: bytes::Bytes,
     /// The table as the registry sent it ([`chunked::Metadata::toc_z`])
     pub toc_z: bytes::Bytes,
@@ -123,8 +125,9 @@ pub async fn pull_metadata(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<
     let Some(info) = chunked::parse_info(layer)? else {
         return Ok(None);
     };
-    // (the fetcher finds them: `Probe`; what it gives is verified below)
-    let (toc_z, ts_z) = chunked::metadata(ctx, layer).await?;
+    // (the fetcher finds the table: `Probe`; what it gives is verified
+    // below; the tar-split waits for the completion)
+    let (toc_z, ts_z) = chunked::metadata(ctx, layer, Parts::Toc).await?;
     found_of(info, toc_z, ts_z, layer.digest, max_tar)
         .await
         .map(Some)

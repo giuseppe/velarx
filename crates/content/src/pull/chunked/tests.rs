@@ -1302,6 +1302,41 @@ fn test_a_tar_split_the_table_contradicts_is_refused_by_the_pull() {
     assert!(e.to_string().contains(".other`"), "{e}");
 }
 
+/// A lazy start does without the tar-split: the table is checked, the
+/// tar-split is checked when it comes ([`check_tarsplit`] at the
+/// completion), and a pull that commits the layer at once needs it.
+#[test]
+fn test_a_lazy_start_needs_no_tar_split() {
+    let layer = crate::sha256(b"layer");
+    let file = canonical_layer().entries[3].clone();
+    let ts = tarsplit_of(std::slice::from_ref(&file));
+    let toc = Toc {
+        version: 1,
+        entries: vec![file],
+        tar_split_digest: Some(crate::sha256(&ts).to_string()),
+    };
+    let (z, info) = vouched(&toc, Some((0, ts.len() as u64, 0)));
+    let lazy = verified_table(&info, &z, Vec::new(), &layer, (u64::MAX, false)).unwrap();
+    assert!(lazy.tarsplit_z.is_empty());
+    // (the table the layer is stored by keeps the digest of its tar-split)
+    assert!(check_tarsplit(&lazy.stored, &ts).is_ok());
+    let e = check_tarsplit(&lazy.stored, b"tx").unwrap_err();
+    assert!(matches!(e, ImageError::DigestMismatch { .. }), "{e}");
+    // (one that comes all the same is checked)
+    let e = verified_table(&info, &z, b"tx".to_vec(), &layer, (u64::MAX, false))
+        .err()
+        .unwrap();
+    assert!(matches!(e, ImageError::DigestMismatch { .. }), "{e}");
+    assert!(verify_metadata(&info, &z, Vec::new(), &layer, u64::MAX).is_err());
+    // (a table without the digest of its tar-split is refused at the start)
+    let toc = Toc {
+        tar_split_digest: None,
+        ..toc
+    };
+    let (z, info) = vouched(&toc, Some((0, ts.len() as u64, 0)));
+    assert!(verified_table(&info, &z, Vec::new(), &layer, (u64::MAX, false)).is_err());
+}
+
 /// `file` again under `name`, 4096 bytes larger (the last chunk too).
 fn bigger_copy(file: &TocEntry, name: &str) -> TocEntry {
     let mut copy = file.clone();

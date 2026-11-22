@@ -348,7 +348,7 @@ impl ImageService {
     pub async fn complete_pull(
         &self,
         id: &str,
-        completion: Completion,
+        mut completion: Completion,
     ) -> ImageResult<TransferStats> {
         let start = std::time::Instant::now();
         let area = self.staging_area();
@@ -388,6 +388,9 @@ impl ImageService {
         // containers made on the pull run on its files, the layers the
         // driver holds already too)
         let keeps = !self.storage.holds_objects();
+        // (the credentials of the command reach the tar-splits that the
+        // start did without, fetched before the files)
+        self.set_lazy_access(std::mem::take(&mut completion.access));
         let layers: Arc<[LazyLayer]> = self
             .lazy_layers(&area, &manifest, &config, &keys, keeps)
             .await?
@@ -480,7 +483,11 @@ impl ImageService {
                 )));
             };
             let toc: Toc = serde_json::from_str(&staged.toc_text()?)?;
-            let (toc, tarsplit) = (Arc::new(toc), bytes::Bytes::from(staged.tarsplit()?));
+            let mut tarsplit = bytes::Bytes::from(staged.tarsplit()?);
+            if tarsplit.is_empty() && !toc.is_canonical() {
+                tarsplit = self.lazy_tarsplit(key, &toc).await?;
+            }
+            let toc = Arc::new(toc);
             replays.push(tokio::task::spawn_blocking({
                 let (toc, tarsplit, layer) = (toc.clone(), tarsplit.clone(), desc.digest);
                 move || velarx_content::pull::lazy::replay(&toc, tarsplit, &layer)
@@ -594,11 +601,8 @@ impl ImageService {
             return Ok(());
         }
         let Completion {
-            access,
-            permits,
-            progress,
+            permits, progress, ..
         } = completion;
-        self.set_lazy_access(access);
         let staged = self.staged_files(layers)?;
         let (store, l) = (self.file_store.clone(), layers.clone());
         let (first, wanted, left) = tokio::task::spawn_blocking(move || {

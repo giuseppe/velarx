@@ -24,7 +24,7 @@ use super::*;
 use futures::future::{BoxFuture, FutureExt, RemoteHandle, Shared};
 use std::collections::HashMap;
 use std::sync::{Mutex as StdMutex, Weak};
-use velarx_content::fetcher::fetch::Urgency;
+use velarx_content::fetcher::fetch::{Parts, Urgency};
 use velarx_content::pull::staged_fetch::StagedFetch;
 use velarx_content::pull::start_set;
 use velarx_registry::auth::RegistryAccess;
@@ -738,6 +738,27 @@ impl ImageService {
         drop(lease);
         self.prune_lease(key);
         staged
+    }
+
+    /// The compressed tar-split of the lazily staged layer `key` (its table
+    /// `toc`), which its start did without: fetched now and checked against
+    /// the digest the table gives it.
+    pub(crate) async fn lazy_tarsplit(
+        &self,
+        key: &LayerKey,
+        toc: &Toc,
+    ) -> ImageResult<bytes::Bytes> {
+        let ctx = self.lazy_layer_ctx(key).await?;
+        let walker = self.lazy_walker((&ctx.walk, &ctx.manifest)).await?;
+        let (_, ts_z) = walker
+            .probe(&ctx.desc, false, Parts::Tarsplit)
+            .await?
+            .ok_or_else(|| {
+                ImageError::Layer(format!("layer {key}: no fetcher gave its tar-split"))
+            })?;
+        velarx_content::pull::chunked::check_tarsplit(toc, &ts_z)
+            .map_err(|e| velarx_content::pull::chunked::naming(&ctx.desc.digest, e))?;
+        Ok(ts_z.into())
     }
 
     /// The slot of the lease of `key` goes when nothing holds the lease nor

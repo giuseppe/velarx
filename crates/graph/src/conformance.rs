@@ -4160,6 +4160,29 @@ async fn lazy_offer(s: &Subject, reg: &Registry, tar: &[u8], verity: bool) -> Of
     }
 }
 
+/// `done`, a layer a lazy pull staged without its tar-split, with the one
+/// its completion fetches: the tar-split of the blob of `tar` (the writer
+/// makes the same blob of the same tar), checked against the table.
+fn completed(mut done: LayerDone, tar: &[u8]) -> LayerDone {
+    use velarx_content::layer::writer::{write_layer, Compression};
+    let mut blob = Vec::new();
+    let w = write_layer(
+        tar,
+        velarx_types::digest::Algorithm::Sha256,
+        Compression::ZstdChunked,
+        &mut blob,
+    )
+    .expect("a layer");
+    let at: Vec<usize> = w.annotations["io.github.containers.zstd-chunked.tarsplit-position"]
+        .split(':')
+        .map(|x| x.parse().unwrap())
+        .collect();
+    let ts_z = &blob[at[0]..at[0] + at[1]];
+    velarx_content::pull::chunked::check_tarsplit(&done.toc, ts_z).expect("its tar-split");
+    done.tarsplit = ts_z.to_vec().into();
+    done
+}
+
 /// A pool of the files of `tar`, by their fs-verity digest, as the engine
 /// fills it while a lazy pull is completed.
 fn pool_of(dir: &Path, tar: &[u8]) -> Arc<FileStore> {
@@ -4193,7 +4216,7 @@ pub async fn a_lazy_pull_is_staged_by_the_engine_and_completed_into_the_driver(f
     let reg = Registry::start_blocking();
     let lazy = lazy_offer(&s, &reg, &tar, true).await;
     let pulled = lazy.pull(&s, engine_check()).await.expect("a lazy pull");
-    let done = pulled.layers[0].clone();
+    let done = completed(pulled.layers[0].clone(), &tar);
     assert!(done.lazy, "the layer is staged, not pulled");
     let artifact = pulled.artifacts[&done.key].clone();
     let refs = vec![LayerRef {
@@ -4278,7 +4301,7 @@ pub async fn a_staged_file_that_is_not_its_name_is_not_stored(f: &Factory) {
     let reg = Registry::start_blocking();
     let lazy = lazy_offer(&s, &reg, &tar, true).await;
     let pulled = lazy.pull(&s, engine_check()).await.expect("a lazy pull");
-    let done = pulled.layers[0].clone();
+    let done = completed(pulled.layers[0].clone(), &tar);
     let pool = pool_of(&s.dir.join("pool"), &tar);
     // a file of the pool with the bytes of another of the same size
     let big_key = done
