@@ -130,6 +130,21 @@ pub fn toc_time(t: Option<&str>) -> Option<(i64, u32)> {
     Some((d.timestamp() + i64::from(nanos / SECOND), nanos % SECOND))
 }
 
+/// The RFC 3339 text of a time of a table of contents: seconds since the
+/// epoch and nanoseconds, as [`toc_time`] reads them back.
+pub fn rfc3339((secs, nanos): (i64, u32)) -> Option<String> {
+    // RFC 3339 has four digit years: a time outside of them is clamped
+    // (chrono would write `+10000-...`, which the Go parsers refuse)
+    const FIRST: i64 = -62_135_596_800; // 0001-01-01T00:00:00Z
+    const LAST: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
+    let (secs, nanos) = match secs {
+        ..FIRST => (FIRST, 0),
+        _ if secs > LAST => (LAST, 0),
+        _ => (secs, nanos),
+    };
+    chrono::DateTime::from_timestamp(secs, nanos).map(|t| t.to_rfc3339())
+}
+
 impl TocEntry {
     /// The modification time: seconds since the epoch (before it for a
     /// time before 1970) and nanoseconds; `(0, 0)` when the entry has none

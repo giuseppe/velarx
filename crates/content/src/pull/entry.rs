@@ -5,7 +5,7 @@ use super::tar::{normalize_path, Header, Kind, MAX_NAME_LEN, MAX_XATTRS, MAX_XAT
 use base64::Engine;
 use std::collections::HashMap;
 use std::io;
-use velarx_storage::{toc_time, Toc, TocEntry, TocEntryType};
+use velarx_storage::{rfc3339, toc_time, Toc, TocEntry, TocEntryType};
 use velarx_types::digest::{Algorithm, Digest};
 
 /// Entries of one layer accepted.
@@ -38,19 +38,6 @@ fn is_overlay_xattr(name: &str) -> bool {
             name.strip_prefix(ns)
                 .is_some_and(|n| n.starts_with("overlay."))
         })
-}
-
-pub fn rfc3339((secs, nanos): (i64, u32)) -> Option<String> {
-    // RFC 3339 has four digit years: a time outside of them is clamped
-    // (chrono would write `+10000-...`, which the Go parsers refuse)
-    const FIRST: i64 = -62_135_596_800; // 0001-01-01T00:00:00Z
-    const LAST: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
-    let (secs, nanos) = match secs {
-        ..FIRST => (FIRST, 0),
-        _ if secs > LAST => (LAST, 0),
-        _ => (secs, nanos),
-    };
-    chrono::DateTime::from_timestamp(secs, nanos).map(|t| t.to_rfc3339())
 }
 
 /// The name a layer gives the entry at `path` (the root directory of the

@@ -6,6 +6,7 @@ mod fsverity;
 mod lock;
 mod served;
 mod sparse;
+pub mod table;
 mod toc_verity;
 mod unfinished;
 

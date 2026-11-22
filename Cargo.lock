@@ -5422,6 +5422,7 @@ dependencies = [
  "hex",
  "libc",
  "rand 0.8.8",
+ "rayon",
  "rustix",
  "serde",
  "serde_json",
