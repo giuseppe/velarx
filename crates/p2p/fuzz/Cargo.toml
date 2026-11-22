@@ -39,10 +39,3 @@ path = "fuzz_targets/p2p_gossip.rs"
 test = false
 doc = false
 bench = false
-
-[[bin]]
-name = "p2p_quic_request"
-path = "fuzz_targets/p2p_quic_request.rs"
-test = false
-doc = false
-bench = false

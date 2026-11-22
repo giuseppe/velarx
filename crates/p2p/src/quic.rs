@@ -618,21 +618,6 @@ async fn read_digests(
     digests_of(kinds, &raw)
 }
 
-/// The operation and the digests of a request as the server reads them
-/// from its stream ([`digests_count`], [`kinds_of`], [`digests_of`]), from
-/// the bytes `data`: what the fuzz target of the request runs
-/// ([`crate::fuzzing`]).  Never more is allocated than `data` holds.
-pub fn parse_request(data: &[u8]) -> io::Result<(u8, Vec<String>)> {
-    let eof = || io::Error::from(io::ErrorKind::UnexpectedEof);
-    let (&[op, urgency, c0, c1], rest) = data.split_first_chunk::<4>().ok_or_else(eof)?;
-    Urgency::try_from(urgency)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "an unknown urgency"))?;
-    let count = digests_count([op, c0, c1])?;
-    let (kinds, len) = kinds_of(rest.get(..count).ok_or_else(eof)?)?;
-    let raw = rest[count..].get(..len).ok_or_else(eof)?;
-    Ok((op, digests_of(kinds, raw)?))
-}
-
 /// The answer to a request for chunks, read chunk by chunk.
 pub struct Reply {
     _send: quinn::SendStream,
@@ -4126,40 +4111,6 @@ mod tests {
         }
         // the connection is still good
         assert_eq!(answer_to(&connection, &one(&d[1])).await, [HERE]);
-    }
-
-    /// The bytes of a request read as the server reads them from its stream:
-    /// what a client sends comes back, and a head that claims more than it
-    /// carries, none or too many digests, or a digest of no algorithm is
-    /// refused (the fuzz target runs the same function).
-    #[test]
-    fn a_request_reads_as_the_server_reads_it() {
-        let (a, b) = (digest_of(b"a"), digest_of(b"b"));
-        let mut two = vec![OP_CHUNKS, 0, 2];
-        two.extend(digests_wire([a.as_str(), b.as_str()].into_iter()).unwrap());
-        assert_eq!(
-            parse_request(&waited(&two)).unwrap(),
-            (OP_CHUNKS, vec![a.clone(), b])
-        );
-        let mut probe = vec![OP_PROBE, 0, 1];
-        probe.extend(digests_wire(std::iter::once(a.as_str())).unwrap());
-        assert_eq!(parse_request(&waited(&probe)).unwrap(), (OP_PROBE, vec![a]));
-        let mut bad = probe.clone();
-        bad[3] = 9;
-        let too_many = (MAX_REQUEST_DIGESTS as u16 + 1).to_be_bytes();
-        let mut unknown = waited(&probe);
-        unknown[1] = 9;
-        for wrong in [
-            waited(&[]),
-            waited(&[OP_PROBE, 0]),
-            waited(&[OP_PROBE, 0, 0]),
-            waited(&[OP_CHUNKS, too_many[0], too_many[1]]),
-            waited(&two[..two.len() - 1]),
-            waited(&bad),
-            unknown,
-        ] {
-            assert!(parse_request(&wrong).is_err(), "{wrong:?}");
-        }
     }
 
     /// A request for more chunks than the limit gets nothing, one for as many
