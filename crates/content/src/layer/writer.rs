@@ -1525,6 +1525,83 @@ mod tests {
         }
     }
 
+    /// The data of a zstd:chunked layer (its frames before the first one of
+    /// metadata) is fixed: how the files are cut into chunks and frames, and
+    /// their compression, are those of every other writer of the format,
+    /// whatever the metadata after them and the algorithm of the digests.
+    /// A change here changes the blob of every layer.
+    #[test]
+    fn test_the_data_of_a_chunked_layer_is_fixed() {
+        let data = |blob: &[u8], w: &Written| {
+            let start = ["table-position", "manifest-position"]
+                .iter()
+                .filter_map(|k| w.annotations.get(&format!("{ANNOTATION_PREFIX}{k}")))
+                .map(|p| p.split(':').next().unwrap().parse::<usize>().unwrap())
+                .min()
+                .unwrap();
+            Digest::of(Algorithm::Sha256, &blob[..start - 8]).to_string()
+        };
+        // (a canonical tar of the files of `sample_tar`)
+        let mut random = vec![0u8; 400_000];
+        rand::rngs::StdRng::seed_from_u64(7).fill(&mut random[..]);
+        let entry = |name: &str, kind, size| TocEntry {
+            mode: 0o644,
+            size,
+            mod_time: velarx_storage::rfc3339((1_700_000_000, 0)),
+            ..TocEntry::new(name, kind)
+        };
+        let mut link = entry("./etc/w", TocEntryType::Hardlink, 0);
+        link.link_name = Some("./etc/small".into());
+        let entries = [
+            entry("./", TocEntryType::Dir, 0),
+            entry("./etc/", TocEntryType::Dir, 0),
+            entry("./etc/small", TocEntryType::Reg, 6),
+            link,
+            entry("./usr/", TocEntryType::Dir, 0),
+            entry("./usr/holey", TocEntryType::Reg, 30_000),
+            entry("./usr/random", TocEntryType::Reg, 400_000),
+        ];
+        let mut holey = vec![1u8; 5000];
+        holey.extend(vec![0u8; 20_000]);
+        holey.extend(vec![2u8; 5000]);
+        let mut canonical = Vec::new();
+        velarx_storage::canonical::write(&entries, &mut canonical, |e, out| {
+            out.write_all(match e.name.as_str() {
+                "./etc/small" => b"hello\n",
+                "./usr/holey" => &holey,
+                _ => &random,
+            })
+        })
+        .unwrap();
+        for alg in Algorithm::ALL {
+            let mut blob = Vec::new();
+            let w =
+                write_layer(&sample_tar()[..], alg, Compression::ZstdChunked, &mut blob).unwrap();
+            assert_eq!(
+                data(&blob, &w),
+                "sha256:e72534e16eedf5f86d86e6deb4afbccb835f78ee8a4d107251fca5c72df5de74",
+                "{alg}"
+            );
+            let mut blob = Vec::new();
+            let w = write_canonical_layer(
+                &canonical[..],
+                alg,
+                Compression::ZstdChunked,
+                None,
+                &mut blob,
+            )
+            .unwrap();
+            assert!(w
+                .annotations
+                .contains_key(&format!("{ANNOTATION_PREFIX}table-position")));
+            assert_eq!(
+                data(&blob, &w),
+                "sha256:b7855df072545030e01c8074877b8274d1348178cb127c544a2375a40c41eb97",
+                "{alg}"
+            );
+        }
+    }
+
     /// A layer whose paths are not in order has no table, and keeps its
     /// TOC.
     #[test]
