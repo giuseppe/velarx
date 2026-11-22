@@ -28,8 +28,8 @@ pub const MAX_ACCESS: u64 = 1 << 20;
 pub const PROFILE_MAX_BYTES: u64 = 512 * 1024;
 
 /// The capability words.
-pub const CAPABILITIES: [&str; 8] = [
-    "objects", "unpack", "metadata", "lazy", "sha512", "reuse", "origin", "handover",
+pub const CAPABILITIES: [&str; 9] = [
+    "objects", "unpack", "metadata", "lazy", "sha512", "reuse", "origin", "handover", "table",
 ];
 
 /// How much a request is waited for.  It orders a fetcher's work.
@@ -89,7 +89,19 @@ impl Blob {
     /// The checksum of the zstd:chunked table of contents its descriptor
     /// names: none for a layer without one.
     pub fn toc_checksum(&self) -> Option<velarx_types::digest::Digest> {
-        let desc = velarx_types::OciDescriptor {
+        velarx_types::layer::chunked_checksum(&self.descriptor()?)
+    }
+
+    /// Whether its descriptor names a binary table: a layer that is pulled
+    /// by it, which only a fetcher that announces `table` is asked for.
+    pub fn has_table(&self) -> bool {
+        self.descriptor().is_some_and(|d| {
+            velarx_types::layer::chunked_annotation(&d, "table-checksum").is_some()
+        })
+    }
+
+    fn descriptor(&self) -> Option<velarx_types::OciDescriptor> {
+        Some(velarx_types::OciDescriptor {
             media_type: self.media_type.clone(),
             digest: self.digest.parse().ok()?,
             size: i64::try_from(self.size).ok()?,
@@ -99,8 +111,7 @@ impl Blob {
                 .flatten()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-        };
-        velarx_types::layer::chunked_checksum(&desc)
+        })
     }
 }
 

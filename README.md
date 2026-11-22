@@ -43,7 +43,10 @@ velarx container exec -it box sh
 Pull and run an image lazily. It must be zstd:chunked with the fs-verity
 digest of every file, as `velarx image push --compression-format zstd:chunked`
 writes it (a zstd:chunked layer is only ever pulled through its table of
-contents, lazily or not, and one that cannot be is refused):
+contents, lazily or not, and one that cannot be is refused). The layers velarx
+writes also carry that table in a binary form, with the digests of the
+algorithm of the image (`--digest sha512` makes them sha512), which velarx
+pulls them by; other tools read the JSON table and ignore it:
 
 ```sh
 velarx image pull --lazy registry.example/app:chunked

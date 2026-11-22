@@ -289,7 +289,12 @@ object name.
   the image was made), `table-checksum` too.  A layer gets one when each of
   its paths is there once and in the order of the paths, a directory before
   what it holds, with hard links to an earlier file: every layer velarx
-  builds.
+  builds.  A pull of a layer that has one, lazy or not, fetches and checks
+  the table instead of the JSON TOC (its checksum against the descriptor,
+  then every record, see `crates/storage/src/table.rs`), and never reads
+  the JSON: a table that cannot be used is an error that names the layer.
+  Its key is `toc:` and the table's checksum, so the layer is not the one
+  a pull by its JSON TOC stored.
 * **Layers of other tools.**  A zstd:chunked layer is pulled through its
   TOC or not at all, lazily or not: one whose TOC gives no fs-verity digest
   for a file (containers/storage writes none unless asked) is refused with

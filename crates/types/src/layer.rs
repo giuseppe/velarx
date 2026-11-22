@@ -4,8 +4,9 @@
 //! A layer is known by what verified it.  A layer pulled whole is checked
 //! against the digest of its blob and its diff id: it is `Whole(blob)`.  A
 //! layer of a descriptor with zstd:chunked labels is pulled through its table
-//! of contents, which the descriptor vouches for (`manifest-checksum`); its
-//! blob is never checked: it is `Toc(toc digest)`.  The two are never
+//! of contents, which the descriptor vouches for (`manifest-checksum`, or
+//! `table-checksum` for a layer with a binary table, which it is then
+//! pulled by); its blob is never checked: it is `Toc(toc digest)`.  The two are never
 //! mixed: a lookup of one kind never finds a layer of the other, so a store
 //! never claims a blob it did not check, nor a TOC it did not read.
 
@@ -149,14 +150,21 @@ pub fn is_zstd(media_type: &str) -> bool {
 }
 
 /// The TOC digest of a descriptor with zstd:chunked labels: a zstd layer
-/// with `manifest-checksum` and `manifest-position` (the two that podman
-/// requires), the position of a TOC (its fourth field is 1: another kind
-/// of manifest is no TOC to pull by).  None for any other (the pull
-/// refuses a descriptor that has one of the two): the blob is never looked
-/// at to decide.
+/// with `table-checksum` and `table-position` (a binary table: offset,
+/// length, length uncompressed), else with `manifest-checksum` and
+/// `manifest-position` (the two that podman requires), the position of a
+/// TOC (its fourth field is 1: another kind of manifest is no TOC to pull
+/// by).  None for any other (the pull refuses a descriptor that has one of
+/// the two): the blob is never looked at to decide.
 pub fn chunked_checksum(desc: &OciDescriptor) -> Option<Digest> {
     if !is_zstd(&desc.media_type) {
         return None;
+    }
+    if let Some(table) = chunked_annotation(desc, "table-checksum") {
+        let position = chunked_annotation(desc, "table-position")?;
+        return (position.split(':').count() == 3)
+            .then(|| table.parse().ok())
+            .flatten();
     }
     let checksum = chunked_annotation(desc, "manifest-checksum")?;
     let position = chunked_annotation(desc, "manifest-position")?;
@@ -273,6 +281,46 @@ mod tests {
             ),
         ] {
             assert_eq!(LayerKey::expected(&d), LayerKey::Whole(D.parse().unwrap()));
+        }
+    }
+
+    /// A layer with a binary table is the layer of its table, whatever its
+    /// JSON TOC.
+    #[test]
+    fn a_table_decides_over_the_toc() {
+        const TABLE: &str = "io.github.containers.zstd-chunked.table-checksum";
+        const AT: &str = "io.github.containers.zstd-chunked.table-position";
+        let s512 = crate::digest::Digest::of(crate::digest::Algorithm::Sha512, b"t");
+        let s512 = s512.to_string();
+        for table in [D, s512.as_str()] {
+            let both = desc(
+                ZSTD,
+                &[
+                    (CHECKSUM, T),
+                    (POSITION, "1:2:3:1"),
+                    (TABLE, table),
+                    (AT, "4:5:6"),
+                ],
+            );
+            assert_eq!(
+                LayerKey::expected(&both),
+                LayerKey::Toc(table.parse().unwrap())
+            );
+            let only = desc(ZSTD, &[(TABLE, table), (AT, "4:5:6")]);
+            assert_eq!(
+                LayerKey::expected(&only),
+                LayerKey::Toc(table.parse().unwrap())
+            );
+        }
+        for at in ["4:5", "4:5:6:1"] {
+            let bad = desc(
+                ZSTD,
+                &[(CHECKSUM, T), (POSITION, "1:2:3:1"), (TABLE, D), (AT, at)],
+            );
+            assert_eq!(
+                LayerKey::expected(&bad),
+                LayerKey::Whole(D.parse().unwrap())
+            );
         }
     }
 

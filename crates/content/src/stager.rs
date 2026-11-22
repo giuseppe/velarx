@@ -494,7 +494,8 @@ impl LayerToc {
         }
     }
 
-    /// The table the engine told with the layer (compressed), parsed.
+    /// The table the engine told with the layer (compressed), parsed: the
+    /// JSON TOC, or the binary table of a layer that has one.
     fn of(
         layer: &crate::serve_fetch::LayerScope,
     ) -> Result<Self, crate::fetcher::fetch::FetcherError> {
@@ -510,15 +511,21 @@ impl LayerToc {
         )
         .map_err(|w| bad(format!("the table of contents {w}")))?;
         let max = crate::pull::chunked::MAX_TOC_JSON;
-        let mut json = Vec::new();
+        let mut raw = Vec::new();
         crate::pull::zstd_decoder(&toc_z[..])
-            .and_then(|d| d.take(max + 1).read_to_end(&mut json))
+            .and_then(|d| d.take(max + 1).read_to_end(&mut raw))
             .map_err(|e| bad(format!("the table of contents: {e}")))?;
-        if json.len() as u64 > max {
+        if raw.len() as u64 > max {
             return Err(bad("the table of contents is too large".into()));
         }
-        let toc: velarx_storage::Toc = serde_json::from_slice(&json)
-            .map_err(|e| bad(format!("not a table of contents: {e}")))?;
+        // (the ranges are checked against the size of the blob by each
+        // fetch, as those of a JSON table)
+        let toc = match raw.starts_with(velarx_storage::table::MAGIC) {
+            true => velarx_storage::table::decode(&raw, u64::MAX)
+                .map_err(|e| bad(format!("not a table: {e}")))?,
+            false => serde_json::from_slice(&raw)
+                .map_err(|e| bad(format!("not a table of contents: {e}")))?,
+        };
         let mut at = std::collections::HashMap::new();
         for (i, e) in toc.entries.iter().enumerate() {
             if e.entry_type == velarx_storage::TocEntryType::Reg && e.size > 0 {

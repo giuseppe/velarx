@@ -970,6 +970,7 @@ impl StagingFetcher for RegistryFetch {
             name: "registry".into(),
             capabilities: [
                 "objects", "unpack", "metadata", "lazy", "sha512", "reuse", "origin", "handover",
+                "table",
             ]
             .map(String::from)
             .to_vec(),

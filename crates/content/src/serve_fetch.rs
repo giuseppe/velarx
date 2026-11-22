@@ -1023,7 +1023,8 @@ mod service {
         }
 
         /// Tell this fetcher of a layer: `staging` its staging directory,
-        /// `toc` its table of contents (JSON compressed with zstd, a sealed
+        /// `toc` its table of contents (JSON, or the binary table of a layer
+        /// that has one, compressed with zstd, a sealed
         /// memory file).  `Layer` again replaces it; the calls in flight on the
         /// one before end as with `Forget`.  A scope keeps at most 1024 layers
         /// (`Busy`).
@@ -2110,6 +2111,11 @@ pub fn definition() -> String {
          # event that has `files`: for each of its `objects` the descriptor of the file, a\n\
          # complete file with no name, instead of a name in the staging directory.  A file\n\
          # that is not small, or that needs fs-verity, is named as before.\n\
+         #\n\
+         # TABLES.  A zstd:chunked layer whose descriptor has the annotations\n\
+         # `table-position` and `table-checksum` is pulled by its binary table, not by\n\
+         # its JSON table of contents: only a fetcher that announces the word table is\n\
+         # asked for it, and the table is what `Probe` carries and `Layer` gives.\n\
          #\n\
          # TRUST.  A fetcher is not trusted.  A name it made is a claim; the engine opens\n\
          # it and takes the kernel's measure.  A file it hands over is a claim too: the\n\

@@ -37,7 +37,7 @@ use tracing::debug;
 use velarx_db::ChunkLocation as ChunkLocationRecord;
 use velarx_proto::transfer::FailureClass;
 use velarx_registry::target::Target;
-use velarx_storage::{canonical, Toc, TocEntry, TocEntryType, TOC_VERSION};
+use velarx_storage::{canonical, table, Toc, TocEntry, TocEntryType, TOC_VERSION};
 use velarx_types::digest::{Algorithm, Digest, DigestWriter, Offloaded};
 use velarx_types::{ImageError, ImageResult, LayerKey, OciDescriptor};
 
@@ -83,9 +83,15 @@ pub struct Pulled {
 /// The positions of the metadata in the blob.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Info {
+    /// The table the layer is pulled by: offset, length, length
+    /// uncompressed
     pub toc: (u64, u64, u64),
     pub checksum: Digest,
     pub tarsplit: Option<(u64, u64, u64)>,
+    /// The table is the binary table ([`velarx_storage::table`]), not the
+    /// JSON TOC
+    #[serde(default)]
+    pub table: bool,
 }
 
 fn annotation<'a>(layer: &'a OciDescriptor, name: &str) -> Option<&'a String> {
@@ -112,7 +118,9 @@ fn parse_numbers<const N: usize>(s: &str) -> Option<[u64; N]> {
 /// which it is pulled by or not at all: annotations that do not name one
 /// this can read (on a layer that is not zstd, without the position or the
 /// checksum of the table, of another kind of table) are an error, never a
-/// layer to read as a stream.
+/// layer to read as a stream.  A layer with a binary table (`table-*`) is
+/// pulled by it: its JSON TOC is never read, and a table that cannot be
+/// used is an error, never a reason to read the JSON.
 pub fn parse_info(layer: &OciDescriptor) -> ImageResult<Option<Info>> {
     if !layer
         .annotations
@@ -135,25 +143,46 @@ pub fn parse_info(layer: &OciDescriptor) -> ImageResult<Option<Info>> {
             layer.media_type
         )));
     }
-    let (Some(position), Some(checksum)) = (
-        annotation(layer, "manifest-position"),
-        annotation(layer, "manifest-checksum"),
-    ) else {
-        return Err(refused(
-            "do not give both the position and the checksum of its table of contents",
-        ));
+    // (a layer with a binary table is pulled by it: its JSON TOC is for
+    // the readers that do not know the table)
+    let (toc, checksum, table) = match (
+        annotation(layer, "table-position"),
+        annotation(layer, "table-checksum"),
+    ) {
+        (Some(position), Some(checksum)) => {
+            let at = parse_numbers::<3>(position).ok_or_else(|| {
+                ImageError::Manifest(format!("invalid zstd:chunked table position `{position}`"))
+            })?;
+            (at, checksum, true)
+        }
+        (None, None) => {
+            let (Some(position), Some(checksum)) = (
+                annotation(layer, "manifest-position"),
+                annotation(layer, "manifest-checksum"),
+            ) else {
+                return Err(refused(
+                    "do not give both the position and the checksum of its table of contents",
+                ));
+            };
+            let toc = parse_numbers::<4>(position).ok_or_else(|| {
+                ImageError::Manifest(format!(
+                    "invalid zstd:chunked manifest position `{position}`"
+                ))
+            })?;
+            if toc[3] != 1 {
+                return Err(ImageError::Manifest(format!(
+                    "unknown zstd:chunked manifest type {}",
+                    toc[3]
+                )));
+            }
+            ([toc[0], toc[1], toc[2]], checksum, false)
+        }
+        _ => {
+            return Err(refused(
+                "do not give both the position and the checksum of its table",
+            ))
+        }
     };
-    let toc = parse_numbers::<4>(position).ok_or_else(|| {
-        ImageError::Manifest(format!(
-            "invalid zstd:chunked manifest position `{position}`"
-        ))
-    })?;
-    if toc[3] != 1 {
-        return Err(ImageError::Manifest(format!(
-            "unknown zstd:chunked manifest type {}",
-            toc[3]
-        )));
-    }
     let checksum: Digest = checksum.parse().map_err(|e| {
         ImageError::Manifest(format!(
             "invalid zstd:chunked manifest checksum `{checksum}`: {e}"
@@ -172,6 +201,7 @@ pub fn parse_info(layer: &OciDescriptor) -> ImageResult<Option<Info>> {
         toc: (toc[0], toc[1], toc[2]),
         checksum,
         tarsplit,
+        table,
     }))
 }
 
@@ -429,9 +459,25 @@ fn vouched_metadata(
     layer: &Digest,
     (max_tar, keep): (u64, bool),
 ) -> ImageResult<Metadata> {
-    let json = decompress_bounded(toc_z, MAX_TOC_JSON, info.toc.2, "TOC")?;
-    let toc = parse_toc(&json).map_err(|e| fail(format!("invalid TOC: {e}")))?;
-    drop(json);
+    let toc = match info.table {
+        true => {
+            let bytes = decompress_bounded(toc_z, MAX_TOC_JSON, info.toc.2, "table")?;
+            let alg = table::head(&bytes)
+                .map_err(|e| fail(format!("invalid table: {e}")))?
+                .alg;
+            if alg != info.checksum.alg() {
+                return Err(fail(format!(
+                    "the digests of its table are {alg}, its checksum is {}",
+                    info.checksum.alg()
+                )));
+            }
+            table::decode(&bytes, info.toc.0).map_err(|e| fail(format!("invalid table: {e}")))?
+        }
+        false => {
+            let json = decompress_bounded(toc_z, MAX_TOC_JSON, info.toc.2, "TOC")?;
+            parse_toc(&json).map_err(|e| fail(format!("invalid TOC: {e}")))?
+        }
+    };
     if let Some(problem) = entry::toc_problem(&toc.entries) {
         return Err(fail(problem));
     }

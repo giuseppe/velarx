@@ -359,6 +359,7 @@ fn test_metadata_checks() {
         toc: (0, toc_z.len() as u64, toc_json.len() as u64),
         checksum: crate::sha256(&toc_z),
         tarsplit: Some((0, ts.len() as u64, 0)),
+        table: false,
     };
     let layer = crate::sha256(b"layer");
     assert!(verify_metadata(&info, &toc_z, ts.clone(), &layer, u64::MAX).is_ok());
@@ -1175,6 +1176,7 @@ fn vouched(toc: &Toc, tarsplit: Option<(u64, u64, u64)>) -> (Vec<u8>, Info) {
         toc: (0, z.len() as u64, json.len() as u64),
         checksum: crate::sha256(&z),
         tarsplit,
+        table: false,
     };
     (z, info)
 }
@@ -1514,4 +1516,207 @@ fn a_full_disk_is_no_fault_of_the_index() {
         expected: "a".into(),
         actual: "b".into(),
     }));
+}
+
+/// A layer of a root, a directory, two files and a hard link written with
+/// `alg` (a canonical tar or one with a tar-split), and its descriptor.
+fn written(alg: Algorithm, canonical: bool) -> (Vec<u8>, OciDescriptor) {
+    use crate::layer::writer::{write_canonical_layer, write_layer, Compression};
+    let mut entries = vec![
+        canonical_entry("./", TocEntryType::Dir, 0),
+        canonical_entry("./d/", TocEntryType::Dir, 0),
+        canonical_entry("./d/a", TocEntryType::Reg, 5),
+        canonical_entry("./d/b", TocEntryType::Reg, 200_000),
+    ];
+    let mut link = canonical_entry("./d/c", TocEntryType::Hardlink, 0);
+    link.link_name = Some("./d/a".into());
+    entries.push(link);
+    let mut tar = Vec::new();
+    velarx_storage::canonical::write(&entries, &mut tar, |e, out| {
+        let bytes: Vec<u8> = (0..e.size).map(|i| (i * 7 % 251) as u8).collect();
+        out.write_all(&bytes)
+    })
+    .unwrap();
+    let mut blob = Vec::new();
+    let c = Compression::ZstdChunked;
+    let w = match canonical {
+        true => write_canonical_layer(&tar[..], alg, c, None, &mut blob),
+        false => write_layer(&tar[..], alg, c, &mut blob),
+    }
+    .unwrap();
+    let desc = OciDescriptor {
+        media_type: ZSTD.into(),
+        digest: w.digest,
+        size: blob.len() as i64,
+        annotations: w.annotations.into_iter().collect(),
+    };
+    (blob, desc)
+}
+
+/// The metadata of `desc` as a pull verifies it, from the ranges of
+/// `blob` its annotations name.
+fn pulled(blob: &[u8], desc: &OciDescriptor, lazy: bool) -> ImageResult<Metadata> {
+    let info = parse_info(desc)?.unwrap();
+    let range = |(off, len, _): (u64, u64, u64)| blob[off as usize..(off + len) as usize].to_vec();
+    let ts = info.tarsplit.map(range).unwrap_or_default();
+    match lazy {
+        true => verified_table(
+            &info,
+            &range(info.toc),
+            Vec::new(),
+            &desc.digest,
+            (u64::MAX, false),
+        ),
+        false => verify_metadata(&info, &range(info.toc), ts, &desc.digest, u64::MAX),
+    }
+}
+
+/// A descriptor without the annotations of the binary table: what a reader
+/// that does not know it sees.
+fn without_table(desc: &OciDescriptor) -> OciDescriptor {
+    let mut old = desc.clone();
+    old.annotations.retain(|k, _| !k.contains("table-"));
+    old
+}
+
+/// A layer with a binary table is pulled by it, lazily or not, with the
+/// digests of its algorithm, and is the same layer as by its JSON TOC (what
+/// a reader that does not know the table takes, the content digests of the
+/// files aside); a layer without one is pulled by its JSON TOC.
+#[test]
+fn test_a_layer_is_pulled_by_its_binary_table() {
+    for alg in Algorithm::ALL {
+        for canonical in [true, false] {
+            let (blob, desc) = written(alg, canonical);
+            let info = parse_info(&desc).unwrap().unwrap();
+            assert!(info.table);
+            assert_eq!(info.checksum.alg(), alg);
+            assert_eq!(LayerKey::expected(&desc), LayerKey::Toc(info.checksum));
+            let old = without_table(&desc);
+            assert!(!parse_info(&old).unwrap().unwrap().table);
+            for lazy in [false, true] {
+                let by_table = pulled(&blob, &desc, lazy).unwrap();
+                let by_json = pulled(&blob, &old, lazy).unwrap();
+                let view = |t: &Toc| {
+                    t.entries
+                        .iter()
+                        .map(|e| {
+                            (
+                                e.name.clone(),
+                                e.entry_type,
+                                e.size,
+                                e.fsverity,
+                                e.link_name.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let names = |t: &Toc| {
+                    t.entries
+                        .iter()
+                        .map(|e| e.name.trim_start_matches("./").to_string())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    names(&by_table.stored),
+                    names(&by_json.stored),
+                    "{alg} {canonical} {lazy}"
+                );
+                if canonical {
+                    assert_eq!(view(&by_table.stored), view(&by_json.stored));
+                }
+                assert!(by_table
+                    .stored
+                    .entries
+                    .iter()
+                    .all(|e| e.fsverity.is_none_or(|v| v.alg() == alg)));
+                assert_eq!(by_table.toc_z.len() as u64, info.toc.1);
+            }
+        }
+    }
+}
+
+/// A table that its checksum vouches for and that cannot be used is an
+/// error that names the layer, never a reason to read the JSON TOC.
+#[test]
+fn test_a_table_that_cannot_be_used_is_an_error() {
+    let (blob, desc) = written(Algorithm::Sha256, true);
+    let info = parse_info(&desc).unwrap().unwrap();
+    let (off, len, raw) = info.toc;
+    let mut table = zstd::decode_all(&blob[off as usize..(off + len) as usize]).unwrap();
+    // (the first name, after the root's, made a `/`)
+    let names = u64::from_le_bytes(table[32 + 32 + 16..32 + 32 + 24].try_into().unwrap());
+    table[names as usize] = b'/';
+    let z = zstd::encode_all(&table[..], 3).unwrap();
+    let bad = Info {
+        toc: (off, z.len() as u64, raw),
+        checksum: crate::sha256(&z),
+        ..info.clone()
+    };
+    let e = verify_metadata(&bad, &z, Vec::new(), &desc.digest, u64::MAX)
+        .err()
+        .unwrap();
+    assert!(matches!(e, ImageError::Contradicted(_)), "{e}");
+    assert!(
+        e.to_string().contains("invalid table") && e.to_string().contains(&desc.digest.to_string()),
+        "{e}"
+    );
+    // a sha256 table vouched for by a sha512 checksum
+    let z = &blob[off as usize..(off + len) as usize];
+    let other = Info {
+        checksum: Digest::of(Algorithm::Sha512, z),
+        ..info
+    };
+    let e = verify_metadata(&other, z, Vec::new(), &desc.digest, u64::MAX)
+        .err()
+        .unwrap();
+    assert!(
+        e.to_string()
+            .contains("the digests of its table are sha256"),
+        "{e}"
+    );
+}
+
+#[test]
+fn test_parse_info_of_a_binary_table() {
+    let prefix = "io.github.containers.zstd-chunked.";
+    let checksum = crate::sha256_text(b"t");
+    let both = layer(
+        &[
+            (&format!("{prefix}manifest-position"), "100:50:200:1"),
+            (
+                &format!("{prefix}manifest-checksum"),
+                &crate::sha256_text(b""),
+            ),
+            (&format!("{prefix}table-position"), "10:20:30"),
+            (&format!("{prefix}table-checksum"), &checksum),
+            (&format!("{prefix}version"), "2"),
+        ],
+        ZSTD,
+    );
+    let i = parse_info(&both).unwrap().unwrap();
+    assert_eq!(
+        (i.toc, i.checksum.to_string(), i.table),
+        ((10, 20, 30), checksum.clone(), true)
+    );
+    // a table alone (no JSON TOC) is a table too
+    let mut alone = both.clone();
+    alone.annotations.retain(|k, _| !k.contains("manifest-"));
+    assert_eq!(parse_info(&alone).unwrap().unwrap(), i);
+    // half of the table, or a position of another form: refused, not read by
+    // the JSON TOC
+    for (name, value) in [
+        ("table-position", None),
+        ("table-checksum", None),
+        ("table-position", Some("10:20:30:1")),
+        ("table-checksum", Some("sha256:zz")),
+    ] {
+        let mut bad = both.clone();
+        let key = format!("{prefix}{name}");
+        match value {
+            Some(v) => bad.annotations.insert(key, v.into()),
+            None => bad.annotations.remove(&key),
+        };
+        assert!(parse_info(&bad).is_err(), "{name} {value:?}");
+    }
 }

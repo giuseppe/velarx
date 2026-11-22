@@ -115,8 +115,14 @@ lengths before allocating and verifies every digest.
   and nothing of it is stored.  A lazy pull stages a layer and runs
   containers on it once every byte is checked against the table, and
   replays its tar-split at the completion, which commits nothing of a pull
-  whose tar-split is not the table's.  Only a layer without the annotations
-  is read as a stream.  The image of a layer is what an extraction of its
+  whose tar-split is not the table's.  A layer whose descriptor names a
+  binary table (`table-checksum`) has a third description, which velarx
+  pulls it by alone, with the same rules: its JSON table and the table
+  velarx reads may differ as the table and the stream may, and nothing
+  falls back from one to the other.  The binary table is parsed in the pull
+  in user space, every record checked before it is used; the EROFS image
+  is always made here from its checked values.  Only a layer without the
+  annotations is read as a stream.  The image of a layer is what an extraction of its
   entries in their order makes: a hard link names the file its target is at
   that point of the archive, and a layer whose entry has a parent that is not
   a directory there, or that turns a directory into another type, is

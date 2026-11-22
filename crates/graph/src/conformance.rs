@@ -2275,8 +2275,9 @@ pub async fn a_feed_writes_into_the_files_a_driver_hands_over(f: &Factory) {
         let (file, base, size) = &places[&e.content_key().unwrap()];
         let mut bytes = vec![0u8; *size as usize];
         file.read_exact_at(&mut bytes, *base).unwrap();
-        let hash = Digest::of(velarx_types::digest::Algorithm::Sha256, &bytes);
-        assert_eq!(Some(hash.to_string()), e.digest, "{}", e.name);
+        let verity =
+            velarx_storage::fsverity_digest_of(velarx_types::digest::Algorithm::Sha256, &bytes);
+        assert_eq!(Some(verity), e.verity(), "{}", e.name);
     }
     // and the layer read back from them is the layer
     struct Places(HashMap<String, (std::fs::File, u64, u64)>);

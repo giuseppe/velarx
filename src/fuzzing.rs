@@ -186,6 +186,7 @@ pub fn toc(data: &[u8]) {
         toc: (0, data.len() as u64, 0),
         checksum: velarx_types::digest::Digest::of(velarx_types::digest::Algorithm::Sha256, data),
         tarsplit: None,
+        table: false,
     };
     let _ = velarx_content::pull::chunked::verify_metadata(
         &info,

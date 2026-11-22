@@ -123,6 +123,9 @@ struct Fetcher {
     /// It announces `handover`: it hands the small files it fetches over as
     /// descriptors when the pull keeps them in the engine
     handover: bool,
+    /// It announces `table`: it is asked for the layers that have a binary
+    /// table, which it finds and reads
+    table: bool,
     /// Its connection failed (the peer restarted, the socket went): the
     /// scope it was given is gone with it
     lost: std::sync::atomic::AtomicBool,
@@ -382,6 +385,7 @@ impl StagedFetch {
                     reuse: info.can("reuse"),
                     origin: info.can("origin"),
                     handover: info.can("handover"),
+                    table: info.can("table"),
                     lost: Default::default(),
                 }),
                 Err(e) => debug!("The fetcher {name} is left out of the pull: {e}"),
@@ -438,6 +442,7 @@ impl StagedFetch {
                 reuse: info.can("reuse"),
                 origin: info.can("origin"),
                 handover: info.can("handover"),
+                table: info.can("table"),
                 lost: Default::default(),
             });
         }
@@ -467,6 +472,7 @@ impl StagedFetch {
             reuse: info.can("reuse"),
             origin: info.can("origin"),
             handover: info.can("handover"),
+            table: info.can("table"),
             lost: Default::default(),
         });
         Self::assemble(fetchers, origin, root, verity, manifest)
@@ -592,7 +598,18 @@ impl StagedFetch {
             if left.is_empty() {
                 break;
             }
-            let answered = match self.probe_one(fetcher, &left, (again, parts)).await {
+            // (a layer with a binary table only of one that reads it)
+            let asked: Vec<u32> = left
+                .iter()
+                .copied()
+                .filter(|i| {
+                    fetcher.table || !self.blobs.get(*i as usize).is_some_and(Blob::has_table)
+                })
+                .collect();
+            if asked.is_empty() {
+                continue;
+            }
+            let answered = match self.probe_one(fetcher, &asked, (again, parts)).await {
                 Ok(a) => a,
                 Err(e) if refused(&e) => return Err(fetcher_error(&fetcher.name, e)),
                 Err(e) => {
@@ -1076,6 +1093,9 @@ impl StagedFetch {
             // registry fetcher)
             for (i, fetcher) in self.fetchers.iter().enumerate() {
                 if !missed[i] || !breaker.usable(i) || (!with_origin && Some(i) == self.origin) {
+                    continue;
+                }
+                if described.has_table() && !fetcher.table {
                     continue;
                 }
                 let toc = toc_fd
