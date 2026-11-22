@@ -62,6 +62,13 @@ impl StoreContent {
         }
     }
 
+    /// A call failed on its connection: the store service may have been
+    /// restarted, and the connections kept are gone with it.
+    fn failed(&self, e: impl std::fmt::Display) -> io::Error {
+        self.idle.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        io::Error::other(e.to_string())
+    }
+
     /// The files of `digests` (at most [`MAX_LOOKUP`]), for those the store
     /// gives.
     async fn lookup(&self, digests: &[String]) -> io::Result<Vec<Option<ChunkFile>>> {
@@ -73,10 +80,7 @@ impl StoreContent {
             })
             .collect();
         let mut conn = self.connection().await?;
-        let (reply, mut fds) = conn
-            .lookup(wants)
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let (reply, mut fds) = conn.lookup(wants).await.map_err(|e| self.failed(e))?;
         let reply = reply.map_err(io::Error::other)?;
         if reply.items.len() != digests.len() {
             return Err(io::Error::other("the store service lost a digest"));
@@ -154,7 +158,7 @@ impl ChunkProvider for StoreContent {
             let answer = conn
                 .index(layer, MAX_ITEM_BYTES as u64)
                 .await
-                .map_err(|e| io::Error::other(e.to_string()))?;
+                .map_err(|e| self.failed(e))?;
             self.keep(conn);
             match answer {
                 (Ok(reply), fds) => Self::item(fds, reply.fd).map(Some),
@@ -170,7 +174,7 @@ impl ChunkProvider for StoreContent {
             let answer = conn
                 .profile(image, velarx_content::fetcher::fetch::PROFILE_MAX_BYTES)
                 .await
-                .map_err(|e| io::Error::other(e.to_string()))?;
+                .map_err(|e| self.failed(e))?;
             self.keep(conn);
             match answer {
                 (Ok(reply), fds) => Self::item(fds, reply.file).map(Some),
