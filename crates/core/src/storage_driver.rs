@@ -132,7 +132,10 @@ fn open_service(
             "the storage driver varlink needs [storage.varlink] socket = \"/path\"",
         )
     })?;
-    let service: Arc<dyn StorageDriver> = Arc::new(open_varlink(varlink)?);
+    let service = Arc::new(open_varlink(varlink)?);
+    // (the files of the layers are the service's: the database reads them
+    // from it)
+    parts.db.clone().with_layer_files(service.clone());
     let local = Arc::new(ComposefsDriver::new(
         parts.db,
         parts.store,
@@ -140,7 +143,10 @@ fn open_service(
         parts.fsverity,
         options.composefs.clone(),
     ));
-    Ok(Arc::new(LazyPhase::new(service, local)))
+    Ok(Arc::new(LazyPhase::new(
+        service as Arc<dyn StorageDriver>,
+        local,
+    )))
 }
 
 /// The `varlink` driver at the socket of `options`: the store id of the graph

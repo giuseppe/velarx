@@ -62,21 +62,44 @@ pub fn write(root: &Path, key: &LayerKey, kind: &str, bytes: &[u8]) -> io::Resul
     Ok(digest)
 }
 
-/// The bytes of the file of the kind `kind` of the layer `key` that has the
-/// digest `expected`, if they have it.
-pub fn read(root: &Path, key: &LayerKey, kind: &str, expected: &Digest) -> io::Result<Vec<u8>> {
-    let path = file(root, key, kind, expected);
-    let bytes = std::fs::read(&path)?;
-    if Digest::of(expected.alg(), &bytes) != *expected {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{}: not the file with the digest {expected}",
-                path.display()
-            ),
-        ));
+/// Where the files of the layers of a store are read from: its directory,
+/// or the storage driver that keeps them (a service of another process).
+/// What a source gives is not trusted: the reader checks it against the
+/// digest of the row.
+pub trait Source: Send + Sync {
+    /// The bytes of the file of the kind `kind` of the layer `key` that has
+    /// the digest `digest`.
+    fn read(&self, key: &LayerKey, kind: &str, digest: &Digest) -> io::Result<Vec<u8>>;
+}
+
+/// The files of the layers in the directory of the store `root`.
+pub struct Directory(pub PathBuf);
+
+impl Source for Directory {
+    fn read(&self, key: &LayerKey, kind: &str, digest: &Digest) -> io::Result<Vec<u8>> {
+        std::fs::read(file(&self.0, key, kind, digest))
     }
-    Ok(bytes)
+}
+
+/// The source of the files in the directory of the store `root`, shared by
+/// the clones of a database.
+pub(crate) fn of_directory(
+    root: Option<&Path>,
+) -> std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<dyn Source>>>> {
+    let source: Option<std::sync::Arc<dyn Source>> =
+        root.map(|r| std::sync::Arc::new(Directory(r.to_path_buf())) as _);
+    std::sync::Arc::new(std::sync::RwLock::new(source))
+}
+
+/// `bytes`, if their digest is `expected`.
+pub fn checked(bytes: Vec<u8>, expected: &Digest) -> io::Result<Vec<u8>> {
+    match Digest::of(expected.alg(), &bytes) == *expected {
+        true => Ok(bytes),
+        false => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("not the file with the digest {expected}"),
+        )),
+    }
 }
 
 /// Remove the directory of the layer `key`, if it is there.
@@ -99,14 +122,16 @@ mod tests {
         let bytes = b"table";
         let good = write(root.path(), &key, TOC, bytes).unwrap();
         assert_eq!(good, Digest::of(Algorithm::Sha256, bytes));
-        assert_eq!(read(root.path(), &key, TOC, &good).unwrap(), bytes);
+        let source = Directory(root.path().to_path_buf());
+        let read = |expected: &Digest| checked(source.read(&key, TOC, expected)?, expected);
+        assert_eq!(read(&good).unwrap(), bytes);
         // (a name is the digest of the bytes it holds: damage is found)
         let path = file(root.path(), &key, TOC, &good);
         std::fs::write(&path, b"damaged").unwrap();
-        let e = read(root.path(), &key, TOC, &good).unwrap_err();
+        let e = read(&good).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         let wrong = Digest::of(Algorithm::Sha256, b"other");
-        let e = read(root.path(), &key, TOC, &wrong).unwrap_err();
+        let e = read(&wrong).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
         remove_layer(root.path(), &key).unwrap();
         assert!(!layer_dir(root.path(), &key).exists());
@@ -119,25 +144,17 @@ mod tests {
     fn other_bytes_for_a_layer_are_another_file() {
         let root = tempfile::tempdir().unwrap();
         let key = LayerKey::Whole(Digest::of(Algorithm::Sha256, b"layer"));
+        let source = Directory(root.path().to_path_buf());
         let a = write(root.path(), &key, TOC, b"json of a build").unwrap();
         let b = write(root.path(), &key, TOC, b"json of another").unwrap();
         assert_ne!(a, b);
-        assert_eq!(
-            read(root.path(), &key, TOC, &a).unwrap(),
-            b"json of a build"
-        );
-        assert_eq!(
-            read(root.path(), &key, TOC, &b).unwrap(),
-            b"json of another"
-        );
+        assert_eq!(source.read(&key, TOC, &a).unwrap(), b"json of a build");
+        assert_eq!(source.read(&key, TOC, &b).unwrap(), b"json of another");
         // (the same bytes are the same name)
         assert_eq!(
             write(root.path(), &key, TOC, b"json of a build").unwrap(),
             a
         );
-        assert_eq!(
-            read(root.path(), &key, TOC, &a).unwrap(),
-            b"json of a build"
-        );
+        assert_eq!(source.read(&key, TOC, &a).unwrap(), b"json of a build");
     }
 }

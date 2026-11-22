@@ -63,6 +63,12 @@ pub struct OfImage<S> {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct LayerFiles<S> {
+    pub store: S,
+    pub layer: S,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct HasLayers<S, V> {
     pub store: S,
     pub layers: V,
@@ -170,6 +176,7 @@ method!(Commit<S, V>, "Commit", proto::Ack);
 method!(CreateRoot<S, V, A>, "CreateRoot", proto::Created, MORE);
 method!(CreateImageVolume<S, V, A>, "CreateImageVolume", proto::VolumeCreated, MORE);
 method!(MountImage<S, V>, "MountImage", proto::Ack);
+method!(LayerFiles<S>, "LayerFiles", proto::Ack);
 method!(Mounts<S, A, V>, "Mounts", proto::MountsReply);
 method!(Check<S, V>, "Check", proto::Checked, MORE);
 method!(Repair<S, V>, "Repair", proto::Repaired, MORE);
@@ -252,6 +259,7 @@ pub(crate) fn served() -> Vec<(&'static str, Vec<String>)> {
             store: s,
             layers: v,
         }),
+        of(&LayerFiles { store: s, layer: s }),
         of(&WritableRoot(OfContainer {
             store: s,
             container: s,

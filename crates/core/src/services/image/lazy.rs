@@ -862,7 +862,6 @@ impl ImageService {
             );
             (commit.record.blob, commit.record.size) =
                 (layer.meta.blob.parse().ok(), layer.meta.size);
-            self.write_layer_files([&pulled]).await?;
             self.db.commit_layers(vec![commit], Vec::new()).await?;
             debug!("Layer {} pulled into the storage driver", layer.key);
         }

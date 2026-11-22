@@ -23,34 +23,6 @@ pub(super) fn with_image(
 }
 
 impl ImageService {
-    /// Write the files of the layers `done` (their table of contents and
-    /// tar-split), before the rows that name them, unless the storage driver
-    /// wrote them with the barrier of its commit: one that keeps its objects
-    /// in another process does not, and its barrier is not the engine's.
-    pub(super) async fn write_layer_files<'a>(
-        &self,
-        done: impl IntoIterator<Item = &'a velarx_content::pull::LayerDone>,
-    ) -> ImageResult<()> {
-        if self.storage.holds_objects() {
-            return Ok(());
-        }
-        let done: Vec<velarx_content::pull::LayerDone> = done.into_iter().cloned().collect();
-        let store = self.file_store.clone();
-        tokio::task::spawn_blocking(move || {
-            let root = velarx_db::layer_files::root_of(store.root());
-            for d in &done {
-                d.write_files(root)?;
-            }
-            match done.is_empty() {
-                true => Ok(()),
-                false => store.barrier(&velarx_db::layer_files::layers_dir(root)),
-            }
-        })
-        .await
-        .map_err(|e| ImageError::Storage(e.to_string()))?
-        .map_err(|e| ImageError::Storage(format!("cannot write the files of the layers: {e}")))
-    }
-
     /// The mode of `[storage] composefs_digests` of this node.
     pub fn composefs_digests(&self) -> ComposefsDigests {
         self.storage_options.digests

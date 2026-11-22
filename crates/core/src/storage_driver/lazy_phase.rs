@@ -668,7 +668,11 @@ mod tests {
                     owners: None,
                 };
                 self.db
-                    .insert_layer_with_toc(&record, &zstd::encode_all(toc.as_bytes(), 3).unwrap())
+                    .insert_layer_with_toc(
+                        velarx_db::layer_files::root_of(self.store.root()),
+                        &record,
+                        &zstd::encode_all(toc.as_bytes(), 3).unwrap(),
+                    )
                     .await
                     .unwrap();
                 for f in files {
@@ -833,9 +837,13 @@ mod tests {
             let c = copy().await;
             let mut kept = c.layer(1, &[10, 11]).await;
             kept.key = key(2);
-            c.db.insert_layer_with_toc(&kept, &zstd::encode_all(&b"{"[..], 3).unwrap())
-                .await
-                .unwrap();
+            c.db.insert_layer_with_toc(
+                velarx_db::layer_files::root_of(c.store.root()),
+                &kept,
+                &zstd::encode_all(&b"{"[..], 3).unwrap(),
+            )
+            .await
+            .unwrap();
             c.phase.pin(&c.writable(C1), &[kept]).unwrap();
             let e = c.release(&[1], &[C1], &[], &[]).await.unwrap_err();
             assert!(e.to_string().contains("table of contents"), "{e}");

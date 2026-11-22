@@ -295,6 +295,45 @@ impl Server {
         Ok(reply_fds(&proto::MountsReply { root, volumes }, fds))
     }
 
+    /// `LayerFiles`: the table file of a committed layer, and its tar-split if
+    /// it has one, as the descriptors 0 and 1.  The files are the ones the
+    /// pull wrote with the layer (`Index` of the feed gave them); the engine
+    /// checks them against its own record of the layer.
+    pub(crate) fn layer_files(&self, call: Call<'_>) -> DriverResult<Out> {
+        use velarx_db::layer_files;
+        let p: request::LayerFiles<String> = call.params()?;
+        let store = self.store(&call, &p.store)?;
+        let key = velarx_types::LayerKey::parse(&p.layer)
+            .ok_or_else(|| failed(format!("{:?} is no layer key", p.layer)))?;
+        let missing = || {
+            DriverError::missing(
+                NAME,
+                Some(&key),
+                format!("the layer {key} is not stored"),
+                Remedy::PullAgain,
+            )
+        };
+        // (the files its own row names: the engine checks them against its)
+        let Some((Some(toc), tarsplit)) = store
+            .rt
+            .block_on(store.db.layer_file_digests(&key))
+            .map_err(failed)?
+        else {
+            return Err(missing());
+        };
+        let root = layer_files::root_of(store.files.root());
+        let open = |kind, digest| {
+            std::fs::File::open(layer_files::file(root, &key, kind, digest))
+                .map(OwnedFd::from)
+                .map_err(|_| missing())
+        };
+        let mut fds = vec![open(layer_files::TOC, &toc)?];
+        if let Some(tarsplit) = tarsplit {
+            fds.push(open(layer_files::TARSPLIT, &tarsplit)?);
+        }
+        Ok(reply_fds(&proto::Ack {}, fds))
+    }
+
     /// `MountImage`: the root of the image of the layers as one descriptor.
     /// The server has no overlay of its layers (the vfs driver copies them),
     /// so it keeps a copy of each image it is asked for, made once, named by
@@ -503,10 +542,9 @@ fn collect_store(
             }
         }))
         .map_err(failed)?;
-    if let Some(root) = store.db.root() {
-        for k in gone.iter().filter_map(|k| velarx_types::LayerKey::parse(k)) {
-            velarx_db::layer_files::remove_layer(root, &k).map_err(failed)?;
-        }
+    let root = velarx_db::layer_files::root_of(store.files.root());
+    for k in gone.iter().filter_map(|k| velarx_types::LayerKey::parse(k)) {
+        velarx_db::layer_files::remove_layer(root, &k).map_err(failed)?;
     }
     let mut recorded: HashSet<String> = HashSet::new();
     for l in rows.iter().filter(|l| kept.contains(&l.key.to_string())) {

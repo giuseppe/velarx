@@ -20,7 +20,7 @@ pub mod network_ext;
 pub use network_ext::{Ip6Choice, IpChoice};
 
 use rusqlite::OptionalExtension as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tokio_rusqlite::Connection;
 use tracing::info;
@@ -50,9 +50,10 @@ pub struct Database {
     conn: Arc<Conn>,
     /// The file of the database (none in memory)
     path: Option<Arc<std::path::PathBuf>>,
-    /// The directory of the store, where the files of its layers are (that
-    /// of the database; none in memory)
-    root: Option<Arc<std::path::PathBuf>>,
+    /// Where the files of its layers are read from (the directory of the
+    /// database; none in memory), shared by the clones of the database
+    /// ([`Database::with_layer_files`])
+    files: Arc<std::sync::RwLock<Option<Arc<dyn layer_files::Source>>>>,
     /// The databases of the read-only stores under this one, whose
     /// images, layers and files are found when this one has not got them
     more: Arc<Vec<Database>>,
@@ -362,7 +363,7 @@ impl Database {
         let db = Self {
             conn,
             lease_dir: Arc::new(leases::lock_dir(Some(&path))),
-            root: path.parent().map(|p| Arc::new(p.to_path_buf())),
+            files: layer_files::of_directory(path.parent()),
             path: Some(Arc::new(path)),
             more: Arc::new(Vec::new()),
         };
@@ -380,7 +381,7 @@ impl Database {
         let db = Self {
             conn: Arc::new(Conn::new(conn, false, None)),
             path: None,
-            root: None,
+            files: layer_files::of_directory(None),
             lease_dir: Arc::new(leases::lock_dir(None)),
             more: Arc::new(Vec::new()),
         };
@@ -864,11 +865,15 @@ impl Database {
     }
 
     /// [`Self::insert_layer`] of a layer whose table of contents is `toc_z`,
-    /// a file of its directory as a pull writes it (for the tests of what
-    /// reads it).
+    /// a file written in the store `root` as a pull writes it (for the tests
+    /// of what reads it).
     #[cfg(any(test, feature = "test-support"))]
-    pub async fn insert_layer_with_toc(&self, layer: &LayerRecord, toc_z: &[u8]) -> DbResult<()> {
-        let root = self.root().expect("a database in memory has no files");
+    pub async fn insert_layer_with_toc(
+        &self,
+        root: &Path,
+        layer: &LayerRecord,
+        toc_z: &[u8],
+    ) -> DbResult<()> {
         let digest = layer_files::write(root, &layer.key, layer_files::TOC, toc_z)
             .map_err(|e| io_error(&layer_files::layer_dir(root, &layer.key), e))?;
         self.insert_layer(layer).await?;
@@ -957,17 +962,12 @@ impl Database {
             .await?)
     }
 
-    /// The directory of the store: where its database, its layers' files and
-    /// its objects are (none for a database in memory).
-    pub fn root(&self) -> Option<&Path> {
-        self.root.as_deref().map(|p| p.as_path())
-    }
-
-    /// This database with the files of its layers in the directory `root`,
-    /// where its store is when that is not the directory of the file (for
-    /// the tests of a database in memory, and of a store made apart).
-    pub fn with_root(mut self, root: &Path) -> Self {
-        self.root = Some(Arc::new(root.to_path_buf()));
+    /// This database with the files of its layers read from `source`: the
+    /// storage driver that keeps them, or a directory (for the tests of a
+    /// database in memory, and of a store made apart).  The clones of the
+    /// database have it too.
+    pub fn with_layer_files(self, source: Arc<dyn layer_files::Source>) -> Self {
+        *self.files.write().unwrap_or_else(|e| e.into_inner()) = Some(source);
         self
     }
 
@@ -992,10 +992,24 @@ impl Database {
             .map_err(DbError::Sqlite)
     }
 
+    /// The digests of the files the row of the layer `key` names, of its
+    /// table of contents and of its tar-split (none for a layer without one,
+    /// or that is not complete); none for a layer with no row.  A storage
+    /// service opens the files by them.
+    pub async fn layer_file_digests(
+        &self,
+        key: &LayerKey,
+    ) -> DbResult<Option<(Option<Digest>, Option<Digest>)>> {
+        Ok(self
+            .layer_files_here(key)
+            .await?
+            .map(|(toc, tarsplit)| (toc, tarsplit.and_then(|t| t.parse().ok()))))
+    }
+
     /// The file `name` of the layer `key` once its digest is checked: the
-    /// one of this store's directory of the layer, or of a read-only store
-    /// (an image of one has its rows copied here, not its files), whichever
-    /// has the file with that digest.
+    /// one of this store's source, or of a read-only store (an image of one
+    /// has its rows copied here, not its files), whichever has the file with
+    /// that digest.
     async fn read_layer_file(
         &self,
         key: &LayerKey,
@@ -1003,25 +1017,30 @@ impl Database {
         expected: Digest,
     ) -> DbResult<Vec<u8>> {
         let key = *key;
-        let roots: Vec<PathBuf> = std::iter::once(self)
+        let sources: Vec<Arc<dyn layer_files::Source>> = std::iter::once(self)
             .chain(self.more.iter())
-            .filter_map(|db| db.root().map(Path::to_path_buf))
+            .filter_map(|db| db.files.read().unwrap_or_else(|e| e.into_inner()).clone())
             .collect();
         tokio::task::spawn_blocking(move || {
-            // (what the first store says if none has it)
+            // (what the first source says if none has it)
             let mut first = None;
-            for root in &roots {
-                match layer_files::read(root, &key, name, &expected) {
+            for source in &sources {
+                match source
+                    .read(&key, name, &expected)
+                    .and_then(|bytes| layer_files::checked(bytes, &expected))
+                {
                     Ok(bytes) => return Ok(bytes),
                     Err(e) => {
-                        first.get_or_insert((root, e));
+                        first.get_or_insert(e);
                     }
                 }
             }
-            let (root, e) = first.ok_or_else(|| {
-                DbError::NotFound(format!("layer {key}: the store has no directory"))
-            })?;
-            Err(io_error(&layer_files::layer_dir(root, &key), e))
+            let e = first.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "the store has no files")
+            });
+            Err(DbError::Sqlite(tokio_rusqlite::Error::Other(
+                format!("layer {key}: {name}: {e}").into(),
+            )))
         })
         .await
         .map_err(|e| DbError::Sqlite(tokio_rusqlite::Error::Other(Box::new(e))))?

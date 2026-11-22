@@ -1090,7 +1090,9 @@ pub async fn env_built(
     let (host, reg) = start_registry().await;
     let tmp = tempfile::tempdir().unwrap();
     // (the files of the layers are in the directory of the store)
-    let db = db.with_root(tmp.path());
+    let db = db.with_layer_files(Arc::new(velarx_db::layer_files::Directory(
+        tmp.path().to_path_buf(),
+    )));
     let store = Arc::new(
         FileStore::new(tmp.path().join("objects"))
             .unwrap()
@@ -1465,7 +1467,9 @@ pub async fn side_with(conf: Option<&str>) -> Side {
     let db = Database::open_in_memory()
         .await
         .unwrap()
-        .with_root(tmp.path());
+        .with_layer_files(Arc::new(velarx_db::layer_files::Directory(
+            tmp.path().to_path_buf(),
+        )));
     let store = Arc::new(FileStore::new(tmp.path().join("objects")).unwrap());
     let service = ImageService::new(
         db.clone(),

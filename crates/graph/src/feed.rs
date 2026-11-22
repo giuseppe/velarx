@@ -34,7 +34,9 @@
 //!    against it and hands the identities, with the images it made them
 //!    from, back to the driver; a pull it refuses leaves nothing in the
 //!    store;
-//! 6. the driver makes what it pulled durable with one barrier, names the
+//! 6. the driver makes what it pulled durable with two barriers, a `syncfs`
+//!    of the staging and one of the store once the files are named (never
+//!    more, and none of the engine's), names the
 //!    files by what they hold (the commit of the session) and stores the
 //!    identities (composefs writes the images the engine made: they are not
 //!    built twice) and records what it made ([`Pulled::artifacts`]); what
@@ -1348,8 +1350,9 @@ fn refused(driver: &str, e: ImageError) -> DriverError {
 
 /// The pull of a driver that keeps its store in this process (composefs,
 /// vfs): the want of each file is `Session::have`, the bytes go to a staging
-/// session, and what is pulled is committed with one barrier (a `syncfs`
-/// before the files are moved into the store and one after).  The layers
+/// session, and what is pulled is committed with two barriers (a `syncfs`
+/// before the files are moved into the store and one after, which makes the
+/// names and what the driver writes in between durable).  The layers
 /// come back settled, with the identities the engine's check made of them;
 /// the driver stores those, and the verdict of the check goes back to the
 /// engine with its [`Pulled`].

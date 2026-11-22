@@ -175,7 +175,8 @@ fn toc_in(root: &Path, key: &LayerKey) -> PathBuf {
 /// Check the files the layers name, and keep their tables of contents
 /// (the view of an image and the copy of a container are made from them,
 /// without the database).  This is where vfs checks fs-verity: the files
-/// are measured against their digests now, at pull.
+/// are measured against their digests now, at pull.  The caller makes
+/// them durable: a barrier of the store (a pull has the one of its commit).
 fn keep_tocs<T: std::borrow::Borrow<Toc>>(
     store: &FileStore,
     verity: VerityMode,
@@ -199,9 +200,7 @@ fn keep_tocs<T: std::borrow::Borrow<Toc>>(
         )?;
         tmp.persist(toc_in(root, key)).map_err(|e| e.error)?;
     }
-    // (the files durable with one barrier, then their names)
-    store.barrier(&dir)?;
-    store.sync_dir(&dir)
+    Ok(())
 }
 
 /// The image below a copy, with the ranges of its user and group ids.
@@ -848,33 +847,31 @@ impl StorageDriver for VfsDriver {
             staging_dir: self.staging_dir.clone(),
             fsverity: self.fsverity,
         };
-        let write: feed::Written<()> = Box::new(|_, _| Ok(((), false)));
+        // (the identity is the engine's: nothing is made of the layers
+        // here, only their tables of contents are kept, once the files are
+        // linked and before the barrier of the store makes them durable)
+        let (store, verity, root) = (self.store.clone(), self.fsverity, self.root.clone());
+        let write: feed::Written<()> = Box::new(move |pulled, _| {
+            if let Some(l) = pulled.iter().find(|l| l.lazy) {
+                return Err(unsupported(format!(
+                    "the layer {} was pulled lazily, and the vfs driver copies whole layers: pull without --lazy",
+                    l.key
+                )));
+            }
+            let tocs: Vec<(LayerKey, Arc<Toc>)> =
+                pulled.iter().map(|l| (l.key, Arc::clone(&l.toc))).collect();
+            keep_tocs(&store, verity, &root, &tocs).map_err(io_error)?;
+            Ok(((), true))
+        });
         let (pulled, settlement, ()) =
             feed::pull_in_process(&parts, feed, layers, settled, write).await?;
         let Settlement {
             identities,
             verdict,
         } = settlement;
-        if let Some(l) = pulled.iter().find(|l| l.lazy) {
-            return Err(unsupported(format!(
-                "the layer {} was pulled lazily, and the vfs driver copies whole layers: pull without --lazy",
-                l.key
-            )));
-        }
-        let tocs: Vec<(LayerKey, Arc<Toc>)> =
-            pulled.iter().map(|l| (l.key, Arc::clone(&l.toc))).collect();
-        let (store, verity, root) = (self.store.clone(), self.fsverity, self.root.clone());
-        // (the identity is the engine's: nothing is made of the layers
-        // here, only their tables of contents are kept)
-        let artifacts = tokio::task::spawn_blocking(move || {
-            keep_tocs(&store, verity, &root, &tocs).map_err(io_error)?;
-            Ok::<_, DriverError>(identities.artifacts)
-        })
-        .await
-        .map_err(join_error)??;
         Ok(Pulled {
             layers: pulled,
-            artifacts,
+            artifacts: identities.artifacts,
             verdict,
         })
     }
@@ -889,6 +886,10 @@ impl StorageDriver for VfsDriver {
         tokio::task::spawn_blocking(move || {
             let ids = Self::identities(&layers).map_err(io_error)?;
             keep_tocs(&store, verity, &root, &layers).map_err(io_error)?;
+            // (the files durable with one barrier, then their names)
+            let dir = tocs_in(&root);
+            store.barrier(&dir).map_err(io_error)?;
+            store.sync_dir(&dir).map_err(io_error)?;
             Ok(ids
                 .into_iter()
                 .map(|(k, i)| {

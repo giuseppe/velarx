@@ -54,11 +54,13 @@ The driver is chosen by `[storage] driver` or `--storage-driver`: `composefs`
 (the default), `vfs` and `varlink` (never chosen for you). A store keeps the
 driver it was made with; opening it with another is an error that names both.
 
-## The driver interface (`org.velarx.Storage`, version 1)
+## The driver interface (`org.velarx.Storage`, version 2)
 
-The engine owns the network, the table of contents and tar-split of each layer,
-the identities (diff ids, EROFS digests, owners) and the reachability of
-everything (what is kept).  A **storage driver** owns where the bytes live and
+The engine owns the network, the identities (diff ids, EROFS digests, owners)
+and the reachability of everything (what is kept); the table of contents and
+tar-split of each layer are files of the driver (`Index` of the feed gives them
+to it, `LayerFiles` brings them back), which the engine hashes against the
+digests of its record each time it reads one.  A **storage driver** owns where the bytes live and
 how a root file system is made of them.  The interface is the Rust trait
 `StorageDriver` (`crates/graph/src/lib.rs`); a driver that is a separate
 process serves `org.velarx.Storage`
@@ -99,11 +101,12 @@ mount any other directory of the host; an image mount is never a `directory`.
 | `HasObjects` | `(objects: []string) -> (have: []bool)` | asked only of a driver whose `objects` capability is true; at most `limits.wants` keys; one answer for each, in the order asked, true for an object the driver has committed and can read now, under that key or by an alias of it (an object it names by its fs-verity digest is held for the hash of its content too); not an object that is only staged by a pull, nor one a collection removed; answered from the driver's own store, the engine keeps no table of its own; the engine names a held object as the source of a `copy` event of a `Fetch`, below |
 | `BeginPull` | `(pull, layers: []PullLayer) -> (kind)` | the pull of an image, driven by the driver; the whole ordered layer list, each layer with its `chain_id`, its `parent` chain id and `stored` (what `HasLayers` answered for its place), and only the layers not stored are fetched; the descriptor 0 is the driver's end of the feed socket pair (`org.velarx.StorageFeed`); `more`: replies of kind `progress` (with a `progress` field), then `staged` (the engine's `Settled` check comes after it, **before** the driver publishes: a refusal leaves nothing visible) |
 | `ReadObjects` | `(pull?, ranges: []Range) -> (index, size?)` | `more`: one reply for each range, in the order asked, and the bytes of the range follow on the pipe that is the descriptor 0; `pull` names the objects a pull staged and has not committed; at most `limits.ranges` |
-| `Commit` | `(pull, layers: []LayerRef) -> ()` | the layers the pull brought in; all or nothing, one barrier |
+| `Commit` | `(pull, layers: []LayerRef) -> ()` | the layers the pull brought in; all or nothing, made durable by the driver (the engine takes no barrier) |
 | `Abort` | `(pull) -> ()` | ends a pull; drops only what no other live pull and no committed layer uses |
 | `CreateRoot` | `(container, workdir, image?, layers: []LayerRef, owner?, ask: MountAsk, size_limit?) -> (root?: Mounted)` | idempotent; `more`; makes what the driver keeps for the root; the reply has the kind of the mount (`plan`, `idmap`, `label`) and **no descriptor**, none without an image (`--rootfs`); every later `Mounts` answers the same kind, `idmap` and `label` |
 | `CreateImageVolume` | `(container, index, image, layers: []LayerRef, ask: MountAsk) -> (volume?: Mounted)` | idempotent; `more`; the same for an image mount (the engine counts the `mount_fd` ones and refuses more than 15 at create) |
 | `Mounts` | `(container, root?: MountAsk, volumes: []VolumeAsk) -> (root?: Mounted, volumes: []Mounted)` | the only source of descriptors; the mounts of one container per call (the client takes it from `MountsRequest::container`, which refuses a request of two); a volume never created is `missing` with `recreate_container` |
+| `LayerFiles` | `(layer) -> ()` | the files of a committed layer as the driver kept them, as regular files opened read-only: `toc.zst` is the descriptor 0 and `tarsplit.zst`, if the layer has one, the descriptor 1; the engine hashes them against the digests of its record, so a file that is not those bytes is refused; a layer that is not committed is `missing` with `pull_again` |
 | `MountImage` | `(layers: []LayerRef) -> ()` | one descriptor: a new read-only mount of the root file system of the image made of the layers (a directory where the service cannot make a mount), for the engine's reads of what a create needs of the image; no container, no mapping, no label; the engine reads below it with `openat2` and drops it |
 | `WritableRoot` | `(container) -> ()` | one descriptor: the container's writable layer, the directory its writes land in (the upper of an overlay, the copy of a copying driver), for the engine's walks: the user files and the label at create, `cp` and `export` of a stopped container, and `diff`, `changes` and `commit`, which may be of a **running** one.  A driver whose layer is a mount answers a new detached clone of the mount the container runs on (the same superblock), never a second mount of the same upper |
 | `Size` | `(container) -> (bytes)` | mandatory: a walk over the wire costs a call per file |

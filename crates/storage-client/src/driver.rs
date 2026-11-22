@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `StorageDriver` over a unix socket: every method is a call of
 //! `org.velarx.Storage` on a connection of its own (or the engine-side form
-//! that `docs/STORAGE.md` states for it), made with the rules of version 1.
+//! that `docs/STORAGE.md` states for it), made with the rules of version 2.
 
 use crate::conn::{Link, Session};
 use crate::convert::{self, known};
@@ -69,6 +69,44 @@ pub struct Inner {
 /// A storage driver that is a program of its own, behind a unix socket.
 pub struct VarlinkDriver {
     inner: Arc<Inner>,
+}
+
+/// The files of the layers are the service's: the engine reads them back
+/// from it (`LayerFiles`) and hashes them against its own record.
+impl velarx_db::layer_files::Source for VarlinkDriver {
+    fn read(&self, key: &LayerKey, kind: &str, _digest: &Digest) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        // (the service opens the files its record of the layer names)
+        let at = match kind {
+            velarx_db::layer_files::TOC => 0,
+            velarx_db::layer_files::TARSPLIT => 1,
+            _ => return Err(std::io::ErrorKind::NotFound.into()),
+        };
+        let key = key.to_string();
+        let (_, fds): (proto::Ack, _) = self
+            .session()
+            .and_then(|mut session| {
+                session.call(
+                    &request::LayerFiles {
+                        store: self.store_id(),
+                        layer: key.as_str(),
+                    },
+                    &[],
+                )
+            })
+            .map_err(std::io::Error::other)?;
+        let fd = fds
+            .into_iter()
+            .nth(at)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        let mut bytes = Vec::new();
+        let mut file = File::from(fd);
+        // (a descriptor passed is at the offset it was left at)
+        std::io::Seek::rewind(&mut file)?;
+        file.take(velarx_content::pull::tarsplit::MAX_SIZE)
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
 }
 
 impl std::fmt::Debug for VarlinkDriver {
@@ -1643,6 +1681,7 @@ impl VarlinkDriver {
                 // (what the proof read tells the fs-verity digest of the
                 // files the table of contents knows by their hash)
                 objects.with_verity(Arc::make_mut(&mut p.toc));
+                p.keep_toc();
                 p.files = velarx_content::pull::stream::FileUse::of_toc(&p.toc);
                 // (where the chunks of the layer are in the driver's objects,
                 // by the keys it knows them by now: the next pull has the

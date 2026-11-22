@@ -41,7 +41,7 @@ pub struct Fake {
 /// copies.
 pub fn default_info() -> Value {
     json!({
-        "proto": 1,
+        "proto": 2,
         "version": "1.2.3",
         "name": "fake",
         "capabilities": ["rootless", "size_limit", "verity_pull_only", "a_capability_of_a_later_version"],

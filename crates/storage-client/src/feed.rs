@@ -160,7 +160,7 @@ impl Feed {
             if !seen.insert(layer.key.to_string()) {
                 continue;
             }
-            let toc = serde_json::to_vec(&*index.toc).map_err(|e| e.to_string())?;
+            let toc = index.toc_z.to_vec();
             let mut keys = HashMap::new();
             for e in &index.toc.entries {
                 if e.entry_type == velarx_storage::TocEntryType::Reg && e.size > 0 {

@@ -21,7 +21,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use velarx_content::pull::stream::FileUse;
 use velarx_content::pull::LayerDone;
 use velarx_graph::{FeedLayer, Incoming, LayerIndex, PullFeed};
-use velarx_storage::Toc;
 use velarx_storage_client::feed_proto::{
     request, Copy, EventKind, FeedInfo, Fetched, Want, INTERFACE, MAX_FETCH_BYTES, MAX_FILES,
     MAX_WANTS,
@@ -306,10 +305,11 @@ impl WireFeed {
                     ImageError::Storage(format!("the {what} the engine's feed gave {e}"))
                 })
             };
-            use velarx_content::pull::chunked::{MAX_METADATA_COMPRESSED, MAX_TOC_JSON};
-            let toc = read(&File::from(toc_fd), "table of contents", 2 * MAX_TOC_JSON)?;
-            let toc: Toc = serde_json::from_slice(&toc)
-                .map_err(|e| ImageError::Storage(format!("the table of contents: {e}")))?;
+            use velarx_content::pull::chunked::MAX_METADATA_COMPRESSED;
+            let key = velarx_types::LayerKey::parse(key)
+                .ok_or_else(|| ImageError::Storage(format!("{key} is not the key of a layer")))?;
+            let toc_z = read(&File::from(toc_fd), "toc.zst", MAX_METADATA_COMPRESSED)?;
+            let toc = velarx_content::pull::stored::stored_view(&toc_z, &key)?;
             // (a canonical layer has no tar-split: an empty file)
             let tarsplit_file = File::from(tarsplit_fd);
             let tarsplit =
@@ -318,11 +318,9 @@ impl WireFeed {
                 } else {
                     read(&tarsplit_file, "tar-split", MAX_METADATA_COMPRESSED)?
                 };
-            let key = velarx_types::LayerKey::parse(key)
-                .ok_or_else(|| ImageError::Storage(format!("{key} is not the key of a layer")))?;
             Ok::<_, ImageError>(LayerIndex {
                 key,
-                toc_z: velarx_content::pull::stored::json_z(&toc),
+                toc_z: toc_z.into(),
                 toc: Arc::new(toc),
                 tarsplit: tarsplit.into(),
             })

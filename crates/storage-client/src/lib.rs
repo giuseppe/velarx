@@ -6,7 +6,7 @@
 //! The interface is `interfaces/org.velarx.Storage.varlink` (the calls of the
 //! driver) and `interfaces/org.velarx.StorageFeed.varlink` (what the engine
 //! offers it during a pull), both made from the types of [`proto`] and
-//! [`feed_proto`] by a test, and `docs/STORAGE.md` has the rules of version 1.
+//! [`feed_proto`] by a test, and `docs/STORAGE.md` has the rules of version 2.
 //! What this package does with them:
 //!
 //! * **One connection for each call**, and on each one `GetInfo` first: a

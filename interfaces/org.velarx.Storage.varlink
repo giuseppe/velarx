@@ -13,7 +13,7 @@
 # writes it.  docs/STORAGE.md maps it to the StorageDriver trait.
 #
 # Versions: the engine calls GetInfo first on each connection and refuses a
-# `proto` other than its own (1); there is no negotiation and no
+# `proto` other than its own (2); there is no negotiation and no
 # compatibility.  A change of a shape is a new version, so what is announced for
 # later is a capability (`later` in GetInfo), not a new shape.  Unknown fields
 # are ignored.  A value of an enum the engine does not know, in a reply, is a
@@ -393,7 +393,8 @@ method ReadObjects(store: string, pull: ?string, ranges: []Range) -> (
 )
 
 # Publish the layers of the pull and their objects, all or nothing,
-# with one barrier.  Idempotent: succeeds when each layer is
+# durable (the driver's barriers, none of the engine's).  Idempotent:
+# succeeds when each layer is
 # committed by this pull or already committed, by anyone, with the
 # same diff id; `Busy` with another.
 method Commit(store: string, pull: string, layers: []LayerRef) -> ()
@@ -466,6 +467,14 @@ method Mounts(store: string, container: string, root: ?MountAsk, volumes: []Volu
 # layer the service does not have is `Missing` with the remedy
 # `pull_again`.
 method MountImage(store: string, layers: []LayerRef) -> ()
+
+# The files of the committed layer as the driver kept them (what
+# `Index` of the feed gave it): `toc.zst` as the descriptor 0 and
+# `tarsplit.zst`, when the layer has one, as the descriptor 1,
+# regular files opened read-only.  The engine hashes them against
+# the digests of its record of the layer, so what is not those bytes
+# is refused.  A layer that is not committed is `Missing`.
+method LayerFiles(store: string, layer: string) -> ()
 
 # The root of the writable layer of the container, as the one
 # descriptor of the reply: a directory, or a detached clone of the

@@ -154,7 +154,8 @@ mod storage {
         }
 
         /// Publish the layers of the pull and their objects, all or nothing,
-        /// with one barrier.  Idempotent: succeeds when each layer is
+        /// durable (the driver's barriers, none of the engine's).  Idempotent:
+        /// succeeds when each layer is
         /// committed by this pull or already committed, by anyone, with the
         /// same diff id; `Busy` with another.
         async fn commit(
@@ -270,6 +271,22 @@ mod storage {
             layers: Vec<LayerRef>,
         ) -> (Result<Ack, StorageError>, Vec<OwnedFd>) {
             let _ = (store, layers);
+            (no(), Vec::new())
+        }
+
+        /// The files of the committed layer as the driver kept them (what
+        /// `Index` of the feed gave it): `toc.zst` as the descriptor 0 and
+        /// `tarsplit.zst`, when the layer has one, as the descriptor 1,
+        /// regular files opened read-only.  The engine hashes them against
+        /// the digests of its record of the layer, so what is not those bytes
+        /// is refused.  A layer that is not committed is `Missing`.
+        #[zlink(return_fds)]
+        async fn layer_files(
+            &self,
+            store: String,
+            layer: String,
+        ) -> (Result<Ack, StorageError>, Vec<OwnedFd>) {
+            let _ = (store, layer);
             (no(), Vec::new())
         }
 
@@ -445,12 +462,15 @@ mod feed {
             (Ok(Ack {}), Vec::new())
         }
 
-        /// The table of contents the layer is stored by (descriptor 0): the
-        /// entries of the verified table as a layer keeps them (the names
-        /// normalised, the permission bits only, no attribute of the overlay
-        /// file system), which the engine records for the layer; and the zstd
-        /// compressed tar-split (descriptor 1) of a `chunked` layer, as sealed
-        /// memory files of the lengths `GetInfo` says.
+        /// The two files of the layer as the engine keeps them, as sealed
+        /// memory files of the lengths `GetInfo` says: `toc.zst` (descriptor
+        /// 0), the table of the layer as the registry sent it, or the zstd of
+        /// the JSON of its table of contents, whose entries are those of the
+        /// verified table as a layer keeps them (the names normalised, the
+        /// permission bits only, no attribute of the overlay file system);
+        /// and the zstd compressed tar-split (descriptor 1) of a `chunked`
+        /// layer.  The driver keeps both as they are: the engine reads them
+        /// back with `LayerFiles`.
         #[zlink(return_fds)]
         async fn index(&self, layer: String) -> (Result<Ack, FeedError>, Vec<OwnedFd>) {
             let _ = layer;

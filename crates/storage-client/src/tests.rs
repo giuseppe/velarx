@@ -246,15 +246,15 @@ fn open_reads_the_capabilities_and_makes_the_store_id() {
 fn a_driver_of_another_version_is_refused_at_connect_and_at_each_call() {
     let fake = Fake::start();
     let graph = tempfile::tempdir().unwrap();
-    // (a version 2 may have another shape altogether)
-    fake.say(|i| *i = json!({"proto": 2, "something": "else"}));
+    // (a version 3 may have another shape altogether)
+    fake.say(|i| *i = json!({"proto": 3, "something": "else"}));
     let e = expect_err(
         open(&fake, graph.path(), Duration::from_secs(1)),
         "version 2",
     );
     assert!(matches!(e.kind, DriverErrorKind::ProtocolMismatch), "{e:?}");
     assert!(
-        e.message().contains("Storage.2") && e.message().contains("Storage.1"),
+        e.message().contains("Storage.3") && e.message().contains("Storage.2"),
         "{e}"
     );
     assert!(e.message().contains("upgrade"), "{e}");
@@ -1322,6 +1322,37 @@ fn the_image_is_read_below_the_descriptor_of_mount_image() {
         assert!(err.message().contains(says), "{what}: {err}");
         assert!(err.message().contains("MountImage"), "{what}: {err}");
     }
+}
+
+/// The files of a layer are the service's: `toc.zst` is the descriptor 0 of
+/// `LayerFiles` and `tarsplit.zst` the descriptor 1, which a canonical layer
+/// does not have.
+#[test]
+fn the_files_of_a_layer_are_read_from_the_service() {
+    use velarx_db::layer_files::{Source, TARSPLIT, TOC};
+    let e = env();
+    let key = layer_records()[0].key;
+    let digest = Digest::of(velarx_types::digest::Algorithm::Sha256, b"table");
+    let store = e.driver.store().as_str().to_string();
+    let layer = key.to_string();
+    e.fake.handle(move |c, conn| {
+        assert_eq!(c.method, "LayerFiles");
+        assert_eq!(c.params["store"].as_str(), Some(store.as_str()));
+        assert_eq!(c.params["layer"].as_str(), Some(layer.as_str()));
+        reply(
+            conn,
+            &json!({}),
+            false,
+            &[memfd("table").as_fd(), memfd("split").as_fd()],
+        );
+    });
+    assert_eq!(e.driver.read(&key, TOC, &digest).unwrap(), b"table");
+    assert_eq!(e.driver.read(&key, TARSPLIT, &digest).unwrap(), b"split");
+    e.fake
+        .handle(|_, conn| reply(conn, &json!({}), false, &[memfd("table").as_fd()]));
+    assert_eq!(e.driver.read(&key, TOC, &digest).unwrap(), b"table");
+    let none = e.driver.read(&key, TARSPLIT, &digest).unwrap_err();
+    assert_eq!(none.kind(), std::io::ErrorKind::NotFound);
 }
 
 fn bytes_of(range: &ObjectRange) -> Vec<u8> {

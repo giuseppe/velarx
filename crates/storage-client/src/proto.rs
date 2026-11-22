@@ -4,7 +4,7 @@
 //! definition (`interfaces/org.velarx.Storage.varlink`) is made from these
 //! types and the methods of [`super::interface`] by a test, as the one of
 //! `org.velarx.Fetcher` is; `docs/STORAGE.md` is the description of the
-//! rules (version 1).
+//! rules (version 2).
 //!
 //! A storage driver is a program behind a listening unix socket.  The engine
 //! is its client: one connection for each call, and a connection with no
@@ -25,7 +25,7 @@ pub const INTERFACE: &str = "org.velarx.Storage";
 
 /// The version of the protocol: the engine refuses another one (exact match,
 /// no negotiation; a capability is a word of `GetInfo`).
-pub const PROTO: u32 = 1;
+pub const PROTO: u32 = 2;
 
 /// The most objects one `Fetch` of the feed asks for: `max_wants` of the limits.
 pub const MAX_WANTS: u64 = 4096;

@@ -209,7 +209,7 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// The limits of version 1 of the interface.
+    /// The limits of version 2 of the interface.
     pub const V1: Limits = Limits {
         message: velarx_wire::varlink::MAX_MESSAGE,
         fds: velarx_wire::varlink::MAX_FDS,
@@ -1528,7 +1528,8 @@ pub trait StorageDriver: Send + Sync + 'static {
 
     // layers
 
-    /// Pull `layers` from `feed` into the store, durable with one barrier,
+    /// Pull `layers` from `feed` into the store, durable (two barriers in
+    /// process, the engine takes none),
     /// and return the layers pulled with what the driver recorded of each
     /// (what the engine records with them).  The driver says what it wants
     /// of each layer and receives the bytes ([`Incoming`]: a layer the store

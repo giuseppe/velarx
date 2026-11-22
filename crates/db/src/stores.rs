@@ -15,8 +15,8 @@ use rusqlite::{OpenFlags, OptionalExtension};
 use tokio_rusqlite::Connection;
 
 use super::{
-    Database, ImageRecord, ImageTag, LayerRecord, LayerState, OLDEST_READ_ONLY_VERSION,
-    SCHEMA_VERSION,
+    layer_files, Database, ImageRecord, ImageTag, LayerRecord, LayerState,
+    OLDEST_READ_ONLY_VERSION, SCHEMA_VERSION,
 };
 use velarx_storage::Object;
 use velarx_types::digest::Digest;
@@ -108,7 +108,7 @@ impl Database {
         Ok(Self {
             conn: Arc::new(super::Conn::new(conn, false, None)),
             lease_dir: Arc::new(super::leases::lock_dir(Some(path))),
-            root: path.parent().map(|p| Arc::new(p.to_path_buf())),
+            files: layer_files::of_directory(path.parent()),
             path: Some(Arc::new(path.to_path_buf())),
             more: Arc::new(Vec::new()),
         })

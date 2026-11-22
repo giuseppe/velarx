@@ -1677,8 +1677,6 @@ impl ImageService {
                     .map(|c| super::storage::with_image(c, &made))
             })
             .collect::<ImageResult<Vec<velarx_db::LayerCommit>>>()?;
-        self.write_layer_files(done_layers.values().filter(|d| !d.lazy))
-            .await?;
         debug!("Rows prepared after {:?}", start.elapsed());
         let image = ImageRecord {
             id: image_id.clone(),

@@ -628,6 +628,7 @@ impl Server {
             "CreateImageVolume" => self.create_image_volume(call, conn),
             "Mounts" => self.mounts(call),
             "MountImage" => self.mount_image(call),
+            "LayerFiles" => self.layer_files(call),
             "WritableRoot" | "Size" | "Exists" | "RemoveRoot" => self.container_call(method, call),
             "RemoveImage" => {
                 let p: request::OfImage<String> = call.params()?;

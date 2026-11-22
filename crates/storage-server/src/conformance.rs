@@ -75,7 +75,6 @@ pub fn factory(chunked_only: bool, wrap: Wrap) -> Factory {
             let shared = Served::start(&dir);
             let graph = dir.join("graph");
             std::fs::create_dir_all(&graph).unwrap();
-            let db = Database::open(dir.join("db")).await.unwrap();
             let store = Arc::new(FileStore::new(dir.join("objects")).unwrap());
             let staging = dir.join("staging");
             let client = {
@@ -94,6 +93,13 @@ pub fn factory(chunked_only: bool, wrap: Wrap) -> Factory {
                 .unwrap()
                 .expect("open")
             };
+            // (the files of the layers are the server's: the database reads
+            // them from it)
+            let client = Arc::new(client);
+            let db = Database::open(dir.join("db"))
+                .await
+                .unwrap()
+                .with_layer_files(client.clone());
             let id = StoreId::of_root(&graph).unwrap();
             let uid = rustix::process::geteuid().as_raw();
             // (where the server makes the roots: beneath the work directory
@@ -105,7 +111,7 @@ pub fn factory(chunked_only: bool, wrap: Wrap) -> Factory {
                 .join(id.as_str())
                 .join("vfs")
                 .join("tocs");
-            let driver = wrap(Arc::new(client), &db, &store, &staging);
+            let driver = wrap(client, &db, &store, &staging);
             Subject {
                 driver,
                 kernel: None,

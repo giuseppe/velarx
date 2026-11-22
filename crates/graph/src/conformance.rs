@@ -3277,6 +3277,22 @@ async fn forget_layer_rows(s: &Subject, keys: &[&LayerKey]) {
         .unwrap();
 }
 
+/// The two files of a layer are the driver's: what the engine reads back,
+/// from the directory of the store or from the service, is the bytes the
+/// pull handed over.
+pub async fn the_files_of_a_stored_layer_are_the_bytes_the_pull_gave(f: &Factory) {
+    let (_tmp, s) = begin!(f, "the_files_of_a_stored_layer_are_the_bytes_the_pull_gave");
+    let base = store_layer(&s, base_layer()).await;
+    assert_eq!(
+        s.db.get_layer_toc_z(&base.key).await.unwrap().unwrap(),
+        base.done.toc_z.to_vec()
+    );
+    assert_eq!(
+        s.db.get_layer_tarsplit(&base.key).await.unwrap().unwrap(),
+        base.done.tarsplit.to_vec()
+    );
+}
+
 pub async fn has_layers_reports_what_a_pull_stored(f: &Factory) {
     let (_tmp, s) = begin!(f, "has_layers_reports_what_a_pull_stored");
     let (base, top) = (
@@ -6527,7 +6543,8 @@ forward_storage_driver! {
 /// The commit of a layer a pull stored, as the engine makes it: the files of
 /// the layer are written before the row that names it.
 fn commit_of(s: &Subject, done: &LayerDone) -> velarx_db::LayerCommit {
-    done.write_files(s.db.root().unwrap()).unwrap();
+    done.write_files(velarx_db::layer_files::root_of(s.store.root()))
+        .unwrap();
     layer_commit(done, None).unwrap()
 }
 
@@ -6839,6 +6856,7 @@ macro_rules! conformance_suite_with {
             a_layer_keyed_by_sha256_only_is_refused,
             a_gzip_layer_of_a_registry_is_pulled_and_read_back,
             a_layer_that_is_not_stored_is_an_error,
+            the_files_of_a_stored_layer_are_the_bytes_the_pull_gave,
             has_layers_reports_what_a_pull_stored,
             has_layers_does_not_report_what_is_not_committed,
             has_layers_forgets_what_a_collection_removed,

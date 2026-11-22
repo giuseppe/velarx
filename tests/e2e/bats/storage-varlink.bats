@@ -656,7 +656,7 @@ time.sleep(6)' "$VDIR/s.sock" 3>&- &
     kill "$fake"
     start_daemon
     check "the engine does not start" 125 "$rc"
-    check_match "it names both versions" 'speaks org.velarx.Storage.99 and velarx org.velarx.Storage.1' "$out"
+    check_match "it names both versions" 'speaks org.velarx.Storage.99 and velarx org.velarx.Storage.2' "$out"
     check_match "and what to do" 'upgrade the driver or velarx' "$out"
     check_match "and the key" 'storage\] driver = "varlink"' "$out"
 }

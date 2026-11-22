@@ -1193,6 +1193,7 @@ mod tests {
         let key = velarx_types::LayerKey::Whole(digest);
         // (a table of contents of a big layer: a file of its directory)
         db.insert_layer_with_toc(
+            dir.path(),
             &velarx_db::LayerRecord {
                 stream_size: Some(0),
                 key,
@@ -1283,6 +1284,7 @@ mod engine_copy_tests {
             {"name": "f", "type": "reg", "size": 4, "fsverity": file}
         ]});
         db.insert_layer_with_toc(
+            dir.path(),
             &velarx_db::LayerRecord {
                 stream_size: Some(0),
                 key,
@@ -1579,7 +1581,11 @@ mod engine_copy_tests {
         };
         match toc {
             Some(toc) => db
-                .insert_layer_with_toc(&record, &zstd::encode_all(toc.as_bytes(), 3).unwrap())
+                .insert_layer_with_toc(
+                    velarx_db::layer_files::root_of(store.root()),
+                    &record,
+                    &zstd::encode_all(toc.as_bytes(), 3).unwrap(),
+                )
                 .await
                 .unwrap(),
             None => db.insert_layer(&record).await.unwrap(),

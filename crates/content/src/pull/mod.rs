@@ -11,8 +11,8 @@
 //! Both write to a staging session (`session`) and verify every digest
 //! once, as the data arrives; the diff id of each layer is checked against
 //! the configuration of the image.  Only when every layer is verified is the
-//! staged content synced with a single `syncfs`, moved into the store, and
-//! recorded in the database in one transaction.
+//! staged content synced with a `syncfs`, moved into the store, a `syncfs`
+//! of the store, and the layers recorded in the database in one transaction.
 
 pub mod access;
 pub mod chunked;
@@ -455,10 +455,16 @@ impl LayerDone {
                 c.file_digest = id.clone();
             }
         }
+        self.keep_toc();
+        Ok(())
+    }
+
+    /// The file `toc.zst` of a layer that is not pulled by its table holds
+    /// the JSON of `toc` as it is now: made again when `toc` was changed.
+    pub fn keep_toc(&mut self) {
         if !self.key.is_toc() {
             self.toc_z = stored::json_z(&self.toc);
         }
-        Ok(())
     }
 }
 

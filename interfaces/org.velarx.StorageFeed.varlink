@@ -18,7 +18,7 @@
 # the tables of contents of the layers of this pull.
 #
 # Versions: GetInfo is the first call; the `proto` is the one of
-# org.velarx.Storage (1).  Limits: a message is at most 1048576 bytes and
+# org.velarx.Storage (2).  Limits: a message is at most 1048576 bytes and
 # carries at most 16 descriptors.
 #
 # Parallelism: one connection for each concurrent Fetch (Connect), at most
@@ -121,7 +121,7 @@ type FeedLayer (
 	# The key of the layer, as `BeginPull` names it
 	key: string,
 	diff_id: string,
-	# The bytes of its table of contents (the first file of `Index`)
+	# The bytes of its `toc.zst` (the first file of `Index`)
 	toc_length: int,
 	# The bytes of its compressed tar-split (the second file of `Index`); 0
 	# for a layer whose table of contents has `"version": 2`, the canonical
@@ -240,12 +240,15 @@ method GetInfo() -> (
 # one.  `TooMuch` at `max_fetches`.
 method Connect() -> ()
 
-# The table of contents the layer is stored by (descriptor 0): the
-# entries of the verified table as a layer keeps them (the names
-# normalised, the permission bits only, no attribute of the overlay
-# file system), which the engine records for the layer; and the zstd
-# compressed tar-split (descriptor 1) of a `chunked` layer, as sealed
-# memory files of the lengths `GetInfo` says.
+# The two files of the layer as the engine keeps them, as sealed
+# memory files of the lengths `GetInfo` says: `toc.zst` (descriptor
+# 0), the table of the layer as the registry sent it, or the zstd of
+# the JSON of its table of contents, whose entries are those of the
+# verified table as a layer keeps them (the names normalised, the
+# permission bits only, no attribute of the overlay file system);
+# and the zstd compressed tar-split (descriptor 1) of a `chunked`
+# layer.  The driver keeps both as they are: the engine reads them
+# back with `LayerFiles`.
 method Index(layer: string) -> ()
 
 # The driver has every file of `layer` that it lacks: the engine
