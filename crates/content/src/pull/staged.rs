@@ -722,7 +722,7 @@ impl Staging {
         if dir.join("pull.json").is_file() {
             // (read under the lock: two pulls that join at once keep both
             // their names)
-            let _lock = match self.lock_pull_file(&pull.id) {
+            let _lock = match self.lock_names(&pull.id) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     return self.publish_new(pull, barrier)
                 }
@@ -790,11 +790,29 @@ impl Staging {
         }
     }
 
-    /// The names are merged under a lock of their own: the lease is the
-    /// completer's for its whole life.
-    fn lock_pull_file(&self, id: &str) -> io::Result<velarx_sys::flock::Held> {
-        velarx_storage::locks::lock(&self.image_dir(id).join("names.lock"), true)
-            .map(|f| f.expect("a wait gives the lock or an error"))
+    /// The lock of the names of the pull, of its own (the lease is the
+    /// completer's for its whole life), which a pull that joins it takes to
+    /// add its own: a completion that reads the names and removes the pull
+    /// under it loses none.  `NotFound` when the pull is gone.
+    pub fn lock_names(&self, id: &str) -> io::Result<velarx_sys::flock::Held> {
+        use rustix::fs::{openat, FlockOperation, Mode, OFlags};
+        // (relative to the directory: a pull that went is not made again)
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(self.image_dir(id))?;
+        let file = File::from(openat(
+            &dir,
+            "names.lock",
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )?);
+        velarx_sys::flock::flock_retrying(&file, FlockOperation::LockExclusive)?;
+        // (removed with the pull while this waited)
+        if std::os::unix::fs::MetadataExt::nlink(&file.metadata()?) == 0 {
+            return Err(io::ErrorKind::NotFound.into());
+        }
+        Ok(velarx_sys::flock::Held::new(file))
     }
 
     /// The token of the pull: what the image servers of its containers are
@@ -1467,6 +1485,34 @@ mod tests {
         });
         let tags = area.pull(&pull(1, "x").id).unwrap().unwrap().tags;
         assert_eq!(tags.len(), 9, "{tags:?}");
+    }
+
+    /// A pull that joins one whose completion holds the lock of the names
+    /// waits for it: the names it adds are those the completion reads, or,
+    /// once it removed the pull, the pull is published anew with them.
+    #[test]
+    fn a_pull_that_joins_a_completion_loses_no_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let area = Staging::new(tmp.path());
+        let id = area.publish_pull(&pull(1, "first")).unwrap().id;
+        let names = area.lock_names(&id).unwrap();
+        let joining = {
+            let area = area.clone();
+            std::thread::spawn(move || area.publish_pull(&pull(1, "second")).unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let read = area.pull(&id).unwrap().unwrap();
+        assert_eq!(read.tags.len(), 1, "joined under the lock");
+        area.remove_pull(&id).unwrap();
+        drop(names);
+        let published = joining.join().unwrap();
+        assert_eq!(published.tags.len(), 1);
+        assert_eq!(published.tags[0].tag, "second");
+        assert!(area.pull(&id).unwrap().is_some(), "published anew");
+        assert!(matches!(
+            area.lock_names(&pull(2, "x").id),
+            Err(e) if e.kind() == io::ErrorKind::NotFound
+        ));
     }
 
     /// The area is on the file system of the objects, or a pull is refused

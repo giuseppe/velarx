@@ -355,17 +355,18 @@ impl ImageService {
         let Some(pull) = area.pull(id)? else {
             return Ok(TransferStats::default());
         };
+        let manifest: OciManifest = serde_json::from_str(&pull.manifest)?;
         if self
             .db
             .get_image_by_digest(&pull.manifest_digest)
             .await
             .is_ok()
         {
-            // committed by another process, or by an earlier run of this one
-            self.forget_pull(&pull).await;
+            // (committed by another process, by an earlier run of this one,
+            // or pulled whole meanwhile: the names of the pull are its)
+            self.commit_image(&pull, &manifest, None).await?;
             return Ok(TransferStats::default());
         }
-        let manifest: OciManifest = serde_json::from_str(&pull.manifest)?;
         let config: OciConfig = serde_json::from_str(&pull.config)?;
         if manifest.layers.len() != config.rootfs.diff_ids.len()
             || manifest.layers.len() != pull.layers.len()
@@ -405,8 +406,7 @@ impl ImageService {
             self.pull_staged(&pull, &manifest, &config, &keys, &layers)
                 .await?;
         }
-        self.commit_image(&pull, &manifest, &keys).await?;
-        self.forget_pull(&pull).await;
+        self.commit_image(&pull, &manifest, Some(&keys)).await?;
         if keeps {
             // (the image is the store's and the pull is gone: what the
             // containers made on the pull do not name is not needed)
@@ -971,27 +971,36 @@ impl ImageService {
         }
     }
 
-    /// The image, once every layer of it is in the store: its record, names,
-    /// signatures and the right to announce it, in one transaction.  A
-    /// sealed manifest's merged EROFS is checked before.
+    /// The image of the pull `read` (as it was read), once every layer of
+    /// it is in the store: its record, names, signatures and the right to
+    /// announce it, in one transaction, then the pull removed.  The names
+    /// are the pull's as it is at the commit, read and removed under the
+    /// lock a pull that joins it takes: none of a pull that joined meanwhile
+    /// is lost.  A sealed manifest's merged EROFS is checked before.  No
+    /// `keys`: the image is in the store already, the pull adds its names.
     async fn commit_image(
         &self,
-        pull: &StagedPull,
+        read: &StagedPull,
         manifest: &OciManifest,
-        keys: &[LayerKey],
+        keys: Option<&[LayerKey]>,
     ) -> ImageResult<()> {
-        let _store = self.lock_store().await?;
-        if !super::seal::expected(manifest)?.is_empty() && self.storage.holds_objects() {
-            let mut tocs = Vec::with_capacity(keys.len());
-            for k in keys {
+        let area = self.staging_area();
+        let store = self.lock_store().await?;
+        let layers = keys.unwrap_or_default();
+        if keys.is_none() {
+            // (still there: it was looked for before the lock)
+            self.db.get_image_by_digest(&read.manifest_digest).await?;
+        } else if self.storage.holds_objects() && !super::seal::expected(manifest)?.is_empty() {
+            let mut tocs = Vec::with_capacity(layers.len());
+            for k in layers {
                 let toc = self.db.get_layer(k).await?.toc.ok_or_else(|| {
                     ImageError::Layer(format!("layer {k} has no table of contents"))
                 })?;
                 tocs.push(serde_json::from_str::<Toc>(&toc)?);
             }
             let (store, want) = (self.file_store.clone(), manifest.clone());
-            let alg = pull.manifest_digest.alg();
-            let algs: Vec<Algorithm> = keys.iter().map(|k| k.digest().alg()).collect();
+            let alg = read.manifest_digest.alg();
+            let algs: Vec<Algorithm> = layers.iter().map(|k| k.digest().alg()).collect();
             tokio::task::spawn_blocking(move || {
                 let tocs: Vec<&Toc> = tocs.iter().collect();
                 super::seal::merged_erofs(alg, &algs, &tocs, &|d| store.get_path(d), Some(&want))
@@ -1000,6 +1009,13 @@ impl ImageService {
             .await
             .map_err(|e| ImageError::Storage(e.to_string()))??;
         }
+        let names = match area.lock_names(&read.id) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            other => other?,
+        };
+        let Some(pull) = area.pull(&read.id)? else {
+            return Ok(());
+        };
         let image = pull.image_record();
         let image = ImageRecord {
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -1025,7 +1041,7 @@ impl ImageService {
                 pull: velarx_db::PullCommit {
                     layers: Vec::new(),
                     image,
-                    image_layers: keys.to_vec(),
+                    image_layers: layers.to_vec(),
                     tags,
                     digest_names,
                     sources: super::pull::blob_sources(manifest, pull.registry_ref.as_deref()),
@@ -1038,6 +1054,10 @@ impl ImageService {
                 started_at: pull.started_at.clone(),
             })
             .await?;
+        area.remove_pull(&pull.id)?;
+        drop(names);
+        drop(store);
+        self.forget_pull(&pull).await;
         Ok(())
     }
 
