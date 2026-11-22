@@ -1825,7 +1825,7 @@ pub async fn complete_layer(
                     .fetch_files(
                         &staging,
                         layer,
-                        &meta.toc,
+                        (&meta.toc, &meta.toc_z),
                         (claim.keys().to_vec(), &reuse),
                         (&ctx.sink, &ctx.workers),
                         &progress,
@@ -1845,7 +1845,7 @@ pub async fn complete_layer(
                     .fetch_files(
                         &staging,
                         layer,
-                        &meta.toc,
+                        (&meta.toc, &meta.toc_z),
                         (left, &Default::default()),
                         (&ctx.sink, &ctx.workers),
                         &progress,
@@ -2197,7 +2197,7 @@ async fn unpack_by_index(
     };
     let (have, cap) = (ctx.have_fn(), ctx.limits.inflate_cap(layer.size));
     let json_cap = super::index::json_cap(layer.size);
-    let (claimed, tarsplit, missing) = tokio::task::spawn_blocking(move || {
+    let (claimed, toc_z, tarsplit, missing) = tokio::task::spawn_blocking(move || {
         let bad = |why: &str| ImageError::Contradicted(format!("the index of the layer: {why}"));
         let (toc, tarsplit) =
             super::index::decode_parts(&toc_z, ts_z, json_cap).map_err(|e| bad(&e))?;
@@ -2226,7 +2226,7 @@ async fn unpack_by_index(
         if total > cap {
             return Err(bad("the files are larger than the layer may be"));
         }
-        Ok((toc, tarsplit, missing))
+        Ok((toc, toc_z, tarsplit, missing))
     })
     .await
     .map_err(|e| fail(format!("planning the layer: {e}")))??;
@@ -2239,7 +2239,7 @@ async fn unpack_by_index(
                 .fetch_from_sources(
                     &staging,
                     layer,
-                    &claimed,
+                    (&claimed, &toc_z),
                     missing,
                     (&scratch, &ctx.workers),
                     progress,

@@ -103,7 +103,8 @@ pub struct LayerScope {
     pub layer: String,
     /// The layer's staging directory
     pub staging: File,
-    /// Its table of contents as the engine verified it
+    /// Its table of contents as the engine verified it (compressed with
+    /// zstd)
     pub toc: Option<File>,
     pub blob: Option<Blob>,
     /// Cancelled by `Forget`
@@ -1021,9 +1022,10 @@ mod service {
         }
 
         /// Tell this fetcher of a layer: `staging` its staging directory,
-        /// `toc` its table of contents (a sealed memory file).  `Layer`
-        /// again replaces it; the calls in flight on the one before end as
-        /// with `Forget`.  A scope keeps at most 1024 layers (`Busy`).
+        /// `toc` its table of contents (JSON compressed with zstd, a sealed
+        /// memory file).  `Layer` again replaces it; the calls in flight on the
+        /// one before end as with `Forget`.  A scope keeps at most 1024 layers
+        /// (`Busy`).
         pub async fn layer(
             &self,
             #[zlink(fds)] fds: Vec<OwnedFd>,
@@ -1071,10 +1073,17 @@ mod service {
                     reason: format!("at most {MAX_LAYERS} layers a scope: forget one"),
                 });
             }
+            let scope = Arc::new(scope);
             // (told again: the calls on the staging told before end)
-            if let Some(old) = state.layers.insert(layer, Arc::new(scope)) {
+            if let Some(old) = state.layers.insert(layer, scope.clone()) {
                 old.cancel.cancel();
             }
+            drop(state);
+            // (the table is parsed now, while the engine goes on, not by
+            // the first `Fetch` of the layer)
+            tokio::task::spawn_blocking(move || {
+                let _ = crate::stager::LayerToc::kept(&scope);
+            });
             Ok(Ack {})
         }
 

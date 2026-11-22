@@ -62,8 +62,8 @@ struct InFlight {
 }
 
 /// A layer of a pull the start set is fetched from: its key, its descriptor
-/// as it was staged, and its table.
-pub(super) type StartLayer = (LayerKey, OciDescriptor, Arc<Toc>);
+/// as it was staged, its table, and the table as the layer has it.
+pub(super) type StartLayer = (LayerKey, OciDescriptor, Arc<Toc>, bytes::Bytes);
 
 /// The files of the start set of an image (`start_set`), in each of its
 /// layers (the lowest first): the engine's files, the program and the files
@@ -73,7 +73,7 @@ pub(super) fn plan_start_set(
     config: &velarx_types::OciImageConfig,
     profile: &[String],
 ) -> Vec<Vec<String>> {
-    let tocs: Vec<&Toc> = layers.iter().map(|(.., toc)| &**toc).collect();
+    let tocs: Vec<&Toc> = layers.iter().map(|(_, _, toc, _)| &**toc).collect();
     let mut sets = vec![Vec::new(); layers.len()];
     for (at, digest) in start_set::Layers::new(&tocs).start_set(config, profile) {
         sets[at].push(digest);
@@ -188,6 +188,9 @@ impl Drop for SetGuard {
 struct LayerCtx {
     desc: OciDescriptor,
     toc: Arc<Toc>,
+    /// The table as the layer has it (compressed), which the fetchers are
+    /// told
+    toc_z: bytes::Bytes,
     /// The position of each regular file in `toc`, by its fs-verity digest
     /// (made when a miss asks for it)
     files: std::sync::OnceLock<HashMap<String, usize>>,
@@ -445,12 +448,13 @@ impl ImageService {
             let mut kept = self.funnel.layers.lock().unwrap_or_else(|e| e.into_inner());
             layers
                 .iter()
-                .map(|(key, desc, toc)| {
+                .map(|(key, desc, toc, toc_z)| {
                     let ctx = Arc::new(LayerCtx {
                         desc: desc.clone(),
                         files: std::sync::OnceLock::new(),
                         profile: std::sync::OnceLock::new(),
                         toc: toc.clone(),
+                        toc_z: toc_z.clone(),
                         walk: walk.clone(),
                         manifest: pulled.manifest.clone(),
                     });
@@ -591,7 +595,13 @@ impl ImageService {
         let staged = match self.lazy_walker((&ctx.walk, &ctx.manifest)).await {
             Ok(walker) => {
                 let staged = walker
-                    .stage_files(&key.file_stem(), &ctx.desc, &ctx.toc, left, (urgency, told))
+                    .stage_files(
+                        &key.file_stem(),
+                        &ctx.desc,
+                        (&ctx.toc, &ctx.toc_z),
+                        left,
+                        (urgency, told),
+                    )
                     .await;
                 stale = walker.stale();
                 staged
@@ -780,12 +790,15 @@ impl ImageService {
                 .clone()
                 .or_else(|| pull.registry_ref.clone())
                 .ok_or_else(|| ImageError::Layer(format!("layer {k} names no repository")))?;
-            let toc: Arc<Toc> = Arc::new(serde_json::from_str(&layer.toc_text()?)?);
+            let text = layer.toc_text()?;
+            let toc: Arc<Toc> = Arc::new(serde_json::from_str(&text)?);
             Ok::<_, ImageError>(LayerCtx {
                 desc,
                 files: std::sync::OnceLock::new(),
                 profile: std::sync::OnceLock::new(),
                 toc,
+                // (the table this process fetches by, the staged one)
+                toc_z: zstd::bulk::compress(text.as_bytes(), 1)?.into(),
                 walk: walk_key(repository, &layer.meta.reach),
                 manifest: pull.manifest.into_bytes(),
             })
@@ -1031,6 +1044,9 @@ impl ImageService {
                     desc,
                     files: std::sync::OnceLock::new(),
                     profile: std::sync::OnceLock::new(),
+                    toc_z: zstd::bulk::compress(&serde_json::to_vec(&toc).unwrap(), 1)
+                        .unwrap()
+                        .into(),
                     toc: Arc::new(toc),
                     walk: walk.clone(),
                     manifest: Vec::new(),
@@ -1175,7 +1191,8 @@ mod tests {
             .await;
         assert!(service.lazy_file_path(&key, &file).is_none());
         let profile = futures::future::ready(vec![file.clone()]);
-        let layers = vec![(key, desc, Arc::new(toc))];
+        let toc_z = zstd::bulk::compress(&serde_json::to_vec(&toc).unwrap(), 1).unwrap();
+        let layers = vec![(key, desc, Arc::new(toc), toc_z.into())];
         let config = velarx_types::OciImageConfig::default();
         let first = plan_start_set(&layers, &config, &[]);
         assert_eq!(first, [[file.clone()]]);

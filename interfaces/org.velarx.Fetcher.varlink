@@ -250,9 +250,10 @@ method Connect() -> ()
 method Renew(access: int) -> ()
 
 # Tell this fetcher of a layer: `staging` its staging directory,
-# `toc` its table of contents (a sealed memory file).  `Layer`
-# again replaces it; the calls in flight on the one before end as
-# with `Forget`.  A scope keeps at most 1024 layers (`Busy`).
+# `toc` its table of contents (JSON compressed with zstd, a sealed
+# memory file).  `Layer` again replaces it; the calls in flight on the
+# one before end as with `Forget`.  A scope keeps at most 1024 layers
+# (`Busy`).
 method Layer(layer: string, staging: int, blob: ?Blob, toc: ?int) -> ()
 
 # Forget the layer: its calls end, later ones are `Refused`, and what

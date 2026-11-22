@@ -478,35 +478,46 @@ pub struct LayerToc {
 impl LayerToc {
     /// The table of a layer, as the scope that told it gave it, parsed once
     /// and kept with the layer (another scope's table of the same layer is
-    /// its own).
+    /// its own).  A call while it is parsed waits for that parse.
     pub fn kept(
         layer: &crate::serve_fetch::LayerScope,
     ) -> Result<std::sync::Arc<Self>, crate::fetcher::fetch::FetcherError> {
-        if let Some(t) = layer
+        type Kept = Result<std::sync::Arc<LayerToc>, crate::fetcher::fetch::FetcherError>;
+        let kept = layer
             .kept
-            .get()
-            .and_then(|k| k.clone().downcast::<Self>().ok())
-        {
-            return Ok(t);
+            .get_or_init(|| std::sync::Arc::new(Self::of(layer).map(std::sync::Arc::new)));
+        match kept.downcast_ref::<Kept>() {
+            Some(kept) => kept.clone(),
+            None => Err(crate::fetcher::fetch::FetcherError::Refused {
+                reason: "the layer keeps something else than its table".into(),
+            }),
         }
-        let t = std::sync::Arc::new(Self::of(layer)?);
-        let _ = layer.kept.set(t.clone());
-        Ok(t)
     }
 
-    /// The table the engine told with the layer, parsed.
+    /// The table the engine told with the layer (compressed), parsed.
     fn of(
         layer: &crate::serve_fetch::LayerScope,
     ) -> Result<Self, crate::fetcher::fetch::FetcherError> {
         use crate::fetcher::fetch::FetcherError;
+        use std::io::Read;
         let bad = |reason: String| FetcherError::InvalidArgument { reason };
         let file = layer.toc.as_ref().ok_or_else(|| FetcherError::Refused {
             reason: "the layer was told without its table of contents".into(),
         })?;
-        let bytes =
-            velarx_base::sealed::read_sealed_whole(file, crate::pull::chunked::MAX_TOC_JSON)
-                .map_err(|w| bad(format!("the table of contents {w}")))?;
-        let toc: velarx_storage::Toc = serde_json::from_slice(&bytes)
+        let toc_z = velarx_base::sealed::read_sealed_whole(
+            file,
+            crate::pull::chunked::MAX_METADATA_COMPRESSED,
+        )
+        .map_err(|w| bad(format!("the table of contents {w}")))?;
+        let max = crate::pull::chunked::MAX_TOC_JSON;
+        let mut json = Vec::new();
+        crate::pull::zstd_decoder(&toc_z[..])
+            .and_then(|d| d.take(max + 1).read_to_end(&mut json))
+            .map_err(|e| bad(format!("the table of contents: {e}")))?;
+        if json.len() as u64 > max {
+            return Err(bad("the table of contents is too large".into()));
+        }
+        let toc: velarx_storage::Toc = serde_json::from_slice(&json)
             .map_err(|e| bad(format!("not a table of contents: {e}")))?;
         let mut at = std::collections::HashMap::new();
         for (i, e) in toc.entries.iter().enumerate() {
@@ -717,7 +728,8 @@ mod tests {
     #[test]
     fn a_layers_table_is_parsed_once() {
         let (_tmp, dir) = staging();
-        let toc = velarx_base::sealed::sealed_memory(br#"{"version":1,"entries":[]}"#).unwrap();
+        let toc_z = zstd::bulk::compress(br#"{"version":1,"entries":[]}"#, 1).unwrap();
+        let toc = velarx_base::sealed::sealed_memory(&toc_z).unwrap();
         let layer = crate::serve_fetch::LayerScope {
             layer: "sha256:aa".into(),
             staging: dir,

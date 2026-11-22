@@ -1684,7 +1684,7 @@ impl ImageService {
             velarx_base::trace::point("pull rows committed");
             // (the files a start reads are planned while the barrier waits)
             let set = from.zip(walker).map(|(from, walker)| {
-                let layers: Vec<super::lazy_fetch::StartLayer> = layer_keys
+                let layers = layer_keys
                     .iter()
                     .zip(&manifest.layers)
                     .filter_map(|(k, l)| Some((done_layers.get(k).filter(|d| d.lazy)?, l)))
@@ -1695,15 +1695,20 @@ impl ImageService {
                             size: d.size,
                             ..l.clone()
                         };
-                        (d.key, desc, d.toc.clone())
+                        let toc_z = match &d.toc_z {
+                            Some(toc_z) => toc_z.clone(),
+                            None => zstd::bulk::compress(&serde_json::to_vec(&*d.toc)?, 1)?.into(),
+                        };
+                        Ok((d.key, desc, d.toc.clone(), toc_z))
                     })
-                    .collect();
+                    .collect::<ImageResult<Vec<super::lazy_fetch::StartLayer>>>()?;
                 let (tocs, config) = (layers.clone(), config.config.clone());
                 let planned = tokio::task::spawn_blocking(move || {
                     super::lazy_fetch::plan_start_set(&tocs, &config, &[])
                 });
-                (from, layers, walker, planned)
+                Ok::<_, ImageError>((from, layers, walker, planned))
             });
+            let set = set.transpose()?;
             let area = self.staging_area();
             let mut barrier = velarx_content::pull::staged::Barrier::default();
             // (the barrier holds the leases of the layers until it commits:

@@ -746,7 +746,8 @@ impl StagedFetch {
     }
 
     /// Bring the files `keys` of `layer` (whose verified table of contents
-    /// is `toc`) into its staging directory `staging` and give each to
+    /// is `toc`, and `toc_z` as the layer has it) into its staging directory
+    /// `staging` and give each to
     /// `sink`.  `progress` gets the compressed bytes fetched so far.  The
     /// staging of the layer is removed with `staging` once every file is
     /// given (unless a lazy pull staged the layer: then it is that pull's
@@ -755,7 +756,7 @@ impl StagedFetch {
         &self,
         staging: &Arc<LayerStaging>,
         layer: &OciDescriptor,
-        toc: &Toc,
+        toc: (&Toc, &[u8]),
         (keys, reuse): (Vec<String>, &Reuses),
         (sink, taking): (&Arc<dyn Sink>, &Arc<tokio::sync::Semaphore>),
         progress: &(dyn Fn(u64) + Send + Sync),
@@ -780,7 +781,7 @@ impl StagedFetch {
         &self,
         staging: &Arc<LayerStaging>,
         layer: &OciDescriptor,
-        toc: &Toc,
+        toc: (&Toc, &[u8]),
         keys: Vec<String>,
         (sink, taking): (&Arc<dyn Sink>, &Arc<tokio::sync::Semaphore>),
         progress: &(dyn Fn(u64) + Send + Sync),
@@ -798,7 +799,8 @@ impl StagedFetch {
     }
 
     /// Bring the files `keys` of `layer` (whose verified table of contents
-    /// is `toc`) into the staging directory of the layer of `stem` and leave
+    /// is `toc`, and `toc_z` as the layer has it) into the staging directory
+    /// of the layer of `stem` and leave
     /// them there, named as the object contract says: the staging of a lazy
     /// pull.  The caller holds the lease of the layer.  `staged` is told
     /// the key of each file as soon as it is staged (a miss waits for its
@@ -807,21 +809,11 @@ impl StagedFetch {
         &self,
         stem: &str,
         layer: &OciDescriptor,
-        toc: &Toc,
+        toc: (&Toc, &[u8]),
         keys: Vec<String>,
         (urgency, staged): (Urgency, &(dyn Fn(&str) + Send + Sync)),
     ) -> ImageResult<Walked> {
-        let dir = self.root.join(LAYERS).join(stem);
-        let opened = dir.clone();
-        let dir = tokio::task::spawn_blocking(move || {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder.create(&opened)?;
-            File::open(&opened)
-        })
-        .await
-        .map_err(|e| ImageError::Layer(format!("the staging of a layer: {e}")))?
-        .map_err(|e| ImageError::Layer(format!("the staging {}: {e}", dir.display())))?;
+        let dir = self.lazy_staging(stem).await?;
         self.walk(
             layer,
             toc,
@@ -834,6 +826,22 @@ impl StagedFetch {
         .await
     }
 
+    /// The staging directory of the layer of `stem` of a lazy pull, open
+    /// (made if it is not there).
+    async fn lazy_staging(&self, stem: &str) -> ImageResult<File> {
+        let dir = self.root.join(LAYERS).join(stem);
+        let opened = dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(&opened)?;
+            File::open(&opened)
+        })
+        .await
+        .map_err(|e| ImageError::Layer(format!("the staging of a layer: {e}")))?
+        .map_err(|e| ImageError::Layer(format!("the staging {}: {e}", dir.display())))
+    }
+
     /// Tell the fetchers of `layer` once, then walk the list for the files
     /// `keys` in batches: each staged file is given to the sink (and its
     /// name taken away from the staging unless it is `kept`), or left where
@@ -842,7 +850,7 @@ impl StagedFetch {
     async fn walk(
         &self,
         layer: &OciDescriptor,
-        toc: &Toc,
+        (toc, toc_z): (&Toc, &[u8]),
         (keys, reuse): (Vec<String>, &Reuses),
         dir: &File,
         sink: Option<Eager<'_>>,
@@ -851,7 +859,7 @@ impl StagedFetch {
     ) -> ImageResult<Walked> {
         let name = layer.digest.to_string();
         let breaker = Breaker::new(self.fetchers.len());
-        self.tell(layer, (dir, Some(toc)), &breaker, with_origin)
+        self.tell(layer, (dir, Some(toc_z)), &breaker, with_origin)
             .await?;
         // (the names the files of a session are staged by: a lazy pull's
         // files stay where they are staged, and a table of 120,000 entries
@@ -980,13 +988,13 @@ impl StagedFetch {
         }
     }
 
-    /// Tell the fetchers of `layer` (whose verified table of contents is
-    /// `toc`, if it has one) and its staging directory `dir`, once; the
-    /// origin only `with_origin`.
+    /// Tell the fetchers of `layer` (whose verified table of contents, as
+    /// the layer has it, is `toc_z`, if it has one) and its staging
+    /// directory `dir`, once; the origin only `with_origin`.
     async fn tell(
         &self,
         layer: &OciDescriptor,
-        (dir, toc): (&File, Option<&Toc>),
+        (dir, toc_z): (&File, Option<&[u8]>),
         breaker: &Breaker,
         with_origin: bool,
     ) -> ImageResult<()> {
@@ -1006,13 +1014,10 @@ impl StagedFetch {
                 .collect()
         };
         if missed.iter().any(|m| *m) {
-            let toc_fd = match toc {
-                Some(toc) => Some(
-                    velarx_base::sealed::sealed_memory(&serde_json::to_vec(toc)?)
-                        .map_err(ImageError::Io)?,
-                ),
-                None => None,
-            };
+            let toc_fd = toc_z
+                .map(velarx_base::sealed::sealed_memory)
+                .transpose()
+                .map_err(ImageError::Io)?;
             let described = Blob {
                 digest: name.clone(),
                 size: u64::try_from(layer.size).unwrap_or(0),
@@ -2294,7 +2299,7 @@ mod tests {
             .stage_files(
                 "stem",
                 &desc,
-                &toc,
+                (&toc, &toc_z(&toc)),
                 vec![key_of(1)],
                 (Urgency::OnDemand, &|_| {}),
             )
@@ -2391,7 +2396,7 @@ mod tests {
                 .stage_files(
                     "stem",
                     &desc,
-                    &toc,
+                    (&toc, &toc_z(&toc)),
                     vec![key_of(n)],
                     (Urgency::OnDemand, &|_| {}),
                 )
@@ -2443,7 +2448,7 @@ mod tests {
             .stage_files(
                 "stem",
                 &desc,
-                &toc,
+                (&toc, &toc_z(&toc)),
                 vec![key_of(1)],
                 (Urgency::OnDemand, &|_| {}),
             )
@@ -2487,7 +2492,7 @@ mod tests {
                 .stage_files(
                     "stem",
                     &desc,
-                    &toc,
+                    (&toc, &toc_z(&toc)),
                     vec![name.into()],
                     (Urgency::OnDemand, &|_| {}),
                 )
@@ -2536,13 +2541,14 @@ mod tests {
             .collect();
         let toc: Toc =
             serde_json::from_value(serde_json::json!({"version": 1, "entries": entries})).unwrap();
+        let sent = toc_z(&toc);
         let started = std::time::Instant::now();
         for n in 0..250 {
             staged
                 .stage_files(
                     "stem",
                     &desc,
-                    &toc,
+                    (&toc, &sent),
                     vec![key_of(n)],
                     (Urgency::OnDemand, &|_| {}),
                 )
@@ -2567,6 +2573,11 @@ mod tests {
         let got = staged.probe_all(&[0], false).await.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0.toc, TocSource::Unpack);
+    }
+
+    /// The table as a layer has it: its JSON compressed.
+    fn toc_z(toc: &Toc) -> Vec<u8> {
+        zstd::bulk::compress(&serde_json::to_vec(toc).unwrap(), 1).unwrap()
     }
 
     fn layer_and_toc() -> (OciDescriptor, Toc) {
@@ -2677,7 +2688,7 @@ mod tests {
             .fetch_files(
                 &layer,
                 &desc,
-                &toc,
+                (&toc, &toc_z(&toc)),
                 (vec![name.clone()], &Reuses::default()),
                 (&sink, &Arc::new(tokio::sync::Semaphore::new(2))),
                 &|_| {},
@@ -2912,7 +2923,7 @@ mod tests {
                 .stage_files(
                     "stem",
                     &desc,
-                    &toc,
+                    (&toc, &toc_z(&toc)),
                     vec![key_of(n)],
                     (Urgency::OnDemand, &|_| {}),
                 )
@@ -2976,7 +2987,7 @@ mod tests {
             .stage_files(
                 "stem",
                 &desc,
-                &toc,
+                (&toc, &toc_z(&toc)),
                 vec![key_of(1)],
                 (Urgency::OnDemand, &|_| {}),
             )
@@ -2993,7 +3004,7 @@ mod tests {
             .stage_files(
                 "stem",
                 &desc,
-                &toc,
+                (&toc, &toc_z(&toc)),
                 vec![key_of(2)],
                 (Urgency::OnDemand, &|_| {}),
             )
@@ -3004,7 +3015,7 @@ mod tests {
             .stage_files(
                 "stem",
                 &desc,
-                &toc,
+                (&toc, &toc_z(&toc)),
                 vec![key_of(4)],
                 (Urgency::OnDemand, &|_| {}),
             )
@@ -3060,7 +3071,7 @@ mod tests {
             .stage_files(
                 "stem",
                 &desc,
-                &toc,
+                (&toc, &toc_z(&toc)),
                 vec![key_of(1)],
                 (Urgency::OnDemand, &|_| {}),
             )
