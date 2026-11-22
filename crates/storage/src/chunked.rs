@@ -20,19 +20,26 @@ pub enum TocEntryType {
 /// ChunkTypeZeros is "zeros" for zero-filled chunks (sparse file holes)
 pub const CHUNK_TYPE_ZEROS: &str = "zeros";
 
+/// A field of a TOC entry that is not written when it is zero, as
+/// containers/storage does (`omitempty`): a reader takes a missing number
+/// as 0.
+fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TocEntry {
     pub name: String,
     #[serde(rename = "type")]
     pub entry_type: TocEntryType,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub mode: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub uid: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub gid: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub size: u64,
     /// The digest of the content of a regular file, in the algorithm of the
     /// layer, which old readers check.  A pull checks it where a fetcher
@@ -50,15 +57,15 @@ pub struct TocEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub fsverity: Option<Digest>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub offset: u64,
-    #[serde(default, rename = "endOffset")]
+    #[serde(default, rename = "endOffset", skip_serializing_if = "is_zero")]
     pub end_offset: u64,
     #[serde(skip_serializing_if = "Option::is_none", rename = "chunkDigest")]
     pub chunk_digest: Option<String>,
-    #[serde(default, rename = "chunkSize")]
+    #[serde(default, rename = "chunkSize", skip_serializing_if = "is_zero")]
     pub chunk_size: u64,
-    #[serde(default, rename = "chunkOffset")]
+    #[serde(default, rename = "chunkOffset", skip_serializing_if = "is_zero")]
     pub chunk_offset: u64,
     /// Chunk type: "" for data chunks, "zeros" for zero-filled chunks
     /// Matches Go's ChunkTypeData and ChunkTypeZeros constants
@@ -526,6 +533,24 @@ mod tests {
         assert!(entry.dev_minor.is_none());
 
         assert!(entry.xattrs.is_empty());
+    }
+
+    /// Fields that are zero are not written, and an entry that has them
+    /// written (an older writer) reads as the same entry.
+    #[test]
+    fn test_zero_fields_are_not_written() {
+        let entry = TocEntry::new("d/", TocEntryType::Dir);
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            r#"{"name":"d/","type":"dir"}"#
+        );
+        let written = r#"{"name":"d/","type":"dir","mode":0,"uid":0,"gid":0,"size":0,
+            "offset":0,"endOffset":0,"chunkSize":0,"chunkOffset":0}"#;
+        let old: TocEntry = serde_json::from_str(written).unwrap();
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            serde_json::to_string(&entry).unwrap()
+        );
     }
 
     /// Test serialization roundtrip

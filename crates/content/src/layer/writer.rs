@@ -22,6 +22,9 @@ use velarx_types::digest::{Algorithm, Digest, DigestWriter, Hashing};
 use zstd::stream::raw::{Encoder as RawEncoder, InBuffer, Operation, OutBuffer};
 
 const ZSTD_LEVEL: i32 = 3;
+/// The level of the TOC and the tar-split: compressed once at push, fetched
+/// before every lazy start.
+const METADATA_LEVEL: i32 = 19;
 const GZIP_LEVEL: u32 = 6;
 const OUT_BUFFER: usize = 128 * 1024;
 
@@ -749,7 +752,7 @@ impl<W: Write> Writer<W> {
         let (ts_z, ts_len) = match self.split.take() {
             Some(split) => {
                 let (ts, _) = split.finish()?;
-                (zstd::bulk::compress(&ts, ZSTD_LEVEL)?, ts.len())
+                (zstd::bulk::compress(&ts, METADATA_LEVEL)?, ts.len())
             }
             None if canonical => (Vec::new(), 0),
             None => return Err(io::Error::other("no tar-split")),
@@ -764,7 +767,7 @@ impl<W: Write> Writer<W> {
             tar_split_digest: (!canonical).then(|| Digest::of(self.alg, &ts_z).to_string()),
         };
         let toc_json = self.toc_json(&toc)?;
-        let toc_z = zstd::bulk::compress(&toc_json, ZSTD_LEVEL)?;
+        let toc_z = zstd::bulk::compress(&toc_json, METADATA_LEVEL)?;
 
         let backend = self.backend()?;
         let toc_offset = backend.size() + 8;
@@ -1218,7 +1221,14 @@ mod tests {
 
         let toc_z = &blob[le(0) as usize..(le(0) + le(1)) as usize];
         assert_eq!(crate::sha256_text(toc_z), a("manifest-checksum"));
-        let toc: Toc = serde_json::from_slice(&zstd::decode_all(toc_z).unwrap()).unwrap();
+        let json = zstd::decode_all(toc_z).unwrap();
+        assert_eq!(json.len() as u64, le(2));
+        // (no field of an entry is written as 0)
+        let raw: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        for e in raw["entries"].as_array().unwrap() {
+            assert!(e.as_object().unwrap().values().all(|v| v != 0), "{e}");
+        }
+        let toc: Toc = serde_json::from_slice(&json).unwrap();
         let ts_z = &blob[le(4) as usize..(le(4) + le(5)) as usize];
         assert_eq!(
             toc.tar_split_digest.as_deref(),
@@ -1544,6 +1554,10 @@ mod tests {
     #[test]
     fn test_the_digests_of_a_fixed_stream_do_not_change() {
         let tar = sample_tar();
+        assert_eq!(
+            data_part(&tar),
+            "sha256:e72534e16eedf5f86d86e6deb4afbccb835f78ee8a4d107251fca5c72df5de74"
+        );
         let expected = [
             (
                 Compression::None,
@@ -1555,7 +1569,7 @@ mod tests {
             ),
             (
                 Compression::ZstdChunked,
-                "sha256:48eb46208ddd41b3e44048b34739c5a67f3ce24e23b649e64d47299df2c57f3e",
+                "sha256:75157784b8201f0dd72d0500cc55ba29610f0824d2125029986a74853075e3b8",
             ),
         ];
         for (c, digest) in expected {
@@ -1564,6 +1578,16 @@ mod tests {
             }
             assert_eq!(write(&tar, c).1.digest.to_string(), digest, "{c:?}");
         }
+    }
+
+    /// The digest of the frames of a zstd:chunked layer of `tar` before its
+    /// metadata: the chunks, which do not depend on how the TOC and the
+    /// tar-split are written.
+    fn data_part(tar: &[u8]) -> String {
+        let (blob, w) = write(tar, Compression::ZstdChunked);
+        let position = &w.annotations[&format!("{ANNOTATION_PREFIX}manifest-position")];
+        let toc: usize = position.split(':').next().unwrap().parse().unwrap();
+        crate::sha256_text(&blob[..toc - 8])
     }
 
     /// Whether the digests of `c` can be checked: the zstd output, and so
@@ -1584,6 +1608,10 @@ mod tests {
     #[test]
     fn test_the_digests_of_a_fixed_stream_of_zeros_do_not_change() {
         let tar = tar_of(&files_with_zeros());
+        assert_eq!(
+            data_part(&tar),
+            "sha256:cdd3540a440e10785a7321d97d9d00b054d6fafa7f25748ada74ca3a3bc5a5d2"
+        );
         let expected = [
             (
                 Compression::None,
@@ -1595,7 +1623,7 @@ mod tests {
             ),
             (
                 Compression::ZstdChunked,
-                "sha256:685ee85d234640e242db968376f5eee4bdc4a22daeec2c0933361882f3dfb3b0",
+                "sha256:b5e1ea901eac30f8a7bd8d82b824982ee1981a484a06b20e3ed5c22e1f68aff7",
             ),
         ];
         for (c, digest) in expected {
