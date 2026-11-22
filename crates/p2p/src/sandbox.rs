@@ -56,9 +56,6 @@ use velarx_sys::allow::{self, Allow};
 pub struct Paths {
     /// Read
     pub readable: Vec<PathBuf>,
-    /// The directories of its sockets (bound before; nothing is made or
-    /// removed there once confined)
-    pub sockets: Vec<PathBuf>,
     /// The staging of the layers of the store (the content role)
     pub staging: Option<PathBuf>,
 }
@@ -85,32 +82,13 @@ pub fn paths(role: Role, config: &Config, settings: &Settings, config_path: &Pat
     {
         readable.extend(file.parent().map(Path::to_path_buf));
     }
-    let mut sockets = Vec::new();
-    let served = match role {
-        Role::Content => vec![
-            settings.control_socket(config),
-            settings.fetcher_socket(config),
-        ],
-        Role::Overlay => vec![settings.network_socket(config)],
-    };
-    for socket in served {
-        if let Some(dir) = socket.parent() {
-            sockets.push(dir.to_path_buf());
-        }
-    }
-    sockets.sort();
-    sockets.dedup();
     let staging = (role == Role::Content).then(|| {
         config
             .storage
             .staging_dir()
             .join(velarx_content::pull::staged_fetch::LAYERS)
     });
-    Paths {
-        readable,
-        sockets,
-        staging,
-    }
+    Paths { readable, staging }
 }
 
 /// The Landlock ABI the service needs: every right of its ruleset is a must
@@ -145,10 +123,9 @@ fn landlock(paths: &Paths, staging: Option<std::os::fd::BorrowedFd<'_>>) -> Resu
 /// What the service makes: the runtime and the files and IPv4 and IPv6
 /// sockets of a pull worker, the sockets it listens on and serves (UNIX,
 /// the daemon's and its own) and netlink (the interfaces mDNS watches), UDP
-/// in batches (QUIC), and in the directories of its sockets and the files
-/// of its callers what Landlock lets it write: the files it fills (and
-/// punches holes in) for a caller, its sockets, its peers file.  No process,
-/// no execution, no namespace, no `kill` of anything but itself.
+/// in batches (QUIC), and beneath the staging of the store what Landlock
+/// lets it write: the files of the layers it fetches.  No process, no
+/// execution, no namespace, no `kill` of anything but itself.
 fn allowed(pid: u32, role: Role) -> Result<Allow, String> {
     use velarx_sys::allow::one_of;
     // (what the two roles make: the runtime, sockets of the peers' families,
@@ -289,11 +266,6 @@ pub fn enter_role_thread(
     velarx_base::hardening::raise_open_files().map_err(|e| format!("RLIMIT_NOFILE: {e}"))?;
     drop_privileges()?;
     let paths = paths(role, config, settings, config_path);
-    // The directories exist before Landlock is told about them (a missing
-    // path gets no rule).
-    for dir in &paths.sockets {
-        velarx_base::ipc::ensure_private_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
     // (the staging of the store, private as the engine makes it, opened:
     // the rule is the descriptor's)
     let staging = match &paths.staging {

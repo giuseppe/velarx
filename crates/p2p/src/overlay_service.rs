@@ -8,7 +8,7 @@
 //! names, and is the network provider (`org.velarx.Network`,
 //! `velarx_runtime::network::provider`) the engine names, on its own socket.
 
-use crate::service::serve_control;
+use crate::service::serve_on_thread;
 use crate::settings::Settings;
 use crate::tun_overlay::TunOverlayManager;
 use std::os::fd::OwnedFd;
@@ -148,7 +148,7 @@ pub async fn run_overlay(
         .map_err(|e| anyhow::anyhow!("cannot announce the overlay: {e}"))?;
     let manager = Arc::new(manager);
     // The overlay network is a network provider on a socket of its own
-    let _network = serve_control(listener, "p2p-network", limits, network::Network(manager))?;
+    let _network = serve_on_thread(listener, "p2p-network", limits, network::Network(manager))?;
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {

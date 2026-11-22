@@ -396,13 +396,13 @@ fn pretty<T: serde::Serialize>(value: &T) -> Result<String, String> {
     serde_json::to_string_pretty(value).map_err(|e| e.to_string())
 }
 
-/// Serve the varlink service `control` from a thread of its own, on
+/// Serve the varlink service `service` from a thread of its own, on
 /// `listener`, until the returned guard is dropped.
-pub(crate) fn serve_control<S>(
+pub(crate) fn serve_on_thread<S>(
     listener: std::os::unix::net::UnixListener,
     name: &'static str,
     limits: velarx_content::activation::Limits,
-    control: S,
+    service: S,
 ) -> std::io::Result<tokio::sync::oneshot::Sender<()>>
 where
     S: zlink::Service<zlink::tokio::unix::Stream> + Clone + Send + 'static,
@@ -420,7 +420,7 @@ where
                     let listener = tokio::net::UnixListener::from_std(listener)?;
                     tokio::select! {
                         _ = velarx_content::activation::serve_varlink(
-                            listener, None, velarx_base::ipc::trusted_uid, limits, name, control,
+                            listener, None, velarx_base::ipc::trusted_uid, limits, name, service,
                         ) => {}
                         // (the guard was dropped: the sender is gone)
                         _ = stopped => {}
@@ -534,7 +534,8 @@ pub(crate) async fn start_node(
     identity: libp2p::identity::Keypair,
     authority: Option<Arc<crate::authority::Authority>>,
 ) -> anyhow::Result<Arc<P2PNode>> {
-    // The swarm key is required: the node refuses to start without one.
+    // (the swarm key, or the authority: the node refuses to start with
+    // neither)
     let private_key = std::env::var("VELARX_P2P_SWARM_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty());
