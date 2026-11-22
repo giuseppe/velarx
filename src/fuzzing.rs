@@ -11,12 +11,13 @@ use std::io::{BufReader, Cursor, Read};
 
 /// The names of the targets, as `fuzz/fuzz_targets/NAME.rs` and the
 /// directories of `fuzz/corpus/` name them.
-pub const TARGETS: [&str; 22] = [
+pub const TARGETS: [&str; 23] = [
     "tar",
     "sparse",
     "tarsplit",
     "multipart",
     "toc",
+    "table",
     "manifest",
     "challenge",
     "registries_conf",
@@ -44,6 +45,7 @@ pub fn run(name: &str, data: &[u8]) -> bool {
         "tarsplit" => tarsplit(data),
         "multipart" => multipart(data),
         "toc" => toc(data),
+        "table" => table(data),
         "manifest" => manifest(data),
         "challenge" => challenge(data),
         "registries_conf" => registries_conf(data),
@@ -194,6 +196,23 @@ pub fn toc(data: &[u8]) {
     );
     // and as JSON, as the store reads it
     let _ = serde_json::from_slice::<velarx_storage::Toc>(data);
+}
+
+/// The binary table of a zstd:chunked layer.  A table that is accepted is
+/// the one encoding of the table of contents it decodes to: written again,
+/// it is the same bytes (its optional features aside).
+pub fn table(data: &[u8]) {
+    use velarx_storage::table;
+    let Ok(toc) = table::decode(data, u64::MAX) else {
+        return;
+    };
+    let alg = table::head(data).expect("the header of a table").alg;
+    let mut again = table::encode(&toc, alg).expect("a decoded table is a table");
+    again[16..20].copy_from_slice(&data[16..20]);
+    assert!(
+        again == data,
+        "a table that is not its one encoding is accepted"
+    );
 }
 
 /// A manifest or an index, and the choice of a platform.

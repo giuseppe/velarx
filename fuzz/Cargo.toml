@@ -86,6 +86,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "table"
+path = "fuzz_targets/table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "manifest"
 path = "fuzz_targets/manifest.rs"
 test = false
