@@ -28,7 +28,8 @@
 # of the first TCP address is also the UDP port of the QUIC endpoint (see
 # `quic_port`): UDP and TCP must be reachable between the nodes.
 listen_addresses = ["/ip4/127.0.0.1/tcp/4001"]
-# Bootstrap peer addresses
+# Bootstrap peer addresses: "/ip4/192.0.2.7/tcp/4001", or with the peer id
+# (".../p2p/12D3KooW...") to take only that node at the address
 bootstrap_peers = []
 # The connections the node keeps up.  With fewer the bootstrap peers are dialed
 # again (a peer that is full refuses a node, one that is down comes back): the

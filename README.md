@@ -125,8 +125,12 @@ velarx-p2p generate-key /etc/velarx/swarm.key
 ```toml
 private_key_path = "/etc/velarx/swarm.key"
 listen_addresses = ["/ip4/<lan-ip>/tcp/4001"]   # the default is the loopback
-bootstrap_peers = ["/ip4/<peer-ip>/tcp/4001/p2p/<peer-id>"]
+bootstrap_peers = ["/ip4/<peer-ip>/tcp/4001"]
 ```
+
+A bootstrap peer may be named with its id too (`/p2p/<peer-id>` at the
+end); without it any node of the swarm at that address is taken.  The id of a
+node stays the same across restarts (`identity_path`).
 
 ```sh
 velarx-p2p &
