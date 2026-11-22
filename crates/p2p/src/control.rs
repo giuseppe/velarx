@@ -42,6 +42,8 @@ pub struct PeerTraffic {
     pub chunks_received: u64,
     /// The bytes of those
     pub bytes_received: u64,
+    /// The chunks it sent that did not match their digests (dropped)
+    pub chunks_wrong: u64,
     /// The average time of an answer, in milliseconds
     pub average_ms: Option<f64>,
     /// The smoothed time of an answer that ranks the peers, in milliseconds

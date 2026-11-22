@@ -84,6 +84,8 @@ type PeerTraffic (
 	chunks_received: int,
 	# The bytes of those
 	bytes_received: int,
+	# The chunks it sent that did not match their digests (dropped)
+	chunks_wrong: int,
 	# The average time of an answer, in milliseconds
 	average_ms: ?float,
 	# The smoothed time of an answer that ranks the peers, in milliseconds

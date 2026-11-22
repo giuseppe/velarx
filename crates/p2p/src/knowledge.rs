@@ -110,6 +110,8 @@ pub struct Traffic {
     /// Chunks it sent that matched their digests, and their bytes
     pub chunks: u64,
     pub bytes: u64,
+    /// Chunks it sent that did not match their digests
+    pub wrong: u64,
     /// The time of the requests it answered, in all
     pub answer_time: Duration,
     /// When it was last asked
@@ -512,6 +514,13 @@ impl Knowledge {
             }
             None => t.failures += 1,
         });
+    }
+
+    /// `peer` sent `chunks` chunks whose bytes did not match their digests
+    /// (counted apart from the request, which [`Self::count`] counts).
+    pub fn wrong(&self, peer: PeerId, chunks: u64) {
+        let mut traffic = self.traffic.lock().unwrap_or_else(|e| e.into_inner());
+        traffic.entry(peer).or_default().wrong += chunks;
     }
 
     /// A request to `peer` was refused for want of room: it is not a failure

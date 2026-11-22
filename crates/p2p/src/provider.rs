@@ -741,6 +741,8 @@ struct Answers {
     tx: tokio::sync::mpsc::Sender<Received>,
     rx: tokio::sync::mpsc::Receiver<Received>,
     valid: std::collections::HashMap<u64, (usize, u64)>,
+    /// The chunks of each request whose bytes were not them
+    wrong: std::collections::HashMap<u64, u64>,
     requests: u64,
 }
 
@@ -751,6 +753,7 @@ impl Answers {
             tx,
             rx,
             valid: Default::default(),
+            wrong: Default::default(),
             requests: 0,
         }
     }
@@ -1941,11 +1944,8 @@ impl PeerSource {
             matches,
         } = received;
         if !matches {
-            warn!(
-                "P2P chunk mismatch from {}: the bytes sent for {} are not it",
-                peer,
-                short(&wanted),
-            );
+            debug!(%peer, "the bytes sent for {} are not it", short(&wanted));
+            *answers.wrong.entry(request).or_default() += 1;
             return Ok(());
         }
         let mut asked = false;
@@ -1992,6 +1992,10 @@ impl PeerSource {
             result,
         } = attempt;
         let (n, bytes) = answers.valid.remove(&request).unwrap_or_default();
+        if let Some(wrong) = answers.wrong.remove(&request) {
+            warn!(%peer, "P2P: {wrong} chunks sent did not match their digests");
+            self.knowledge.wrong(peer, wrong);
+        }
         match result {
             Ok(()) => {}
             // (it may have the chunks: nothing is recorded of the layer, and
@@ -3155,6 +3159,11 @@ mod tests {
             .unwrap();
         assert_eq!(fake.asked.lock().unwrap().clone(), [liar, good]);
         assert_eq!(digests_of(&out), sorted(&c));
+        // (the status tells the wrong chunks of each peer)
+        let wrong: HashMap<PeerId, (u64, u64)> = (s.knowledge().traffic().into_iter())
+            .map(|(p, t)| (p, (t.chunks, t.wrong)))
+            .collect();
+        assert_eq!((wrong[&liar], wrong[&good]), ((0, 1), (1, 0)));
     }
 
     #[tokio::test]
