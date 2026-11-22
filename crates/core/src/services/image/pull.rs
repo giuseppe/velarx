@@ -735,14 +735,14 @@ impl ImageService {
                 media_type: "application/octet-stream".into(),
                 annotations: None,
             };
-            let got = async {
+            let got = velarx_content::idle::within(link.idle, async {
                 link.conn
                     .open(velarx_content::fetcher::fetch_client::Scoping::bare(
                         link.idle,
                     ))
                     .await?;
                 link.conn.get_blob(&blob).await
-            }
+            })
             .await;
             let Ok(file) = got else {
                 continue;

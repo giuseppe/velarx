@@ -222,14 +222,14 @@ impl ImageService {
         );
         let mut text = None;
         for mut link in self.source_links(names).await {
-            let got = async {
+            let got = velarx_content::idle::within(link.idle, async {
                 link.conn
                     .open(velarx_content::fetcher::fetch_client::Scoping::bare(
                         link.idle,
                     ))
                     .await?;
                 link.conn.get_profile(&name, max_bytes).await
-            }
+            })
             .await;
             let Ok(file) = got else {
                 continue;

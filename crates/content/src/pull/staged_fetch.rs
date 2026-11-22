@@ -181,7 +181,8 @@ impl Breaker {
 
 impl Fetcher {
     /// A connection for one call, and the place of it among those of the
-    /// process ([`CONNECTIONS`]): held while the connection is used.
+    /// process ([`CONNECTIONS`]): held while the connection is used.  The
+    /// fetcher is silent for its idle time at most, as in a call.
     async fn connection(
         &self,
     ) -> Result<(FetchConn, tokio::sync::OwnedSemaphorePermit), CallError> {
@@ -190,7 +191,8 @@ impl Fetcher {
             .acquire_owned()
             .await
             .map_err(|e| CallError::Protocol(e.to_string()))?;
-        let conn = self.control.lock().await.connect().await?;
+        let mut control = self.control.lock().await;
+        let conn = crate::idle::within(self.idle, control.connect()).await?;
         Ok((conn, permit))
     }
 }
@@ -324,8 +326,7 @@ pub struct StagedFetch {
     /// the blob, with the staging directory it was given (device and
     /// inode): a staging made again since (the layer was committed and
     /// removed, and is fetched anew) is told again, or the fetchers would
-    /// write into the removed one; a fetcher whose `Layer` failed is not
-    /// marked, it is told again by the next walk
+    /// write into the removed one
     told: Mutex<HashMap<String, Vec<Option<StagingId>>>>,
     /// The layers the fetchers were asked about (`Probe`) since they were
     /// last forgotten: what a fetcher keeps for a blob it read to answer
@@ -334,6 +335,10 @@ pub struct StagedFetch {
     /// Held while a layer is told: a second walk of the layer, at the same
     /// time, waits for the `Layer` call of the first, not for nothing
     telling: tokio::sync::Mutex<()>,
+    /// The fetchers but the origin whose `Layer` failed (the place in
+    /// `fetchers`): not asked again by this pull, so that no call waits for
+    /// one that is silent
+    unwilling: Vec<std::sync::atomic::AtomicBool>,
     /// The staging of each layer that is open, by its name: a layer that is
     /// opened twice while it is open is one staging (whoever drops the
     /// last takes it away)
@@ -365,7 +370,7 @@ impl StagedFetch {
                 .await?;
                 Ok::<_, CallError>(info)
             };
-            match opened.await {
+            match crate::idle::within(idle, opened).await {
                 Ok(info) => fetchers.push(Fetcher {
                     name,
                     control: tokio::sync::Mutex::new(conn),
@@ -473,6 +478,7 @@ impl StagedFetch {
         manifest: &[u8],
     ) -> ImageResult<Arc<Self>> {
         let max_objects = fetchers.iter().map(|f| f.max_objects).min().unwrap_or(1);
+        let unwilling = fetchers.iter().map(|_| Default::default()).collect();
         let parsed: velarx_types::OciManifest = serde_json::from_slice(manifest)?;
         Ok(Arc::new(Self {
             verity,
@@ -500,8 +506,15 @@ impl StagedFetch {
             told: Mutex::default(),
             probed: Mutex::default(),
             telling: tokio::sync::Mutex::default(),
+            unwilling,
             open: Arc::default(),
         }))
+    }
+
+    /// Whether the fetcher at `at` is left out of the pull: a `Layer` of it
+    /// failed.
+    fn unwilling(&self, at: usize) -> bool {
+        self.unwilling[at].load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A connection of a fetcher failed: its scope is gone with it (a peer
@@ -566,7 +579,7 @@ impl StagedFetch {
         let mut left: Vec<u32> = at.to_vec();
         let breaker = Breaker::new(self.fetchers.len());
         for (fetcher_at, fetcher) in self.fetchers.iter().enumerate() {
-            if !breaker.usable(fetcher_at) {
+            if !breaker.usable(fetcher_at) || self.unwilling(fetcher_at) {
                 continue;
             }
             if left.is_empty() {
@@ -938,8 +951,12 @@ impl StagedFetch {
         if !told && !probed {
             return;
         }
-        for fetcher in &self.fetchers {
-            if let Err(e) = fetcher.control.lock().await.forget(layer).await {
+        for (at, fetcher) in self.fetchers.iter().enumerate() {
+            if self.unwilling(at) {
+                continue;
+            }
+            let mut control = fetcher.control.lock().await;
+            if let Err(e) = crate::idle::within(fetcher.idle, control.forget(layer)).await {
                 debug!("The fetcher {} keeps the layer {layer}: {e}", fetcher.name);
             }
         }
@@ -974,6 +991,11 @@ impl StagedFetch {
         with_origin: bool,
     ) -> ImageResult<()> {
         let _telling = self.telling.lock().await;
+        for (i, fetcher) in self.fetchers.iter().enumerate() {
+            if self.unwilling(i) {
+                breaker.distrust(i, fetcher, "a layer it was told of failed");
+            }
+        }
         let name = layer.digest.to_string();
         let staging = dir.metadata().map(|m| (m.dev(), m.ino()))?;
         let missed: Vec<bool> = {
@@ -1005,7 +1027,6 @@ impl StagedFetch {
             };
             // (every fetcher is told, by the engine: the blob only to the
             // registry fetcher)
-            let last = self.fetchers.len() - 1;
             for (i, fetcher) in self.fetchers.iter().enumerate() {
                 if !missed[i] || !breaker.usable(i) || (!with_origin && Some(i) == self.origin) {
                     continue;
@@ -1030,10 +1051,14 @@ impl StagedFetch {
                         known[i] = Some(staging);
                     }
                     // (one that cannot take the layer, whatever it says, is
-                    // not asked for it by this walk, and told again by the
-                    // next; the last one's failure ends the walk)
-                    Err(e) if i != last => breaker.distrust(i, fetcher, &e.to_string()),
-                    Err(e) => return Err(fetcher_error(&fetcher.name, e)),
+                    // not asked for it by this walk, and by no call of the
+                    // pull unless it is the origin)
+                    Err(e) => {
+                        if Some(i) != self.origin {
+                            self.unwilling[i].store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        breaker.distrust(i, fetcher, &e.to_string());
+                    }
                 }
             }
         }
@@ -2264,6 +2289,155 @@ mod tests {
             std::time::Duration::from_millis(400),
         )
         .await;
+        let (desc, toc) = layer_and_toc();
+        staged
+            .stage_files(
+                "stem",
+                &desc,
+                &toc,
+                vec![key_of(1)],
+                (Urgency::OnDemand, &|_| {}),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A connection to `f` through a relay that passes nothing more, either
+    /// way, once `mute` is set: a fetcher that takes calls and never answers.
+    fn muted(f: &LocalFetcher, mute: Arc<AtomicBool>) -> FetchConn {
+        use std::io::{Read, Write};
+        let theirs = f.connect().unwrap();
+        let (ours, relay) = std::os::unix::net::UnixStream::pair().unwrap();
+        for (mut from, mut to) in [
+            (relay.try_clone().unwrap(), theirs.try_clone().unwrap()),
+            (theirs, relay),
+        ] {
+            let mute = mute.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n @ 1..) = from.read(&mut buf) {
+                    if !mute.load(Ordering::SeqCst) && to.write_all(&buf[..n]).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        FetchConn::new(ours).unwrap()
+    }
+
+    /// A fetcher that never answers is left out of the pull when it opens.
+    #[tokio::test]
+    async fn a_fetcher_that_never_answers_is_left_out() {
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let registry = LocalFetcher::start(Arc::new(Stages), Limits::default()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let link = Link {
+            name: "peers".into(),
+            conn: FetchConn::new(ours).unwrap(),
+            idle: std::time::Duration::from_millis(200),
+        };
+        let staged = StagedFetch::open(
+            (
+                vec![link],
+                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Vec::new(),
+            ),
+            root.path(),
+            false,
+            ("localhost/a", true),
+            Some(b"{}"),
+            &manifest(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(staged.sources(), ["registry"]);
+    }
+
+    /// A fetcher that stops answering in a pull is waited for once, for its
+    /// idle time: the walks after it leave it out, and a probe does not wait
+    /// for the reply it still owes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fetcher_that_stops_answering_is_waited_for_once() {
+        let idle = std::time::Duration::from_millis(300);
+        let peers = LocalFetcher::start(Arc::new(Stages), Limits::default()).unwrap();
+        let registry = LocalFetcher::start(Arc::new(Stages), Limits::default()).unwrap();
+        let mute = Arc::new(AtomicBool::new(false));
+        let root = tempfile::tempdir().unwrap();
+        let link = Link {
+            name: "peers".into(),
+            conn: muted(&peers, mute.clone()),
+            idle,
+        };
+        let staged = StagedFetch::open(
+            (
+                vec![link],
+                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Vec::new(),
+            ),
+            root.path(),
+            false,
+            ("localhost/a", true),
+            Some(b"{}"),
+            &manifest(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(staged.sources(), ["peers", "registry"]);
+        mute.store(true, Ordering::SeqCst);
+        let (desc, toc) = layer_and_toc();
+        for (n, most) in [(1, None), (2, Some(idle))] {
+            let started = std::time::Instant::now();
+            staged
+                .stage_files(
+                    "stem",
+                    &desc,
+                    &toc,
+                    vec![key_of(n)],
+                    (Urgency::OnDemand, &|_| {}),
+                )
+                .await
+                .unwrap();
+            if let Some(most) = most {
+                assert!(started.elapsed() < most, "{:?}", started.elapsed());
+            }
+        }
+        let probed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            staged.probe_all(&[0], false),
+        )
+        .await;
+        assert!(probed.is_ok(), "the probe waits for the silent fetcher");
+    }
+
+    /// A fetcher after the origin, the last of the list, that cannot take
+    /// a layer is left out: the origin brings the files.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_last_fetcher_that_fails_a_layer_is_left_out() {
+        let after = LocalFetcher::start(Arc::new(Stages), Limits::default()).unwrap();
+        let registry = LocalFetcher::start(Arc::new(Stages), Limits::default()).unwrap();
+        let mute = Arc::new(AtomicBool::new(false));
+        let root = tempfile::tempdir().unwrap();
+        let link = Link {
+            name: "after".into(),
+            conn: muted(&after, mute.clone()),
+            idle: std::time::Duration::from_millis(200),
+        };
+        let staged = StagedFetch::open(
+            (
+                Vec::new(),
+                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                vec![link],
+            ),
+            root.path(),
+            false,
+            ("localhost/a", true),
+            Some(b"{}"),
+            &manifest(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(staged.sources(), ["registry", "after"]);
+        mute.store(true, Ordering::SeqCst);
         let (desc, toc) = layer_and_toc();
         staged
             .stage_files(
