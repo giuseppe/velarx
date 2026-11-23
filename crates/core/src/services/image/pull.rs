@@ -1123,6 +1123,18 @@ impl ImageService {
         );
 
         let requirements = self.policy_for(&image_ref)?;
+        // (a tag is resolved by the sources of `[pull] names`: one that is
+        // not the registry gives the digest it is signed for, and the pull
+        // goes on by that digest; the image is still asked for by its tag,
+        // which the signatures are judged for and the image is named by)
+        let pinned = match (&image_ref.tag, &image_ref.digest) {
+            (Some(_), None) => self.resolve_tag(&image_ref, &requirements).await?,
+            _ => None,
+        };
+        let fetched_ref = ImageReference {
+            digest: pinned.or(image_ref.digest),
+            ..image_ref.clone()
+        };
         let target = client.target(&image_ref)?;
         let access = client.request_access().cloned().unwrap_or_default();
         let mut net = self.inspect_net(client, &image_ref, reach.tls_verify, &access)?;
@@ -1133,7 +1145,7 @@ impl ImageService {
             use velarx_content::pull::net::origin::{MetadataSources, Source};
             let names = self.sources_of(sources.as_deref())?;
             let (first, rest) = split_at_registry(&names);
-            let digest = image_ref.digest.is_some();
+            let digest = fetched_ref.digest.is_some();
             let mut listed = Vec::new();
             if digest {
                 let links = self.source_links(first).await;
@@ -1158,7 +1170,7 @@ impl ImageService {
             })
         };
         let (manifest, manifest_digest, manifest_bytes, indexes) = net
-            .manifest_raw(&image_ref, platform.as_ref(), Some(&stored))
+            .manifest_raw(&fetched_ref, platform.as_ref(), Some(&stored))
             .await?;
         velarx_base::trace::point("pull manifest");
         // the policy, before anything else of the image is read

@@ -139,8 +139,9 @@ impl Net {
         })
         .await
         .map_err(|e| match (e, &image_ref.digest) {
-            // (only the registry says what a tag names: the other sources
-            // serve what a digest names)
+            // (only the registry, or a signed record from a source of
+            // `[pull] names`, says what a tag names: the other sources serve
+            // what a digest names)
             (ImageError::Transfer { party, object, mut failure }, None)
                 if matches!(
                     failure.class,
@@ -148,7 +149,7 @@ impl Net {
                 ) =>
             {
                 failure.reason = format!(
-                    "{} (a tag needs the registry; a pull by digest can take the image from the other sources)",
+                    "{} (a tag needs the registry, or a source of [pull] names; a pull by digest can take the image from the other sources)",
                     failure.reason
                 );
                 ImageError::Transfer { party, object, failure }

@@ -457,6 +457,15 @@ lazy_profile_peers = true
 # interfaces/org.velarx.Fetcher.varlink is the interface to write one.  A
 # list of several: ["dircache", "p2p", "registry"].
 # sources = ["registry"]
+# Where a tag is resolved to the digest of its manifest, in the order written:
+# "registry" (the registry says what a tag names), or the name of a source that
+# keeps signatures (the peers, `names = ["p2p"]`, which need `serve_names` on
+# the nodes that answer).  A source that is not "registry" is believed for
+# nothing: the tag is taken from the newest signature made for exactly that
+# name and tag that policy.json accepts for it, and a name whose policy asks
+# no signature is refused.  The registry answers or fails: what follows
+# "registry" is not asked.  A pull by digest never needs it.
+# names = ["registry"]
 
 [push]
 # Layers regenerated and uploaded at the same time
@@ -940,8 +949,9 @@ filter_interval_secs = 2
 # swarm, and anyone who has the swarm key, can then list what the node has.
 announce_images = false
 # `true`: the node tells the peers that ask which signed manifest digests it
-# holds for a name and tag (`docker.io/library/alpine:3`), with the
-# signatures.  A member that guesses a name learns that this node has it (the
+# holds for a name and tag (`docker.io/library/alpine:3`), with the signatures,
+# so that a peer with `names = ["p2p"]` in `[pull]` resolves the tag from
+# them.  A member that guesses a name learns that this node has it (the
 # signatures of a manifest digest are given in any case).
 serve_names = false
 # The connected peers asked at once ("do you have this chunk?"; the answer is

@@ -5,8 +5,10 @@
 //! of the image is fetched, as podman checks them.
 
 use super::*;
+use velarx_content::fetcher::fetch::SignedRecord;
 use velarx_content::pull::net::Net;
 use velarx_signature::evaluate::{self, Image, Manifest};
+use velarx_signature::name;
 use velarx_signature::reference::DockerRef;
 use velarx_signature::registries_d::{self, RegistriesD};
 use velarx_signature::sigstore::{Signature, MAX_SIGNATURE_SIZE};
@@ -63,6 +65,46 @@ async fn accepted_blocking(
     }
 }
 
+/// The record of `records` that `requirements` accept for the tag
+/// `reference` with the latest time of signing, computed on a blocking
+/// thread, in VERIFY_TIMEOUT at most.
+async fn newest_blocking(
+    requirements: Vec<PolicyRequirement>,
+    reference: DockerRef,
+    records: Vec<name::Record>,
+) -> ImageResult<Option<name::Named>> {
+    let job = tokio::task::spawn_blocking(move || {
+        name::newest(&requirements, &reference, records, now())
+    });
+    match tokio::time::timeout(VERIFY_TIMEOUT, job).await {
+        Err(_) => Err(rejected("the verification of the signatures took too long")),
+        Ok(Err(e)) => Err(ImageError::Storage(e.to_string())),
+        Ok(Ok(result)) => result.map_err(rejected),
+    }
+}
+
+/// The signatures of `record` that read as signatures, in what is left of
+/// `budget`: what a fetcher sends is not an error when it is junk or too
+/// much, it is left out.
+fn read_record(record: SignedRecord, budget: &mut u64) -> name::Record {
+    use base64::Engine;
+    let mut signatures = Vec::new();
+    for text in record.signatures {
+        let blob = base64::engine::general_purpose::STANDARD.decode(text);
+        let Ok(blob) = blob else { continue };
+        if blob.len() as u64 > MAX_SIGNATURE_SIZE || spend(budget, blob.len() as u64).is_err() {
+            continue;
+        }
+        if let Ok(signature) = Signature::from_blob(&blob) {
+            signatures.push(signature);
+        }
+    }
+    name::Record {
+        digest: record.digest,
+        signatures,
+    }
+}
+
 fn rejected(e: impl std::fmt::Display) -> ImageError {
     ImageError::Registry(format!("Source image rejected: {e}"))
 }
@@ -110,6 +152,57 @@ impl ImageService {
         .map_err(|e| ImageError::Registry(format!("registries.d: {e}")))
     }
 
+    /// The digest the tag of `image_ref` names according to `[pull] names`,
+    /// in the order of the list: None when the registry is to say (it comes
+    /// first); a source that is not the registry is believed for nothing,
+    /// the tag is the newest record signed for exactly this name and tag by
+    /// a key the policy (`requirements`) accepts.
+    pub(super) async fn resolve_tag(
+        &self,
+        image_ref: &ImageReference,
+        requirements: &[PolicyRequirement],
+    ) -> ImageResult<Option<Digest>> {
+        use velarx_content::pull::net::origin::MetadataSources;
+        let reference = intended(image_ref)?;
+        let name = reference.string();
+        let mut why = "[pull] names has no source".to_string();
+        for source in self.sources_of(Some(&self.pull_config.names))? {
+            if source == "registry" {
+                return Ok(None);
+            }
+            if !evaluate::needs_signatures(requirements) {
+                why = "the signature policy names no key for it, so no signature says what the tag names".into();
+                continue;
+            }
+            let links = self.source_links(std::slice::from_ref(&source)).await;
+            let given = MetadataSources::open(links).await.signatures(&name).await;
+            if given.is_empty() {
+                why = "no source has a signed record of the tag".into();
+                continue;
+            }
+            let given_count = given.len();
+            let mut budget = MAX_SIGNATURES_TOTAL;
+            let records: Vec<_> = given
+                .into_iter()
+                .map(|r| read_record(r, &mut budget))
+                .filter(|r| !r.signatures.is_empty())
+                .collect();
+            match newest_blocking(requirements.to_vec(), reference.clone(), records).await? {
+                Some(named) => {
+                    return named.digest.parse().map(Some).map_err(rejected);
+                }
+                None => {
+                    why = format!(
+                        "{given_count} records of the tag, none signed by a key the policy accepts"
+                    );
+                }
+            }
+        }
+        Err(ImageError::Registry(format!(
+            "{name}: `registry` is not one of [pull] names, and {why}"
+        )))
+    }
+
     /// Check the manifest `manifest` (of digest `digest`) of `image_ref`
     /// against `requirements`; the signatures the requirements accepted.  Nothing is fetched when no requirement needs
     /// signatures.
@@ -121,8 +214,7 @@ impl ImageService {
         manifest: &[u8],
         requirements: &[PolicyRequirement],
     ) -> ImageResult<Vec<Signature>> {
-        let digest = digest.to_string();
-        let digest = digest.as_str();
+        let text = digest.to_string();
         if !evaluate::needs_signatures(requirements) {
             return Ok(Vec::new());
         }
@@ -130,11 +222,20 @@ impl ImageService {
         let config = self.registries_config()?;
         let mut budget = MAX_SIGNATURES_TOTAL;
         let mut signatures = self
-            .lookaside_signatures(net, &config, &reference, digest, &mut budget)
+            .lookaside_signatures(net, &config, &reference, &text, &mut budget)
             .await?;
         let attachments = config.use_sigstore_attachments(&reference);
-        if attachments {
-            signatures.extend(self.sigstore_attachments(net, digest, &mut budget).await?);
+        if attachments && net.has_registry() {
+            signatures.extend(self.sigstore_attachments(net, &text, &mut budget).await?);
+        }
+        // (what the fetchers of the sources keep: judged like the rest)
+        let fetched = net.fetched_signatures(digest).await;
+        for record in fetched.into_iter().filter(|r| r.digest == text) {
+            for signature in read_record(record, &mut budget).signatures {
+                if !signatures.contains(&signature) {
+                    signatures.push(signature);
+                }
+            }
         }
         debug!(
             "{} signatures of {} ({digest})",
@@ -387,7 +488,9 @@ impl ImageService {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
                     Err(e) => return Err(ImageError::Registry(format!("{}: {e}", path.display()))),
                 },
-                // (over the network: the registry fetcher reads it)
+                // (over the network: the registry fetcher reads it, when
+                // the registry is one of the sources)
+                None if !net.has_registry() => break,
                 None => match net
                     .signature(&url, MAX_SIGNATURE_SIZE.min(*budget))
                     .await
@@ -505,6 +608,138 @@ mod tests {
                 read_bounded(&fifo)
             });
         assert!(r.is_err());
+    }
+
+    const FIRST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const SECOND: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+    /// The base64 blob of the signature of `digest` for `docker.io/acme/app:1`
+    /// by `signer` at `time`.
+    fn record_of(signer: &velarx_signature::sign::Signer, digest: &str, time: i64) -> SignedRecord {
+        use base64::Engine;
+        let signature = signer
+            .sign_manifest(digest, "docker.io/acme/app:1", "test", time)
+            .unwrap();
+        SignedRecord {
+            digest: digest.into(),
+            signatures: vec![base64::engine::general_purpose::STANDARD
+                .encode(Signature::Sigstore(signature).to_blob())],
+        }
+    }
+
+    fn signer() -> (velarx_signature::sign::Signer, String) {
+        let (private, public) = velarx_signature::sign::generate_key_pair(b"x").unwrap();
+        let files = velarx_signature::sign::KeyFiles {
+            key: private.as_bytes().to_vec(),
+            passphrase: b"x".to_vec(),
+        };
+        (
+            velarx_signature::sign::Signer::load(&files).unwrap(),
+            public,
+        )
+    }
+
+    /// A service whose policy trusts `public` for `docker.io/acme` and whose
+    /// source `peer` gives `records`, with `names` as `[pull] names`.
+    async fn resolving(
+        public: &str,
+        records: &[SignedRecord],
+        names: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        ImageService,
+        velarx_content::serve_fetch::ServerThread,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = tmp.path().join("acme.pub");
+        std::fs::write(&key, public).unwrap();
+        let policy = tmp.path().join("policy.json");
+        std::fs::write(
+            &policy,
+            serde_json::json!({
+                "default": [{"type": "insecureAcceptAnything"}],
+                "transports": {"docker": {"docker.io/acme": [
+                    {"type": "sigstoreSigned", "keyPath": key}
+                ]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let socket = tmp.path().join("peer.sock");
+        let served = velarx_content::serve_fetch::serve_in_thread(
+            std::os::unix::net::UnixListener::bind(&socket).unwrap(),
+            Arc::new(velarx_content::fakes::Metadata(
+                serde_json::to_vec(records).unwrap(),
+            )),
+            velarx_content::activation::Limits::default(),
+        )
+        .unwrap();
+        let db = velarx_db::Database::open_in_memory().await.unwrap();
+        let store = Arc::new(velarx_storage::FileStore::new(tmp.path().join("objects")).unwrap());
+        let service = ImageService::new(
+            db,
+            store,
+            tmp.path().join("pulls"),
+            velarx_storage::VerityMode::Off,
+        )
+        .unwrap()
+        .with_fetchers(vec![velarx_config::ExternalSourceConfig {
+            name: "peer".into(),
+            socket: Some(socket),
+            dir: None,
+            idle_timeout_secs: 15,
+            settings: Default::default(),
+        }])
+        .with_pull_config(velarx_config::PullConfig {
+            names: names.iter().map(|n| n.to_string()).collect(),
+            policy_path: Some(policy),
+            ..Default::default()
+        })
+        .unwrap();
+        (tmp, service, served)
+    }
+
+    async fn resolved(service: &ImageService, name: &str) -> ImageResult<Option<Digest>> {
+        let image_ref = ImageReference::parse(name).unwrap();
+        let requirements = service.policy_for(&image_ref)?;
+        service.resolve_tag(&image_ref, &requirements).await
+    }
+
+    /// A tag is the digest of the newest record a key of the policy signed
+    /// for it, from a source that is believed for nothing else; and what
+    /// cannot be resolved says why.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tag_is_resolved_by_the_newest_signed_record_of_the_names_sources() {
+        let ((mine, public), (other, _)) = (signer(), signer());
+        let records = [
+            record_of(&mine, FIRST, 100),
+            record_of(&mine, SECOND, 200),
+            // newer, by a key the policy does not name
+            record_of(&other, FIRST, 300),
+        ];
+        let (_tmp, service, _served) = resolving(&public, &records, &["peer"]).await;
+        let got = resolved(&service, "acme/app:1").await.unwrap();
+        assert_eq!(got.map(|d| d.to_string()).as_deref(), Some(SECOND));
+        // (another tag has no record: the signatures are for `:1`)
+        let e = resolved(&service, "acme/app:2").await.unwrap_err();
+        assert!(e.to_string().contains("none signed by a key"), "{e}");
+        // (a policy that asks for no signature says nobody names the tag)
+        let e = resolved(&service, "quay.io/x/y:1").await.unwrap_err();
+        assert!(e.to_string().contains("names no key"), "{e}");
+        let (_tmp, none, _served) = resolving(&public, &[], &["peer"]).await;
+        let e = resolved(&none, "acme/app:1").await.unwrap_err();
+        assert!(
+            e.to_string().contains("no source has a signed record"),
+            "{e}"
+        );
+        // two records of the same time that disagree
+        let tied = [record_of(&mine, FIRST, 100), record_of(&mine, SECOND, 100)];
+        let (_tmp, service, _served) = resolving(&public, &tied, &["peer"]).await;
+        let e = resolved(&service, "acme/app:1").await.unwrap_err();
+        assert!(e.to_string().contains("same time"), "{e}");
+        // the registry first: it says, as it always did
+        let (_tmp, service, _served) = resolving(&public, &records, &["registry", "peer"]).await;
+        assert_eq!(resolved(&service, "acme/app:1").await.unwrap(), None);
     }
 
     #[test]

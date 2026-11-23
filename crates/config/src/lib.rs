@@ -481,6 +481,13 @@ pub struct PullConfig {
     /// a source that fails is skipped and the next one is asked.
     #[serde(default = "default_sources")]
     pub sources: Vec<String>,
+    /// Where a tag is resolved to the digest of its manifest, in order: the
+    /// names of `[[sources.external]]` and `registry`.  A source that is not
+    /// the registry is believed for nothing: the tag is the newest signed
+    /// record of a key that policy.json accepts for the name.  What follows
+    /// `registry` is not asked.
+    #[serde(default = "default_sources")]
+    pub names: Vec<String>,
     /// Files of lazily pulled images fetched at the same time by one process
     #[serde(default = "default_lazy_fetches")]
     pub lazy_fetches: usize,
@@ -642,6 +649,7 @@ impl Default for PullConfig {
             max_workers: default_max_workers(),
             registry_hints: default_true(),
             sources: default_sources(),
+            names: default_sources(),
             lazy_fetches: default_lazy_fetches(),
             lazy_complete_fetches: default_lazy_complete_fetches(),
             lazy_completers: default_lazy_completers(),
@@ -1850,15 +1858,17 @@ impl Config {
         {
             return invalid("[pull] lazy_* settings must not be 0".into());
         }
-        for name in &pull.sources {
-            let name = name.as_str();
-            if name != "registry" && !defined.contains(&name) {
-                let mut known = vec!["registry"];
-                known.extend(defined.iter().copied());
-                return invalid(format!(
-                    "[pull] sources: unknown source `{name}` (known: {})",
-                    known.join(", ")
-                ));
+        for (key, list) in [("sources", &pull.sources), ("names", &pull.names)] {
+            for name in list {
+                let name = name.as_str();
+                if name != "registry" && !defined.contains(&name) {
+                    let mut known = vec!["registry"];
+                    known.extend(defined.iter().copied());
+                    return invalid(format!(
+                        "[pull] {key}: unknown source `{name}` (known: {})",
+                        known.join(", ")
+                    ));
+                }
             }
         }
         Ok(())
@@ -2343,6 +2353,20 @@ mod tests {
         assert!(config.pull.sources.is_empty());
         let config = parse("[pull]\nsources = [\"registry\"]\n").unwrap();
         assert_eq!(config.pull.sources, ["registry"]);
+    }
+
+    #[test]
+    fn test_the_names_default_to_the_registry_and_are_sources() {
+        assert_eq!(parse("").unwrap().pull.names, ["registry"]);
+        let config = parse(&format!(
+            "{EXTERNAL}[pull]\nnames = [\"cache\", \"registry\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(config.pull.names, ["cache", "registry"]);
+        let e = parse("[pull]\nnames = [\"ipfs\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("[pull] names: unknown source `ipfs`"), "{e}");
     }
 
     const EXTERNAL: &str = "[[sources.external]]\nname = \"cache\"\nsocket = \"/run/cache.sock\"\n";
