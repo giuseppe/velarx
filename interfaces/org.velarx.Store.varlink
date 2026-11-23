@@ -113,6 +113,13 @@ method Profile(image: string, max: int) -> (
 	file: int
 )
 
+# The signatures kept with the pulls of a manifest digest or of a
+# `repository:tag`, as records: a file with no name.
+method Signatures(reference: string, max: int) -> (
+	# The position of the file among the descriptors of the reply
+	file: int
+)
+
 # What may be announced, then what changes in it, called with
 # `more`: a `snapshot`, then `added` and `removed` as the store
 # changes, until the client closes the connection.

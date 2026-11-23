@@ -18,6 +18,8 @@
 //!   file with no name, read-only.
 //! * `Profile`: the startup profile of an image, the file of the store
 //!   itself, read-only.
+//! * `Signatures`: the signatures kept with the pulls of a manifest digest,
+//!   or of a name and tag, as records, in a file with no name.
 //! * `ImageList` (one a reply, `more`), `ImageInspect`: the images the
 //!   store has ([`ImageInfo`]: the digests of the manifest, the
 //!   configuration and the layers, the names and the size).  A lazy image
@@ -51,6 +53,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, warn};
 use velarx_config::Config;
 use velarx_content::activation::{self, IdleExit};
+use velarx_content::fetcher::fetch::SignedRecord;
 use velarx_db::Database;
 use velarx_proto::info::Info;
 use velarx_storage::{ChunkFile, FileStore};
@@ -65,6 +68,9 @@ pub const PROTO: u32 = 1;
 /// The most digests a `Lookup` carries: the files of one wave of such
 /// a service, opened in one round trip.
 pub const MAX_LOOKUP: usize = 8;
+
+/// The most records (manifest digests) `Signatures` gives.
+pub const MAX_RECORDS: usize = 16;
 
 /// The longest reference `ImageInspect` takes.
 const MAX_REFERENCE: usize = 512;
@@ -121,6 +127,13 @@ pub struct IndexReply {
 /// The startup profile of an image: a file of digests, one a line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::Type)]
 pub struct ProfileReply {
+    /// The position of the file among the descriptors of the reply
+    pub file: u32,
+}
+
+/// The signatures of a name or a manifest: a file of records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, introspect::Type)]
+pub struct SignaturesReply {
     /// The position of the file among the descriptors of the reply
     pub file: u32,
 }
@@ -807,6 +820,50 @@ impl StoreService {
         })
     }
 
+    /// The records of the signatures kept with the pulls of `reference` (a
+    /// manifest digest, or a `repository:tag`) in a file with no name, as
+    /// `GetSignatures` carries them (at most [`MAX_RECORDS`], and the file
+    /// at most `max` bytes).
+    pub async fn signatures_of(
+        &self,
+        reference: &str,
+        max: u64,
+    ) -> Result<Option<(OwnedFd, u64)>, StoreError> {
+        let unavailable = |e: &dyn std::fmt::Display| StoreError::Unavailable {
+            reason: e.to_string(),
+        };
+        let pulls = self
+            .inner
+            .db
+            .signed_pulls(reference, MAX_RECORDS)
+            .await
+            .map_err(|e| unavailable(&e))?;
+        let mut records = Vec::new();
+        for (digest, rows) in pulls {
+            // (each row is a JSON array of the signatures of a pull)
+            for row in rows {
+                let signatures: Vec<String> =
+                    serde_json::from_slice(&row).map_err(|e| unavailable(&e))?;
+                records.push(SignedRecord {
+                    digest: digest.clone(),
+                    signatures,
+                });
+            }
+        }
+        let Some(text) = SignedRecord::encoded(records, max) else {
+            return Ok(None);
+        };
+        let objects = self.inner.objects.clone();
+        let length = text.len() as u64;
+        let file = tokio::task::spawn_blocking(move || {
+            velarx_content::pull::unnamed::read_only_unnamed(&objects, &text)
+        })
+        .await
+        .map_err(|e| unavailable(&e))?
+        .map_err(|e| unavailable(&e))?;
+        Ok(Some((file, length)))
+    }
+
     /// The index of the layer `layer` (its key: the layer of a TOC is not
     /// the one of its blob) in a file with no name, opened read-only, if the
     /// layer is complete and the index is at most `max` bytes.
@@ -1139,6 +1196,21 @@ mod service {
             }
         }
 
+        /// The signatures kept with the pulls of a manifest digest or of a
+        /// `repository:tag`, as records: a file with no name.
+        #[zlink(return_fds)]
+        async fn signatures(
+            &self,
+            reference: String,
+            max: u64,
+        ) -> (Result<SignaturesReply, StoreError>, Vec<OwnedFd>) {
+            match self.signatures_of(&reference, max).await {
+                Ok(Some((fd, _))) => (Ok(SignaturesReply { file: 0 }), vec![fd]),
+                Ok(None) => (Err(none_to_give("signatures", &reference)), Vec::new()),
+                Err(e) => (Err(e), Vec::new()),
+            }
+        }
+
         /// What may be announced, then what changes in it, called with
         /// `more`: a `snapshot`, then `added` and `removed` as the store
         /// changes, until the client closes the connection.
@@ -1264,6 +1336,12 @@ pub trait StoreProxy {
         image: &str,
         max: u64,
     ) -> zlink::Result<(Result<ProfileReply, StoreError>, Vec<OwnedFd>)>;
+    #[zlink(return_fds)]
+    async fn signatures(
+        &mut self,
+        reference: &str,
+        max: u64,
+    ) -> zlink::Result<(Result<SignaturesReply, StoreError>, Vec<OwnedFd>)>;
     #[zlink(more)]
     async fn subscribe(
         &mut self,
@@ -1647,6 +1725,48 @@ mod tests {
             activation::lock_path(Path::new("/run/x/store.sock")),
             PathBuf::from("/run/x/store.sock.lock")
         );
+    }
+
+    /// The signatures of the pulls are given as records, by digest and by
+    /// name, and nothing when there is none or they are too large.
+    #[tokio::test]
+    async fn the_signatures_of_a_name_are_given_as_records() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("db.sqlite")).await.unwrap();
+        let files = Arc::new(FileStore::new(dir.path().join("files")).unwrap());
+        let service = StoreService::new(db.clone(), files).await.unwrap();
+        let digest =
+            velarx_types::digest::Digest::of(velarx_types::digest::Algorithm::Sha256, b"m");
+        for (reference, signatures) in [
+            ("r.io/a:1", r#"["YQ==","Yg=="]"#),
+            ("r.io/a:1@sha256:00", r#"["Yg==","Yw=="]"#),
+            ("r.io/a:2", r#"[]"#),
+        ] {
+            db.set_pulled_image(&digest, reference, signatures.as_bytes().to_vec())
+                .await
+                .unwrap();
+        }
+        let records = |got: Option<(OwnedFd, u64)>| {
+            let (fd, length) = got?;
+            let file = std::fs::File::from(fd);
+            let mut text = vec![0u8; length as usize];
+            file.read_exact_at(&mut text, 0).unwrap();
+            let records: Vec<velarx_content::fetcher::fetch::SignedRecord> =
+                serde_json::from_slice(&text).unwrap();
+            Some(records)
+        };
+        for reference in ["r.io/a:1", &digest.to_string()] {
+            let got = records(service.signatures_of(reference, 4096).await.unwrap()).unwrap();
+            assert_eq!(got.len(), 1, "{reference}");
+            assert_eq!(got[0].digest, digest.to_string());
+            // (the signatures of the pulls together, each once)
+            assert_eq!(got[0].signatures.len(), 3, "{reference}");
+        }
+        assert!(records(service.signatures_of("r.io/a:1", 10).await.unwrap()).is_none());
+        assert!(records(service.signatures_of("r.io/b:1", 4096).await.unwrap()).is_none());
+        // (a pull that found no signature has none to give)
+        assert!(records(service.signatures_of("r.io/a:2", 4096).await.unwrap()).is_none());
     }
 
     /// What the test counts of the watcher.
