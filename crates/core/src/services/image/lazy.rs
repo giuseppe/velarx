@@ -436,12 +436,13 @@ impl ImageService {
         let mut layers = Vec::new();
         let mut replays = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for (((desc, diff_id), key), have) in manifest
+        for (at, (((desc, diff_id), key), have)) in manifest
             .layers
             .iter()
             .zip(&config.rootfs.diff_ids)
             .zip(keys)
             .zip(&have)
+            .enumerate()
         {
             // (`staged_too`: a layer the driver has and the pull staged is
             // the engine's to keep as well, for the containers made on the
@@ -466,7 +467,23 @@ impl ImageService {
                     )));
                 }
             }
-            let Some(staged) = area.layer(key)? else {
+            // (read whole: the completion of another image that shares the
+            // layer may commit it and remove its staging meanwhile)
+            let staged = area.layer(key).and_then(|staged| {
+                staged
+                    .map(|s| Ok((s.toc_text()?, s.tarsplit()?, s.toc_z()?, s.meta)))
+                    .transpose()
+            });
+            let staged = match staged {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                staged => staged?,
+            };
+            let Some((toc_text, tarsplit, toc_z, meta)) = staged else {
+                // (the completion of another image that shares the layer
+                // committed it since: the driver has it now)
+                if self.stored_layers(keys, config).await?[at] {
+                    continue;
+                }
                 // (a layer that another pull's completion released from the
                 // staging area and that the driver lost since: the engine
                 // kept its files for the containers of this pull, and they
@@ -482,8 +499,8 @@ impl ImageService {
                     "layer {key} is neither in the store nor staged: pull the image again"
                 )));
             };
-            let toc: Toc = serde_json::from_str(&staged.toc_text()?)?;
-            let mut tarsplit = bytes::Bytes::from(staged.tarsplit()?);
+            let toc: Toc = serde_json::from_str(&toc_text)?;
+            let mut tarsplit = bytes::Bytes::from(tarsplit);
             if tarsplit.is_empty() && !toc.is_canonical() {
                 tarsplit = self.lazy_tarsplit(key, &toc).await?;
             }
@@ -492,7 +509,7 @@ impl ImageService {
                 let (toc, tarsplit, layer) = (toc.clone(), tarsplit.clone(), desc.digest);
                 move || velarx_content::pull::lazy::replay(&toc, tarsplit, &layer)
             }));
-            let toc_z = match staged.toc_z()? {
+            let toc_z = match toc_z {
                 Some(toc_z) => toc_z.into(),
                 None => velarx_content::pull::stored::json_z(&toc),
             };
@@ -503,7 +520,7 @@ impl ImageService {
                 toc,
                 tarsplit,
                 toc_z,
-                meta: staged.meta,
+                meta,
             });
         }
         // (what the pull staged was checked against the digests of the table;
