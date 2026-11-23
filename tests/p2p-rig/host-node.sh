@@ -6,12 +6,15 @@
 # directory) and BIN (the binaries) may be set first.
 D=${D:-/var/tmp/two-hosts/node}
 BIN=${BIN:-$D/bin}
-ev () { echo "HOME=$D/home XDG_RUNTIME_DIR=$D/run XDG_CONFIG_HOME=$D/home/.config XDG_DATA_HOME=$D/home/data PATH=$BIN:/usr/bin:/usr/sbin"; }
+# (TRACE, when set: the file of the trace points of every process)
+ev () { echo "HOME=$D/home XDG_RUNTIME_DIR=$D/run XDG_CONFIG_HOME=$D/home/.config XDG_DATA_HOME=$D/home/data PATH=$BIN:/usr/bin:/usr/sbin${TRACE:+ VELARX_TRACE_FILE=$TRACE}"; }
 v () { env -i $(ev) RUST_LOG=warn "$BIN/velarx" --config "$D/config.toml" "$@"; }
+vc () { env -i $(ev) RUST_LOG=warn "$BIN/velarx-client" --config "$D/config.toml" "$@"; }
 p () { env -i $(ev) RUST_LOG=warn "$BIN/velarx-p2p" --config "$D/config.toml" "$@"; }
-# setup LISTEN_IP PORT [BOOTSTRAP_ADDRESS...]
+# setup LISTEN_IP PORT [BOOTSTRAP_ADDRESS...] (SOURCES: the sources of a
+# pull, default "p2p", "registry")
 setup () {
-    local ip=$1 port=$2 boot="" b
+    local ip=$1 port=$2 boot="" b sources=${SOURCES:-'"p2p", "registry"'}
     shift 2
     mkdir -p "$D/home/.config" "$D/home/data" "$D/run" "$D/services"
     chmod 700 "$D" "$D/home" "$D/run" "$D/services"
@@ -26,7 +29,7 @@ root_dir = "$D/root"
 [storage]
 root = "$D/store"
 [pull]
-sources = ["p2p", "registry"]
+sources = [$sources]
 [[sources.external]]
 name = "p2p"
 socket = "$D/services/p2p-fetcher.sock"
