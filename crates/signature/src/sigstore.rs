@@ -142,6 +142,9 @@ mod b64 {
 pub struct Payload {
     pub manifest_digest: String,
     pub docker_reference: String,
+    /// When it was signed (seconds since the epoch), as the signer wrote
+    /// it; 0 when it did not.
+    pub timestamp: i64,
 }
 
 /// The fields of the JSON object `v`, which must be exactly `names`.
@@ -181,16 +184,15 @@ pub fn parse_payload(data: &[u8], kind: &str) -> Result<Payload, Error> {
     if !optional.is_object() && !optional.is_null() {
         return err("`optional` is not a JSON object");
     }
+    let mut timestamp = 0;
     if let Some(t) = optional.get("timestamp") {
         // (a JSON number of integral value, 1.7e9 too, as containers/image
         // reads it into a float)
-        if !t.is_i64()
-            && !t
-                .as_f64()
-                .is_some_and(|f| f.fract() == 0.0 && f.abs() < 9.2e18)
-        {
-            return err("`optional.timestamp` is not an integer");
-        }
+        timestamp = match (t.as_i64(), t.as_f64()) {
+            (Some(i), _) => i,
+            (None, Some(f)) if f.fract() == 0.0 && f.abs() < 9.2e18 => f as i64,
+            _ => return err("`optional.timestamp` is not an integer"),
+        };
     }
     if optional.get("creator").is_some_and(|c| !c.is_string()) {
         return err("`optional.creator` is not a string");
@@ -218,6 +220,7 @@ pub fn parse_payload(data: &[u8], kind: &str) -> Result<Payload, Error> {
     Ok(Payload {
         manifest_digest,
         docker_reference: string(r, "the docker reference")?.to_string(),
+        timestamp,
     })
 }
 
@@ -967,7 +970,8 @@ pub(crate) mod tests {
         );
         // an integral timestamp written as a float is an integer
         let float_timestamp = null_optional.replace("null", r#"{"timestamp":1.7e9,"creator":"c"}"#);
-        parse_payload(float_timestamp.as_bytes(), SIGSTORE_TYPE).unwrap();
+        let parsed = parse_payload(float_timestamp.as_bytes(), SIGSTORE_TYPE).unwrap();
+        assert_eq!(parsed.timestamp, 1_700_000_000);
         for bad in [
             r#"{"critical":{"type":"x","image":{},"identity":{}},"optional":[]}"#,
             r#"{"critical":{}}"#,

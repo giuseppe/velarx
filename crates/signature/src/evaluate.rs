@@ -14,12 +14,30 @@ use base64::Engine;
 /// Largest key, keyring or certificate file read.
 const MAX_KEY_FILE: u64 = 4 << 20;
 
+/// What the signatures are judged for.
+#[derive(Clone, Copy)]
+pub enum Manifest<'a> {
+    /// The bytes of the manifest (of the platform's manifest of an index).
+    Bytes(&'a [u8]),
+    /// Its digest, when the bytes are not there yet: the signatures name
+    /// the digest, and the bytes are judged by it later.
+    Digest(&'a str),
+}
+
+impl Manifest<'_> {
+    fn has_digest(&self, digest: &str) -> bool {
+        match self {
+            Manifest::Bytes(bytes) => sigstore::manifest_matches(bytes, digest),
+            Manifest::Digest(d) => *d == digest,
+        }
+    }
+}
+
 /// An image as the requirements see it.
 pub struct Image<'a> {
     /// The reference it was asked by.
     pub reference: &'a DockerRef,
-    /// The bytes of its manifest (of the platform's manifest of an index).
-    pub manifest: &'a [u8],
+    pub manifest: Manifest<'a>,
     /// The signatures found for that manifest.
     pub signatures: &'a [Signature],
 }
@@ -62,10 +80,21 @@ pub fn accepted(
     image: &Image,
     now: i64,
 ) -> Result<Vec<usize>, String> {
+    accepted_at(requirements, image, now).map(|(used, _)| used)
+}
+
+/// Like `accepted`, with when the image was signed: for each requirement
+/// its newest signature, and of those the oldest time (0 when none needs
+/// a signature).
+pub fn accepted_at(
+    requirements: &[PolicyRequirement],
+    image: &Image,
+    now: i64,
+) -> Result<(Vec<usize>, i64), String> {
     if requirements.is_empty() {
         return Err("no requirement applies".into());
     }
-    let mut used = Vec::new();
+    let mut used: Vec<(usize, i64)> = Vec::new();
     for r in requirements {
         match r {
             PolicyRequirement::InsecureAcceptAnything => {}
@@ -142,9 +171,11 @@ pub fn accepted(
             }
         }
     }
+    let signed = used.iter().map(|(_, t)| *t).min().unwrap_or(0);
+    let mut used: Vec<usize> = used.into_iter().map(|(i, _)| i).collect();
     used.sort_unstable();
     used.dedup();
-    Ok(used)
+    Ok((used, signed))
 }
 
 fn read(path: &str) -> Result<Vec<u8>, String> {
@@ -244,8 +275,8 @@ fn check_payload(
     payload: &sigstore::Payload,
     identity: Option<&SignedIdentity>,
     image: &Image,
-) -> Result<(), String> {
-    if !sigstore::manifest_matches(image.manifest, &payload.manifest_digest) {
+) -> Result<i64, String> {
+    if !image.manifest.has_digest(&payload.manifest_digest) {
         return Err(format!(
             "signature for digest {} does not match",
             payload.manifest_digest
@@ -258,7 +289,7 @@ fn check_payload(
             payload.docker_reference
         ));
     }
-    Ok(())
+    Ok(payload.timestamp)
 }
 
 /// The summary of the reasons the signatures were refused.
@@ -281,7 +312,7 @@ fn signed_by(
     identity: Option<&SignedIdentity>,
     image: &Image,
     now: i64,
-) -> Result<usize, String> {
+) -> Result<(usize, i64), String> {
     if key_type != KeyType::GpgKeys {
         return Err(format!("unimplemented keyType {key_type:?}"));
     }
@@ -296,7 +327,7 @@ fn signed_by(
     if keys.is_empty() {
         return Err("no public keys imported".into());
     }
-    let mut rejections = Vec::new();
+    let (mut rejections, mut newest) = (Vec::new(), None);
     for (i, sig) in image.signatures.iter().enumerate() {
         let Signature::Simple(blob) = sig else {
             continue;
@@ -308,11 +339,12 @@ fn signed_by(
             })
             .and_then(|payload| check_payload(&payload, identity, image));
         match result {
-            Ok(()) => return Ok(i),
+            Ok(signed) if newest.is_none_or(|(_, t)| signed > t) => newest = Some((i, signed)),
+            Ok(_) => {}
             Err(e) => rejections.push(e),
         }
     }
-    Err(summary(rejections, NO_SIGNATURE.into()))
+    newest.ok_or_else(|| summary(rejections, NO_SIGNATURE.into()))
 }
 
 fn sigstore_signed(
@@ -320,8 +352,8 @@ fn sigstore_signed(
     identity: Option<&SignedIdentity>,
     image: &Image,
     now: i64,
-) -> Result<usize, String> {
-    let mut rejections = Vec::new();
+) -> Result<(usize, i64), String> {
+    let (mut rejections, mut newest) = (Vec::new(), None);
     let (mut others, mut attachments) = (0, 0);
     for (i, sig) in image.signatures.iter().enumerate() {
         let Signature::Sigstore(s) = sig else {
@@ -337,9 +369,13 @@ fn sigstore_signed(
             .map_err(|e| e.0)
             .and_then(|payload| check_payload(&payload, identity, image));
         match result {
-            Ok(()) => return Ok(i),
+            Ok(signed) if newest.is_none_or(|(_, t)| signed > t) => newest = Some((i, signed)),
+            Ok(_) => {}
             Err(e) => rejections.push(e),
         }
+    }
+    if let Some(newest) = newest {
+        return Ok(newest);
     }
     let none = if others + attachments == 0 {
         NO_SIGNATURE.to_string()
@@ -400,7 +436,7 @@ mod tests {
         // msg-rsa signs a digest no manifest has
         let image = Image {
             reference: &reference,
-            manifest: b"{}",
+            manifest: Manifest::Bytes(b"{}"),
             signatures: &sigs,
         };
         let e = allows(&r, &image, NOW).unwrap_err();
@@ -412,7 +448,7 @@ mod tests {
             &r,
             &Image {
                 reference: &reference,
-                manifest,
+                manifest: Manifest::Bytes(manifest),
                 signatures: &good,
             },
             NOW,
@@ -425,7 +461,7 @@ mod tests {
             &r,
             &Image {
                 reference: &reference,
-                manifest,
+                manifest: Manifest::Bytes(manifest),
                 signatures: &mixed,
             },
             NOW,
@@ -436,7 +472,7 @@ mod tests {
             &r,
             &Image {
                 reference: &reference,
-                manifest,
+                manifest: Manifest::Bytes(manifest),
                 signatures: &mixed,
             },
             NOW,
@@ -447,7 +483,7 @@ mod tests {
             &r,
             &Image {
                 reference: &v2,
-                manifest,
+                manifest: Manifest::Bytes(manifest),
                 signatures: &good
             },
             NOW
@@ -456,7 +492,7 @@ mod tests {
         // no signature at all
         let none = Image {
             reference: &reference,
-            manifest: b"{}",
+            manifest: Manifest::Bytes(b"{}"),
             signatures: &[],
         };
         assert!(allows(&r, &none, NOW)
@@ -479,7 +515,7 @@ mod tests {
     ) -> Image<'a> {
         Image {
             reference,
-            manifest,
+            manifest: Manifest::Bytes(manifest),
             signatures: sigs,
         }
     }
@@ -531,7 +567,7 @@ mod tests {
         let reference = DockerRef::parse_normalized("a:b").unwrap();
         let image = Image {
             reference: &reference,
-            manifest: b"{}",
+            manifest: Manifest::Bytes(b"{}"),
             signatures: &[],
         };
         for json in [

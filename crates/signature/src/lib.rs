@@ -5,6 +5,7 @@
 //! (cosign keys, Fulcio certificates, Rekor).
 
 pub mod evaluate;
+pub mod name;
 pub mod openpgp;
 mod policy;
 pub mod reference;

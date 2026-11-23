@@ -6,7 +6,7 @@
 
 use super::*;
 use velarx_content::pull::net::Net;
-use velarx_signature::evaluate::{self, Image};
+use velarx_signature::evaluate::{self, Image, Manifest};
 use velarx_signature::reference::DockerRef;
 use velarx_signature::registries_d::{self, RegistriesD};
 use velarx_signature::sigstore::{Signature, MAX_SIGNATURE_SIZE};
@@ -50,7 +50,7 @@ async fn accepted_blocking(
             &requirements,
             &Image {
                 reference: &reference,
-                manifest: &manifest,
+                manifest: Manifest::Bytes(&manifest),
                 signatures: &signatures,
             },
             now(),
