@@ -284,17 +284,36 @@ lease_held () {
     fresh_store
     sh_ image pull --lazy --tls-verify=false "$IMAGE" > /dev/null 2>&1
     layer=$(ls "$BASE/meta" | head -1)
-    toc=$BASE/meta/$layer/toc.json
+    toc=$BASE/meta/$layer/toc.zst
     # the table lies about the content of a file: no fetch can satisfy it
-    python3 -I - "$toc" << 'PY'
-import json, sys
-t = json.load(open(sys.argv[1]))
+    # (the staged table is binary: the layer's JSON TOC is read from its blob
+    # in the registry, made to lie, and staged in its place)
+    python3 -I - "$toc" "$IMAGE" "$layer" << 'PY'
+import json, sys, urllib.request
+from compression import zstd
+path, image, stem = sys.argv[1:4]
+host, rest = image.split("/", 1)
+repo, tag = rest.rsplit(":", 1)
+def get(url, headers):
+    return urllib.request.urlopen(urllib.request.Request(url, headers=headers)).read()
+manifest = json.loads(get("http://%s/v2/%s/manifests/%s" % (host, repo, tag),
+                          {"Accept": "application/vnd.oci.image.manifest.v1+json"}))
+prefix = "io.github.containers.zstd-chunked."
+for layer in manifest["layers"]:
+    a = layer.get("annotations", {})
+    checksum = a.get(prefix + "table-checksum") or a.get(prefix + "manifest-checksum")
+    if stem == "toc-" + checksum.replace(":", "-"):
+        break
+offset, length = [int(n) for n in a[prefix + "manifest-position"].split(":")[:2]]
+frame = get("http://%s/v2/%s/blobs/%s" % (host, repo, layer["digest"]),
+            {"Range": "bytes=%d-%d" % (offset, offset + length - 1)})
+t = json.loads(zstd.decompress(frame))
 for e in t["entries"]:
     if e.get("type") == "reg" and e.get("size", 0) > 0 and e.get("fsverity"):
         v = e["fsverity"]
         e["fsverity"] = v[:-1] + ("0" if v[-1] != "0" else "1")
         break
-json.dump(t, open(sys.argv[1], "w"))
+open(path, "wb").write(zstd.compress(json.dumps(t).encode()))
 PY
     check_match "a command that waits is told why" "failed" "$(sh_ image complete "$IMAGE" 2>&1)"
     check "the completion let the pull go" free "$(lease_held)"

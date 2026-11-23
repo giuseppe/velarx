@@ -258,8 +258,7 @@ async fn test_a_toc_that_lies_about_a_file_is_caught_when_the_file_is_fetched() 
         entry.digest = None;
         entry.chunk_digest = None;
     }
-    let json = serde_json::to_string(&toc).unwrap();
-    std::fs::write(e.area().layer_dir(&layer_digest).join("toc.json"), json).unwrap();
+    restage_toc(&e, &layer_digest, &toc);
     assert!(e
         .service
         .fetch_lazy_file(&lie, &layer_digest)

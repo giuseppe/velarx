@@ -1485,9 +1485,8 @@ mod engine_copy_tests {
                 owners: String::new(),
                 created_at: String::new(),
             },
-            toc: "{}",
             tarsplit: b"",
-            toc_z: None,
+            toc_z: b"",
         })
         .unwrap();
         assert_eq!(area.unnamed_layers(), [key]);

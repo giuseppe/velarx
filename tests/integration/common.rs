@@ -2069,5 +2069,12 @@ pub async fn image_tocs(db: &Database, image: &str) -> Vec<velarx_storage::Toc> 
 
 /// The table of contents of a staged layer.
 pub fn staged_toc(layer: &velarx_content::pull::staged::StagedLayer) -> velarx_storage::Toc {
-    serde_json::from_str(&layer.toc_text().unwrap()).unwrap()
+    layer.toc().unwrap()
+}
+
+/// Stage `toc` as the table of the layer `key` (the table as it came is
+/// replaced by the zstd of its JSON).
+pub fn restage_toc(e: &Env, key: &velarx_db::LayerKey, toc: &velarx_storage::Toc) {
+    let z = zstd::encode_all(&serde_json::to_vec(toc).unwrap()[..], 3).unwrap();
+    std::fs::write(e.area().layer_dir(key).join("toc.zst"), z).unwrap();
 }

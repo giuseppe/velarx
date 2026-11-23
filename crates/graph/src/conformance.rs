@@ -3574,7 +3574,7 @@ pub async fn a_lazy_layer_waits_and_is_completed(f: &Factory) {
     velarx_content::pull::stage_layer(
         &area,
         &mut barrier,
-        (&done, &serde_json::to_string(&*done.toc).unwrap()),
+        &done,
         None,
         velarx_db::LayerReach::default(),
         (&artifact.image_digest, &artifact.owners),
@@ -3611,9 +3611,8 @@ pub async fn a_lazy_layer_waits_and_is_completed(f: &Factory) {
             owners: artifact.owners.clone(),
             created_at: String::new(),
         },
-        toc: &serde_json::to_string(&*done.toc).unwrap(),
         tarsplit: &done.tarsplit,
-        toc_z: None,
+        toc_z: &done.toc_z,
     };
     area.remove_layer(&done.key).unwrap();
     area.publish_layer(&lying).unwrap();

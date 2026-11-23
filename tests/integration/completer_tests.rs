@@ -306,12 +306,12 @@ async fn a_command_that_waits_is_told_why_the_completion_stopped() {
     let service = engine_service(&e, false);
     let pulled = pull_lazily(&service, &e).await;
     let key = e.area().layer_keys().remove(0);
-    let path = e.area().layer_dir(&key).join("toc.json");
-    let toc = std::fs::read_to_string(&path).unwrap();
     let toc_of =
         |data: &[u8]| velarx_storage::toc_value(&velarx_storage::to_toc(&vid(data)).unwrap());
     let (real, forged) = (toc_of(b"hello\n"), toc_of(b"not hello"));
-    std::fs::write(&path, toc.replacen(&real, &forged, 1)).unwrap();
+    let toc = serde_json::to_string(&staged_toc(&e.area().layer(&key).unwrap().unwrap())).unwrap();
+    let forged = toc.replacen(&real, &forged, 1);
+    restage_toc(&e, &key, &serde_json::from_str(&forged).unwrap());
     let err = service
         .complete_waiting(&pulled.id, RegistryAccess::default())
         .await

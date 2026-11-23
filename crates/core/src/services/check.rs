@@ -30,7 +30,7 @@ use velarx_db::Database;
 use velarx_proto::system::{
     CheckAction, CheckProblem, CheckRemovedContainer, CheckReport, CheckSpec,
 };
-use velarx_storage::{FileStore, Object, StorageLock, Toc, TocEntryType};
+use velarx_storage::{FileStore, Object, StorageLock, TocEntryType};
 use velarx_types::OciManifest;
 
 #[derive(Error, Debug)]
@@ -782,10 +782,7 @@ impl CheckService {
                             &area.objects_stand_in(),
                             &key.file_stem(),
                         );
-                        let toc_ok = layer
-                            .toc_text()
-                            .ok()
-                            .is_some_and(|t| serde_json::from_str::<Toc>(&t).is_ok());
+                        let toc_ok = layer.toc().is_ok();
                         if !toc_ok {
                             add(
                                 "bad_toc",
@@ -836,7 +833,7 @@ impl CheckService {
             .into_iter()
             .filter_map(|k| {
                 let layer = area.layer(&k).ok()??;
-                let toc: Toc = serde_json::from_str(&layer.toc_text().ok()?).ok()?;
+                let toc = layer.toc().ok()?;
                 let named = toc
                     .entries
                     .iter()

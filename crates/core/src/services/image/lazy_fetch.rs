@@ -925,15 +925,14 @@ impl ImageService {
                 .clone()
                 .or_else(|| pull.registry_ref.clone())
                 .ok_or_else(|| ImageError::Layer(format!("layer {k} names no repository")))?;
-            let text = layer.toc_text()?;
-            let toc: Arc<Toc> = Arc::new(serde_json::from_str(&text)?);
+            let toc: Arc<Toc> = Arc::new(layer.toc()?);
             Ok::<_, ImageError>(LayerCtx {
                 desc,
                 files: std::sync::OnceLock::new(),
                 profile: std::sync::OnceLock::new(),
                 toc,
                 // (the table this process fetches by, the staged one)
-                toc_z: zstd::bulk::compress(text.as_bytes(), 1)?.into(),
+                toc_z: layer.toc_z()?.into(),
                 walk: walk_key(repository, &layer.meta.reach),
                 manifest: pull.manifest.into_bytes(),
             })

@@ -471,14 +471,14 @@ impl ImageService {
             // layer may commit it and remove its staging meanwhile)
             let staged = area.layer(key).and_then(|staged| {
                 staged
-                    .map(|s| Ok((s.toc_text()?, s.tarsplit()?, s.toc_z()?, s.meta)))
+                    .map(|s| Ok((s.toc()?, s.tarsplit()?, s.toc_z()?, s.meta)))
                     .transpose()
             });
             let staged = match staged {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 staged => staged?,
             };
-            let Some((toc_text, tarsplit, toc_z, meta)) = staged else {
+            let Some((toc, tarsplit, toc_z, meta)) = staged else {
                 // (the completion of another image that shares the layer
                 // committed it since: the driver has it now)
                 if self.stored_layers(keys, config).await?[at] {
@@ -499,7 +499,6 @@ impl ImageService {
                     "layer {key} is neither in the store nor staged: pull the image again"
                 )));
             };
-            let toc: Toc = serde_json::from_str(&toc_text)?;
             let mut tarsplit = bytes::Bytes::from(tarsplit);
             if tarsplit.is_empty() && !toc.is_canonical() {
                 tarsplit = self.lazy_tarsplit(key, &toc).await?;
@@ -509,17 +508,13 @@ impl ImageService {
                 let (toc, tarsplit, layer) = (toc.clone(), tarsplit.clone(), desc.digest);
                 move || velarx_content::pull::lazy::replay(&toc, tarsplit, &layer)
             }));
-            let toc_z = match toc_z {
-                Some(toc_z) => toc_z.into(),
-                None => velarx_content::pull::stored::json_z(&toc),
-            };
             layers.push(LazyLayer {
                 key: *key,
                 desc: desc.clone(),
                 diff_id: *diff_id,
                 toc,
                 tarsplit,
-                toc_z,
+                toc_z: toc_z.into(),
                 meta,
             });
         }
@@ -2435,9 +2430,8 @@ mod tests {
                 owners: "[[],[]]".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
             },
-            toc: &toc.to_string(),
             tarsplit: &tarsplit,
-            toc_z: None,
+            toc_z: &zstd::encode_all(toc.to_string().as_bytes(), 3).unwrap(),
         })
         .unwrap();
         let manifest: OciManifest = serde_json::from_value(serde_json::json!({

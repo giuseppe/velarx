@@ -1865,11 +1865,7 @@ impl StorageDriver for ComposefsDriver {
                 )
             })?;
             if let Some(layer) = area.layer(&key).map_err(|e| refused(e.into()))? {
-                let text = layer.toc_text().map_err(|e| refused(e.into()))?;
-                tocs.push((
-                    key,
-                    serde_json::from_str::<Toc>(&text).map_err(|e| refused(e.into()))?,
-                ));
+                tocs.push((key, layer.toc().map_err(|e| refused(e.into()))?));
                 recorded.insert(key, layer.meta.erofs.clone());
             }
         }

@@ -846,7 +846,6 @@ impl ImageService {
                     )));
                 }
                 accepted.made.insert(m.key, (m.artifact, m.image));
-                accepted.tocs.insert(m.key, m.toc);
             }
             match answer {
                 Ok(f) => {
@@ -871,9 +870,8 @@ impl ImageService {
     }
 
     /// What the pull of the lazy `layer` needs of its verified table `toc`,
-    /// made at once: the identity and the EROFS image of the layer, the
-    /// JSON of the table its staging keeps, and its files, with the first
-    /// that the store has with another size.
+    /// made at once: the identity and the EROFS image of the layer, and its
+    /// files, with the first that the store has with another size.
     async fn made_of_table(
         layer: &OciDescriptor,
         toc: &Arc<velarx_storage::Toc>,
@@ -884,10 +882,6 @@ impl ImageService {
             let toc = toc.clone();
             move || storage::identity_of(&key, &toc)
         });
-        let json = tokio::task::spawn_blocking({
-            let toc = toc.clone();
-            move || serde_json::to_string(&*toc)
-        });
         let files: Vec<(String, u64)> = toc
             .entries
             .iter()
@@ -897,12 +891,10 @@ impl ImageService {
         let stored_conflict = db.file_size_conflict(files.clone()).await?;
         let task = |e: tokio::task::JoinError| ImageError::Layer(format!("layer {key}: {e}"));
         let (key, artifact, image) = identity.await.map_err(task)??;
-        let toc = json.await.map_err(task)??;
         Ok(MadeOfTable {
             key,
             artifact,
             image,
-            toc,
             files,
             stored_conflict,
         })
@@ -1540,7 +1532,6 @@ impl ImageService {
         let Accepted {
             found: lazy_found,
             made: made_early,
-            tocs: mut staged_tocs,
         } = accepted;
         let mut content = match source {
             Some(source) => ContentFeed::new(net, source, self.db.clone(), limits),
@@ -1729,16 +1720,10 @@ impl ImageService {
                 let m = made.get(&d.key).ok_or_else(|| {
                     ImageError::Layer(format!("no EROFS image was made for layer {}", d.key))
                 })?;
-                // (a layer the storage driver holds already was not probed:
-                // its table is the one the feed checked)
-                let toc = match staged_tocs.remove(&d.key) {
-                    Some(toc) => toc,
-                    None => serde_json::to_string(&*d.toc)?,
-                };
                 pull::stage_layer(
                     &area,
                     &mut barrier,
-                    (d, &toc),
+                    d,
                     registry_ref.as_deref(),
                     reach,
                     (&m.image_digest, &m.owners),
@@ -1911,12 +1896,11 @@ pub(super) struct Settling<'a> {
 
 /// The lazy layers [`ImageService::accept_lazy`] accepted, by blob digest,
 /// with what was made of their tables by layer: their identities and EROFS
-/// images, and the JSON of the tables their staging keeps.
+/// images.
 #[derive(Default)]
 struct Accepted {
     found: HashMap<String, pull::lazy::Found>,
     made: Made,
-    tocs: HashMap<LayerKey, String>,
 }
 
 /// [`ImageService::made_of_table`].
@@ -1924,7 +1908,6 @@ struct MadeOfTable {
     key: LayerKey,
     artifact: crate::storage_driver::LayerArtifact,
     image: velarx_fuse::layer_erofs::LayerImage,
-    toc: String,
     files: Vec<(String, u64)>,
     stored_conflict: Option<(String, u64, u64)>,
 }

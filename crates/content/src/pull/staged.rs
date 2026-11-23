@@ -15,8 +15,8 @@
 //!                         to a fetcher: `lease` (`flock`, held while files
 //!                         are fetched into it), and for a lazily staged
 //!                         layer layer.json (written last: the publish
-//!                         point), toc.json, tarsplit.zst, toc.zst (the
-//!                         table as the registry sent it)
+//!                         point), tarsplit.zst, toc.zst (the table as
+//!                         the registry sent it)
 //! composefs/              the EROFS images of the staged layers, moved to
 //!                         the store's `composefs/` with the layer's commit
 //!                         (`objects` beside it, never made, stands for the
@@ -251,8 +251,9 @@ impl StagedLayer {
         }
     }
 
-    pub fn toc_text(&self) -> io::Result<String> {
-        std::fs::read_to_string(self.dir.join("toc.json"))
+    /// The table of contents the layer is stored by, made from its table.
+    pub fn toc(&self) -> io::Result<velarx_storage::Toc> {
+        crate::pull::stored::stored_view(&self.toc_z()?, &self.key()).map_err(io::Error::other)
     }
 
     pub fn tarsplit(&self) -> io::Result<Vec<u8>> {
@@ -260,21 +261,17 @@ impl StagedLayer {
     }
 
     /// The table as the registry sent it, recorded with the layer.
-    pub fn toc_z(&self) -> io::Result<Option<Vec<u8>>> {
-        match std::fs::read(self.dir.join("toc.zst")) {
-            Ok(toc_z) => Ok(Some(toc_z)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
+    pub fn toc_z(&self) -> io::Result<Vec<u8>> {
+        std::fs::read(self.dir.join("toc.zst"))
     }
 }
 
 /// What a layer is published with.
 pub struct NewLayer<'a> {
     pub meta: StagedLayerMeta,
-    pub toc: &'a str,
     pub tarsplit: &'a [u8],
-    pub toc_z: Option<&'a [u8]>,
+    /// The table as the registry sent it
+    pub toc_z: &'a [u8],
 }
 
 /// A pull in the area, with what is known of its completion.
@@ -632,11 +629,8 @@ impl Staging {
         }
         // (`layer.json` is the publish point: without it, nothing reads the
         // table and the tar-split, which a publish cut short left)
-        barrier.write(&dir.join("toc.json"), layer.toc.as_bytes())?;
         barrier.write(&dir.join("tarsplit.zst"), layer.tarsplit)?;
-        if let Some(toc_z) = layer.toc_z {
-            barrier.write(&dir.join("toc.zst"), toc_z)?;
-        }
+        barrier.write(&dir.join("toc.zst"), layer.toc_z)?;
         barrier.publish(
             &dir.join("layer.json"),
             &serde_json::to_vec(&layer.meta).map_err(io::Error::other)?,
@@ -1071,14 +1065,12 @@ impl Staging {
             let Ok(Some(layer)) = self.layer(&key) else {
                 continue;
             };
-            let Ok(text) = layer.toc_text() else {
+            let Ok(toc) = layer.toc() else {
                 continue;
             };
-            if let Ok(toc) = serde_json::from_str::<velarx_storage::Toc>(&text) {
-                for e in &toc.entries {
-                    if let Some(d) = e.verity() {
-                        out.insert(d, e.size);
-                    }
+            for e in &toc.entries {
+                if let Some(d) = e.verity() {
+                    out.insert(d, e.size);
                 }
             }
         }
@@ -1164,9 +1156,8 @@ mod tests {
                 area.publish_layer_in(
                     &NewLayer {
                         meta,
-                        toc: "{}",
                         tarsplit: b"ts",
-                        toc_z: None,
+                        toc_z: b"tz",
                     },
                     &mut barrier,
                 )
@@ -1195,19 +1186,14 @@ mod tests {
         area.publish_layer_in(
             &NewLayer {
                 meta,
-                toc: "{}",
                 tarsplit: b"ts",
-                toc_z: Some(b"tz"),
+                toc_z: b"tz",
             },
             &mut barrier,
         )
         .unwrap();
         let dir = area.layer_dir(&key);
-        for (name, bytes) in [
-            ("toc.json", &b"{}"[..]),
-            ("tarsplit.zst", b"ts"),
-            ("toc.zst", b"tz"),
-        ] {
+        for (name, bytes) in [("tarsplit.zst", &b"ts"[..]), ("toc.zst", b"tz")] {
             assert_eq!(std::fs::read(dir.join(name)).unwrap(), bytes);
         }
         assert!(area.layer(&key).unwrap().is_none());
@@ -1225,9 +1211,8 @@ mod tests {
         let (meta, key) = layer(1);
         area.publish_layer(&NewLayer {
             meta,
-            toc: "{}",
             tarsplit: b"ts",
-            toc_z: None,
+            toc_z: b"tz",
         })
         .unwrap();
         let old = pull(1, "old");
@@ -1265,9 +1250,8 @@ mod tests {
         let (meta, key) = layer(1);
         area.publish_layer(&NewLayer {
             meta: meta.clone(),
-            toc: "{\"version\":1,\"entries\":[]}",
             tarsplit: b"ts",
-            toc_z: None,
+            toc_z: b"tz",
         })
         .unwrap();
         let got = area.layer(&key).unwrap().unwrap();
