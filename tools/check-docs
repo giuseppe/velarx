@@ -80,7 +80,7 @@ STALE = [
     # velarx reads its own files, not podman's
     (
         r"containers\.conf",
-        r"(README\.md|CHANGELOG\.md|docs/.*|man/.*|config\.toml\.example"
+        r"(README\.md|docs/.*|man/.*|config\.toml\.example"
         r"|interfaces/.*|systemd/.*|Makefile)",
         r"reads no containers\.conf|not read|reads nothing|nothing of",
     ),

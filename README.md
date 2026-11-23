@@ -178,7 +178,6 @@ do.
 * [docs/USERNS.md](docs/USERNS.md): user namespaces and id mappings.
 * [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md): what is protected and from whom.
 * [docs/CRI.md](docs/CRI.md): the CRI server.
-* [CHANGELOG.md](CHANGELOG.md): what changed in each release.
 
 ## License
 
