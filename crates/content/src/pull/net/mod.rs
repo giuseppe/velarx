@@ -60,6 +60,27 @@ impl Net {
         self.origin()?.path_index().await
     }
 
+    /// Whether the registry is one of the sources of the pull: the places
+    /// it keeps signatures in are looked at only then.
+    pub fn has_registry(&self) -> bool {
+        match self {
+            Net::Origin(origin) => origin.has_registry(),
+            Net::Offline => false,
+        }
+    }
+
+    /// The records of the signatures of the manifest `digest` that the
+    /// fetchers among the sources give (untrusted).
+    pub async fn fetched_signatures(
+        &self,
+        digest: &Digest,
+    ) -> Vec<crate::fetcher::fetch::SignedRecord> {
+        match self {
+            Net::Origin(origin) => origin.fetched_signatures(digest).await,
+            Net::Offline => Vec::new(),
+        }
+    }
+
     /// The signature at `url` of a lookaside storage (http or https), at
     /// most `limit` bytes, None when there is none: the registry fetcher
     /// reads it.

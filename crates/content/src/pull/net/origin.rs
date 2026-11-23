@@ -8,7 +8,7 @@
 //! their own.
 //! Everything the fetcher sends is untrusted: the callers check the digests.
 
-use crate::fetcher::fetch::{Blob, FetcherError};
+use crate::fetcher::fetch::{Blob, FetcherError, SignedRecord, SIGNATURES_MAX_BYTES};
 use crate::fetcher::fetch_client::{Access, CallError, FetchConn, Scoping};
 use crate::fetcher::proto::{Hit, RegistryError, Remote};
 use crate::list::RegistryOrigin;
@@ -323,6 +323,23 @@ impl OriginNet {
         ImageError::transfer_of(REGISTRY, what, FailureClass::Unavailable, reason)
     }
 
+    /// Whether the registry is one of the sources.
+    pub fn has_registry(&self) -> bool {
+        self.sources.iter().any(|s| matches!(s, Source::Registry))
+    }
+
+    /// The records of the signatures of the manifest `digest` that the
+    /// fetchers among the sources give.
+    pub async fn fetched_signatures(&self, digest: &Digest) -> Vec<SignedRecord> {
+        let mut records = Vec::new();
+        for source in &self.sources {
+            if let Source::Fetchers(fetchers) = source {
+                records.extend(fetchers.signatures(&digest.to_string()).await);
+            }
+        }
+        records
+    }
+
     /// The manifest `reference` (a tag or a digest) names and the digest of
     /// its bytes, from the first source that has it (only the registry
     /// resolves a tag); None if the registry does not have it.
@@ -552,6 +569,37 @@ impl MetadataSources {
         None
     }
 
+    /// The records of the signatures of `reference` (a manifest digest, or
+    /// a name and tag) that the fetchers give, together: those of one
+    /// manifest digest are one record, each signature once.  Untrusted, to
+    /// be judged.
+    pub async fn signatures(&self, reference: &str) -> Vec<SignedRecord> {
+        let mut links = self.links.lock().await;
+        let mut records = Vec::new();
+        for link in links.iter_mut() {
+            let got = crate::idle::within(
+                link.idle,
+                link.conn.get_signatures(reference, SIGNATURES_MAX_BYTES),
+            )
+            .await;
+            let file = match got {
+                Ok(file) => file,
+                Err(e) => {
+                    tracing::debug!("The fetcher {} gives no signatures: {e}", link.name);
+                    continue;
+                }
+            };
+            let given = velarx_base::sealed::read_sealed_whole(&file, SIGNATURES_MAX_BYTES).ok();
+            let Some(given) =
+                given.and_then(|b| serde_json::from_slice::<Vec<SignedRecord>>(&b).ok())
+            else {
+                continue;
+            };
+            records.extend(given);
+        }
+        SignedRecord::merged(records)
+    }
+
     /// The blob `blob` names, of exactly its size, from the first fetcher
     /// that has it.
     pub async fn blob(&self, blob: &Blob) -> Option<Bytes> {
@@ -694,6 +742,48 @@ mod tests {
         let wrong = Digest::of(velarx_types::digest::Algorithm::Sha256, b"other");
         let e = net.manifest(&wrong.to_string()).await.unwrap_err();
         assert!(e.to_string().contains("no other has it"), "{e}");
+    }
+
+    /// The records of several fetchers are together, those of a digest one
+    /// record with each signature once; what is not records is nobody's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_signatures_of_the_fetchers_are_together() {
+        use crate::pull::staged_fetch::{Link, REGISTRY_IDLE};
+        let mut links = Vec::new();
+        let mut keep = Vec::new();
+        for (name, body) in [
+            ("one", r#"[{"digest":"sha256:aa","signatures":["a"]}]"#),
+            (
+                "two",
+                r#"[{"digest":"sha256:aa","signatures":["b","a"]},{"digest":"sha256:bb","signatures":["c"]}]"#,
+            ),
+            ("three", "not records"),
+        ] {
+            let fetcher = crate::serve_fetch::LocalFetcher::start(
+                Arc::new(crate::fakes::Metadata(body.as_bytes().to_vec())),
+                crate::activation::Limits::default(),
+            )
+            .unwrap();
+            links.push(Link {
+                name: name.into(),
+                conn: FetchConn::new(fetcher.connect().unwrap()).unwrap(),
+                idle: REGISTRY_IDLE,
+            });
+            keep.push(fetcher);
+        }
+        let sources = MetadataSources::open(links).await;
+        let got = sources.signatures("r.io/a:1").await;
+        let shown: Vec<(&str, &[String])> = got
+            .iter()
+            .map(|r| (r.digest.as_str(), &r.signatures[..]))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("sha256:aa", &["a".to_string(), "b".to_string()][..]),
+                ("sha256:bb", &["c".to_string()][..])
+            ]
+        );
     }
 
     async fn sources_of(bytes: &[u8]) -> (Arc<MetadataSources>, crate::serve_fetch::LocalFetcher) {

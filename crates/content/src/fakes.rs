@@ -138,4 +138,15 @@ impl StagingFetcher for Metadata {
             .map_err(|e| FetcherError::failed(e.to_string()))?;
         Ok(file.into())
     }
+
+    async fn get_signatures(
+        &self,
+        _scope: &Scope,
+        _reference: &str,
+        _max: u64,
+    ) -> Result<std::fs::File, FetcherError> {
+        let file = velarx_base::sealed::sealed_memory(&self.0)
+            .map_err(|e| FetcherError::failed(e.to_string()))?;
+        Ok(file.into())
+    }
 }
