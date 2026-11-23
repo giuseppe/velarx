@@ -725,7 +725,18 @@ impl ContentFeed {
                     ))
                 })?,
         };
-        pull::pull_layer_files(ctx, target, &layer.descriptor, meta, &layer.diff_id, report).await
+        // (the files of a call are written at the places the driver chose for
+        // it: a file another call fetches is not in them)
+        let ctx = ctx.clone().with_own_fetching();
+        pull::pull_layer_files(
+            &ctx,
+            target,
+            &layer.descriptor,
+            meta,
+            &layer.diff_id,
+            report,
+        )
+        .await
     }
 
     /// Read a layer that has no table of contents whole, into a spool of the

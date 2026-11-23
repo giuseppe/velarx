@@ -295,6 +295,13 @@ impl PullCtx {
         self
     }
 
+    /// The layers of this ctx fetch files of their own: what another layer
+    /// fetches is not in the sink of this one ([`Fetching`]).
+    pub fn with_own_fetching(mut self) -> Self {
+        self.fetching = Arc::default();
+        self
+    }
+
     /// The driver says what it has ([`PullCtx::have_fn`]).
     pub fn with_have(mut self, have: Have) -> Self {
         self.have = Some(have);

@@ -48,14 +48,16 @@ config_with () { # NAME LINES...
     { printf '%s\n' "$@"; grep -v '^storage\.\(driver\|varlink\)' "$CONFIG"; } > "$WORKDIR/$name.toml"
 }
 
-# two_layer_image: $E2E_REGISTRY/e2e/varlink-two:1, the image $IMAGE and one
-# layer of a file more, pushed zstd:chunked from the store of an engine on the
-# vfs driver of its own, which states
-# the digest of the merged EROFS image in its manifest.  Made once for the
-# registry.
+# two_layer_image [NAME [COMMAND]]: $E2E_REGISTRY/e2e/NAME:1 (default
+# varlink-two), the image $IMAGE and one layer of what the shell COMMAND makes
+# (default: a file /two),
+# pushed zstd:chunked from the store of an engine on the vfs driver of its
+# own, which states the digest of the merged EROFS image in its manifest.
+# Made once for the registry.
 two_layer_image () {
+    local name=${1:-varlink-two} cmd=${2:-echo two > /two}
     curl -sf -o /dev/null -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
-        "http://$E2E_REGISTRY/v2/e2e/varlink-two/manifests/1" && return 0
+        "http://$E2E_REGISTRY/v2/e2e/$name/manifests/1" && return 0
     local d=$VDIR/vfs pid vx
     mkdir -p "$d" && chmod 700 "$d"
     sed -e 's#^storage\.driver.*#storage.driver = "vfs"#' -e '/^storage\.varlink/d' \
@@ -65,10 +67,10 @@ two_layer_image () {
         e2e_die "the engine for the image does not start: $(tail -3 "$d/daemon.log")"
     vx () { "$BIN/velarx" --config "$d/config.toml" --socket "$d/engine.sock" "$@" 3>&-; }
     vx image pull "$IMAGE" > /dev/null &&
-        vx container run --name two --network none "$IMAGE" sh -c 'echo two > /two' > /dev/null &&
-        vx container commit two localhost/e2e/varlink-two:1 > /dev/null &&
-        vx image push --tls-verify=false --compression-format zstd:chunked localhost/e2e/varlink-two:1 \
-            "$E2E_REGISTRY/e2e/varlink-two:1" > "$d/push.log" 2>&1
+        vx container run --name two --network none "$IMAGE" sh -c "$cmd" > /dev/null &&
+        vx container commit two localhost/e2e/$name:1 > /dev/null &&
+        vx image push --tls-verify=false --compression-format zstd:chunked localhost/e2e/$name:1 \
+            "$E2E_REGISTRY/e2e/$name:1" > "$d/push.log" 2>&1
     local rc=$?
     kill "$pid" 2> /dev/null
     e2e_wait_exit "$pid" 30

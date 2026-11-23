@@ -714,3 +714,14 @@ time.sleep(6)' "$VDIR/s.sock" 3>&- &
     sh_ system prune --all --volumes --force --filter until=1 > /dev/null 2>&1
     check "a filter is given, the store stays" 0 "$(test -d "$(sdir)"; echo $?)"
 }
+
+@test "a layer with files its predecessor has: one pull fetches both, each file is in the layer that has it" {
+    two_layer_image varlink-usr 'cp -a /usr /shared; echo own > /own'
+    shared=$E2E_REGISTRY/e2e/varlink-usr:1
+    # (the store is dropped: both layers are missing from the service)
+    sh_ container rm -f -t 0 -a > /dev/null 2>&1
+    sh_ system prune --all --volumes --force > /dev/null 2>&1
+    out=$(sh_ image pull "$shared" 2>&1)
+    check "the pull ($out)" 0 $?
+    check "a file of the first layer, and its copy in the second" same "$(sh_ container run --rm --network none "$shared" sh -c 'cmp /etc/os-release /shared/lib/os-release && echo same')"
+}
