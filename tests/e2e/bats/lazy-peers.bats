@@ -15,7 +15,7 @@
 #   VELARX_BINDIR=target/debug E2E_IMAGE=image bats tests/e2e/bats/lazy-peers.bats
 #
 # LAZY_DIGEST=sha512 makes the image one of sha512 digests first (a build
-# --digest sha512 --squash-all of it), and the nodes pull that.
+# --digest sha512 --squash-all of it, with a big file), and the nodes pull that.
 
 load helpers
 
@@ -77,11 +77,14 @@ setup_file () {
         [ -z "${LAZY_IMAGE_SEALED:-}" ] || { node s $((PORT_A + 3)); sh_ s image pull --tls-verify=false "$IMAGE" > /dev/null 2>&1; }
         local big=$E2E_REGISTRY/velarx-e2e/lazy-peers-512-$$
         mkdir -p "$WORKDIR/ctx512"
-        printf 'FROM %s\n' "$IMAGE" > "$WORKDIR/ctx512/Containerfile"
+        # (and a file too big to be asked of the peers whole: they have its chunks)
+        head -c 20971520 /dev/urandom > "$WORKDIR/ctx512/big.bin"
+        printf 'FROM %s\nCOPY big.bin /data/big.bin\n' "$IMAGE" > "$WORKDIR/ctx512/Containerfile"
         { sh_ s build --digest sha512 --squash-all -t localhost/lazy512:1 "$WORKDIR/ctx512" &&
           sh_ s image push --tls-verify=false --compression-format zstd:chunked localhost/lazy512:1 "$big:zstd"
         } > "$WORKDIR/seal512.log" 2>&1 || { echo "cannot make the sha512 image"; cat "$WORKDIR/seal512.log"; exit 1; }
-        IMAGE=$big:zstd@$(sh_ s image inspect --format '{{.Digest}}' localhost/lazy512:1)
+        # (the digest of the manifest as pushed: the compressed layer is not the local one)
+        IMAGE=$big:zstd@$(sed -n 's/^Digest: //p' "$WORKDIR/seal512.log")
         check_match "the image is a sha512 one" '@sha512:[0-9a-f]{128}$' "$IMAGE"
     fi
 }
@@ -247,6 +250,20 @@ wait_profile () { e2e_wait_glob "$WORKDIR/b/store/composefs/*.profile.json" 5; }
     # (a, at debug level, logs what the gossip tells it of a peer)
     e2e_wait_line "$WORKDIR/a.p2p.log" "Peer $d_id announced" 30 || true
     check_match "node a sees the image of node d" "$d_id" "$(p2p_ a images 2>&1)"
+}
+
+# An eager pull whose only source of files is a peer: node g has node a for
+# a peer, and the registry gives only the metadata (with LAZY_DIGEST=sha512,
+# the chunks asked of the peer are sha512 ones).
+@test "a node pulls eagerly from a peer, the registry gives only the metadata" {
+    local out
+    [ -n "${peer_id:-}" ] || { echo "no peer id of node a (the first test failed or did not run)" >&2; exit 1; }
+    node g $((PORT_A + 8)) "/ip4/127.0.0.1/tcp/$PORT_A/p2p/$peer_id" debug
+    e2e_wait_line "$WORKDIR/g.p2p.log" "Connected to $peer_id" 30 || true
+    out=$(sh_ g image pull --tls-verify=false "$IMAGE" 2>&1)
+    check "node g pulls the image" 0 $?
+    check_match "the registry gave only the metadata" "\([0-4]\.[0-9]% registry" "$out"
+    check_match "the peer gave the files" "(9[5-9]|100)\.[0-9]% p2p" "$out"
 }
 
 # Node e pulled two versions of a big file, the second made of the chunks of
