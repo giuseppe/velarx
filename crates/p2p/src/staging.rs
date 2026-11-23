@@ -33,7 +33,7 @@ use velarx_content::fetcher::fetch::{
 use velarx_content::serve_fetch::{Described, FetchCall, LayerScope, Out, Scope, StagingFetcher};
 use velarx_content::stager::{self, name_of, LayerToc, Name, Unnamed};
 use velarx_storage::Toc;
-use velarx_types::digest::Digest;
+use velarx_types::digest::{Algorithm, Digest};
 
 /// The most objects of one `Fetch`.
 pub const MAX_OBJECTS: u32 = 4096;
@@ -274,15 +274,9 @@ type PeerChunk = (String, u64, u64);
 /// The chunks of a file to ask the peers for, by its entry `at` of the
 /// table: (digest, place in the file, size); none when one has no digest of
 /// its own (only the origin can serve it).
-fn chunks_of(toc: &Toc, at: usize) -> Option<(u64, Vec<PeerChunk>)> {
-    let fc = velarx_content::pull::chunked::file_chunks(
-        toc,
-        velarx_types::digest::Algorithm::Sha256,
-        at,
-        None,
-        MAX_ITEM_BYTES as u64,
-    )
-    .ok()?;
+fn chunks_of(toc: &Toc, alg: Algorithm, at: usize) -> Option<(u64, Vec<PeerChunk>)> {
+    let fc = velarx_content::pull::chunked::file_chunks(toc, alg, at, None, MAX_ITEM_BYTES as u64)
+        .ok()?;
     let mut chunks = Vec::with_capacity(fc.chunks.len());
     for c in fc.chunks {
         if !crate::limits::is_digest(&c.digest) {
@@ -693,6 +687,7 @@ impl StagingFetcher for PeerSource {
                     nobody.push(i as u32);
                     continue;
                 };
+                let alg = name.alg();
                 // (a file of one chunk, or one with a chunk that has no digest
                 // of its own, is asked whole by its fs-verity digest: the
                 // name of the object of a peer's store)
@@ -702,15 +697,16 @@ impl StagingFetcher for PeerSource {
                     }
                     _ => None,
                 };
-                let chunked = chunks_of(&indexed.toc, at).filter(|(_, c)| c.len() > 1);
+                let chunked = chunks_of(&indexed.toc, alg, at).filter(|(_, c)| c.len() > 1);
                 // (a file of many chunks is asked by them first, the way the
                 // peers that pulled the same layer have them; a peer that
                 // has the file by another cutting, or from a layer it made
                 // some other way, has it by its fs-verity digest)
                 let again = (chunked.is_some() && whole.is_some())
                     .then(|| (key.clone(), entry.size, name.clone()));
-                let Some((size, chunks)) =
-                    chunked.or(whole).or_else(|| chunks_of(&indexed.toc, at))
+                let Some((size, chunks)) = chunked
+                    .or(whole)
+                    .or_else(|| chunks_of(&indexed.toc, alg, at))
                 else {
                     nobody.push(i as u32);
                     continue;
@@ -817,6 +813,36 @@ mod tests {
                 size: Some(*s),
             })
             .collect()
+    }
+
+    /// The chunks of a file of a sha512 layer are asked of the peers by
+    /// their sha512 digests, as those of a sha256 layer by sha256.
+    #[test]
+    fn the_chunks_of_a_sha512_file_are_asked_by_their_digests() {
+        use velarx_storage::{TocEntry, TocEntryType};
+        let sha512 = |b: &[u8]| Digest::of(Algorithm::Sha512, b).to_string();
+        let mut file = TocEntry::new("f", TocEntryType::Reg);
+        file.size = 8;
+        file.digest = Some(sha512(b"0123456789abcdef"));
+        file.chunk_digest = Some(sha512(b"01234567"));
+        file.chunk_size = 8;
+        let mut second = TocEntry::new("f", TocEntryType::Chunk);
+        second.chunk_digest = Some(sha512(b"89abcdef"));
+        second.chunk_size = 8;
+        second.chunk_offset = 8;
+        second.offset = 20;
+        file.size = 16;
+        file.end_offset = 20;
+        let toc = Toc {
+            version: 1,
+            entries: vec![file, second],
+            tar_split_digest: None,
+        };
+        let (size, chunks) = chunks_of(&toc, Algorithm::Sha512, 0).unwrap();
+        assert_eq!(size, 16);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[1], (sha512(b"89abcdef"), 8, 8));
+        assert!(chunks_of(&toc, Algorithm::Sha256, 0).is_none());
     }
 
     /// A file that could not be written for a full disk is `no_space`:

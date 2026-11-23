@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! A fetcher of items named by their digests: a directory of files named
-//! by the hex of the sha256 of their content (with or without `sha256:`; a
-//! chunk cache on a disk or an NFS mount, a mirror rsynced from elsewhere),
+//! by the hex of the digest of their content (with or without `sha256:`;
+//! a chunk cache on a disk or an NFS mount, a mirror rsynced from elsewhere),
 //! or any other [`Items`].  A file of a layer is staged from the item of
 //! its content, or from the items of its chunks, by the object contract
-//! ([`crate::stager`]): every chunk is checked against the sha256 the table
+//! ([`crate::stager`]): every chunk is checked against the digest the table
 //! gives it, the file against its name.  A layer without a table of
 //! contents is answered to `Probe` with its index (its table and tar-split, a
 //! claim the engine replays), and its files are staged as those of a table.
@@ -46,7 +46,7 @@ pub trait Items: Send + Sync {
     }
 }
 
-/// A directory of files named by the hex of the sha256 of their content.
+/// A directory of files named by the digest of their content (or its hex).
 pub struct Dir(pub PathBuf);
 
 impl Items for Dir {
@@ -147,13 +147,8 @@ fn stage_file(
         file.finish(staging.as_fd(), &name, verity)?;
         return Ok(true);
     }
-    let Ok(fc) = crate::pull::chunked::file_chunks(
-        &indexed.toc,
-        velarx_types::digest::Algorithm::Sha256,
-        at,
-        None,
-        MAX_ITEM,
-    ) else {
+    let Ok(fc) = crate::pull::chunked::file_chunks(&indexed.toc, name.alg(), at, None, MAX_ITEM)
+    else {
         return Ok(false);
     };
     let mut pieces = Vec::with_capacity(fc.chunks.len());
@@ -350,6 +345,50 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A file of a sha512 layer is staged from the items of its chunks,
+    /// asked by their sha512 digests.
+    #[test]
+    fn a_sha512_file_is_staged_from_its_chunks() {
+        use velarx_storage::{Toc, TocEntry, TocEntryType};
+        use velarx_types::digest::Algorithm;
+        let items = tempfile::tempdir().unwrap();
+        let sha512 = |b: &[u8]| Digest::of(Algorithm::Sha512, b);
+        for part in [&b"01234567"[..], b"89abcdef"] {
+            std::fs::write(items.path().join(sha512(part).hex()), part).unwrap();
+        }
+        let key = sha512(b"0123456789abcdef").to_string();
+        let mut file = TocEntry::new("f", TocEntryType::Reg);
+        file.size = 16;
+        file.digest = Some(key.clone());
+        file.chunk_digest = Some(sha512(b"01234567").to_string());
+        file.chunk_size = 8;
+        file.end_offset = 20;
+        let mut second = TocEntry::new("f", TocEntryType::Chunk);
+        second.chunk_digest = Some(sha512(b"89abcdef").to_string());
+        second.chunk_size = 8;
+        second.chunk_offset = 8;
+        second.offset = 20;
+        let indexed = LayerToc {
+            toc: Toc {
+                version: 1,
+                entries: vec![file, second],
+                tar_split_digest: None,
+            },
+            at: HashMap::from([(key.clone(), 0)]),
+        };
+        let staging_dir = tempfile::tempdir().unwrap();
+        let staging = std::fs::File::open(staging_dir.path()).unwrap();
+        let staged = stage_file(
+            &Dir(items.path().into()),
+            &indexed,
+            (&key, 0),
+            &staging,
+            false,
+        );
+        assert!(staged.unwrap());
+        assert!(stager::staged(&staging, &key));
+    }
 
     struct Indexes(HashMap<String, Vec<u8>>);
 

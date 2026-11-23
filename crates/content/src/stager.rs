@@ -57,6 +57,11 @@ impl Name {
             Name::Verity(d) | Name::Content(d) => d,
         }
     }
+
+    /// The algorithm of the digests of the layer the name is of.
+    pub fn alg(&self) -> velarx_types::digest::Algorithm {
+        self.digest().alg()
+    }
 }
 
 /// The path below a staging directory of the file a table of contents names
