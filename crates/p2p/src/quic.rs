@@ -71,6 +71,10 @@
 //! * the startup profile of an image ([`OP_PROFILE`],
 //!   [`velarx_content::fetcher::Kind::Profile`]): as an index, by the image's id as a
 //!   digest, at most [`velarx_content::fetcher::fetch::PROFILE_MAX_BYTES`].
+//! * the signatures of a manifest or a name ([`OP_SIGNATURES`], the records of
+//!   `GetSignatures`): as an index, with the reference as text in place of the
+//!   digest (the count of the request is its length in bytes, at most
+//!   [`MAX_REFERENCE`]).
 //!
 //! Resources: connections, streams per connection and requests at the same
 //! time are bounded, and what the server accepts to receive is small
@@ -101,6 +105,10 @@ pub const OP_CHUNKS: u8 = 1;
 pub const OP_INDEX: u8 = 2;
 pub const OP_PROFILE: u8 = 3;
 pub const OP_PROBE: u8 = 4;
+pub const OP_SIGNATURES: u8 = 5;
+/// The longest reference (a name with its tag, or a digest) of a request
+/// for signatures.
+const MAX_REFERENCE: usize = 512;
 const ABSENT: u8 = 0;
 const HERE: u8 = 1;
 const NO_ROOM: u8 = 2;
@@ -618,6 +626,24 @@ async fn read_digests(
     digests_of(kinds, &raw)
 }
 
+/// The reference of a request for signatures: `length` bytes of text.
+async fn read_reference(
+    recv: &mut quinn::RecvStream,
+    length: usize,
+    idle: Duration,
+) -> io::Result<String> {
+    if length == 0 || length > MAX_REFERENCE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a reference of a bad length",
+        ));
+    }
+    let mut text = vec![0u8; length];
+    read(recv, &mut text, idle).await?;
+    String::from_utf8(text)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "a reference that is not text"))
+}
+
 /// The answer to a request for chunks, read chunk by chunk.
 pub struct Reply {
     _send: quinn::SendStream,
@@ -1089,6 +1115,29 @@ impl Quic {
         .await
     }
 
+    /// The records of the signatures of `reference` (a `repository:tag` or a
+    /// manifest digest) from the peer at `addr`, if it has any, in at most
+    /// `max` bytes.  Not checked: the asker judges the signatures.
+    pub async fn signatures(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        reference: &str,
+        max: u64,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let max = max.min(velarx_content::fetcher::fetch::SIGNATURES_MAX_BYTES);
+        let length = u16::try_from(reference.len())
+            .ok()
+            .filter(|n| (1..=MAX_REFERENCE as u16).contains(n))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "a reference of a bad length")
+            })?;
+        let mut head = vec![OP_SIGNATURES, Urgency::Wait as u8];
+        head.extend_from_slice(&length.to_be_bytes());
+        head.extend_from_slice(reference.as_bytes());
+        head.extend_from_slice(&max.to_be_bytes());
+        self.item(addr, &head, max).await
+    }
+
     /// The one item named by `digest` of the operation `op` (an index, a
     /// profile), at most `max` bytes.
     async fn one(
@@ -1101,7 +1150,17 @@ impl Quic {
         let mut head = vec![op, Urgency::Wait as u8, 0, 1];
         head.extend_from_slice(&digests_wire(std::iter::once(layer))?);
         head.extend_from_slice(&max.to_be_bytes());
-        let (_send, mut recv) = self.open(addr, &head, &Via::Primary).await?;
+        self.item(addr, &head, max).await
+    }
+
+    /// The answer to the request `head` for an item of at most `max` bytes.
+    async fn item(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        head: &[u8],
+        max: u64,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let (_send, mut recv) = self.open(addr, head, &Via::Primary).await?;
         let mut status = [0u8; 1];
         read(&mut recv, &mut status, self.idle).await?;
         if status[0] == ABSENT {
@@ -1950,14 +2009,19 @@ impl Server {
         // (what is more urgent has the first of the bytes the connection
         // sends)
         send.set_priority(urgency as i32).map_err(other)?;
-        let count = digests_count(head)?;
-        let digests = read_digests(&mut recv, count, idle).await?;
+        let digests = if op == OP_SIGNATURES {
+            vec![read_reference(&mut recv, u16::from_be_bytes([c0, c1]) as usize, idle).await?]
+        } else {
+            read_digests(&mut recv, digests_count(head)?, idle).await?
+        };
+        let count = digests.len();
         let span = tracing::Span::current();
         span.record(
             "what",
             match head[0] {
                 OP_INDEX => "index",
                 OP_PROFILE => "profile",
+                OP_SIGNATURES => "signatures",
                 OP_PROBE => "probe",
                 _ => "chunks",
             },
@@ -1982,14 +2046,14 @@ impl Server {
                     .await?;
             }
             OP_PROBE if count == 1 => self.probe(&mut answer, &provider, &digests[0]).await?,
-            OP_INDEX | OP_PROFILE if count == 1 => {
+            OP_INDEX | OP_PROFILE | OP_SIGNATURES if count == 1 => {
                 let mut max = [0u8; 8];
                 read(&mut recv, &mut max, idle).await?;
-                let max = match head[0] {
-                    OP_INDEX => u64::from_be_bytes(max).min(MAX_ITEM_BYTES as u64),
-                    _ => u64::from_be_bytes(max)
-                        .min(velarx_content::fetcher::fetch::PROFILE_MAX_BYTES),
-                };
+                let max = u64::from_be_bytes(max).min(match head[0] {
+                    OP_INDEX => MAX_ITEM_BYTES as u64,
+                    OP_PROFILE => velarx_content::fetcher::fetch::PROFILE_MAX_BYTES,
+                    _ => velarx_content::fetcher::fetch::SIGNATURES_MAX_BYTES,
+                });
                 self.index(&mut answer, &provider, urgency, head[0], &digests[0], max)
                     .await?
             }
@@ -2057,6 +2121,7 @@ impl Server {
             let (p, l) = (provider.clone(), layer.to_string());
             let index = tokio::task::spawn_blocking(move || match op {
                 OP_PROFILE => p.get_profile(&l),
+                OP_SIGNATURES => p.get_signatures(&l),
                 _ => p.get_index(&l),
             })
             .await
@@ -3326,6 +3391,28 @@ mod tests {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Some(format!("profile of {image}").into_bytes()))
         }
+        fn get_signatures(&self, reference: &str) -> std::io::Result<Option<Vec<u8>>> {
+            Ok((reference != "none").then(|| format!("signatures of {reference}").into_bytes()))
+        }
+    }
+
+    /// The signatures of a name travel as text of the request, bounded in
+    /// the size asked and of a length the server takes.
+    #[tokio::test]
+    async fn the_signatures_of_a_name_are_asked_by_its_text() {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = served(Arc::new(Indexes(asked)));
+        let (_server, addr) = bind_with(provider, Limits::default());
+        let client = Quic::bind("127.0.0.1:0".parse().unwrap(), Arc::default(), KEY).unwrap();
+        let name = "docker.io/library/alpine:3";
+        let got = client.signatures(addr, name, 1000).await.unwrap().unwrap();
+        assert_eq!(got, format!("signatures of {name}").into_bytes());
+        assert_eq!(client.signatures(addr, name, 10).await.unwrap(), None);
+        assert_eq!(client.signatures(addr, "none", 1000).await.unwrap(), None);
+        // (nothing is sent for what the server would refuse)
+        let long = "a".repeat(MAX_REFERENCE + 1);
+        assert!(client.signatures(addr, &long, 1000).await.is_err());
+        assert!(client.signatures(addr, "", 1000).await.is_err());
     }
 
     #[tokio::test]

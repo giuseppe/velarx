@@ -114,6 +114,11 @@ pub struct Settings {
     /// the filter or ask for one digest
     #[serde(default)]
     pub announce_images: bool,
+    /// Answer the peers that ask for the signatures kept with a name and
+    /// tag (so that they can resolve the tag of an image this node pulled);
+    /// off, only those of a manifest digest are given
+    #[serde(default)]
+    pub serve_names: bool,
     /// Tell the peers a filter of the layers this node holds (a member can
     /// test a layer it knows in it, not list them); off, the peers ask the
     /// node one digest at a time
@@ -299,6 +304,7 @@ impl Default for Settings {
             hedge_ms: 0,
             stripe_peers: default_stripe_peers(),
             announce_images: false,
+            serve_names: false,
             advertise_layers: true,
             filter_fpr: default_filter_fpr(),
             filter_max_kib: default_filter_max_kib(),
@@ -593,6 +599,7 @@ mod tests {
         let s = Settings::load(&Config::default(), "p2p", Path::new("/etc/velarx")).unwrap();
         assert_eq!(s.quic_streams, 4);
         assert!(!s.announce_images, "no list of images is told by default");
+        assert!(!s.serve_names, "no name is answered by default");
         assert!(
             s.advertise_layers,
             "the filter of the layers is told by default"

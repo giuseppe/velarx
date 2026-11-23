@@ -126,6 +126,14 @@ pub trait Peers: Send + Sync + 'static {
         image: &str,
         max: u64,
     ) -> Result<Option<Vec<u8>>, PeerError>;
+    /// The records of the signatures of `reference`, if the peer has any, in
+    /// at most `max` bytes.
+    async fn signatures(
+        &self,
+        peer: PeerId,
+        reference: &str,
+        max: u64,
+    ) -> Result<Option<Vec<u8>>, PeerError>;
 }
 
 /// What the peers are asked through: the node (QUIC, the DHT), or the
@@ -178,6 +186,12 @@ pub trait Transport: Send + Sync + 'static {
         &self,
         peer: PeerId,
         image: &str,
+        max: u64,
+    ) -> super::P2PResult<Option<Vec<u8>>>;
+    async fn request_signatures(
+        &self,
+        peer: PeerId,
+        reference: &str,
         max: u64,
     ) -> super::P2PResult<Option<Vec<u8>>>;
 }
@@ -247,6 +261,15 @@ impl Transport for P2PNode {
     ) -> super::P2PResult<Option<Vec<u8>>> {
         P2PNode::request_profile(self, peer, image, max).await
     }
+
+    async fn request_signatures(
+        &self,
+        peer: PeerId,
+        reference: &str,
+        max: u64,
+    ) -> super::P2PResult<Option<Vec<u8>>> {
+        P2PNode::request_signatures(self, peer, reference, max).await
+    }
 }
 
 /// The peers as `T` reaches them: over QUIC, the only way data goes.
@@ -308,6 +331,18 @@ impl<T: Transport> Peers for NodePeers<T> {
     ) -> Result<Option<Vec<u8>>, PeerError> {
         self.0
             .request_profile(peer, image, max)
+            .await
+            .map_err(peer_error)
+    }
+
+    async fn signatures(
+        &self,
+        peer: PeerId,
+        reference: &str,
+        max: u64,
+    ) -> Result<Option<Vec<u8>>, PeerError> {
+        self.0
+            .request_signatures(peer, reference, max)
             .await
             .map_err(peer_error)
     }
@@ -1453,6 +1488,29 @@ impl PeerSource {
         Ok(())
     }
 
+    /// What the connected peers have of the signatures of `reference`: the
+    /// answer of each of at most `query_peers` of them, the best ranked
+    /// first.  Untrusted: whoever asks judges the signatures.
+    pub(crate) async fn signatures(&self, reference: &str, max: u64) -> Vec<Vec<u8>> {
+        let mut peers = self.peers.connected().await;
+        self.knowledge.rank(&mut peers);
+        peers.truncate(self.policy.query_peers);
+        let asked = peers.into_iter().map(|peer| async move {
+            match self.peers.signatures(peer, reference, max).await {
+                Ok(answer) => answer,
+                Err(e) => {
+                    debug!("P2P: the signatures of {reference} from {peer}: {e}");
+                    None
+                }
+            }
+        });
+        futures::future::join_all(asked)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     /// The chunks of a group from the best peer, and from a second one when
     /// the first is slow or has not everything: the first valid answer of
     /// each chunk is the one that is passed on, the requests still under way
@@ -2262,6 +2320,15 @@ mod tests {
                 .filter(|p| p.len() as u64 <= max)
                 .cloned())
         }
+
+        async fn signatures(
+            &self,
+            _: PeerId,
+            _: &str,
+            _: u64,
+        ) -> Result<Option<Vec<u8>>, PeerError> {
+            Ok(None)
+        }
     }
 
     #[derive(Default)]
@@ -2761,6 +2828,14 @@ mod tests {
         async fn profile(&self, _: PeerId, _: &str, _: u64) -> Result<Option<Vec<u8>>, PeerError> {
             Ok(None)
         }
+        async fn signatures(
+            &self,
+            _: PeerId,
+            _: &str,
+            _: u64,
+        ) -> Result<Option<Vec<u8>>, PeerError> {
+            Ok(None)
+        }
     }
 
     struct Passing(Collect, Arc<tokio::sync::Notify>);
@@ -2835,6 +2910,14 @@ mod tests {
             Ok(Presence::Has)
         }
         async fn profile(&self, _: PeerId, _: &str, _: u64) -> Result<Option<Vec<u8>>, PeerError> {
+            Ok(None)
+        }
+        async fn signatures(
+            &self,
+            _: PeerId,
+            _: &str,
+            _: u64,
+        ) -> Result<Option<Vec<u8>>, PeerError> {
             Ok(None)
         }
     }

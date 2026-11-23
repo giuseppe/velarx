@@ -102,6 +102,11 @@ pub trait ChunkProvider: Send + Sync + 'static {
     fn get_profile(&self, _image: &str) -> std::io::Result<Option<Vec<u8>>> {
         Ok(None)
     }
+    /// The records of the signatures of `reference` (a `repository:tag` or a
+    /// manifest digest) (`GetSignatures`)
+    fn get_signatures(&self, _reference: &str) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
     /// The files that hold `digests`, for those it can hand over; empty when
     /// it cannot (the bytes come from `get_chunk` then).  Blocking.
     fn open_chunks(&self, _digests: &[String]) -> std::io::Result<Vec<Option<ChunkFile>>> {
@@ -1058,6 +1063,21 @@ impl P2PNode {
     ) -> P2PResult<Option<Vec<u8>>> {
         let (quic, addr) = self.quic_path(peer).await?;
         quic.profile(addr, image, max)
+            .await
+            .map_err(|e| quic_error(peer, e))
+    }
+
+    /// The records of the signatures of `reference` (a `repository:tag` or a
+    /// manifest digest) from `peer` over QUIC, if it has any, in at most
+    /// `max` bytes.  Not checked: the asker judges the signatures.
+    pub async fn request_signatures(
+        &self,
+        peer: PeerId,
+        reference: &str,
+        max: u64,
+    ) -> P2PResult<Option<Vec<u8>>> {
+        let (quic, addr) = self.quic_path(peer).await?;
+        quic.signatures(addr, reference, max)
             .await
             .map_err(|e| quic_error(peer, e))
     }

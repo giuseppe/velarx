@@ -184,6 +184,25 @@ impl ChunkProvider for StoreContent {
         })
     }
 
+    fn get_signatures(&self, reference: &str) -> io::Result<Option<Vec<u8>>> {
+        self.runtime.block_on(async {
+            let mut conn = self.connection().await?;
+            let answer = conn
+                .signatures(
+                    reference,
+                    velarx_content::fetcher::fetch::SIGNATURES_MAX_BYTES,
+                )
+                .await
+                .map_err(|e| self.failed(e))?;
+            self.keep(conn);
+            match answer {
+                (Ok(reply), fds) => Self::item(fds, reply.file).map(Some),
+                (Err(store_service::StoreError::NotFound { .. }), _) => Ok(None),
+                (Err(e), _) => Err(io::Error::other(e)),
+            }
+        })
+    }
+
     fn open_chunks(&self, digests: &[String]) -> io::Result<Vec<Option<ChunkFile>>> {
         let mut files = Vec::with_capacity(digests.len());
         for wave in digests.chunks(MAX_LOOKUP) {

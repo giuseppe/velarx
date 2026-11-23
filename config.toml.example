@@ -939,6 +939,11 @@ filter_interval_secs = 2
 # connected to nobody that holds the layer finds it by).  EVERY peer of the
 # swarm, and anyone who has the swarm key, can then list what the node has.
 announce_images = false
+# `true`: the node tells the peers that ask which signed manifest digests it
+# holds for a name and tag (`docker.io/library/alpine:3`), with the
+# signatures.  A member that guesses a name learns that this node has it (the
+# signatures of a manifest digest are given in any case).
+serve_names = false
 # The connected peers asked at once ("do you have this chunk?"; the answer is
 # yes or no, the chunk is not sent) when no peer is known to have the chunk of
 # a pull, for 2 seconds at most.  The ones that say yes are asked for the

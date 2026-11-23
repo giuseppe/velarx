@@ -409,6 +409,15 @@ impl Peers for Noting {
     ) -> Result<Option<Vec<u8>>, velarx_p2p::provider::PeerError> {
         self.0.profile(peer, image, max).await
     }
+
+    async fn signatures(
+        &self,
+        peer: libp2p::PeerId,
+        reference: &str,
+        max: u64,
+    ) -> Result<Option<Vec<u8>>, velarx_p2p::provider::PeerError> {
+        self.0.signatures(peer, reference, max).await
+    }
 }
 
 /// Another node of the swarm, connected to B, that answers with `provider`.

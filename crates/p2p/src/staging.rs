@@ -27,7 +27,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsFd;
 use velarx_content::fetcher::fetch::{
-    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, Parts, Urgency,
+    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, Parts, SignedRecord,
+    Urgency,
 };
 use velarx_content::serve_fetch::{Described, FetchCall, LayerScope, Out, Scope, StagingFetcher};
 use velarx_content::stager::{self, name_of, LayerToc, Name, Unnamed};
@@ -615,6 +616,31 @@ impl StagingFetcher for PeerSource {
         Ok((self.given(one, reference).await?, None))
     }
 
+    /// The records of the signatures of `reference` (a name with a tag, or
+    /// a manifest digest) the peers have, together (those of one digest one
+    /// record): untrusted, the engine judges them.
+    async fn get_signatures(
+        &self,
+        _scope: &Scope,
+        reference: &str,
+        max: u64,
+    ) -> Result<std::fs::File, FetcherError> {
+        // (an answer that is not records is nobody's)
+        let answers = self.signatures(reference, max).await;
+        let records = answers.iter().flat_map(|answer| {
+            serde_json::from_slice::<Vec<SignedRecord>>(answer).unwrap_or_default()
+        });
+        let Some(bytes) = SignedRecord::encoded(records, max) else {
+            return Err(FetcherError::unavailable(
+                self.nobody(&format!("{reference}: no peer has a signature"))
+                    .await,
+            ));
+        };
+        Ok(velarx_base::sealed::sealed_memory(&bytes)
+            .map_err(failed)?
+            .into())
+    }
+
     /// The startup profile of the image `image`.
     async fn get_profile(
         &self,
@@ -852,6 +878,14 @@ mod tests {
         async fn profile(&self, _: PeerId, _: &str, _: u64) -> Result<Option<Vec<u8>>, PeerError> {
             Ok(None)
         }
+        async fn signatures(
+            &self,
+            _: PeerId,
+            _: &str,
+            _: u64,
+        ) -> Result<Option<Vec<u8>>, PeerError> {
+            Ok(None)
+        }
     }
 
     /// The layers of a `Probe` are asked of the peers all at once, not one
@@ -938,6 +972,14 @@ mod tests {
             Ok(Presence::Has)
         }
         async fn profile(&self, _: PeerId, _: &str, _: u64) -> Result<Option<Vec<u8>>, PeerError> {
+            Ok(None)
+        }
+        async fn signatures(
+            &self,
+            _: PeerId,
+            _: &str,
+            _: u64,
+        ) -> Result<Option<Vec<u8>>, PeerError> {
             Ok(None)
         }
     }

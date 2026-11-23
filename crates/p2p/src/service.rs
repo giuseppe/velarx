@@ -626,6 +626,7 @@ pub async fn run_with(
     node.set_chunk_provider(Arc::new(Given {
         store: Arc::new(StoreContent::new(store_socket.clone())),
         staged: staged.clone(),
+        names: p2p.serve_names,
     }))?;
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);

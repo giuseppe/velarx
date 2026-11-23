@@ -156,6 +156,9 @@ impl Transport for SimTransport {
     ) -> P2PResult<Option<Vec<u8>>> {
         self.index(peer, image, true, max).await
     }
+    async fn request_signatures(&self, _: PeerId, _: &str, _: u64) -> P2PResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 impl SimTransport {

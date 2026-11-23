@@ -134,6 +134,9 @@ impl Staged {
 pub struct Given {
     pub store: Arc<dyn ChunkProvider>,
     pub staged: Arc<Staged>,
+    /// Whether it answers for the signatures of a name (those of a digest
+    /// are given anyway)
+    pub names: bool,
 }
 
 impl ChunkProvider for Given {
@@ -158,6 +161,13 @@ impl ChunkProvider for Given {
 
     fn get_profile(&self, image: &str) -> io::Result<Option<Vec<u8>>> {
         self.store.get_profile(image)
+    }
+
+    fn get_signatures(&self, reference: &str) -> io::Result<Option<Vec<u8>>> {
+        if !self.names && reference.parse::<velarx_types::digest::Digest>().is_err() {
+            return Ok(None);
+        }
+        self.store.get_signatures(reference)
     }
 
     fn open_chunks(&self, digests: &[String]) -> io::Result<Vec<Option<ChunkFile>>> {
@@ -189,6 +199,9 @@ mod tests {
         fn get_chunk(&self, digest: &str) -> io::Result<Option<Vec<u8>>> {
             Ok((digest == "in-store").then(|| b"store".to_vec()))
         }
+        fn get_signatures(&self, reference: &str) -> io::Result<Option<Vec<u8>>> {
+            Ok(Some(reference.as_bytes().to_vec()))
+        }
     }
 
     fn file_of(bytes: &[u8]) -> File {
@@ -203,6 +216,7 @@ mod tests {
         let given = Given {
             store: Arc::new(Store),
             staged: staged.clone(),
+            names: false,
         };
         staged.add(
             Some("layer-1"),
@@ -225,6 +239,22 @@ mod tests {
         assert!(staged.open("a").is_none() && staged.open("b").is_none());
         assert!(staged.open("n0").is_some());
         assert!(staged.first_of("layer") && !staged.first_of("layer"));
+    }
+
+    /// The signatures of a digest are given, those of a name only when the
+    /// node serves names.
+    #[test]
+    fn the_signatures_of_a_name_are_given_only_when_asked_for() {
+        let digest = format!("sha256:{}", "0".repeat(64));
+        for (names, by_name) in [(false, false), (true, true)] {
+            let given = Given {
+                store: Arc::new(Store),
+                staged: Arc::new(Staged::default()),
+                names,
+            };
+            assert!(given.get_signatures(&digest).unwrap().is_some());
+            assert_eq!(given.get_signatures("r.io/a:1").unwrap().is_some(), by_name);
+        }
     }
 
     #[test]
