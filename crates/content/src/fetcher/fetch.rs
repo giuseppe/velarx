@@ -27,6 +27,9 @@ pub const MAX_ACCESS: u64 = 1 << 20;
 /// thousands of digests, small next to the files they name.
 pub const PROFILE_MAX_BYTES: u64 = 512 * 1024;
 
+/// The most bytes of the records `GetSignatures` gives or takes.
+pub const SIGNATURES_MAX_BYTES: u64 = 1 << 20;
+
 /// The capability words.
 pub const CAPABILITIES: [&str; 9] = [
     "objects", "unpack", "metadata", "lazy", "sha512", "reuse", "origin", "handover", "table",
@@ -221,6 +224,44 @@ pub struct ProbeReply {
     pub probed: Option<Probed>,
 }
 
+/// A record of `GetSignatures`: the signatures made for the manifest
+/// `digest`, each the base64 of a signature blob (the blob of a lookaside
+/// storage).  Untrusted: the engine judges the signatures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedRecord {
+    pub digest: String,
+    pub signatures: Vec<String>,
+}
+
+impl SignedRecord {
+    /// `records` with those of one digest made one, each signature once.
+    pub fn merged(records: impl IntoIterator<Item = SignedRecord>) -> Vec<SignedRecord> {
+        let mut by_digest = std::collections::BTreeMap::<_, std::collections::BTreeSet<_>>::new();
+        for record in records {
+            by_digest
+                .entry(record.digest)
+                .or_default()
+                .extend(record.signatures);
+        }
+        by_digest
+            .into_iter()
+            .map(|(digest, signatures)| SignedRecord {
+                digest,
+                signatures: signatures.into_iter().collect(),
+            })
+            .collect()
+    }
+
+    /// The JSON of `records` merged, those with no signature left out;
+    /// None when no record is left or it is longer than `max`.
+    pub fn encoded(records: impl IntoIterator<Item = SignedRecord>, max: u64) -> Option<Vec<u8>> {
+        let mut records = Self::merged(records);
+        records.retain(|r| !r.signatures.is_empty());
+        let bytes = serde_json::to_vec(&records).ok()?;
+        (!records.is_empty() && bytes.len() as u64 <= max).then_some(bytes)
+    }
+}
+
 /// What `GetManifest` answers: the manifest is in the sealed memory file
 /// `file` of the reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::Type)]
@@ -229,7 +270,7 @@ pub struct Manifest {
     pub media_type: Option<String>,
 }
 
-/// What `GetBlob` and `GetProfile` answer: the item is in the sealed memory
+/// What `GetBlob`, `GetProfile` and `GetSignatures` answer: the item is in the sealed memory
 /// file `file` of the reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::Type)]
 pub struct Item {
@@ -480,6 +521,14 @@ mod proxy {
         async fn get_profile(
             &mut self,
             image: &str,
+            max: u64,
+        ) -> zlink::Result<(Result<Item, FetcherError>, Vec<OwnedFd>)>;
+
+        /// The signatures of the manifest or tag `reference` names.
+        #[zlink(return_fds)]
+        async fn get_signatures(
+            &mut self,
+            reference: &str,
             max: u64,
         ) -> zlink::Result<(Result<Item, FetcherError>, Vec<OwnedFd>)>;
 

@@ -484,6 +484,16 @@ impl FetchConn {
         file_at(fds, item.file, image)
     }
 
+    /// The signatures of `reference` (a tag or a digest): the sealed memory
+    /// file of the reply.
+    pub async fn get_signatures(&mut self, reference: &str, max: u64) -> Result<File, CallError> {
+        let (conn, busy) = self.begin().await?;
+        let got = conn.get_signatures(reference, max).await;
+        busy.store(false, Ordering::Release);
+        let (item, fds) = done_fds(got)?;
+        file_at(fds, item.file, reference)
+    }
+
     /// What the fetcher can do for `layers` (`again`: the index it carried
     /// for one of them in the last probe was wrong; `parts`: what of a table
     /// of contents to carry).

@@ -268,6 +268,19 @@ pub trait StagingFetcher: Send + Sync + 'static {
         Err(FetcherError::unavailable(format!("{image}: nobody has it")))
     }
 
+    /// The signatures of the manifest or tag `reference` names, at most
+    /// `max` bytes: a JSON array of [`SignedRecord`].
+    async fn get_signatures(
+        &self,
+        _scope: &Scope,
+        reference: &str,
+        _max: u64,
+    ) -> Result<File, FetcherError> {
+        Err(FetcherError::unavailable(format!(
+            "{reference}: nobody has a signature"
+        )))
+    }
+
     /// Read the whole blob of the layer (one with no table of contents) and
     /// give its files, as the descriptors of `staged` events (the positions
     /// of the events' `objects`), and `toc.claim` and `tarsplit` names in its
@@ -1205,6 +1218,38 @@ mod service {
             }
         }
 
+        /// The signatures of the manifest or tag `reference` names (a
+        /// `repository:tag`, or a manifest digest), at most `max` bytes: a
+        /// JSON array of records, `{"digest": "sha256:...", "signatures":
+        /// ["<base64 of a signature blob>", ...]}`, in `file`, a sealed
+        /// memory file in the reply.  What the fetcher has none of is
+        /// `unavailable`.  A client trusts nothing in it: it judges the
+        /// signatures itself.
+        #[zlink(return_fds)]
+        pub async fn get_signatures(
+            &self,
+            reference: String,
+            max: u64,
+        ) -> (Result<Item, FetcherError>, Vec<OwnedFd>) {
+            let scope = match self.scope() {
+                Ok(s) if max > 0 => s,
+                Ok(_) => {
+                    return (Err(maximum()), Vec::new());
+                }
+                Err(e) => return (Err(e), Vec::new()),
+            };
+            let api = self.api.clone();
+            let got = owned(&self.runtime, async move {
+                api.get_signatures(&scope, &reference, max).await
+            })
+            .await
+            .unwrap_or_else(|e| Err(stopped(e)));
+            match got {
+                Ok(file) => (Ok(Item { file: 0 }), vec![file.into()]),
+                Err(e) => (Err(e), Vec::new()),
+            }
+        }
+
         /// What can this fetcher do for `layers`?  Called with `more`: one
         /// `probed` a reply, in any order, then a last reply without one.
         /// `again`: the index this fetcher carried for a layer without a
@@ -2121,7 +2166,8 @@ pub fn definition() -> String {
          # it and takes the kernel's measure.  A file it hands over is a claim too: the\n\
          # engine copies it, or takes the kernel's measure of it, and knows it by the\n\
          # digest of the bytes it read.  What it returns with GetManifest,\n\
-         # GetBlob, GetProfile and Probe is hashed by the engine before it is used.\n\
+         # GetBlob, GetProfile and Probe is hashed by the engine before it is used,\n\
+         # and the signatures of GetSignatures are judged by the engine's policy.\n\
          #\n\
          # CAPABILITIES.  What a fetcher can do is a word of capabilities in GetInfo; a\n\
          # client ignores the words it does not know; what it cannot do without is a\n\
@@ -2228,6 +2274,7 @@ mod tests {
             "GetManifest",
             "GetBlob",
             "GetProfile",
+            "GetSignatures",
             "Probe",
             "Unpack",
             "Fetch",
@@ -2443,6 +2490,8 @@ mod tests {
         let got = e.get_blob(blob("sha256:aa")).await;
         assert!(matches!(got.0, Err(FetcherError::Failed { .. })));
         let got = e.get_profile("sha256:aa".into(), 100).await;
+        assert!(matches!(got.0, Err(FetcherError::Failed { .. })));
+        let got = e.get_signatures("a/b:c".into(), 100).await;
         assert!(matches!(got.0, Err(FetcherError::Failed { .. })));
         // (an item is asked for with a maximum)
         let got = e.get_manifest("latest".into(), 0).await;

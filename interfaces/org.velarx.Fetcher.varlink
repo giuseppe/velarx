@@ -55,7 +55,8 @@
 # it and takes the kernel's measure.  A file it hands over is a claim too: the
 # engine copies it, or takes the kernel's measure of it, and knows it by the
 # digest of the bytes it read.  What it returns with GetManifest,
-# GetBlob, GetProfile and Probe is hashed by the engine before it is used.
+# GetBlob, GetProfile and Probe is hashed by the engine before it is used,
+# and the signatures of GetSignatures are judged by the engine's policy.
 #
 # CAPABILITIES.  What a fetcher can do is a word of capabilities in GetInfo; a
 # client ignores the words it does not know; what it cannot do without is a
@@ -295,6 +296,15 @@ method GetBlob(blob: Blob) -> (file: int)
 # fetcher that does not keep profiles answers `Failed` of class
 # `unavailable`.
 method GetProfile(image: string, max: int) -> (file: int)
+
+# The signatures of the manifest or tag `reference` names (a
+# `repository:tag`, or a manifest digest), at most `max` bytes: a
+# JSON array of records, `{"digest": "sha256:...", "signatures":
+# ["<base64 of a signature blob>", ...]}`, in `file`, a sealed
+# memory file in the reply.  What the fetcher has none of is
+# `unavailable`.  A client trusts nothing in it: it judges the
+# signatures itself.
+method GetSignatures(reference: string, max: int) -> (file: int)
 
 # What can this fetcher do for `layers`?  Called with `more`: one
 # `probed` a reply, in any order, then a last reply without one.
