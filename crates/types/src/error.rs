@@ -199,10 +199,18 @@ fn tls_error_of(err: &(dyn std::error::Error + 'static)) -> Option<TlsError> {
 pub struct HttpError {
     text: String,
     tls: Option<TlsError>,
+    /// The connection (or its TLS handshake) did not come up in time
+    connect_timeout: bool,
     cause: Box<dyn std::error::Error + Send + Sync>,
 }
 
 impl HttpError {
+    /// Whether the connection to the server did not come up in time: a
+    /// server that is not there, which a try again does not bring.
+    pub fn is_connect_timeout(&self) -> bool {
+        self.connect_timeout
+    }
+
     /// The error of the HTTP client.
     pub fn cause(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
         &*self.cause
@@ -220,6 +228,7 @@ impl From<reqwest::Error> for ImageError {
         ImageError::Http(HttpError {
             text,
             tls,
+            connect_timeout: err.is_connect() && err.is_timeout(),
             cause: Box::new(err),
         })
     }
@@ -311,7 +320,8 @@ impl ImageError {
     /// refusal, a missing image, a format velarx refuses, a bad manifest,
     /// bytes that are not the digest they should be, a certificate that is
     /// not trusted, or this machine failing (a full disk: what
-    /// `ImageError::Io` mostly is, by the kind of the system's error).
+    /// `ImageError::Io` mostly is, by the kind of the system's error), or
+    /// a server that did not answer the connection in time.
     pub fn is_transient(&self) -> bool {
         use std::io::ErrorKind as K;
         match self {
@@ -330,7 +340,7 @@ impl ImageError {
                     | K::NetworkUnreachable
                     | K::NetworkDown
             ),
-            ImageError::Http(_) => self.tls_error().is_none(),
+            ImageError::Http(e) => e.tls.is_none() && !e.connect_timeout,
             _ => false,
         }
     }

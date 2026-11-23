@@ -91,6 +91,9 @@ pub fn registry_failure(e: &ImageError) -> Failure {
         {
             C::NoSpace
         }
+        // (a registry that is not there: the next source is asked, and
+        // the same is not asked again)
+        ImageError::Http(h) if h.is_connect_timeout() => C::Unavailable,
         e if e.is_transient() => C::Transient,
         _ => C::Failed,
     };
@@ -1361,6 +1364,32 @@ impl StagingFetcher for RegistryFetch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registry that does not answer the connection in time is not tried
+    /// again by the same call: the failure is `unavailable`, not
+    /// `transient`; one that cuts the connection still is.
+    #[tokio::test]
+    async fn a_connection_that_times_out_is_not_tried_again() {
+        // (a server that takes the connection and never speaks: the TLS
+        // handshake does not finish)
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://{}/v2/", silent.local_addr().unwrap());
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let e = ImageError::from(client.get(&url).send().await.unwrap_err());
+        assert!(!e.is_transient(), "{e}");
+        assert_eq!(
+            registry_failure(&e).class,
+            velarx_proto::transfer::FailureClass::Unavailable
+        );
+        let cut = ImageError::Io(std::io::ErrorKind::ConnectionReset.into());
+        assert_eq!(
+            registry_failure(&cut).class,
+            velarx_proto::transfer::FailureClass::Transient
+        );
+    }
 
     /// The calls of a scope share their workers, with or without credentials
     /// of their own.
