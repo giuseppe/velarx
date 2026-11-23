@@ -39,7 +39,9 @@ What it does not give you, as [THREAT-MODEL.md](THREAT-MODEL.md) says:
   `sha512-` and 128 digits do not fit a tag.
 * **Not "this is the newest".** A signature says that this manifest was
   signed.  Whoever controls the registry (or the node's store) can put back an
-  older manifest, correctly signed, under the same name.
+  older manifest, correctly signed, under the same name.  Among peers
+  ([below](#a-tag-among-peers-with-no-registry)) the newest signature the
+  reachable peers have wins, and an old signed image is as good as a new one.
 * **No revocation.** A key that leaked stays valid for every image it signed
   until the consumers drop it from their policy (key rotation).
 * **No check of the content of a policy-accepted image.** Where the policy
@@ -329,11 +331,72 @@ signatures, or whose policy asks a signature of that name (a `default` rule
 of `sigstoreSigned`, say), set `[containers] infra_image` to a signed
 image.  A container made with `--rootfs` has no image and is not checked.
 
+## A tag among peers, with no registry
+
+A pull by digest takes everything from the peers of a swarm, and so do the
+signatures of that digest.  A pull by `NAME:TAG` needs one thing more, what
+the tag names, and the registry is not the only one that can say it: a
+signature already says it.  Velarx signs the name with its tag, the digest of
+the manifest and the time, so a node that holds a signed image can answer
+"`acme/app:1` is `sha256:D`, signed by this key", and the node that asks takes
+that from the newest such signature that **its own policy** accepts for the
+name, and from nothing else.  Nothing is new to publish: the signature is the
+one `push --sign-by-sigstore-private-key` made, and the keys are those of
+`policy.json`.
+
+On the nodes that hold the image (they pulled it under the policy, which keeps
+the signature with it):
+
+```toml
+[sources.external.settings]
+serve_names = true
+```
+
+On the node that pulls, a policy that names the key for the scope, the peers
+as the source of the names, and no registry:
+
+```toml
+[pull]
+sources = ["p2p"]
+names = ["p2p"]
+```
+
+```console
+$ velarx run --lazy localhost:5077/acme/app:1 cat /etc/acme-release
+release 1.0
+```
+
+The tag is resolved by the newest record whose signature names exactly
+`localhost:5077/acme/app:1` (a `matchRepository` rule does not make the
+signature of `:1` the record of `:latest`) and is made by a key of the policy
+for it.  The pull then goes on by that digest, and everything is checked on the
+node as in any pull: the manifest by its digest, the rest by the manifest, and
+the signatures again against the manifest.  `names` is a list like `sources`,
+in order: `["p2p", "registry"]` asks the peers first and the registry when they
+have no record.  The registry answers or fails, so what follows `registry` is
+not asked.  It is `["registry"]` by default, and `serve_names` is off by
+default.
+
+What it does not give you: an image nobody signed has no name among peers, the
+default policy (it accepts everything) names no key, and a name whose policy
+asks for no signature is refused (`the signature policy names no key for it, so
+no signature says what the tag names`): pull it by digest.  The newest is the
+newest of the peers asked: peers that hold only older records make the node
+resolve to the older image.  The time is the one in the signed payload, as the
+signer wrote it: a signature with none (cosign writes none) is of time 0, one
+dated in the future wins over all those made before that date, and two records
+of the same time for two digests are an error.  A record names the manifest of
+one platform, the one the peer pulled: among peers of several architectures a
+tag may resolve to the image of another platform, and a publisher that signed
+two platforms in the same second makes it an error.  A member that asks a node
+for a name learns that it has it.
+
 ## Troubleshooting
 
 | What you see | Why, and what to do |
 | --- | --- |
 | `Pushing signatures to a Docker Registry is not supported, and there is no applicable signature storage configured: set use-sigstore-attachments in registries.d` | Add `use-sigstore-attachments: true` for the registry. |
+| `...: `registry` is not one of [pull] names, and no source has a signed record of the tag` (or `N records of the tag, none signed by a key the policy accepts`, or `the signature policy names no key for it...`) | A tag pulled with no registry among `[pull] names`: the peers have no record signed by a key your policy names for it (are they `serve_names = true`, and did they pull it under a policy that asks for the signature?), or the policy asks for none. |
 | `Source image rejected: a signature was required, but no signature exists` | The image has no signature (or none in the attachment of the registry: a cleaner may have deleted it). |
 | `... no signature exists (registries.d sets no use-sigstore-attachments for ..., so sigstore signatures are not looked for)` | This node's registries.d does not look for the attachments of that registry: `image trust set` writes the file, or add `use-sigstore-attachments: true` by hand. |
 | `Source image rejected: cryptographic signature verification failed` | There are signatures and none is by a key of the policy (an imposter, a rotated key, or a second `-f` that made the policy need both keys). |

@@ -160,7 +160,11 @@ UDP 4001 between the nodes.
 
 The sources are asked in the order written (the default is
 `["registry"]`): with `["p2p"]` alone the registry is never asked, and
-images are pulled by digest only.
+images are pulled by digest only, unless `names = ["p2p"]` says that the
+peers resolve a tag too: from the newest signature they have for `NAME:TAG`
+that the node's `policy.json` accepts (the nodes that hold the image set
+`serve_names = true`), see
+[docs/SIGNING.md](docs/SIGNING.md#a-tag-among-peers-with-no-registry).
 
 Nothing listens on the network until you set `listen_addresses`. See
 [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) for what a member of a swarm can

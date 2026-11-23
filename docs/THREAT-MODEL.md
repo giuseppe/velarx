@@ -92,9 +92,14 @@ lengths before allocating and verifies every digest.
   each step against the one above it (the platform's manifest against the
   index, the configuration and layers against the manifest, the files of a
   zstd:chunked layer against the table its annotation names, every file
-  against the fs-verity digest the engine measured).  A tag is taken only
-  from its registry, never when the `[pull] sources` do not name
-  `registry`; the peers serve what a digest names.  What is off the
+  against the fs-verity digest the engine measured).  A tag is taken
+  from its registry, or, with `[pull] names` listing another source (the
+  peers), from the newest signed record of the name and tag: a signature
+  made for exactly that name and tag by a key the policy accepts for it,
+  whatever its age, so a name whose policy asks for no signature is never
+  resolved by a peer, and a peer is believed for nothing it did not get
+  signed.  Records of the same time that name two digests are an error.  The
+  peers serve what a digest names, and the signatures kept with it.  What is off the
   chain is recorded as a claim and never names anything: the diff id of a
   zstd:chunked layer, the content digest of a file the table also gives an
   fs-verity digest, the blob of a layer made from an index (a node that asks
@@ -238,7 +243,9 @@ member:
   manifest, an index, a configuration, a startup profile), whatever brought
   it: a pull with credentials or without, a build, a commit.  There is no
   per-image or per-layer rule.  What keeps an image to the nodes that have
-  it is that its digests are not known: the fs-verity digest of a file and
+  it is that its digests are not known (a node that sets `serve_names`
+  tells a member which digest a name and tag has, to a member that guesses
+  the name: it is off by default): the fs-verity digest of a file and
   the digest of a chunk or a layer are known to whoever has the content, its
   manifest or its table of contents, and the digest of a manifest to whoever
   was given it.  A member learns a digest when a pull asks the peers for it
