@@ -5012,6 +5012,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "velarx-dns-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-fuse"
 version = "0.1.0"
 dependencies = [
@@ -5167,6 +5171,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "velarx-base",
+ "velarx-dns-core",
  "velarx-nsid",
  "velarx-sys",
  "velarx-types",

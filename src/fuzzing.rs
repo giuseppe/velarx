@@ -352,9 +352,8 @@ pub fn dns(data: &[u8]) {
     let size = data.first().map_or(512, |b| usize::from(*b) * 8);
     let _ = velarx_netkernel::dns::answer(&zone, data, size);
     let _ = velarx_netkernel::dns::servfail(data);
-    if let Some(q) = velarx_netkernel::dns::question(data) {
-        let _ = velarx_netkernel::dns::head(data, &q, 2);
-    }
+    let _ = velarx_netkernel::dns::question(data);
+    let _ = velarx_netkernel::dns::head(data, 2);
 }
 
 /// An image archive (docker save, oci-archive), opened as `load` opens it.

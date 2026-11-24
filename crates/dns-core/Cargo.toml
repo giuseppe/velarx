@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-dns-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The DNS messages of the container name server: reading the question of a query, and building the reply from the records that were looked up"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on byte slices and vectors: no dependency, no I/O.  The
+# bytes come from any container of a bridge.  The shell that looks the names
+# up (the zone of a network, the peers of an overlay), forwards to the
+# upstream servers and moves the datagrams is `velarx-netkernel` (dns) and its
+# users.
+
+[lib]
+name = "velarx_dns_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

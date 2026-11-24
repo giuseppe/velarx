@@ -24,6 +24,7 @@ velarx-base = { path = "../base" }
 velarx-types = { path = "../types" }
 velarx-wire = { path = "../wire" }
 velarx-nsid = { path = "../nsid" }
+velarx-dns-core = { path = "../dns-core" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 rustix = { workspace = true, features = ["fs", "net", "process", "thread", "event", "mount"] }

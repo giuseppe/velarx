@@ -144,10 +144,10 @@ impl DnsHandler {
             }
         }
         debug!("'{}' is not a container's: asked upstream", q.name);
-        Some(match self.forward_to_upstream(query, &q, transport).await {
-            Some(answer) => answer,
-            None => dns::head(query, &q, dns::RCODE_SERVFAIL),
-        })
+        match self.forward_to_upstream(query, &q, transport).await {
+            Some(answer) => Some(answer),
+            None => dns::head(query, dns::RCODE_SERVFAIL),
+        }
     }
 
     /// The record of the container named `name`, with the domain suffix or
@@ -205,8 +205,9 @@ impl DnsHandler {
                         response.len(),
                         takes
                     );
-                    // (the flags and the code of the answer, cut)
-                    let mut cut = dns::head(query, q, 0);
+                    // (the flags and the code of the answer, cut; the head
+                    // cannot fail here: the query was parsed)
+                    let mut cut = dns::head(query, 0)?;
                     cut[2..4].copy_from_slice(&response[2..4]);
                     cut[2] |= DNS_TC_TRUNCATED;
                     return Some(cut);
