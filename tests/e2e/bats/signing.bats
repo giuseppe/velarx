@@ -500,7 +500,7 @@ JSON
     echo '{"default":[{"type":"reject"}]}' > "$WORKDIR/reject.json"
     out=$($SH image pull --tls-verify=false --signature-policy "$WORKDIR/reject.json" "$REPO/unsigned:v1" 2>&1)
     check "a pull under a rejecting policy file fails" 125 $?
-    check_match "it says why" "rejected by the signature policy" "$out"
+    check_match "it says why" "the signature policy rejects it" "$out"
     out=$(sc image pull --tls-verify=false --signature-policy "$WORKDIR/reject.json" "$REPO/unsigned:v1" 2>&1)
     check "an engine service has its own policy" 125 $?
     check_match "it says why" "--signature-policy is not supported with an engine service" "$out"

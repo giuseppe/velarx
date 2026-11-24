@@ -46,6 +46,19 @@ pub struct Image<'a> {
 /// containers/image).
 pub const NO_SIGNATURE: &str = "a signature was required, but no signature exists";
 
+/// Why `requirements` refuse an image whatever its signatures: a `reject`,
+/// or a `signedBaseLayer` (which containers/image does not implement
+/// either).
+pub fn refusal(requirements: &[PolicyRequirement]) -> Option<&'static str> {
+    requirements.iter().find_map(|r| match r {
+        PolicyRequirement::Reject => Some("rejects it"),
+        PolicyRequirement::SignedBaseLayer { .. } => {
+            Some("has a signedBaseLayer requirement, which is not implemented")
+        }
+        _ => None,
+    })
+}
+
 /// Whether any of `requirements` needs the signatures of the image.
 pub fn needs_signatures(requirements: &[PolicyRequirement]) -> bool {
     requirements.iter().any(|r| {

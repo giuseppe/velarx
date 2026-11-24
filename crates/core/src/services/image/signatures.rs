@@ -299,7 +299,8 @@ impl ImageService {
     /// signatures needs signatures for that name, whether it was pulled by
     /// another name, loaded from an archive or built; an image with no tag
     /// is judged by the names it was pulled by.  With `Check` and `Require` a `reject`
-    /// requirement of the scope refuses the image, as podman's
+    /// or `signedBaseLayer` requirement of the scope refuses the image (as a
+    /// pull does), as podman's
     /// `composefs-verity` branch judges the whole policy with
     /// `signature=`; `Policy` does not apply it (`reject` is for pulls:
     /// podman runs the images of its store whatever the policy says of
@@ -411,11 +412,11 @@ impl ImageService {
         let mut signatures: Option<Vec<Signature>> = None;
         for name in names {
             let (scope, all) = self.scoped_requirements_of(&name)?;
-            if judging != SignatureJudging::Policy
-                && all.iter().any(|r| matches!(r, PolicyRequirement::Reject))
+            if let Some(why) =
+                evaluate::refusal(&all).filter(|_| judging != SignatureJudging::Policy)
             {
                 return Err(ImageError::Registry(format!(
-                    "{}: the signature policy ({}) rejects it ({scope})",
+                    "{}: the signature policy ({}) {why} ({scope})",
                     name.full_name(),
                     self.policy_location()
                 )));
@@ -838,12 +839,13 @@ mod tests {
         let policy = r#"{"default": [{"type": "insecureAcceptAnything"}],
             "transports": {"docker": {"quay.io/x": [{"type": "signedBaseLayer",
                 "baseLayerIdentity": {"type": "matchRepository"}}]}}}"#;
+        // (documented: in this mode the requirements that only refuse, as
+        // `reject`, are for pulls)
         judged(policy, SignatureJudging::Policy).await.unwrap();
-        // as it is today: wrong, fixed by the next commit
-        judged(policy, SignatureJudging::Check).await.unwrap();
-        judged(policy, SignatureJudging::Require("why"))
-            .await
-            .unwrap_err();
+        for judging in [SignatureJudging::Check, SignatureJudging::Require("why")] {
+            let e = judged(policy, judging).await.unwrap_err();
+            assert!(e.to_string().contains("signedBaseLayer"), "{e}");
+        }
     }
 
     #[tokio::test]
@@ -858,6 +860,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("rejects it"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_pull_refuses_reject_and_signed_base_layer() {
+        for (rule, said) in [
+            (r#"{"type": "reject"}"#, "rejects it"),
+            (r#"{"type": "signedBaseLayer"}"#, "signedBaseLayer"),
+        ] {
+            let (_tmp, service) = with_policy(&format!(
+                r#"{{"default": [{{"type": "insecureAcceptAnything"}}],
+                    "transports": {{"docker": {{"quay.io/x": [{rule}]}}}}}}"#
+            ))
+            .await;
+            let e = service
+                .policy_for(&ImageReference::parse("quay.io/x/y:1").unwrap())
+                .unwrap_err();
+            assert!(e.to_string().contains(said), "{e}");
+            service
+                .policy_for(&ImageReference::parse("quay.io/z/y:1").unwrap())
+                .unwrap();
+        }
     }
 
     #[test]

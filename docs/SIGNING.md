@@ -257,9 +257,9 @@ By default (`image_signature = "policy"`) the policy is judged when the
 container is created, and not again at its starts: the `signedBy` and
 `sigstoreSigned` rules for each name of the image must accept a signature
 stored with it.  An image whose rules ask for no signature runs, which is
-every image outside the scopes you wrote such rules for; a `reject` rule
-refuses pulls only, and does not stop a container of an image already in the
-store (a policy whose default is `reject` would otherwise refuse every image
+every image outside the scopes you wrote such rules for; a `reject` or
+`signedBaseLayer` rule refuses pulls only, and does not stop a container of
+an image already in the store (a policy whose default is `reject` would otherwise refuse every image
 built or loaded on the node).
 
 `--security-opt signature=check` judges the **whole** policy at the create,
@@ -267,7 +267,9 @@ keeps that in the container and judges again at **every start** by the
 engine (start, restart, restore, pod start), with the policy of that moment:
 a signature rule must be
 satisfied by a signature stored with the image, `reject` refuses (also an
-image built or loaded here, under a default of `reject`), and an image the
+image built or loaded here, under a default of `reject`), as does a
+`signedBaseLayer` rule (which is not implemented, and refuses a pull as
+well), and an image the
 policy accepts without a signature (`insecureAcceptAnything`) runs.  A key
 dropped from the policy, or a `reject` rule added for the repository, stops
 the next start of such a container.  A container made without the option is
@@ -294,7 +296,8 @@ judges: its tags and the names it was pulled by (an image pulled by its
 digest only, and run by its id, is judged by `repository@digest`).  An image
 with no name (no tag, never pulled, asked for by its id) and an image the policy accepts without a signature
 (`insecureAcceptAnything`) are refused; so is an image whose scope has a
-`reject` rule, with the message that the policy rejects it.  A container
+`reject` rule, with the message that the policy rejects it, or a
+`signedBaseLayer` rule.  A container
 can only tighten the node's value:
 
 ```console
@@ -404,6 +407,7 @@ for a name learns that it has it.
 | `... the signature policy (...) accepts it without a signature, and --security-opt signature=require` (or `[containers] image_signature is "require"`) | The image is not covered by a `sigstoreSigned` or `signedBy` rule; pull it again under a policy that has one, or change the policy. |
 | `composefs digest: layer 1 of N (...): its EROFS image has the fs-verity digest ..., the manifest says ... (io.containers.composefs.digest), and [storage] composefs_digests is "require"` (at a start: `... is recorded with the fs-verity digest ..., the manifest says ..., and --security-opt verity=enforce`) | The digests are required and none of the values the manifest states is that of the layer; edited or made by another writer (podman's digests are another format).  Pull it again from its publisher; if it persists the manifest is not the publisher's.  Where nothing requires the digests such a list is accepted. |
 | `Error: ...: the signature policy (...) rejects it (scope ...)` | A `reject` rule of the policy applies to the name of the image, at the create or the start of a container made with `--security-opt signature=check` or `require` (or under `image_signature = "require"`). |
+| `Error: ...: the signature policy (...) has a signedBaseLayer requirement, which is not implemented (scope ...)` (a pull says `NAME: the signature policy has a signedBaseLayer requirement ...`) | A `signedBaseLayer` rule applies to the name of the image; no image can satisfy it, as in containers/image.  Take the rule out of the policy.  A container made without `signature=check` or `require` is not judged by it. |
 | `... states no EROFS digest (io.containers.composefs.digest), and [storage] composefs_digests is "require"` (or `--security-opt verity=enforce`; `states no sha256:<hex> or sha512:<hex> EROFS digest` when the annotation has only values of other writers) | The manifest is another writer's (or older Velarx's) and states none of Velarx's.  A push with a `--compression-format` other than that of its layers (`zstd:chunked` for gzip layers, `gzip` for zstd ones) writes a manifest with the digests; a push in the same compression keeps the manifest as it is.  Or set the digest check to `"check"`. |
 | `composefs digest: the digests of the EROFS images are enforced and the image ... has no fs-verity` | The store is on a file system without fs-verity (or the layer image was replaced by a copy); use a store on ext4 with `-O verity`, btrfs or f2fs. |
 | `crun: the EROFS image ... cannot be measured (it has no fs-verity) and the digests are enforced` | At the start: the layer image of a container made before was replaced by a file without fs-verity. |

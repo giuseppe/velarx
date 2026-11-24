@@ -765,30 +765,19 @@ impl ImageService {
             .map_err(ImageError::Registry)
     }
 
-    /// The signature policy, before anything is fetched: `reject` refuses
-    /// the image.  Ok: the requirements, which a pull checks against the
+    /// The signature policy, before anything is fetched: `reject` and `signedBaseLayer`
+    /// refuse the image.  Ok: the requirements, which a pull checks against the
     /// signatures of the manifest it gets (`verify_signatures`).
     pub(super) fn policy_for(
         &self,
         image_ref: &ImageReference,
     ) -> ImageResult<Vec<velarx_signature::PolicyRequirement>> {
-        use velarx_signature::PolicyRequirement;
-        let name = image_ref.name();
         let requirements = self.requirements_of(image_ref)?;
-        for req in &requirements {
-            match req {
-                PolicyRequirement::Reject => {
-                    return Err(ImageError::Registry(format!(
-                        "{name} is rejected by the signature policy"
-                    )))
-                }
-                PolicyRequirement::SignedBaseLayer { .. } => {
-                    return Err(ImageError::Registry(format!(
-                        "the signature policy of {name} has a signedBaseLayer requirement, which is not implemented"
-                    )))
-                }
-                _ => {}
-            }
+        if let Some(why) = velarx_signature::evaluate::refusal(&requirements) {
+            return Err(ImageError::Registry(format!(
+                "{}: the signature policy {why}",
+                image_ref.name()
+            )));
         }
         Ok(requirements)
     }
