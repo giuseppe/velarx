@@ -735,7 +735,8 @@ impl SigningArgs {
 /// How a pull or a push authenticates to the registry.
 #[derive(clap::Args, Clone, Default)]
 pub struct RegistryAccessArgs {
-    /// Credentials (USERNAME[:PASSWORD]) for the registry
+    /// Credentials (USERNAME[:PASSWORD]) for the host you named, not for a
+    /// mirror on another host
     #[arg(long)]
     pub creds: Option<String>,
     /// The auth file to use instead of the default ones

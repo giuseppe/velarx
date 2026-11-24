@@ -120,6 +120,21 @@ and `registries.conf` in `/etc/velarx` or `~/.config/velarx`.
 It never reads `/etc/containers`. Without a `policy.json` every image is
 accepted and no signature is verified.
 
+`registries.conf` differs from containers-registries.conf(5) where the
+reading of it was a risk.  A prefix ends at a component: `example.com` does
+not govern `example.com:5000` (a prefix that names the port does).  A
+mirror is insecure by its own entry only; it may reach private addresses
+(`allow-private-addresses`) if the block of its own location says so, or
+the block that lists it, and the block of a registry that does not list it
+gives it nothing.  A mirror for digests only is asked by the digest, never
+by a tag, and bytes that do not match it skip that mirror only.  A mirror
+that a block of its own location blocks is not used.  A `location` without
+a path, for the name that is the prefix, is an error.  The credentials of
+`--creds` go to the endpoints on the host that was named, not to a mirror
+on another host nor to its token endpoint, nor to a registry that a
+`location` moved to another host: those have what is stored for their own
+host.
+
 ## Peer-to-peer
 
 As root: create a swarm key once, copy it to every node, add the service as

@@ -354,7 +354,7 @@ pub fn is_file_key(text: &str) -> bool {
 /// Where the blobs of an image come from.
 #[derive(Clone)]
 pub enum Source {
-    Registry(Target),
+    Registry(Box<Target>),
     /// The origin of a path (`velarx-dir --origin`): the layers are
     /// unpacked there, by the fetchers of the pull
     Path,

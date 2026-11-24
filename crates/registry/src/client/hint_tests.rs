@@ -32,12 +32,16 @@ fn hint_notices(client: &RegistryClient) -> Notices {
     }
 }
 
-fn name_resolves_to(name: &str, addrs: Vec<std::net::SocketAddr>) {
+pub(super) fn name_resolves_to(name: &str, addrs: Vec<std::net::SocketAddr>) {
     DNS.lock().unwrap().push((name.into(), addrs, 0));
 }
 
 /// Names that a test says are public, so that it can be reached.
 static PUBLIC: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+pub(super) fn say_public(name: &str) {
+    PUBLIC.lock().unwrap().push(name.into());
+}
 
 pub(crate) fn pretend_public(name: &str) -> bool {
     PUBLIC.lock().unwrap().iter().any(|n| n == name)
@@ -759,7 +763,7 @@ async fn the_redirect_reported_is_the_one_of_the_endpoint_that_served_the_blob()
     let first = redirecting_registry(&cdn_good).await;
     let (client, t) =
         RegistryClient::from_specs(&[spec(&first, None), spec(&second, None)]).unwrap();
-    client.transport.redirects.put(
+    client.redirects.put(
         &t.fallbacks[0].blob_key(&digest()),
         "http://stale.example/b",
     );

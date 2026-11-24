@@ -362,7 +362,15 @@ max_archive_gib = 256
 # containers-registries.conf(5):
 # ~/.config/velarx/registries.conf (rootless) or /etc/velarx/registries.conf,
 # with their registries.conf.d drop-ins, or the file $VELARX_REGISTRIES_CONF
-# names.  The certificates of a registry are in certs.d/HOST[:PORT] of
+# names.  `insecure = true` of a registry (and --tls-verify=false) turns the
+# certificate checks off for every host that registry names while it is
+# pulled from or pushed to: its token endpoint and the CDN of its blobs too,
+# not the registry alone, and each is offered the client certificate of the
+# registry; it also allows plain http to the registry and to its token
+# endpoint.  An https registry that answers an upload with an http://
+# location is refused, unless it is the registry's own address (then it is
+# asked over https): fix the registry (distribution `http.relativeurls:
+# true`, or the proxy passing `X-Forwarded-Proto: https`).  The certificates of a registry are in certs.d/HOST[:PORT] of
 # /etc/velarx, ~/.config/velarx (rootless) or /etc/docker; the credentials in
 # $XDG_RUNTIME_DIR/velarx/auth/auth.json (/run/velarx/auth/auth.json for
 # root), ~/.config/velarx/auth/auth.json, or the file $REGISTRY_AUTH_FILE

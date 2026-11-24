@@ -1174,7 +1174,7 @@ mod tests {
         let r = ImageReference::parse(name).map_err(|e| e.to_string())?;
         r.validate().map_err(|e| e.to_string())?;
         transport
-            .endpoints(&r.registry, &r.repository, r.digest.is_some(), true)
+            .endpoints(&r.registry, &r.repository, r.digest.as_ref(), true)
             .map(|endpoints| {
                 endpoints
                     .into_iter()

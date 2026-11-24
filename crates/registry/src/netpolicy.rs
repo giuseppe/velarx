@@ -145,7 +145,8 @@ impl Policy {
         if local && !self.private_allowed().await {
             return Err(format!(
                 "refusing {}: a private address, and the registry {} is not on one \
-                 (`allow-private-addresses` in registries.conf allows it)",
+                 (`allow-private-addresses = true` in the block of registries.conf of \
+                 the registry, or of the registry it is a mirror of, allows it)",
                 host, self.registry
             ));
         }
@@ -171,7 +172,8 @@ impl Policy {
                 std::io::ErrorKind::PermissionDenied,
                 format!(
                     "refusing to connect to {name}: it is a private address, and the registry {} \
-                     is not on one (`allow-private-addresses` in registries.conf allows it)",
+                     is not on one (`allow-private-addresses = true` in the block of registries.conf \
+                     of the registry, or of the registry it is a mirror of, allows it)",
                     self.registry
                 ),
             ));

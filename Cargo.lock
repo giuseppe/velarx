@@ -5023,6 +5023,10 @@ name = "velarx-dns-core"
 version = "0.1.0"
 
 [[package]]
+name = "velarx-endpoint-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-fuse"
 version = "0.1.0"
 dependencies = [
@@ -5326,6 +5330,7 @@ dependencies = [
  "futures",
  "hyper",
  "libc",
+ "openssl",
  "percent-encoding",
  "reqwest",
  "rustix",
@@ -5336,7 +5341,9 @@ dependencies = [
  "toml",
  "tracing",
  "velarx-base",
+ "velarx-endpoint-core",
  "velarx-ref-core",
+ "velarx-send-core",
  "velarx-sys",
  "velarx-types",
  "zeroize",
@@ -5449,6 +5456,10 @@ dependencies = [
  "velarx-storage",
  "velarx-sys",
 ]
+
+[[package]]
+name = "velarx-send-core"
+version = "0.1.0"
 
 [[package]]
 name = "velarx-shape"

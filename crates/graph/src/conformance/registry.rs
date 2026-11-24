@@ -389,6 +389,6 @@ impl Registry {
         )
         .await
         .expect("the list of the pull");
-        (staged, Source::Registry(target))
+        (staged, Source::Registry(Box::new(target)))
     }
 }

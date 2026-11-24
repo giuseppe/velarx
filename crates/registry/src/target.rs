@@ -61,76 +61,49 @@ impl TransportConfig {
     /// `registries.conf` rules: blocked registries are refused and a block
     /// with a `location` rewrites the name.
     pub fn resolve(&self, registry: &str, repository: &str) -> ImageResult<Endpoint> {
-        self.registries.check().map_err(ImageError::Registry)?;
-        let name = format!("{registry}/{repository}");
-        let mut insecure = !self.tls_verify;
-        let mut allow_private = false;
-        let (host, repository) = match self.registries.find_registry(&name) {
-            Some(reg) => {
-                if reg.blocked {
-                    return Err(ImageError::Registry(format!(
-                        "registry `{registry}` is blocked in registries.conf"
-                    )));
-                }
-                insecure |= reg.insecure;
-                allow_private = reg.allow_private_addresses;
-                let rewritten = reg.rewrite(&name);
-                match rewritten.split_once('/') {
-                    Some((h, r)) => (h.to_string(), r.to_string()),
-                    None => (registry.to_string(), repository.to_string()),
-                }
-            }
-            None => (registry.to_string(), repository.to_string()),
-        };
-        let host = if host == "docker.io" {
-            "registry-1.docker.io".to_string()
-        } else {
-            host
-        };
-        Ok(Endpoint {
-            host,
-            repository,
-            insecure,
-            allow_private,
-        })
+        let mut all = self.endpoints(registry, repository, None, false)?;
+        Ok(all.remove(0))
     }
 
     /// The endpoints to try for `registry/repository`, in order: the mirrors
-    /// that apply (to a reference with or without a digest), then the
+    /// that apply (to a reference with or without a `digest`), then the
     /// registry itself.  Without `mirrors` only the registry.
     pub fn endpoints(
         &self,
         registry: &str,
         repository: &str,
-        has_digest: bool,
+        digest: Option<&Digest>,
         mirrors: bool,
     ) -> ImageResult<Vec<Endpoint>> {
-        let primary = self.resolve(registry, repository)?;
-        let mut out = Vec::new();
-        if mirrors {
-            let name = format!("{registry}/{repository}");
-            for (location, insecure) in self.registries.mirror_names(&name, has_digest) {
-                let Some((host, repository)) = location.split_once('/') else {
-                    continue;
-                };
-                let host = if host == "docker.io" {
-                    "registry-1.docker.io".to_string()
-                } else {
-                    host.to_string()
-                };
-                if host == primary.host && repository == primary.repository {
-                    continue;
-                }
-                out.push(Endpoint {
-                    host,
-                    repository: repository.to_string(),
-                    insecure: insecure || !self.tls_verify,
-                    allow_private: primary.allow_private,
-                });
-            }
-        }
-        out.push(primary);
-        Ok(out)
+        self.registries.check().map_err(ImageError::Registry)?;
+        let ask = velarx_endpoint_core::Ask {
+            has_digest: digest.is_some(),
+            push: !mirrors,
+            tls_verify: self.tls_verify,
+        };
+        let (host, path) = (registry.as_bytes(), repository.as_bytes());
+        let all = velarx_endpoint_core::endpoints(&self.registries.blocks(), host, path, &ask)
+            .map_err(|why| match why {
+                velarx_endpoint_core::Refused::Blocked => ImageError::Registry(format!(
+                    "registry `{registry}` is blocked in registries.conf"
+                )),
+                velarx_endpoint_core::Refused::NoRepository => ImageError::Registry(format!(
+                    "registries.conf leaves no repository for `{registry}/{repository}`: \
+                     a location needs a path where the name is the prefix"
+                )),
+            })?;
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        Ok(all
+            .iter()
+            .map(|e| Endpoint {
+                host: text(&e.host),
+                repository: text(&e.path),
+                insecure: e.insecure,
+                allow_private: e.allow_private,
+                command_line: matches!(e.creds, velarx_endpoint_core::Creds::CommandLine),
+                by_digest: digest.filter(|_| e.by_digest).copied(),
+            })
+            .collect())
     }
 }
 
@@ -142,6 +115,13 @@ pub struct Endpoint {
     pub insecure: bool,
     /// `allow-private-addresses` of the registry's block
     pub allow_private: bool,
+    /// It may be given the credentials of the command line: it is on the
+    /// host that was named, not on another one (a mirror, or a location)
+    pub command_line: bool,
+    /// The manifest is asked of this endpoint by this digest, not by the
+    /// tag: a mirror for digests only, which does not serve what it
+    /// cannot be checked of
+    pub by_digest: Option<Digest>,
 }
 
 /// Read the file of a certificate or a key of `certs.d`.
@@ -576,7 +556,7 @@ impl Resolver {
         let endpoints = self.config.endpoints(
             &image_ref.registry,
             &image_ref.repository,
-            image_ref.digest.is_some(),
+            image_ref.digest.as_ref(),
             mirrors,
         )?;
         let mut targets = Vec::new();
@@ -656,7 +636,11 @@ impl Resolver {
     /// The credentials for the repository of `t`, if any.
     pub fn credentials(&self, t: &Target) -> ImageResult<Option<Credentials>> {
         self.auth
-            .lookup(&t.endpoint.host, &t.endpoint.repository)
+            .lookup_for(
+                t.endpoint.command_line,
+                &t.endpoint.host,
+                &t.endpoint.repository,
+            )
             .map_err(ImageError::Registry)
     }
 
@@ -1070,5 +1054,153 @@ mod tests {
         ] {
             assert!(RegistriesConfig::parse(conf).is_err(), "{what}");
         }
+    }
+    fn hosts(endpoints: &[Endpoint]) -> Vec<(&str, &str)> {
+        endpoints
+            .iter()
+            .map(|e| (e.host.as_str(), e.repository.as_str()))
+            .collect()
+    }
+
+    /// A prefix governs a name at the end of a component: `example.com`
+    /// does not govern `example.com:5000`, which is another server (a name
+    /// has no tag, so a colon is a port); a prefix that names the port
+    /// does.
+    #[test]
+    fn a_prefix_without_a_port_does_not_govern_the_same_host_on_a_port() {
+        let t = transport(
+            "[[registry]]\nprefix = \"example.com\"\nlocation = \"first.test\"\n\
+             insecure = true\n[[registry.mirror]]\nlocation = \"mirror.test\"\n",
+            true,
+        );
+        let e = t.endpoints("example.com:5000", "x", None, true).unwrap();
+        assert_eq!(hosts(&e), [("example.com:5000", "x")]);
+        assert!(!e[0].insecure);
+        // the registry without the port is governed
+        let e = t.endpoints("example.com", "x", None, true).unwrap();
+        assert_eq!(hosts(&e), [("mirror.test", "x"), ("first.test", "x")]);
+        assert!(e[1].insecure && !e[0].insecure);
+        // a prefix that is not at a boundary does not apply
+        let e = t.endpoints("example.community", "x", None, true).unwrap();
+        assert_eq!(hosts(&e), [("example.community", "x")]);
+        // the block that names the port governs it, and a block that
+        // blocks the registry does not block it on another port
+        let t = transport(
+            "[[registry]]\nprefix = \"example.com\"\nblocked = true\n\
+             [[registry]]\nprefix = \"example.com:5000\"\ninsecure = true\n",
+            true,
+        );
+        assert!(t.resolve("example.com:5000", "x").unwrap().insecure);
+        assert!(t.resolve("example.com", "x").is_err());
+        assert!(!t.resolve("example.com:6000", "x").unwrap().insecure);
+    }
+
+    /// A rewrite whose result has no repository (a location without a path,
+    /// for the name that is the prefix) is an error, as it is for
+    /// containers/image, and not the name as typed with the flags of the
+    /// block; a longer name is rewritten as the file says.  The same for a
+    /// mirror.
+    #[test]
+    fn a_location_without_a_path_is_an_error_for_the_name_that_is_the_prefix() {
+        let t = transport(
+            "[[registry]]\nprefix = \"docker.io/library/alpine\"\n\
+             location = \"internal\"\ninsecure = true\n\
+             [[registry.mirror]]\nlocation = \"cache.test\"\n",
+            true,
+        );
+        let e = t
+            .endpoints("docker.io", "library/alpine", None, true)
+            .unwrap_err();
+        assert!(e.to_string().contains("leaves no repository"), "{e}");
+        assert!(t.resolve("docker.io", "library/alpine").is_err());
+        // with a longer name the same block rewrites as it says
+        let e = t
+            .endpoints("docker.io", "library/alpine/x", None, true)
+            .unwrap();
+        assert_eq!(hosts(&e), [("cache.test", "x"), ("internal", "x")]);
+    }
+
+    /// A mirror is insecure by its own entry only (or `--tls-verify=false`),
+    /// never because of a block.  It may reach private addresses if the
+    /// block of its own location allows it, or the block that lists it as
+    /// a mirror (the administrator wrote it there); the block of a registry
+    /// that does not list it gives it nothing.
+    #[test]
+    fn a_mirror_may_reach_private_addresses_by_its_own_block_or_the_one_that_lists_it() {
+        let t = transport(
+            "[[registry]]\nprefix = \"a.test\"\nallow-private-addresses = true\n\
+             insecure = true\n\
+             [[registry.mirror]]\nlocation = \"m.test/mirror\"\n\
+             [[registry.mirror]]\nlocation = \"n.test/mirror\"\ninsecure = true\n\
+             [[registry]]\nprefix = \"c.test\"\n\
+             [[registry.mirror]]\nlocation = \"d.test/mirror\"\n\
+             [[registry]]\nprefix = \"d.test\"\nallow-private-addresses = true\n\
+             insecure = true\n",
+            true,
+        );
+        // a.test may reach private addresses and is insecure: its mirrors
+        // may reach them (it lists them) and are insecure only if they say so
+        let e = t.endpoints("a.test", "x", None, true).unwrap();
+        assert_eq!(
+            hosts(&e),
+            [
+                ("m.test", "mirror/x"),
+                ("n.test", "mirror/x"),
+                ("a.test", "x")
+            ]
+        );
+        let flags: Vec<_> = e.iter().map(|e| (e.insecure, e.allow_private)).collect();
+        assert_eq!(flags, [(false, true), (true, true), (true, true)]);
+        // the block of the mirror's own location allows private addresses
+        // for it; that block's `insecure` does not make it insecure, and the
+        // registry that lists it has none to give
+        let e = t.endpoints("c.test", "x", None, true).unwrap();
+        assert_eq!(hosts(&e), [("d.test", "mirror/x"), ("c.test", "x")]);
+        let flags: Vec<_> = e.iter().map(|e| (e.insecure, e.allow_private)).collect();
+        assert_eq!(flags, [(false, true), (false, false)]);
+        // no verification of the certificates: every endpoint is insecure
+        let t = transport(
+            "[[registry]]\nprefix = \"c.test\"\n[[registry.mirror]]\nlocation = \"d.test\"\n",
+            false,
+        );
+        let e = t.endpoints("c.test", "x", None, true).unwrap();
+        assert!(e.len() == 2 && e.iter().all(|e| e.insecure && !e.allow_private));
+    }
+
+    /// A mirror that its own block blocks is not used, as containers/image
+    /// skips it when it contacts it; the registry is.
+    #[test]
+    fn a_mirror_that_is_blocked_is_skipped() {
+        let t = transport(
+            "[[registry]]\nprefix = \"a.test\"\n\
+             [[registry.mirror]]\nlocation = \"b.test/mirror\"\n\
+             [[registry.mirror]]\nlocation = \"c.test/mirror\"\n\
+             [[registry]]\nprefix = \"b.test\"\nblocked = true\n",
+            true,
+        );
+        let e = t.endpoints("a.test", "x", None, true).unwrap();
+        assert_eq!(hosts(&e), [("c.test", "mirror/x"), ("a.test", "x")]);
+        assert!(t.resolve("b.test", "mirror/x").is_err());
+    }
+
+    /// The credentials of the command line are for the host that was named:
+    /// a registry that a `location` moves to another host, and a mirror
+    /// there, have what is stored for them; a mirror on the same host has
+    /// the credentials of the command line too.
+    #[test]
+    fn command_line_credentials_follow_the_host_that_was_named() {
+        let t = transport(
+            "[[registry]]\nprefix = \"a.test\"\nlocation = \"internal.test\"\n\
+             [[registry]]\nprefix = \"b.test\"\n\
+             [[registry.mirror]]\nlocation = \"b.test/m\"\n\
+             [[registry.mirror]]\nlocation = \"c.test\"\n",
+            true,
+        );
+        let e = t.endpoints("a.test", "x", None, true).unwrap();
+        assert_eq!(hosts(&e), [("internal.test", "x")]);
+        assert!(!e[0].command_line);
+        let e = t.endpoints("b.test", "x", None, true).unwrap();
+        let named: Vec<_> = e.iter().map(|e| e.command_line).collect();
+        assert_eq!(named, [true, false, true]);
     }
 }

@@ -1281,7 +1281,7 @@ impl ImageService {
             manifest_digest,
             config,
             config_bytes,
-            source: Some(Source::Registry(target)),
+            source: Some(Source::Registry(Box::new(target))),
             via: None,
             made: Vec::new(),
             registry_ref: Some(image_ref.full_name()),

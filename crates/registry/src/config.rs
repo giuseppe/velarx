@@ -4,6 +4,8 @@
 //! The file has the TOML format of the registries.conf of podman and CRI-O,
 //! in velarx's own directories.
 //! See: https://github.com/containers/image/blob/main/docs/containers-registries.conf.5.md
+//! Where the endpoints of a name come from is `velarx-endpoint-core`; the
+//! differences from that format are in the README.
 //!
 //! A configuration that cannot be read or parsed fails closed: the client
 //! refuses every registry operation with the error instead of going on
@@ -541,19 +543,41 @@ impl RegistriesConfig {
         }
     }
 
+    /// The blocks, for [`velarx_endpoint_core`].
+    pub(crate) fn blocks(&self) -> Vec<velarx_endpoint_core::Block> {
+        use velarx_endpoint_core::{Block, Mirror, Mode};
+        let mode = |s: &str| match s {
+            "digest-only" => Mode::DigestOnly,
+            "tag-only" => Mode::TagOnly,
+            _ => Mode::All,
+        };
+        let bytes = |s: &str| s.as_bytes().to_vec();
+        let mirror = |reg: &RegistryConfig, m: &MirrorConfig| Mirror {
+            location: bytes(&m.location),
+            insecure: m.insecure,
+            mode: mode(
+                m.pull_from_mirror
+                    .as_deref()
+                    .unwrap_or(&reg.pull_from_mirror),
+            ),
+        };
+        self.registry
+            .iter()
+            .map(|r| Block {
+                prefix: bytes(&r.prefix),
+                location: r.location.as_deref().map(bytes),
+                insecure: r.insecure,
+                blocked: r.blocked,
+                allow_private: r.allow_private_addresses,
+                mirrors: r.mirror.iter().map(|m| mirror(r, m)).collect(),
+            })
+            .collect()
+    }
+
     /// Find registry config matching a given image reference
     pub fn find_registry(&self, image_ref: &str) -> Option<&RegistryConfig> {
-        let mut best_match: Option<&RegistryConfig> = None;
-        let mut best_len = 0;
-
-        for reg in &self.registry {
-            if prefix_matches(&reg.prefix, image_ref) && reg.prefix.len() > best_len {
-                best_match = Some(reg);
-                best_len = reg.prefix.len();
-            }
-        }
-
-        best_match
+        velarx_endpoint_core::select(&self.blocks(), image_ref.as_bytes())
+            .map(|i| &self.registry[i])
     }
 
     /// Whether the registry block for `registry` (`host/repository`) allows
@@ -620,30 +644,6 @@ impl RegistriesConfig {
         }
         Ok(candidates)
     }
-
-    /// The mirrors of the registry block for `name` (`registry/repository`)
-    /// that apply to a reference with or without a digest, as locations with
-    /// the name rewritten, and whether each is insecure.
-    pub fn mirror_names(&self, name: &str, has_digest: bool) -> Vec<(String, bool)> {
-        let Some(reg) = self.find_registry(name) else {
-            return Vec::new();
-        };
-        reg.mirror
-            .iter()
-            .filter(|m| {
-                match m
-                    .pull_from_mirror
-                    .as_deref()
-                    .unwrap_or(&reg.pull_from_mirror)
-                {
-                    "digest-only" => has_digest,
-                    "tag-only" => !has_digest,
-                    _ => true,
-                }
-            })
-            .map(|m| (reg.rewrite_to(&m.location, name), m.insecure))
-            .collect()
-    }
 }
 
 /// The `*.conf` files of the drop-in directories, sorted by name; a file
@@ -691,55 +691,6 @@ fn is_short_name(name: &str) -> bool {
         .is_ok_and(|s| s.host_end == 0 && s.tag.is_none() && s.digest.is_none())
 }
 
-/// Whether `prefix` of a [[registry]] block applies to the image name
-/// `name`, like containers/image: the match is on whole components (the
-/// prefix `localhost:5000` does not apply to `localhost:50001/img`), and a
-/// leading `*.` matches any subdomain of the host.
-pub(crate) fn prefix_matches(prefix: &str, name: &str) -> bool {
-    if let Some(domain) = prefix.strip_prefix("*.") {
-        let host = name.split(['/', '@']).next().unwrap_or(name);
-        let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
-        return host.len() > domain.len()
-            && host.ends_with(domain)
-            && host.as_bytes()[host.len() - domain.len() - 1] == b'.';
-    }
-    match name.strip_prefix(prefix) {
-        Some("") => true,
-        // The prefix must end at a component boundary (a tag or digest
-        // separator ends it too).
-        Some(rest) => rest.starts_with(['/', ':', '@']),
-        None => false,
-    }
-}
-
-impl RegistryConfig {
-    /// Rewrite an image name matched by this block to the registry
-    /// location: `prefix` is replaced by `location`.
-    pub fn rewrite(&self, name: &str) -> String {
-        match (&self.location, name.strip_prefix(self.prefix.as_str())) {
-            (Some(location), Some(rest)) if !self.prefix.starts_with("*.") => {
-                format!("{}{}", location, rest)
-            }
-            _ => name.to_string(),
-        }
-    }
-
-    /// The name `name` (matched by this block) as it is at `location`:
-    /// the prefix, or for a wildcard prefix the host, is replaced.
-    pub fn rewrite_to(&self, location: &str, name: &str) -> String {
-        if self.prefix.starts_with("*.") {
-            return match name.split_once('/') {
-                Some((_, rest)) => format!("{location}/{rest}"),
-                None => location.to_string(),
-            };
-        }
-        match name.strip_prefix(self.prefix.as_str()) {
-            Some(rest) => format!("{location}{rest}"),
-            None => name.to_string(),
-        }
-    }
-}
-
 #[cfg(test)]
 impl RegistriesConfig {
     /// Get mirrors for a registry (in order of preference)
@@ -760,6 +711,46 @@ impl RegistryConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mirrors of the registry for `name` (`registry/repository`) that
+    /// apply to a reference with or without a digest, as the locations
+    /// the name is rewritten to, and whether each is insecure.
+    fn mirror_names(c: &RegistriesConfig, name: &str, has_digest: bool) -> Vec<(String, bool)> {
+        let ask = velarx_endpoint_core::Ask {
+            has_digest,
+            push: false,
+            tls_verify: true,
+        };
+        let (host, path) = name.split_once('/').unwrap();
+        let mut all =
+            velarx_endpoint_core::endpoints(&c.blocks(), host.as_bytes(), path.as_bytes(), &ask)
+                .ok()
+                .unwrap();
+        all.pop();
+        all.iter()
+            .map(|e| {
+                let at = format!("{}/{}", text(&e.host), text(&e.path));
+                (at, e.insecure)
+            })
+            .collect()
+    }
+
+    fn text(b: &[u8]) -> String {
+        String::from_utf8_lossy(b).into_owned()
+    }
+
+    /// Whether `prefix` governs `name`.
+    fn prefix_matches(prefix: &str, name: &str) -> bool {
+        let block = velarx_endpoint_core::Block {
+            prefix: prefix.as_bytes().to_vec(),
+            location: None,
+            insecure: false,
+            blocked: false,
+            allow_private: false,
+            mirrors: Vec::new(),
+        };
+        velarx_endpoint_core::select(&[block], name.as_bytes()).is_some()
+    }
 
     #[test]
     fn a_key_that_is_not_a_setting_is_an_error() {
@@ -998,24 +989,24 @@ location = "cache.example/corp"
         );
         let name = "docker.io/library/alpine";
         assert_eq!(
-            c.mirror_names(name, true),
+            mirror_names(&c, name, true),
             [
                 ("mirror.example:5000/library/alpine".to_string(), true),
                 ("any.example/library/alpine".to_string(), false)
             ]
         );
         assert_eq!(
-            c.mirror_names(name, false),
+            mirror_names(&c, name, false),
             [
                 ("tags.example/library/alpine".to_string(), false),
                 ("any.example/library/alpine".to_string(), false)
             ]
         );
         assert_eq!(
-            c.mirror_names("reg.corp.example/team/img", false),
+            mirror_names(&c, "reg.corp.example/team/img", false),
             [("cache.example/corp/team/img".to_string(), false)]
         );
-        assert!(c.mirror_names("quay.io/x/y", false).is_empty());
+        assert!(mirror_names(&c, "quay.io/x/y", false).is_empty());
     }
 
     #[test]
@@ -1056,7 +1047,8 @@ location = "cache.example/corp"
         assert!(prefix_matches("localhost:5000", "localhost:5000/img:1"));
         assert!(prefix_matches("localhost:5000", "localhost:5000"));
         assert!(prefix_matches("quay.io/foo", "quay.io/foo/bar"));
-        assert!(prefix_matches("quay.io/foo", "quay.io/foo:tag"));
+        assert!(!prefix_matches("quay.io/foo", "quay.io/foo:tag"));
+        assert!(!prefix_matches("quay.io", "quay.io:5000/foo"));
         assert!(!prefix_matches("localhost:5000", "localhost:50001/img"));
         assert!(!prefix_matches("quay.io/foo", "quay.io/foobar"));
         assert!(prefix_matches("*.example.com", "a.example.com/x"));
@@ -1082,10 +1074,18 @@ location = "cache.example/corp"
             "[[registry]]\nprefix = \"example.com/ns\"\nlocation = \"mirror.local:5000/other\"\n",
         )
         .unwrap();
-        let reg = config.find_registry("example.com/ns/img:1").unwrap();
+        let ask = velarx_endpoint_core::Ask {
+            has_digest: false,
+            push: true,
+            tls_verify: true,
+        };
+        let got =
+            velarx_endpoint_core::endpoints(&config.blocks(), b"example.com", b"ns/img", &ask)
+                .ok()
+                .unwrap();
         assert_eq!(
-            reg.rewrite("example.com/ns/img:1"),
-            "mirror.local:5000/other/img:1"
+            (text(&got[0].host), text(&got[0].path)),
+            ("mirror.local:5000".to_string(), "other/img".to_string())
         );
     }
 
@@ -1337,8 +1337,8 @@ registries = ["evil.example"]
             "[[registry]]\nprefix = \"docker.io\"\nmirror-by-digest-only = true\n[[registry.mirror]]\nlocation = \"m.io\"",
         )
         .unwrap();
-        assert!(c.mirror_names("docker.io/library/a", false).is_empty());
-        assert_eq!(c.mirror_names("docker.io/library/a", true).len(), 1);
+        assert!(mirror_names(&c, "docker.io/library/a", false).is_empty());
+        assert_eq!(mirror_names(&c, "docker.io/library/a", true).len(), 1);
         assert!(RegistriesConfig::parse(
             "[[registry]]\nprefix = \"docker.io\"\nmirror-by-digest-only = true\n[[registry.mirror]]\nlocation = \"m.io\"\npull-from-mirror = \"tag-only\""
         )

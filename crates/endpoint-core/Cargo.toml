@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-endpoint-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Which registries a reference is fetched from: the primary and the mirrors, with the flags of each"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on the blocks of registries.conf and the parts of a
+# reference as bytes: no dependency, no I/O.  The shell that reads the
+# TOML, builds the URLs and looks the credentials up is the registry
+# package (`velarx-registry`, config.rs and target.rs).
+
+[lib]
+name = "velarx_endpoint_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

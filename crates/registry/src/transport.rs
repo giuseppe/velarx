@@ -7,7 +7,11 @@
 //! `certs.d`, and the scheme: registries marked `insecure` in
 //! `registries.conf` (or every registry with `--tls-verify=false`) skip the
 //! certificate checks and may be reached over plain HTTP, tried after HTTPS
-//! like containers/image does.
+//! like containers/image does.  The flag is the registry's, and so wide as
+//! its requests: the client of a host is also the one of the token endpoint
+//! the registry names and of the CDN it redirects a blob to, so those are
+//! reached without certificate checks too (and with the client certificate
+//! of the registry).
 //!
 //! The directories searched for `<dir>/<host[:port]>/` are
 //! `/etc/velarx/certs.d`, `/etc/docker/certs.d` and, rootless,
@@ -288,7 +292,9 @@ impl HostTransport {
 
 /// Where a registry redirected a blob to (typically the signed URL of a
 /// CDN), for the requests that follow: it saves the round trip to the
-/// registry and its redirect.  Bounded, the oldest entry is replaced.
+/// registry and its redirect.  Bounded, the oldest entry is replaced.  A
+/// client keeps one for the credentials it has: the URL is a signed answer
+/// to the caller that was asked.
 #[derive(Default)]
 pub struct RedirectCache {
     entries: Mutex<VecDeque<(String, String)>>,
@@ -321,7 +327,6 @@ impl RedirectCache {
 #[derive(Default)]
 pub struct Transport {
     hosts: Mutex<HashMap<String, Arc<HostTransport>>>,
-    pub redirects: RedirectCache,
 }
 
 impl Transport {

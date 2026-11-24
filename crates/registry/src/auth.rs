@@ -249,7 +249,8 @@ impl std::fmt::Debug for Entry {
 /// command line or by an API client, which come first.
 #[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
-    /// Credentials for every registry (`--creds`).
+    /// Credentials of the command line (`--creds`), for the endpoints on
+    /// the host that was named.
     any: Option<Credentials>,
     explicit: Vec<(String, Credentials)>,
     files: Vec<AuthFile>,
@@ -591,10 +592,37 @@ impl AuthConfig {
 
     /// The credentials for `repository` of `registry`, if any.
     pub fn lookup(&self, registry: &str, repository: &str) -> Result<Option<Credentials>, String> {
-        let registry = normalize_registry(registry);
         if let Some(c) = &self.any {
             return Ok(Some(c.clone()));
         }
+        self.lookup_stored(registry, repository)
+    }
+
+    /// [`lookup`](Self::lookup) for an endpoint that is given the
+    /// credentials of the command line only if it is on the host that was
+    /// named (`command_line`), not a mirror or a registry on another one.
+    pub fn lookup_for(
+        &self,
+        command_line: bool,
+        registry: &str,
+        repository: &str,
+    ) -> Result<Option<Credentials>, String> {
+        if command_line {
+            self.lookup(registry, repository)
+        } else {
+            self.lookup_stored(registry, repository)
+        }
+    }
+
+    /// The credentials for `repository` of `registry` that were given for
+    /// it (a key of the explicit ones, an auth file, a helper), never the
+    /// ones of the command line.
+    fn lookup_stored(
+        &self,
+        registry: &str,
+        repository: &str,
+    ) -> Result<Option<Credentials>, String> {
+        let registry = normalize_registry(registry);
         if let Some(c) = best_match(&self.explicit, registry, repository) {
             return Ok(Some(c.clone()));
         }
@@ -710,7 +738,8 @@ impl AuthConfig {
 /// certificates (`--cert-dir`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RegistryAccess {
-    /// For every registry the request reaches.
+    /// For the endpoints of the request on the host that was named (the
+    /// registry of the reference, and what is on its host).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creds: Option<Credentials>,
     /// By registry or `registry/namespace`.
@@ -1649,5 +1678,75 @@ mod tests {
         assert_eq!(find(".:bin:../x"), None);
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(find(&abs), None);
+    }
+
+    /// The credentials stored for a registry are returned for that host
+    /// only, the port being part of it; the names of Docker Hub are one
+    /// host.
+    #[test]
+    fn credentials_of_a_registry_are_returned_for_its_host_only() {
+        let who = |c: &AuthConfig, registry: &str, repository: &str| {
+            user(c.lookup(registry, repository).unwrap())
+        };
+        let c = AuthConfig::default()
+            .with_credentials("r.test", Credentials::basic("a", "1"))
+            .with_credentials("p.test:5000", Credentials::basic("b", "2"))
+            .with_credentials("r.test/ns", Credentials::basic("c", "3"))
+            .with_credentials("https://index.docker.io/v1/", Credentials::basic("d", "4"));
+        assert_eq!(who(&c, "r.test", "x"), "a:1");
+        // a host with a port is another host, whichever side has it
+        assert_eq!(who(&c, "r.test:5000", "x"), "");
+        assert_eq!(who(&c, "p.test", "x"), "");
+        assert_eq!(who(&c, "p.test:5000", "x"), "b:2");
+        assert_eq!(who(&c, "p.test:50001", "x"), "");
+        // a name that only starts with the key, and a sub-domain
+        assert_eq!(who(&c, "r.test.evil", "x"), "");
+        assert_eq!(who(&c, "xr.test", "x"), "");
+        assert_eq!(who(&c, "sub.r.test", "x"), "");
+        // the case of a host is not folded: no credentials, not other's
+        assert_eq!(who(&c, "R.TEST", "x"), "");
+        // a namespace key is a path component, the longest wins
+        assert_eq!(who(&c, "r.test", "ns/img"), "c:3");
+        assert_eq!(who(&c, "r.test", "nsx/img"), "a:1");
+        // the three names of Docker Hub are one host, with no port
+        for name in ["docker.io", "index.docker.io", "registry-1.docker.io"] {
+            assert_eq!(who(&c, name, "library/alpine"), "d:4", "{name}");
+        }
+        assert_eq!(who(&c, "registry-1.docker.io:443", "x"), "");
+        assert_eq!(who(&c, "docker.io:5000", "x"), "");
+        assert_eq!(who(&c, "docker.io.evil", "x"), "");
+    }
+
+    /// The credentials of the command line (`--creds`, or an
+    /// `X-Registry-Auth` without `serveraddress`) are the answer for every
+    /// host; those with a `serveraddress` are for it only.
+    #[test]
+    fn credentials_of_the_command_line_answer_every_host() {
+        let c = AuthConfig::default()
+            .with_credentials("r.test", Credentials::basic("a", "1"))
+            .with_access(&RegistryAccess {
+                creds: Some(Credentials::basic("cli", "pw")),
+                ..Default::default()
+            });
+        for host in ["r.test", "other.test", "other.test:5000", "docker.io"] {
+            assert_eq!(user(c.lookup(host, "x").unwrap()), "cli:pw", "{host}");
+        }
+        // an endpoint that is not the one that was named (a mirror) is
+        // not given them: it has what is stored for its own host
+        let lookup = |command_line, host| user(c.lookup_for(command_line, host, "x").unwrap());
+        assert_eq!(lookup(true, "other.test"), "cli:pw");
+        assert_eq!(lookup(false, "other.test"), "");
+        assert_eq!(lookup(false, "other.test:5000"), "");
+        assert_eq!(lookup(false, "r.test"), "a:1");
+        let header = BASE64
+            .encode(r#"{"username":"u","password":"p","serveraddress":"https://s.test:5000/v2/"}"#);
+        let access = RegistryAccess::from_registry_auth(&header).unwrap();
+        assert!(access.creds.is_none());
+        let c = AuthConfig::default().with_access(&access);
+        assert_eq!(user(c.lookup("s.test:5000", "x").unwrap()), "u:p");
+        assert_eq!(user(c.lookup("s.test", "x").unwrap()), "");
+        let header = BASE64.encode(r#"{"username":"u","password":"p"}"#);
+        let access = RegistryAccess::from_registry_auth(&header).unwrap();
+        assert!(access.creds.is_some());
     }
 }

@@ -4,7 +4,8 @@
 //! The client owns the authentication (anonymous or with credentials,
 //! `Bearer` token flow with expiry and renewal, `Basic`), the manual
 //! following of redirects (the `Authorization` header is only sent to the
-//! registry origin and a redirect never leaves HTTPS for HTTP), and the
+//! registry origin, and no more once a request has left it; nothing goes from
+//! HTTPS to HTTP, a redirect or an upload location), and the
 //! redirect cache of blobs.  The connections, TLS settings and the scheme of
 //! each registry are in [`super::transport`].
 
@@ -15,7 +16,7 @@ use super::target::{
     manifest_digest, manifest_reference, resolve_manifest, verify_digest, Challenge, Endpoint,
     EndpointSpec, Platform, Resolver, Target, TransportConfig, MAX_MANIFEST_SIZE,
 };
-use super::transport::{HostTransport, Transport};
+use super::transport::{HostTransport, RedirectCache, Transport};
 use base64::Engine;
 use bytes::Bytes;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
@@ -28,6 +29,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
+use velarx_send_core as send_core;
+use velarx_send_core::{Action, Answer, Event, Request, Why};
 use velarx_types::digest::{Algorithm, Digest};
 use velarx_types::{ImageError, ImageReference, ImageResult, OciDescriptor, OciManifest};
 
@@ -38,9 +41,6 @@ const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'.')
     .remove(b'~');
-
-/// Redirects followed for one request.
-const MAX_REDIRECTS: usize = 10;
 
 /// How long a connection made in advance may take.
 const PRECONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -94,7 +94,8 @@ struct Brokered {
 }
 
 /// Registry client.  Cheap to clone: the connections, the tokens and the
-/// redirect cache are shared by the clones.
+/// redirect cache are shared by the clones (a client of other credentials has
+/// its own tokens and redirect cache).
 #[derive(Clone)]
 pub struct RegistryClient {
     /// The configuration, the credentials and the certificates
@@ -102,6 +103,9 @@ pub struct RegistryClient {
     transport: Arc<Transport>,
     brokered: Option<Brokered>,
     tokens: Arc<Mutex<HashMap<String, CachedToken>>>,
+    /// Where the registry sent a blob, for the callers that have these
+    /// credentials: what a registry gave one caller is not for another.
+    redirects: Arc<RedirectCache>,
     challenges: Arc<Mutex<HashMap<String, Challenge>>>,
     hinting: Arc<Hinting>,
 }
@@ -186,6 +190,7 @@ impl RegistryClient {
             transport: Arc::new(Transport::default()),
             brokered: None,
             tokens: Arc::new(Mutex::new(HashMap::new())),
+            redirects: Arc::default(),
             challenges: Arc::new(Mutex::new(HashMap::new())),
             hinting: Arc::default(),
         }
@@ -230,6 +235,7 @@ impl RegistryClient {
         Self {
             resolver: self.resolver.with_tls_verify(tls_verify),
             transport: Arc::new(Transport::default()),
+            redirects: Arc::default(),
             challenges: Arc::new(Mutex::new(HashMap::new())),
             hinting: Arc::default(),
             ..self.clone()
@@ -244,6 +250,7 @@ impl RegistryClient {
             resolver: self.resolver.without_credentials(),
             brokered: None,
             tokens: Arc::new(Mutex::new(HashMap::new())),
+            redirects: Arc::default(),
             ..self.clone()
         }
     }
@@ -256,6 +263,7 @@ impl RegistryClient {
         Ok(Self {
             resolver: self.resolver.with_reloaded_credentials(files)?,
             tokens: Arc::new(Mutex::new(HashMap::new())),
+            redirects: Arc::default(),
             ..self.clone()
         })
     }
@@ -274,8 +282,9 @@ impl RegistryClient {
             },
             // credentials of the request: the client's own, not a broker's
             brokered: None,
-            // tokens got with other credentials are not these
+            // what was got with other credentials is not for these
             tokens: Arc::new(Mutex::new(HashMap::new())),
+            redirects: Arc::default(),
             challenges: Arc::new(Mutex::new(HashMap::new())),
             hinting: Arc::default(),
         }
@@ -383,6 +392,9 @@ impl RegistryClient {
                     repository: spec.repository.clone(),
                     insecure: spec.insecure,
                     allow_private: spec.allow_private,
+                    // (what the spec has is what the endpoint is given)
+                    command_line: false,
+                    by_digest: None,
                 },
                 certs: spec.certs.clone(),
                 mount_from: None,
@@ -638,7 +650,7 @@ impl RegistryClient {
     pub fn redirect_of(&self, t: &Target, digest: &Digest) -> Option<(usize, String)> {
         t.chain()
             .enumerate()
-            .find_map(|(i, e)| Some((i, self.transport.redirects.get(&e.blob_key(digest))?)))
+            .find_map(|(i, e)| Some((i, self.redirects.get(&e.blob_key(digest))?)))
     }
 
     /// Remember where the registry sent the blob `digest` (another worker
@@ -654,7 +666,7 @@ impl RegistryClient {
             return;
         }
         if self.may_redirect_to(t, &parsed).await {
-            self.transport.redirects.put(&t.blob_key(digest), url);
+            self.redirects.put(&t.blob_key(digest), url);
         }
     }
 
@@ -807,7 +819,8 @@ impl RegistryClient {
         }
         let auth = self.resolver.auth().clone();
         let (host, repository) = (t.endpoint.host.clone(), t.endpoint.repository.clone());
-        tokio::task::spawn_blocking(move || auth.lookup(&host, &repository))
+        let command_line = t.endpoint.command_line;
+        tokio::task::spawn_blocking(move || auth.lookup_for(command_line, &host, &repository))
             .await
             .map_err(|e| ImageError::Registry(format!("credential lookup: {e}")))?
             .map_err(ImageError::Registry)
@@ -1047,7 +1060,9 @@ impl RegistryClient {
     }
 
     /// Send a request to the registry and follow the redirects by hand.
-    /// `url` is absolute.  `headers` must not contain `Authorization`.
+    /// `url` is absolute.  `headers` must not contain `Authorization`.  What
+    /// is sent where, and when to stop, is decided by [`send_core`] from
+    /// what each answer was.
     async fn send_url(&self, t: &Target, request: SendUrl<'_>) -> ImageResult<Response> {
         let SendUrl {
             method,
@@ -1057,174 +1072,215 @@ impl RegistryClient {
             actions,
             cache_key,
         } = request;
-        let origin_url = reqwest::Url::parse(url)
+        let mut start = reqwest::Url::parse(url)
             .map_err(|e| ImageError::Registry(format!("invalid URL `{url}`: {e}")))?;
         // The registry's own place: only a request to it gets the
         // credentials, and any other place is checked as a redirect is
         // (the URL of an upload session is the registry's word too).
-        let home = reqwest::Url::parse(&self.host(t)?.base_url().await?)
+        let host = self.host(t)?;
+        let home = reqwest::Url::parse(&host.base_url().await?)
             .map_err(|e| ImageError::Registry(format!("invalid registry URL: {e}")))?;
-        let mut refreshed = false;
-        'retry: loop {
-            // A registry that is not known to ask for a token is asked
-            // for the thing itself first: its 401 says what it wants,
-            // which the `GET /v2/` would cost a round trip to learn.
-            let probe = !refreshed && self.probes(t, actions).await;
-            let auth = if probe {
-                None
-            } else {
-                self.authorization(t, actions, refreshed).await?
-            };
-            let mut current = origin_url.clone();
-            let (mut method, mut body) = (method.clone(), body.clone());
-            for hop in 0..=MAX_REDIRECTS {
-                let same_origin = same_origin(&home, &current);
-                if !same_origin {
-                    self.host(t)?.check_url(&current).await?;
+        // The location an https registry behind a proxy that does not
+        // pass the scheme gives is its own address over http: it is the
+        // registry, and is asked over https.
+        if home.scheme() == "https" && start.scheme() == "http" {
+            let mut secure = start.clone();
+            if secure.set_scheme("https").is_ok() && same_origin(&home, &secure) {
+                start = secure;
+            }
+        }
+        let (first, mut problem) = judge(&host, &home, &start, &start).await;
+        let (mut state, mut action) = send_core::begin(&send_core::Begin {
+            home_https: home.scheme() == "https",
+            start: first,
+            method: core_method(&method),
+            body: body.as_ref().is_some_and(|b| !b.is_empty()),
+            cacheable: cache_key.is_some(),
+        });
+        let (mut current, mut probe, mut auth, mut last) = (start.clone(), false, None, None);
+        loop {
+            let event = match action {
+                Action::Pass { refresh } => {
+                    // A registry that is not known to ask for a token is
+                    // asked for the thing itself first: its 401 says what
+                    // it wants, which the `GET /v2/` would cost a round
+                    // trip to learn.
+                    probe = !refresh && self.probes(t, actions).await;
+                    auth = if probe {
+                        None
+                    } else {
+                        self.authorization(t, actions, refresh).await?
+                    };
+                    current = start.clone();
+                    Event::Authed {
+                        probe,
+                        held: auth.is_some(),
+                    }
                 }
-                let build = || -> ImageResult<reqwest::RequestBuilder> {
-                    let mut req = self
-                        .host(t)?
-                        .client()?
-                        .request(method.clone(), current.clone())
-                        .headers(headers.clone());
-                    if same_origin {
-                        if let Some(a) = &auth {
+                Action::Send(send) => {
+                    let (verb, has_body, authorized, remember) = match send {
+                        Request::Home { auth, method, body } => (method, body, auth, false),
+                        Request::Away {
+                            method,
+                            body,
+                            remember,
+                        } => (method, body, false, remember),
+                    };
+                    let verb = match verb {
+                        send_core::Method::Get => Method::GET,
+                        send_core::Method::Head => Method::HEAD,
+                        send_core::Method::Other => method.clone(),
+                    };
+                    // The target is remembered when the registry sent us to
+                    // another place (the CDN of a blob).
+                    if let (true, Some(key)) = (remember, cache_key) {
+                        self.redirects.put(key, current.as_str());
+                    }
+                    // A connection the server closed while it was idle is
+                    // found out by the request that uses it: a request that
+                    // reads is sent again on another.
+                    let mut again = 0;
+                    let resp = loop {
+                        let mut req = host
+                            .client()?
+                            .request(verb.clone(), current.clone())
+                            .headers(headers.clone());
+                        if let (true, Some(a)) = (authorized, &auth) {
                             req = req.header(AUTHORIZATION, a.clone());
                         }
-                    }
-                    if let Some(b) = &body {
-                        req = req.body(b.clone());
-                    }
-                    Ok(req)
-                };
-                // A connection the server closed while it was idle is found
-                // out by the request that uses it: a request that reads is
-                // sent again on another.
-                let mut again = 0;
-                let resp = loop {
-                    match build()?.send().await {
-                        Ok(r) => break r,
-                        Err(e)
-                            if again < 2
-                                && (method == Method::GET || method == Method::HEAD)
-                                && connection_lost(&e) =>
-                        {
-                            again += 1;
-                            debug!("{}: {e}: trying again", current);
+                        if let Some(b) = body.as_ref().filter(|_| has_body) {
+                            req = req.body(b.clone());
                         }
-                        Err(e) => return Err(e.into()),
-                    }
-                };
-                let status = resp.status();
-                if same_origin
-                    && auth.is_some()
-                    && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-                    && self.drop_hint(
-                        &t.endpoint.host,
-                        &format!("the registry answered {}", status.as_u16()),
-                    )
-                {
-                    // asked again as without the hint: no token, the
-                    // registry's 401 says what it wants
-                    continue 'retry;
-                }
-                if same_origin && auth.is_some() {
-                    self.hint_served(&t.endpoint.host);
-                }
-                if status == StatusCode::UNAUTHORIZED && same_origin && !refreshed {
-                    if probe {
-                        if let Some(c) = resp
-                            .headers()
-                            .get("www-authenticate")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|h| Challenge::parse(h).ok())
-                        {
-                            self.challenges
-                                .lock()
-                                .unwrap()
-                                .insert(t.endpoint.host.clone(), c.clone());
-                            self.learned(t, &c).await;
-                            continue 'retry;
+                        match req.send().await {
+                            Ok(r) => break r,
+                            Err(e)
+                                if again < 2
+                                    && (verb == Method::GET || verb == Method::HEAD)
+                                    && connection_lost(&e) =>
+                            {
+                                again += 1;
+                                debug!("{}: {e}: trying again", current);
+                            }
+                            Err(e) => return Err(e.into()),
                         }
+                    };
+                    let status = resp.status();
+                    let hinted = authorized
+                        && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                        && self.drop_hint(
+                            &t.endpoint.host,
+                            &format!("the registry answered {}", status.as_u16()),
+                        );
+                    if authorized && !hinted {
+                        self.hint_served(&t.endpoint.host);
                     }
-                    refreshed = true;
-                    continue 'retry;
+                    let home_probe = probe && matches!(send, Request::Home { .. });
+                    if home_probe && (status.is_success() || status.is_redirection()) {
+                        // served without a token: the registry asks for none
+                        // (the next requests do not look up credentials
+                        // again; a 401 later asks `/v2/` for the challenge)
+                        self.challenges
+                            .lock()
+                            .unwrap()
+                            .entry(t.endpoint.host.clone())
+                            .or_insert(Challenge::None);
+                    }
+                    let answer = if hinted {
+                        Answer::Hinted
+                    } else if status == StatusCode::UNAUTHORIZED {
+                        Answer::Unauthorized {
+                            challenge: home_probe && self.learn(t, &resp).await,
+                        }
+                    } else if matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
+                        Answer::Missing
+                    } else if status.is_redirection() && status != StatusCode::NOT_MODIFIED {
+                        match location(&resp, &current) {
+                            Ok(next) => {
+                                let (to, refusal) = judge(&host, &home, &start, &next).await;
+                                problem = refusal;
+                                current = next;
+                                Answer::Redirect {
+                                    keeps: matches!(
+                                        status,
+                                        StatusCode::TEMPORARY_REDIRECT
+                                            | StatusCode::PERMANENT_REDIRECT
+                                    ),
+                                    next: to,
+                                }
+                            }
+                            Err(e) => {
+                                problem = Some(e);
+                                Answer::Unusable
+                            }
+                        }
+                    } else {
+                        Answer::Served
+                    };
+                    last = Some(resp);
+                    Event::Got(answer)
                 }
-                if probe
-                    && same_origin
-                    && (status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND)
-                {
+                Action::AskV2 => {
                     // Not every registry answers a request without a token
                     // with a 401: ask `/v2/`; the challenge it gives (kept
                     // for the host, so no request probes again) is used for
                     // one more try.  When `/v2/` does not say, the answer
                     // stands.
-                    match self.challenge(t, true).await {
-                        Ok(_) => {
-                            debug!("{}: {status} without a token: asked /v2/", t.endpoint.host);
-                            continue 'retry;
+                    let learned = self.challenge(t, true).await;
+                    debug!(
+                        "{}: refused without a token, /v2/: {learned:?}",
+                        t.endpoint.host
+                    );
+                    Event::V2(learned.is_ok())
+                }
+                Action::Done => return Ok(last.expect("a request is answered before it is done")),
+                Action::Refuse(why) => {
+                    return Err(match why {
+                        Why::TooMany => {
+                            ImageError::Registry(format!("too many redirects for `{url}`"))
                         }
-                        Err(e) => debug!(
-                            "{}: {status} without a token and /v2/ does not say: {e}",
-                            t.endpoint.host
+                        Why::Downgrade if last.is_none() => ImageError::Registry(format!(
+                            "the https registry gave an http:// location `{url}`; refused. \
+                             Fix the registry: distribution `http.relativeurls: true`, or \
+                             have the proxy pass `X-Forwarded-Proto: https`."
+                        )),
+                        Why::Downgrade => ImageError::Registry(format!(
+                            "refusing to go from https to `{current}`"
+                        )),
+                        Why::Body => ImageError::Registry(format!(
+                            "refusing to send the request body to `{}`",
+                            current.origin().ascii_serialization()
+                        )),
+                        Why::Location | Why::Policy => {
+                            problem.expect("the answer that is refused says why")
+                        }
+                        // the loop tells the events in the order it asks them
+                        Why::OutOfTurn => ImageError::Registry(
+                            "internal error: the send loop got an event out of turn".into(),
                         ),
-                    }
+                    });
                 }
-                if probe && same_origin && (status.is_success() || status.is_redirection()) {
-                    // served without a token: the registry asks for none
-                    // (the next requests do not look up credentials again;
-                    // a 401 later asks `/v2/` for the challenge)
-                    self.challenges
-                        .lock()
-                        .unwrap()
-                        .entry(t.endpoint.host.clone())
-                        .or_insert(Challenge::None);
-                }
-                if !status.is_redirection() || status == StatusCode::NOT_MODIFIED {
-                    return Ok(resp);
-                }
-                if hop == MAX_REDIRECTS {
-                    return Err(ImageError::Registry(format!(
-                        "too many redirects for `{url}`"
-                    )));
-                }
-                let location = resp
-                    .headers()
-                    .get(LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| {
-                        ImageError::Registry(format!("redirect without a location for `{url}`"))
-                    })?;
-                let next = current.join(location).map_err(|e| {
-                    ImageError::Registry(format!("invalid redirect to `{location}`: {e}"))
-                })?;
-                if next.scheme() != "https" && next.scheme() != "http" {
-                    return Err(ImageError::Registry(format!(
-                        "invalid redirect to `{next}`"
-                    )));
-                }
-                if current.scheme() == "https" && next.scheme() != "https" {
-                    return Err(ImageError::Registry(format!(
-                        "refusing redirect from https to `{next}`"
-                    )));
-                }
-                (method, body) = redirected(&method, body, status, &origin_url, &next)?;
-                // The target is remembered when the registry sent us to
-                // another place (the CDN of a blob).
-                if hop == 0 {
-                    if let Some(key) = cache_key {
-                        if !same_origin_url(&origin_url, &next)
-                            && self.may_redirect_to(t, &next).await
-                        {
-                            self.transport.redirects.put(key, next.as_str());
-                        }
-                    }
-                }
-                current = next;
-            }
-            unreachable!();
+            };
+            (state, action) = send_core::step(&state, &event);
         }
+    }
+
+    /// The challenge a registry gave to a request without a token, kept
+    /// for it; false when it gave none that is understood.
+    async fn learn(&self, t: &Target, resp: &Response) -> bool {
+        let Some(c) = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|h| Challenge::parse(h).ok())
+        else {
+            return false;
+        };
+        self.challenges
+            .lock()
+            .unwrap()
+            .insert(t.endpoint.host.clone(), c.clone());
+        self.learned(t, &c).await;
+        true
     }
 
     fn api_url(base: &str, t: &Target, path: &str) -> String {
@@ -1251,7 +1307,7 @@ impl RegistryClient {
                         .enumerate()
                         .filter_map(|(j, e)| (j != i).then_some(e))
                     {
-                        self.transport.redirects.drop_key(&other.blob_key(digest));
+                        self.redirects.drop_key(&other.blob_key(digest));
                     }
                     return Ok(resp);
                 }
@@ -1441,11 +1497,11 @@ impl RegistryClient {
             );
         }
         let key = t.blob_key(digest);
-        let cached = match self.transport.redirects.get(&key) {
+        let cached = match self.redirects.get(&key) {
             Some(c) => match reqwest::Url::parse(&c) {
                 Ok(url) if self.may_redirect_to(t, &url).await => Some(c),
                 _ => {
-                    self.transport.redirects.drop_key(&key);
+                    self.redirects.drop_key(&key);
                     None
                 }
             },
@@ -1474,11 +1530,11 @@ impl RegistryClient {
                 }
                 Ok(resp) => {
                     debug!("cached redirect of {} answered {}", digest, resp.status());
-                    self.transport.redirects.drop_key(&key);
+                    self.redirects.drop_key(&key);
                 }
                 Err(e) => {
                     debug!("cached redirect of {} failed: {}", digest, e);
-                    self.transport.redirects.drop_key(&key);
+                    self.redirects.drop_key(&key);
                 }
             }
         }
@@ -1578,7 +1634,12 @@ impl RegistryClient {
     ) -> ImageResult<Result<(Bytes, Digest), ImageError>> {
         let mut last = Err(ImageError::Registry("no endpoint".into()));
         for endpoint in t.chain() {
-            match self.fetch_manifest_from(endpoint, reference).await {
+            // a tag is not what a mirror for digests is asked by
+            let asked = match &endpoint.endpoint.by_digest {
+                Some(d) if manifest_reference(reference)?.is_none() => d.to_string(),
+                _ => reference.to_string(),
+            };
+            match self.fetch_manifest_from(endpoint, &asked).await {
                 Ok(Ok(found)) => return Ok(Ok(found)),
                 Ok(Err(e)) => {
                     debug!("{} does not have {reference}: {e}", endpoint.endpoint.host);
@@ -1703,7 +1764,7 @@ impl RegistryClient {
             .await?;
         match resp.status() {
             StatusCode::CREATED if mount.is_some() => Ok(UploadStart::Mounted),
-            s if s.is_success() => Ok(UploadStart::Session(upload_location(&base, &resp)?)),
+            s if s.is_success() => Ok(UploadStart::Session(upload_location(&resp)?)),
             s => Err(answered(
                 s,
                 format!(
@@ -1788,7 +1849,6 @@ impl RegistryClient {
         offset: Option<u64>,
         data: Bytes,
     ) -> ImageResult<Patched> {
-        let base = self.host(t)?.base_url().await?;
         let mut headers = HeaderMap::new();
         headers.insert(
             CONTENT_TYPE,
@@ -1821,7 +1881,7 @@ impl RegistryClient {
         };
         let status = resp.status();
         if status.is_success() {
-            return Ok(Patched::Done(upload_location(&base, &resp)?));
+            return Ok(Patched::Done(upload_location(&resp)?));
         }
         let text = read_limited(resp, 4096).await.unwrap_or_default();
         let e = answered(
@@ -1852,8 +1912,6 @@ impl RegistryClient {
         t: &Target,
         session: &reqwest::Url,
     ) -> Result<(u64, reqwest::Url), String> {
-        let host = self.host(t).map_err(|e| e.to_string())?;
-        let base = host.base_url().await.map_err(|e| e.to_string())?;
         let resp = self
             .send_url(
                 t,
@@ -1877,7 +1935,7 @@ impl RegistryClient {
             .and_then(|v| v.to_str().ok())
             .ok_or("the registry does not say what it has (no Range)")?;
         let have = parse_upload_range(range).ok_or(format!("invalid Range {range:?}"))?;
-        let next = upload_location(&base, &resp).unwrap_or_else(|_| session.clone());
+        let next = upload_location(&resp).unwrap_or_else(|_| session.clone());
         Ok((have, next))
     }
 
@@ -2097,14 +2155,16 @@ fn parse_upload_range(range: &str) -> Option<u64> {
     Some(if end <= 0 { 0 } else { end as u64 + 1 })
 }
 
-fn upload_location(base: &str, resp: &Response) -> ImageResult<reqwest::Url> {
+/// The next URL of an upload, read against the URL that answered: a host
+/// that is not the registry does not choose a path of the registry.
+fn upload_location(resp: &Response) -> ImageResult<reqwest::Url> {
     let location = resp
         .headers()
         .get(LOCATION)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ImageError::Registry("No location header in upload response".into()))?;
-    reqwest::Url::parse(&format!("{base}/"))
-        .and_then(|b| b.join(location))
+    resp.url()
+        .join(location)
         .map_err(|e| ImageError::Registry(format!("invalid upload location: {e}")))
 }
 
@@ -2129,46 +2189,62 @@ fn bearer_header(token: &str) -> ImageResult<HeaderValue> {
     Ok(v)
 }
 
-/// The method and the body of the request that follows a redirect of a
-/// request with `method` and `body`: 301, 302 and 303 turn it into a GET
-/// without a body (what browsers and Go do); 307 and 308 keep them, but
-/// the body (an upload) is never sent to another origin.
-fn redirected(
-    method: &Method,
-    body: Option<Bytes>,
-    status: StatusCode,
-    origin: &reqwest::Url,
-    next: &reqwest::Url,
-) -> ImageResult<(Method, Option<Bytes>)> {
-    let keep = matches!(
-        status,
-        StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
-    );
-    if !keep {
-        let method = if *method == Method::HEAD {
-            Method::HEAD
-        } else {
-            Method::GET
-        };
-        return Ok((method, None));
-    }
-    if body.as_ref().is_some_and(|b| !b.is_empty()) && !same_origin(origin, next) {
+/// Where a redirect of `resp` goes, read against the URL `from` that was
+/// asked.
+fn location(resp: &Response, from: &reqwest::Url) -> ImageResult<reqwest::Url> {
+    let location = resp
+        .headers()
+        .get(LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ImageError::Registry(format!("redirect without a location for `{from}`")))?;
+    let next = from
+        .join(location)
+        .map_err(|e| ImageError::Registry(format!("invalid redirect to `{location}`: {e}")))?;
+    if next.scheme() != "https" && next.scheme() != "http" {
         return Err(ImageError::Registry(format!(
-            "refusing to send the request body to `{}`",
-            next.origin().ascii_serialization()
+            "invalid redirect to `{next}`"
         )));
     }
-    Ok((method.clone(), body))
+    Ok(next)
+}
+
+/// What [`send_core`] needs to know of `url`, and why the address policy
+/// refuses it when it does.
+async fn judge(
+    host: &HostTransport,
+    home: &reqwest::Url,
+    start: &reqwest::Url,
+    url: &reqwest::Url,
+) -> (send_core::Target, Option<ImageError>) {
+    let is_home = same_origin(home, url);
+    let refusal = if is_home {
+        None
+    } else {
+        host.check_url(url).await.err()
+    };
+    let target = send_core::Target {
+        home: is_home,
+        start: same_origin(start, url),
+        https: url.scheme() == "https",
+        allowed: refusal.is_none(),
+    };
+    (target, refusal)
+}
+
+fn core_method(method: &Method) -> send_core::Method {
+    if *method == Method::GET {
+        send_core::Method::Get
+    } else if *method == Method::HEAD {
+        send_core::Method::Head
+    } else {
+        send_core::Method::Other
+    }
 }
 
 fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
     a.scheme() == b.scheme()
         && a.host_str() == b.host_str()
         && a.port_or_known_default() == b.port_or_known_default()
-}
-
-fn same_origin_url(a: &reqwest::Url, b: &reqwest::Url) -> bool {
-    same_origin(a, b)
 }
 
 #[cfg(test)]
@@ -2256,6 +2332,8 @@ pub async fn read_limited_by(
 
 #[cfg(test)]
 pub(crate) mod hint_tests;
+#[cfg(test)]
+mod pin_tests;
 
 /// Whether a request failed because the connection it used was closed (by
 /// the server, or while it was idle) before the answer: nothing was done
@@ -2683,35 +2761,6 @@ mod tests {
             }
         };
         assert!(resolve_manifest(&r, None, bad).await.is_err());
-    }
-
-    #[test]
-    fn test_redirected_requests() {
-        let a = reqwest::Url::parse("https://reg.io/v2/x").unwrap();
-        let same = reqwest::Url::parse("https://reg.io/other").unwrap();
-        let other = reqwest::Url::parse("https://cdn.io/blob").unwrap();
-        let body = Some(Bytes::from_static(b"data"));
-        for status in [
-            StatusCode::MOVED_PERMANENTLY,
-            StatusCode::FOUND,
-            StatusCode::SEE_OTHER,
-        ] {
-            let (m, b) = redirected(&Method::PUT, body.clone(), status, &a, &other).unwrap();
-            assert_eq!((m, b), (Method::GET, None));
-            let (m, _) = redirected(&Method::HEAD, None, status, &a, &other).unwrap();
-            assert_eq!(m, Method::HEAD);
-        }
-        for status in [
-            StatusCode::TEMPORARY_REDIRECT,
-            StatusCode::PERMANENT_REDIRECT,
-        ] {
-            let (m, b) = redirected(&Method::PATCH, body.clone(), status, &a, &same).unwrap();
-            assert_eq!((m, b), (Method::PATCH, body.clone()));
-            assert!(redirected(&Method::PATCH, body.clone(), status, &a, &other).is_err());
-            let (m, b) = redirected(&Method::GET, None, status, &a, &other).unwrap();
-            assert_eq!((m, b), (Method::GET, None));
-            assert!(redirected(&Method::POST, Some(Bytes::new()), status, &a, &other).is_ok());
-        }
     }
 
     #[test]

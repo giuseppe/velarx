@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-send-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "What the registry client does with each answer: where a request goes, with which credentials and body, and when it stops"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on facts the shell reads from the answers: no dependency,
+# no I/O.  The shell that sends the requests, parses the URLs, compares the
+# origins, applies the address policy and keeps the caches is the registry
+# client (`velarx-registry`, client.rs).
+
+[lib]
+name = "velarx_send_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
