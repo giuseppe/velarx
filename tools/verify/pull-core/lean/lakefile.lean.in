@@ -1,0 +1,25 @@
+-- SPDX-License-Identifier: Apache-2.0
+import Lake
+open Lake DSL
+
+-- (AENEAS of ../pins)
+require aeneas from git
+  "https://github.com/AeneasVerif/aeneas" @ "@AENEAS@" / "backends/lean"
+
+package «pull-core»
+
+-- The functions of the standard library written by hand
+lean_lib Models
+
+-- What Aeneas made of crates/pull-core (../../run puts it there)
+lean_lib Extracted where
+  globs := #[.submodules `Extracted]
+
+-- `#proved` (../../Proved.lean)
+@[default_target] lean_lib Proved
+
+-- `Ok` (../../Ok.lean)
+@[default_target] lean_lib Ok
+
+@[default_target] lean_lib PullCore where
+  globs := #[.submodules `PullCore]
