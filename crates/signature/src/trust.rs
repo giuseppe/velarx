@@ -171,6 +171,7 @@ pub fn set_scope(
                 scopes.insert(scope.into(), Value::Array(requirements));
             }
             None => {
+                check_docker_scope(scope)?;
                 transports
                     .entry("docker")
                     .or_insert_with(|| json!({}))
@@ -184,6 +185,23 @@ pub fn set_scope(
     // (what is written is a policy the engine reads)
     SignaturePolicy::parse(&text).map_err(|e| e.to_string())?;
     Ok(text + "\n")
+}
+
+/// Refuse a new docker scope that can match no image: a scope is compared
+/// with the full normalized name of an image (`docker.io/library/alpine`).
+fn check_docker_scope(scope: &str) -> Result<(), String> {
+    let host = scope.split('/').next().unwrap_or(scope);
+    if host == "index.docker.io" {
+        return Err(format!(
+            "invalid scope {scope:?}: the name of Docker Hub is docker.io, not index.docker.io"
+        ));
+    }
+    if scope != "default" && !host.contains(['.', ':']) && host != "localhost" {
+        return Err(format!(
+            "invalid scope {scope:?}: it has no registry host; write docker.io/NAME, or docker.io/library/NAME for an official image of Docker Hub"
+        ));
+    }
+    Ok(())
 }
 
 /// A row of `image trust show`.
@@ -299,6 +317,34 @@ mod tests {
     use super::*;
 
     const BASE: &str = r#"{"default":[{"type":"insecureAcceptAnything"}]}"#;
+
+    #[test]
+    fn a_scope_that_can_match_no_image_is_refused() {
+        for scope in [
+            "alpine",
+            "library/alpine",
+            "index.docker.io/library/alpine",
+            "index.docker.io",
+        ] {
+            let e = set_scope(BASE, scope, TrustType::Reject, &[]).unwrap_err();
+            assert!(e.contains("docker.io"), "{scope}: {e}");
+        }
+        for scope in [
+            "docker.io/library",
+            "docker.io/library/alpine",
+            "docker.io/someorg",
+            "docker.io",
+            "reg.example:5000/ns",
+            "localhost/ns",
+            "localhost:5000",
+            "*.example.com",
+            "quay.io/org/img:tag",
+        ] {
+            set_scope(BASE, scope, TrustType::Reject, &[])
+                .unwrap_or_else(|e| panic!("{scope}: {e}"));
+        }
+        set_scope(BASE, "default", TrustType::Reject, &[]).unwrap();
+    }
 
     #[test]
     fn only_a_path_that_does_not_exist_is_no_policy() {
