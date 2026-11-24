@@ -4892,6 +4892,7 @@ dependencies = [
  "velarx-netdetach",
  "velarx-netkernel",
  "velarx-nsid",
+ "velarx-plan-core",
  "velarx-proto",
  "velarx-registry",
  "velarx-runtime",
@@ -5238,6 +5239,10 @@ dependencies = [
  "velarx-p2p",
  "velarx-wire",
 ]
+
+[[package]]
+name = "velarx-plan-core"
+version = "0.1.0"
 
 [[package]]
 name = "velarx-proto"

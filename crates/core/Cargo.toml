@@ -30,6 +30,7 @@ velarx-sys = { path = "../sys", features = ["tokio", "seccompiler"] }
 velarx-runtime = { path = "../runtime", default-features = false }
 velarx-nsid = { path = "../nsid" }
 velarx-lazy-core = { path = "../lazy-core" }
+velarx-plan-core = { path = "../plan-core" }
 velarx-netkernel = { path = "../netkernel" }
 velarx-netdetach = { path = "../netdetach" }
 velarx-base = { path = "../base" }

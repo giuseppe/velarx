@@ -69,42 +69,6 @@ fn is_file(e: &velarx_storage::TocEntry) -> bool {
     e.entry_type == TocEntryType::Reg && e.size > 0
 }
 
-/// The contents of the regular files of the table that `wanted` accepts
-/// (asked once for each, with its first entry), in the order of the table,
-/// in groups of at most `files` files and `bytes` bytes (a bigger file is a
-/// group of its own): the groups to fetch together.  A file whose digest the
-/// table does not give as an fs-verity digest is an error.
-pub fn groups(
-    toc: &Toc,
-    files: usize,
-    bytes: u64,
-    mut wanted: impl FnMut(&str, &velarx_storage::TocEntry) -> bool,
-) -> Result<Vec<Vec<String>>, String> {
-    let mut groups = Vec::new();
-    let mut group: Vec<String> = Vec::new();
-    let mut size = 0u64;
-    let mut seen: HashSet<String> = HashSet::new();
-    for e in toc.entries.iter().filter(|e| is_file(e)) {
-        let d = e
-            .verity()
-            .ok_or_else(|| format!("`{}` has no fs-verity digest in the table", e.name))?;
-        if !seen.insert(d.clone()) || !wanted(&d, e) {
-            continue;
-        }
-        if !group.is_empty() && (group.len() >= files.max(1) || size.saturating_add(e.size) > bytes)
-        {
-            groups.push(std::mem::take(&mut group));
-            size = 0;
-        }
-        size = size.saturating_add(e.size);
-        group.push(d);
-    }
-    if !group.is_empty() {
-        groups.push(group);
-    }
-    Ok(groups)
-}
-
 /// The directory of an entry.
 fn parent(name: &str) -> &str {
     name.rsplit_once('/').map_or("", |(dir, _)| dir)

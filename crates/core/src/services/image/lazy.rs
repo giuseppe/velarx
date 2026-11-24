@@ -67,95 +67,6 @@ pub(super) struct PlanGroup {
     pub(super) bytes: u64,
 }
 
-/// The files of a layer that neither the store nor the staging has, in
-/// groups; and the files they have, and the bytes those took in the blob.
-struct Wanted {
-    groups: Vec<Vec<String>>,
-    reused_files: u64,
-    reused_bytes: u64,
-}
-
-/// For each layer (a content once, in the first layer that has it), the
-/// groups of files that are neither in the store nor in the staging (if any).
-fn wanted_groups(
-    layers: &[LazyLayer],
-    store: &FileStore,
-    staged: &dyn Fn(&str) -> bool,
-    files: usize,
-    bytes: u64,
-    skip: &std::collections::HashSet<String>,
-) -> ImageResult<Vec<Wanted>> {
-    let mut seen = std::collections::HashSet::new();
-    layers
-        .iter()
-        .map(|layer| {
-            let (mut reused_files, mut reused_bytes) = (0, 0);
-            let groups = velarx_content::pull::window::groups(&layer.toc, files, bytes, |d, e| {
-                if !seen.insert(d.to_string()) {
-                    return false;
-                }
-                if store.get_path(d).is_some() || staged(d) {
-                    reused_files += 1;
-                    reused_bytes += e.end_offset.saturating_sub(e.offset);
-                    return false;
-                }
-                // (fetched before the others, with the startup profile)
-                !skip.contains(d)
-            })
-            .map_err(|e| ImageError::Layer(format!("layer {}: {e}", layer.desc.digest)))?;
-            Ok(Wanted {
-                groups,
-                reused_files,
-                reused_bytes,
-            })
-        })
-        .collect()
-}
-
-/// The groups of the files the startup profile names that `missing` says
-/// the store and the staging lack, in the order of the profile, files of one
-/// layer in a row together (at most [`GROUP_FILES`] files or [`GROUP_BYTES`]).
-/// A profile names the files a container looked up: what is not a file of
-/// the layers, what is there already and what is named twice is ignored.
-fn profile_groups(
-    layers: &[LazyLayer],
-    profile: &[String],
-    missing: impl Fn(&str) -> bool,
-) -> Vec<(usize, Vec<String>)> {
-    let mut place: std::collections::HashMap<String, (usize, u64)> = Default::default();
-    for (i, layer) in layers.iter().enumerate() {
-        for e in &layer.toc.entries {
-            if e.entry_type != TocEntryType::Reg || e.size == 0 {
-                continue;
-            }
-            if let Some(d) = e.verity() {
-                // (the first layer that has the content fetches it)
-                place.entry(d).or_insert((i, e.size));
-            }
-        }
-    }
-    let mut groups: Vec<(usize, u64, Vec<String>)> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for digest in profile {
-        let Some(&(layer, size)) = place.get(digest) else {
-            continue;
-        };
-        if !missing(digest) || !seen.insert(digest.as_str()) {
-            continue;
-        }
-        let fits = groups.last().is_some_and(|(l, bytes, files)| {
-            *l == layer && files.len() < GROUP_FILES && bytes + size <= GROUP_BYTES
-        });
-        if !fits {
-            groups.push((layer, 0, Vec::new()));
-        }
-        let (_, bytes, files) = groups.last_mut().expect("a group was just made");
-        *bytes += size;
-        files.push(digest.clone());
-    }
-    groups.into_iter().map(|(l, _, f)| (l, f)).collect()
-}
-
 impl ImageService {
     /// The startup profile of the image of the pull `id` from the sources
     /// that have one: at most `max` digests of files, empty when nobody has
@@ -512,7 +423,8 @@ impl ImageService {
     /// The groups of files to fetch for `layers`, in the order they are
     /// fetched (the files the startup `profile` names first, in its order),
     /// with the layers that wait for each, and the bytes and files the store
-    /// and the staging had already.
+    /// and the staging had already.  What the stores hold is asked once for
+    /// each content: the plan is of that snapshot.
     async fn plan_groups(
         &self,
         layers: &Arc<[LazyLayer]>,
@@ -524,62 +436,70 @@ impl ImageService {
         let staged = self.staged_files(layers)?;
         let (store, l) = (self.file_store.clone(), layers.clone());
         tokio::task::spawn_blocking(move || {
-            let staged = |d: &str| staged.iter().any(|s| s.get_path(d).is_some());
-            // the files the startup profile names come first, in its order
-            let first = profile_groups(&l, &profile, |d| !store.contains(d) && !staged(d));
-            let skip: std::collections::HashSet<String> =
-                first.iter().flat_map(|(_, g)| g.iter().cloned()).collect();
-            let wanted = wanted_groups(&l, &store, &staged, GROUP_FILES, GROUP_BYTES, &skip)?;
-            let reused = wanted.iter().fold((0, 0), |(bytes, files), w| {
-                (bytes + w.reused_bytes, files + w.reused_files)
-            });
-            let positions: Vec<_> = l
+            // the contents get dense numbers, in the order of the tables
+            let mut id_of: std::collections::HashMap<String, u32> = Default::default();
+            let mut digests: Vec<String> = Vec::new();
+            // (the bytes the first entry of a content takes in the blob)
+            let mut blob: Vec<u64> = Vec::new();
+            let mut tables: Vec<Vec<velarx_plan_core::File>> = Vec::new();
+            for layer in l.iter() {
+                let mut table = Vec::new();
+                for e in layer
+                    .toc
+                    .entries
+                    .iter()
+                    .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+                {
+                    let d = e.verity().ok_or_else(|| {
+                        ImageError::Layer(format!(
+                            "layer {}: `{}` has no fs-verity digest in the table",
+                            layer.desc.digest, e.name
+                        ))
+                    })?;
+                    let content = *id_of.entry(d.clone()).or_insert_with(|| {
+                        digests.push(d);
+                        blob.push(e.end_offset.saturating_sub(e.offset));
+                        digests.len() as u32 - 1
+                    });
+                    table.push(velarx_plan_core::File {
+                        content,
+                        size: e.size,
+                    });
+                }
+                tables.push(table);
+            }
+            let present: Vec<bool> = digests
                 .iter()
-                .map(|l| velarx_content::pull::window::file_positions(&l.toc))
+                .map(|d| store.contains(d) || staged.iter().any(|s| s.get_path(d).is_some()))
                 .collect();
-            let size_of = |layer: usize, d: &str| {
-                positions[layer]
-                    .get(d)
-                    .map_or(0, |&at| l[layer].toc.entries[at].size)
+            let mut reused: (u64, u64) = (0, 0);
+            for (here, bytes) in present.iter().zip(&blob) {
+                if *here {
+                    reused = (reused.0.saturating_add(*bytes), reused.1 + 1);
+                }
+            }
+            let profile: Vec<u32> = profile
+                .iter()
+                .filter_map(|d| id_of.get(d))
+                .copied()
+                .collect();
+            let limits = velarx_plan_core::Limits {
+                files: GROUP_FILES as u32,
+                bytes: GROUP_BYTES,
             };
-            let rest = wanted
+            let groups = velarx_plan_core::plan(&tables, &present, &profile, limits)
                 .into_iter()
-                .enumerate()
-                .flat_map(|(i, w)| w.groups.into_iter().map(move |g| (i, g)));
-            let mut groups: Vec<PlanGroup> = first
-                .into_iter()
-                .chain(rest)
-                .map(|(layer, files)| PlanGroup {
-                    layer,
-                    needed_by: Vec::new(),
-                    bytes: files.iter().map(|d| size_of(layer, d)).sum(),
-                    files,
+                .map(|g| PlanGroup {
+                    layer: g.layer as usize,
+                    needed_by: g.needed_by.iter().map(|&l| l as usize).collect(),
+                    files: g
+                        .files
+                        .iter()
+                        .map(|&c| digests[c as usize].clone())
+                        .collect(),
+                    bytes: g.bytes,
                 })
                 .collect();
-            // the layers wait for the files they lack: their own, and those
-            // another layer fetches for them (a content is fetched once)
-            let mut group_of: std::collections::HashMap<&str, usize> = Default::default();
-            for (g, group) in groups.iter().enumerate() {
-                for d in &group.files {
-                    group_of.insert(d, g);
-                }
-            }
-            let mut needed: Vec<Vec<usize>> = vec![Vec::new(); groups.len()];
-            for (i, layer) in l.iter().enumerate() {
-                for d in layer.toc.files() {
-                    if store.contains(&d) || staged(&d) {
-                        continue;
-                    }
-                    if let Some(&g) = group_of.get(d.as_str()) {
-                        if needed[g].last() != Some(&i) {
-                            needed[g].push(i);
-                        }
-                    }
-                }
-            }
-            for (group, needed_by) in groups.iter_mut().zip(needed) {
-                group.needed_by = needed_by;
-            }
             Ok::<_, ImageError>((groups, reused))
         })
         .await
@@ -914,31 +834,34 @@ impl ImageService {
 
     /// The files of the layers are in the store, or nothing more is done:
     /// no fetch is made behind the link, and the proof finds every file
-    /// under its name in the store (after it).
+    /// under its name in the store (after it).  It relies on the plan having
+    /// refused a regular file without a digest: `files` has every file.
     async fn require_covered(&self, layers: &Arc<[LazyLayer]>) -> ImageResult<()> {
         let (store, l) = (self.file_store.clone(), layers.clone());
         let lacking = tokio::task::spawn_blocking(move || {
-            wanted_groups(
-                &l,
-                &store,
-                &|_| false,
-                usize::MAX,
-                u64::MAX,
-                &Default::default(),
-            )
+            // (a content is asked once, in the first layer that has it)
+            let mut seen = std::collections::HashSet::new();
+            for layer in l.iter() {
+                let lacking: Vec<String> = layer
+                    .toc
+                    .files()
+                    .into_iter()
+                    .filter(|d| seen.insert(d.clone()) && !store.contains(d))
+                    .collect();
+                if let Some(first) = lacking.first() {
+                    return Some((layer.key, lacking.len(), first.clone()));
+                }
+            }
+            None
         })
         .await
-        .map_err(|e| ImageError::Storage(e.to_string()))??;
-        for (layer, w) in layers.iter().zip(&lacking) {
-            if let Some(file) = w.groups.iter().flatten().next() {
-                let n: usize = w.groups.iter().map(Vec::len).sum();
-                let digest = &layer.key;
-                return Err(ImageError::Storage(format!(
-                    "{n} files of layer {digest} are not in the store after the link \
-                     ({file} is the first; a staged file is not what its name says, \
-                     or went meanwhile): the layer stays staged"
-                )));
-            }
+        .map_err(|e| ImageError::Storage(e.to_string()))?;
+        if let Some((digest, n, file)) = lacking {
+            return Err(ImageError::Storage(format!(
+                "{n} files of layer {digest} are not in the store after the link \
+                 ({file} is the first; a staged file is not what its name says, \
+                 or went meanwhile): the layer stays staged"
+            )));
         }
         Ok(())
     }
@@ -1472,58 +1395,28 @@ mod tests {
         assert_eq!(wanted[0].len() + wanted[1].len(), 3);
     }
 
-    /// The profile comes first in its order and together by layer; what it
-    /// names wrongly is ignored; a group is bounded in files and bytes.
-    #[test]
-    fn the_startup_profile_is_fetched_first_in_its_order() {
-        let a = layer_of(&[("a", b"one"), ("b", b"two"), ("c", b"three")]);
-        let mut b = layer_of(&[("d", b"four"), ("e", b"five")]);
-        b.key = LayerKey::Toc(format!("sha256:{}", "3".repeat(64)).parse().unwrap());
-        let layers = [a, b];
-        let id = |d: &[u8]| velarx_storage::fsverity_digest_of(Algorithm::Sha256, d);
-        let (one, two, three, four, five) = (
-            id(b"one"),
-            id(b"two"),
-            id(b"three"),
-            id(b"four"),
-            id(b"five"),
-        );
-        let profile = [
-            four.clone(),
-            one.clone(),
-            two.clone(),
-            "../../x".to_string(),
-            one.clone(),
-            three.clone(),
-            String::new(),
-        ];
-        let got = profile_groups(&layers, &profile, |d| d != three);
-        assert_eq!(got, vec![(1, vec![four]), (0, vec![one, two])]);
-        assert!(profile_groups(&layers, &[five], |_| false).is_empty());
-        // bounded in files
-        let many: Vec<(&str, Vec<u8>)> = (0..GROUP_FILES + 6)
-            .map(|i| ("f", format!("content {i}").into_bytes()))
-            .collect();
-        let files: Vec<(&str, &[u8])> = many.iter().map(|(n, d)| (*n, d.as_slice())).collect();
-        let big = [layer_of(&files)];
-        let profile: Vec<String> = many.iter().map(|(_, d)| id(d)).collect();
-        let sizes: Vec<usize> = profile_groups(&big, &profile, |_| true)
-            .iter()
-            .map(|(_, g)| g.len())
-            .collect();
-        assert_eq!(sizes, [GROUP_FILES, 6]);
-    }
-
-    fn stores() -> (tempfile::TempDir, Arc<FileStore>, Arc<FileStore>) {
+    fn stores() -> (tempfile::TempDir, Arc<FileStore>) {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(FileStore::new(tmp.path().join("objects")).unwrap());
-        let staging = Arc::new(FileStore::new(tmp.path().join("staging/files")).unwrap());
-        (tmp, store, staging)
+        (tmp, store)
     }
 
-    #[test]
-    fn the_retrieval_wants_what_neither_the_store_nor_the_staging_has() {
-        let (_tmp, store, staging) = stores();
+    /// A service with a staging area and an empty store.
+    async fn planner() -> (tempfile::TempDir, ImageService, Arc<FileStore>) {
+        let (tmp, store) = stores();
+        let db = velarx_db::Database::open_in_memory().await.unwrap();
+        let service =
+            ImageService::new(db, store.clone(), tmp.path().join("pulls"), VerityMode::Off)
+                .unwrap();
+        service.staging_area().create().unwrap();
+        (tmp, service, store)
+    }
+
+    /// What the store and the staging have is not planned, and is counted
+    /// once for each content with the bytes its first entry takes in the blob.
+    #[tokio::test]
+    async fn the_plan_leaves_out_what_the_store_or_the_staging_has() {
+        let (_tmp, service, store) = planner().await;
         let layer = layer_of(&[
             ("a", b"in the store"),
             ("b", b"in the staging"),
@@ -1531,55 +1424,64 @@ mod tests {
             ("d", b"nowhere either"),
             ("e", b"in the store"),
         ]);
-        store
-            .put(velarx_types::digest::Algorithm::Sha256, b"in the store")
-            .unwrap();
-        staging
-            .put(velarx_types::digest::Algorithm::Sha256, b"in the staging")
-            .unwrap();
-        let wanted = wanted_groups(
-            &[layer],
-            &store,
-            &|d: &str| staging.get_path(d).is_some(),
-            1,
-            u64::MAX,
-            &Default::default(),
-        )
-        .unwrap();
-        let want = |d: &[u8]| {
-            velarx_storage::fsverity_digest_of(velarx_types::digest::Algorithm::Sha256, d)
-        };
-        assert_eq!(
-            wanted[0].groups,
-            vec![vec![want(b"nowhere")], vec![want(b"nowhere either")]]
-        );
-        assert_eq!(wanted[0].reused_files, 2);
-        assert_eq!(wanted[0].reused_bytes, 40);
+        let staging = FileStore::new(service.staging_area().layer_files(&layer.key)).unwrap();
+        store.put(Algorithm::Sha256, b"in the store").unwrap();
+        staging.put(Algorithm::Sha256, b"in the staging").unwrap();
+        let layers: Arc<[LazyLayer]> = vec![layer].into();
+        let (groups, reused) = service.plan_groups(&layers, Vec::new()).await.unwrap();
+        let want = |d: &[u8]| velarx_storage::fsverity_digest_of(Algorithm::Sha256, d);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].files, [want(b"nowhere"), want(b"nowhere either")]);
+        assert_eq!(groups[0].bytes, 7 + 14);
+        assert_eq!(groups[0].needed_by, [0]);
+        assert_eq!(reused, (40, 2));
     }
 
-    #[test]
-    fn a_content_is_wanted_once_for_all_the_layers() {
-        let (_tmp, store, staging) = stores();
-        let layers = [
-            layer_of(&[("a", b"shared")]),
-            layer_of(&[("a", b"shared"), ("b", b"own")]),
-        ];
-        let wanted = wanted_groups(
-            &layers,
-            &store,
-            &|d: &str| staging.get_path(d).is_some(),
-            64,
-            u64::MAX,
-            &Default::default(),
-        )
-        .unwrap();
-        assert_eq!(wanted[0].groups.len(), 1);
+    /// A content two layers have is planned once, into the first, and the
+    /// second waits for it; the profile names it, and what is no file.
+    #[tokio::test]
+    async fn a_content_is_planned_once_for_all_the_layers() {
+        let (_tmp, service, _) = planner().await;
+        let mut second = layer_of(&[("a", b"shared"), ("b", b"own")]);
+        second.key = LayerKey::Toc(format!("sha256:{}", "3".repeat(64)).parse().unwrap());
+        let layers: Arc<[LazyLayer]> = vec![layer_of(&[("a", b"shared")]), second].into();
+        let want = |d: &[u8]| velarx_storage::fsverity_digest_of(Algorithm::Sha256, d);
+        let profile = vec![want(b"own"), "../../x".to_string(), want(b"shared")];
+        let (groups, _) = service.plan_groups(&layers, profile).await.unwrap();
+        let got: Vec<_> = groups
+            .iter()
+            .map(|g| (g.layer, g.files.clone(), g.needed_by.clone()))
+            .collect();
         assert_eq!(
-            wanted[1].groups,
-            vec![vec![velarx_storage::fsverity_digest_of(
-                velarx_types::digest::Algorithm::Sha256,
-                b"own"
-            )]]
+            got,
+            [
+                (1, vec![want(b"own")], vec![1]),
+                (0, vec![want(b"shared")], vec![0, 1])
+            ]
+        );
+    }
+
+    /// A regular file with no fs-verity digest in the table is an error of the
+    /// plan, not a file left out.
+    #[tokio::test]
+    async fn a_file_without_a_digest_is_an_error_of_the_plan() {
+        let (_tmp, service, _) = planner().await;
+        let mut layer = layer_of(&[]);
+        layer.toc = Arc::new(
+            serde_json::from_value(serde_json::json!({"version": 1, "entries": [
+                {"name": "f", "type": "reg", "size": 3}
+            ]}))
+            .unwrap(),
+        );
+        let layers: Arc<[LazyLayer]> = vec![layer].into();
+        let err = service
+            .plan_groups(&layers, Vec::new())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("`f` has no fs-verity digest"),
+            "{err}"
         );
     }
 
@@ -1587,7 +1489,7 @@ mod tests {
     /// fetched to make up for it.
     #[tokio::test]
     async fn files_that_remain_uncovered_are_an_error() {
-        let (tmp, store, _staging) = stores();
+        let (tmp, store) = stores();
         let db = velarx_db::Database::open_in_memory().await.unwrap();
         let service =
             ImageService::new(db, store.clone(), tmp.path().join("pulls"), VerityMode::Off)
@@ -2103,12 +2005,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_completion_of_a_layer_of_many_files_is_not_quadratic() {
         const FILES: usize = 6_000;
-        let tmp = tempfile::tempdir().unwrap();
-        let db = velarx_db::Database::open_in_memory().await.unwrap();
-        let store = Arc::new(FileStore::new(tmp.path().join("objects")).unwrap());
-        let service =
-            ImageService::new(db, store, tmp.path().join("pulls"), VerityMode::Off).unwrap();
-        service.staging_area().create().unwrap();
+        let (_tmp, service, _) = planner().await;
         let mut layer = layer_of(&[]);
         let entries: Vec<serde_json::Value> = (0..FILES)
             .map(|i| {
@@ -2129,7 +2026,11 @@ mod tests {
             .collect();
         let started = std::time::Instant::now();
         let (groups, _) = service.plan_groups(&layers, profile).await.unwrap();
+        let planned: std::collections::HashSet<&String> =
+            groups.iter().flat_map(|g| &g.files).collect();
+        assert_eq!(planned.len(), FILES, "each file is planned");
         assert_eq!(groups.iter().map(|g| g.files.len()).sum::<usize>(), FILES);
+        assert!(groups.iter().all(|g| g.layer == 0 && g.needed_by == [0]));
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "{:?}",
