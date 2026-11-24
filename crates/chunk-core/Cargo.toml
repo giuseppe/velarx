@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-chunk-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The chunks of a file of a zstd:chunked layer: whether they tile it, where they lie in the layer, and the limits of a pull"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# A plain function on numbers: no dependency, no I/O.  The shell that reads
+# the table of contents and builds the plan is `velarx-content`
+# (pull/chunked).
+
+[lib]
+name = "velarx_chunk_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

@@ -4803,6 +4803,10 @@ name = "velarx-caps-core"
 version = "0.1.0"
 
 [[package]]
+name = "velarx-chunk-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-config"
 version = "0.1.0"
 dependencies = [
@@ -4844,6 +4848,7 @@ dependencies = [
  "toml",
  "tracing",
  "velarx-base",
+ "velarx-chunk-core",
  "velarx-config",
  "velarx-db",
  "velarx-fuse",

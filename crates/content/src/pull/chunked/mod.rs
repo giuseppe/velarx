@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
+use velarx_chunk_core::{check, comp_range, Caps, Chunk, File as CoreFile, Refusal, Totals};
 use velarx_db::ChunkLocation as ChunkLocationRecord;
 use velarx_proto::transfer::FailureClass;
 use velarx_registry::target::Target;
@@ -702,14 +703,6 @@ fn unsupported(msg: impl Into<String>) -> ImageError {
     ImageError::Layer(msg.into())
 }
 
-/// The largest compressed form of `size` bytes accepted: what zstd needs
-/// for data it cannot compress, and some framing.  A chunk whose compressed
-/// range is larger is refused before anything of it is fetched (the bytes
-/// are buffered before they are decompressed).
-pub fn compressed_bound(size: u64) -> u64 {
-    size.saturating_add(size / 64).saturating_add(1 << 20)
-}
-
 /// Where the chunks of the files of a verified table of contents are in the
 /// layer's own objects: for each chunk with a digest (a file in one chunk
 /// that its file digest covers has none), the object it is in (the key the
@@ -753,6 +746,68 @@ struct TocChunk {
     zeros: bool,
 }
 
+/// No limit on the chunks of a file, for what is not about a pull.
+const UNLIMITED: Caps = Caps {
+    chunk: u64::MAX,
+    zeros: u64::MAX,
+    planned: u64::MAX,
+};
+
+/// The entry at `i` of a table, a regular file, and the chunk entries that
+/// follow it.
+fn chunk_run(entries: &[TocEntry], i: usize) -> &[TocEntry] {
+    let mut end = i + 1;
+    while end < entries.len() && entries[end].entry_type == TocEntryType::Chunk {
+        end += 1;
+    }
+    &entries[i..end]
+}
+
+/// The chunks of a file as `check` reads them: the file is the first of
+/// the entries of `run` and the chunks that follow say where they are in
+/// it.  The first has the size of the file when it says none.
+fn core_chunks(run: &[TocEntry]) -> Vec<Chunk> {
+    let mut chunks = Vec::with_capacity(run.len());
+    for (k, c) in run.iter().enumerate() {
+        chunks.push(Chunk {
+            file_off: if k == 0 { 0 } else { c.chunk_offset },
+            size: if k == 0 && c.chunk_size == 0 {
+                c.size
+            } else {
+                c.chunk_size
+            },
+            comp_off: c.offset,
+            zeros: c.is_zeros_chunk(),
+        });
+    }
+    chunks
+}
+
+/// The regular file `e` as `check` reads it: its size and its compressed
+/// range, which is looked at when the table is of a blob (`placed`).
+fn core_file(e: &TocEntry, placed: bool) -> CoreFile {
+    CoreFile {
+        size: e.size,
+        comp_start: e.offset,
+        comp_end: e.end_offset,
+        placed,
+    }
+}
+
+/// The error of the chunks of the file `name` that `check` refuses.
+fn refused(name: &str, why: Refusal) -> ImageError {
+    match why {
+        Refusal::NotTiled => fail(format!("invalid chunks for `{name}`")),
+        Refusal::ChunkTooBig => unsupported(format!("a chunk of `{name}` is too big")),
+        Refusal::TooManyZeros => unsupported("the layer has too many zeros"),
+        Refusal::TooMuchData => unsupported("the files to fetch are too big for the layer"),
+        Refusal::Misplaced => fail(format!("invalid chunk offsets for `{name}`")),
+        Refusal::CompressedTooBig => fail(format!(
+            "the compressed range of a chunk of `{name}` is too big"
+        )),
+    }
+}
+
 /// The chunks a table of contents gives a regular file with content, in
 /// order, when they cover it exactly, each with a digest; and the key of
 /// the object the file is.
@@ -770,36 +825,20 @@ impl TocChunks {
             return None;
         }
         let key = e.content_key()?;
-        let mut chunks = Vec::new();
-        let mut file_off = 0u64;
-        let mut j = i;
-        loop {
-            let c = &entries[j];
-            let size = match (j == i, c.chunk_size) {
-                (true, 0) => e.size,
-                _ => c.chunk_size,
-            };
-            let digest = c
-                .chunk_digest
-                .as_deref()
-                .and_then(|d| d.parse::<Digest>().ok())?;
-            let end = file_off.checked_add(size)?;
-            if size == 0 || end > e.size {
-                return None;
-            }
+        let run = chunk_run(entries, i);
+        let tiles = core_chunks(run);
+        let file = core_file(e, false);
+        check(&file, &tiles, &UNLIMITED, &Totals::ZERO).ok()?;
+        let mut chunks = Vec::with_capacity(run.len());
+        for (c, tile) in run.iter().zip(&tiles) {
             chunks.push(TocChunk {
-                offset: file_off,
-                size,
-                digest,
-                zeros: c.is_zeros_chunk(),
+                offset: tile.file_off,
+                size: tile.size,
+                digest: c.chunk_digest.as_deref()?.parse::<Digest>().ok()?,
+                zeros: tile.zeros,
             });
-            file_off = end;
-            j += 1;
-            if j >= entries.len() || entries[j].entry_type != TocEntryType::Chunk {
-                break;
-            }
         }
-        (file_off == e.size).then_some(Self { key, chunks })
+        Some(Self { key, chunks })
     }
 
     /// The places of the chunks that are not holes.
@@ -822,12 +861,14 @@ impl TocChunks {
 /// offset of the next chunk, or to the end of the file for the last one.
 /// `blob_size`: the blob the offsets are of (none: the table is not of a blob
 /// and has no offsets, as that of a layer without a table of contents).
+/// `cap`: the most bytes of data the plan may hold.
 fn plan_file(
     plan: &mut Plan,
     entries: &[TocEntry],
     i: usize,
     blob_size: Option<i64>,
     max_chunk: u64,
+    cap: u64,
 ) -> ImageResult<()> {
     let e = &entries[i];
     let digest_str = e.content_key().unwrap_or_default();
@@ -838,108 +879,65 @@ fn plan_file(
             return Err(fail(format!("invalid offsets for `{}`", e.name)));
         }
     }
+    let run = chunk_run(entries, i);
+    let chunks = if e.chunk_digest.is_some() {
+        core_chunks(run)
+    } else if run.len() == 1 {
+        // (a file of one chunk, which its own digest covers)
+        vec![Chunk {
+            file_off: 0,
+            size: e.size,
+            comp_off: e.offset,
+            zeros: false,
+        }]
+    } else {
+        return Err(fail(format!(
+            "chunks without a chunk digest for `{}`",
+            e.name
+        )));
+    };
+    let file = core_file(e, placed);
+    let caps = Caps {
+        chunk: max_chunk,
+        zeros: MAX_ZEROS,
+        planned: cap,
+    };
+    let before = Totals {
+        zeros: plan.zeros,
+        planned: plan.planned,
+    };
+    let totals = check(&file, &chunks, &caps, &before).map_err(|r| refused(&e.name, r))?;
+    (plan.zeros, plan.planned) = (totals.zeros, totals.planned);
+
     let job = plan.jobs.len();
     let first = plan.chunks.len();
     let mut holes = Vec::new();
-
-    let mut last = i;
-    while last + 1 < entries.len() && entries[last + 1].entry_type == TocEntryType::Chunk {
-        last += 1;
-    }
-
-    if e.chunk_digest.is_none() {
-        if last > i {
-            return Err(fail(format!(
-                "chunks without a chunk digest for `{}`",
-                e.name
-            )));
-        }
-        if e.size > max_chunk {
-            return Err(unsupported(format!(
-                "`{}` is too big to be fetched as a chunk",
-                e.name
-            )));
-        }
-        if placed && e.end_offset - e.offset > compressed_bound(e.size) {
-            return Err(fail(format!(
-                "the compressed range of `{}` is too big",
-                e.name
-            )));
-        }
-        plan.chunks.push(ChunkPlan {
-            job,
-            file_off: 0,
-            size: e.size,
+    for (k, c) in chunks.iter().enumerate() {
+        let entry = &run[k];
+        let digest = match entry.chunk_digest.as_deref() {
+            Some(d) => Some(layer_digest(&e.name, d, alg)?),
             // (when the TOC gives the hash of the file it is the one of the
             // chunk)
-            digest: e
+            None if k == 0 => e
                 .digest
                 .as_deref()
                 .map(|d| layer_digest(&e.name, d, alg))
                 .transpose()?,
-            comp: e.offset..e.end_offset,
-        });
-    } else {
-        let mut file_off = 0u64;
-        for j in i..=last {
-            let c = &entries[j];
-            let size = if j == i {
-                if c.chunk_size != 0 {
-                    c.chunk_size
-                } else {
-                    e.size
-                }
-            } else {
-                c.chunk_size
-            };
-            let chunk_off = if j == i { 0 } else { c.chunk_offset };
+            None => return Err(fail(format!("chunk without a digest for `{}`", e.name))),
+        };
+        if c.zeros {
+            holes.push((c.file_off, c.size));
+        } else {
             // The compressed bytes of a chunk end where those of the next
             // entry begin (a zeros chunk has a small frame of its own).
-            let end = if j == last {
-                e.end_offset
-            } else {
-                entries[j + 1].offset
-            };
-            if chunk_off != file_off || size == 0 || size > e.size - file_off {
-                return Err(fail(format!("invalid chunks for `{}`", e.name)));
-            }
-            let chunk_digest = c
-                .chunk_digest
-                .clone()
-                .ok_or_else(|| fail(format!("chunk without a digest for `{}`", e.name)))?;
-            let chunk_digest = layer_digest(&e.name, &chunk_digest, alg)?;
-            // (a hole is not held in memory: it is bounded by MAX_ZEROS)
-            if size > max_chunk && !c.is_zeros_chunk() {
-                return Err(unsupported(format!("a chunk of `{}` is too big", e.name)));
-            }
-            if c.is_zeros_chunk() {
-                plan.zeros += size;
-                if plan.zeros > MAX_ZEROS {
-                    return Err(unsupported("the layer has too many zeros"));
-                }
-                holes.push((file_off, size));
-            } else {
-                if placed && (c.offset < e.offset || end <= c.offset || end > e.end_offset) {
-                    return Err(fail(format!("invalid chunk offsets for `{}`", e.name)));
-                }
-                if placed && end - c.offset > compressed_bound(size) {
-                    return Err(fail(format!(
-                        "the compressed range of a chunk of `{}` is too big",
-                        e.name
-                    )));
-                }
-                plan.chunks.push(ChunkPlan {
-                    job,
-                    file_off,
-                    size,
-                    digest: Some(chunk_digest),
-                    comp: c.offset..end,
-                });
-            }
-            file_off += size;
-        }
-        if file_off != e.size {
-            return Err(fail(format!("chunks do not cover `{}`", e.name)));
+            let (from, end) = comp_range(&file, &chunks, k);
+            plan.chunks.push(ChunkPlan {
+                job,
+                file_off: c.file_off,
+                size: c.size,
+                digest,
+                comp: from..end,
+            });
         }
     }
     plan.jobs.push(FileJob {
@@ -1023,19 +1021,15 @@ pub(crate) fn make_plan(
         let available = have(d, e.size);
         if !first || available {
             plan.skipped_files += 1;
-            plan.skipped_compressed += e.end_offset.saturating_sub(e.offset);
+            plan.skipped_compressed = plan
+                .skipped_compressed
+                .saturating_add(e.end_offset.saturating_sub(e.offset));
             if available {
                 plan.skipped.push((d.to_string(), e.size));
             }
             continue;
         }
-        // (the holes are bounded on their own: no byte of them is fetched)
-        let zeros = plan.zeros;
-        plan_file(&mut plan, &toc.entries, i, Some(blob_size), max_chunk)?;
-        plan.planned += e.size - (plan.zeros - zeros);
-        if plan.planned > cap {
-            return Err(unsupported("the files to fetch are too big for the layer"));
-        }
+        plan_file(&mut plan, &toc.entries, i, Some(blob_size), max_chunk, cap)?;
     }
     Ok(plan)
 }
@@ -2694,7 +2688,7 @@ pub fn file_chunks(
         .filter(|e| e.has_content())
         .ok_or_else(|| fail(format!("entry {at} of the table is no regular file")))?;
     let mut plan = Plan::new(alg);
-    plan_file(&mut plan, &toc.entries, at, blob_size, max_chunk)?;
+    plan_file(&mut plan, &toc.entries, at, blob_size, max_chunk, u64::MAX)?;
     let job = &plan.jobs[0];
     Ok(FileChunks {
         digest: e.content_key().unwrap_or_default(),

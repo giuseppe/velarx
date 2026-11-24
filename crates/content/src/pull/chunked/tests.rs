@@ -6,6 +6,7 @@ fn cap(blob: i64) -> u64 {
 use super::*;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
+use velarx_chunk_core::compressed_bound;
 
 fn layer(annotations: &[(&str, &str)], media: &str) -> OciDescriptor {
     OciDescriptor {
@@ -270,6 +271,310 @@ fn test_plan_limits() {
         &|_, _| { false }
     )
     .is_ok());
+}
+
+/// The plan of `entries` from a blob of 1 GiB, whatever is known.
+fn plan_of(entries: Vec<TocEntry>, max_chunk: u64) -> ImageResult<Plan> {
+    make_plan(
+        &toc(entries),
+        Algorithm::Sha256,
+        1 << 30,
+        max_chunk,
+        cap(1 << 30),
+        &|_, _| false,
+    )
+}
+
+fn zeros(mut e: TocEntry) -> TocEntry {
+    e.chunk_type = Some("zeros".into());
+    e
+}
+
+/// The chunks of the first file as `located_chunks` records them: the
+/// chunk digest of each, in order.
+fn located(entries: Vec<TocEntry>) -> Vec<String> {
+    let found = located_chunks(&toc(entries));
+    found.iter().map(|c| c.chunk_digest.to_string()).collect()
+}
+
+/// The two readings of the chunks of a file, `TocChunks::of` (the places
+/// a pull records) and `plan_file` (what it fetches), agree on what covers
+/// a file, the offset a chunk entry gives in the file included.  Each
+/// case is one file of 30 bytes: `plan` says whether the plan takes it,
+/// `located` whether its first chunk is recorded.
+#[test]
+fn the_two_readings_of_the_chunks_of_a_file() {
+    let first = |size: u64| reg("f", &d(9), 30, 100, 160, Some((&d(1), size)));
+    let cases: Vec<(&str, Vec<TocEntry>, bool, bool)> = vec![
+        (
+            "chunks that tile",
+            vec![
+                first(10),
+                chunk("f", &d(2), 10, 10, 120),
+                chunk("f", &d(3), 10, 20, 140),
+            ],
+            true,
+            true,
+        ),
+        (
+            "the first chunk is the size of the file when it says none",
+            vec![first(0)],
+            true,
+            true,
+        ),
+        (
+            "a chunk that begins where the file has no byte of it",
+            vec![
+                first(10),
+                chunk("f", &d(2), 10, 15, 120),
+                chunk("f", &d(3), 10, 20, 140),
+            ],
+            false,
+            false,
+        ),
+        (
+            "a chunk that begins before its place",
+            vec![
+                first(10),
+                chunk("f", &d(2), 10, 5, 120),
+                chunk("f", &d(3), 10, 20, 140),
+            ],
+            false,
+            false,
+        ),
+        (
+            "a chunk of no bytes",
+            vec![
+                first(10),
+                chunk("f", &d(2), 0, 10, 120),
+                chunk("f", &d(3), 20, 10, 140),
+            ],
+            false,
+            false,
+        ),
+        (
+            "chunks that end past the file",
+            vec![
+                first(10),
+                chunk("f", &d(2), 10, 10, 120),
+                chunk("f", &d(3), 20, 20, 140),
+            ],
+            false,
+            false,
+        ),
+        (
+            "chunks that end before the file",
+            vec![first(10), chunk("f", &d(2), 10, 10, 120)],
+            false,
+            false,
+        ),
+        (
+            "a chunk that says no size, after the first",
+            vec![
+                first(10),
+                chunk("f", &d(2), 0, 10, 120),
+                chunk("f", &d(3), 10, 20, 140),
+            ],
+            false,
+            false,
+        ),
+        (
+            "a chunk without a digest",
+            vec![first(10), {
+                let mut c = chunk("f", &d(2), 20, 10, 120);
+                c.chunk_digest = None;
+                c
+            }],
+            false,
+            false,
+        ),
+        (
+            "a chunk with a digest that is none",
+            vec![first(10), chunk("f", "not a digest", 20, 10, 120)],
+            false,
+            false,
+        ),
+        (
+            "a hole in the middle",
+            vec![
+                first(10),
+                zeros(chunk("f", &d(2), 10, 10, 120)),
+                chunk("f", &d(3), 10, 20, 140),
+            ],
+            true,
+            true,
+        ),
+    ];
+    for (what, entries, plans, locates) in cases {
+        assert_eq!(plan_of(entries.clone(), 1 << 20).is_ok(), plans, "{what}");
+        // (a chunk of zeros is no record: what is recorded is the data)
+        let recorded = located(entries);
+        let has_first = recorded.iter().any(|c| *c == d(1));
+        assert_eq!(has_first, locates, "{what}: {recorded:?}");
+    }
+}
+
+/// A chunk entry that is not the first of a file takes the sizes of the
+/// chunks before it for its place in the file, and both readings give the
+/// chunks the same sizes and places when the entries agree.
+#[test]
+fn the_chunks_of_a_file_are_where_their_sizes_put_them() {
+    let entries = vec![
+        reg("f", &d(9), 30, 100, 160, Some((&d(1), 10))),
+        chunk("f", &d(2), 10, 10, 120),
+        chunk("f", &d(3), 10, 20, 140),
+    ];
+    let plan = plan_of(entries.clone(), 1 << 20).unwrap();
+    let in_plan: Vec<(u64, u64)> = plan.chunks.iter().map(|c| (c.file_off, c.size)).collect();
+    let recorded: Vec<(u64, u64)> = located_chunks(&toc(entries))
+        .iter()
+        .map(|c| (c.offset, c.size))
+        .collect();
+    assert_eq!(in_plan, [(0, 10), (10, 10), (20, 10)]);
+    assert_eq!(recorded, in_plan);
+}
+
+/// Chunk entries after a file that gives no chunk digest are an error of
+/// the plan, and no record of the places.
+#[test]
+fn chunk_entries_after_a_file_without_a_chunk_digest() {
+    let entries = vec![
+        reg("f", &d(9), 20, 100, 140, None),
+        chunk("f", &d(2), 10, 10, 120),
+    ];
+    assert!(plan_of(entries.clone(), 1 << 20).is_err());
+    assert!(located(entries).is_empty());
+}
+
+/// The compressed range of a chunk goes from its offset to the offset of
+/// the entry after it (the end of the file for the last), and a pull
+/// refuses what does not lie in the range of the file, in order, or what is
+/// bigger than the bound of the size of the chunk.
+#[test]
+fn the_compressed_ranges_of_the_chunks() {
+    let file = |end: u64| reg("f", &d(9), 20, 100, end, Some((&d(1), 10)));
+    let bound = compressed_bound(10);
+    let cases: Vec<(&str, Vec<TocEntry>, bool)> = vec![
+        (
+            "in order",
+            vec![file(140), chunk("f", &d(2), 10, 10, 120)],
+            true,
+        ),
+        (
+            "the second chunk begins before the file",
+            vec![file(140), chunk("f", &d(2), 10, 10, 90)],
+            false,
+        ),
+        (
+            "the first chunk is empty: the second begins where it does",
+            vec![file(140), chunk("f", &d(2), 10, 10, 100)],
+            false,
+        ),
+        (
+            "the second chunk is empty: it begins where the file ends",
+            vec![file(140), chunk("f", &d(2), 10, 10, 140)],
+            false,
+        ),
+        (
+            "the second chunk begins after the file",
+            vec![file(140), chunk("f", &d(2), 10, 10, 150)],
+            false,
+        ),
+        (
+            "the first chunk is bigger than its bound",
+            vec![
+                file((3 << 20) + 140),
+                chunk("f", &d(2), 10, 10, (2 << 20) + 120),
+            ],
+            false,
+        ),
+        (
+            "the second chunk is bigger than its bound",
+            vec![file((3 << 20) + 140), chunk("f", &d(2), 10, 10, 120)],
+            false,
+        ),
+        (
+            "at the bound of both",
+            vec![
+                file(100 + 2 * bound),
+                chunk("f", &d(2), 10, 10, 100 + bound),
+            ],
+            true,
+        ),
+    ];
+    for (what, entries, ok) in cases {
+        assert_eq!(plan_of(entries, 1 << 20).is_ok(), ok, "{what}");
+    }
+    // A table that is not of a blob has no offsets: they are not read.
+    let nowhere = [
+        reg("f", &d(9), 20, 500, 600, Some((&d(1), 10))),
+        chunk("f", &d(2), 10, 10, 520),
+    ];
+    let t = toc(nowhere.to_vec());
+    let got = file_chunks(&t, Algorithm::Sha256, 0, None, 1 << 20).unwrap();
+    assert_eq!(got.chunks.len(), 2);
+}
+
+/// The ranges of two chunks that are fetched do not overlap when a hole
+/// lies between them: the range of the first ends where the entry of the
+/// hole begins, which is placed against the others.
+#[test]
+fn a_hole_between_two_chunks_is_placed() {
+    let after = |at: u64| {
+        vec![
+            reg("f", &d(9), 30, 100, 160, Some((&d(1), 10))),
+            zeros(chunk("f", &d(2), 10, 10, 140)),
+            chunk("f", &d(3), 10, 20, at),
+        ]
+    };
+    assert!(plan_of(after(110), 1 << 20).is_err());
+    let plan = plan_of(after(145), 1 << 20).unwrap();
+    assert_eq!(comps(&plan.chunks), [100..140, 145..160]);
+}
+
+/// A chunk of data is at most `max_chunk` bytes, a hole is not held and
+/// has no such limit.
+#[test]
+fn the_size_of_a_chunk_is_limited_unless_it_is_a_hole() {
+    let data = vec![
+        reg("f", &d(9), 30, 100, 160, Some((&d(1), 10))),
+        chunk("f", &d(2), 20, 10, 120),
+    ];
+    assert!(plan_of(data.clone(), 20).is_ok());
+    assert!(matches!(plan_of(data, 19), Err(ImageError::Layer(_))));
+    let hole = vec![
+        reg("f", &d(9), 30, 100, 160, Some((&d(1), 10))),
+        zeros(chunk("f", &d(2), 20, 10, 120)),
+    ];
+    assert!(plan_of(hole, 10).is_ok());
+    // a file that is one chunk is the chunk
+    let one = vec![reg("f", &d(9), 30, 100, 160, None)];
+    assert!(plan_of(one.clone(), 30).is_ok());
+    assert!(plan_of(one, 29).is_err());
+}
+
+/// The holes of a layer, all its files together, are at most `MAX_ZEROS`.
+#[test]
+fn the_holes_of_a_layer_are_limited_together() {
+    let half = MAX_ZEROS / 2 + 1;
+    let file = |name: &str, n: u8| {
+        vec![
+            reg(name, &d(n), half + 10, 100, 160, Some((&d(n + 1), 10))),
+            zeros(chunk(name, &d(n + 2), half, 10, 120)),
+        ]
+    };
+    let one = file("a", 10);
+    assert!(plan_of(one.clone(), 1 << 20).is_ok());
+    let mut two = one.clone();
+    two.extend(file("b", 20));
+    assert!(plan_of(two, 1 << 20).is_err(), "the sum is over the limit");
+    let mut at_the_limit = file("a", 10);
+    at_the_limit[1].chunk_size = MAX_ZEROS;
+    at_the_limit[0].size = MAX_ZEROS + 10;
+    assert!(plan_of(at_the_limit.clone(), 1 << 20).is_ok());
+    at_the_limit[1].chunk_size += 1;
+    at_the_limit[0].size += 1;
+    assert!(plan_of(at_the_limit, 1 << 20).is_err());
 }
 
 fn comps(c: &[ChunkPlan]) -> Vec<Range<u64>> {
