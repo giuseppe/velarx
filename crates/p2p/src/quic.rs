@@ -474,7 +474,7 @@ fn extras_for(bytes: u64, lanes: usize, waited: bool) -> usize {
         .min(1 + EXTRAS_PER_PEER)
         .min(lanes);
     match waited {
-        true => connections - 1,
+        true => connections.saturating_sub(1),
         false => connections.min(EXTRAS_PER_PEER),
     }
 }
@@ -3670,6 +3670,20 @@ mod tests {
         assert!(client.fetch(addr, &[(d.clone(), Some(4))]).await.is_err());
         let found = client.fetch(addr, &[(d.clone(), Some(5))]).await.unwrap();
         assert_eq!(found, vec![(d, b"12345".to_vec())]);
+    }
+
+    /// No lanes asks for no extra connection, waited for or not (the primary
+    /// one is not counted against zero connections).
+    #[test]
+    fn no_lanes_ask_for_no_extra_connection() {
+        for bytes in [0, SPREAD_MIN_BYTES - 1, SPREAD_MIN_BYTES, u64::MAX] {
+            for waited in [false, true] {
+                assert_eq!(extras_for(bytes, 0, waited), 0, "{bytes} {waited}");
+            }
+        }
+        assert_eq!(extras_for(SPREAD_MIN_BYTES, 1, true), 0);
+        assert_eq!(extras_for(u64::MAX, 100, true), EXTRAS_PER_PEER);
+        assert_eq!(extras_for(u64::MAX, 100, false), EXTRAS_PER_PEER);
     }
 
     #[test]
