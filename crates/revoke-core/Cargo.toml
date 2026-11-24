@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-revoke-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Which revocation lists a node adopts: the newest verified list of each issuer, whatever else a text holds"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on numbers the shell reads from the lists: no dependency, no
+# I/O.  The shell that reads the texts, checks the signatures and keeps the
+# lists is the peer-to-peer provider (authority.rs).
+
+[lib]
+name = "velarx_revoke_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

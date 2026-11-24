@@ -5249,6 +5249,7 @@ dependencies = [
  "velarx-netkernel",
  "velarx-proto",
  "velarx-registry",
+ "velarx-revoke-core",
  "velarx-runtime",
  "velarx-sandbox",
  "velarx-storage",
@@ -5375,6 +5376,10 @@ dependencies = [
  "zeroize",
  "zstd",
 ]
+
+[[package]]
+name = "velarx-revoke-core"
+version = "0.1.0"
 
 [[package]]
 name = "velarx-runtime"

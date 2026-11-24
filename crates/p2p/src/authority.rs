@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+use velarx_revoke_core::{Held, Part};
 
 const MAX_CERT_WIRE: usize = 8 << 10;
 /// How long the exchange of certificates on a connection may take.
@@ -536,6 +537,29 @@ struct State {
     news: u64,
 }
 
+/// A part of a text of lists, judged: the issuer and the number it says, and
+/// the list if its signature is of an authority.
+type Judged = ([u8; 32], u64, Option<RevocationList>);
+
+impl State {
+    /// The number the core knows an authority by.
+    fn id(&self, issuer: &[u8; 32]) -> Option<u64> {
+        self.keys.iter().position(|k| k == issuer).map(|i| i as u64)
+    }
+
+    /// The lists held, for the core.
+    fn held(&self) -> Vec<Held> {
+        let held = self.lists.values();
+        held.filter_map(|l| {
+            Some(Held {
+                issuer: self.id(&l.issuer)?,
+                number: l.number,
+            })
+        })
+        .collect()
+    }
+}
+
 struct Entry {
     cert: CertificateDer<'static>,
     who: Admitted,
@@ -612,9 +636,7 @@ impl Authority {
                     watched.path.display()
                 );
             }
-            for list in lists {
-                Self::adopt_into(&mut state, list);
-            }
+            Self::adopt_into(&mut state, lists.into_iter().map(Self::signed).collect());
         }
         info!(
             "This node is {:?} ({}), certified by {} authority(ies); {} peer(s) revoked",
@@ -733,22 +755,46 @@ impl Authority {
         }
     }
 
-    fn adopt_into(state: &mut State, list: RevocationList) -> bool {
-        if state
-            .lists
-            .get(&list.issuer)
-            .is_some_and(|have| have.number >= list.number)
-        {
-            return false;
+    fn signed(list: RevocationList) -> Judged {
+        (list.issuer, list.number, Some(list))
+    }
+
+    /// Adopt what `velarx_revoke_core` picks of the lists judged (the
+    /// issuer and number a part says, and the list when its signature held):
+    /// the numbers adopted.
+    fn adopt_into(state: &mut State, judged: Vec<Judged>) -> Vec<u64> {
+        let (mut parts, mut lists) = (Vec::new(), Vec::new());
+        for (issuer, number, list) in judged {
+            // (what a part says of itself counts only when its signature held)
+            let (issuer, number) = list
+                .as_ref()
+                .map_or((issuer, number), |l| (l.issuer, l.number));
+            if let Some(issuer) = state.id(&issuer) {
+                let verified = list.is_some();
+                parts.push(Part {
+                    issuer,
+                    number,
+                    verified,
+                });
+                lists.push(list);
+            }
         }
-        state.lists.insert(list.issuer, list);
-        state.news += 1;
-        state.revoked = state
-            .lists
-            .values()
-            .flat_map(|l| l.peers.iter().copied())
-            .collect();
-        true
+        let mut numbers = Vec::new();
+        for i in velarx_revoke_core::adopt(&state.held(), &parts) {
+            if let Some(list) = lists[i].take() {
+                numbers.push(list.number);
+                state.lists.insert(list.issuer, list);
+            }
+        }
+        if !numbers.is_empty() {
+            state.news += numbers.len() as u64;
+            state.revoked = state
+                .lists
+                .values()
+                .flat_map(|l| l.peers.iter().copied())
+                .collect();
+        }
+        numbers
     }
 
     /// The identity of a certificate presented on a connection, judged now.
@@ -870,50 +916,51 @@ impl Authority {
             .collect()
     }
 
-    /// The lists a peer sent (one text, one list after the other): each
-    /// taken when it is signed by an authority and newer.
+    /// The lists a peer sent (one text, one list after the other): of each
+    /// authority the newest list that is signed by it, when newer than the
+    /// one held, whatever else the text holds.  A list can be checked only
+    /// when it says an authority of this node and a number newer than the
+    /// one held, and at most two of each authority are: one text costs at
+    /// most twice the authorities in signature checks, and junk that claims
+    /// one authority cannot use up the checks of another.  (An honest peer
+    /// sends one list of each authority; a peer that fills the checks with
+    /// junk before them sends no list, which it may as well do.)
     pub fn adopt(&self, text: &str) -> bool {
         // (the signatures are checked before the lock that the handshakes
-        // wait for is taken, and only of the newest list of each authority
-        // when it is newer than the one held: lists sent again, or many
-        // forged ones, cost one signature check an authority at most)
+        // wait for is taken)
         let (keys, held) = {
             let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-            let held: HashMap<[u8; 32], u64> =
-                state.lists.iter().map(|(i, l)| (*i, l.number)).collect();
-            (state.keys.clone(), held)
+            (state.keys.clone(), state.held())
         };
-        let mut newest: HashMap<[u8; 32], (u64, &str)> = HashMap::new();
+        let mut judged = Vec::new();
+        let mut checks = vec![0; keys.len()];
         for part in RevocationList::split(text).1 {
-            if let Some((issuer, number)) = RevocationList::head(part) {
-                if keys.contains(&issuer)
-                    && held.get(&issuer).is_none_or(|h| number > *h)
-                    && newest.get(&issuer).is_none_or(|(n, _)| number > *n)
-                {
-                    newest.insert(issuer, (number, part));
-                }
+            let Some((issuer, number)) = RevocationList::head(part) else {
+                continue;
+            };
+            let asked = keys.iter().position(|k| *k == issuer);
+            if let Some(id) = asked.filter(|id| {
+                checks[*id] < 2 && velarx_revoke_core::newer(&held, *id as u64, number)
+            }) {
+                checks[id] += 1;
+                judged.push((issuer, number, RevocationList::parse(part, &keys).ok()));
+            }
+            if judged.len() == 2 * keys.len() {
+                break;
             }
         }
-        let lists: Vec<RevocationList> = newest
-            .into_values()
-            .filter_map(|(_, part)| RevocationList::parse(part, &keys).ok())
-            .collect();
-        if lists.is_empty() {
+        if judged.is_empty() {
             return false;
         }
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-        let mut news = false;
-        for list in lists {
-            let number = list.number;
-            if Self::adopt_into(&mut state, list) {
-                info!(
-                    "A newer revocation list (number {number}) came from a peer: {} peer(s) revoked",
-                    state.revoked.len()
-                );
-                news = true;
-            }
+        let numbers = Self::adopt_into(&mut state, judged);
+        for number in &numbers {
+            info!(
+                "A newer revocation list (number {number}) came from a peer: {} peer(s) revoked",
+                state.revoked.len()
+            );
         }
-        news
+        !numbers.is_empty()
     }
 
     /// Remember a peer admitted on libp2p.
@@ -1094,14 +1141,12 @@ impl Authority {
                 } else {
                     state.lists_read = Instant::now();
                 }
-                for list in found {
-                    let number = list.number;
-                    if Self::adopt_into(&mut state, list) {
-                        info!(
-                            "The revocation list (number {number}) was read: {} peer(s) revoked",
-                            state.revoked.len()
-                        );
-                    }
+                let judged = found.into_iter().map(Self::signed).collect();
+                for number in Self::adopt_into(&mut state, judged) {
+                    info!(
+                        "The revocation list (number {number}) was read: {} peer(s) revoked",
+                        state.revoked.len()
+                    );
                 }
             }
             Some(Err(e)) => warn!("The revocation list cannot be read: {e}; the last one is kept"),
@@ -1677,6 +1722,85 @@ pub(crate) mod tests {
         assert!(authority
             .verify(&c.der(), &[], now, Usage::Control)
             .is_err());
+    }
+
+    /// A text that holds a genuine newer list and junk that claims the same
+    /// issuer with the highest number must not hide the genuine one: a
+    /// relayer that adds junk does not mask a revocation.
+    #[test]
+    fn junk_in_a_text_does_not_hide_a_genuine_newer_list() {
+        let swarm = Swarm::new();
+        let mut a = swarm.node("a", None, Role::Both);
+        let b = swarm.node("b", None, Role::Both);
+        let c = swarm.node("c", None, Role::Both);
+        let revoked = swarm.dir.path().join("revoked");
+        a.config.revocation_path = Some(revoked.clone());
+        ca::revoke(&swarm.ca(), &[b.key.public().to_peer_id()]).unwrap();
+        std::fs::copy(swarm.ca().join("revoked"), &revoked).unwrap();
+        let c_id = c.key.public().to_peer_id();
+        let genuine = ca::revoke(&swarm.ca(), &[c_id]).unwrap();
+        assert_eq!(genuine.number, 2);
+        let forged = genuine
+            .text()
+            .replace("number 2", "number 18446744073709551615");
+        let unsigned = forged.replace("signature ", "ignored ");
+        for junk in [&forged, &unsigned] {
+            for text in [
+                format!("{junk}{}", genuine.text()),
+                format!("{}{junk}", genuine.text()),
+            ] {
+                // (a node that holds the first list only)
+                let authority = a.authority();
+                assert!(authority.adopt(&text), "the genuine list is adopted");
+                assert_eq!(authority.revoked_count(), 2);
+                assert_eq!(
+                    authority
+                        .verify(&c.der(), &[], UnixTime::now(), Usage::Control)
+                        .unwrap_err(),
+                    Error::Revoked(c_id)
+                );
+            }
+        }
+    }
+
+    /// A text costs at most twice the authorities in signature checks: the
+    /// parts after that are not looked at.
+    #[test]
+    fn a_text_costs_a_bounded_number_of_signature_checks() {
+        let swarm = Swarm::new();
+        let a = swarm.node("a", None, Role::Both);
+        let b = swarm.node("b", None, Role::Both);
+        let genuine = ca::revoke(&swarm.ca(), &[b.key.public().to_peer_id()]).unwrap();
+        let forged = genuine.text().replace("number 1", "number 7");
+        let authority = a.authority();
+        let text = format!("{forged}{forged}{}", genuine.text());
+        assert!(!authority.adopt(&text));
+        let text = format!("{forged}{}{forged}", genuine.text());
+        assert!(authority.adopt(&text));
+    }
+
+    /// The checks are counted for each authority: junk that claims one does
+    /// not use up the checks of another.
+    #[test]
+    fn junk_of_one_authority_does_not_starve_another() {
+        let first = Swarm::new();
+        let second = Swarm::new();
+        let a = first.node("a", None, Role::Both);
+        let victim = second.node("victim", None, Role::Both);
+        let authority = a.authority();
+        let bundle = format!(
+            "{}{}",
+            std::fs::read_to_string(first.ca().join("ca.crt")).unwrap(),
+            std::fs::read_to_string(second.ca().join("ca.crt")).unwrap()
+        );
+        std::fs::write(&a.config.ca_path, bundle).unwrap();
+        authority.sweep();
+        let own = ca::revoke(&first.ca(), &[a.key.public().to_peer_id()]).unwrap();
+        let junk = own.text().replace("number 1", "number 7");
+        let genuine = ca::revoke(&second.ca(), &[victim.key.public().to_peer_id()]).unwrap();
+        let text = format!("{junk}{junk}{junk}{junk}{}", genuine.text());
+        assert!(authority.adopt(&text));
+        assert_eq!(authority.revoked_count(), 1);
     }
 
     #[test]

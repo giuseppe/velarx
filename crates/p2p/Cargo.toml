@@ -46,6 +46,7 @@ velarx-types = { path = "../types" }
 velarx-storage = { path = "../storage" }
 velarx-fuse = { path = "../fuse" }
 velarx-group-core = { path = "../group-core" }
+velarx-revoke-core = { path = "../revoke-core" }
 
 # chunk transfer between peers over QUIC (quic.rs)
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
