@@ -196,9 +196,12 @@ async fn distribution(call: Call) -> ApiResult {
     Ok(reply::json(200, &velarx_shape::image::distribution(&d)))
 }
 
-/// The registries on the loopback are insecure, as for the Docker daemon.
+/// The registries on the loopback are insecure, as for the Docker daemon:
+/// the registry of the reference, not its first component, which is an
+/// image of Docker Hub when it is `localhost` with a tag.
 fn loopback_registry(reference: &str) -> bool {
-    velarx_base::host::is_loopback_host(reference.split('/').next().unwrap_or(""))
+    velarx_types::ImageReference::parse(reference)
+        .is_ok_and(|r| velarx_base::host::is_loopback_host(&r.registry))
 }
 
 /// A duration of the query (Go's syntax), in milliseconds.
@@ -647,11 +650,8 @@ async fn do_pull(call: Call, reference: String, compat: bool) -> ApiResult {
     // libpod: every tag of the repository, and the attempts of a pull
     // that fails on the way (not one the registry refuses)
     let all_tags = !compat && call.q_bool("allTags", false)?;
-    let tagged = reference.contains('@')
-        || reference
-            .rsplit('/')
-            .next()
-            .is_some_and(|l| l.contains(':'));
+    let tagged = velarx_base::reference::parse(reference.as_bytes())
+        .is_ok_and(|spans| spans.tag.is_some() || spans.digest.is_some());
     if all_tags && tagged {
         return Err(ApiError::bad_request(
             "tag can't be used with --all-tags/-a",
@@ -967,5 +967,15 @@ mod tests {
         assert!(!loopback_registry("127.evil.example/app"));
         assert!(!loopback_registry("localhost.evil.example:5000/app"));
         assert!(!loopback_registry("docker.io/library/alpine"));
+        // (no registry: `localhost` is an image of Docker Hub, and `5000`
+        // its tag)
+        for hub in [
+            "localhost",
+            "localhost:5000",
+            "127.0.0.1",
+            "localhost@sha256:",
+        ] {
+            assert!(!loopback_registry(hub), "{hub}");
+        }
     }
 }
