@@ -179,3 +179,91 @@ fn a_slow_honest_holder_is_not_punished_for_being_slow() {
         });
     }
 }
+
+/// The chunks `from..to` of the one layer of `image`, as a layer with its
+/// digest: what a pull asks of the peers in one group.
+fn part(image: &sim::Image, from: usize, to: usize) -> sim::Image {
+    let mut part = image.clone();
+    part.layers[0].chunks = image.layers[0].chunks[from..to].to_vec();
+    part
+}
+
+/// A peer that served a layer and then sends only wrong bytes is failing:
+/// the next group does not take it as a candidate, and gets the layer from
+/// the holder.
+#[test]
+fn a_peer_that_served_and_now_sends_wrong_bytes_is_failing() {
+    for seed in sim::seeds(&[1, 2]) {
+        sim::run(seed, |world| async move {
+            let image = one_layer("turned", 41, 96);
+            let layer = image.layers[0].digest.clone();
+            let turning = world.add_node(NodeConfig {
+                announce: true,
+                ..Default::default()
+            });
+            // (the holder tells no filter: the other peer, whose filter
+            // names the layer, is asked first)
+            let holder = world.add_node(NodeConfig {
+                bootstrap: vec![turning.index],
+                filter: velarx_p2p::filter::Config {
+                    advertise: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let asker = world.add_node(NodeConfig {
+                bootstrap: vec![turning.index, holder.index],
+                ..Default::default()
+            });
+            settle(30).await;
+            seed_image(&world, holder.index, &image).await;
+            seed_image(&world, turning.index, &image).await;
+            settle(5).await;
+            // the first group: the peer serves it
+            let r = pull(&asker, &part(&image, 0, 32)).await;
+            assert_eq!((r.wrong, r.peer_chunks), (0, 32));
+            let k = asker.live().source.knowledge().clone();
+            assert!(k.providers(&layer).contains(&turning.id()));
+            // it turns bad: the second group is asked of it first, and
+            // comes from the holder
+            turning.set_behavior(Behavior::Corrupt);
+            let r = pull(&asker, &part(&image, 32, 64)).await;
+            assert_eq!((r.wrong, r.peer_chunks), (0, 32));
+            // (the group whose first candidate is the peer that turned bad)
+            let events = asker.live().source.decisions().about(&layer, &[]);
+            let second = &events
+                .iter()
+                .find(|d| {
+                    matches!(&d.events[0], velarx_p2p::explain::Event::Candidates(c)
+                    if c[0].0 == turning.id())
+                })
+                .expect("a group that began with the peer")
+                .events;
+            assert!(
+                matches!(&second[0], velarx_p2p::explain::Event::Candidates(c)
+                    if c[0] == (turning.id(), velarx_p2p::explain::Why::Served)),
+                "the peer that served was not the first candidate: {second:?}"
+            );
+            let wrong = k
+                .traffic()
+                .into_iter()
+                .find(|(p, _)| *p == turning.id())
+                .map_or(0, |(_, t)| t.wrong);
+            eprintln!("seed {seed}: the bad peer sent {wrong} wrong chunks");
+            assert!(wrong > 0, "the peer sent no wrong bytes: nothing shown");
+            // it is failing: still believed to have the layer, but not
+            // asked by the next group
+            assert!(k.failing(&turning.id()));
+            let r = pull(&asker, &part(&image, 64, 96)).await;
+            assert_eq!((r.wrong, r.peer_chunks), (0, 32));
+            // (the last group made, the first listed)
+            let third = &asker.live().source.decisions().about(&layer, &[])[0];
+            assert!(
+                !third.events.iter().any(|e| matches!(e,
+                    velarx_p2p::explain::Event::Candidates(c)
+                        if c.iter().any(|(p, _)| *p == turning.id()))),
+                "the peer that sent wrong bytes was a candidate of the next group: {third:?}"
+            );
+        });
+    }
+}

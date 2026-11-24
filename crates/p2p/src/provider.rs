@@ -1328,6 +1328,7 @@ impl PeerSource {
                         outcome: Outcome::NoPath(why.clone()),
                         took: started.elapsed(),
                     });
+                    self.knowledge.failed(provider);
                     debug!(
                         "P2P: the index of {} from {}: no QUIC path: {why}",
                         short(&item.digest),
@@ -1340,6 +1341,7 @@ impl PeerSource {
                         outcome: Outcome::Failed(e.clone()),
                         took: started.elapsed(),
                     });
+                    self.knowledge.failed(provider);
                     self.knowledge.count(provider, started.elapsed(), None);
                     debug!(
                         "P2P: the index of {} from {}: {}",
@@ -2059,7 +2061,8 @@ impl PeerSource {
             result,
         } = attempt;
         let (n, bytes) = answers.valid.remove(&request).unwrap_or_default();
-        if let Some(wrong) = answers.wrong.remove(&request) {
+        let wrong = answers.wrong.remove(&request).unwrap_or_default();
+        if wrong > 0 {
             warn!(%peer, "P2P: {wrong} chunks sent did not match their digests");
             self.knowledge.wrong(peer, wrong);
         }
@@ -2120,9 +2123,18 @@ impl PeerSource {
             chunks = n,
             "chunk request"
         );
-        if n == 0 {
+        if n == 0 && wrong > 0 {
+            // (a peer that has served the layer is still believed to have
+            // it when it misses a chunk, but not when it sends wrong bytes;
+            // the request itself was answered, so it is counted as one, and
+            // the wrong chunks are counted apart by `wrong`)
+            self.knowledge.failed(peer);
+        } else if n == 0 {
             self.knowledge.missed(layer, peer);
         } else {
+            // (also when some chunks were wrong: a store with a few damaged
+            // chunks is still worth asking, each wrong chunk comes from
+            // another peer)
             self.knowledge.served(layer, peer, took);
         }
         Ok(Taken::Sent(n))
@@ -3160,6 +3172,36 @@ mod tests {
         assert!(out.0.iter().all(|(d, data)| digest_of(data) == *d));
     }
 
+    /// A peer that served the layer and then sends only wrong bytes is
+    /// failing, as one whose request failed: the next group does not start
+    /// with it.
+    #[tokio::test]
+    async fn a_peer_that_served_and_sends_wrong_bytes_is_not_asked_by_the_next_group() {
+        let fake = Arc::new(Fake::default());
+        let c = chunks(6);
+        let liar = fake.peer(
+            0,
+            Ok(c.iter()
+                .map(|(d, _)| (d.clone(), b"lies".to_vec()))
+                .collect()),
+        );
+        let good = fake.peer(0, Ok(c.clone()));
+        let s = source(&fake, None);
+        s.knowledge()
+            .served(Some(LAYER), liar, Duration::from_micros(1));
+        s.knowledge()
+            .served(Some(LAYER), good, Duration::from_micros(2));
+        for group in [&c[..3], &c[3..]] {
+            let mut out = Collect::default();
+            s.fetch_group(&items(group), Some(LAYER), &mut out)
+                .await
+                .unwrap();
+            assert_eq!(digests_of(&out), sorted(group));
+        }
+        assert_eq!(fake.asked.lock().unwrap().clone(), [liar, good, good]);
+        assert!(s.knowledge().failing(&liar));
+    }
+
     /// Peers that whose filter says they hold the layer and fail, lie or say nothing
     /// are replaced by the next sources, not by the registry: the three
     /// the filters name are not all there is.
@@ -3842,6 +3884,36 @@ mod tests {
             .unwrap();
         assert_eq!((given, out.0.len()), (Some(liar), 1));
         assert_eq!(*fake.index_asked.lock().unwrap(), [liar, honest, liar]);
+    }
+
+    /// A peer that cannot be reached over UDP, asked for an index, is
+    /// failing as it is when asked for chunks.
+    #[tokio::test]
+    async fn a_peer_with_no_path_for_an_index_is_failing() {
+        let fake = Arc::new(Fake::default());
+        let (away, honest) = (fake.peer(0, Ok(vec![])), fake.peer(0, Ok(vec![])));
+        fake.no_path.lock().unwrap().insert(away);
+        fake.indexes
+            .lock()
+            .unwrap()
+            .insert(honest, b"an index".to_vec());
+        let s = source(&fake, None);
+        let layer = Item {
+            digest: digest_of(b"a layer"),
+            size: Some(1 << 20),
+        };
+        for (peer, rtt) in [(away, 1), (honest, 2)] {
+            s.knowledge()
+                .served(Some(&layer.digest), peer, Duration::from_millis(rtt));
+        }
+        let mut out = Collect::default();
+        let given = s
+            .fetch_index(&layer, false, &[], &any(), &mut out)
+            .await
+            .unwrap();
+        assert_eq!(given, Some(honest));
+        assert!(s.knowledge().failing(&away));
+        assert!(!s.knowledge().failing(&honest));
     }
 
     /// A table of contents is taken from a peer only when it has the
