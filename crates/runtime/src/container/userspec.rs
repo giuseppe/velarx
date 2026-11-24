@@ -55,6 +55,8 @@ impl ResolvedUser {
 pub enum UserError {
     #[error("invalid user `{0}`")]
     Invalid(String),
+    #[error("invalid group `{0}`")]
+    InvalidGroup(String),
     #[error("unable to find user {0}: no matching entries in passwd file")]
     NoUser(String),
     #[error("unable to find group {0}: no matching entries in group file")]
@@ -75,10 +77,15 @@ pub enum UserError {
 
 /// A numeric id: digits only, below `u32::MAX` (which means "no id").
 fn parse_id(s: &str) -> Option<u32> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+    if !all_digits(s) {
         return None;
     }
     s.parse::<u32>().ok().filter(|&n| n != u32::MAX)
+}
+
+/// Digits only: it can only be an id, never a name.
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 struct PasswdEntry<'a> {
@@ -132,6 +139,7 @@ fn add_gid(v: &mut Vec<u32>, gid: u32) {
 fn group_id(group: &str, g: &str) -> Result<u32, UserError> {
     match parse_id(g) {
         Some(gid) => Ok(gid),
+        None if all_digits(g) => Err(UserError::InvalidGroup(g.to_string())),
         None => group_entries(group)
             .find(|e| e.name == g)
             .map(|e| e.gid)
@@ -177,6 +185,9 @@ pub fn resolve_user_groups(
     }
 
     let by_id = parse_id(user_part);
+    if by_id.is_none() && all_digits(user_part) {
+        return Err(UserError::Invalid(user_part.to_string()));
+    }
     let entry = passwd_entries(passwd).find(|e| match by_id {
         Some(id) => e.uid == id,
         None => e.name == user_part,
@@ -529,6 +540,26 @@ audio:x:63:\nnum:x:4294967295:alice\n";
         assert_eq!(r("bad", &[]), Err(UserError::NoUser("bad".into())));
         // a group line with an invalid gid is ignored
         assert_eq!(r("0", &["num"]), Err(UserError::NoGroup("num".into())));
+    }
+
+    #[test]
+    fn digits_above_the_id_range_are_never_names() {
+        // a passwd line named like the number must not capture it
+        let passwd = "4294967295:x:0:0:x:/root:/bin/sh\n99999999999:x:0:0:x:/:/bin/sh\n";
+        let group = "4294967295:x:5:\n";
+        for user in ["4294967295", "99999999999"] {
+            let got = resolve_user(passwd, group, user, &[]);
+            assert_eq!(got, Err(UserError::Invalid(user.into())));
+        }
+        assert_eq!(
+            resolve_user(passwd, group, "0:4294967295", &[]),
+            Err(UserError::InvalidGroup("4294967295".into()))
+        );
+        let add = ["4294967295".to_string()];
+        assert_eq!(
+            resolve_user(passwd, group, "0", &add),
+            Err(UserError::InvalidGroup("4294967295".into()))
+        );
     }
 
     #[test]

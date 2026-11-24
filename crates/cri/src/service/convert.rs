@@ -404,27 +404,22 @@ fn infra_security_of(
     let Some(sc) = sc else {
         return Ok(i);
     };
-    let id = |v: &cri::Int64Value, what: &str| {
-        u32::try_from(v.value).map_err(|_| Status::invalid_argument(format!("invalid {what}")))
-    };
     i.run_as_user = sc
         .run_as_user
         .as_ref()
-        .map(|v| id(v, "run_as_user"))
+        .map(|v| id_of(v.value, "run_as_user"))
         .transpose()?;
     i.run_as_group = sc
         .run_as_group
         .as_ref()
-        .map(|v| id(v, "run_as_group"))
+        .map(|v| id_of(v.value, "run_as_group"))
         .transpose()?;
     // (the `Strict` supplemental groups policy is the infra container's
     // anyway: its image, catatonit alone, has no /etc/group to add groups)
     i.supplemental_groups = sc
         .supplemental_groups
         .iter()
-        .map(|g| {
-            u32::try_from(*g).map_err(|_| Status::invalid_argument("invalid supplemental group"))
-        })
+        .map(|g| id_of(*g, "supplemental group"))
         .collect::<Result<_>>()?;
     i.read_only_rootfs = sc.readonly_rootfs;
     i.privileged = sc.privileged;
@@ -463,6 +458,12 @@ pub fn selinux_opts(s: &cri::SeLinuxOption) -> Vec<String> {
     v
 }
 
+/// An id of the kubelet: it must be one of the engine's, never a number that
+/// the engine would look up as a name (`-1`).
+fn id_of(v: i64, what: &str) -> Result<u32> {
+    u32::try_from(v).map_err(|_| Status::invalid_argument(format!("invalid {what}")))
+}
+
 /// The user a container runs as, from its security context: `UID[:GID]`, a
 /// name, or empty (the image's).
 pub fn user_of(cfg: &cri::ContainerConfig) -> Result<String> {
@@ -474,11 +475,19 @@ pub fn user_of(cfg: &cri::ContainerConfig) -> Result<String> {
             "run_as_group is set without run_as_user",
         ));
     }
-    let uid = sc.run_as_user.as_ref().map(|v| v.value.to_string());
-    let gid = sc.run_as_group.as_ref().map(|v| v.value.to_string());
+    let uid = sc
+        .run_as_user
+        .as_ref()
+        .map(|v| id_of(v.value, "run_as_user"))
+        .transpose()?;
+    let gid = sc
+        .run_as_group
+        .as_ref()
+        .map(|v| id_of(v.value, "run_as_group"))
+        .transpose()?;
     Ok(match (uid, gid, sc.run_as_username.as_str()) {
         (Some(u), Some(g), _) => format!("{u}:{g}"),
-        (Some(u), None, _) => u,
+        (Some(u), None, _) => u.to_string(),
         (None, Some(g), "") => format!("0:{g}"),
         (None, Some(g), n) => format!("{n}:{g}"),
         (None, None, n) => n.to_string(),
@@ -721,7 +730,11 @@ pub fn container_create_of(
             c.groups_strict =
                 cri::SupplementalGroupsPolicy::try_from(sc.supplemental_groups_policy)
                     == Ok(cri::SupplementalGroupsPolicy::Strict);
-            c.group_add = sc.supplemental_groups.iter().map(i64::to_string).collect();
+            c.group_add = sc
+                .supplemental_groups
+                .iter()
+                .map(|g| id_of(*g, "supplemental group").map(|g| g.to_string()))
+                .collect::<Result<_>>()?;
             let mut selinux = sc
                 .selinux_options
                 .as_ref()
@@ -1331,6 +1344,31 @@ mod tests {
     }
 
     /// The engine's default pids limit is not a CRI container's.
+    /// An id that is not a uid or a gid is refused, not given to the engine
+    /// as text it looks up as a name.
+    #[test]
+    fn ids_out_of_range_are_refused() {
+        fn int(value: i64) -> Option<cri::Int64Value> {
+            Some(cri::Int64Value { value })
+        }
+        let with = |f: fn(&mut cri::LinuxContainerSecurityContext)| {
+            container(|c| {
+                let mut sc = cri::LinuxContainerSecurityContext::default();
+                f(&mut sc);
+                c.linux.get_or_insert_default().security_context = Some(sc);
+            })
+        };
+        assert!(with(|sc| sc.run_as_user = int(-1)).is_err());
+        assert!(with(|sc| sc.run_as_user = int(1 << 32)).is_err());
+        assert!(with(|sc| {
+            sc.run_as_user = int(1);
+            sc.run_as_group = int(-1);
+        })
+        .is_err());
+        assert!(with(|sc| sc.supplemental_groups = vec![5, -1]).is_err());
+        assert!(with(|sc| sc.run_as_user = int(1000)).is_ok());
+    }
+
     #[test]
     fn a_cri_container_has_no_default_pids_limit() {
         assert_eq!(container(|_| {}).unwrap().pids_limit, Some(-1));
