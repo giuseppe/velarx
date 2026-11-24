@@ -326,8 +326,15 @@ pub fn convert_for(
             .into_iter()
             .map(Value::from)
             .collect();
-        if let Some(n) = rule.get("name").and_then(Value::as_str) {
-            names.push(Value::from(n));
+        match rule.get("name") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(n)) => names.push(Value::from(n.as_str())),
+            // dropped, the rule would name fewer calls than it says
+            Some(_) => {
+                return Err(SeccompError::InvalidProfile(
+                    "`name` is not a string".into(),
+                ))
+            }
         }
         if names.is_empty() {
             return Err(SeccompError::InvalidProfile("a rule without names".into()));
@@ -339,11 +346,19 @@ pub fn convert_for(
                 o.insert(k.into(), x.clone());
             }
         }
-        if let Some(args) = rule
-            .get("args")
-            .filter(|a| a.as_array().is_some_and(|a| !a.is_empty()))
-        {
-            o.insert("args".into(), args.clone());
+        match rule.get("args") {
+            None | Some(Value::Null) => {}
+            Some(args @ Value::Array(a)) => {
+                if !a.is_empty() {
+                    o.insert("args".into(), args.clone());
+                }
+            }
+            // dropped, the rule would apply to every call
+            Some(_) => {
+                return Err(SeccompError::InvalidProfile(
+                    "`args` is not an array".into(),
+                ))
+            }
         }
         syscalls.push(Value::Object(o));
     }
@@ -463,8 +478,19 @@ mod tests {
                 {"names": ["a"], "action": "SCMP_ACT_ALLOW", "includes": {"minKernel": "x"}}]}),
             serde_json::json!({"defaultAction": "SCMP_ACT_ALLOW", "syscalls": [
                 {"names": [1], "action": "SCMP_ACT_ALLOW"}]}),
+            serde_json::json!({"defaultAction": "SCMP_ACT_ALLOW", "syscalls": [
+                {"names": ["a"], "action": "SCMP_ACT_ERRNO", "args": {"index": 0}}]}),
+            serde_json::json!({"defaultAction": "SCMP_ACT_ALLOW", "syscalls": [
+                {"names": ["a"], "name": 1, "action": "SCMP_ACT_ERRNO"}]}),
         ] {
             assert!(convert_for(&bad, &caps(&[]), AMD64, None).is_err(), "{bad}");
+        }
+        // no arguments to compare: the rule is as it says
+        for args in [serde_json::json!(null), serde_json::json!([])] {
+            let ok = serde_json::json!({"defaultAction": "SCMP_ACT_ALLOW", "syscalls": [
+                {"names": ["a"], "action": "SCMP_ACT_ERRNO", "args": args}]});
+            let v = convert_for(&ok, &caps(&[]), AMD64, None).unwrap();
+            assert!(v["syscalls"][0].get("args").is_none(), "{ok}");
         }
         // what the OCI types refuse
         assert!(convert(r#"{"defaultAction": "SCMP_ACT_NOPE"}"#, &caps(&[])).is_err());
