@@ -88,7 +88,9 @@ use crate::{content_size, size_conflict, toc_time, TocEntry, TocEntryType};
 use base64::Engine;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
-use velarx_tarsplit_header::emit::{put_decimal, put_octal, put_time, record_len, seal};
+use velarx_tarsplit_header::emit::{
+    path_order, put_decimal, put_octal, put_time, record_len, seal,
+};
 use velarx_tarsplit_header::{cstr, decimal, number, pax_time, PaxError};
 
 const BLOCK: usize = 512;
@@ -254,7 +256,7 @@ impl Checker {
             return Err("a directory is named with a final `/` and nothing else is".into());
         }
         if let Some(previous) = &self.previous {
-            match components(previous).cmp(components(key)) {
+            match path_order(previous.as_bytes(), key.as_bytes()) {
                 std::cmp::Ordering::Less => {}
                 std::cmp::Ordering::Equal => return Err("the path is in the layer twice".into()),
                 std::cmp::Ordering::Greater => {

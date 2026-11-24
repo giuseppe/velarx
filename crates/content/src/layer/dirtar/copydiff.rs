@@ -438,6 +438,6 @@ pub fn changes(dir: BorrowedFd<'_>, opts: &Options) -> io::Result<Vec<(String, C
     WALK.run(dir.try_clone_to_owned()?, root, &mut walk)?;
     let mut out = walk.out;
     // (the parents first, the names of a directory in order)
-    out.sort_by(|a, b| a.0.split('/').cmp(b.0.split('/')));
+    out.sort_by(|a, b| path_order(a.0.as_bytes(), b.0.as_bytes()));
     Ok(out)
 }

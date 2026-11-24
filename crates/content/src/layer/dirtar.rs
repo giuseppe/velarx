@@ -23,7 +23,7 @@
 
 use rustix::fd::{BorrowedFd, OwnedFd};
 use rustix::fs::{fstat, lgetxattr, llistxattr, openat, readlinkat, FileType, Mode, OFlags, Stat};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
 
@@ -34,6 +34,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use velarx_base::walk::{Visit, Walk};
+use velarx_tarsplit_header::emit::path_order;
 
 /// The longest path of an entry.
 const MAX_PATH: usize = 4096;
@@ -1267,14 +1268,53 @@ pub fn record(dir: BorrowedFd<'_>, opts: &Options) -> io::Result<Vec<Recorded>> 
 /// that of the file it hides, and what an image below has of a renamed
 /// directory after the rest.
 pub fn sort_canonical(entries: &mut [Recorded]) {
-    // (the root, `./`, has none: it is first)
-    fn components(e: &Recorded) -> impl Iterator<Item = &str> {
-        e.path
-            .trim_end_matches('/')
-            .split('/')
-            .filter(|c| *c != ".")
+    // (the root, `./`, is the path with no component: it is first)
+    fn key(e: &Recorded) -> &[u8] {
+        match e.path.trim_end_matches('/') {
+            "." => b"",
+            path => path.as_bytes(),
+        }
     }
-    entries.sort_by(|a, b| components(a).cmp(components(b)));
+    entries.sort_by(|a, b| path_order(key(a), key(b)));
+    first_path_carries_links(entries);
+}
+
+/// The walk gives a hard-linked file to the path it meets first, and the
+/// others as links to it; in the order of the tar another path may be the
+/// first, and a link must come after its target.  So of the paths of one
+/// file the first in the order has its header, records and content, and the
+/// others are links to it.
+fn first_path_carries_links(entries: &mut [Recorded]) {
+    let at: HashMap<String, usize> = (entries.iter().enumerate())
+        .map(|(i, e)| (e.path.clone(), i))
+        .collect();
+    // the file (its place) and the places of the links to it
+    let mut files: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        let target = e.link.as_ref().and_then(|l| at.get(l.to_str()?));
+        if let (tar::EntryType::Link, Some(&t)) = (e.kind, target) {
+            files.entry(t).or_insert_with(|| vec![t]).push(i);
+        }
+    }
+    for (t, paths) in files {
+        // (for a file of the image each path has the header and attributes of
+        // its own entry of the table of contents: if an image recorded them
+        // differently for two names of one file, the first in the tar wins)
+        let first = paths.iter().fold(t, |first, &i| first.min(i));
+        if first != t {
+            let (before, after) = entries.split_at_mut(t);
+            let (a, b) = (&mut before[first], &mut after[0]);
+            std::mem::swap(&mut a.kind, &mut b.kind);
+            std::mem::swap(&mut a.header, &mut b.header);
+            std::mem::swap(&mut a.pax, &mut b.pax);
+            std::mem::swap(&mut a.link, &mut b.link);
+            std::mem::swap(&mut a.data, &mut b.data);
+        }
+        let name = PathBuf::from(&entries[first].path);
+        for i in paths.into_iter().filter(|&i| i != first) {
+            entries[i].link = Some(name.clone());
+        }
+    }
 }
 
 /// Give the entry `e` of a record to `out`, its content read now from
@@ -1362,7 +1402,7 @@ pub fn changes(dir: BorrowedFd<'_>, opts: &Options) -> io::Result<Vec<(String, C
     WALK.run(dir.try_clone_to_owned()?, root, &mut walk)?;
     let mut out = walk.out;
     // (the parents first, the names of a directory in order)
-    out.sort_by(|a, b| a.0.split('/').cmp(b.0.split('/')));
+    out.sort_by(|a, b| path_order(a.0.as_bytes(), b.0.as_bytes()));
     Ok(out)
 }
 
@@ -1626,6 +1666,16 @@ mod tests {
     fn lower_with(
         tmp: &std::path::Path,
     ) -> (Arc<Lower>, Vec<(&'static str, Vec<u8>)>, Arc<Spooled>) {
+        lower_of(tmp, false)
+    }
+
+    /// [`lower_with`], and with `linked` the file `opt/d/a` is a hard link to
+    /// `etc/old`.
+    #[allow(clippy::type_complexity)]
+    fn lower_of(
+        tmp: &std::path::Path,
+        linked: bool,
+    ) -> (Arc<Lower>, Vec<(&'static str, Vec<u8>)>, Arc<Spooled>) {
         use velarx_storage::{Toc, TocEntryType};
         let store = Arc::new(velarx_storage::FileStore::new(tmp.join("files")).unwrap());
         let mut entries = Vec::new();
@@ -1642,6 +1692,11 @@ mod tests {
             e.entry_type = TocEntryType::Reg;
             (e.mode, e.size, e.fsverity) =
                 (0o644, data.len() as u64, velarx_storage::to_toc(&digest));
+            if linked && name == "opt/d/a" {
+                e.entry_type = TocEntryType::Hardlink;
+                (e.size, e.fsverity) = (0, None);
+                e.link_name = Some("etc/old".into());
+            }
             entries.push(e);
             files.push((name, data));
         }
@@ -2049,6 +2104,232 @@ mod tests {
             .map(|e| e.0)
             .collect();
         assert_eq!(names, ["ren/", "ren/d/", "ren/d/a", "ren/d/b"]);
+    }
+
+    /// The layer of an upper directory, or the reason it is not one: the
+    /// walk, its entries in the order of the tar, and the rules of the tar.
+    /// Each entry as its name, a `*` and the target for a link, and its size.
+    fn layer_of(
+        tmp: &std::path::Path,
+        upper: &std::path::Path,
+        opts: &Options,
+    ) -> io::Result<Vec<(String, u64)>> {
+        let session = crate::pull::session::Session::create(
+            &tmp.join("staging"),
+            Arc::new(velarx_storage::FileStore::new(tmp.join("store")).unwrap()),
+        )
+        .unwrap();
+        let sink: Arc<dyn crate::pull::sink::Sink> = session;
+        let (made, _) = crate::pull::made::from_dir(
+            open(upper).as_fd(),
+            opts,
+            &sink,
+            velarx_types::digest::Algorithm::Sha256,
+            u64::MAX,
+            Box::new(|_| Ok(())),
+        )?;
+        Ok(made
+            .toc
+            .entries
+            .iter()
+            .map(|e| match &e.link_name {
+                Some(l) => (format!("{}*{l}", e.name), e.size),
+                None => (e.name.clone(), e.size),
+            })
+            .collect())
+    }
+
+    /// The image has `etc/old` and `opt/d/a`, one file; the upper renames
+    /// the directories so that the walk gives the path that is later in the
+    /// tar first: `aaa` is `opt`, and `aaa/n`, in it, is `etc`.  The walk
+    /// gives what `aaa` has of its own and its `n` before what `aaa` has of
+    /// `opt`, so `aaa/n/old` is where the file is and `aaa/d/a` a link to
+    /// it.  In the tar the first path of the file is `aaa/d/a`: it has the
+    /// file, and `aaa/n/old` is the link.
+    #[test]
+    fn test_the_first_path_in_the_tar_of_a_hard_linked_pair_has_the_file() {
+        let d = tempfile::tempdir().unwrap();
+        let upper = d.path().join("upper");
+        std::fs::create_dir_all(upper.join("aaa/n")).unwrap();
+        // another file of two paths, in order, in the same layer
+        std::fs::write(upper.join("zz1"), "pair").unwrap();
+        std::fs::hard_link(upper.join("zz1"), upper.join("zz2")).unwrap();
+        if !set_xattr(&upper.join("aaa"), "user.overlay.redirect", b"/opt")
+            || !set_xattr(&upper.join("aaa/n"), "user.overlay.redirect", b"/etc")
+        {
+            eprintln!("skipped: no user xattrs here");
+            return;
+        }
+        let (lower, _, _) = lower_of(d.path(), true);
+        let opts = Options {
+            lower: Some(lower),
+            ..Default::default()
+        };
+        let walked = record(open(&upper).as_fd(), &opts).unwrap();
+        let paths = |entries: &[Recorded]| -> Vec<String> {
+            entries.iter().map(|e| e.path.clone()).collect()
+        };
+        assert_eq!(
+            paths(&walked),
+            [
+                "aaa/",
+                "aaa/n/",
+                "aaa/n/old",
+                "aaa/d/",
+                "aaa/d/a",
+                "aaa/d/b",
+                "zz1",
+                "zz2"
+            ]
+        );
+        // (the content of `etc/old` is 11 bytes, and not the size of the
+        // link of the image)
+        assert_eq!(
+            layer_of(d.path(), &upper, &opts).unwrap(),
+            [
+                ("./aaa/".to_string(), 0),
+                ("./aaa/d/".to_string(), 0),
+                ("./aaa/d/a".to_string(), 11),
+                ("./aaa/d/b".to_string(), 4),
+                ("./aaa/n/".to_string(), 0),
+                ("./aaa/n/old*./aaa/d/a".to_string(), 0),
+                ("./zz1".to_string(), 4),
+                ("./zz2*./zz1".to_string(), 0),
+            ]
+        );
+    }
+
+    /// The paths of a file the container made, three of them, recorded with
+    /// the file at the one that is last in the tar and the others links to
+    /// it (the order the walk of a renamed directory can give): the first
+    /// in the tar has the file, with its bytes read from the upper
+    /// directory, and the other two are links to it.
+    #[test]
+    fn test_the_first_of_three_paths_of_an_upper_file_has_the_content() {
+        let d = tempfile::tempdir().unwrap();
+        let upper = d.path().join("upper");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::write(upper.join("f1"), "upper bytes").unwrap();
+        std::fs::hard_link(upper.join("f1"), upper.join("f2")).unwrap();
+        std::fs::hard_link(upper.join("f1"), upper.join("f3")).unwrap();
+        let opts = Options::default();
+        let mut entries = record(open(&upper).as_fd(), &opts).unwrap();
+        // (f1 has the file and f2, f3 are links to it: now it is in the
+        // order ccc, bbb, aaa)
+        for (e, name) in entries.iter_mut().zip(["ccc", "bbb", "aaa"]) {
+            e.path = name.to_string();
+            if e.link.is_some() {
+                e.link = Some(PathBuf::from("ccc"));
+            }
+        }
+        sort_canonical(&mut entries);
+        let session = crate::pull::session::Session::create(
+            &d.path().join("staging"),
+            Arc::new(velarx_storage::FileStore::new(d.path().join("store")).unwrap()),
+        )
+        .unwrap();
+        let sink: Arc<dyn crate::pull::sink::Sink> = session;
+        let dir = open(&upper);
+        let (made, _) = crate::pull::made::from_walk(
+            &sink,
+            velarx_types::digest::Algorithm::Sha256,
+            u64::MAX,
+            Box::new(|_| Ok(())),
+            |out| entries.iter().try_for_each(|e| replay(e, dir.as_fd(), out)),
+        )
+        .unwrap();
+        let layer: Vec<_> = made
+            .toc
+            .entries
+            .iter()
+            .map(|e| (e.name.clone(), e.link_name.clone(), e.size))
+            .collect();
+        assert_eq!(
+            layer,
+            [
+                ("./aaa".to_string(), None, 11),
+                ("./bbb".to_string(), Some("./aaa".to_string()), 0),
+                ("./ccc".to_string(), Some("./aaa".to_string()), 0),
+            ]
+        );
+    }
+
+    /// The same file when the walk gives the first path in the tar first:
+    /// nothing changes, `ccc/d/a` is the link.
+    #[test]
+    fn test_a_hard_linked_pair_in_the_order_of_the_walk_is_as_it_was() {
+        let d = tempfile::tempdir().unwrap();
+        let upper = d.path().join("upper");
+        for dir in ["aaa", "ccc"] {
+            std::fs::create_dir_all(upper.join(dir)).unwrap();
+        }
+        std::fs::write(upper.join("bbb"), "").unwrap();
+        if !set_xattr(&upper.join("aaa"), "user.overlay.redirect", b"/etc")
+            || !set_xattr(&upper.join("ccc"), "user.overlay.redirect", b"/opt")
+            || !set_xattr(&upper.join("bbb"), "user.overlay.whiteout", b"y")
+        {
+            eprintln!("skipped: no user xattrs here");
+            return;
+        }
+        let (lower, _, _) = lower_of(d.path(), true);
+        let opts = Options {
+            lower: Some(lower),
+            ..Default::default()
+        };
+        assert_eq!(
+            layer_of(d.path(), &upper, &opts).unwrap(),
+            [
+                ("./.wh.bbb".to_string(), 0),
+                ("./aaa/".to_string(), 0),
+                ("./aaa/old".to_string(), 11),
+                ("./ccc/".to_string(), 0),
+                ("./ccc/d/".to_string(), 0),
+                ("./ccc/d/a*./aaa/old".to_string(), 0),
+                ("./ccc/d/b".to_string(), 4),
+            ]
+        );
+    }
+
+    /// A whiteout between the two renamed directories that hold the paths
+    /// of a hard-linked file goes where its name says, and the pair stays in
+    /// order.
+    #[test]
+    fn test_a_hard_linked_pair_across_a_whiteout_is_in_order() {
+        let d = tempfile::tempdir().unwrap();
+        let upper = d.path().join("upper");
+        for dir in ["aaa", "ccc"] {
+            std::fs::create_dir_all(upper.join(dir)).unwrap();
+        }
+        std::fs::write(upper.join("bbb"), "").unwrap();
+        if !set_xattr(&upper.join("aaa"), "user.overlay.redirect", b"/opt")
+            || !set_xattr(&upper.join("ccc"), "user.overlay.redirect", b"/etc")
+            || !set_xattr(&upper.join("bbb"), "user.overlay.whiteout", b"y")
+        {
+            eprintln!("skipped: no user xattrs here");
+            return;
+        }
+        let (lower, _, _) = lower_of(d.path(), true);
+        let opts = Options {
+            lower: Some(lower),
+            ..Default::default()
+        };
+        let names: Vec<_> = layer_of(d.path(), &upper, &opts)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.0)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "./.wh.bbb",
+                "./aaa/",
+                "./aaa/d/",
+                "./aaa/d/a",
+                "./aaa/d/b",
+                "./ccc/",
+                "./ccc/old*./aaa/d/a"
+            ]
+        );
     }
 
     /// A directory of a copy that is the image's, with nothing changed below

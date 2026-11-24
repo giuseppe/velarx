@@ -4844,6 +4844,7 @@ dependencies = [
  "velarx-storage",
  "velarx-sys",
  "velarx-tarsplit",
+ "velarx-tarsplit-header",
  "velarx-types",
  "velarx-wire",
  "zeroize",
