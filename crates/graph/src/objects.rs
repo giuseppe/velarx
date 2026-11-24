@@ -269,7 +269,7 @@ pub async fn has_layers(
         .map(|l| {
             states
                 .get(&l.key)
-                .is_some_and(|s| s.has_tarsplit && s.matches_diff_id(&l.diff_id))
+                .is_some_and(|s| s.is_stored_as(&l.diff_id))
         })
         .collect())
 }

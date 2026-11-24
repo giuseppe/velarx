@@ -541,6 +541,14 @@ pub struct LayerState {
 }
 
 impl LayerState {
+    /// Whether the store has the layer as an image that says the diff id `d`
+    /// needs it: complete, with its tar-split, and proven against `d`.  The
+    /// one answer to "the store has it" (a layer marked incomplete has a row
+    /// and is not).
+    pub fn is_stored_as(&self, d: &Digest) -> bool {
+        self.has_tarsplit && self.matches_diff_id(d)
+    }
+
     /// Whether the layer may be the one an image says by the diff id `d`: it
     /// was verified against it, or against none and is a layer of a table
     /// of contents (as [`LayerRecord::matches_diff_id`]).

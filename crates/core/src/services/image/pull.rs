@@ -386,6 +386,15 @@ impl ImageService {
         Ok(locks)
     }
 
+    /// Whether the store has the image of the manifest `digest`, with every
+    /// layer of it.
+    pub(super) async fn image_stored(&self, digest: &Digest) -> bool {
+        match self.db.get_image_by_digest(digest).await {
+            Ok(image) => self.layers_stored(&image).await,
+            Err(_) => false,
+        }
+    }
+
     /// Whether every layer of a stored image is stored (complete, with what
     /// it is rebuilt as a stream from: push and archives need it); an image
     /// with a layer that is not is pulled again.

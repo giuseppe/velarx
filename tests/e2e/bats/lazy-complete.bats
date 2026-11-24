@@ -244,6 +244,24 @@ lease_held () {
     check_match "the files are in the store" "^[1-9][0-9]*$" "$(files_in_store)"
 }
 
+@test "a lazy pull of an image whose layer is marked incomplete repairs the layer" {
+    fresh_store
+    sh_ image pull --lazy --tls-verify=false "$IMAGE" > /dev/null 2>&1
+    sh_ image complete "$IMAGE" > /dev/null 2>&1
+    check "the layer has its tar-split" 0 "$(db 'SELECT count(*) FROM layers WHERE tarsplit_digest IS NULL')"
+    # (what a start that finds the EROFS image of the layer gone does)
+    sqlite3 "$WORKDIR/store/db.sqlite" 'UPDATE layers SET tarsplit_digest = NULL'
+    check "the layer is incomplete" 1 "$(db 'SELECT count(*) FROM layers WHERE tarsplit_digest IS NULL')"
+    sh_ image pull --lazy --tls-verify=false "$IMAGE" > /dev/null 2>&1
+    check "the pull fetches it again" 1 "$(sh_ image pulls -q | wc -l)"
+    sh_ image complete "$IMAGE" > /dev/null 2>&1
+    check "image complete" 0 $?
+    check "the layer has its tar-split again" 0 "$(db 'SELECT count(*) FROM layers WHERE tarsplit_digest IS NULL')"
+    check "no pull is left" "" "$(sh_ image pulls -q)"
+    check "the staging area is empty" "0 0" "$(files_in_pool) $(staged_layers)"
+    check "system check" 0 "$(sh_ system check > /dev/null 2>&1; echo $?)"
+}
+
 @test "a pull is resumed after the engine service is gone, by the next one at its start" {
     local id
     fresh_store

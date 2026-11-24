@@ -356,12 +356,7 @@ impl ImageService {
             return Ok(TransferStats::default());
         };
         let manifest: OciManifest = serde_json::from_str(&pull.manifest)?;
-        if self
-            .db
-            .get_image_by_digest(&pull.manifest_digest)
-            .await
-            .is_ok()
-        {
+        if self.image_stored(&pull.manifest_digest).await {
             // (committed by another process, by an earlier run of this one,
             // or pulled whole meanwhile: the names of the pull are its)
             self.commit_image(&pull, &manifest, None).await?;
@@ -915,19 +910,22 @@ impl ImageService {
         let one = self.commit_layer_lock(&layer.key).await?;
         let store = self.lock_store().await?;
         // The race check of this commit: under the commit lock of the layer,
-        // the engine's row says whether another process committed it first
-        // (the driver's `has_layers` was asked before, in `lazy_layers`).
-        if let Ok(record) = self.db.get_own_layer(&layer.key).await {
-            if !record.matches_diff_id(&layer.diff_id) {
+        // the store says whether another process committed it first, as it
+        // said when the layers were chosen.  A layer it has marked
+        // incomplete is committed again.
+        if let Some(state) = self.db.get_own_layer_states(&[layer.key]).await?.first() {
+            if !state.matches_diff_id(&layer.diff_id) {
                 return Err(ImageError::Contradicted(format!(
                     "layer {} has the diff id {:?}, the image says {}",
-                    layer.key, record.diff_id, layer.diff_id
+                    layer.key, state.diff_id, layer.diff_id
                 )));
             }
-            stats.layers_cached += 1;
-            drop((store, one));
-            self.release_layer(&layer.key).await;
-            return Ok(());
+            if state.is_stored_as(&layer.diff_id) {
+                stats.layers_cached += 1;
+                drop((store, one));
+                self.release_layer(&layer.key).await;
+                return Ok(());
+            }
         }
         // (a staged layer is always one with a table of contents,
         // `LayerKey::expected` of a chunked descriptor: no other key has

@@ -374,12 +374,7 @@ impl ImageService {
                         .map_err(|e| ImageError::Storage(e.to_string()))??;
                 }
             }
-            if self
-                .db
-                .get_image_by_digest(&pull.manifest_digest)
-                .await
-                .is_ok()
-            {
+            if self.image_stored(&pull.manifest_digest).await {
                 return Ok(TransferStats {
                     duration_ms: start.elapsed().as_millis() as u64,
                     ..TransferStats::default()
