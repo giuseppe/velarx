@@ -176,7 +176,12 @@ impl Server {
                     }
                 }
                 st = store.wait(st, interval);
-                if progress(conn, "waiting for a pull of the same layers").is_err() {
+                // (not under the lock: an engine that does not read would
+                // stop every call of the store)
+                drop(st);
+                let sent = progress(conn, "waiting for a pull of the same layers");
+                st = store.state();
+                if sent.is_err() {
                     st.core.stop(n, Why::Gone);
                 }
             }
@@ -312,7 +317,12 @@ impl Server {
                         return Err(failed("the pull was cancelled"));
                     }
                 }
-                Err(_) => return Err(failed("the pull ended without a result")),
+                Err(_) => {
+                    // (the task died: its claims are not left to wait for)
+                    let e = "the pull ended without a result";
+                    release(&store, &p.pull, Err(e.into()));
+                    return Err(failed(e));
+                }
             }
         }
     }
@@ -344,6 +354,7 @@ impl Server {
         let mut st = store.state();
         let Some(n) = st.pulls.get(&p.pull).map(|pull| pull.n) else {
             // (committed already, by this pull or another)
+            drop(st);
             let all = self.rt.block_on(store.vfs.has_layers(&refs))?;
             return if all.iter().all(|h| *h) {
                 Ok(reply(&proto::Ack {}))
@@ -952,6 +963,37 @@ mod tests {
         assert!(!store.state().pulls.contains_key(PULL));
         assert!(claimed(&store, &key), "the claim of the other stands");
         assert!(store.state().pulls.contains_key("other"));
+    }
+
+    /// A waiter whose engine does not read its messages holds no lock while
+    /// it sends them: the other calls of the store go on.
+    #[test]
+    fn a_waiter_whose_engine_does_not_read_blocks_no_other_call() {
+        let (_d, server, store) = setup_with(Duration::from_secs(2), Duration::from_secs(2));
+        claim(&store, 1, "other");
+        let (feed, _engine_feed) = UnixStream::pair().unwrap();
+        let (conn, engine) = UnixStream::pair().unwrap();
+        // (the socket is full: the next message blocks)
+        conn.set_nonblocking(true).unwrap();
+        while (&conn).write(&[0; 4096]).is_ok() {}
+        conn.set_nonblocking(false).unwrap();
+        let waiter = {
+            let server = server.clone();
+            std::thread::spawn(move || begin_on(&server, PULL, &[to_fetch(1)], feed, conn))
+        };
+        // (after one interval, the waiter sends)
+        std::thread::sleep(Duration::from_millis(1500));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let looker = store.clone();
+        std::thread::spawn(move || {
+            drop(looker.state());
+            let _ = tx.send(());
+        });
+        let free = rx.recv_timeout(Duration::from_secs(1));
+        // (the send fails, and the waiter is cancelled)
+        drop(engine);
+        assert!(waiter.join().unwrap().is_err());
+        free.expect("the store is locked while the waiter sends");
     }
 
     /// `release` frees the claims of the pull, sets it over, and removes of
