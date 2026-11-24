@@ -220,7 +220,8 @@ SPARE_DIR_FILE_NAME=spare-dir
 spare_prefix () {
     local w=$SPARE_DIR
     SPARE=(setpriv --reuid "$SPARE_UID" --regid "$SPARE_UID" --clear-groups
-        env HOME="$w/home" XDG_RUNTIME_DIR="$w/run" VELARX_REGISTRIES_CONF="$HOME/.config/velarx/registries.conf")
+        env HOME="$w/home" XDG_RUNTIME_DIR="$w/run" XDG_CONFIG_HOME="$w/home/.config"
+        XDG_DATA_HOME="$w/home/data" VELARX_REGISTRIES_CONF="$HOME/.config/velarx/registries.conf")
 }
 spare () { spare_prefix; "${SPARE[@]}" "$@" 3>&-; }
 spare_velarx () { spare "$BIN/velarx" --config "$SPARE_DIR/config.toml" --socket "$SPARE_DIR/run/e.sock" "$@"; }

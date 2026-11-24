@@ -47,29 +47,42 @@ pub fn policy_paths() -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
+/// Whether the policy file `path` is there.  Only a path that does not
+/// exist is not: one that cannot be looked at, or a file that is a symlink to
+/// nothing, is an error, never "no policy".
+pub fn is_there(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    }
+}
+
 /// The text of the policy in force (the first file there is, else the
 /// built-in default that accepts every image) and where `set` writes: the
-/// first of `policy_paths`.
-pub fn current(path: Option<&Path>) -> Result<(String, PathBuf), String> {
+/// first of `policy_paths`, or `path`, which must be there unless `create`
+/// (`set` starts a policy at a path that does not exist yet).
+pub fn current(path: Option<&Path>, create: bool) -> Result<(String, PathBuf), String> {
     let read = |p: &Path| {
         velarx_base::conf::read_config_file(p, 4 << 20)
             .map_err(|e| format!("cannot read {}: {e}", p.display()))
     };
     if let Some(p) = path {
-        let text = if p.exists() {
-            read(p)?
-        } else {
+        let text = if create && !is_there(p)? {
             default_policy_text()
+        } else {
+            read(p)?
         };
         return Ok((text, p.to_path_buf()));
     }
     let paths = policy_paths()?;
     let target = paths.first().cloned().ok_or("no policy file")?;
-    let text = match paths.iter().find(|p| p.exists()) {
-        Some(p) => read(p)?,
-        None => default_policy_text(),
-    };
-    Ok((text, target))
+    for p in &paths {
+        if is_there(p)? {
+            return Ok((read(p)?, target));
+        }
+    }
+    Ok((default_policy_text(), target))
 }
 
 fn default_policy_text() -> String {
@@ -286,6 +299,32 @@ mod tests {
     use super::*;
 
     const BASE: &str = r#"{"default":[{"type":"insecureAcceptAnything"}]}"#;
+
+    #[test]
+    fn only_a_path_that_does_not_exist_is_no_policy() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(is_there(&d.path().join("none.json")), Ok(false));
+        // (a link in a parent directory that leads nowhere: not there)
+        std::os::unix::fs::symlink(d.path().join("nowhere"), d.path().join("dir")).unwrap();
+        assert_eq!(is_there(&d.path().join("dir/policy.json")), Ok(false));
+        std::fs::write(d.path().join("f"), BASE).unwrap();
+        assert_eq!(is_there(&d.path().join("f")), Ok(true));
+        // the file itself a link to nothing, or a path under a file
+        std::os::unix::fs::symlink(d.path().join("nowhere"), d.path().join("link")).unwrap();
+        assert_eq!(is_there(&d.path().join("link")), Ok(true));
+        assert!(is_there(&d.path().join("f/policy.json")).is_err());
+        // the policy shown or changed is read as the engine reads it
+        // (`show` of a path that is not there is an error, as the engine's)
+        assert!(current(Some(&d.path().join("none.json")), false).is_err());
+        assert!(current(Some(&d.path().join("link")), false).is_err());
+        assert_eq!(current(Some(&d.path().join("f")), false).unwrap().0, BASE);
+        // `set` starts the file, but never writes through a link to nothing
+        let (text, target) = current(Some(&d.path().join("none.json")), true).unwrap();
+        assert_eq!(target, d.path().join("none.json"));
+        assert_eq!(text, default_policy_text());
+        assert!(current(Some(&d.path().join("link")), true).is_err());
+        assert_eq!(current(Some(&d.path().join("f")), true).unwrap().0, BASE);
+    }
 
     #[test]
     fn set_writes_the_entries_podman_writes() {

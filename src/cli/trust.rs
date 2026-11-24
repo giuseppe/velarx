@@ -174,7 +174,8 @@ mod engine {
                     None
                 };
                 let file = policy_file(policypath, &config);
-                let (_, target) = trust::current(file.as_deref()).map_err(anyhow::Error::msg)?;
+                let (_, target) =
+                    trust::current(file.as_deref(), true).map_err(anyhow::Error::msg)?;
                 {
                     let _lock = lock_dir(
                         target
@@ -185,7 +186,7 @@ mod engine {
                     // (read again under the lock: what is changed is what is
                     // replaced)
                     let (policy, target) =
-                        trust::current(file.as_deref()).map_err(anyhow::Error::msg)?;
+                        trust::current(file.as_deref(), true).map_err(anyhow::Error::msg)?;
                     let text = trust::set_scope(&policy, &scope, kind, &pubkeysfile)
                         .map_err(anyhow::Error::msg)?;
                     write_replacing(&target, text.as_bytes())
@@ -208,8 +209,9 @@ mod engine {
                 registrypath,
                 scope,
             } => {
-                let (policy, _) = trust::current(policy_file(policypath, &config).as_deref())
-                    .map_err(anyhow::Error::msg)?;
+                let (policy, _) =
+                    trust::current(policy_file(policypath, &config).as_deref(), false)
+                        .map_err(anyhow::Error::msg)?;
                 if raw {
                     print!("{policy}");
                     if !policy.ends_with('\n') {

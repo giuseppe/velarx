@@ -167,9 +167,13 @@ do not leave the publisher.
 ## The consumer: require the signature
 
 The consumer's policy is `~/.config/velarx/policy.json` (rootless) or
-`/etc/velarx/policy.json`.  Without one, every image is accepted and nothing
-is verified: here is an image from the same registry pulled before any
-policy, and removed again:
+`/etc/velarx/policy.json`.  Without one (no file of these names), every image
+is accepted and nothing is verified; a path that exists but cannot be read
+(the file itself a symlink to nothing, a file of no permission, a directory)
+is an error, not "no policy", for the engine and for `image trust`; so is
+a `--policypath` or `[pull] policy_path` that is not there, for reading
+(`image trust set` creates it).  Here is an image from the same
+registry pulled before any policy, and removed again:
 
 ```console
 $ velarx image pull localhost:5077/acme/imposter:1.0

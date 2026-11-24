@@ -249,12 +249,15 @@ impl SignaturePolicy {
         Self::load_first(&paths)
     }
 
-    /// The first of `paths` that exists, else the built-in default.
+    /// The first of `paths` that is there (see [`crate::trust::is_there`]),
+    /// else the built-in default.
     fn load_first(paths: &[std::path::PathBuf]) -> SignatureResult<Self> {
-        match paths.iter().find(|p| p.exists()) {
-            Some(p) => Self::load(p),
-            None => Ok(Self::default()),
+        for path in paths {
+            if crate::trust::is_there(path).map_err(SignatureError::InvalidFormat)? {
+                return Self::load(path);
+            }
         }
+        Ok(Self::default())
     }
 
     /// The policy requirements for an image, like containers/image: the
@@ -611,8 +614,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let link = d.path().join("policy.json");
         std::os::unix::fs::symlink(d.path().join("nowhere"), &link).unwrap();
-        // as it is today: wrong, fixed by the next commit
-        assert!(SignaturePolicy::load_first(&[link]).is_ok());
+        assert!(SignaturePolicy::load_first(&[link]).is_err());
         // a directory in the place of the file cannot be read
         let dir = d.path().join("dir.json");
         std::fs::create_dir(&dir).unwrap();
@@ -620,8 +622,7 @@ mod tests {
         // a path under a file cannot even be looked at
         let file = d.path().join("file");
         std::fs::write(&file, "").unwrap();
-        // as it is today: wrong, fixed by the next commit
-        assert!(SignaturePolicy::load_first(&[file.join("policy.json")]).is_ok());
+        assert!(SignaturePolicy::load_first(&[file.join("policy.json")]).is_err());
     }
 
     #[test]

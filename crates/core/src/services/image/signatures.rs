@@ -452,7 +452,12 @@ impl ImageService {
             Some(p) => p.display().to_string(),
             None => velarx_signature::trust::policy_paths()
                 .ok()
-                .and_then(|paths| paths.into_iter().find(|p| p.exists()))
+                .and_then(|paths| {
+                    // (an error is the file the engine failed to read)
+                    paths
+                        .into_iter()
+                        .find(|p| velarx_signature::trust::is_there(p).unwrap_or(true))
+                })
                 .map_or_else(
                     || "the built-in default".to_string(),
                     |p| p.display().to_string(),
