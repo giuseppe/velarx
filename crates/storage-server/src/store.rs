@@ -13,37 +13,21 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use tokio::runtime::Handle;
 use velarx_db::Database;
 use velarx_graph::{DriverError, DriverParts, DriverResult};
+use velarx_pull_core::{Begin, Claim, Core, LayerId, PullId};
 use velarx_storage::{FileStore, VerityMode};
 use velarx_storage_client::proto::LayerRef;
 use velarx_types::digest::Digest;
 use velarx_vfs::{VfsDriver, VfsOptions};
 
-/// What a pull is waiting for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Decision {
-    Pending,
-    Commit,
-    Abort,
-}
-
-/// Where a pull is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Phase {
-    /// Fetching, or waiting for the layers another pull holds.
-    Running,
-    /// Every object is in the store, the engine proves and decides.
-    Staged,
-    /// Over: published (`Ok`) or not.
-    Over(Result<(), String>),
-}
-
 pub struct Pull {
-    pub phase: Phase,
-    pub decision: Decision,
+    /// The number the core knows it by.
+    pub n: PullId,
     /// The objects of its layers, fetched or found in the store: what an
     /// `Abort` of another pull leaves, and what a collection keeps, while it
     /// lives.
     pub keys: HashSet<String>,
+    /// What went wrong, once it is over without being published.
+    pub error: String,
     /// When it was over: the record of its outcome is kept for an engine that
     /// asks again (`Commit` after a lost reply), and forgotten later.
     pub ended: Option<std::time::Instant>,
@@ -51,9 +35,11 @@ pub struct Pull {
 
 #[derive(Default)]
 pub struct State {
+    /// The phases of the pulls and the layers they claim.
+    pub core: Core,
     pub pulls: HashMap<String, Pull>,
-    /// The layers a live pull is fetching, and the pull.
-    pub claimed: HashMap<String, String>,
+    /// The layers the core claims, by number: cleared when no pull lives.
+    layers: Vec<String>,
     /// The objects of the pulls that are staged, by pull: verified and not
     /// named in the store until the engine commits, where their bytes are
     /// (the engine reads them back before it decides).
@@ -184,11 +170,72 @@ fn io(e: impl std::fmt::Display) -> DriverError {
 }
 
 impl State {
+    /// The objects of the pulls that are not over: what a collection keeps
+    /// and what an `Abort` of another pull leaves.
+    pub fn live_keys(&self) -> HashSet<String> {
+        self.pulls
+            .values()
+            .filter(|p| self.core.live(p.n))
+            .flat_map(|p| p.keys.iter().cloned())
+            .collect()
+    }
+
+    /// The layers a live pull is fetching.
+    pub fn claimed_layers(&self) -> impl Iterator<Item = &String> {
+        (0..)
+            .zip(&self.layers)
+            .filter(|(i, _)| self.core.held(*i))
+            .map(|(_, l)| l)
+    }
+
     /// Forget the pulls that were over before `before`: a `Commit` of one of
     /// them then answers from what the store has committed.
     pub fn forget_ended(&mut self, before: std::time::Instant) {
-        self.pulls
-            .retain(|_, p| p.ended.is_none_or(|t| t >= before));
+        let core = &mut self.core;
+        self.pulls.retain(|_, p| {
+            let keep = p.ended.is_none_or(|t| t >= before);
+            if !keep {
+                core.forget(p.n);
+            }
+            keep
+        });
+    }
+
+    /// The pull `id` begins, unless a pull of that id is not over.
+    pub fn begin(&mut self, id: &str) -> Begin {
+        if !self.core.busy() {
+            self.layers.clear();
+        }
+        let begin = self.core.begin(self.pulls.get(id).map(|p| p.n));
+        if let Begin::Started(n) = begin {
+            self.pulls.insert(
+                id.into(),
+                Pull {
+                    n,
+                    keys: HashSet::new(),
+                    error: String::new(),
+                    ended: None,
+                },
+            );
+        }
+        begin
+    }
+
+    /// The pull `n` claims the layers `keys`, all or none.
+    pub fn claim(&mut self, n: PullId, keys: &[String]) -> Claim {
+        let mut layers = Vec::new();
+        for key in keys {
+            let at = self
+                .layers
+                .iter()
+                .position(|l| l == key)
+                .unwrap_or_else(|| {
+                    self.layers.push(key.clone());
+                    self.layers.len() - 1
+                });
+            layers.push(at as LayerId);
+        }
+        self.core.claim(n, &layers)
     }
 }
 
@@ -452,14 +499,7 @@ impl Stores {
     /// layer claimed.
     pub fn holds_claims(&self) -> bool {
         let open = self.open.lock().unwrap_or_else(|e| e.into_inner());
-        open.values().any(|s| {
-            let st = s.state();
-            !st.claimed.is_empty()
-                || st
-                    .pulls
-                    .values()
-                    .any(|p| !matches!(p.phase, Phase::Over(_)))
-        })
+        open.values().any(|s| s.state().core.busy())
     }
 
     /// The stores on the disk of the user.
@@ -498,12 +538,7 @@ impl Stores {
         let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
         let key = (uid, id.to_string());
         if let Some(s) = open.get(&key) {
-            let live = s
-                .state()
-                .pulls
-                .values()
-                .any(|p| !matches!(p.phase, Phase::Over(_)));
-            if live || s.containers() > 0 {
+            if s.state().core.busy() || s.containers() > 0 {
                 return Err(DriverError::of(
                     "velarx-storage-ref",
                     velarx_graph::DriverErrorKind::Busy,
@@ -529,8 +564,41 @@ impl Stores {
 }
 
 #[cfg(test)]
+impl State {
+    /// The pull `id` in `phase`, reached by the calls that lead there.
+    pub fn put(&mut self, id: &str, phase: velarx_pull_core::Phase) -> &mut Pull {
+        use velarx_pull_core::Phase;
+        self.begin(id);
+        let n = self.pulls[id].n;
+        let core = &mut self.core;
+        if phase != Phase::Waiting {
+            core.claim(n, &[]);
+        }
+        match phase {
+            Phase::Staged | Phase::Committing | Phase::Over(None) => {
+                core.staged(n);
+            }
+            _ => {}
+        }
+        match phase {
+            Phase::Committing | Phase::Over(None) => {
+                core.commit(n);
+            }
+            Phase::Stopping(why) | Phase::Over(Some(why)) => core.stop(n, why),
+            _ => {}
+        }
+        if let Phase::Over(outcome) = phase {
+            core.end(n, outcome.is_none());
+        }
+        assert_eq!(core.phase(n), Some(phase));
+        self.pulls.get_mut(id).unwrap()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use velarx_pull_core::{Phase, Why};
 
     /// A pull that is not over holds claims; one that is over, none.
     #[test]
@@ -542,28 +610,34 @@ mod tests {
         assert!(!stores.holds_claims());
         let store = stores.get(1000, id).unwrap();
         assert!(!stores.holds_claims(), "an open store holds nothing");
-        let pull = |phase| Pull {
-            phase,
-            decision: Decision::Pending,
-            keys: HashSet::new(),
-            ended: None,
-        };
-        for phase in [Phase::Running, Phase::Staged] {
-            store.state().pulls.insert("p".into(), pull(phase));
+        for phase in [Phase::Waiting, Phase::Fetching, Phase::Staged] {
+            store.state().put("p", phase);
             assert!(stores.holds_claims());
         }
-        store
-            .state()
-            .pulls
-            .insert("p".into(), pull(Phase::Over(Ok(()))));
+        store.state().put("p", Phase::Over(None));
         assert!(
             !stores.holds_claims(),
             "the record of an ended pull holds none"
         );
-        store.state().claimed.insert("k".into(), "p".into());
-        assert!(stores.holds_claims(), "a claimed layer is held");
-        store.state().claimed.clear();
-        assert!(!stores.holds_claims());
+    }
+
+    /// The live keys are those of the pulls that are not over.
+    #[test]
+    fn live_keys_are_those_of_the_pulls_that_are_not_over() {
+        let mut st = State::default();
+        assert!(st.live_keys().is_empty());
+        for (id, phase, keys) in [
+            ("a", Phase::Fetching, ["x", "y"]),
+            ("b", Phase::Staged, ["y", "z"]),
+            ("c", Phase::Over(None), ["w", "w"]),
+            ("d", Phase::Over(Some(Why::Failed)), ["v", "v"]),
+        ] {
+            st.put(id, phase)
+                .keys
+                .extend(keys.iter().map(|k| k.to_string()));
+        }
+        let want: HashSet<String> = ["x", "y", "z"].iter().map(|k| k.to_string()).collect();
+        assert_eq!(st.live_keys(), want);
     }
 
     /// A record that is not a container is an error, not a container the

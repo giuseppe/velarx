@@ -515,7 +515,7 @@ fn collect_store(
 ) -> DriverResult<(u64, Vec<String>)> {
     let held: HashSet<String> = {
         let st = store.state();
-        st.claimed.keys().cloned().collect()
+        st.claimed_layers().cloned().collect()
     };
     let kept: HashSet<String> = keep
         .layers
@@ -564,14 +564,7 @@ fn collect_store(
         recorded.extend(refs.into_iter().map(|r| r.file_digest));
     }
     // (the objects a live pull staged are not recorded yet)
-    {
-        let st = store.state();
-        for pull in st.pulls.values() {
-            if !matches!(pull.phase, crate::store::Phase::Over(_)) {
-                recorded.extend(pull.keys.iter().cloned());
-            }
-        }
-    }
+    recorded.extend(store.state().live_keys());
     let mut freed = swept;
     let mut errors = Vec::new();
     let found = velarx_graph::objects::objects(store.files.root(), &recorded, keep.grace)

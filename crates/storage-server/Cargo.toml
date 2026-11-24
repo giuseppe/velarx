@@ -31,6 +31,7 @@ conformance = ["velarx-graph/conformance"]
 velarx-vfs = { path = "../vfs" }
 velarx-graph = { path = "../graph" }
 velarx-storage-client = { path = "../storage-client" }
+velarx-pull-core = { path = "../pull-core" }
 velarx-proto = { path = "../proto", default-features = false }
 velarx-content = { path = "../content" }
 velarx-base = { path = "../base" }

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-pull-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The decisions of a pull of the storage server: its phases and the layers it claims"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on a table, called under the lock of the server's store: no
+# dependency, no I/O, no clock.  The shell that waits, fetches and publishes
+# is `velarx-storage-server` (pull.rs).
+
+[lib]
+name = "velarx_pull_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

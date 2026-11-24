@@ -5261,6 +5261,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "velarx-pull-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-registry"
 version = "0.1.0"
 dependencies = [
@@ -5485,6 +5489,7 @@ dependencies = [
  "velarx-fuse",
  "velarx-graph",
  "velarx-proto",
+ "velarx-pull-core",
  "velarx-storage",
  "velarx-storage-client",
  "velarx-storage-server",

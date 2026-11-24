@@ -599,14 +599,7 @@ impl Server {
                 // it.  One that a pull that is not over has, and that no
                 // committed layer records, is that pull's: it may still be
                 // aborted and the object removed, so it is not held)
-                let running: std::collections::HashSet<String> = {
-                    let st = store.state();
-                    st.pulls
-                        .values()
-                        .filter(|p| !matches!(p.phase, crate::store::Phase::Over(_)))
-                        .flat_map(|p| p.keys.iter().cloned())
-                        .collect()
-                };
+                let running = store.state().live_keys();
                 let have = p
                     .objects
                     .iter()
@@ -739,7 +732,7 @@ pub(crate) fn refs(layers: &[proto::LayerRef]) -> DriverResult<Vec<velarx_graph:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Decision, Phase, Pull};
+    use velarx_pull_core::{Phase, Why};
 
     /// A pull that holds claims keeps the server busy and from being idle,
     /// with no connection open, until it is over.
@@ -757,15 +750,7 @@ mod tests {
             .get(1000, "0123456789abcdef0123456789abcdef")
             .unwrap();
         assert!(!server.busy());
-        store.state().pulls.insert(
-            "p".into(),
-            Pull {
-                phase: Phase::Staged,
-                decision: Decision::Pending,
-                keys: Default::default(),
-                ended: None,
-            },
-        );
+        store.state().put("p", Phase::Staged);
         assert!(server.busy());
         let (tx, rx) = std::sync::mpsc::channel();
         let s = server.clone();
@@ -775,7 +760,7 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(800));
         assert!(rx.try_recv().is_err(), "idle while a pull holds claims");
-        store.state().pulls.get_mut("p").unwrap().phase = Phase::Over(Ok(()));
+        store.state().put("p", Phase::Over(None));
         store.notify();
         rx.recv_timeout(Duration::from_secs(10))
             .expect("idle once the pull is over");
@@ -798,15 +783,7 @@ mod tests {
         let mut running = server.listen(&dir.path().join("s.sock")).unwrap();
         let uid = rustix::process::geteuid().as_raw();
         let store = server.stores.get(uid, ID).unwrap();
-        store.state().pulls.insert(
-            "p".into(),
-            Pull {
-                phase: Phase::Staged,
-                decision: Decision::Pending,
-                keys: Default::default(),
-                ended: None,
-            },
-        );
+        store.state().put("p", Phase::Staged);
         // the call: it waits for the pull to end
         let mut client = velarx_wire::varlink::Conn::connect(&running.socket).unwrap();
         client.set_deadline(std::time::Instant::now() + Duration::from_secs(30));
@@ -820,7 +797,7 @@ mod tests {
             .unwrap();
         // ... in flight: it decided, and waits (the state changes with it)
         let mut st = store.state();
-        while !matches!(st.pulls["p"].decision, Decision::Abort) {
+        while st.core.phase(st.pulls["p"].n) != Some(Phase::Stopping(Why::Aborted)) {
             st = store.wait(st, Duration::from_secs(30));
         }
         drop(st);
@@ -839,7 +816,7 @@ mod tests {
                     "stop did not begin to end the connections"
                 );
             }
-            st2.state().pulls.get_mut("p").unwrap().phase = Phase::Over(Ok(()));
+            st2.state().put("p", Phase::Over(Some(Why::Aborted)));
             st2.notify();
         });
         running.stop();
