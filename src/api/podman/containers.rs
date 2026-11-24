@@ -474,18 +474,14 @@ fn filter_match(filters: &Filters, info: &Info, bounds: &Bounds) -> bool {
         return false;
     }
     let annotations = info.annotations();
-    if !filters
+    filters
         .get("annotation")
         .iter()
         .all(|w| labels_match(w, &annotations))
-        || filters
+        && !filters
             .get("annotation!")
             .iter()
             .any(|w| labels_match(w, &annotations))
-    {
-        return false;
-    }
-    true
 }
 
 /// What a list of containers asks.

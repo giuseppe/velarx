@@ -16,15 +16,23 @@ use std::sync::Arc;
 use std::time::Duration;
 use velarx_p2p::{GossipCodec, GossipMessage, GossipReply, P2PConfig, P2PNode, GOSSIP_PROTOCOL};
 
-/// A peer that speaks the gossip, and ping as it is asked to (no
-/// identify, no DHT).
-#[derive(NetworkBehaviour)]
-#[behaviour(prelude = "libp2p::swarm::derive_prelude")]
-struct Bare {
-    gossip: request_response::Behaviour<GossipCodec>,
-    ping: Toggle<ping::Behaviour>,
-    mute: Toggle<request_response::Behaviour<Mute>>,
+// The code the derive generates trips unreachable_code, a lint that
+// cannot be allowed on the struct, only on the module around it.
+mod bare {
+    #![allow(unreachable_code)]
+    use super::*;
+
+    /// A peer that speaks the gossip, and ping as it is asked to (no
+    /// identify, no DHT).
+    #[derive(NetworkBehaviour)]
+    #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+    pub(super) struct Bare {
+        pub(super) gossip: request_response::Behaviour<GossipCodec>,
+        pub(super) ping: Toggle<ping::Behaviour>,
+        pub(super) mute: Toggle<request_response::Behaviour<Mute>>,
+    }
 }
+use bare::*;
 
 /// How a bare peer answers pings.
 #[derive(Clone, Copy)]

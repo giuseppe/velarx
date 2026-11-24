@@ -219,25 +219,32 @@ impl Role {
     }
 }
 
-/// Combined network behaviour for Velarx
-#[derive(NetworkBehaviour)]
-struct VelarxBehaviour {
-    /// Bounds the connections peers can open
-    connection_limits: connection_limits::Behaviour,
-    /// Bounds the handshakes of one address
-    /// Kademlia DHT for content discovery
-    kademlia: kad::Behaviour<kad::store::MemoryStore>,
-    /// mDNS for local peer discovery
-    mdns: Toggle<Mdns>,
-    /// Identify protocol for peer identification
-    identify: identify::Behaviour,
-    /// Liveness: a peer that does not answer a ping loses its connection
-    ping: ping::Behaviour,
-    /// Request-response for what the peers tell each other
-    gossip: request_response::Behaviour<GossipCodec>,
-    /// Request-response for TUN tunnel packets (the overlay role)
-    tun_tunnel: Toggle<request_response::Behaviour<tun_tunnel::TunPacketCodec>>,
+// The code the derive generates trips unreachable_code, a lint that
+// cannot be allowed on the struct, only on the module around it.
+mod behaviour {
+    #![allow(unreachable_code)]
+    use super::*;
+
+    /// Combined network behaviour for Velarx
+    #[derive(NetworkBehaviour)]
+    pub(crate) struct VelarxBehaviour {
+        /// Bounds the connections peers can open
+        pub(crate) connection_limits: connection_limits::Behaviour,
+        /// Kademlia DHT for content discovery
+        pub(crate) kademlia: kad::Behaviour<kad::store::MemoryStore>,
+        /// mDNS for local peer discovery
+        pub(crate) mdns: Toggle<Mdns>,
+        /// Identify protocol for peer identification
+        pub(crate) identify: identify::Behaviour,
+        /// Liveness: a peer that does not answer a ping loses its connection
+        pub(crate) ping: ping::Behaviour,
+        /// Request-response for what the peers tell each other
+        pub(crate) gossip: request_response::Behaviour<GossipCodec>,
+        /// Request-response for TUN tunnel packets (the overlay role)
+        pub(crate) tun_tunnel: Toggle<request_response::Behaviour<tun_tunnel::TunPacketCodec>>,
+    }
 }
+use behaviour::*;
 
 #[derive(Debug, Clone)]
 pub struct PeerStats {

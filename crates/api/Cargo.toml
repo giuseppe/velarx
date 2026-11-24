@@ -41,7 +41,6 @@ toml.workspace = true
 zlink = { workspace = true, features = ["tokio", "proxy", "service", "tracing"] }
 rustix = { workspace = true, features = ["fs", "net", "process", "pipe", "event"] }
 tracing.workspace = true
-tracing-subscriber = { workspace = true, features = ["std", "fmt", "ansi"] }
 percent-encoding.workspace = true
 base64.workspace = true
 futures.workspace = true
@@ -54,6 +53,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 # paused time: a test of a deadline does not wait for it
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
+tracing-subscriber = { workspace = true, features = ["std", "fmt", "ansi"] }
 
 [lints]
 workspace = true
