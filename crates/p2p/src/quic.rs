@@ -96,6 +96,7 @@ use std::time::Duration;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 use velarx_content::fetcher::fetch::Urgency;
+use velarx_request_core as request_core;
 use velarx_storage::ChunkFile;
 use velarx_types::digest::{Algorithm, Digest, Kind};
 
@@ -568,39 +569,14 @@ fn digests_wire<'a>(digests: impl Iterator<Item = &'a str> + Clone) -> io::Resul
     Ok(out)
 }
 
-/// The number of digests the head of a request (its operation, then the
-/// count, big endian) says it carries: one at least, at most
-/// [`MAX_REQUEST_DIGESTS`].
-fn digests_count(head: [u8; 3]) -> io::Result<usize> {
-    let count = u16::from_be_bytes([head[1], head[2]]) as usize;
-    if count == 0 || count > MAX_REQUEST_DIGESTS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "too many digests",
-        ));
-    }
-    Ok(count)
-}
-
-/// The kinds of the digests of a request, a byte each, and how many bytes
-/// their raw digests take.
-fn kinds_of(bytes: &[u8]) -> io::Result<(Vec<Kind>, usize)> {
-    let kinds: Vec<Kind> = bytes
-        .iter()
-        .copied()
-        .map(kind_of)
-        .collect::<io::Result<_>>()?;
-    let raw = kinds.iter().map(|k| k.alg().len()).sum();
-    Ok((kinds, raw))
-}
-
-/// The digests of `kinds`, their bytes in `raw` (as long as [`kinds_of`]
-/// says), as text.
-fn digests_of(kinds: Vec<Kind>, raw: &[u8]) -> io::Result<Vec<String>> {
+/// The digests of a request as text: the kind bytes and the raw bytes
+/// of each, as [`velarx_request_core::parse`] cut them.
+fn digests_of(kinds: &[u8], raw: &[u8]) -> io::Result<Vec<String>> {
     let mut at = 0;
     kinds
-        .into_iter()
-        .map(|kind| {
+        .iter()
+        .map(|&byte| {
+            let kind = kind_of(byte)?;
             let n = kind.alg().len();
             let bytes = raw
                 .get(at..at + n)
@@ -612,18 +588,35 @@ fn digests_of(kinds: Vec<Kind>, raw: &[u8]) -> io::Result<Vec<String>> {
         .collect()
 }
 
-/// The `count` digests a request carries, as text.
+/// The digests a request carries, as text, after the four bytes `wire` of
+/// its head: what the bytes say is `velarx_request_core`'s, which asks for
+/// more of them (at most [`MAX_REQUEST_DIGESTS`] digests) until it has the
+/// head.
 async fn read_digests(
     recv: &mut quinn::RecvStream,
-    count: usize,
+    wire: [u8; 4],
     idle: Duration,
 ) -> io::Result<Vec<String>> {
-    let mut kinds = vec![0u8; count];
-    read(recv, &mut kinds, idle).await?;
-    let (kinds, len) = kinds_of(&kinds)?;
-    let mut raw = vec![0u8; len];
-    read(recv, &mut raw, idle).await?;
-    digests_of(kinds, &raw)
+    let mut buf = wire.to_vec();
+    loop {
+        match request_core::parse(&buf, MAX_REQUEST_DIGESTS) {
+            request_core::Parse::Need(n) => {
+                let at = buf.len();
+                buf.resize(n, 0);
+                read(recv, &mut buf[at..], idle).await?;
+            }
+            request_core::Parse::Bad => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "not the head of a request",
+                ))
+            }
+            request_core::Parse::Done { count, used } => {
+                let at = request_core::HEADER + count;
+                return digests_of(&buf[request_core::HEADER..at], &buf[at..used]);
+            }
+        }
+    }
 }
 
 /// The reference of a request for signatures: `length` bytes of text.
@@ -2012,7 +2005,7 @@ impl Server {
         let digests = if op == OP_SIGNATURES {
             vec![read_reference(&mut recv, u16::from_be_bytes([c0, c1]) as usize, idle).await?]
         } else {
-            read_digests(&mut recv, digests_count(head)?, idle).await?
+            read_digests(&mut recv, wire, idle).await?
         };
         let count = digests.len();
         let span = tracing::Span::current();
@@ -3717,6 +3710,11 @@ mod tests {
         }
         assert!(kind_of(0).is_err() && kind_of(3).is_err() && kind_of(0x80).is_err());
         assert!(kind_of(0x83).is_err() && kind_of(0xff).is_err());
+        // (the core cuts the head by the lengths it knows: the same ones)
+        for byte in 0..=255u8 {
+            let len = kind_of(byte).map_or(0, |k| k.alg().len());
+            assert_eq!(request_core::alg_len(byte), len, "{byte}");
+        }
         // read back as the same texts: a hash of the bytes and the
         // fs-verity digest of them are never one for the other, nor are
         // the two algorithms
