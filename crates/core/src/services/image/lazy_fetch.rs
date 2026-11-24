@@ -410,7 +410,7 @@ impl ImageService {
                 let _ = staged.wait_for(|s| *s).await;
                 if this.lazy_file_path(&key, &file).is_none() {
                     fetch.await.map_err(unshared)?;
-                    return Err(ImageError::Layer(format!(
+                    return Err(ImageError::Storage(format!(
                         "{file} of layer {key} was not staged"
                     )));
                 }
@@ -683,8 +683,20 @@ impl ImageService {
         files: Vec<String>,
         (urgency, told): (Urgency, &(dyn Fn(&str) + Send + Sync)),
     ) -> ImageResult<Walked> {
-        let ctx = self.lazy_layer_ctx(key).await?;
         let lease = self.layer_lease(key).await?;
+        let staged = self.stage_leased(key, files, (urgency, told)).await;
+        drop(lease);
+        self.prune_lease(key);
+        staged
+    }
+
+    /// [`Self::stage_batch`], with the lease of the layer held.
+    async fn stage_leased(
+        &self,
+        key: &LayerKey,
+        files: Vec<String>,
+        (urgency, told): (Urgency, &(dyn Fn(&str) + Send + Sync)),
+    ) -> ImageResult<Walked> {
         let (store, staged) = (
             self.file_store.clone(),
             self.staging_area().layer_files(key),
@@ -705,6 +717,9 @@ impl ImageService {
         if left.is_empty() {
             return Ok(Walked::default());
         }
+        // (the layer is read after the filter: its staging goes when its
+        // last file is in the store)
+        let ctx = self.lazy_layer_ctx(key).await?;
         let mut stale = false;
         let staged = match self.lazy_walker((&ctx.walk, &ctx.manifest)).await {
             Ok(walker) => {
@@ -735,8 +750,6 @@ impl ImageService {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(key);
         }
-        drop(lease);
-        self.prune_lease(key);
         staged
     }
 
@@ -901,7 +914,7 @@ impl ImageService {
         let ctx = blocking(move || {
             let layer = area
                 .layer(&k)?
-                .ok_or_else(|| ImageError::Layer(format!("layer {k} is not staged")))?;
+                .ok_or_else(|| ImageError::Storage(format!("layer {k} is not staged")))?;
             let name = k.to_string();
             let pull = area
                 .pull_records()
@@ -1267,6 +1280,33 @@ mod tests {
         waiting.await.unwrap();
         service.forget_lazy(&key).await;
         assert_eq!(inflight(&service), None);
+    }
+
+    /// A fetch of files the store has needs no staged layer: another
+    /// completion committed the layer and removed its staging.  A file it
+    /// does not have of a layer that is not staged is an error the
+    /// completion tries again on.
+    #[tokio::test]
+    async fn a_fetch_of_a_layer_that_went_asks_for_what_the_store_lacks_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service(tmp.path()).await;
+        service.staging_area().create().unwrap();
+        let key = LayerKey::Whole(Digest::of(Algorithm::Sha256, b"layer"));
+        let file = service
+            .file_store
+            .put(Algorithm::Sha256, b"in the store")
+            .unwrap();
+        let walked = service
+            .stage_lazy(&key, vec![file], Urgency::Background)
+            .await
+            .unwrap();
+        assert_eq!(walked.bytes, 0);
+        let lacking = velarx_storage::fsverity_digest_of(Algorithm::Sha256, b"lacking");
+        let e = service
+            .stage_lazy(&key, vec![lacking], Urgency::Background)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ImageError::Storage(_)), "{e}");
     }
 
     /// A minimal 64-bit ELF program with the interpreter `interp` that
