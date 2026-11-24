@@ -545,11 +545,9 @@ impl Completer {
         let started = Instant::now();
         let _turn = self.turn(boost, speed).await;
         loop {
-            if let Ok(PullState::Cancelled) = self.area.state(id).map(|s| s.state) {
-                info!("The pull {id} is cancelled");
+            if !self.record_state(PullState::Running, Some(std::process::id())) {
                 return;
             }
-            self.record_state(PullState::Running, Some(std::process::id()));
             let progress = Arc::new(ProgressWriter::new(self.area.clone(), id.to_string()));
             let completion = Completion {
                 access: self.access.clone(),
@@ -623,10 +621,19 @@ impl Completer {
 
     /// Record the state of the pull for whoever looks at it; a state that
     /// cannot be written is said (the pull goes on as the state says).
-    fn record_state(&self, state: PullState, pid: Option<u32>) {
+    /// False when the pull was cancelled: nothing more is recorded.
+    fn record_state(&self, state: PullState, pid: Option<u32>) -> bool {
         let name = format!("{state:?}");
-        if let Err(e) = self.area.set_state(&self.id, state, pid) {
-            warn!("The pull {}: cannot record the state {name}: {e}", self.id);
+        match self.area.advance_state(&self.id, state, pid) {
+            Ok(false) => {
+                info!("The pull {} is cancelled", self.id);
+                false
+            }
+            Ok(true) => true,
+            Err(e) => {
+                warn!("The pull {}: cannot record the state {name}: {e}", self.id);
+                true
+            }
         }
     }
 

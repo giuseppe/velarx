@@ -837,6 +837,23 @@ impl Staging {
     }
 
     pub fn set_state(&self, id: &str, state: PullState, pid: Option<u32>) -> io::Result<()> {
+        let _dir = self.lock_pull_dir(id)?;
+        self.write_state(id, state, pid)
+    }
+
+    /// Record the state a completion goes on with, unless the pull was
+    /// cancelled meanwhile: a cancel is not overwritten.  Whether it was
+    /// recorded.
+    pub fn advance_state(&self, id: &str, state: PullState, pid: Option<u32>) -> io::Result<bool> {
+        let _dir = self.lock_pull_dir(id)?;
+        if self.state(id)?.state == PullState::Cancelled {
+            return Ok(false);
+        }
+        self.write_state(id, state, pid)?;
+        Ok(true)
+    }
+
+    fn write_state(&self, id: &str, state: PullState, pid: Option<u32>) -> io::Result<()> {
         write_atomic(
             &self.image_dir(id).join("state.json"),
             &serde_json::to_vec(&StateFile {
@@ -1438,6 +1455,23 @@ mod tests {
             t.join().unwrap();
         }
         assert_eq!(refused, 0, "a take saw a lease no completer held");
+    }
+
+    /// A completion that read the state before a cancel does not write over
+    /// it.
+    #[test]
+    fn a_completion_does_not_overwrite_a_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let area = Staging::new(tmp.path());
+        let p = pull(1, "latest");
+        area.publish_pull(&p).unwrap();
+        assert!(area.advance_state(&p.id, PullState::Running, None).unwrap());
+        area.set_state(&p.id, PullState::Cancelled, None).unwrap();
+        assert!(!area.advance_state(&p.id, PullState::Running, None).unwrap());
+        assert_eq!(area.state(&p.id).unwrap().state, PullState::Cancelled);
+        // (a pull again of it starts it over)
+        area.set_state(&p.id, PullState::Queued, None).unwrap();
+        assert!(area.advance_state(&p.id, PullState::Running, None).unwrap());
     }
 
     #[test]
