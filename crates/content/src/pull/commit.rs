@@ -904,7 +904,7 @@ fn failure(
         match (why, cannot) {
             (Why::StoreUnmeasured, _) => format!(
                 "fs-verity is required and the kernel does not measure the object {path}: \
-                 remove it, and it is fetched again"
+                 `velarx system check --repair` enables it"
             ),
             (Why::NoMeasure, Some(e)) => {
                 format!("fs-verity is required and cannot be enabled on {key}: {e}")
@@ -2175,6 +2175,7 @@ mod tests {
             let said = e.to_string();
             assert!(said.contains("fs-verity is required"), "{said}");
             assert!(said.contains(&target.display().to_string()), "{said}");
+            assert!(said.contains("system check --repair"), "{said}");
             assert!(l.path.join(&w.rel).exists(), "cross {cross}: name dropped");
             assert_eq!(std::fs::metadata(&target).unwrap().ino(), ino);
             assert_eq!(std::fs::read(&target).unwrap(), OTHER);

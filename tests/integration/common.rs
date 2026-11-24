@@ -1072,6 +1072,21 @@ pub async fn env_on(
 /// [`env_on`], with the service `built` makes of the one it made.
 pub async fn env_built(
     db: Database,
+    pull: PullConfig,
+    push: velarx_config::PushConfig,
+    sources: Fetchers,
+    read_only: Option<std::path::PathBuf>,
+    built: impl FnOnce(ImageService) -> ImageService,
+) -> Env {
+    env_built_in(None, db, pull, push, sources, read_only, built).await
+}
+
+/// [`env_built`] with the directory of the environment made in `base` (the
+/// temporary directory where it is None): a test that needs a file system
+/// with fs-verity.
+pub async fn env_built_in(
+    base: Option<&std::path::Path>,
+    db: Database,
     mut pull: PullConfig,
     push: velarx_config::PushConfig,
     sources: Fetchers,
@@ -1088,7 +1103,11 @@ pub async fn env_built(
         pull.worker_path = Some(registry_bin().into());
     }
     let (host, reg) = start_registry().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = match base {
+        Some(base) => tempfile::tempdir_in(base),
+        None => tempfile::tempdir(),
+    }
+    .unwrap();
     // (the files of the layers are in the directory of the store)
     let db = db.with_layer_files(Arc::new(velarx_db::layer_files::Directory(
         tmp.path().to_path_buf(),

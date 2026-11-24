@@ -5,7 +5,8 @@
 //! contents, each file its layers name (it is in the objects, of the size
 //! the table says and, unless the check is quick, of the content: its
 //! fs-verity digest, which names it, recomputed, and the kernel's measure
-//! where the file has fs-verity), and
+//! where the file has fs-verity; where the store requires fs-verity, a whole
+//! file the kernel does not measure is reported as `no_verity`), and
 //! its composefs image.  The store is looked at too: objects no row knows,
 //! rows of files that are gone, temporary files, pull and container
 //! staging directories of nothing, leases of pulls that died.
@@ -14,8 +15,9 @@
 //! checked first, as many as the timeout leaves time for.  A repair takes the
 //! exclusive lock for what it removes in the store; it makes the composefs
 //! images of an image again from the tables of contents and the objects,
-//! and removes the images whose objects are damaged or gone (a pull brings
-//! them back), unless a container uses them.
+//! enables fs-verity in place on the whole objects that lack it where the
+//! store requires it, and removes the images whose objects are damaged or
+//! gone (a pull brings them back), unless a container uses them.
 
 use crate::services::ImageService;
 use crate::storage_driver::Leftovers;
@@ -67,6 +69,9 @@ enum Fix {
     /// Finish the pull `id`: nothing completes it.
     Complete(String),
     ReleaseLease(String),
+    /// Enable fs-verity on the object, which is the file named by this
+    /// digest and whole.
+    EnableVerity(String, Object),
 }
 
 /// A problem, before the repair decides what to do about it.
@@ -519,7 +524,11 @@ impl CheckService {
                 continue;
             }
             if full && !run.verdicts.contains_key(digest) {
-                to_read.push((digest.clone(), object.clone(), path, meta.len()));
+                // (an object of a read-only store is copied by a pull, and cannot be
+                // repaired: fs-verity is asked of those of this store alone)
+                let required = self.store.verity() == velarx_storage::VerityMode::Require
+                    && path == self.store.object_path(object);
+                to_read.push((digest.clone(), object.clone(), path, (meta.len(), required)));
             } else if full {
                 // (read for an image before: the same verdict)
                 for (kind, message) in &run.verdicts[digest] {
@@ -527,8 +536,8 @@ impl CheckService {
                         kind,
                         message.clone(),
                         Some(self.object_path(digest, object)),
-                        Fix::None,
-                        true,
+                        self.verdict_fix(kind, digest, object, &self.object_path(digest, object)),
+                        damages(kind),
                     );
                 }
             }
@@ -545,8 +554,15 @@ impl CheckService {
                     continue;
                 };
                 run.bytes_read += bytes;
+                let object = &rows[&digest];
                 for (kind, message) in &verdict {
-                    add(kind, message.clone(), Some(path.clone()), Fix::None, true);
+                    add(
+                        kind,
+                        message.clone(),
+                        Some(path.clone()),
+                        self.verdict_fix(kind, &digest, object, &path),
+                        damages(kind),
+                    );
                 }
                 run.verdicts.insert(digest, verdict);
             }
@@ -597,6 +613,16 @@ impl CheckService {
             return path;
         }
         self.store.find_additional(digest).unwrap_or(path)
+    }
+
+    /// What a repair does about a finding of the verdict on an object: only
+    /// an object of this store, not of a read-only one, gets fs-verity.
+    fn verdict_fix(&self, kind: &str, digest: &str, object: &Object, path: &Path) -> Fix {
+        if kind == NO_VERITY && path == self.store.object_path(object) {
+            Fix::EnableVerity(digest.to_string(), object.clone())
+        } else {
+            Fix::None
+        }
     }
 
     /// The problems of the store itself: what no image accounts for.
@@ -895,6 +921,54 @@ impl CheckService {
         Ok(())
     }
 
+    /// Enable fs-verity on the whole objects the findings name (the store
+    /// is locked: nothing is being written), and say what became of each.
+    /// The kernel's measure of an object must then be its name: when it is
+    /// not, the object was not whole after all and is damaged like any
+    /// other.  Returns the paths that have fs-verity now.
+    async fn enable_verity(&self, checked: &mut [Checked]) -> CheckResult<HashSet<PathBuf>> {
+        let mut todo = BTreeMap::new();
+        for f in checked.iter().flat_map(|c| &c.findings) {
+            if let (Fix::EnableVerity(digest, object), Some(path)) = (&f.fix, &f.path) {
+                todo.insert(path.clone(), (digest.clone(), object.clone()));
+            }
+        }
+        let Some(manager) = self.store.verity().manager().filter(|_| !todo.is_empty()) else {
+            return Ok(HashSet::new());
+        };
+        let results = crate::off_thread(move || {
+            Ok(todo
+                .into_iter()
+                .map(|(path, (digest, object))| {
+                    let result = enable(&manager, &digest, &object, &path);
+                    (path, result)
+                })
+                .collect::<HashMap<_, _>>())
+        })
+        .await?;
+        for f in checked.iter_mut().flat_map(|c| &mut c.findings) {
+            let Some(Err(why)) = f.path.as_ref().and_then(|p| results.get(p)) else {
+                continue;
+            };
+            match why {
+                Unenabled::Cannot(why) => {
+                    f.message
+                        .push_str(&format!(" (and cannot be repaired: {why})"));
+                }
+                Unenabled::Damaged(message) => {
+                    f.kind = "verity_mismatch";
+                    f.message = message.clone();
+                    f.fix = Fix::None;
+                    f.damaged = true;
+                }
+            }
+        }
+        Ok(results
+            .into_iter()
+            .filter_map(|(path, r)| r.is_ok().then_some(path))
+            .collect())
+    }
+
     /// Repair what was found, as far as the store allows, and report it.
     async fn repair(
         &self,
@@ -940,6 +1014,7 @@ impl CheckService {
         }
 
         // the store, under the exclusive lock: nothing is being recorded
+        let enabled: HashSet<PathBuf>;
         let mut dropped: HashSet<String> = HashSet::new();
         let mut done_store = Vec::new();
         let mut completing: Vec<String> = Vec::new();
@@ -969,6 +1044,7 @@ impl CheckService {
                 self.db.delete_files(gone.clone()).await?;
                 dropped.extend(gone);
             }
+            enabled = self.enable_verity(&mut checked).await?;
             for f in scan.findings {
                 let action = match &f.fix {
                     Fix::RemoveFile(p) => remove(|| std::fs::remove_file(p), p),
@@ -985,7 +1061,7 @@ impl CheckService {
                         completing.push(id.clone());
                         true
                     }
-                    Fix::None | Fix::Remake => false,
+                    Fix::None | Fix::Remake | Fix::EnableVerity(..) => false,
                 };
                 done_store.push(f.into_problem(if action {
                     CheckAction::Repaired
@@ -1052,6 +1128,11 @@ impl CheckService {
                                 CheckAction::Repaired
                             }
                             Fix::Remake => CheckAction::Repaired,
+                            Fix::EnableVerity(..)
+                                if f.path.as_ref().is_some_and(|p| enabled.contains(p)) =>
+                            {
+                                CheckAction::Repaired
+                            }
                             _ => CheckAction::None,
                         }
                     };
@@ -1100,8 +1181,9 @@ fn short_key(key: &velarx_types::LayerKey) -> String {
     }
 }
 
-/// A file to judge: its digest, object, path and size.
-type ToRead = (String, Object, PathBuf, u64);
+/// A file to judge: its digest, object, path, and its size and whether the
+/// store requires fs-verity of it.
+type ToRead = (String, Object, PathBuf, (u64, bool));
 /// A judged file: its digest, path and (bytes read, verdict).
 type Judged = (String, PathBuf, Option<(u64, Verdict)>);
 
@@ -1112,11 +1194,11 @@ fn read_files(files: Vec<ToRead>, deadline: Option<Instant>) -> Vec<Judged> {
     let work = || {
         files
             .into_par_iter()
-            .map(|(digest, object, path, size)| {
+            .map(|(digest, object, path, (size, required))| {
                 if deadline.is_some_and(|d| Instant::now() >= d) {
                     return (digest, path, None);
                 }
-                let verdict = judge(&digest, &object, &path, size);
+                let verdict = judge(&digest, &object, &path, (size, required));
                 (digest, path, Some((size, verdict)))
             })
             .collect()
@@ -1127,10 +1209,87 @@ fn read_files(files: Vec<ToRead>, deadline: Option<Instant>) -> Vec<Judged> {
     }
 }
 
+/// Why an object did not get fs-verity.
+enum Unenabled {
+    /// It cannot have it here: the message says why.
+    Cannot(String),
+    /// It has it now, and the kernel's digest is not its name: the message
+    /// is the finding.
+    Damaged(String),
+}
+
+/// Enable fs-verity on the object `path`, which the check found whole under
+/// the name `digest`, and hold the kernel's measure to the name.
+fn enable(
+    manager: &velarx_storage::FsVerityManager,
+    digest: &str,
+    object: &Object,
+    path: &Path,
+) -> Result<(), Unenabled> {
+    use std::os::unix::fs::PermissionsExt;
+    use velarx_storage::FsVerityError;
+    let alg = object.alg();
+    let file = std::fs::File::open(path)
+        .map_err(|e| Unenabled::Cannot(format!("cannot open the object: {e}")))?;
+    let manager = manager.for_algorithm(alg);
+    let mut enabled = manager.enable_file(&file, path);
+    // (the kernel wants write access to the inode, which a stored object,
+    // made read-only, has not: it is given for the call, and enabling makes
+    // the object read-only again)
+    if let Err(FsVerityError::PermissionDenied) = enabled {
+        let stat = |e: std::io::Error| Unenabled::Cannot(format!("cannot change the mode: {e}"));
+        let mode = file.metadata().map_err(stat)?.permissions();
+        let mut writable = mode.clone();
+        writable.set_mode(mode.mode() | 0o200);
+        file.set_permissions(writable).map_err(stat)?;
+        enabled = manager.enable_file(&file, path);
+        if enabled.is_err() {
+            // (best effort: the object is as it was)
+            let _ = file.set_permissions(mode);
+        }
+    }
+    enabled.map_err(|e| {
+        Unenabled::Cannot(match e {
+            FsVerityError::NotSupported => "the file system of the store has no fs-verity".into(),
+            e => e.to_string(),
+        })
+    })?;
+    let measure = velarx_storage::measure_file(&file)
+        .map_err(|e| Unenabled::Cannot(format!("cannot measure the object: {e}")))?;
+    // (a file system of small blocks makes another digest than the name)
+    if !velarx_storage::canonical_digest(&file, alg) {
+        return Err(Unenabled::Cannot(
+            "the file system of the store cannot make the fs-verity digest that names the object"
+                .into(),
+        ));
+    }
+    let kernel = measure.object().map(|o| o.to_string());
+    if kernel.as_deref() == Some(digest) {
+        return Ok(());
+    }
+    Err(Unenabled::Damaged(format!(
+        "the object is named {} and, with fs-verity enabled, its digest is {}",
+        object.verity,
+        kernel.unwrap_or_else(|| measure.to_string())
+    )))
+}
+
+/// What the check says of a sound object that the kernel does not measure,
+/// where the store requires fs-verity.
+const NO_VERITY: &str = "no_verity";
+
+/// Whether a finding of this kind means the object is damaged (and the
+/// image with it): a sound object without fs-verity is not.
+fn damages(kind: &str) -> bool {
+    kind != NO_VERITY
+}
+
 /// Read the file and recompute its fs-verity digest, which must be the name
 /// of the object, `digest` (and what the kernel measures, when the file has
-/// fs-verity and blocks of 4096 bytes).
-fn judge(digest: &str, object: &Object, path: &Path, size: u64) -> Verdict {
+/// fs-verity and blocks of 4096 bytes).  `size` is what the table says and
+/// whether the store requires fs-verity: a sound file the kernel does not
+/// measure is then `no_verity`.
+fn judge(digest: &str, object: &Object, path: &Path, (size, required): (u64, bool)) -> Verdict {
     use std::io::Read;
     let mut out = Verdict::new();
     let mut file = match std::fs::File::open(path) {
@@ -1185,7 +1344,9 @@ fn judge(digest: &str, object: &Object, path: &Path, size: u64) -> Verdict {
         return out;
     }
     // (a file system of small blocks measures another digest)
-    let measured = velarx_storage::measure_file(&file)
+    let measure = velarx_storage::measure_file(&file);
+    let measured = measure
+        .as_ref()
         .ok()
         .filter(|_| velarx_storage::canonical_digest(&file, alg))
         .and_then(|m| m.object())
@@ -1200,6 +1361,125 @@ fn judge(digest: &str, object: &Object, path: &Path, size: u64) -> Verdict {
                 measured.unwrap_or(computed)
             ),
         ));
+    } else if required
+        && matches!(
+            measure,
+            Err(velarx_storage::FsVerityError::NotEnabled
+                | velarx_storage::FsVerityError::NotSupported)
+        )
+    {
+        out.push((
+            NO_VERITY,
+            format!(
+                "the object of {digest} is whole but has no fs-verity, which is required: \
+                 `velarx system check --repair` enables it"
+            ),
+        ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use velarx_types::digest::Algorithm;
+
+    /// The kinds `judge` finds for a file with `data` named as `named`.
+    fn kinds(named: &[u8], data: &[u8], required: bool) -> Vec<&'static str> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("object");
+        std::fs::write(&path, data).unwrap();
+        kinds_at(&path, named, required)
+    }
+
+    /// The kinds `judge` finds for the file `path` named as `named`.
+    fn kinds_at(path: &Path, named: &[u8], required: bool) -> Vec<&'static str> {
+        let name = velarx_storage::fsverity_digest_of(Algorithm::Sha256, named);
+        let object = Object::new(&name, false).unwrap();
+        let size = std::fs::metadata(path).unwrap().len();
+        judge(&name, &object, path, (size, required))
+            .into_iter()
+            .map(|(kind, _)| kind)
+            .collect()
+    }
+
+    /// A whole file that the kernel does not measure (a temporary directory
+    /// has no fs-verity) is found where fs-verity is required, and only
+    /// there.
+    #[test]
+    fn a_whole_file_without_fs_verity_is_found_only_when_required() {
+        assert_eq!(kinds(b"data", b"data", true), [NO_VERITY]);
+        assert!(kinds(b"data", b"data", false).is_empty());
+    }
+
+    /// A file that is not what its name says is damaged, not just unmeasured.
+    #[test]
+    fn a_damaged_file_stays_damaged_when_required() {
+        for required in [false, true] {
+            assert_eq!(kinds(b"data", b"dat0", required), ["verity_mismatch"]);
+        }
+    }
+
+    /// Only a damaged file damages its image.
+    #[test]
+    fn only_a_missing_fs_verity_leaves_the_image_whole() {
+        assert!(!damages(NO_VERITY));
+        assert!(damages("verity_mismatch"));
+    }
+
+    /// A directory of a file system with fs-verity (`VELARX_VERITY_DIR`),
+    /// where fs-verity has to work, or a test would pass for the wrong
+    /// reason.
+    fn verity_dir() -> Option<tempfile::TempDir> {
+        let Some(base) = std::env::var_os("VELARX_VERITY_DIR") else {
+            eprintln!("VELARX_VERITY_DIR not set: skipped");
+            return None;
+        };
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let probe = dir.path().join("probe");
+        std::fs::write(&probe, b"probe").unwrap();
+        velarx_storage::VerityMode::Require
+            .manager()
+            .unwrap()
+            .enable(&probe)
+            .unwrap();
+        assert!(velarx_storage::measure_file(&std::fs::File::open(&probe).unwrap()).is_ok());
+        Some(dir)
+    }
+
+    /// The repair of a whole file without fs-verity: the kernel measures it
+    /// as its name afterwards and the check finds nothing; the digest of a
+    /// file that is not whole is found when the kernel measures it.
+    #[test]
+    fn enabling_fs_verity_makes_the_kernel_measure_the_name() {
+        let Some(dir) = verity_dir() else {
+            return;
+        };
+        let manager = velarx_storage::VerityMode::Require.manager().unwrap();
+        let name = velarx_storage::fsverity_digest_of(Algorithm::Sha256, b"data");
+        let object = Object::new(&name, false).unwrap();
+        let path = dir.path().join("object");
+        std::fs::write(&path, b"data").unwrap();
+        // (read-only, as a stored object is)
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(kinds_at(&path, b"data", true), [NO_VERITY]);
+        assert!(enable(&manager, &name, &object, &path).is_ok());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert!(kinds_at(&path, b"data", true).is_empty());
+        // (again: it has it already)
+        assert!(enable(&manager, &name, &object, &path).is_ok());
+
+        // other bytes under the name: the kernel's measure is not the name
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"dat0").unwrap();
+        assert!(matches!(
+            enable(&manager, &name, &object, &other),
+            Err(Unenabled::Damaged(_))
+        ));
+        assert_eq!(kinds_at(&other, b"data", true), ["verity_mismatch"]);
+    }
 }

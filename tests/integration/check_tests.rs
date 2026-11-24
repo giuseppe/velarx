@@ -22,6 +22,24 @@ pub(crate) async fn pulled() -> (Env, String) {
     (e, id)
 }
 
+/// [`pulled`] in a directory of `base`.
+async fn pulled_in(base: &std::path::Path) -> (Env, String) {
+    let e = env_built_in(
+        Some(base),
+        velarx_db::Database::open_in_memory().await.unwrap(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        None,
+        |service| service.with_composefs("auto"),
+    )
+    .await;
+    let layer = build_chunked(&sample());
+    e.publish(&[&layer], &[ZSTD]);
+    let id = e.pull().await.unwrap().id;
+    (e, id)
+}
+
 pub(crate) async fn composefs_env() -> Env {
     let mut e = env().await;
     let service: ImageService = (*e.service).clone().with_composefs("auto");
@@ -34,6 +52,21 @@ fn checker(e: &Env) -> CheckService {
         e.db.clone(),
         Arc::new((*e.service).clone()),
         e.store.clone(),
+        e.staging.clone(),
+    )
+    .with_grace(Duration::ZERO)
+}
+
+/// The checker of the store of `e` as one that requires fs-verity.
+fn requiring(e: &Env) -> CheckService {
+    CheckService::new(
+        e.db.clone(),
+        Arc::new((*e.service).clone()),
+        Arc::new(
+            velarx_storage::FileStore::new(e.store.root())
+                .unwrap()
+                .with_verity(velarx_storage::VerityMode::Require),
+        ),
         e.staging.clone(),
     )
     .with_grace(Duration::ZERO)
@@ -1055,4 +1088,62 @@ async fn a_lost_composefs_image_of_a_layer_made_here_is_left_to_the_repair() {
     check(&e, true, true).await;
     assert!(plan(&e, &id).await.is_ok());
     assert!(check(&e, false, false).await.ok());
+}
+
+/// Where fs-verity is required, the objects pulled without it are found, and
+/// the image is whole: a repair that cannot enable fs-verity (the file system
+/// of the test has none) keeps the image, says why, and the store is still
+/// not as it should be.
+#[tokio::test]
+async fn objects_without_the_required_fs_verity_are_found() {
+    let (e, id) = pulled().await;
+    assert!(check(&e, false, false).await.ok());
+    let r = requiring(&e).check(&request(false, false)).await.unwrap();
+    assert!(!r.ok());
+    assert!(r
+        .problems
+        .iter()
+        .all(|p| p.kind == "no_verity" && p.action == CheckAction::None));
+    let r = requiring(&e).check(&request(false, true)).await.unwrap();
+    assert!(!r.ok());
+    assert!(r.problems.iter().all(|p| p.kind == "no_verity"
+        && p.action == CheckAction::None
+        && p.message.contains("(and cannot be repaired: ")));
+    assert!(e.db.list_images().await.unwrap().iter().any(|i| i.id == id));
+}
+
+/// On a file system with fs-verity (`VELARX_VERITY_DIR`) a repair enables it
+/// on the objects pulled without it, which the kernel measures then: nothing
+/// is found by the next check.
+#[tokio::test]
+async fn a_repair_enables_the_required_fs_verity() {
+    let Some(base) = std::env::var_os("VELARX_VERITY_DIR") else {
+        eprintln!("VELARX_VERITY_DIR not set: skipped");
+        return;
+    };
+    // (fs-verity has to work there, or the test would pass for the wrong reason)
+    let probe = tempfile::tempdir_in(&base).unwrap();
+    std::fs::write(probe.path().join("probe"), b"probe").unwrap();
+    velarx_storage::VerityMode::Require
+        .manager()
+        .unwrap()
+        .enable(&probe.path().join("probe"))
+        .unwrap();
+    let (e, id) = pulled_in(base.as_ref()).await;
+    let object = object_of(&e, &id, "usr/big").await;
+    let measured = |path: &std::path::Path| {
+        velarx_storage::measure_file(&std::fs::File::open(path).unwrap()).is_ok()
+    };
+    assert!(!measured(&object));
+    let r = requiring(&e).check(&request(false, false)).await.unwrap();
+    assert!(r.problems.iter().any(|p| p.kind == "no_verity"));
+    let r = requiring(&e).check(&request(false, true)).await.unwrap();
+    assert!(r.ok(), "{:?}", r.problems);
+    assert!(r
+        .problems
+        .iter()
+        .all(|p| p.kind == "no_verity" && p.action == CheckAction::Repaired));
+    assert!(measured(&object));
+    let r = requiring(&e).check(&request(false, false)).await.unwrap();
+    assert!(r.problems.is_empty(), "{:?}", r.problems);
 }

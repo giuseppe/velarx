@@ -384,10 +384,17 @@ pub(super) fn run_system_command(cmd: SystemCommands, inv: &Invocation<'_>) -> a
                 print!("{}", check_text(&report));
             }
             if !report.ok() {
-                anyhow::bail!(if repair || force {
-                    "damage in local storage still present after repair attempt"
-                } else {
-                    "damage detected in local storage"
+                // (objects without the fs-verity the store requires are whole)
+                let unmeasured = report
+                    .problems
+                    .iter()
+                    .filter(|p| p.open())
+                    .all(|p| p.kind == "no_verity");
+                anyhow::bail!(match (repair || force, unmeasured) {
+                    (true, true) => "local storage still needs repair after repair attempt",
+                    (true, false) => "damage in local storage still present after repair attempt",
+                    (false, true) => "local storage needs repair",
+                    (false, false) => "damage detected in local storage",
                 });
             }
         }

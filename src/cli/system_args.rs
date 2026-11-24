@@ -944,8 +944,9 @@ pub enum SystemCommands {
     /// directories of nothing.  Nothing is printed when all is well, and
     /// damage ends the command with status 125.
     ///
-    /// --repair makes the composefs images of an image again, removes the
-    /// leftovers and removes the images whose files are damaged or gone
+    /// --repair makes the composefs images of an image again, enables
+    /// fs-verity on the whole objects that lack it where the store requires
+    /// it, removes the leftovers and removes the images whose files are damaged or gone
     /// (pull them again), except those a container uses; --force with it
     /// removes those containers too, and the image (a running container
     /// is not removed).  --max is the age of the leftovers to remove; the
@@ -962,8 +963,9 @@ pub enum SystemCommands {
         /// Skip reading the content of the files and of the composefs images
         #[arg(long, short)]
         quick: bool,
-        /// Make again what can be made from the store, remove the images
-        /// that are damaged and not in use
+        /// Make again what can be made from the store, enable fs-verity on
+        /// the whole objects that lack it where the store requires it,
+        /// remove the images that are damaged and not in use
         #[arg(long, short, alias = "fix")]
         repair: bool,
         /// With --repair: remove the containers that use a damaged image
