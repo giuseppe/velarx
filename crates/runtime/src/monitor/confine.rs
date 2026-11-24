@@ -19,8 +19,8 @@
 //!   measure what the engine staged), makes files beneath the directory of
 //!   the startup profile only, looks up no unix socket by name (the
 //!   connections to the engine come through a process forked before; Landlock
-//!   ABI 9 and later; no TCP at all), and makes none of [`DENIED`] but
-//!   `socket` and `connect`.
+//!   ABI 9 and later; no TCP at all), and makes none of [`DENIED`], sockets
+//!   included.
 //!
 //! They are a must: on a kernel without Landlock the threads do not run
 //! (the pull workers need it as well).
@@ -159,22 +159,6 @@ fn filter() -> &'static [libc::sock_filter] {
     FILTER.get_or_init(|| sys::deny_filter(DENIED, libc::EPERM as u32))
 }
 
-/// The calls of [`DENIED`] a fetching thread makes: a connection to the
-/// socket of the engine that holds the pull.
-const FETCH_ALLOWED: &[i64] = &[libc::SYS_socket, libc::SYS_connect];
-
-fn fetch_filter() -> &'static [libc::sock_filter] {
-    static FILTER: OnceLock<Vec<libc::sock_filter>> = OnceLock::new();
-    FILTER.get_or_init(|| {
-        let denied: Vec<i64> = DENIED
-            .iter()
-            .copied()
-            .filter(|nr| !FETCH_ALLOWED.contains(nr))
-            .collect();
-        sys::deny_filter(&denied, libc::EPERM as u32)
-    })
-}
-
 /// The rights beneath a directory where a fetching thread makes files (the
 /// directory of the startup profile): read them, make files and
 /// directories, write, truncate and remove its own temporary files.
@@ -240,8 +224,8 @@ pub struct Fetching {
 
 /// Confine the calling thread (and those it makes) for the requests for the
 /// files of an image that is being pulled: the file system of `reach` only,
-/// no TCP, no process, no mount, none of [`DENIED`] but the connection to a
-/// socket.
+/// no TCP, no process, no mount, none of [`DENIED`] (it opens no socket: its
+/// connections are made by another process).
 pub fn fetch_thread(reach: &Fetching) -> io::Result<()> {
     let rules: Vec<(&Path, u64, bool)> = reach
         .read
@@ -250,7 +234,7 @@ pub fn fetch_thread(reach: &Fetching) -> io::Result<()> {
         .chain(reach.make.iter().map(|d| (d.as_path(), MAKE, true)))
         .collect();
     landlock_rules(&rules)?;
-    sys::seccomp_thread(fetch_filter())
+    sys::seccomp_thread(filter())
 }
 
 /// What the threads that record and release a container reach (the
@@ -921,5 +905,19 @@ mod tests {
             // of the engine's neither)
             assert!(no_other_socket.0 && no_other_socket.1);
         }
+    }
+
+    /// A fetching thread opens no socket of its own, whatever the family:
+    /// Landlock does not cover UDP, so the filter has to.
+    #[test]
+    fn a_fetching_thread_opens_no_datagram_socket() {
+        use rustix::net::{AddressFamily, SocketType};
+        let opened = std::thread::spawn(|| {
+            fetch_thread(&Fetching::default()).unwrap();
+            rustix::net::socket(AddressFamily::INET, SocketType::DGRAM, None).is_ok()
+        })
+        .join()
+        .unwrap();
+        assert!(!opened);
     }
 }
