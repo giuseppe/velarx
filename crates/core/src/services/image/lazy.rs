@@ -4,7 +4,6 @@
 
 use super::*;
 use std::path::{Path, PathBuf};
-use velarx_content::fetcher::fetch::Urgency;
 use velarx_content::pull::commit::ImageStep;
 use velarx_content::pull::staged::{StagedPull, Staging};
 use velarx_content::pull::{layer_commit, LayerDone};
@@ -25,9 +24,9 @@ const PROFILE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A staged layer of an image being completed, and what its proof needs.
 #[derive(Clone)]
-struct LazyLayer {
+pub(super) struct LazyLayer {
     /// The layer of the store (its TOC)
-    key: LayerKey,
+    pub(super) key: LayerKey,
     desc: OciDescriptor,
     /// The diff id the configuration of the image claims for it
     diff_id: Digest,
@@ -39,51 +38,39 @@ struct LazyLayer {
     meta: velarx_content::pull::staged::StagedLayerMeta,
 }
 
-/// What is told of the progress of a completion.
-pub type ProgressFn = Arc<dyn Fn(&CompletionProgress) + Send + Sync>;
-
-/// How a completion goes: what it brings to the registry, how many groups
-/// of files it fetches at once, and whom it tells of its progress.
-pub struct Completion {
-    /// The credentials and certificates of the command
-    pub access: RegistryAccess,
-    /// Groups of files in flight at most: permits, which more may be added
-    /// to while the completion runs (a command that waits for it)
-    pub permits: Arc<Semaphore>,
-    /// Called as files are fetched and layers committed
-    pub progress: Option<ProgressFn>,
+/// What a try of the completion of a pull works on: the layers the store
+/// lacks and the groups of files to fetch for them.
+pub(super) struct Plan {
+    pub(super) pull: StagedPull,
+    manifest: OciManifest,
+    config: OciConfig,
+    keys: Vec<LayerKey>,
+    /// The layers the store lacks
+    pub(super) layers: Arc<[LazyLayer]>,
+    /// The groups, in the order they are fetched
+    pub(super) groups: Vec<PlanGroup>,
+    /// What the store and the staging had of the files already
+    pub(super) reused: (u64, u64),
+    /// The image is in the store already: only the names of the pull are
+    /// added
+    names_only: bool,
 }
 
-impl Completion {
-    /// A completion that fetches as the monitors do (`[pull] lazy_fetches`).
-    pub fn new(config: &velarx_config::PullConfig) -> Self {
-        Self {
-            access: RegistryAccess::default(),
-            permits: Arc::new(Semaphore::new(config.lazy_fetches.max(1))),
-            progress: None,
-        }
-    }
-}
-
-/// What a completion has done, of what the staged layers lacked when it
-/// started.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CompletionProgress {
-    pub files_done: u64,
-    pub files_total: u64,
-    pub bytes_done: u64,
-    pub bytes_total: u64,
-    pub layers_done: u64,
-    pub layers_total: u64,
+/// A group of files, fetched into the staging of a layer.
+pub(super) struct PlanGroup {
+    /// The layer it is fetched into (a content is fetched once, into the
+    /// first layer that has it)
+    pub(super) layer: usize,
+    /// The layers that wait for its files
+    pub(super) needed_by: Vec<usize>,
+    pub(super) files: Vec<String>,
+    pub(super) bytes: u64,
 }
 
 /// The files of a layer that neither the store nor the staging has, in
 /// groups; and the files they have, and the bytes those took in the blob.
 struct Wanted {
     groups: Vec<Vec<String>>,
-    /// The files and bytes the groups hold
-    files_wanted: u64,
-    bytes_wanted: u64,
     reused_files: u64,
     reused_bytes: u64,
 }
@@ -103,7 +90,6 @@ fn wanted_groups(
         .iter()
         .map(|layer| {
             let (mut reused_files, mut reused_bytes) = (0, 0);
-            let (mut files_wanted, mut bytes_wanted) = (0u64, 0u64);
             let groups = velarx_content::pull::window::groups(&layer.toc, files, bytes, |d, e| {
                 if !seen.insert(d.to_string()) {
                     return false;
@@ -114,18 +100,11 @@ fn wanted_groups(
                     return false;
                 }
                 // (fetched before the others, with the startup profile)
-                if skip.contains(d) {
-                    return false;
-                }
-                files_wanted += 1;
-                bytes_wanted += e.size;
-                true
+                !skip.contains(d)
             })
             .map_err(|e| ImageError::Layer(format!("layer {}: {e}", layer.desc.digest)))?;
             Ok(Wanted {
                 groups,
-                files_wanted,
-                bytes_wanted,
                 reused_files,
                 reused_bytes,
             })
@@ -343,24 +322,33 @@ impl ImageService {
         self.complete_waiting(id, RegistryAccess::default()).await
     }
 
-    /// The pull `id`, finished: see [`Self::complete_image`].  Layers
-    /// are committed one at a time, each as soon as its last file is there.
-    pub async fn complete_pull(
+    /// What a try of the completion of the pull `id` works on, once the
+    /// layers the store lacks are staged and proven against their tables
+    /// (`access`: the credentials of the command).  None: the pull is gone.
+    pub(super) async fn prepare(
         &self,
         id: &str,
-        mut completion: Completion,
-    ) -> ImageResult<TransferStats> {
-        let start = std::time::Instant::now();
+        access: RegistryAccess,
+    ) -> ImageResult<Option<Arc<Plan>>> {
         let area = self.staging_area();
         let Some(pull) = area.pull(id)? else {
-            return Ok(TransferStats::default());
+            return Ok(None);
         };
         let manifest: OciManifest = serde_json::from_str(&pull.manifest)?;
+        let driver_pulls = !self.storage.holds_objects();
         if self.image_stored(&pull.manifest_digest).await {
             // (committed by another process, by an earlier run of this one,
             // or pulled whole meanwhile: the names of the pull are its)
-            self.commit_image(&pull, &manifest, None).await?;
-            return Ok(TransferStats::default());
+            return Ok(Some(Arc::new(Plan {
+                config: serde_json::from_str(&pull.config)?,
+                pull,
+                manifest,
+                keys: Vec::new(),
+                layers: Vec::new().into(),
+                groups: Vec::new(),
+                reused: (0, 0),
+                names_only: true,
+            })));
         }
         let config: OciConfig = serde_json::from_str(&pull.config)?;
         if manifest.layers.len() != config.rootfs.diff_ids.len()
@@ -382,36 +370,44 @@ impl ImageService {
         // as a pull brings them, and the engine keeps every staged layer: the
         // containers made on the pull run on its files, the layers the
         // driver holds already too)
-        let keeps = !self.storage.holds_objects();
         // (the credentials of the command reach the tar-splits that the
         // start did without, fetched before the files)
-        self.set_lazy_access(std::mem::take(&mut completion.access));
+        self.set_lazy_access(access);
         let layers: Arc<[LazyLayer]> = self
-            .lazy_layers(&area, &manifest, &config, &keys, keeps)
+            .lazy_layers(&area, &manifest, &config, &keys, driver_pulls)
             .await?
             .into();
-        let mut stats = TransferStats {
-            layers_cached: (keys.len() - layers.len()) as u64,
-            ..TransferStats::default()
-        };
         let profile = velarx_fuse::profile::read(
             &velarx_fuse::composefs::profile_path(self.file_store.root(), id),
             self.pull_config.lazy_profile_files,
         );
-        self.commit_layers(&layers, profile, &mut stats, completion, !keeps)
-            .await?;
-        if keeps {
-            self.pull_staged(&pull, &manifest, &config, &keys, &layers)
-                .await?;
+        let (groups, reused) = self.plan_groups(&layers, profile).await?;
+        Ok(Some(Arc::new(Plan {
+            pull,
+            manifest,
+            config,
+            keys,
+            layers,
+            groups,
+            reused,
+            names_only: false,
+        })))
+    }
+
+    /// The pull, finished: the image of the store with the layers of the
+    /// plan (the storage driver has pulled them).
+    pub(super) async fn commit_planned_image(&self, plan: &Plan) -> ImageResult<()> {
+        if plan.names_only {
+            return self.commit_image(&plan.pull, &plan.manifest, None).await;
         }
-        self.commit_image(&pull, &manifest, Some(&keys)).await?;
-        if keeps {
+        self.commit_image(&plan.pull, &plan.manifest, Some(&plan.keys))
+            .await?;
+        if !self.storage.holds_objects() {
             // (the image is the store's and the pull is gone: what the
             // containers made on the pull do not name is not needed)
-            self.release_engine_copies(Some(&keys)).await;
+            self.release_engine_copies(Some(&plan.keys)).await;
         }
-        stats.duration_ms = start.elapsed().as_millis() as u64;
-        Ok(stats)
+        Ok(())
     }
 
     /// The staged layers of the image that the store lacks, each once, with
@@ -602,157 +598,81 @@ impl ImageService {
         }))
     }
 
-    /// Fetch the files the layers lack into their staging, and commit each layer
-    /// when it is complete (`commit`; else the staging is all that is filled:
-    /// the layers are the driver's to pull from it).  Layers that nothing is
-    /// lacking for are committed first.
-    async fn commit_layers(
+    /// The groups of files to fetch for `layers`, in the order they are
+    /// fetched (the files the startup `profile` names first, in its order),
+    /// with the layers that wait for each, and the bytes and files the store
+    /// and the staging had already.
+    async fn plan_groups(
         &self,
         layers: &Arc<[LazyLayer]>,
         profile: Vec<String>,
-        stats: &mut TransferStats,
-        completion: Completion,
-        commit: bool,
-    ) -> ImageResult<()> {
+    ) -> ImageResult<(Vec<PlanGroup>, (u64, u64))> {
         if layers.is_empty() {
-            return Ok(());
+            return Ok((Vec::new(), (0, 0)));
         }
-        let Completion {
-            permits, progress, ..
-        } = completion;
         let staged = self.staged_files(layers)?;
         let (store, l) = (self.file_store.clone(), layers.clone());
-        let (first, wanted, left) = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let staged = |d: &str| staged.iter().any(|s| s.get_path(d).is_some());
             // the files the startup profile names come first, in its order
             let first = profile_groups(&l, &profile, |d| !store.contains(d) && !staged(d));
             let skip: std::collections::HashSet<String> =
                 first.iter().flat_map(|(_, g)| g.iter().cloned()).collect();
             let wanted = wanted_groups(&l, &store, &staged, GROUP_FILES, GROUP_BYTES, &skip)?;
-            // the files each layer waits for: its own, and those another
-            // layer fetches for it (a content is fetched once)
-            let left: Vec<std::collections::HashSet<String>> = l
+            let reused = wanted.iter().fold((0, 0), |(bytes, files), w| {
+                (bytes + w.reused_bytes, files + w.reused_files)
+            });
+            let positions: Vec<_> = l
                 .iter()
-                .map(|layer| {
-                    layer
-                        .toc
-                        .files()
-                        .into_iter()
-                        .filter(|d| !store.contains(d) && !staged(d))
-                        .collect()
+                .map(|l| velarx_content::pull::window::file_positions(&l.toc))
+                .collect();
+            let size_of = |layer: usize, d: &str| {
+                positions[layer]
+                    .get(d)
+                    .map_or(0, |&at| l[layer].toc.entries[at].size)
+            };
+            let rest = wanted
+                .into_iter()
+                .enumerate()
+                .flat_map(|(i, w)| w.groups.into_iter().map(move |g| (i, g)));
+            let mut groups: Vec<PlanGroup> = first
+                .into_iter()
+                .chain(rest)
+                .map(|(layer, files)| PlanGroup {
+                    layer,
+                    needed_by: Vec::new(),
+                    bytes: files.iter().map(|d| size_of(layer, d)).sum(),
+                    files,
                 })
                 .collect();
-            Ok::<_, ImageError>((first, wanted, left))
+            // the layers wait for the files they lack: their own, and those
+            // another layer fetches for them (a content is fetched once)
+            let mut group_of: std::collections::HashMap<&str, usize> = Default::default();
+            for (g, group) in groups.iter().enumerate() {
+                for d in &group.files {
+                    group_of.insert(d, g);
+                }
+            }
+            let mut needed: Vec<Vec<usize>> = vec![Vec::new(); groups.len()];
+            for (i, layer) in l.iter().enumerate() {
+                for d in layer.toc.files() {
+                    if store.contains(&d) || staged(&d) {
+                        continue;
+                    }
+                    if let Some(&g) = group_of.get(d.as_str()) {
+                        if needed[g].last() != Some(&i) {
+                            needed[g].push(i);
+                        }
+                    }
+                }
+            }
+            for (group, needed_by) in groups.iter_mut().zip(needed) {
+                group.needed_by = needed_by;
+            }
+            Ok::<_, ImageError>((groups, reused))
         })
         .await
-        .map_err(|e| ImageError::Storage(e.to_string()))??;
-        // each layer: what it waits for, and what it has fetched so far
-        let mut waiting = left;
-        for w in &wanted {
-            stats.add(
-                velarx_proto::workload::SOURCE_STORE,
-                w.reused_bytes,
-                w.reused_files,
-            );
-        }
-        let files: Vec<_> = layers
-            .iter()
-            .map(|l| velarx_content::pull::window::file_positions(&l.toc))
-            .collect();
-        let size_of = |layer: usize, d: &str| {
-            files[layer]
-                .get(d)
-                .map_or(0, |&at| layers[layer].toc.entries[at].size)
-        };
-        let mut done = CompletionProgress {
-            layers_total: layers.len() as u64,
-            files_total: wanted.iter().map(|w| w.files_wanted).sum::<u64>()
-                + first.iter().map(|(_, g)| g.len() as u64).sum::<u64>(),
-            bytes_total: wanted.iter().map(|w| w.bytes_wanted).sum::<u64>()
-                + first
-                    .iter()
-                    .flat_map(|(i, g)| g.iter().map(move |d| (*i, d)))
-                    .map(|(i, d)| size_of(i, d))
-                    .sum::<u64>(),
-            ..CompletionProgress::default()
-        };
-        let report = |p: &CompletionProgress| {
-            if let Some(f) = &progress {
-                f(p);
-            }
-        };
-        report(&done);
-        #[allow(clippy::type_complexity)]
-        let mut tasks: tokio::task::JoinSet<
-            ImageResult<(
-                usize,
-                velarx_content::pull::staged_fetch::Walked,
-                Vec<String>,
-                u64,
-            )>,
-        > = tokio::task::JoinSet::new();
-        let rest = wanted
-            .into_iter()
-            .enumerate()
-            .flat_map(|(i, w)| w.groups.into_iter().map(move |g| (i, g)));
-        let keys: Arc<[LayerKey]> = layers.iter().map(|l| l.key).collect();
-        for (i, group) in first.into_iter().chain(rest) {
-            let (this, permits, keys) = (self.clone(), permits.clone(), keys.clone());
-            let key = layers[i].key;
-            let bytes: u64 = group.iter().map(|d| size_of(i, d)).sum();
-            tasks.spawn(async move {
-                let _permit = permits
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| ImageError::Layer("the completion was cancelled".into()))?;
-                this.yield_to_starts(&keys).await;
-                let fetched = this
-                    .stage_lazy(&key, group.clone(), Urgency::Background)
-                    .await?;
-                Ok((i, fetched, group, bytes))
-            });
-        }
-        // (what needed no fetch is complete now)
-        for (layer, _) in layers.iter().zip(&waiting).filter(|(_, w)| w.is_empty()) {
-            if commit {
-                self.commit_layer(layer, layers, Vec::new(), stats).await?;
-            }
-            done.layers_done += 1;
-            report(&done);
-        }
-        while let Some(joined) = tasks.join_next().await {
-            let (_, fetched, group, bytes) =
-                joined.map_err(|e| ImageError::Layer(format!("fetch task: {e}")))??;
-            let sourced: u64 = fetched.sources.iter().map(|s| s.files).sum();
-            for s in &fetched.sources {
-                stats.add(&s.name, s.bytes, s.files);
-            }
-            stats.add(
-                velarx_proto::workload::SOURCE_REGISTRY,
-                fetched.bytes,
-                (group.len() as u64).saturating_sub(sourced),
-            );
-            done.files_done += group.len() as u64;
-            done.bytes_done += bytes;
-            // (the layers that had the group's files to wait for)
-            for (layer, w) in layers
-                .iter()
-                .zip(waiting.iter_mut())
-                .filter(|(_, w)| !w.is_empty())
-            {
-                for d in &group {
-                    w.remove(d);
-                }
-                if w.is_empty() {
-                    if commit {
-                        self.commit_layer(layer, layers, Vec::new(), stats).await?;
-                    }
-                    done.layers_done += 1;
-                }
-            }
-            report(&done);
-        }
-        Ok(())
+        .map_err(|e| ImageError::Storage(e.to_string()))?
     }
 
     /// The staged layers the driver lacks, pulled into it from the files of the
@@ -764,14 +684,15 @@ impl ImageService {
     /// the pull's, the manifest's statements too) and only then records the
     /// layers.  The driver publishes them with its `Commit`; the image is the
     /// caller's to commit.
-    async fn pull_staged(
-        &self,
-        pull: &StagedPull,
-        manifest: &OciManifest,
-        config: &OciConfig,
-        keys: &[LayerKey],
-        layers: &Arc<[LazyLayer]>,
-    ) -> ImageResult<()> {
+    pub(super) async fn pull_staged(&self, plan: &Plan) -> ImageResult<()> {
+        let Plan {
+            pull,
+            manifest,
+            config,
+            keys,
+            layers,
+            ..
+        } = plan;
         if layers.is_empty() {
             return Ok(());
         }
@@ -872,9 +793,6 @@ impl ImageService {
             self.db.commit_layers(vec![commit], Vec::new()).await?;
             debug!("Layer {} pulled into the storage driver", layer.key);
         }
-        for layer in layers.iter() {
-            self.release_layer(&layer.key).await;
-        }
         Ok(())
     }
 
@@ -894,12 +812,11 @@ impl ImageService {
     /// the transaction, so a collection never removes what is linked and not
     /// yet referenced.  A layer that another process committed first is
     /// kept as it is, when it has this image's diff id.
-    async fn commit_layer(
+    pub(super) async fn commit_layer(
         &self,
         layer: &LazyLayer,
         all: &[LazyLayer],
         chunks: Vec<velarx_db::ChunkLocation>,
-        stats: &mut TransferStats,
     ) -> ImageResult<()> {
         // The files and the image of the layer are verified first, with no
         // lock held (the reads and hashes of the commit are all here): the
@@ -921,9 +838,6 @@ impl ImageService {
                 )));
             }
             if state.is_stored_as(&layer.diff_id) {
-                stats.layers_cached += 1;
-                drop((store, one));
-                self.release_layer(&layer.key).await;
                 return Ok(());
             }
         }
@@ -978,7 +892,6 @@ impl ImageService {
         self.db.commit_layers(vec![commit], Vec::new()).await?;
         debug!("Layer {} committed to the store", layer.key);
         drop(held);
-        self.release_layer(&layer.key).await;
         Ok(())
     }
 
@@ -987,7 +900,7 @@ impl ImageService {
     /// staging end (of this process too: another completion may still
     /// fetch a file the store had from another layer); called with no lock
     /// of the commit held, which a holder of the lease may wait for.
-    async fn release_layer(&self, key: &LayerKey) {
+    pub(super) async fn release_layer(&self, key: &LayerKey) {
         let (area, k) = (self.staging_area(), *key);
         let removed = tokio::task::spawn_blocking(move || area.remove_layer(&k)).await;
         self.forget_lazy(key).await;
@@ -1550,6 +1463,7 @@ struct Refused {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+    use velarx_content::fetcher::fetch::Urgency;
 
     /// The locks of a commit are let go when the thread that links ends, not
     /// when the task that waits for it is dropped.
@@ -2272,10 +2186,9 @@ mod tests {
         );
     }
 
-    /// The completion of a layer of many files asks the size of each file
-    /// once and finds it at once: the time does not grow with the square of
-    /// the number of files.  (No fetcher is registered: the completion
-    /// fails at its first fetch, after it has sized every group.)
+    /// The groups of a layer of many files ask the size of each file once
+    /// and find it at once: the time does not grow with the square of the
+    /// number of files.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_completion_of_a_layer_of_many_files_is_not_quadratic() {
         const FILES: usize = 6_000;
@@ -2304,12 +2217,8 @@ mod tests {
             .map(|i| format!("fsverity-sha256-12:{i:064x}"))
             .collect();
         let started = std::time::Instant::now();
-        let mut stats = TransferStats::default();
-        let completion = Completion::new(&velarx_config::PullConfig::default());
-        let failed = service
-            .commit_layers(&layers, profile, &mut stats, completion, false)
-            .await;
-        assert!(failed.is_err());
+        let (groups, _) = service.plan_groups(&layers, profile).await.unwrap();
+        assert_eq!(groups.iter().map(|g| g.files.len()).sum::<usize>(), FILES);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "{:?}",

@@ -179,7 +179,6 @@ pub use pause::{infra_image_name, pause_image_name};
 mod pull;
 mod pull_origin;
 mod pulls;
-pub use lazy::{Completion, CompletionProgress};
 use pulls::pulling_error;
 pub use pulls::PullInfo;
 mod push;

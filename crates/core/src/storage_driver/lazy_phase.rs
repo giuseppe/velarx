@@ -13,7 +13,7 @@
 //! the containers made on it; everything else is the service's.  The service
 //! sees nothing of the lazy phase: when the files are all in the pool of the
 //! staging area the engine pulls the layers into the service as an eager pull
-//! does, from the pool (`ImageService::complete_pull`).
+//! does, from the pool (`ImageService::pull_staged`).
 //!
 //! `lazy` is a capability the engine gives the service (the service does not
 //! say it); a layer that cannot be served lazily (it is not a zstd:chunked

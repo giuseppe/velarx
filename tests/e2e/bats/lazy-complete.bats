@@ -60,9 +60,17 @@ EOF
           sh_ image push --tls-verify=false --compression-format zstd:chunked "$sealed:gzip" "$sealed:zstd"
         } > "$WORKDIR/seal.log" 2>&1 || { echo "cannot make the image"; cat "$WORKDIR/seal.log"; exit 1; }
         IMAGE=$sealed:zstd
+        # (another image of the same layer, with one of its own that has
+        # a file of it again)
+        printf 'FROM %s\nRUN cp /bin/busybox /busybox-again\n' "$sealed:gzip" > "$WORKDIR/Containerfile"
+        { sh_ build -t "$sealed-shared:gzip" -f "$WORKDIR/Containerfile" "$WORKDIR" &&
+          sh_ image push --tls-verify=false --compression-format zstd:chunked "$sealed-shared:gzip" "$sealed-shared:zstd"
+        } > "$WORKDIR/shared.log" 2>&1 || { echo "cannot make the second image"; cat "$WORKDIR/shared.log"; exit 1; }
+        SHARED=$sealed-shared:zstd
         fresh_store
     fi
     echo "IMAGE=$IMAGE" > "$WORKDIR/vars"
+    echo "SHARED=${SHARED:-}" >> "$WORKDIR/vars"
 }
 
 teardown_file () {
@@ -242,6 +250,24 @@ lease_held () {
     check "no pull is left" "" "$(sh_ image pulls -q)"
     check "the image is in the store" 1 "$(db 'SELECT count(*) FROM images')"
     check_match "the files are in the store" "^[1-9][0-9]*$" "$(files_in_store)"
+}
+
+@test "two images that share a layer, the second with a layer that repeats a file of it, completed at once, both end in the store" {
+    [ -n "$SHARED" ] || skip "no second image"
+    fresh_store
+    sh_ image pull --lazy --tls-verify=false "$IMAGE" > /dev/null 2>&1
+    sh_ image pull --lazy --tls-verify=false "$SHARED" > /dev/null 2>&1
+    check "two pulls" 2 "$(sh_ image pulls -q | wc -l)"
+    sh_ image complete "$IMAGE" > /dev/null 2>&1 &
+    local first=$!
+    sh_ image complete "$SHARED" > /dev/null 2>&1
+    check "the second completes" 0 $?
+    wait "$first"
+    check "the first completes" 0 $?
+    check "no pull is left" "" "$(sh_ image pulls -q)"
+    check "both images are in the store" 2 "$(db 'SELECT count(*) FROM images')"
+    check "the layer of the first is the second's, which has one more" 2 "$(db 'SELECT count(*) FROM layers')"
+    check "the staging area is empty" "0 0" "$(files_in_pool) $(staged_layers)"
 }
 
 @test "a lazy pull of an image whose layer is marked incomplete repairs the layer" {

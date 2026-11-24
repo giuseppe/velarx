@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-lazy-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The decisions of the completion of lazy pulls, as a state machine with no I/O"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# `step` takes an event and says what to do: no dependency, no async, no
+# clock, no file system.  The shell that performs the actions is in
+# `velarx-core` (services/image/completer.rs).
+
+[lib]
+name = "velarx_lazy_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
