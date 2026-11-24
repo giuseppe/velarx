@@ -812,13 +812,8 @@ impl ImageService {
             None => SignaturePolicy::load_default(),
         }
         .map_err(|e| ImageError::Registry(format!("cannot read the signature policy: {e}")))?;
-        let (scope, requirements) = policy.scoped_requirements_for(
-            "docker",
-            &image_ref.registry,
-            &image_ref.repository,
-            image_ref.tag.as_deref(),
-            image_ref.digest.map(|d| d.to_string()).as_deref(),
-        );
+        let (scope, requirements) =
+            policy.scoped_requirements_for("docker", &signatures::intended(image_ref)?);
         if requirements.is_empty() {
             return Err(ImageError::Registry(format!(
                 "no signature policy applies to {}",

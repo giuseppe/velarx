@@ -268,14 +268,14 @@ pub fn policy(data: &[u8]) {
         return;
     };
     if let Ok(p) = velarx_signature::SignaturePolicy::parse(s) {
-        let _ = p.requirements_for(
-            "docker",
-            "docker.io",
-            "library/alpine",
-            Some("latest"),
-            None,
-        );
-        let _ = p.requirements_for("docker", "localhost:5000", "a/b", None, Some("sha256:00"));
+        for name in [
+            "docker.io/library/alpine:latest",
+            "localhost:5000/a/b@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            if let Ok(reference) = velarx_signature::reference::DockerRef::parse_normalized(name) {
+                let _ = p.requirements_for("docker", &reference);
+            }
+        }
     }
 }
 

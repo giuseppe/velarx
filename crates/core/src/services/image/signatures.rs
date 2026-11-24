@@ -742,6 +742,124 @@ mod tests {
         assert_eq!(resolved(&service, "acme/app:1").await.unwrap(), None);
     }
 
+    /// A service whose policy is `policy` (the JSON text).
+    async fn with_policy(policy: &str) -> (tempfile::TempDir, ImageService) {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("policy.json");
+        std::fs::write(&file, policy).unwrap();
+        let db = velarx_db::Database::open_in_memory().await.unwrap();
+        let store = Arc::new(velarx_storage::FileStore::new(tmp.path().join("objects")).unwrap());
+        let service = ImageService::new(
+            db,
+            store,
+            tmp.path().join("pulls"),
+            velarx_storage::VerityMode::Off,
+        )
+        .unwrap()
+        .with_pull_config(velarx_config::PullConfig {
+            policy_path: Some(file),
+            ..Default::default()
+        })
+        .unwrap();
+        (tmp, service)
+    }
+
+    fn scope_of(service: &ImageService, name: &str) -> String {
+        service
+            .scoped_requirements_of(&ImageReference::parse(name).unwrap())
+            .unwrap()
+            .0
+    }
+
+    /// The four spellings of the one image of Docker Hub are in the scopes
+    /// of its name, whichever way the policy writes them.
+    #[tokio::test]
+    async fn the_spellings_of_a_docker_hub_image_have_one_scope() {
+        let spellings = [
+            "alpine",
+            "docker.io/alpine",
+            "docker.io/library/alpine",
+            "index.docker.io/library/alpine",
+        ];
+        for scope in ["docker.io/library/alpine", "docker.io/library"] {
+            let (_tmp, service) = with_policy(&format!(
+                r#"{{"default": [{{"type": "insecureAcceptAnything"}}],
+                    "transports": {{"docker": {{"{scope}": [{{"type": "reject"}}]}}}}}}"#
+            ))
+            .await;
+            for name in spellings {
+                assert_eq!(
+                    scope_of(&service, name),
+                    format!("scope {scope}"),
+                    "{name} against {scope}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_uppercase_host_is_a_scope_of_its_own() {
+        let (_tmp, service) = with_policy(
+            r#"{"default": [{"type": "insecureAcceptAnything"}],
+                "transports": {"docker": {"quay.io/x": [{"type": "reject"}]}}}"#,
+        )
+        .await;
+        assert_eq!(scope_of(&service, "quay.io/x/y"), "scope quay.io/x");
+        // as upstream: the host is not lowercased
+        assert_eq!(scope_of(&service, "Quay.io/x/y"), "the default");
+    }
+
+    /// The image `quay.io/x/y:1`, as the create and the start judge it.
+    async fn judged(policy: &str, judging: SignatureJudging) -> ImageResult<()> {
+        let (_tmp, service) = with_policy(policy).await;
+        let manifest = "{}".to_string();
+        let digest = Digest::of(velarx_types::digest::Algorithm::Sha256, manifest.as_bytes());
+        let image = velarx_db::ImageRecord {
+            id: "0".repeat(64),
+            manifest_digest: digest,
+            config_digest: digest,
+            manifest,
+            config: "{}".into(),
+            created_at: String::new(),
+            is_lazy: false,
+        };
+        let tags = [ImageTag {
+            repository: "quay.io/x/y".into(),
+            tag: "1".into(),
+            image_id: image.id.clone(),
+        }];
+        service
+            .verify_pulled("quay.io/x/y:1", &image, &tags, judging, Vec::new())
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_scope_with_only_a_signed_base_layer_at_create_and_start() {
+        let policy = r#"{"default": [{"type": "insecureAcceptAnything"}],
+            "transports": {"docker": {"quay.io/x": [{"type": "signedBaseLayer",
+                "baseLayerIdentity": {"type": "matchRepository"}}]}}}"#;
+        judged(policy, SignatureJudging::Policy).await.unwrap();
+        // as it is today: wrong, fixed by the next commit
+        judged(policy, SignatureJudging::Check).await.unwrap();
+        judged(policy, SignatureJudging::Require("why"))
+            .await
+            .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn a_reject_at_create_and_start() {
+        let policy = r#"{"default": [{"type": "insecureAcceptAnything"}],
+            "transports": {"docker": {"quay.io/x": [{"type": "reject"}]}}}"#;
+        // (documented: in this mode `reject` is for pulls only)
+        judged(policy, SignatureJudging::Policy).await.unwrap();
+        let e = judged(policy, SignatureJudging::Check).await.unwrap_err();
+        assert!(e.to_string().contains("rejects it"), "{e}");
+        let e = judged(policy, SignatureJudging::Require("why"))
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("rejects it"), "{e}");
+    }
+
     #[test]
     fn the_intended_reference_keeps_tag_and_digest() {
         let r = intended(&ImageReference::parse("busybox").unwrap()).unwrap();

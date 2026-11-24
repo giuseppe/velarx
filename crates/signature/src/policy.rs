@@ -16,6 +16,7 @@
 //!   }
 //! }
 
+use super::reference::DockerRef;
 use super::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -259,19 +260,13 @@ impl SignaturePolicy {
     /// The policy requirements for an image, like containers/image: the
     /// scope of the image with its tag or digest, of the repository, of
     /// each parent namespace up to the registry, of the `*.domain`
-    /// wildcards of the registry host (without a port), the default of
-    /// the transport, and last the default.  Scopes are names, compared
-    /// whole: `localhost` is not a scope of `localhost:5000/img`.
-    pub fn requirements_for(
-        &self,
-        transport: &str,
-        registry: &str,
-        repository: &str,
-        tag: Option<&str>,
-        digest: Option<&str>,
-    ) -> &[PolicyRequirement] {
-        self.scoped_requirements_for(transport, registry, repository, tag, digest)
-            .1
+    /// wildcards of the registry host (the port is not part of what they
+    /// match), the default of the transport, and last the default.  Scopes
+    /// are names, compared whole: `localhost` is not a scope of
+    /// `localhost:5000/img`.  `reference` is normalized, so the scope sees
+    /// the name that the identity of a signature is compared with.
+    pub fn requirements_for(&self, transport: &str, reference: &DockerRef) -> &[PolicyRequirement] {
+        self.scoped_requirements_for(transport, reference).1
     }
 
     /// Like [`Self::requirements_for`], with the scope that applies, as a
@@ -279,16 +274,13 @@ impl SignaturePolicy {
     pub fn scoped_requirements_for(
         &self,
         transport: &str,
-        registry: &str,
-        repository: &str,
-        tag: Option<&str>,
-        digest: Option<&str>,
+        reference: &DockerRef,
     ) -> (String, &[PolicyRequirement]) {
         let Some(scopes) = self.transports.get(transport) else {
             return ("the default".to_string(), &self.default);
         };
-        let name = format!("{registry}/{repository}");
-        let full = match (digest, tag) {
+        let name = reference.name();
+        let full = match (&reference.digest, &reference.tag) {
             (Some(d), _) => Some(format!("{name}@{d}")),
             (None, Some(t)) => Some(format!("{name}:{t}")),
             _ => None,
@@ -302,13 +294,15 @@ impl SignaturePolicy {
                 None => break,
             }
         }
-        if !registry.contains(':') {
-            candidates.extend(
-                registry
-                    .match_indices('.')
-                    .map(|(i, _)| format!("*{}", &registry[i..])),
-            );
-        }
+        // (the port is not part of what `*.domain` matches)
+        let host = reference
+            .domain
+            .split_once(':')
+            .map_or(reference.domain.as_str(), |(h, _)| h);
+        candidates.extend(
+            host.match_indices('.')
+                .map(|(i, _)| format!("*{}", &host[i..])),
+        );
         candidates.push(String::new());
         for scope in candidates {
             if let Some(reqs) = scopes.get(&scope) {
@@ -356,7 +350,7 @@ mod tests {
         let p = SignaturePolicy::load_first(&[d.path().join("a.json"), d.path().join("b.json")])
             .unwrap();
         assert!(matches!(
-            p.requirements_for("docker", "quay.io", "a/b", Some("1"), None),
+            p.requirements_for("docker", &dref("quay.io/a/b:1")),
             [PolicyRequirement::InsecureAcceptAnything]
         ));
     }
@@ -376,6 +370,13 @@ mod tests {
     }
 
     use super::*;
+
+    const DEAD: &str = "sha256:deaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddead";
+    const BEEF: &str = "sha256:beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+
+    fn dref(name: &str) -> DockerRef {
+        DockerRef::parse_normalized(name).unwrap()
+    }
 
     #[test]
     fn test_default_policy() {
@@ -419,7 +420,7 @@ mod tests {
         }"#;
 
         let policy: SignaturePolicy = serde_json::from_str(json).unwrap();
-        let reqs = policy.requirements_for("docker", "registry.example.com", "myimage", None, None);
+        let reqs = policy.requirements_for("docker", &dref("registry.example.com/myimage"));
         assert_eq!(reqs.len(), 1);
         assert!(matches!(reqs[0], PolicyRequirement::SignedBy { .. }));
     }
@@ -442,7 +443,7 @@ mod tests {
         }"#;
 
         let policy: SignaturePolicy = serde_json::from_str(json).unwrap();
-        let reqs = policy.requirements_for("docker", "ghcr.io", "myorg/myimage", None, None);
+        let reqs = policy.requirements_for("docker", &dref("ghcr.io/myorg/myimage"));
         assert_eq!(reqs.len(), 1);
         assert!(matches!(reqs[0], PolicyRequirement::SigstoreSigned { .. }));
     }
@@ -451,7 +452,7 @@ mod tests {
     fn test_find_requirements_fallback() {
         let policy = SignaturePolicy::default();
 
-        let reqs = policy.requirements_for("docker", "unknown.registry.io", "myimage", None, None);
+        let reqs = policy.requirements_for("docker", &dref("unknown.registry.io/myimage"));
         assert_eq!(reqs.len(), 1);
         assert!(matches!(reqs[0], PolicyRequirement::InsecureAcceptAnything));
     }
@@ -469,7 +470,7 @@ mod tests {
         .unwrap();
         let ok = |r: &str, repo: &str| {
             matches!(
-                policy.requirements_for("docker", r, repo, None, None),
+                policy.requirements_for("docker", &dref(&format!("{r}/{repo}"))),
                 [PolicyRequirement::InsecureAcceptAnything]
             )
         };
@@ -488,26 +489,153 @@ mod tests {
             r#"{"default":[{"type":"insecureAcceptAnything"}],
                 "transports":{"docker":{
                   "quay.io/org/img:bad":[{"type":"reject"}],
-                  "quay.io/org/img@sha256:dead":[{"type":"reject"}],
+                  "quay.io/org/img@sha256:deaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddead":[{"type":"reject"}],
                   "localhost":[{"type":"reject"}],
                   "*.evil.io":[{"type":"reject"}]}}}"#,
         )
         .unwrap();
-        let rejected = |r: &str, repo: &str, tag: Option<&str>, digest: Option<&str>| {
+        let rejected = |name: &str| {
             matches!(
-                policy.requirements_for("docker", r, repo, tag, digest),
+                policy.requirements_for("docker", &dref(name)),
                 [PolicyRequirement::Reject]
             )
         };
-        assert!(rejected("quay.io", "org/img", Some("bad"), None));
-        assert!(!rejected("quay.io", "org/img", Some("good"), None));
-        assert!(rejected("quay.io", "org/img", None, Some("sha256:dead")));
-        assert!(!rejected("quay.io", "org/img", None, Some("sha256:beef")));
-        assert!(rejected("localhost", "img", None, None));
-        assert!(!rejected("localhost:5000", "img", None, None));
-        assert!(rejected("a.b.evil.io", "img", None, None));
-        assert!(!rejected("evil.io", "img", None, None));
-        assert!(!rejected("evil.io:443", "img", None, None));
+        assert!(rejected("quay.io/org/img:bad"));
+        assert!(!rejected("quay.io/org/img:good"));
+        assert!(rejected(&format!("quay.io/org/img@{DEAD}")));
+        assert!(!rejected(&format!("quay.io/org/img@{BEEF}")));
+        assert!(rejected("localhost/img"));
+        assert!(!rejected("localhost:5000/img"));
+        assert!(rejected("a.b.evil.io/img"));
+        assert!(!rejected("evil.io/img"));
+        assert!(!rejected("evil.io:443/img"));
+    }
+
+    /// The scope that applies to `name`, or `the default`.
+    fn scope_of(policy: &SignaturePolicy, name: &str) -> String {
+        policy.scoped_requirements_for("docker", &dref(name)).0
+    }
+
+    /// A policy with these scopes, each with a requirement.
+    fn with_scopes(scopes: &[&str]) -> SignaturePolicy {
+        let body: Vec<String> = scopes
+            .iter()
+            .map(|s| format!(r#""{s}": [{{"type": "reject"}}]"#))
+            .collect();
+        SignaturePolicy::parse(&format!(
+            r#"{{"default": [{{"type": "insecureAcceptAnything"}}],
+                "transports": {{"docker": {{{}}}}}}}"#,
+            body.join(",")
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_scopes_are_tried_from_the_most_specific() {
+        let by_digest = format!("a.b.io/x/y/z@{DEAD}");
+        let order = [
+            by_digest.as_str(),
+            "a.b.io/x/y/z",
+            "a.b.io/x/y",
+            "a.b.io/x",
+            "a.b.io",
+            "*.b.io",
+            "*.io",
+            "",
+        ];
+        for first in 0..order.len() {
+            let policy = with_scopes(&order[first..]);
+            let got = scope_of(&policy, &by_digest);
+            let want = match order[first] {
+                "" => "the default of the docker transport".to_string(),
+                s => format!("scope {s}"),
+            };
+            assert_eq!(got, want, "without {:?}", &order[..first]);
+        }
+        // the tag in the place of the digest
+        let policy = with_scopes(&["a.b.io/x/y/z:1", "a.b.io/x/y/z"]);
+        assert_eq!(scope_of(&policy, "a.b.io/x/y/z:1"), "scope a.b.io/x/y/z:1");
+        assert_eq!(scope_of(&policy, "a.b.io/x/y/z:2"), "scope a.b.io/x/y/z");
+        // another transport, and no scope at all: the global default
+        let policy = with_scopes(&["a.b.io"]);
+        assert_eq!(
+            policy.scoped_requirements_for("dir", &dref("a.b.io/x")).0,
+            "the default"
+        );
+        assert_eq!(scope_of(&policy, "c.io/x"), "the default");
+    }
+
+    #[test]
+    fn a_wildcard_scope_of_a_host_with_a_port() {
+        let policy = with_scopes(&["*.corp.example"]);
+        assert_eq!(
+            scope_of(&policy, "reg.corp.example/x"),
+            "scope *.corp.example"
+        );
+        assert_eq!(
+            scope_of(&policy, "reg.corp.example:5000/x"),
+            "scope *.corp.example"
+        );
+        // (a wildcard covers the strict subdomains: not `corp.example`)
+        assert_eq!(scope_of(&policy, "corp.example:5000/x"), "the default");
+        // a scope written with a port matches that host and port only
+        let policy = with_scopes(&["reg.x:5000/ns"]);
+        assert_eq!(scope_of(&policy, "reg.x:5000/ns/a"), "scope reg.x:5000/ns");
+        assert_eq!(scope_of(&policy, "reg.x:5001/ns/a"), "the default");
+    }
+
+    #[test]
+    fn a_scope_covers_whole_components_only() {
+        let policy = with_scopes(&["x.io/ab"]);
+        assert_eq!(scope_of(&policy, "x.io/a"), "the default");
+        assert_eq!(scope_of(&policy, "x.io/ab/c"), "scope x.io/ab");
+        assert_eq!(scope_of(&policy, "x.io/abc"), "the default");
+        let policy = with_scopes(&["x.io/a"]);
+        assert_eq!(scope_of(&policy, "x.io/ab"), "the default");
+        assert_eq!(scope_of(&policy, "x.io/a/b"), "scope x.io/a");
+        let policy = with_scopes(&["x.io"]);
+        assert_eq!(scope_of(&policy, "x.io:5000/a"), "the default");
+        assert_eq!(scope_of(&policy, "xx.io/a"), "the default");
+    }
+
+    #[test]
+    fn a_host_is_compared_as_written() {
+        // containers/image lowercases nothing either
+        let policy = with_scopes(&["quay.io/x"]);
+        assert_eq!(scope_of(&policy, "quay.io/x/y"), "scope quay.io/x");
+        assert_eq!(scope_of(&policy, "Quay.io/x/y"), "the default");
+    }
+
+    #[test]
+    fn a_policy_path_that_is_a_dangling_symlink_or_cannot_be_read() {
+        let d = tempfile::tempdir().unwrap();
+        let link = d.path().join("policy.json");
+        std::os::unix::fs::symlink(d.path().join("nowhere"), &link).unwrap();
+        // as it is today: wrong, fixed by the next commit
+        assert!(SignaturePolicy::load_first(&[link]).is_ok());
+        // a directory in the place of the file cannot be read
+        let dir = d.path().join("dir.json");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(SignaturePolicy::load_first(&[dir]).is_err());
+        // a path under a file cannot even be looked at
+        let file = d.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        // as it is today: wrong, fixed by the next commit
+        assert!(SignaturePolicy::load_first(&[file.join("policy.json")]).is_ok());
+    }
+
+    #[test]
+    fn a_duplicated_key_of_the_policy() {
+        // the last one wins, as the JSON parser does; containers/image
+        // refuses such a file
+        let policy = SignaturePolicy::parse(
+            r#"{"default": [{"type": "reject"}], "default": [{"type": "insecureAcceptAnything"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            policy.default[..],
+            [PolicyRequirement::InsecureAcceptAnything]
+        ));
     }
 
     #[test]
