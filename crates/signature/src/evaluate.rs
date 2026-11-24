@@ -455,7 +455,8 @@ mod tests {
         };
     }
 
-    const NOW: i64 = 1_791_739_600;
+    /// After all the gpg fixtures were made: a signature made later is refused.
+    const NOW: i64 = 1_791_743_000;
 
     fn reqs(json: &str) -> Vec<PolicyRequirement> {
         let p = SignaturePolicy::parse(&format!(r#"{{"default": {json}}}"#)).unwrap();

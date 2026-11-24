@@ -186,6 +186,13 @@ pub struct Key {
     /// epoch), and whether it is revoked.
     primary_expires_at: Option<u64>,
     primary_revoked: bool,
+    /// When the first of the signatures that make it a key expires
+    /// (seconds since the epoch): its self-signature, and for a subkey
+    /// also its binding, its back-signature and the self-signature of
+    /// its primary key.
+    sigs_expire_at: Option<u64>,
+    /// When the last of them was made.
+    sigs_made_at: Option<u64>,
 }
 
 impl std::fmt::Debug for Key {
@@ -437,6 +444,18 @@ impl Key {
                 return Some(format!("the key {} is expired", self.fingerprint));
             }
         }
+        if self.sigs_made_at.is_some_and(|t| t > now) {
+            return Some(format!(
+                "the key {} has a self-signature made in the future",
+                self.fingerprint
+            ));
+        }
+        if self.sigs_expire_at.is_some_and(|t| t <= now) {
+            return Some(format!(
+                "the key {} has an expired self-signature",
+                self.fingerprint
+            ));
+        }
         if self.primary_revoked {
             return Some(format!("the primary key {} is revoked", self.primary));
         }
@@ -563,7 +582,16 @@ fn new_key(body: &[u8], primary: Option<&str>) -> Result<Option<Key>, Error> {
         can_sign: false,
         primary_expires_at: None,
         primary_revoked: false,
+        sigs_expire_at: None,
+        sigs_made_at: None,
     }))
+}
+
+/// When `sig` expires, if it does (seconds since the epoch).
+fn expires_at(sig: &Signature) -> Option<u64> {
+    let created = sig.sub.created?;
+    let lifetime = sig.sub.expires.filter(|e| *e != 0)?;
+    Some(u64::from(created) + u64::from(lifetime))
 }
 
 /// Whether `raw` is a signature of type `types` by `by` over `data`; any
@@ -627,6 +655,8 @@ fn parse_keys(data: &[u8], keys: &mut Vec<Key>) -> Result<(), Error> {
         if let Some(sig) = &newest {
             primary.expires = sig.sub.key_expires;
             primary.can_sign = sig.sub.key_flags.is_none_or(|f| f & 0x02 != 0);
+            primary.sigs_expire_at = expires_at(sig);
+            primary.sigs_made_at = sig.sub.created.map(u64::from);
         }
         let primary_expires_at = primary
             .expires
@@ -661,12 +691,28 @@ fn parse_keys(data: &[u8], keys: &mut Vec<Key>) -> Result<(), Error> {
             // a subkey signs when its binding says so and it signed the
             // binding back
             let signs = binding.sub.key_flags.is_some_and(|f| f & 0x02 != 0);
-            sub.can_sign = signs
-                && binding
-                    .sub
-                    .embedded
-                    .iter()
-                    .any(|raw| verified(&sub, raw, &[0x19], &data).is_some());
+            let back = binding
+                .sub
+                .embedded
+                .iter()
+                .find_map(|raw| verified(&sub, raw, &[0x19], &data));
+            sub.can_sign = signs && back.is_some();
+            sub.sigs_expire_at = [
+                primary.sigs_expire_at,
+                expires_at(&binding),
+                back.as_ref().and_then(expires_at),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            sub.sigs_made_at = [
+                primary.sigs_made_at,
+                binding.sub.created.map(u64::from),
+                back.as_ref().and_then(|b| b.sub.created.map(u64::from)),
+            ]
+            .into_iter()
+            .flatten()
+            .max();
             subkeys.push(sub);
         }
         if !has_self_sig {
@@ -825,6 +871,11 @@ pub fn verify_message(keys: &[Key], message: &[u8], now: u64) -> Result<(Vec<u8>
             why.push("a signature without its creation time".to_string());
             continue;
         };
+        // as go-crypto: no allowance for a clock that is behind
+        if u64::from(created) > now {
+            why.push("the signature is made in the future".to_string());
+            continue;
+        }
         if let Some(e) = sig.sub.expires.filter(|e| *e != 0) {
             if u64::from(created) + u64::from(e) <= now {
                 why.push("the signature is expired".to_string());
@@ -1384,31 +1435,31 @@ mod tests {
         body
     }
 
-    /// A keyring of one Ed25519 key whose user ID is certified with the
-    /// key flags subpacket `flags` (none: no such subpacket), and a signed
-    /// message of `PAYLOAD` by it; `cert_extra` and `msg_extra` are more
-    /// hashed subpackets of the two signatures.
-    fn self_made(flags: Option<&[u8]>, cert_extra: &[u8], msg_extra: &[u8]) -> (Vec<Key>, Vec<u8>) {
+    /// A keyring of one Ed25519 key whose user IDs are certified by
+    /// `certs`: the number of the user ID (0 or 1), the creation time of
+    /// the self-signature and its hashed subpackets after that; and a signed
+    /// message of `PAYLOAD` by it with `msg_extra` hashed subpackets.
+    fn certified(certs: &[(usize, u32, &[u8])], msg_extra: &[u8]) -> (Vec<Key>, Vec<u8>) {
         let key = PKey::generate_ed25519().unwrap();
-        let created = (NOW - 1000) as u32;
         let mut public = vec![4];
-        public.extend_from_slice(&created.to_be_bytes());
+        public.extend_from_slice(&((NOW - 3000) as u32).to_be_bytes());
         public.push(ALGO_ED25519);
         public.extend(key.raw_public_key().unwrap());
-        let uid = b"a <a@example.com>";
-        let mut data = framed_key(&public).unwrap();
-        data.extend(framed_id(TAG_USER_ID, uid).unwrap());
-        let mut hashed = sp(2, &created.to_be_bytes());
-        if let Some(f) = flags {
-            hashed.extend(sp(27, f));
-        }
-        hashed.extend_from_slice(cert_extra);
+        let uids: [&[u8]; 2] = [b"a <a@example.com>", b"b <b@example.com>"];
         let mut ring = packet(TAG_PUBLIC_KEY, &public);
-        ring.extend(packet(TAG_USER_ID, uid));
-        ring.extend(packet(
-            TAG_SIGNATURE,
-            &ed_signature(&key, 0x13, &data, &hashed),
-        ));
+        for (i, uid) in uids.iter().enumerate() {
+            ring.extend(packet(TAG_USER_ID, uid));
+            let mut data = framed_key(&public).unwrap();
+            data.extend(framed_id(TAG_USER_ID, uid).unwrap());
+            for (_, created, extra) in certs.iter().filter(|c| c.0 == i) {
+                let mut hashed = sp(2, &created.to_be_bytes());
+                hashed.extend_from_slice(extra);
+                ring.extend(packet(
+                    TAG_SIGNATURE,
+                    &ed_signature(&key, 0x13, &data, &hashed),
+                ));
+            }
+        }
         let mut hashed = sp(2, &(NOW as u32).to_be_bytes());
         hashed.extend_from_slice(msg_extra);
         let mut msg = literal(PAYLOAD);
@@ -1417,6 +1468,16 @@ mod tests {
             &ed_signature(&key, 0, PAYLOAD, &hashed),
         ));
         (parse_keyring(&ring).unwrap(), msg)
+    }
+
+    /// A keyring of one Ed25519 key whose user ID is certified with the
+    /// key flags subpacket `flags` (none: no such subpacket), and a signed
+    /// message of `PAYLOAD` by it; `cert_extra` and `msg_extra` are more
+    /// hashed subpackets of the two signatures.
+    fn self_made(flags: Option<&[u8]>, cert_extra: &[u8], msg_extra: &[u8]) -> (Vec<Key>, Vec<u8>) {
+        let mut extra = flags.map(|f| sp(27, f)).unwrap_or_default();
+        extra.extend_from_slice(cert_extra);
+        certified(&[(0, (NOW - 1000) as u32, &extra)], msg_extra)
     }
 
     /// A keyring of an Ed25519 primary key that certifies and a signing
@@ -1521,6 +1582,89 @@ mod tests {
         // without it the subkey signs
         let (k, msg) = with_subkey(&[], &plain, &plain);
         verify_message(&k, &msg, NOW).unwrap();
+    }
+
+    #[test]
+    fn a_signature_made_after_now_is_refused() {
+        let (k, msg) = self_made(None, &[], &[]);
+        verify_message(&k, &msg, NOW).unwrap();
+        verify_message(&k, &msg, NOW + 1).unwrap();
+        for now in [NOW - 1, NOW - 100_000] {
+            let e = verify_message(&k, &msg, now).unwrap_err();
+            assert!(e.0.contains("made in the future"), "{e}");
+        }
+    }
+
+    /// A signature lifetime subpacket.
+    fn lifetime(secs: u32) -> Vec<u8> {
+        sp(3, &secs.to_be_bytes())
+    }
+
+    #[test]
+    fn an_expired_signature_of_a_key_makes_it_unusable() {
+        // made 1000 seconds before NOW
+        let (alive, gone) = (lifetime(5000), lifetime(500));
+        let (k, msg) = self_made(None, &alive, &[]);
+        verify_message(&k, &msg, NOW).unwrap();
+        let (k, msg) = self_made(None, &gone, &[]);
+        let e = verify_message(&k, &msg, NOW).unwrap_err();
+        assert!(e.0.contains("expired self-signature"), "{e}");
+        // 0 is no expiry
+        let (k, msg) = self_made(None, &lifetime(0), &[]);
+        verify_message(&k, &msg, NOW).unwrap();
+        // a subkey: its binding, its back-signature, the self-signature of
+        // its primary key
+        let none = &[][..];
+        let (k, msg) = with_subkey(none, none, none);
+        assert_eq!(k.len(), 2);
+        verify_message(&k, &msg, NOW).unwrap();
+        let (k, msg) = with_subkey(&alive, &alive, &alive);
+        verify_message(&k, &msg, NOW).unwrap();
+        for (primary, binding, back) in [
+            (&gone, &alive, &alive),
+            (&alive, &gone, &alive),
+            (&alive, &alive, &gone),
+        ] {
+            let (k, msg) = with_subkey(primary, binding, back);
+            let e = verify_message(&k, &msg, NOW).unwrap_err();
+            assert!(e.0.contains("expired self-signature"), "{e}");
+        }
+    }
+
+    #[test]
+    fn the_newest_self_signature_says_when_the_key_expires() {
+        let (long_ago, last) = ((NOW - 2000) as u32, (NOW - 1000) as u32);
+        // a key that is routinely extended: the old self-signature has
+        // expired, with an expiry of the key and of the signature, and the
+        // newer one has none
+        let mut old = lifetime(500);
+        old.extend(sp(9, &100u32.to_be_bytes()));
+        let (k, msg) = certified(&[(0, long_ago, &old), (0, last, &[])], &[]);
+        verify_message(&k, &msg, NOW).unwrap();
+        // on another user ID: the newest of all counts
+        let (k, msg) = certified(&[(0, long_ago, &old), (1, last, &[])], &[]);
+        verify_message(&k, &msg, NOW).unwrap();
+        // and the other way round, the old one is not the newest
+        let (k, msg) = certified(&[(0, last, &[]), (1, long_ago, &old)], &[]);
+        verify_message(&k, &msg, NOW).unwrap();
+        // a newest that has expired makes the key unusable
+        let (k, msg) = certified(&[(0, long_ago, &[]), (1, last, &lifetime(500))], &[]);
+        let e = verify_message(&k, &msg, NOW).unwrap_err();
+        assert!(e.0.contains("expired self-signature"), "{e}");
+    }
+
+    #[test]
+    fn a_self_signature_made_after_now_makes_the_key_unusable() {
+        let future = (NOW + 500) as u32;
+        let (k, msg) = certified(&[(0, future, &[])], &[]);
+        let e = verify_message(&k, &msg, NOW).unwrap_err();
+        assert!(e.0.contains("self-signature made in the future"), "{e}");
+        // a clock that has caught up
+        verify_message(&k, &msg, NOW + 500).unwrap();
+        // the newest counts, even when an older one is fine
+        let (k, msg) = certified(&[(0, (NOW - 1000) as u32, &[]), (1, future, &[])], &[]);
+        let e = verify_message(&k, &msg, NOW).unwrap_err();
+        assert!(e.0.contains("self-signature made in the future"), "{e}");
     }
 
     #[test]
