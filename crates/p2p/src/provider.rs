@@ -808,7 +808,7 @@ enum Taken {
 }
 
 /// The peers a group asks at most, hedges and replacements included.
-const MAX_ASKED: usize = 8;
+pub(crate) const MAX_ASKED: usize = 8;
 /// The rounds of probes a group makes at most (`Policy::query_peers` each).
 const PROBE_ROUNDS: usize = 2;
 

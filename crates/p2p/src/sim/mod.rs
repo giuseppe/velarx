@@ -15,7 +15,10 @@
 //! A run is [`run`]: a seed, a world on a paused clock, and an async closure
 //! that builds nodes and watches them.  The same seed gives the same run;
 //! when the closure panics the seed and the end of the trace are printed.
+//! At the end of every run the decision log of each node is checked for the
+//! rules of asking the peers (`check`).
 
+mod check;
 mod content;
 mod net;
 mod node;
@@ -66,7 +69,9 @@ where
         .expect("a runtime");
     let world = runtime.block_on(async { World::new(seed) });
     let _report = Report(world.clone());
-    runtime.block_on(scenario(world))
+    let result = runtime.block_on(scenario(world.clone()));
+    check::decisions(&world);
+    result
 }
 
 /// The seeds a scenario runs with: `VELARX_SIM_SEED` (one, to repeat a failure),
