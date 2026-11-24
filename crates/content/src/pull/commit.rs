@@ -856,6 +856,11 @@ fn prepare_one(
         drop_name(dir, rel, &meta);
         done(Step::Refused(Refusal::Wrong(why.to_string())))
     };
+    // (one read of the file's bytes)
+    let has_content_digest = |file: &File| -> io::Result<bool> {
+        let read = read_digests(file, alg, (false, true), &|n| store.note_hashed(n))?.1;
+        Ok(read.is_some_and(|r| r.to_string() == key))
+    };
     if !meta.file_type().is_file() {
         return wrong("not a regular file");
     }
@@ -928,8 +933,7 @@ fn prepare_one(
             if read && measured.is_some() && links {
                 // (fs-verity is enabled on it: nothing can change it between
                 // this read and the link)
-                let read = read_digests(&file, alg, (false, true), &|n| store.note_hashed(n))?.1;
-                if read.is_none_or(|r| r.to_string() != key) {
+                if !has_content_digest(&file)? {
                     return wrong("not the content digest of its name");
                 }
                 io::Seek::rewind(&mut file)?;
@@ -949,6 +953,13 @@ fn prepare_one(
     if let Some(m) = &measured {
         if !matches!(want.check, Check::Verity(_)) {
             if let Some(object) = present(store, m, meta.len())? {
+                if content.is_some() {
+                    // (the copy that would hash it is not made: the name
+                    // is proved here, as for a file that is linked)
+                    if !has_content_digest(&file)? {
+                        return wrong("not the content digest of its name");
+                    }
+                }
                 let _ = unlinkat(dir, rel, AtFlags::empty());
                 return done(Step::Linked(object));
             }
@@ -1807,5 +1818,68 @@ mod tests {
             }
             (works, done) => panic!("fs-verity works: {works}, the commit gave {done:?}"),
         }
+    }
+
+    /// A file staged on another file system than the store, whose bytes are
+    /// those of an object the store has, is not given the object under a
+    /// name that is not its content digest.  The kernel has to measure the
+    /// staged file: it runs where `VELARX_VERITY_DIR` is a directory of a
+    /// file system with fs-verity (ext4 with 4 KiB blocks), else not.
+    #[test]
+    fn a_staged_file_is_not_named_by_an_object_with_the_same_measure() {
+        let Some(base) = std::env::var_os("VELARX_VERITY_DIR") else {
+            eprintln!("VELARX_VERITY_DIR not set: skipped");
+            return;
+        };
+        let l = {
+            let dir = tempfile::tempdir_in(base).unwrap();
+            let path = dir.path().join("files");
+            std::fs::create_dir_all(&path).unwrap();
+            Layer {
+                staging: File::open(&path).unwrap(),
+                store: FileStore::new(dir.path().join("objects")).unwrap(),
+                _dir: dir,
+                path,
+            }
+        };
+        // (the directory is asked for: fs-verity has to work in it, or the
+        // test would pass for the wrong reason)
+        let probe = l.path.join("probe");
+        std::fs::write(&probe, b"probe").unwrap();
+        VerityMode::On
+            .manager()
+            .unwrap()
+            .for_algorithm(Algorithm::Sha256)
+            .enable(&probe)
+            .unwrap();
+        assert!(measure(&File::open(&probe).unwrap(), Algorithm::Sha256).is_some());
+        let bytes = b"the bytes of another object";
+        let object = Object::new(&verity_of(bytes).to_string(), false).unwrap();
+        let target = l.store.object_path(&object);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, bytes).unwrap();
+        let w = Want {
+            key: Digest::of(Algorithm::Sha256, b"the name").to_string(),
+            alg: Algorithm::Sha256,
+            rel: "tmp-1".into(),
+            size: None,
+            check: Check::Content(None),
+            own: false,
+        };
+        std::fs::write(l.path.join(&w.rel), bytes).unwrap();
+        // (another device number than the staging's: the store is elsewhere)
+        let dev = std::fs::metadata(l.store.root()).unwrap().dev() + 1;
+        let prepared = prepare_files(
+            l.staging.as_fd(),
+            std::slice::from_ref(&w),
+            (&l.store, dev),
+            VerityMode::On.manager().as_ref(),
+            &CopyBudget::new(),
+        )
+        .unwrap();
+        let done = place_files(l.staging.as_fd(), prepared, &l.store).unwrap();
+        assert!(done.objects.is_empty(), "{:?}", done.objects);
+        assert!(matches!(done.refused[0].1, Refusal::Wrong(_)));
+        assert!(!l.path.join(&w.rel).exists());
     }
 }
