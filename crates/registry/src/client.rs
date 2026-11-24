@@ -653,7 +653,19 @@ impl RegistryClient {
         if !matches!(parsed.scheme(), "https" | "http") || (secure && parsed.scheme() != "https") {
             return;
         }
-        self.transport.redirects.put(&t.blob_key(digest), url);
+        if self.may_redirect_to(t, &parsed).await {
+            self.transport.redirects.put(&t.blob_key(digest), url);
+        }
+    }
+
+    /// Whether the policy of the registry of `t` lets a request go to `url`
+    /// (a private address only for a registry that is on one): a redirect
+    /// is remembered, and used again, only if it does.
+    async fn may_redirect_to(&self, t: &Target, url: &reqwest::Url) -> bool {
+        match self.host(t) {
+            Ok(host) => host.check_url(url).await.is_ok(),
+            Err(_) => false,
+        }
     }
 
     /// Open the connection to the registry of `t` and take the token for
@@ -1202,7 +1214,9 @@ impl RegistryClient {
                 // another place (the CDN of a blob).
                 if hop == 0 {
                     if let Some(key) = cache_key {
-                        if !same_origin_url(&origin_url, &next) {
+                        if !same_origin_url(&origin_url, &next)
+                            && self.may_redirect_to(t, &next).await
+                        {
                             self.transport.redirects.put(key, next.as_str());
                         }
                     }
@@ -1427,7 +1441,17 @@ impl RegistryClient {
             );
         }
         let key = t.blob_key(digest);
-        if let Some(cached) = self.transport.redirects.get(&key) {
+        let cached = match self.transport.redirects.get(&key) {
+            Some(c) => match reqwest::Url::parse(&c) {
+                Ok(url) if self.may_redirect_to(t, &url).await => Some(c),
+                _ => {
+                    self.transport.redirects.drop_key(&key);
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some(cached) = cached {
             match self
                 .host(t)?
                 .client()?

@@ -872,6 +872,18 @@ async fn a_redirect_to_a_private_address_is_refused_for_a_public_registry() {
 }
 
 #[tokio::test]
+async fn a_refused_redirect_is_not_used_by_the_next_request() {
+    let (cdn, hits) = start_cdn(AxStatus::OK).await;
+    let host = redirecting_registry(&cdn).await;
+    let (client, t) = client(spec(&public_name(&host, "cached.registry.test"), None));
+    let e = blob_error(&client, &t).await;
+    assert!(e.contains("refusing"), "{e}");
+    let e = blob_error(&client, &t).await;
+    assert!(e.contains("refusing"), "{e}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn a_registry_on_a_private_address_may_send_the_client_there() {
     let (cdn, hits) = start_cdn(AxStatus::OK).await;
     let host = redirecting_registry(&cdn).await;
