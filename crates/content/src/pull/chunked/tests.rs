@@ -687,6 +687,18 @@ fn test_decompress_is_bounded() {
     );
 }
 
+/// The size an annotation claims is a check of what comes out, not a
+/// buffer made for it: a claim of a terabyte over a small document is
+/// refused for the size and takes no memory.
+#[test]
+fn test_decompress_does_not_make_room_for_a_claim() {
+    let z = zstd::encode_all(&b"small"[..], 3).unwrap();
+    let claim = 1 << 40;
+    let err = decompress_bounded(&z, claim, claim, "x").unwrap_err();
+    assert!(err.to_string().contains("the annotation says"), "{err}");
+    assert_eq!(decompress_bounded(&z, claim, 5, "x").unwrap(), b"small");
+}
+
 /// The tries of a range request, which the pull of the client and the
 /// fetcher of the registry share: a server that takes fewer ranges is asked
 /// half of them, and a request that brings nothing is given up after

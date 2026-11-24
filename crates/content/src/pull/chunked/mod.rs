@@ -339,7 +339,9 @@ pub(crate) fn decompress_bounded(
     what: &str,
 ) -> ImageResult<Vec<u8>> {
     let dec = super::zstd_decoder(data).map_err(data_fail)?;
-    let mut out = Vec::with_capacity(expected.min(max) as usize);
+    // (`expected` is what the image says: the buffer grows with what the
+    // decoder gives, not with the claim)
+    let mut out = Vec::new();
     dec.take(max + 1).read_to_end(&mut out).map_err(data_fail)?;
     if out.len() as u64 > max {
         return Err(fail(format!("the {what} is too large")));
