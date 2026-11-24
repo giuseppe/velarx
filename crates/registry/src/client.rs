@@ -48,6 +48,18 @@ const PRECONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Lifetime of a token whose response does not say.
 const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 
+/// The longest a token is kept, whatever the registry says: a huge
+/// `expires_in` must not overflow the clock.
+const MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(24 * 3600);
+
+/// The registry's `expires_in` for a token (a default when it says none),
+/// held between 30 s and a day.
+fn token_lifetime(expires_in: Option<u64>) -> Duration {
+    expires_in
+        .map_or(DEFAULT_TOKEN_LIFETIME, Duration::from_secs)
+        .clamp(Duration::from_secs(30), MAX_TOKEN_LIFETIME)
+}
+
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, \
      application/vnd.oci.image.index.v1+json, \
      application/vnd.docker.distribution.manifest.v2+json, \
@@ -1015,15 +1027,10 @@ impl RegistryClient {
             .token
             .or(parsed.access_token)
             .ok_or_else(|| ImageError::Registry("No token in response".into()))?;
-        // Renew a little before the expiry; tokens are valid for 60 s at least.
-        let lifetime = parsed
-            .expires_in
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_TOKEN_LIFETIME)
-            .max(Duration::from_secs(30));
         Ok(CachedToken {
             value,
-            expires: Instant::now() + lifetime - Duration::from_secs(10),
+            // Renew a little before the expiry.
+            expires: Instant::now() + token_lifetime(parsed.expires_in) - Duration::from_secs(10),
         })
     }
 
@@ -2286,6 +2293,18 @@ fn go_cause(host: &str, e: &(dyn std::error::Error + 'static)) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_huge_token_lifetime_does_not_overflow_the_clock() {
+        use super::{Duration, Instant};
+        for expires_in in [u64::MAX, u64::MAX / 2, 1 << 40] {
+            let lifetime = super::token_lifetime(Some(expires_in));
+            assert!(Instant::now().checked_add(lifetime).is_some());
+        }
+        assert_eq!(super::token_lifetime(None), Duration::from_secs(60));
+        assert_eq!(super::token_lifetime(Some(1)), Duration::from_secs(30));
+        assert_eq!(super::token_lifetime(Some(300)), Duration::from_secs(300));
+    }
+
     #[test]
     fn a_query_value_escapes_all_but_the_unreserved_characters() {
         let enc = |s: &str| super::utf8_percent_encode(s, super::QUERY_VALUE).to_string();
