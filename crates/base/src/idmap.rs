@@ -442,7 +442,7 @@ pub fn max_id_of_passwd_group(passwd: &str, group: &str) -> u32 {
     let mut size = 0u64;
     let mut bump = |id: u64| {
         if id != 65534 {
-            size = size.max(id + 1);
+            size = size.max(id.saturating_add(1));
         }
     };
     for line in passwd.lines() {
@@ -899,6 +899,33 @@ mod tests {
         assert_eq!(max_id_of_passwd_group(passwd, group), 2001);
         assert_eq!(max_id_of_passwd_group("", ""), 0);
         assert_eq!(max_id_of_passwd_group("x:x:65534:65534::/:/bin/sh", ""), 0);
+    }
+
+    #[test]
+    fn test_max_id_of_passwd_group_at_the_end_of_u64() {
+        // ids of a file of the image: any number that fits 64 bits
+        let big = u64::MAX.to_string();
+        let passwd = format!("a:x:{big}:0::/:/bin/sh\n");
+        assert_eq!(max_id_of_passwd_group(&passwd, ""), u32::MAX);
+        assert_eq!(
+            max_id_of_passwd_group("", &format!("g:x:{big}:\n")),
+            u32::MAX
+        );
+        let last = (u64::MAX - 1).to_string();
+        assert_eq!(
+            max_id_of_passwd_group("", &format!("g:x:{last}:\n")),
+            u32::MAX
+        );
+        let edge = (ID_LIMIT - 1).to_string();
+        assert_eq!(
+            max_id_of_passwd_group("", &format!("g:x:{edge}:\n")),
+            u32::MAX
+        );
+        let before = (ID_LIMIT - 2).to_string();
+        assert_eq!(
+            max_id_of_passwd_group("", &format!("g:x:{before}:\n")),
+            u32::MAX - 1
+        );
     }
 
     #[test]
