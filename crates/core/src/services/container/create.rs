@@ -549,6 +549,7 @@ impl ContainerService {
             unmask_paths: so.unmask_paths.clone(),
             proc_opts: so.proc_opts.clone(),
             verity_enforce: so.verity_enforce,
+            verity_off: so.verity_off,
             seccomp_bpf: match so.seccomp_bpf.clone() {
                 Some(p) => Some(
                     tokio::task::spawn_blocking(move || read_bpf_filter(&p))
@@ -1112,6 +1113,7 @@ impl ContainerService {
                     ContainerError::InvalidArgument(format!("--security-opt verity=enforce: {e}"))
                 })?;
         }
+        self.verity_off(&config)?;
         let enforce = self.digests_enforced(&config);
         if let (Some(why), Some(p)) = (enforce, &config.pinned) {
             self.image_service

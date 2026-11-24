@@ -110,6 +110,14 @@ writers in the list are ignored), which every start of a container checks,
 strictly with
 .B require
 .RB ( composefs_digests ),
+whether a start holds the files of an image to the chain of trust from the
+digest it was made from, or a signature the policy accepts, where the file
+system has fs\-verity and every layer was pulled with it
+.RB ( verity_chain ,
+.BR auto ,
+.B off
+or
+.BR require ),
 the read\-only stores of other instances
 .RB ( additional_image_stores ),
 the garbage collection and how a

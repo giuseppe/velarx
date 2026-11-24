@@ -926,6 +926,46 @@ impl Database {
         Ok(())
     }
 
+    /// Whether every layer of `keys` is sealed (`layers.sealed`: made with
+    /// fs-verity).
+    pub async fn layers_sealed(&self, keys: &[LayerKey]) -> DbResult<bool> {
+        let keys = keys.to_vec();
+        Ok(self
+            .conn
+            .call(move |conn| {
+                let mut stmt =
+                    conn.prepare_cached("SELECT coalesce(sealed, 0) FROM layers WHERE id = ?1")?;
+                for key in &keys {
+                    let sealed = stmt
+                        .query_row([key], |r| r.get::<_, i64>(0))
+                        .optional()?
+                        .unwrap_or(0);
+                    if sealed != 1 {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })
+            .await?)
+    }
+
+    /// Record whether the EROFS image of the layer `key` was made with
+    /// fs-verity (`layers.sealed`): the value it has now, whatever the image
+    /// made before had.
+    pub async fn set_layer_sealed(&self, key: &LayerKey, sealed: bool) -> DbResult<()> {
+        let key = *key;
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE layers SET sealed = ?2 WHERE id = ?1",
+                    rusqlite::params![key, sealed],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Mark the layer `key` incomplete: its row says it has no tar-split, so
     /// the store no longer reports it as stored (a pull fetches it again, as
     /// a layer committed without one) and an image that has it stays
@@ -2356,8 +2396,8 @@ fn commit_layer(tx: &rusqlite::Transaction, layer: &LayerCommit) -> rusqlite::Re
     }
     tx.execute(
         "INSERT INTO layers (id, diff_id, size, toc_digest, created_at, registry_ref,
-                             tarsplit_digest, erofs, owners, blob, blob_checked, stream_size)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                             tarsplit_digest, erofs, owners, blob, blob_checked, stream_size, sealed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(id) DO UPDATE SET
              diff_id = COALESCE(layers.diff_id, excluded.diff_id),
              blob_checked = MAX(layers.blob_checked, excluded.blob_checked),
@@ -2370,7 +2410,11 @@ fn commit_layer(tx: &rusqlite::Transaction, layer: &LayerCommit) -> rusqlite::Re
              blob = CASE WHEN excluded.registry_ref IS NULL THEN layers.blob ELSE excluded.blob END,
              size = CASE WHEN excluded.registry_ref IS NULL THEN layers.size ELSE excluded.size END,
              erofs = COALESCE(excluded.erofs, layers.erofs),
-             owners = COALESCE(excluded.owners, layers.owners)",
+             owners = COALESCE(excluded.owners, layers.owners),
+             -- (an EROFS image made again says whether it has fs-verity, the
+             -- one it replaces had it or not; a record without one says
+             -- nothing of it)
+             sealed = CASE WHEN excluded.erofs IS NULL THEN layers.sealed ELSE excluded.sealed END",
         rusqlite::params![
             key,
             layer.record.diff_id,
@@ -2385,6 +2429,7 @@ fn commit_layer(tx: &rusqlite::Transaction, layer: &LayerCommit) -> rusqlite::Re
             layer.record.blob.map(|d| d.to_string()).unwrap_or_default(),
             layer.blob_checked,
             layer.record.stream_size,
+            layer.sealed,
         ],
     )?;
     if let Some(other) = other {
@@ -3060,6 +3105,7 @@ mod tests {
             toc_digest: toc,
             tarsplit,
             blob_checked: false,
+            sealed: false,
         }
     }
 
@@ -3225,6 +3271,7 @@ mod tests {
             toc_digest: Digest::of(Algorithm::Sha256, b"json"),
             tarsplit: None,
             blob_checked: false,
+            sealed: false,
         };
         // the old file is c1 c2; the new one c1 c3, committed after it
         db.commit_layers(
@@ -3959,6 +4006,75 @@ mod tests {
             .unwrap();
         assert_eq!((tables, version), (0, SCHEMA_VERSION));
         assert_eq!(db.list_images().await.unwrap().len(), 1);
+    }
+
+    /// A layer is sealed only when its commit says so, a layer pulled again
+    /// keeps what it had, and the seal of one layer can be set.
+    #[tokio::test]
+    async fn a_layer_is_sealed_when_its_commit_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let sha = |b: &[u8]| Digest::of(Algorithm::Sha256, b);
+        let (old, new, other) = (
+            LayerKey::Whole(sha(b"old")),
+            LayerKey::Whole(sha(b"new")),
+            LayerKey::Whole(sha(b"other")),
+        );
+        let db = Database::open(&path).await.unwrap();
+        for key in [old, other] {
+            db.commit_layers(vec![layer_commit(key, sha(b"t"), None)], vec![])
+                .await
+                .unwrap();
+        }
+        assert!(!db.layers_sealed(&[old]).await.unwrap());
+        let mut sealed = layer_commit(new, sha(b"t"), None);
+        sealed.sealed = true;
+        db.commit_layers(vec![sealed], vec![]).await.unwrap();
+        assert!(db.layers_sealed(&[new]).await.unwrap());
+        assert!(!db.layers_sealed(&[new, old]).await.unwrap());
+        // (a layer pulled again without it keeps what it had; an unknown
+        // layer is not sealed)
+        db.commit_layers(vec![layer_commit(new, sha(b"t"), None)], vec![])
+            .await
+            .unwrap();
+        assert!(db.layers_sealed(&[new]).await.unwrap());
+        assert!(!db
+            .layers_sealed(&[LayerKey::Whole(sha(b"none"))])
+            .await
+            .unwrap());
+        db.set_layer_sealed(&old, true).await.unwrap();
+        assert!(db.layers_sealed(&[old, new]).await.unwrap());
+        assert!(!db.layers_sealed(&[other]).await.unwrap());
+    }
+
+    /// An EROFS image made again says whether it has fs-verity: one without
+    /// it does not keep the seal of the image it replaces, whether it is
+    /// made by a commit or by a repair.
+    #[tokio::test]
+    async fn an_erofs_image_made_again_has_its_own_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("db.sqlite")).await.unwrap();
+        let key = LayerKey::Whole(Digest::of(Algorithm::Sha256, b"layer"));
+        let toc = Digest::of(Algorithm::Sha256, b"t");
+        let commit = |erofs: &str, sealed: bool| {
+            let mut c = layer_commit(key, toc, None);
+            c.record.erofs = Some(erofs.into());
+            c.record.owners = Some("[]".into());
+            c.sealed = sealed;
+            c
+        };
+        db.commit_layers(vec![commit("sha256:a", true)], vec![])
+            .await
+            .unwrap();
+        assert!(db.layers_sealed(&[key]).await.unwrap());
+        db.commit_layers(vec![commit("sha256:b", false)], vec![])
+            .await
+            .unwrap();
+        assert!(!db.layers_sealed(&[key]).await.unwrap());
+        db.set_layer_sealed(&key, true).await.unwrap();
+        assert!(db.layers_sealed(&[key]).await.unwrap());
+        db.set_layer_sealed(&key, false).await.unwrap();
+        assert!(!db.layers_sealed(&[key]).await.unwrap());
     }
 
     fn record(id: &str) -> ImageRecord {

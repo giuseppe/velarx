@@ -198,14 +198,39 @@ pub enum Enforcing {
     No,
     Node,
     Container,
+    /// What the engine holds by default (the image is signed, or was named
+    /// by its digest): the manifest need not state a digest, each layer is
+    /// held to the digest recorded when its EROFS image was made, or to the
+    /// manifest's where it states ours.
+    Record,
 }
 
 impl Enforcing {
-    fn reason(self) -> &'static str {
+    /// What the node's `[storage] composefs_digests` and the container's
+    /// `--security-opt verity=enforce` make of a start's digests.  A driver
+    /// that checks them at pull only (`pull_only`) enforces nothing at a
+    /// start: a request to enforce was refused at the start of the engine
+    /// and at the create of the container, unless best effort is said.
+    pub fn of(pull_only: bool, node: ComposefsDigests, container: bool) -> Self {
+        match (pull_only, node, container) {
+            (true, _, _) => Enforcing::No,
+            (_, ComposefsDigests::Require, _) => Enforcing::Node,
+            (_, _, true) => Enforcing::Container,
+            _ => Enforcing::No,
+        }
+    }
+
+    /// Whether a manifest must state the digests (asked for by name).
+    fn manifest(self) -> bool {
+        matches!(self, Enforcing::Node | Enforcing::Container)
+    }
+
+    pub fn reason(self) -> &'static str {
         match self {
             Enforcing::No => "",
             Enforcing::Node => "[storage] composefs_digests is \"require\"",
             Enforcing::Container => "--security-opt verity=enforce",
+            Enforcing::Record => "the verity chain is held by default",
         }
     }
 }
@@ -313,7 +338,7 @@ fn start_links(
             match (stated, record.erofs.as_ref()) {
                 (Some(stated), Some(recorded))
                     if !stated.iter().any(|d| d.plain() == *recorded)
-                        && enforcing != Enforcing::No =>
+                        && enforcing.manifest() =>
                 {
                     let stated = plain(&stated);
                     chain.broken(|| {
@@ -335,6 +360,7 @@ fn start_links(
                 (Some(stated), Some(recorded))
                     if !stated.iter().any(|d| d.plain() == *recorded) =>
                 {
+                    record_link(chain, &have, descriptor, i, recorded);
                     Ok(vec![recorded.clone()])
                 }
                 (Some(stated), _) => {
@@ -349,7 +375,7 @@ fn start_links(
                     });
                     Ok(stated)
                 }
-                (None, _) if enforcing != Enforcing::No => {
+                (None, _) if enforcing.manifest() => {
                     chain.broken(|| {
                         (
                             format!("layer {} annotation", i + 1),
@@ -367,13 +393,30 @@ fn start_links(
                         enforcing.reason()
                     )))
                 }
-                (None, Some(recorded)) => Ok(vec![recorded.clone()]),
+                (None, Some(recorded)) => {
+                    record_link(chain, &have, descriptor, i, recorded);
+                    Ok(vec![recorded.clone()])
+                }
                 (None, None) => Err(ImageError::Storage(format!(
                     "image {short}: the EROFS image of {at} is not recorded: `velarx system check --repair` makes it again"
                 ))),
             }
         })
         .collect()
+}
+
+/// The link of layer `i` held to the digest recorded when its EROFS image
+/// was made: the manifest `have` names the blob, the engine's record the
+/// EROFS image.
+fn record_link(chain: &Chain, have: &Digest, layer: &OciDescriptor, i: usize, recorded: &str) {
+    chain.from_record(i + 1);
+    chain.link(|| {
+        format!(
+            "{have} manifest -> {} layer {} blob -> {recorded} record",
+            layer.digest,
+            i + 1
+        )
+    });
 }
 
 /// Refuse by name a manifest that states a merged EROFS digest its layers
@@ -568,6 +611,30 @@ mod tests {
         );
         assert!(state_layer(&mut d, &a));
         assert_eq!(d.annotations[LAYER_EROFS_ANNOTATION], a);
+    }
+
+    /// Which of the node's setting and the container's option enforces the
+    /// digests of the manifest at a start; the node's wins the reason, and a
+    /// driver that checks at pull only enforces nothing.
+    #[test]
+    fn the_node_and_the_container_enforce_the_digests() {
+        use ComposefsDigests::{Check, Require};
+        for (pull_only, node, container, want) in [
+            (false, Check, false, Enforcing::No),
+            (false, Check, true, Enforcing::Container),
+            (false, Require, false, Enforcing::Node),
+            (false, Require, true, Enforcing::Node),
+            (true, Check, false, Enforcing::No),
+            (true, Check, true, Enforcing::No),
+            (true, Require, false, Enforcing::No),
+            (true, Require, true, Enforcing::No),
+        ] {
+            assert_eq!(
+                Enforcing::of(pull_only, node, container),
+                want,
+                "{pull_only} {node:?} {container}"
+            );
+        }
     }
 
     #[test]
@@ -929,6 +996,59 @@ mod tests {
             &Chain::off()
         )
         .is_err());
+    }
+
+    /// Held by default, a layer is held to the digest of the manifest where
+    /// it states ours, else to the record of the engine, one link each; an
+    /// image that is not all in the store, or a layer with no record, is
+    /// refused.
+    #[test]
+    fn by_default_a_layer_is_held_to_its_record_when_the_manifest_states_none() {
+        let d = |c: &str| format!("sha256:{}", c.repeat(64));
+        let (one, two) = (d("1"), d("2"));
+        let (digest, text, records) = stored([Some(&one), None], [Some(&one), Some(&two)]);
+        let chain = Chain::off();
+        let got = start_lists(
+            &digest.hex(),
+            &digest,
+            &text,
+            &records,
+            false,
+            Enforcing::Record,
+            &chain,
+        )
+        .unwrap();
+        assert_eq!(got, [vec![one.clone()], vec![two.clone()]]);
+        // (the manifest's link of each layer: the annotation, the record)
+        assert_eq!(chain.done(), 2);
+        // a list that has none of ours is another writer's: the record
+        let (digest, text, records) =
+            stored([Some("sha512:ab,,"), Some(&one)], [Some(&two), Some(&one)]);
+        let got = start_lists(
+            &digest.hex(),
+            &digest,
+            &text,
+            &records,
+            false,
+            Enforcing::Record,
+            &Chain::off(),
+        )
+        .unwrap();
+        assert_eq!(got, [vec![two.clone()], vec![one.clone()]]);
+        // no record to go by, and not all in the store
+        let (digest, text, records) = stored([None, None], [Some(&one), None]);
+        for lazy in [false, true] {
+            assert!(start_lists(
+                &digest.hex(),
+                &digest,
+                &text,
+                &records,
+                lazy,
+                Enforcing::Record,
+                &Chain::off()
+            )
+            .is_err());
+        }
     }
 
     #[test]

@@ -727,6 +727,7 @@ async fn test_a_layer_is_found_by_its_key_only() {
             toc_digest: digest_of(8),
             tarsplit: None,
             blob_checked,
+            sealed: false,
         }],
         image: ImageRecord {
             id: "i".into(),

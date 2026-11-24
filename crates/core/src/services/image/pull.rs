@@ -1690,12 +1690,13 @@ impl ImageService {
         }
 
         debug!("Files committed after {:?}", start.elapsed());
+        let sealed = self.layers_sealed_now();
         let commits = done_layers
             .values()
             .filter(|d| !d.lazy)
             .map(|d| {
                 layer_commit(d, registry_ref.as_deref())
-                    .map(|c| super::storage::with_image(c, &made))
+                    .map(|c| super::storage::with_image(c, &made, sealed))
             })
             .collect::<ImageResult<Vec<velarx_db::LayerCommit>>>()?;
         debug!("Rows prepared after {:?}", start.elapsed());
@@ -2315,6 +2316,7 @@ mod stored_tests {
             chunks: vec![],
             toc_digest: digest(toc),
             tarsplit: Some(Digest::of(Algorithm::Sha256, tarsplit)),
+            sealed: false,
             blob_checked: false,
         }
     }

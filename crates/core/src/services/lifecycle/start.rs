@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+use super::chain_rule::{self, Facts, Mode, Root};
 use super::root_fd;
 use super::*;
+use crate::services::image::seal::Enforcing;
 use crate::services::SignatureJudging;
 use velarx_db::RecordState;
 use velarx_types::digest::Digest;
@@ -22,7 +24,8 @@ pub enum StartCheck {
     /// A command of a user that starts the containers of a pod (`pod
     /// start`, a play of Kubernetes YAML): the digests typed on it are for all the
     /// containers, each takes those that name its images.  Whether every
-    /// digest names an image that starts, and every enforced image a digest,
+    /// digest names an image that starts, and every image enforced by name a
+    /// digest,
     /// is [`ContainerService::check_pod_digests`], before the first
     /// container starts.
     Pod { digests: Vec<Digest> },
@@ -142,6 +145,7 @@ fn plan_of(chain: &Chain) -> Option<crate::monitor::config::ChainPlan> {
         trail: chain.trail(),
         layers: chain.layers(),
         fuse_layers: chain.fuse_layers(),
+        record: chain.records(),
     })
 }
 
@@ -258,14 +262,21 @@ pub struct MemberImage {
     pub reference: String,
     /// The digest the container was made from (none: a tag)
     pub digest: Option<Digest>,
-    /// Why its digests are enforced (none: they are not)
+    /// The digest of the manifest the store has of it (none: no image)
+    pub manifest: Option<Digest>,
+    /// Why its digests are held (none: they are not)
     pub enforced: Option<&'static str>,
+    /// Whether the node or the container asked for the digests to be
+    /// enforced by name (not only held by default)
+    pub asked: bool,
 }
 
 /// Why the digests `typed` do not fit the images of the containers a pod
-/// starts, if they do not: every enforced image made from a digest is named
-/// by one, and with `option` (`--verify-image`, not the references of a
-/// play) each is the digest of an enforced image, as `start --verify-image`
+/// starts, if they do not: every image whose enforcement was asked for by
+/// name and made from a digest is named by one (an image held by default
+/// goes by its record, as a plain start of a container does), and with
+/// `option` (`--verify-image`, not the references of a play) each is the
+/// digest of a held image or of its manifest, as `start --verify-image`
 /// holds one container to.  This only decides what to refuse by name before
 /// the first container starts: each start hashes its images against the
 /// digests typed, whatever the records say.
@@ -275,10 +286,10 @@ pub fn pod_digests_refusal(
     option: bool,
 ) -> Option<String> {
     if option && !typed.is_empty() && images.iter().all(|i| i.enforced.is_none()) {
-        return Some("--verify-image: the digests of the images of the containers that start are not enforced (--security-opt verity=enforce, [storage] composefs_digests = \"require\"): nothing holds the files to a digest".to_string());
+        return Some("--verify-image: the digests of the images of the containers that start are not held (they have no root of trust, or the chain is turned off, or it cannot be held for them; see the debug log of a start): nothing holds the files to a digest".to_string());
     }
     for image in images {
-        let (Some(why), Some(digest)) = (image.enforced, &image.digest) else {
+        let (true, Some(why), Some(digest)) = (image.asked, image.enforced, &image.digest) else {
             continue;
         };
         if !typed.contains(digest) {
@@ -290,9 +301,10 @@ pub fn pod_digests_refusal(
     }
     if option {
         let held = |d: &Digest| {
-            images
-                .iter()
-                .any(|i| i.enforced.is_some() && i.digest.as_ref() == Some(d))
+            images.iter().any(|i| {
+                i.enforced.is_some()
+                    && (i.digest.as_ref() == Some(d) || i.manifest.as_ref() == Some(d))
+            })
         };
         if let Some(unused) = typed.iter().find(|d| !held(d)) {
             let made: Vec<String> = images
@@ -305,12 +317,26 @@ pub fn pod_digests_refusal(
                 format!("they were made from {}", made.join(", "))
             };
             return Some(format!(
-                "--verify-image {unused}: no image of the containers that start is held to it ({made})"
+                "--verify-image {unused}: it names no image of the containers that start ({made})"
             ));
         }
     }
     None
 }
+
+/// The images mounted in a container (`--mount type=image`), by id, and
+/// whether each was made from a digest.
+fn mounted_images(config: &ContainerConfig) -> impl Iterator<Item = (&str, bool)> {
+    config
+        .mounts
+        .iter()
+        .filter_map(|m| m.image.as_ref())
+        .map(|i| (i.image.as_str(), i.digest.is_some()))
+}
+
+/// What the signature policy is asked of an image held by default: a
+/// signature must have satisfied a requirement of every name it has.
+const SIGNED: &str = "the verity chain is held from a signature";
 
 /// What a check of an image against a digest is about: the image and its
 /// layers, and how the debug log names the check.
@@ -324,6 +350,9 @@ struct VerifyCtx<'a> {
     scope: &'a str,
     /// The settings of the container the chain of the check counts.
     settings: usize,
+    /// An image made from a tag is held to the signature the policy
+    /// accepts (the root of the chain).
+    signature: bool,
 }
 
 impl ContainerService {
@@ -459,27 +488,49 @@ impl ContainerService {
     /// container, if they are: the node's `[storage] composefs_digests =
     /// "require"` or the container's `--security-opt verity=enforce`.
     pub fn digests_enforced(&self, config: &ContainerConfig) -> Option<&'static str> {
-        use velarx_config::ComposefsDigests;
-        // (a driver that checks the digests at pull only enforces nothing at a
-        // start; a request to enforce was refused at the start of the engine
-        // and at the create of the container unless best effort is said)
-        if self.image_service.verity_pull_only() {
-            return None;
-        }
-        match (
+        let enforcing = Enforcing::of(
+            self.image_service.verity_pull_only(),
             self.image_service.composefs_digests(),
             config.security_opt.verity_enforce,
-        ) {
-            (ComposefsDigests::Require, _) => Some("[storage] composefs_digests is \"require\""),
-            (_, true) => Some("--security-opt verity=enforce"),
+        );
+        (enforcing != Enforcing::No).then(|| enforcing.reason())
+    }
+
+    /// Why the chain is not held by default for the container, if it was
+    /// asked not to be: `--security-opt verity=off` or `[storage]
+    /// verity_chain = "off"`.  Refused where signatures or digests are
+    /// required (a container only tightens what the node asks).
+    pub(in crate::services) fn verity_off(
+        &self,
+        config: &ContainerConfig,
+    ) -> ContainerResult<Option<&'static str>> {
+        use velarx_config::VerityChain;
+        let why = match (self.image_service.verity_chain(), config.security_opt.verity_off) {
+            (VerityChain::Require, true) => {
+                return Err(ContainerError::InvalidArgument(
+                    "--security-opt verity=off: [storage] verity_chain is \"require\": the chain of trust cannot be turned off".into(),
+                ))
+            }
+            (_, true) => "--security-opt verity=off",
+            (VerityChain::Off, false) => "[storage] verity_chain is \"off\"",
+            _ => return Ok(None),
+        };
+        let required = match (self.digests_enforced(config), self.signature_judged(config)) {
+            (Some(why), _) | (_, Some(SignatureJudging::Require(why))) => Some(why),
             _ => None,
+        };
+        match required {
+            Some(required) => Err(ContainerError::InvalidArgument(format!(
+                "{why}: {required}: what is required is held by the chain of trust, which cannot be turned off"
+            ))),
+            None => Ok(Some(why)),
         }
     }
 
     /// The images the containers `records` start from, which `typed` must
     /// fit (see [`pod_digests_refusal`]): refused by name before the first
     /// of them starts.  The digests recorded only say which to ask for.
-    pub fn check_pod_digests(
+    pub async fn check_pod_digests(
         &self,
         records: &[ContainerRecord],
         typed: &[Digest],
@@ -489,12 +540,36 @@ impl ContainerService {
         for record in records {
             let config: ContainerConfig = serde_json::from_str(&record.config)?;
             let container = config.name.clone().unwrap_or_else(|| record.id.clone());
-            let enforced = self.digests_enforced(&config);
+            let asked = self.digests_enforced(&config);
+            let root = (config.rootfs.is_none())
+                .then_some((record.image_id.as_str(), config.pinned.is_some()));
+            let targets: Vec<_> = root.into_iter().chain(mounted_images(&config)).collect();
+            let enforced = match asked {
+                Some(why) => Some(why),
+                // (held by default where every image of the member can be)
+                None => {
+                    let off = self.verity_off(&config)?;
+                    self.held_by_default(record, &config, &targets, &[], typed, off)
+                        .await?
+                        .ok()
+                        .map(|_| Enforcing::Record.reason())
+                }
+            };
+            let manifest = match config.rootfs {
+                None => Some(
+                    self.image_of_start(&[], &record.image_id)
+                        .await?
+                        .manifest_digest,
+                ),
+                Some(_) => None,
+            };
             images.push(MemberImage {
                 container: container.clone(),
                 reference: config.image.clone(),
                 digest: config.pinned.as_ref().map(|p| p.digest),
+                manifest,
                 enforced,
+                asked: asked.is_some(),
             });
             for m in &config.mounts {
                 if let Some(image) = &m.image {
@@ -502,7 +577,13 @@ impl ContainerService {
                         container: container.clone(),
                         reference: format!("--mount type=image,source={}", image.image),
                         digest: stored_digest(image.digest.as_deref())?,
+                        manifest: Some(
+                            self.image_of_start(&[], &image.image)
+                                .await?
+                                .manifest_digest,
+                        ),
                         enforced,
+                        asked: asked.is_some(),
                     });
                 }
             }
@@ -530,7 +611,9 @@ impl ContainerService {
         judged: &[(String, velarx_db::ImageRecord)],
     ) -> ContainerResult<()> {
         let name = config.name.as_deref().unwrap_or(&container.id);
-        let enforced = self.digests_enforced(config);
+        // (asked for by name: the manifest's digests; else the chain the
+        // engine holds by default, where every image of the container can)
+        let asked = self.digests_enforced(config);
         // (none: a start of the engine, which has only the record to go by)
         let (user, option) = match check {
             StartCheck::User { digests, option } => (Some(digests.as_slice()), *option),
@@ -538,18 +621,53 @@ impl ContainerService {
             StartCheck::Engine => (None, false),
         };
         let typed = user.unwrap_or_default();
+        let (held, off) = match asked {
+            Some(_) => (Vec::new(), None),
+            None => match self
+                .default_roots(
+                    container,
+                    config,
+                    mc,
+                    judged,
+                    typed,
+                    self.verity_off(config)?,
+                )
+                .await?
+            {
+                Ok(roots) => (roots, None),
+                Err(why) => (Vec::new(), Some(why)),
+            },
+        };
+        let enforced = asked.or((!held.is_empty()).then(|| Enforcing::Record.reason()));
+        let enforcing = match asked {
+            Some(_) => self
+                .image_service
+                .enforcing(config.security_opt.verity_enforce),
+            None if enforced.is_some() => Enforcing::Record,
+            None => Enforcing::No,
+        };
+        // (held by default, a start that types none goes by the digest of
+        // the record: only what was asked for by name refuses it)
+        let user = match asked {
+            Some(_) => user,
+            None => user.filter(|d| !d.is_empty()),
+        };
         if enforced.is_none() && mc.image.is_some() {
-            tracing::debug!("verity chain: OFF");
+            match off {
+                Some(why) => tracing::debug!("verity chain: OFF ({why})"),
+                None => tracing::debug!("verity chain: OFF"),
+            }
         }
         if option && !typed.is_empty() && enforced.is_none() {
             return Err(ContainerError::InvalidArgument(format!(
-                "container {name}: --verify-image: the digests of its images are not enforced (--security-opt verity=enforce, [storage] composefs_digests = \"require\"): nothing holds the files to a digest"
+                "container {name}: --verify-image: the digests of its images are not held ({}): nothing holds the files to a digest",
+                off.unwrap_or("not asked for by name, and the images have no root of trust to hold")
             )));
         }
         // (enforced, the root file system must be the one made from the
         // layers: without the bundle's file the monitor would mount none
         // and the container would run on whatever its directory holds)
-        if let Some(why) = enforced {
+        if let Some(why) = asked {
             if !mc
                 .image
                 .as_ref()
@@ -574,7 +692,7 @@ impl ContainerService {
         }
         // (the check of the create, again: the node's `require` may have been
         // set since)
-        if let Some(why) = enforced {
+        if let Some(why) = asked {
             let artifacts = self.bundle_dir(&container.id).join("artifacts");
             if config
                 .mounts
@@ -589,7 +707,6 @@ impl ContainerService {
         let Some(image) = mc.image.as_mut() else {
             return Ok(());
         };
-        let flag = config.security_opt.verity_enforce;
         let refuse = |e: velarx_types::ImageError| {
             ContainerError::InvalidArgument(format!("container {name}: {e}"))
         };
@@ -612,6 +729,7 @@ impl ContainerService {
                     layers: &layers,
                     scope: "",
                     settings: usize::from(config.pinned.is_some()) + 1,
+                    signature: held.first() == Some(&Root::Signature),
                 };
                 let verified = self
                     .verify_root(user, record_digest, &ctx)
@@ -651,7 +769,7 @@ impl ContainerService {
                 }
             }
             self.image_service
-                .start_digests_in(&record, &layers, flag, &chain)
+                .start_digests_in(&record, &layers, enforcing, &chain)
                 .map_err(refuse)?;
             image.chain = plan_of(&chain);
         }
@@ -659,7 +777,11 @@ impl ContainerService {
             .mounts
             .iter()
             .filter_map(|m| Some((m, m.image.as_ref()?)));
-        for (volume, (mount, mounted)) in image.image_mounts.iter_mut().zip(volumes) {
+        let root_held = image.mount_rootfs;
+        for (n, (volume, (mount, mounted))) in
+            image.image_mounts.iter_mut().zip(volumes).enumerate()
+        {
+            let position = n + usize::from(root_held);
             // (the label of its lines in the debug log)
             let scope = match enforced.is_some() && tracing::enabled!(tracing::Level::DEBUG) {
                 true => format!("image mount {}: ", mount.target),
@@ -683,6 +805,7 @@ impl ContainerService {
                     layers: &layers,
                     scope: &scope,
                     settings: 0,
+                    signature: held.get(position) == Some(&Root::Signature),
                 };
                 let (c, verified) = self
                     .verify_root(user, stored_digest(mounted.digest.as_deref())?, &ctx)
@@ -694,7 +817,7 @@ impl ContainerService {
                 }
             }
             self.image_service
-                .start_digests_in(&record, &layers, flag, &chain)
+                .start_digests_in(&record, &layers, enforcing, &chain)
                 .map_err(|e| {
                     refuse(velarx_types::ImageError::Invalid(format!(
                         "{reference}: {e}"
@@ -723,10 +846,97 @@ impl ContainerService {
                 format!("it was made from {}", made.join(", "))
             };
             return Err(ContainerError::InvalidArgument(format!(
-                "container {name}: --verify-image {unused}: no image of the container is held to it ({made})"
+                "container {name}: --verify-image {unused}: it names no image of the container ({made})"
             )));
         }
         Ok(())
+    }
+
+    /// The root of trust of each image of the container (the root file
+    /// system first, then the images mounted in it) when the chain is held
+    /// to the record of each by default, else why not: the first image that
+    /// cannot be held gives the reason, and the container holds none (the
+    /// monitor enforces for all its mounts or for none).
+    async fn default_roots(
+        &self,
+        container: &ContainerRecord,
+        config: &ContainerConfig,
+        mc: &MonitorConfig,
+        judged: &[(String, velarx_db::ImageRecord)],
+        typed: &[Digest],
+        off: Option<&'static str>,
+    ) -> ContainerResult<Result<Vec<Root>, &'static str>> {
+        let Some(image) = mc.image.as_ref() else {
+            return Ok(Err("no image"));
+        };
+        let root = image
+            .mount_rootfs
+            .then_some((container.image_id.as_str(), config.pinned.is_some()));
+        let targets: Vec<_> = root.into_iter().chain(mounted_images(config)).collect();
+        self.held_by_default(container, config, &targets, judged, typed, off)
+            .await
+    }
+
+    /// [`Self::default_roots`] for the images `targets` (an image id and
+    /// whether the container was made from a digest of it).
+    async fn held_by_default(
+        &self,
+        container: &ContainerRecord,
+        config: &ContainerConfig,
+        targets: &[(&str, bool)],
+        judged: &[(String, velarx_db::ImageRecord)],
+        typed: &[Digest],
+        off: Option<&'static str>,
+    ) -> ContainerResult<Result<Vec<Root>, &'static str>> {
+        let mut roots = Vec::new();
+        for &(id, digest) in targets {
+            let record = self.image_of_start(judged, id).await?;
+            let layers = self.image_layers(&record).await?;
+            let keys: Vec<_> = layers.iter().map(|l| l.key).collect();
+            let mut facts = Facts {
+                asked: Enforcing::No,
+                require: self.image_service.verity_chain() == velarx_config::VerityChain::Require,
+                off,
+                driver: !self.image_service.verity_pull_only(),
+                fsverity: self.image_service.fsverity_on(),
+                complete: !record.is_lazy,
+                sealed: self.db.layers_sealed(&keys).await?,
+                // (a digest typed on the command that names the manifest is
+                // a digest passed, as the one the container was made from)
+                digest: digest || typed.contains(&record.manifest_digest),
+                signed: false,
+            };
+            // (the signature policy judges only an image with no digest to
+            // hold, and that nothing else keeps from being held: a stored
+            // signature is no root, the policy of now must accept it)
+            let signed = Facts {
+                signed: true,
+                ..facts
+            };
+            if chain_rule::mode(&signed) == Mode::Record(Root::Signature) {
+                let (stored, tags) = self.image_service.get_with_tags(id).await?;
+                facts.signed = self
+                    .image_service
+                    .verify_stored(id, &stored, &tags, SignatureJudging::Require(SIGNED))
+                    .await
+                    .is_ok();
+            }
+            match chain_rule::mode(&facts) {
+                Mode::Record(root) => roots.push(root),
+                Mode::Off(why) => return Ok(Err(why)),
+                Mode::Refuse(why) => {
+                    return Err(ContainerError::InvalidArgument(format!(
+                        "container {}: [storage] verity_chain is \"require\": the chain of trust of the image {id} cannot be held: {why}",
+                        config.name.as_deref().unwrap_or(&container.id)
+                    )))
+                }
+                Mode::Manifest(_) => unreachable!("nothing was asked for by name"),
+            }
+        }
+        Ok(match roots.is_empty() {
+            true => Err("no image"),
+            false => Ok(roots),
+        })
     }
 
     /// Hold the stored image to the digest of its reference: the image and
@@ -750,10 +960,18 @@ impl ContainerService {
             scope,
             ..
         } = *ctx;
+        // (made from a tag, a digest typed that names the manifest is the
+        // root of its chain)
+        let recorded = recorded.or_else(|| {
+            typed.and_then(|t| t.iter().copied().find(|d| *d == image.manifest_digest))
+        });
         // (made from a tag: it resolves in the store, nothing to verify)
         let Some(recorded) = recorded else {
             let chain = Chain::new(scope, crate::services::links_of_tag(layers.len()));
-            chain.link(|| format!("root NONE {}", image.manifest_digest));
+            chain.link(|| match ctx.signature {
+                true => format!("root SIGNATURE {}", image.manifest_digest),
+                false => format!("root NONE {}", image.manifest_digest),
+            });
             chain.add(|| image.manifest_digest.to_string());
             return Ok((chain, None));
         };
@@ -820,6 +1038,7 @@ impl ContainerService {
             layers,
             scope,
             settings,
+            ..
         } = *ctx;
         let indexes = self.image_service.pinned_indexes(&root, image).await;
         let indirect = indexes.as_ref().map_or(0, |indexes| {
@@ -1352,16 +1571,22 @@ impl ContainerService {
         }
         let own_ns = !config.uid_mappings.is_empty();
         let mapping = own_ns.then(|| self.translation(&config.uid_mappings, &config.gid_mappings));
-        // the digests each image accepts, when they are enforced
-        let accepted: Vec<Option<Vec<Vec<String>>>> = if self.digests_enforced(config).is_some() {
+        // the digests each image accepts, when they are enforced (by name,
+        // or by default: the monitor was told, by `enforce`)
+        let enforcing = match self.digests_enforced(config) {
+            Some(_) => self
+                .image_service
+                .enforcing(config.security_opt.verity_enforce),
+            None if monitor.image.as_ref().is_some_and(|i| i.enforce) => Enforcing::Record,
+            None => Enforcing::No,
+        };
+        let accepted: Vec<Option<Vec<Vec<String>>>> = if enforcing != Enforcing::No {
             let mut lists = Vec::with_capacity(images.len());
             for (record, layers) in &images {
-                let (l, _) = self.image_service.start_digests(
-                    record,
-                    layers,
-                    config.security_opt.verity_enforce,
-                )?;
-                lists.push(Some(l));
+                lists.push(Some(
+                    self.image_service
+                        .start_digests(record, layers, enforcing)?,
+                ));
             }
             lists
         } else {
@@ -1395,7 +1620,13 @@ impl ContainerService {
                 )
             }))
             .map(|(scope, plan)| {
-                plan.map(|p| Chain::resume(&scope, p.total, p.done, &p.trail, &p.layers))
+                plan.map(|p| {
+                    let chain = Chain::resume(&scope, p.total, p.done, &p.trail, &p.layers);
+                    for n in &p.record {
+                        chain.from_record(*n);
+                    }
+                    chain
+                })
             })
             .collect();
         let mut images = images
@@ -2489,12 +2720,25 @@ mod tests {
             .unwrap()
     }
 
+    /// A member whose digests are asked for by name.
     fn member(container: &str, digest: Option<&Digest>, enforced: bool) -> super::MemberImage {
         super::MemberImage {
             container: container.to_string(),
             reference: format!("img-{container}"),
             digest: digest.copied(),
+            manifest: None,
             enforced: enforced.then_some("--security-opt verity=enforce"),
+            asked: enforced,
+        }
+    }
+
+    /// A member whose image is held by default only, with the digest of
+    /// its manifest.
+    fn held(container: &str, digest: Option<&Digest>, manifest: &Digest) -> super::MemberImage {
+        super::MemberImage {
+            manifest: Some(*manifest),
+            asked: false,
+            ..member(container, digest, true)
         }
     }
 
@@ -2523,13 +2767,25 @@ mod tests {
         // none: the first is named
         let e = super::pod_digests_refusal(&images, &[], true).unwrap();
         assert!(e.contains("container web: img-web"), "{e}");
+        // an image held by default only: no digest is needed to start it,
+        // and the digest it was made from, or of its manifest, is accepted
+        let (d, m) = (digest_of('d'), digest_of('f'));
+        let by_default = [held("dflt", Some(&d), &m), held("by-tag", None, &m)];
+        assert_eq!(super::pod_digests_refusal(&by_default, &[], false), None);
+        assert_eq!(super::pod_digests_refusal(&by_default, &[], true), None);
+        for typed in [d, m] {
+            assert_eq!(
+                super::pod_digests_refusal(&by_default, &[typed], true),
+                None
+            );
+        }
         // a digest of no image, and one of an image that is not enforced
         for stray in [digest_of('d'), c] {
             let typed = [a, b, stray];
             let e = super::pod_digests_refusal(&images, &typed, true).unwrap();
             assert!(
                 e.contains(&format!(
-                    "--verify-image {stray}: no image of the containers that start is held to it"
+                    "--verify-image {stray}: it names no image of the containers that start"
                 )),
                 "{e}"
             );
@@ -2538,7 +2794,7 @@ mod tests {
         // are not
         let loose = [member("loose", Some(&c), false)];
         let e = super::pod_digests_refusal(&loose, std::slice::from_ref(&c), true).unwrap();
-        assert!(e.contains("not enforced"), "{e}");
+        assert!(e.contains("are not held"), "{e}");
         assert_eq!(super::pod_digests_refusal(&loose, &[c], false), None);
         // not a digest: refused where the texts of the request are typed
         let e = super::verify_image_digests(&["sha256:AB".to_string()])

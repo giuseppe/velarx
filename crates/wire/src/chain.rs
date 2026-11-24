@@ -43,6 +43,9 @@ pub struct Chain {
     /// The layers (up to this one, from 2) whose files the FUSE file system
     /// checks, not the overlay: 0 when the overlay checks every layer's.
     fuse_layers: AtomicUsize,
+    /// The layers (from 1) held to the digest the engine recorded when it
+    /// made their EROFS images, where the manifest states none of ours.
+    record: Mutex<Vec<usize>>,
     /// The lines kept instead of said while the chain is held back
     /// (`held_back`): `None` once it speaks.
     held: Mutex<Option<Vec<String>>>,
@@ -78,6 +81,7 @@ impl Chain {
             trail: Mutex::new(Vec::new()),
             layers: Mutex::new(Vec::new()),
             fuse_layers: AtomicUsize::new(0),
+            record: Mutex::new(Vec::new()),
             held: Mutex::new(None),
         }
     }
@@ -114,6 +118,23 @@ impl Chain {
         *chain.trail.lock().unwrap_or_else(|e| e.into_inner()) = trail.to_vec();
         *chain.layers.lock().unwrap_or_else(|e| e.into_inner()) = layers.to_vec();
         chain
+    }
+
+    /// Layer `n` (from 1) is held to the digest the engine recorded, which
+    /// the line of its measure says.
+    pub fn from_record(&self, n: usize) {
+        self.record
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(n);
+    }
+
+    /// The layers held to the record.
+    pub fn records(&self) -> Vec<usize> {
+        self.record
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// A line of the chain in the debug log: the one place that logs, for
@@ -195,10 +216,14 @@ impl Chain {
     }
 
     /// Layer `n` (from 1), whose blob is `blob` and whose EROFS image the
-    /// annotation of its descriptor and the measure on the open image agree
+    /// annotation of its descriptor (the record, with `from_record`) and the measure on the open image agree
     /// on (`erofs`): the link of the layer.
     pub fn layer_measured(&self, n: usize, blob: &str, erofs: &str) {
-        self.link(|| format!("layer {n} annotation {erofs} == erofs fd {erofs}"));
+        let from = match self.records().contains(&n) {
+            true => "record",
+            false => "annotation",
+        };
+        self.link(|| format!("layer {n} {from} {erofs} == erofs fd {erofs}"));
         self.measured(n, || (blob.to_string(), erofs.to_string()));
     }
 
@@ -341,6 +366,24 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// The line of a layer measured says what the digest came from.
+    #[test]
+    fn a_layer_says_whether_its_digest_is_the_annotation_or_the_record() {
+        let lines = logged(tracing::Level::DEBUG, || {
+            let c = Chain::new("", 2);
+            c.from_record(2);
+            c.layer_measured(1, "sha256:b1", "sha256:e1");
+            c.layer_measured(2, "sha256:b2", "sha256:e2");
+        });
+        assert_eq!(
+            lines,
+            [
+                "verity chain: layer 1 annotation sha256:e1 == erofs fd sha256:e1",
+                "verity chain: layer 2 record sha256:e2 == erofs fd sha256:e2",
+            ]
+        );
     }
 
     #[test]

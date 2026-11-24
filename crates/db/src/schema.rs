@@ -204,6 +204,12 @@ CREATE TABLE IF NOT EXISTS layers (
     -- ([[uids], [gids]])
     erofs TEXT,
     owners TEXT,
+    -- 1 when the EROFS image and the objects of the layer were made with
+    -- fs-verity (the file system of the store has it): a start holds the
+    -- layer to the record, and an image that is not the one recorded is an
+    -- error, never a layer without fs-verity.  NULL on a file system without
+    -- fs-verity.
+    sealed INTEGER,
     -- the size of the uncompressed tar of the layer, from its tar-split, kept
     -- at the pull so that a listing never decodes it (it stays when the
     -- tar-split of a layer marked incomplete is dropped)
@@ -601,6 +607,9 @@ pub struct LayerCommit {
     pub tarsplit: Option<Digest>,
     /// The blob was hashed to its digest (`layers.blob_checked`)
     pub blob_checked: bool,
+    /// The EROFS image and the objects of the layer have fs-verity
+    /// (`layers.sealed`).
+    pub sealed: bool,
 }
 
 /// What the pull of a lazy layer needed to reach its registry: the later

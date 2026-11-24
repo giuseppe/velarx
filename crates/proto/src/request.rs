@@ -517,6 +517,11 @@ pub struct SecurityOptions {
     /// the manifest states, at every start
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub verity_enforce: bool,
+    /// `verity=off`: the chain of trust the engine holds by default is not
+    /// held for this container (refused where signatures or digests are
+    /// required)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verity_off: bool,
 }
 
 impl SecurityOptions {
@@ -576,10 +581,14 @@ impl SecurityOptions {
             ("unmask", Some(v)) if !v.is_empty() => self.unmask_paths.extend(paths(v)?),
             ("systempaths", Some("unconfined")) => self.unmask_paths.push("ALL".into()),
             ("proc-opts", Some(v)) if !v.is_empty() => self.proc_opts = Some(v.to_string()),
-            ("verity", Some("enforce")) => self.verity_enforce = true,
+            ("verity", Some("enforce")) if !self.verity_off => self.verity_enforce = true,
+            ("verity", Some("off")) if !self.verity_enforce => self.verity_off = true,
+            ("verity", Some("enforce" | "off")) => {
+                return Err("--security-opt verity=enforce and verity=off contradict".into())
+            }
             ("verity", v) => {
                 return Err(format!(
-                    "invalid --security-opt verity value {:?}, must be \"enforce\"",
+                    "invalid --security-opt verity value {:?}, must be \"enforce\" or \"off\"",
                     v.unwrap_or_default()
                 ))
             }

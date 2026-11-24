@@ -1350,6 +1350,7 @@ pub(crate) fn import_request(
     r.security_opt.no_new_privileges = so.no_new_privileges;
     r.security_opt.mask_paths = so.mask_paths.clone();
     r.security_opt.verity_enforce = so.verity_enforce;
+    r.security_opt.verity_off = so.verity_off;
     r.security_opt.signature = so.signature.clone();
     if let Some(res) = r.resources.as_mut() {
         // raw cgroup files

@@ -585,6 +585,7 @@ mod tests {
                 toc_digest: sha(toc),
                 tarsplit: Some(sha(tarsplit)),
                 blob_checked: false,
+                sealed: false,
             }
         };
         db.commit_layers(

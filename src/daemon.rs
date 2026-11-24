@@ -1173,6 +1173,7 @@ async fn build_core(
     )
     .with_composefs(&config.storage.composefs)
     .with_composefs_digests(config.storage.composefs_digests)
+    .with_verity_chain(config.storage.verity_chain)
     .with_verity_best_effort(config.storage.fsverity_best_effort)
     .with_vfs_ignore_chown_errors(config.storage.vfs_ignore_chown_errors);
     // the storage service of the varlink driver is connected to now: one that

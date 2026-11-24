@@ -460,8 +460,9 @@ pub enum PodCommands {
         /// The digest (sha256:... or sha512:...) of an image of the containers of the pod
         /// (repeat): every container whose digests are enforced is started
         /// held to the one that names its image, as `start --verify-image`
-        /// does (refused where the digests are not enforced: --security-opt
-        /// verity=enforce, [storage] composefs_digests = "require"); the
+        /// does (refused where the digests are not held: --security-opt
+        /// verity=off, [storage] verity_chain = "off", an image no digest or
+        /// signature vouches for, a store without fs-verity); the
         /// infra container needs none
         #[arg(long, value_name = "DIGEST")]
         verify_image: Vec<String>,
@@ -580,8 +581,9 @@ pub enum PodCommands {
         /// The digest (sha256:... or sha512:...) of an image of the containers of the pod
         /// (repeat): every container whose digests are enforced is started
         /// held to the one that names its image, as `start --verify-image`
-        /// does (refused where the digests are not enforced: --security-opt
-        /// verity=enforce, [storage] composefs_digests = "require"); the
+        /// does (refused where the digests are not held: --security-opt
+        /// verity=off, [storage] verity_chain = "off", an image no digest or
+        /// signature vouches for, a store without fs-verity); the
         /// infra container needs none
         #[arg(long, value_name = "DIGEST")]
         verify_image: Vec<String>,

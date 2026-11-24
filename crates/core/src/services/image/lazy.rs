@@ -613,6 +613,7 @@ impl ImageService {
             let mut commit = super::storage::with_image(
                 layer_commit(&pulled, layer.meta.registry_ref.as_deref())?,
                 &checked.ours,
+                self.layers_sealed_now(),
             );
             (commit.record.blob, commit.record.size) =
                 (layer.meta.blob.parse().ok(), layer.meta.size);
@@ -715,6 +716,7 @@ impl ImageService {
             Some(layer.meta.erofs.clone()),
             Some(layer.meta.owners.clone()),
         );
+        commit.sealed = self.layers_sealed_now();
         self.db.commit_layers(vec![commit], Vec::new()).await?;
         debug!("Layer {} committed to the store", layer.key);
         drop(held);
@@ -2104,6 +2106,7 @@ mod tests {
                 refs: vec![],
                 chunks: vec![],
                 toc_digest: sha("{}"),
+                sealed: false,
                 tarsplit: Some(sha("ts")),
                 blob_checked: false,
             }],

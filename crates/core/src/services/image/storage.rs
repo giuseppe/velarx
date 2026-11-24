@@ -14,10 +14,12 @@ use velarx_db::{LayerKey, LayerRecord};
 pub(super) fn with_image(
     mut commit: velarx_db::LayerCommit,
     made: &HashMap<LayerKey, LayerArtifact>,
+    sealed: bool,
 ) -> velarx_db::LayerCommit {
     if let Some(m) = made.get(&commit.record.key) {
         commit.record.erofs = Some(m.image_digest.clone());
         commit.record.owners = Some(m.owners.clone());
+        commit.sealed = sealed;
     }
     commit
 }
@@ -30,16 +32,14 @@ impl ImageService {
 
     /// What a start of a container of `image` (with `layers`) checks of the
     /// stored manifest, and the fs-verity digests it gives the monitor, one
-    /// list per layer (`seal::start_lists`).  `container`: the container
-    /// asked for `--security-opt verity=enforce`; the node's `require`
-    /// enforces them too.  Whether they are enforced comes back with them.
+    /// list per layer (`seal::start_lists`), as `enforcing` says.
     pub fn start_digests(
         &self,
         image: &velarx_db::ImageRecord,
         layers: &[LayerRecord],
-        container: bool,
-    ) -> ImageResult<(Vec<Vec<String>>, bool)> {
-        self.start_digests_in(image, layers, container, &velarx_wire::chain::Chain::off())
+        enforcing: seal::Enforcing,
+    ) -> ImageResult<Vec<Vec<String>>> {
+        self.start_digests_in(image, layers, enforcing, &velarx_wire::chain::Chain::off())
     }
 
     /// The same, with the links it checks said by `chain`, the debug log of
@@ -48,11 +48,10 @@ impl ImageService {
         &self,
         image: &velarx_db::ImageRecord,
         layers: &[LayerRecord],
-        container: bool,
+        enforcing: seal::Enforcing,
         chain: &velarx_wire::chain::Chain,
-    ) -> ImageResult<(Vec<Vec<String>>, bool)> {
-        let enforcing = self.enforcing(container);
-        let lists = seal::start_lists(
+    ) -> ImageResult<Vec<Vec<String>>> {
+        seal::start_lists(
             &image.id,
             &image.manifest_digest,
             &image.manifest,
@@ -60,8 +59,50 @@ impl ImageService {
             image.is_lazy,
             enforcing,
             chain,
-        )?;
-        Ok((lists, enforcing != seal::Enforcing::No))
+        )
+    }
+
+    /// Seal the layers of the stored image `image_id` that were recorded
+    /// without fs-verity (the store had none then) and whose
+    /// EROFS image the kernel measures now with the canonical parameters as
+    /// the digest recorded for it: one ioctl for each layer, no read.  A
+    /// layer that does not measure so is never sealed, and stays held to
+    /// nothing; an image that is not all in the store is left alone.
+    pub async fn seal_measured(&self, image_id: &str) -> ImageResult<()> {
+        if !self.layers_sealed_now() {
+            return Ok(());
+        }
+        let image = self.db.get_image(image_id).await?;
+        if image.is_lazy {
+            return Ok(());
+        }
+        let objects = self.file_store.root().to_path_buf();
+        for layer in self.db.get_image_layers(&image.id).await? {
+            let Some(recorded) = layer.erofs.clone() else {
+                continue;
+            };
+            if self.db.layers_sealed(&[layer.key]).await? {
+                continue;
+            }
+            let path = velarx_fuse::composefs::layer_image_path(&objects, &layer.key.file_stem());
+            let measured = tokio::task::spawn_blocking(move || {
+                use std::os::unix::fs::OpenOptionsExt;
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&path)
+                    .ok()?;
+                velarx_fuse::composefs::measure_layer_image(&file, &path, &[recorded], true)
+                    .ok()
+                    .flatten()
+            })
+            .await
+            .map_err(|e| ImageError::Layer(format!("the measure task: {e}")))?;
+            if measured.is_some() {
+                self.db.set_layer_sealed(&layer.key, true).await?;
+            }
+        }
+        Ok(())
     }
 
     /// The check of a create whose digests are enforced (`container`: its
@@ -105,17 +146,14 @@ impl ImageService {
             .map_err(ImageError::from)
     }
 
-    fn enforcing(&self, container: bool) -> seal::Enforcing {
-        // (a driver that checks the digests at pull only enforces nothing at a
-        // create or a start: the pull held the layers to them)
-        if self.verity_pull_only() {
-            return seal::Enforcing::No;
-        }
-        match (self.storage_options.digests, container) {
-            (ComposefsDigests::Require, _) => seal::Enforcing::Node,
-            (_, true) => seal::Enforcing::Container,
-            _ => seal::Enforcing::No,
-        }
+    /// What the node and the container (`--security-opt verity=enforce`) ask
+    /// of the digests of the manifests.
+    pub fn enforcing(&self, container: bool) -> seal::Enforcing {
+        seal::Enforcing::of(
+            self.verity_pull_only(),
+            self.storage_options.digests,
+            container,
+        )
     }
 
     /// The root file system of the image as its containers see it, read
@@ -358,6 +396,9 @@ impl ImageService {
         for (digest, m) in ours {
             self.db
                 .set_layer_erofs(&digest, &m.image_digest, &m.owners)
+                .await?;
+            self.db
+                .set_layer_sealed(&digest, self.layers_sealed_now())
                 .await?;
         }
         Ok(())

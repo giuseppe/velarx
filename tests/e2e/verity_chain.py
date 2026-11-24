@@ -35,12 +35,12 @@ import sys
 D = r"(?:sha256:[0-9a-f]{64}|sha512:[0-9a-f]{128})"
 LISTED = rf"{D}(?:,{D})*"
 SCOPE = re.compile(r"^image mount (\S+): (.*)$")
-ROOT = re.compile(rf"^root (typed|RECORDED|NONE) ({D})$")
+ROOT = re.compile(rf"^root (typed|RECORDED|NONE|SIGNATURE) ({D})$")
 INDEX = re.compile(rf"^({D}) index -> ({D}) (index|manifest)$")
 CONFIG = re.compile(rf"^({D}) manifest -> ({D}) config$")
 SETTINGS = re.compile(rf"^({D}) config -> settings$")
-LAYER = re.compile(rf"^({D}) manifest -> ({D}) layer ([0-9]+) blob -> ({LISTED}) annotation$")
-MEASURED = re.compile(rf"^layer ([0-9]+) annotation ({D}) == erofs fd ({D})$")
+LAYER = re.compile(rf"^({D}) manifest -> ({D}) layer ([0-9]+) blob -> ({LISTED}) (annotation|record)$")
+MEASURED = re.compile(rf"^layer ([0-9]+) (annotation|record) ({D}) == erofs fd ({D})$")
 # (the files of the layers above the lowest are checked by the FUSE file
 # system where the overlay follows the stubs of the lowest layer only)
 OVERLAY = re.compile(
@@ -61,7 +61,7 @@ class Chain:
     def __init__(self, scope, kind, root):
         self.scope, self.kind, self.root = scope, kind, root
         self.head = root  # the digest the next link must start from
-        self.manifest = root if kind == "NONE" else None
+        self.manifest = root if kind in ("NONE", "SIGNATURE") else None
         self.trail = [root]
         self.config = None
         self.settings = False
@@ -117,14 +117,15 @@ class Chain:
             self.manifest_digest(m[1])
             n = int(m[3])
             self.need(n not in self.layers, f"layer {n} twice")
-            self.layers[n] = (m[2], m[4].split(","))
+            self.layers[n] = (m[2], m[4].split(","), m[5])
         elif m := MEASURED.match(text):
             n = int(m[1])
             self.need(n in self.layers, f"layer {n} measured, no manifest line names it")
-            self.need(m[2] == m[3], f"layer {n}: annotation {m[2]} != erofs fd {m[3]}")
-            self.need(m[2] in self.layers[n][1], f"layer {n}: {m[2]} is not in its annotation")
+            self.need(m[3] == m[4], f"layer {n}: {m[2]} {m[3]} != erofs fd {m[4]}")
+            self.need(m[2] == self.layers[n][2], f"layer {n}: measured as its {m[2]}, the manifest line says {self.layers[n][2]}")
+            self.need(m[3] in self.layers[n][1], f"layer {n}: {m[3]} is not in its {m[2]}")
             self.need(n not in self.measured, f"layer {n} measured twice")
-            self.measured[n] = m[3]
+            self.measured[n] = m[4]
         elif m := OVERLAY.match(text):
             want = [self.measured[n] for n in sorted(self.measured, reverse=True)]
             self.need(m[1].split(",") == want, f"overlay of {m[1]}, measured {','.join(want)}")
@@ -139,7 +140,7 @@ class Chain:
             self.overlay = True
         elif m := COMPLETE.match(text):
             self.need(self.overlay, "COMPLETE without the overlay")
-            self.need(self.kind == "NONE" or self.config is not None, "COMPLETE without the config")
+            self.need(self.kind in ("NONE", "SIGNATURE") or self.config is not None, "COMPLETE without the config")
             self.need(self.layers and len(self.measured) == len(self.layers), "COMPLETE without every layer")
             want = [" -> ".join(self.trail)] + [
                 f"{self.layers[n][0]} -> {self.measured[n]}" for n in sorted(self.layers)
@@ -162,7 +163,7 @@ def chains(lines):
         scope = ""
         if m := SCOPE.match(text):
             scope, text = m[1], m[2]
-        if text == "OFF" or text.startswith("signature "):
+        if text == "OFF" or text.startswith(("OFF (", "signature ")):
             continue
         if m := ROOT.match(text):
             open_[scope] = Chain(scope, m[1], m[2])

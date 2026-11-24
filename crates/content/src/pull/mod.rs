@@ -767,6 +767,7 @@ pub fn layer_commit(done: &LayerDone, registry_ref: Option<&str>) -> ImageResult
         toc_digest: done.toc_digest(),
         tarsplit: done.tarsplit_digest(),
         blob_checked: done.blob_checked && proven,
+        sealed: false,
     })
 }
 

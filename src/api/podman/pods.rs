@@ -464,7 +464,7 @@ fn pod_check(verify: &Option<Vec<velarx_types::digest::Digest>>) -> StartCheck {
 /// that start (see [`velarx_core::services::pod_digests_refusal`]; `option`:
 /// they were given by `--verify-image`).  The infra container is not one of
 /// them: its image is made by velarx, there is no digest to type for it.
-fn check_members(
+async fn check_members(
     state: &Arc<AppState>,
     pod: &Pod,
     recs: &[velarx_db::ContainerRecord],
@@ -479,6 +479,7 @@ fn check_members(
     state
         .container_service
         .check_pod_digests(&members, check.typed(), option)
+        .await
         .map_err(|e| ApiError::bad_request(e.to_string()))
 }
 
@@ -644,7 +645,7 @@ async fn run_of(
                     waiting.push(rec.clone());
                 }
             }
-            check_members(&state, &p, &waiting, &check, true)?;
+            check_members(&state, &p, &waiting, &check, true).await?;
             state.pod_service.ensure_slice(&p).map_err(pod_error)?;
             (
                 "start",
@@ -667,7 +668,7 @@ async fn run_of(
         }
         PodAction::Restart => {
             let check = pod_check(&verify);
-            check_members(&state, &p, &recs, &check, true)?;
+            check_members(&state, &p, &recs, &check, true).await?;
             // (its `--rm` members are kept by the stop, and throw-away
             // again once started)
             let mut errs = stop_all(&state, &recs, timeout).await;

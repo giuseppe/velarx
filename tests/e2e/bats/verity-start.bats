@@ -68,7 +68,7 @@ db_of () { echo "$1/db.sqlite"; }
 @test "verity takes enforce only" {
     out=$(shs "$WORKDIR/plain" run --rm --network none --security-opt verity=on "$IMG" true 2>&1)
     check "refused" 125 $?
-    check "the message" 'Error: invalid --security-opt verity value "on", must be "enforce"' "$out"
+    check "the message" 'Error: invalid --security-opt verity value "on", must be "enforce" or "off"' "$out"
 }
 
 @test "an edited manifest in the database is refused at the start" {

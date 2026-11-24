@@ -256,13 +256,50 @@ object name.
 
 **Not implemented / known limits**
 
+* **The chain of trust is held by default where the store can hold it.**  With `[storage] fsverity` not
+  off, on a file system with fs-verity, for an image that is all in the store whose
+  layers were pulled with it (`layers.sealed`: no probe of the store at a
+  start, and a sealed layer that cannot be measured is refused, never run
+  unheld), a start holds the files to the chain when the
+  container was made from a digest (`NAME@sha256:...`, `--mount
+  type=image,source=NAME@sha256:...`), when `--verify-image` gives the digest
+  of the manifest of the image (an index digest is not accepted), or when the
+  image has a signature the signature policy accepts now and accepted at the
+  pull; with no option.  The digest is hashed against the manifest again at every
+  start (a plain `start` goes by the digest recorded at the create), each
+  layer image is held to the digest the manifest states or, where it states
+  none of ours, to the one recorded when the engine made it, the overlay has
+  `verity=require`, and the monitor reads the mount back.  Held to the record,
+  the chain does not cover a writer of the store who edits the record and the
+  EROFS image together; a manifest that states the digests, signed or typed,
+  does, and `--security-opt verity=enforce` or `composefs_digests =
+  "require"` demand it.  An image named by a tag that no signature vouches
+  for, an image that is not all in the store (a lazy pull, until it is
+  complete), layers recorded when the file system had no
+  fs-verity (a pull of the image, and a full `system check`, seal a layer
+  whose EROFS image the kernel measures as the digest recorded for it, one
+  ioctl each, and never otherwise), and a driver that checks at pull only
+  (vfs) are held to nothing, silently; the debug log says `verity
+  chain: OFF (reason)` for each.  `--security-opt verity=off` and `[storage]
+  verity_chain = "off"` turn it off, and are refused where the digests or
+  signatures are required (`composefs_digests = "require"`,
+  `image_signature = "require"`, `signature=require`, `verity=enforce`).
+  `[storage] verity_chain = "require"` makes a start whose image cannot be
+  held (any of the reasons above) an error with the reason, and refuses
+  `verity=off`; an image that states no digest is fine, it is held to the
+  record.
+  A container with an image mount holds the chain for all of its images or
+  for none (the monitor enforces for the container).  Rootless, on a kernel
+  without `redirect_dir=followdata`, the files of the layers above the lowest
+  are checked on open by the image server.
 * **The images of the layers are held to the manifest at every start by the
   engine.**  The stored manifest is hashed against the image id, and each
   layer image is opened once, measured (fs-verity, constant time) and held to
   the digests the manifest states (`io.containers.composefs.digest`), or to
-  the layer's record when the manifest states none and the digests are not
-  enforced (`--security-opt verity=enforce`, `[storage] composefs_digests =
-  "require"`); the open file that was measured is what is mounted.  A
+  the layer's record when the manifest states none and the chain is not held
+  (`--security-opt verity=enforce` and `[storage] composefs_digests =
+  "require"` demand the manifest's own digests, strictly); the open file that
+  was measured is what is mounted.  A
   restart of a container by its own monitor checks nothing again.  A file
   without fs-verity, or on a file system whose blocks are smaller than 4096
   bytes, cannot be measured that way; `system check` reads it.  A signature

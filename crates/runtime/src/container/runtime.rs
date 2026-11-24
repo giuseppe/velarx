@@ -469,6 +469,9 @@ pub struct SecurityConfig {
     /// every start
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub verity_enforce: bool,
+    /// `--security-opt verity=off`: kept with the container
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verity_off: bool,
 }
 
 /// Resource configuration

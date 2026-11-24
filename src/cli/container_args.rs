@@ -263,7 +263,10 @@ pub struct CreateArgs {
     /// compiled filter, e.g. from easyseccomp), no-new-privileges[=BOOL],
     /// apparmor=, label=, mask=PATHS, unmask=PATHS|ALL, proc-opts=,
     /// systempaths=unconfined, verity=enforce (the digests of the EROFS
-    /// images of the layers in the manifest are enforced at every start)
+    /// images of the layers in the manifest are enforced at every start),
+    /// verity=off (the chain of trust held by default, from the digest the
+    /// container was made from or an accepted signature down to the files, is
+    /// not held; refused where the digests or signatures are required)
     #[arg(long)]
     pub security_opt: Vec<String>,
 
@@ -852,10 +855,12 @@ pub enum ContainerCommands {
         /// The container made last
         #[arg(long, short = 'l')]
         latest: bool,
-        /// The digest (sha256:... or sha512:...) of the image the container is made from,
-        /// of an image mounted in it too (repeat): the start holds the images
-        /// to it (refused where the digests are not enforced: --security-opt
-        /// verity=enforce, [storage] composefs_digests = "require")
+        /// The digest (sha256:... or sha512:...) of the manifest of the image the
+        /// container is made from (not of an index), of an image mounted in it
+        /// too (repeat): the start holds the images
+        /// to it (refused where the digests are not held: --security-opt
+        /// verity=off, [storage] verity_chain = "off", an image no digest or
+        /// signature vouches for, a store without fs-verity)
         #[arg(long, value_name = "DIGEST")]
         verify_image: Vec<String>,
         /// Start as the service manager does at boot, not as a user: the

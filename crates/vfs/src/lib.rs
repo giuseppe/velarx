@@ -2446,6 +2446,7 @@ mod tests {
                 toc_digest: Digest::of(Algorithm::Sha256, &toc_z),
                 tarsplit: None,
                 blob_checked: false,
+                sealed: false,
             }],
             vec![],
         )

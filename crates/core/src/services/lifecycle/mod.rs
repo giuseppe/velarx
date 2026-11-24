@@ -28,6 +28,7 @@ pub use velarx_wire::monitor::sys::{parse_signal, signal_name};
 
 mod adopt;
 mod attach;
+mod chain_rule;
 pub(in crate::services) mod conn;
 mod control;
 use conn::MonitorConn;

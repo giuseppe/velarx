@@ -20,7 +20,17 @@ The manifest of an image Velarx made also states, for each layer, the
 fs-verity digest of the layer's EROFS image (`io.containers.composefs.digest`,
 composefs digests), so the signature
 covers those digests too, and a node that checks them at the start of a
-container ties the files it runs to the signature.
+container ties the files it runs to the signature.  On a file system with
+fs-verity a start holds an image to that chain by default when the signature
+policy of now accepts the signatures the pull kept (see
+[STORAGE.md](STORAGE.md#security-properties-and-limits)); an image whose
+signature nothing accepts, or that has none, is held to nothing unless it
+was made from a digest.  A signature is a root for the manifest and the
+files only: the settings the container took and its spec are checked
+against the configuration of the image only where the container was made from
+a digest.  Tagging a signed image under a name the policy does not protect
+turns the default chain off for it (the policy of now must accept every name
+the image has).
 
 What it does not give you, as [THREAT-MODEL.md](THREAT-MODEL.md) says:
 

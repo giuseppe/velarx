@@ -2955,7 +2955,11 @@ type RequestSecurityOptions (
 	# `verity=enforce`: the layers of the image (and of the images
 	# mounted in the container) must be the images whose fs-verity digests
 	# the manifest states, at every start
-	verity_enforce: bool
+	verity_enforce: bool,
+	# `verity=off`: the chain of trust the engine holds by default is not
+	# held for this container (refused where signatures or digests are
+	# required)
+	verity_off: bool
 )
 
 # Resource limits for container

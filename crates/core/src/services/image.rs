@@ -208,6 +208,9 @@ pub struct ImageService {
     resolver: Resolver,
     /// What fs-verity stored files get
     fsverity: velarx_storage::VerityMode,
+    /// Whether the file system of the store has fs-verity, and the files
+    /// get it (probed once, with the first answer)
+    store_verity: Arc<std::sync::OnceLock<bool>>,
     /// The storage driver: what holds the content of the images and makes
     /// the root file systems of containers (`crate::storage_driver`).
     storage: Arc<dyn StorageDriver>,
@@ -219,6 +222,8 @@ pub struct ImageService {
     /// `[storage] composefs`, once read: the options are found out for it
     /// (`ComposefsOptions::for_mode`) when it or the image server is set.
     composefs_mode: Option<String>,
+    /// `[storage] verity_chain`.
+    verity_chain: velarx_config::VerityChain,
     /// `[storage] fsverity_best_effort`: a driver that checks fs-verity at
     /// pull only is accepted with the settings that enforce it.
     verity_best_effort: bool,
@@ -402,10 +407,12 @@ impl ImageService {
             staging_dir,
             resolver: Resolver::new()?,
             fsverity,
+            store_verity: Arc::default(),
             storage,
             storage_kind,
             storage_options,
             composefs_mode: None,
+            verity_chain: velarx_config::VerityChain::Auto,
             verity_best_effort: false,
             vfs_ignore_chown_errors: false,
             varlink: None,
@@ -526,6 +533,17 @@ impl ImageService {
         self
     }
 
+    /// `[storage] verity_chain`.
+    pub fn with_verity_chain(mut self, mode: velarx_config::VerityChain) -> Self {
+        self.verity_chain = mode;
+        self
+    }
+
+    /// `[storage] verity_chain`.
+    pub fn verity_chain(&self) -> velarx_config::VerityChain {
+        self.verity_chain
+    }
+
     /// `[storage] fsverity_best_effort`.
     pub fn with_verity_best_effort(mut self, best_effort: bool) -> Self {
         self.verity_best_effort = best_effort;
@@ -537,6 +555,24 @@ impl ImageService {
     /// accepts that): nothing is enforced at a start.
     pub fn verity_pull_only(&self) -> bool {
         !self.storage.capabilities().verity_at_run_time()
+    }
+
+    /// Whether what the driver makes of a layer has fs-verity here: the
+    /// driver holds the images and the files to their digests while a
+    /// container runs, the store sets fs-verity on its files, and its file
+    /// system has it.  The layers recorded now are sealed (`layers.sealed`)
+    /// when it does.
+    pub fn layers_sealed_now(&self) -> bool {
+        !self.verity_pull_only()
+            && *self.store_verity.get_or_init(|| {
+                self.fsverity != velarx_storage::VerityMode::Off
+                    && velarx_storage::probe(self.file_store.root()).is_ok()
+            })
+    }
+
+    /// `[storage] fsverity` is not off: the files of the store get fs-verity.
+    pub fn fsverity_on(&self) -> bool {
+        self.fsverity != velarx_storage::VerityMode::Off
     }
 
     /// What the driver of the store cannot do of what the configuration
@@ -744,7 +780,13 @@ impl ImageService {
             }
             .await;
             match result {
-                Ok(done) => return Ok(done),
+                Ok(done) => {
+                    // (a lazy image is not all in the store: nothing to seal)
+                    if !engine.lazy {
+                        self.seal_measured(&done.id).await?;
+                    }
+                    return Ok(done);
+                }
                 // (the image was found: it is not another candidate's)
                 Err(e @ ImageError::NotLazy { .. }) => return Err(e),
                 Err(e) => {

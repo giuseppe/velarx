@@ -944,6 +944,29 @@ pub struct StorageConfig {
     /// states one of ours)
     #[serde(default)]
     pub composefs_digests: ComposefsDigests,
+    /// Whether a start holds the files of an image to the chain of trust
+    /// (the digest it was made from, or a signature, down to the files) where
+    /// the file system supports it: "auto" (the default), "off" (refused
+    /// where signatures or digests are required) or "require" (a start that
+    /// cannot hold the chain is refused, and `--security-opt verity=off` too).
+    #[serde(default)]
+    pub verity_chain: VerityChain,
+}
+
+/// The `[storage] verity_chain` setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerityChain {
+    /// Held where the file system supports it and the image has a root of
+    /// trust
+    #[default]
+    Auto,
+    /// Held only where the node or the container asks for it by name
+    Off,
+    /// Held for every start, whatever the image: a start whose image cannot
+    /// be held (a layer made without fs-verity, a lazy image, a driver that
+    /// checks at pull only, no digest and no accepted signature) is refused
+    Require,
 }
 
 /// `[storage.varlink]`: the program that serves `org.velarx.Storage` for the
@@ -1457,6 +1480,7 @@ impl Default for StorageConfig {
             check_leftover_age_secs: default_check_leftover_age(),
             sync: SyncMode::default(),
             composefs_digests: ComposefsDigests::default(),
+            verity_chain: VerityChain::default(),
         }
     }
 }
@@ -1625,6 +1649,21 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "[containers] image_signature = {s:?}: policy or require"
             )));
+        }
+        if self.storage.verity_chain == VerityChain::Off {
+            let required = match (
+                &self.containers.image_signature[..],
+                self.storage.composefs_digests,
+            ) {
+                ("require", _) => "[containers] image_signature = \"require\"",
+                (_, ComposefsDigests::Require) => "[storage] composefs_digests = \"require\"",
+                _ => "",
+            };
+            if !required.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "[storage] verity_chain = \"off\": {required} is held by the chain of trust, which cannot be turned off, and every start would be refused"
+                )));
+            }
         }
         let l = &self.server.events_logger;
         if !matches!(l.as_str(), "" | "journald" | "file" | "none") {
@@ -2329,6 +2368,38 @@ mod tests {
             );
         }
         assert_eq!(ComposefsDigests::Require.to_string(), "require");
+    }
+
+    #[test]
+    fn the_verity_chain_is_held_unless_the_storage_says_off() {
+        assert_eq!(parse("").unwrap().storage.verity_chain, VerityChain::Auto);
+        let get = |v: &str| parse(&format!("[storage]\nverity_chain = \"{v}\"\n"));
+        assert_eq!(get("auto").unwrap().storage.verity_chain, VerityChain::Auto);
+        assert_eq!(get("off").unwrap().storage.verity_chain, VerityChain::Off);
+        assert_eq!(
+            get("require").unwrap().storage.verity_chain,
+            VerityChain::Require
+        );
+        for bad in ["on", "Off", "enforce"] {
+            let err = get(bad).unwrap_err().to_string();
+            assert!(err.contains("`auto`") && err.contains("`require`"), "{err}");
+        }
+        // off with what is required of the images: every start would be
+        // refused, so the engine does not start
+        for (text, key) in [
+            (
+                "[containers]\nimage_signature = \"require\"\n[storage]\nverity_chain = \"off\"\n",
+                "image_signature",
+            ),
+            (
+                "[storage]\ncomposefs_digests = \"require\"\nverity_chain = \"off\"\n",
+                "composefs_digests",
+            ),
+        ] {
+            let err = parse(text).unwrap_err().to_string();
+            assert!(err.contains("verity_chain") && err.contains(key), "{err}");
+            assert!(parse(&text.replace("off", "auto")).is_ok());
+        }
     }
 
     #[test]

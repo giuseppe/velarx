@@ -205,6 +205,9 @@ impl CheckService {
             }
             match self.check_image(image, full, deadline, &mut run).await? {
                 Some(c) => {
+                    if full && c.findings.is_empty() {
+                        self.images.seal_measured(&c.image.id).await?;
+                    }
                     self.db
                         .set_image_checked(&c.image.id, chrono::Utc::now().timestamp())
                         .await?;

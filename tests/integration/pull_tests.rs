@@ -383,19 +383,23 @@ async fn test_a_start_takes_the_digests_from_the_stored_manifest() {
     let id = e.pull().await.unwrap().id;
     let (image, layers) = stored_image(&e, &id).await;
     for container in [false, true] {
-        let (lists, enforce) = e.service.start_digests(&image, &layers, container).unwrap();
+        let enforcing = e.service.enforcing(container);
+        let lists = e.service.start_digests(&image, &layers, enforcing).unwrap();
         assert_eq!(lists, [vec![other.clone(), ours.clone()]]);
-        assert_eq!(enforce, container);
     }
     // the record of the layer is not among the digests the manifest states
     e.db.set_layer_erofs(&layers[0].key, &other.replace("ab", "cd"), "[[],[]]")
         .await
         .unwrap();
     let (image, layers) = stored_image(&e, &id).await;
-    let (lists, enforce) = e.service.start_digests(&image, &layers, false).unwrap();
+    let enforcing = e.service.enforcing(false);
+    let lists = e.service.start_digests(&image, &layers, enforcing).unwrap();
     assert_eq!(lists, [vec![other.replace("ab", "cd")]]);
-    assert!(!enforce);
-    let err = e.service.start_digests(&image, &layers, true).unwrap_err();
+    let enforcing = e.service.enforcing(true);
+    let err = e
+        .service
+        .start_digests(&image, &layers, enforcing)
+        .unwrap_err();
     assert!(
         matches!(err, velarx_types::ImageError::ComposefsDigest(_)),
         "{err}"
@@ -416,13 +420,18 @@ async fn test_a_manifest_edited_after_the_pull_is_refused_at_the_start() {
     e.publish(&[&annotated_layer(&layer, &ours)], &[ZSTD]);
     let id = e.pull().await.unwrap().id;
     let (mut image, layers) = stored_image(&e, &id).await;
-    e.service.start_digests(&image, &layers, true).unwrap();
+    let enforcing = e.service.enforcing(true);
+    e.service.start_digests(&image, &layers, enforcing).unwrap();
     // the digest the manifest states is changed to the one of another
     // image, and the layer record with it
     image.manifest = image
         .manifest
         .replace(&ours, &format!("sha256:{}", "ab".repeat(32)));
-    let err = e.service.start_digests(&image, &layers, false).unwrap_err();
+    let enforcing = e.service.enforcing(false);
+    let err = e
+        .service
+        .start_digests(&image, &layers, enforcing)
+        .unwrap_err();
     assert!(
         err.to_string().contains("is not the one its id names")
             && err.to_string().contains("pull the image again"),
@@ -441,9 +450,14 @@ async fn test_an_image_without_annotations_is_refused_when_enforced() {
     e.publish(&[&layer], &[ZSTD]);
     let id = e.pull().await.unwrap().id;
     let (image, layers) = stored_image(&e, &id).await;
-    let (lists, enforce) = e.service.start_digests(&image, &layers, false).unwrap();
-    assert_eq!((lists, enforce), (vec![vec![ours]], false));
-    let err = e.service.start_digests(&image, &layers, true).unwrap_err();
+    let enforcing = e.service.enforcing(false);
+    let lists = e.service.start_digests(&image, &layers, enforcing).unwrap();
+    assert_eq!(lists, vec![vec![ours]]);
+    let enforcing = e.service.enforcing(true);
+    let err = e
+        .service
+        .start_digests(&image, &layers, enforcing)
+        .unwrap_err();
     assert!(
         matches!(err, velarx_types::ImageError::ComposefsDigest(_))
             && err.to_string().contains("layer 1 of 1")
@@ -455,7 +469,7 @@ async fn test_an_image_without_annotations_is_refused_when_enforced() {
         .with_composefs_digests(velarx_config::ComposefsDigests::Require);
     for container in [false, true] {
         let err = require
-            .start_digests(&image, &layers, container)
+            .start_digests(&image, &layers, require.enforcing(container))
             .unwrap_err();
         assert!(err.to_string().contains("composefs_digests"), "{err}");
     }

@@ -1157,9 +1157,16 @@ mod tests {
         let e = SecurityOptions::default().apply("verity=on").unwrap_err();
         assert_eq!(
             e,
-            "invalid --security-opt verity value \"on\", must be \"enforce\""
+            "invalid --security-opt verity value \"on\", must be \"enforce\" or \"off\""
         );
         assert!(SecurityOptions::default().apply("verity").is_err());
+        // off is its own option, and contradicts enforce in either order
+        let mut off = SecurityOptions::default();
+        off.apply("verity=off").unwrap();
+        assert!(off.verity_off && !off.verity_enforce);
+        let e = off.apply("verity=enforce").unwrap_err();
+        assert!(e.contains("contradict"), "{e}");
+        assert!(so.apply("verity=off").unwrap_err().contains("contradict"));
         for bad in [
             "seccomp-bpf=relative.bpf",
             "bogus",

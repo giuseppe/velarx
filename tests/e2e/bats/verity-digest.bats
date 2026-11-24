@@ -181,10 +181,13 @@ swap_to_variant () { # store, container id...
     # a new container of the name resolves to the variant: refused when created
     out=$(run_in "$store" "$REPO@$D" --security-opt verity=enforce)
     check_match "refused at create" "the stored manifest hashes to $B, not $D" "$out"
-    # the same swap of a container that is not enforced runs, as before
-    id2=$(shs "$store" create --network none "$REPO@$D" cat /etc/alpine-release) || exit 1
+    # the same swap of a container made from the digest is held by default
+    id3=$(shs "$store" create --network none "$REPO@$D" cat /etc/alpine-release) || exit 1
+    out=$(shs "$store" start -a "$id3" 2>&1 < /dev/null)
+    check_match "held by default" "the stored manifest hashes to $B, not $D" "$out"
+    id2=$(shs "$store" create --network none --security-opt verity=off "$REPO@$D" cat /etc/alpine-release) || exit 1
     check_match "not enforced" '^[0-9]+\.[0-9]+' "$(shs "$store" start -a "$id2" 2>&1 < /dev/null)"
-    shs "$store" rm -t 0 -f "$id" "$id2" > /dev/null 2>&1
+    shs "$store" rm -t 0 -f "$id" "$id2" "$id3" > /dev/null 2>&1
 }
 
 @test "the node's require holds an image named by digest too" {
@@ -363,7 +366,7 @@ json.dump(s, open(p, "w"))' "$store/bundles/$id/config.json" || exit 1
     edit_config "$store" "$id" "del c['pinned']"
     swap_to_variant "$store" "$id"
     out=$(go "$store" "$D" "$id")
-    check_match "the digest typed holds no image" "container .*: --verify-image $D: no image of the container is held to it \(it was made from no digest\)" "$out"
+    check_match "the digest typed holds no image" "container .*: --verify-image $D: it names no image of the container \(it was made from no digest\)" "$out"
     # (a start that gives none: what this record says is a tag, nothing is
     # verified against the digest: the limit of the record)
     check_match "the limit of the record" '^[0-9]+\.[0-9]+' "$(shs "$store" start -a "$id" 2>&1 < /dev/null)"
@@ -388,19 +391,19 @@ json.dump(s, open(p, "w"))' "$store/bundles/$id/config.json" || exit 1
     out=$(go "$store" "$D" "$id" 2>&1)
     check_match "the one digest" '^[0-9]+\.[0-9]+' "$out"
     out=$(shs "$store" start -a --verify-image "$D" --verify-image "$B" "$id" 2>&1 < /dev/null)
-    check_match "two digests for one image" "container .*: --verify-image $B: no image of the container is held to it \(it was made from $D\)" "$out"
+    check_match "two digests for one image" "container .*: --verify-image $B: it names no image of the container \(it was made from $D\)" "$out"
     # restart takes it the same way
     shs "$store" restart --verify-image "$D" "$id" > /dev/null || exit 1
     out=$(shs "$store" restart --verify-image "$B" "$id" 2>&1)
     check_match "restart, another digest" "the stored manifest hashes to $D, not $B.*the container was made from $D, which the command does not give" "$out"
     # a container that does not enforce the digests: refused by name
-    id2=$(shs "$store" create --network none "$REPO@$D" cat /etc/alpine-release) || exit 1
+    id2=$(shs "$store" create --network none --security-opt verity=off "$REPO@$D" cat /etc/alpine-release) || exit 1
     out=$(go "$store" "$D" "$id2")
-    check_match "not enforced" "container .*: --verify-image: the digests of its images are not enforced" "$out"
+    check_match "not held" "container .*: --verify-image: the digests of its images are not held \(--security-opt verity=off\)" "$out"
     mkdir -p "$WORKDIR/rootfs"
     id3=$(shs "$store" create --network none --rootfs "$WORKDIR/rootfs" true) || exit 1
     out=$(go "$store" "$D" "$id3")
-    check_match "--rootfs" "container .*: --verify-image: the digests of its images are not enforced" "$out"
+    check_match "--rootfs" "container .*: --verify-image: the digests of its images are not held" "$out"
     # a digest in a reference: as typed, refused the same
     out=$(run_in "$store" "$REPO@$upper" --security-opt verity=enforce --pull=never)
     check "upper case reference" 125 $?
@@ -770,15 +773,30 @@ h='sha256:[0-9a-f]{64}'
 # every line is digests and the names of what they are, never an explanation
 only_digests () { # lines of the chain
     local other
-    other=$(printf '%s\n' "$1" | sed -E 's/^image mount [^ ]+: //' | grep -avE "^(root (typed|RECORDED|NONE) $h|$h .* -> .*|settings -> spec process|layer [0-9]+ annotation $h == erofs fd $h|erofs fd $h(,$h)* -> overlay verity=require( \(files of layer 1\), fuse verity=require \(files of layers? 2(-[0-9]+)?\))?|COMPLETE .*|BROKEN .* expected .* found .*|OFF|signature .*)$")
+    other=$(printf '%s\n' "$1" | sed -E 's/^image mount [^ ]+: //' | grep -avE "^(root (typed|RECORDED|NONE|SIGNATURE) $h|$h .* -> .*|settings -> spec process|layer [0-9]+ (annotation|record) $h == erofs fd $h|erofs fd $h(,$h)* -> overlay verity=require( \(files of layer 1\), fuse verity=require \(files of layers? 2(-[0-9]+)?\))?|COMPLETE .*|BROKEN .* expected .* found .*|OFF( \(.*\))?|signature .*)$")
     [ -z "$other" ] || { echo "# not a line of digests: $other"; return 1; }
 }
 
-@test "verity_chain.py: the samples of STORAGE.md connect, a digest changed in a link does not" {
-    # (the first block of the log that starts with a root: the sample of a run)
-    ok=$(awk '/^```text$/ { inb = 1; n = 0; next } /^```$/ { if (inb && ok) exit; inb = 0; next }
-              inb { if (n++ == 0) ok = /^verity chain: root /; if (ok) print }' "$E2E_DIR/../../docs/STORAGE.md")
-    [ -n "$ok" ] || { echo "# no sample"; exit 1; }
+# The lines of the chain in the debug log of an enforced start of an image of
+# two layers named by its digest, as the engine wrote them (without the time,
+# the level and the module in front of each).
+chain_sample () {
+    cat <<'EOT'
+verity chain: root typed sha256:2a502ed13438b3ef1358456828ee8ee9a59ce0dca659ebd5a74e9efa45a8f552
+verity chain: sha256:2a502ed13438b3ef1358456828ee8ee9a59ce0dca659ebd5a74e9efa45a8f552 manifest -> sha256:5d060f1fa9825680b9fd9050a877e89a892c6a175ccb48d4b59cfb2e3d243686 config
+verity chain: sha256:5d060f1fa9825680b9fd9050a877e89a892c6a175ccb48d4b59cfb2e3d243686 config -> settings
+verity chain: settings -> spec process
+verity chain: sha256:2a502ed13438b3ef1358456828ee8ee9a59ce0dca659ebd5a74e9efa45a8f552 manifest -> sha256:2ccc041f54d3cf8ac8ba98740e577132ebc622313291eae396ec9b3e07288c50 layer 1 blob -> sha256:0477ed2372f9d75f94fcbdb3c0336031f9b9c08382bcf0c459896d3128158d82 annotation
+verity chain: sha256:2a502ed13438b3ef1358456828ee8ee9a59ce0dca659ebd5a74e9efa45a8f552 manifest -> sha256:a4e5c5441f89c5638848dd27a136514581b8cc3b240e304fa4ed8f41a1420b41 layer 2 blob -> sha256:3341c7cb818bc36ce658d424b9d906d09f37cabd3fbfb755b237baced55a22d9 annotation
+verity chain: layer 2 annotation sha256:3341c7cb818bc36ce658d424b9d906d09f37cabd3fbfb755b237baced55a22d9 == erofs fd sha256:3341c7cb818bc36ce658d424b9d906d09f37cabd3fbfb755b237baced55a22d9
+verity chain: layer 1 annotation sha256:0477ed2372f9d75f94fcbdb3c0336031f9b9c08382bcf0c459896d3128158d82 == erofs fd sha256:0477ed2372f9d75f94fcbdb3c0336031f9b9c08382bcf0c459896d3128158d82
+verity chain: erofs fd sha256:3341c7cb818bc36ce658d424b9d906d09f37cabd3fbfb755b237baced55a22d9,sha256:0477ed2372f9d75f94fcbdb3c0336031f9b9c08382bcf0c459896d3128158d82 -> overlay verity=require
+verity chain: COMPLETE sha256:2a502ed13438b3ef1358456828ee8ee9a59ce0dca659ebd5a74e9efa45a8f552 -> sha256:5d060f1fa9825680b9fd9050a877e89a892c6a175ccb48d4b59cfb2e3d243686 ; sha256:2ccc041f54d3cf8ac8ba98740e577132ebc622313291eae396ec9b3e07288c50 -> sha256:0477ed2372f9d75f94fcbdb3c0336031f9b9c08382bcf0c459896d3128158d82 ; sha256:a4e5c5441f89c5638848dd27a136514581b8cc3b240e304fa4ed8f41a1420b41 -> sha256:3341c7cb818bc36ce658d424b9d906d09f37cabd3fbfb755b237baced55a22d9
+EOT
+}
+
+@test "verity_chain.py: a sample of the log connects, a digest changed in a link does not" {
+    ok=$(chain_sample)
     printf '%s\n' "$ok" | python3 -I "$E2E_DIR/verity_chain.py" > /dev/null || exit 1
     e1=$(printf '%s\n' "$ok" | sed -En "s/^verity chain: layer 1 annotation ($h) == .*/\1/p")
     e2=$(printf '%s\n' "$ok" | sed -En "s/^verity chain: layer 2 annotation ($h) == .*/\1/p")
@@ -905,12 +923,15 @@ broken_at () { # lines, regular expression of what follows BROKEN
     shs "$store" rm -t 0 -f "$id" > /dev/null 2>&1
 }
 
-@test "debug says the digests are not enforced and shows no chain; the default level shows nothing" {
+@test "debug says why the digests are not enforced and shows no chain; the default level shows nothing" {
     need_verity
     store=$VS/dbgplain
     shs "$store" image pull --tls-verify=false "$REPO@$D" > /dev/null || exit 1
-    out=$(dbg "$store" run --rm --network none "$REPO@$D" true)
-    check "one line" "OFF" "$out"
+    shs "$store" image pull --tls-verify=false "$REPO:zstd" > /dev/null || exit 1
+    out=$(dbg "$store" run --rm --network none "$REPO:zstd" true)
+    check "a tag, no signature" "OFF (no digest or signature)" "$out"
+    out=$(dbg "$store" run --rm --network none --security-opt verity=off "$REPO@$D" true)
+    check "turned off" "OFF (--security-opt verity=off)" "$out"
     out=$(shs "$store" run --rm --network none --security-opt verity=enforce "$REPO@$D" cat /etc/alpine-release)
     check_match "default level: the command's output only" '^[0-9]+\.[0-9]+(\.[0-9]+)?$' "$out"
     check "nothing of the chain at the default level" 0 "$(printf '%s\n' "$out" | grep -ac 'verity chain')"
@@ -1046,7 +1067,7 @@ running () { # store: the names of the running containers, one line
     check "nothing started" "" "$(running "$store")"
     # a digest that names no image of the members
     out=$(shs "$store" pod start --verify-image "$D" --verify-image "$B" --verify-image "$zero" pv 2>&1)
-    check_match "no image" "--verify-image $zero: no image of the containers that start is held to it" "$out"
+    check_match "no image" "--verify-image $zero: it names no image of the containers that start" "$out"
     out=$(shs "$store" pod start --verify-image "${D%?}" pv 2>&1)
     check_match "not a digest" "--verify-image ${D%?}: not a digest" "$out"
     check "nothing started" "" "$(running "$store")"
@@ -1090,9 +1111,12 @@ running () { # store: the names of the running containers, one line
     connected "$out" || exit 1
     check "nothing RECORDED" 0 "$(printf '%s\n' "$out" | grep -ac 'RECORDED')"
     shs "$store" pod stop -t 1 ps > /dev/null || exit 1
-    # the digest of the image of the member of a tag is held by no member
-    out=$(shs "$store" pod start --verify-image "$D" --verify-image "$B" ps 2>&1)
-    check_match "a digest of a tag's image" "--verify-image $B: no image of the containers that start is held to it" "$out"
+    # the digest of the manifest of the image of the member of a tag holds it,
+    # as for `start --verify-image`
+    out=$(dbg "$store" pod start --verify-image "$D" --verify-image "$B" ps)
+    check "all run with it" "a1 a2 t1 " "$(running "$store")"
+    check "the member of a tag is held to it" 1 "$(printf '%s\n' "$out" | grep -acE "^root typed $B$")"
+    shs "$store" pod stop -t 1 ps > /dev/null || exit 1
     # the same digest twice is the digest once
     shs "$store" pod start --verify-image "$D" --verify-image "$D" ps > /dev/null || exit 1
     check "all run again" "a1 a2 t1 " "$(running "$store")"
@@ -1131,14 +1155,16 @@ running () { # store: the names of the running containers, one line
     shs "$store" pod rm -t 0 -f pd > /dev/null 2>&1
 }
 
-@test "pod start refuses digests where nothing is enforced, and starts members that are not" {
+@test "pod start refuses digests where nothing is held, and starts members that are not" {
     need_verity
     store=$VS/podplain
-    shs "$store" image pull --tls-verify=false "$REPO@$D" > /dev/null || exit 1
+    shs "$store" image pull --tls-verify=false "$REPO:zstd" > /dev/null || exit 1
     shs "$store" pod create --infra=false --name pp > /dev/null || exit 1
-    shs "$store" create --pod pp --name plain --network none "$REPO@$D" sleep 300 > /dev/null || exit 1
-    out=$(shs "$store" pod start --verify-image "$D" pp 2>&1)
-    check_match "not enforced" "--verify-image: the digests of the images of the containers that start are not enforced" "$out"
+    # (made from a tag that no signature vouches for: held to nothing)
+    shs "$store" create --pod pp --name plain --network none "$REPO:zstd" sleep 300 > /dev/null || exit 1
+    # (a digest that names no image: nothing holds the member to it)
+    out=$(shs "$store" pod start --verify-image "sha256:$(printf 'a%.0s' $(seq 64))" pp 2>&1)
+    check_match "not held" "--verify-image: the digests of the images of the containers that start are not held" "$out"
     shs "$store" pod start pp > /dev/null || exit 1
     check "it runs" "plain " "$(running "$store")"
     shs "$store" pod rm -t 0 -f pp > /dev/null 2>&1
@@ -1264,8 +1290,9 @@ EOT
     shs "$store" image pull --tls-verify=false "$REPO:zstd" > /dev/null || exit 1
     kube_service "$store" || exit 1
     kchain play "$WORKDIR/km.yaml"
-    check "the roots typed: the init container and d" 2 "$(printf '%s\n' "$out" | grep -acE "^root typed $D$")"
-    check "the roots of t and of the infra container" 2 "$(printf '%s\n' "$out" | grep -acE "^root NONE $h$")"
+    # (the container of the tag holds its image to the digest too: it names its manifest)
+    check "the roots typed: the init container, d and t" 3 "$(printf '%s\n' "$out" | grep -acE "^root typed $D$")"
+    check "the root of the infra container" 1 "$(printf '%s\n' "$out" | grep -acE "^root NONE $h$")"
     connected "$out" || exit 1
     check "nothing RECORDED" 0 "$(printf '%s\n' "$out" | grep -ac 'RECORDED')"
     check "d and t run" "km-d km-t " "$(running "$store" | sed 's/[^ ]*-infra //')"
@@ -1281,7 +1308,7 @@ EOT
     out=$(shs "$store" container clone --run orig c1 2>&1)
     check_match "no digest" "the container was made from the digest $D, and the command gives none .*pass --verify-image $D" "$out"
     out=$(shs "$store" container clone --run --verify-image "$B" orig c2 2>&1)
-    check_match "another digest" "--verify-image $B: no image of the container is held to it|which the command does not give" "$out"
+    check_match "another digest" "--verify-image $B: it names no image of the container|which the command does not give" "$out"
     out=$(shs "$store" container clone --run --verify-image "$D" orig c3 2>&1)
     check "right digest" 0 $?
     check "it runs" "c3 " "$(running "$store")"
@@ -1304,7 +1331,7 @@ EOT
     out=$(shs "$store" container restore rs 2>&1)
     check_match "no digest" "the container was made from the digest $D, and the command gives none .*pass --verify-image $D" "$out"
     out=$(shs "$store" container restore --verify-image "$B" rs 2>&1)
-    check_match "another digest" "--verify-image $B: no image of the container is held to it|which the command does not give" "$out"
+    check_match "another digest" "--verify-image $B: it names no image of the container|which the command does not give" "$out"
     check "not running" "" "$(running "$store")"
     out=$(shs "$store" container restore --verify-image "$D" rs 2>&1)
     check "right digest" 0 $?
@@ -1316,7 +1343,7 @@ EOT
     check_match "import, no digest" "the container was made from the digest $D, and the command gives none .*pass --verify-image $D" "$out"
     check "nothing left" "" "$(shs "$store" ps -a --format '{{.Names}}')"
     out=$(shs "$store" container restore --import "$WORKDIR/rs.tar" --verify-image "$B" 2>&1)
-    check_match "import, another digest" "--verify-image $B: no image of the container is held to it|which the command does not give" "$out"
+    check_match "import, another digest" "--verify-image $B: it names no image of the container|which the command does not give" "$out"
     out=$(dbg "$store" container restore --import "$WORKDIR/rs.tar" --verify-image "$D")
     in_order "$out" "^root typed $D$" "^COMPLETE $D -> " || exit 1
     connected "$out" || exit 1
@@ -1340,7 +1367,7 @@ with tarfile.open(src) as t, tarfile.open(dst, "w") as o:
             m.size = len(data)
         o.addfile(m, io.BytesIO(data) if data is not None else None)' "$WORKDIR/rs.tar" "$WORKDIR/edited.tar" "$ref" || exit 1
         out=$(shs "$store" container restore --import "$WORKDIR/edited.tar" --verify-image "$D" 2>&1)
-        check_match "archive of $ref refused" "the stored manifest hashes to $B, not $D|--verify-image $D: no image of the container is held to it \(it was made from no digest\)" "$out"
+        check_match "archive of $ref refused" "the stored manifest hashes to $B, not $D|--verify-image $D: it names no image of the container \(it was made from no digest\)" "$out"
         check "nothing left ($ref)" "" "$(shs "$store" ps -a --format '{{.Names}}')"
     done
 }

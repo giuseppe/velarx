@@ -227,6 +227,10 @@ pub struct ChainPlan {
     /// none), where the overlay follows the stubs of the lowest layer only.
     #[serde(default)]
     pub fuse_layers: usize,
+    /// The layers (from 1) held to the digest the engine recorded for their
+    /// EROFS image, not to one the manifest states.
+    #[serde(default)]
+    pub record: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

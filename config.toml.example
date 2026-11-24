@@ -261,6 +261,21 @@ sync = "syncfs"
 #              pull), --mount type=artifact and --rootfs are refused.
 #              `--security-opt verity=enforce` asks the same of one container
 composefs_digests = "check"
+# Whether a start holds the files of an image to the chain of trust (the
+# digest it was made from or a signature the policy accepts, the digests of
+# the layers recorded at the pull, the files) where the file system has
+# fs-verity:
+#   "auto"  held where every layer was pulled with fs-verity and the image
+#           is all in the store (the default)
+#   "off"   held only where `composefs_digests = "require"` or
+#           `--security-opt verity=enforce` asks for it by name; refused
+#           where signatures are required (`image_signature = "require"`)
+#           or `composefs_digests = "require"`
+#   "require"  a start whose image cannot be held (a layer made without
+#           fs-verity, a lazy image, a driver that checks at pull only, no
+#           digest and no accepted signature) is refused with the reason, and
+#           `--security-opt verity=off` is refused
+verity_chain = "auto"
 
 # The storage service of `driver = "varlink"` (refused with another driver).
 # The engine connects to it when it starts: a service that is not running,
