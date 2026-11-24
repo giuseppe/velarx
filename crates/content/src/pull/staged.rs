@@ -63,7 +63,7 @@ pub const LAYERS: &str = "layers";
 pub const META: &str = "meta";
 /// The boot the area was last used in (the kernel's boot id), below the
 /// staging directory of the store.
-const BOOT: &str = "boot";
+pub const BOOT: &str = "boot";
 
 /// The state of a pull that is not committed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +400,13 @@ impl Staging {
         Ok(())
     }
 
+    /// Whether the area was made in this boot: what it holds of an earlier
+    /// one is not to be used, it goes ([`Self::forget_earlier_boots`]).
+    pub fn is_of_this_boot(&self) -> io::Result<bool> {
+        let now = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        Ok(std::fs::read_to_string(self.base.join(BOOT)).is_ok_and(|b| b == now))
+    }
+
     /// What the area holds of an earlier boot goes: nothing of it was made
     /// durable ([`Barrier`]), so a lazy pull does not outlive a reboot (one
     /// whose engine stopped is resumed by the next).  Called by the process
@@ -407,11 +414,11 @@ impl Staging {
     /// process holds stay (a process of this boot), everything else of the
     /// pulls, the layers and their EROFS images goes, read or not.
     pub fn forget_earlier_boots(&self) -> io::Result<()> {
-        let now = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
-        let boot = self.base.join(BOOT);
-        if std::fs::read_to_string(&boot).is_ok_and(|b| b == now) {
+        if self.is_of_this_boot()? {
             return Ok(());
         }
+        let now = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        let boot = self.base.join(BOOT);
         let names = |dir: &str| -> Vec<String> {
             std::fs::read_dir(self.base.join(dir))
                 .into_iter()
@@ -1246,7 +1253,9 @@ mod tests {
             .join(format!("layer-{}.v1.erofs", key.file_stem()));
         std::fs::write(&image, b"erofs").unwrap();
         std::fs::write(tmp.path().join(BOOT), b"an earlier boot\n").unwrap();
+        assert!(!area.is_of_this_boot().unwrap());
         area.forget_earlier_boots().unwrap();
+        assert!(area.is_of_this_boot().unwrap());
         assert!(area.pull(&old.id).unwrap().is_none());
         assert!(area.pull(&held.id).unwrap().is_some());
         assert!(!area.image_dir("cut").exists());

@@ -357,12 +357,18 @@ impl ImageService {
         // their lease: a pull holds the lock of the store only to start and
         // to commit, not through its download.  The stagings of the layers
         // of a process that died with them go too, and the lazy pulls of an
-        // earlier boot (the first process of a boot is alone).
-        match StorageLock::try_exclusive(&StorageLock::path_of_staging(&staging_dir)) {
+        // earlier boot (the first process of a boot is alone).  What an
+        // earlier boot left is not used by anything: a process that finds it
+        // waits for the lock and cleans it, whoever holds it.
+        let area = velarx_content::pull::staged::Staging::new(&staging_dir);
+        let lock_path = StorageLock::path_of_staging(&staging_dir);
+        let alone = match area.is_of_this_boot() {
+            Ok(true) => StorageLock::try_exclusive(&lock_path),
+            _ => StorageLock::exclusive_blocking(&lock_path).map(Some),
+        };
+        match alone {
             Ok(Some(_alone)) => {
-                if let Err(e) =
-                    velarx_content::pull::staged::Staging::new(&staging_dir).forget_earlier_boots()
-                {
+                if let Err(e) = area.forget_earlier_boots() {
                     warn!("Cannot remove the lazy pulls of an earlier boot: {e}");
                 }
                 velarx_content::pull::session::Session::sweep(&staging_dir, |s| {
@@ -1532,6 +1538,35 @@ mod tests {
             created_at: created.into(),
             is_lazy: false,
         }
+    }
+
+    /// A process that finds what an earlier boot left in the staging area
+    /// waits for the lock of the store, whoever holds it, and cleans it
+    /// before it is used.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_staging_of_an_earlier_boot_is_cleaned_before_it_is_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let area = velarx_content::pull::staged::Staging::new(&staging);
+        area.create().unwrap();
+        let cut = staging.join("pulls/.cut");
+        std::fs::create_dir_all(&cut).unwrap();
+        std::fs::write(staging.join("boot"), b"an earlier boot\n").unwrap();
+        let held =
+            StorageLock::exclusive_blocking(&StorageLock::path_of_staging(&staging)).unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        let store = Arc::new(FileStore::new(tmp.path().join("objects")).unwrap());
+        let (tx, started) = std::sync::mpsc::channel();
+        let dir = staging.clone();
+        let made = std::thread::spawn(move || {
+            tx.send(()).unwrap();
+            ImageService::new(db, store, dir, velarx_storage::VerityMode::Off).map(|_| ())
+        });
+        started.recv().unwrap();
+        drop(held);
+        made.join().unwrap().unwrap();
+        assert!(!cut.exists());
+        assert!(area.is_of_this_boot().unwrap());
     }
 
     #[test]

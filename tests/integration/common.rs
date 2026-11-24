@@ -1181,8 +1181,8 @@ impl Env {
         std::fs::read_dir(&self.staging).map_or(0, |d| {
             d.flatten()
                 .filter(|e| {
-                    use velarx_content::pull::staged::{COMPOSEFS, PULLS};
-                    !matches!(e.file_name().to_str(), Some(PULLS | COMPOSEFS))
+                    use velarx_content::pull::staged::{BOOT, COMPOSEFS, PULLS};
+                    !matches!(e.file_name().to_str(), Some(PULLS | COMPOSEFS | BOOT))
                         && e.path() != stand_in
                 })
                 .map(|e| match e.file_name().to_str() {
