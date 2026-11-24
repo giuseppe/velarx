@@ -532,6 +532,18 @@ fn a_hole_between_two_chunks_is_placed() {
     assert_eq!(comps(&plan.chunks), [100..140, 145..160]);
 }
 
+/// The offsets of a table that is not of a blob are not read, whatever they
+/// say: chunks that end before they begin are no reason to fail.
+#[test]
+fn the_offsets_of_a_table_without_a_blob_may_be_any() {
+    let t = toc(vec![
+        reg("f", &d(9), 20, 500, 100, Some((&d(1), 10))),
+        chunk("f", &d(2), 10, 10, 200),
+    ]);
+    let got = file_chunks(&t, Algorithm::Sha256, 0, None, 1 << 20).unwrap();
+    assert_eq!(got.chunks.len(), 2);
+}
+
 /// A chunk of data is at most `max_chunk` bytes, a hole is not held and
 /// has no such limit.
 #[test]

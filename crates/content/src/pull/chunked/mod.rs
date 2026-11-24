@@ -2654,7 +2654,8 @@ pub(crate) fn chunk_ref(plan: &Plan, i: usize) -> ChunkRef {
         offset: c.file_off,
         blob: Some(BlobRange {
             offset: c.comp.start,
-            length: c.comp.end - c.comp.start,
+            // (a table that is not of a blob has no offsets to be in order)
+            length: c.comp.end.saturating_sub(c.comp.start),
         }),
     }
 }
