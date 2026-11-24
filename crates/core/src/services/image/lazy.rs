@@ -958,8 +958,8 @@ impl ImageService {
         };
         // (its files are written with the others, before the barrier that
         // makes them durable: the row that names the layer comes after it)
-        let linked = self
-            .link_verified(all, verified, vec![done.clone()])
+        let (linked, held) = self
+            .link_verified(all, verified, vec![done.clone()], (store, one))
             .await?;
         // (a file the link refused, or that went meanwhile, is not fetched
         // here: the layer stays staged)
@@ -979,7 +979,7 @@ impl ImageService {
         );
         self.db.commit_layers(vec![commit], Vec::new()).await?;
         debug!("Layer {} committed to the store", layer.key);
-        drop((store, one));
+        drop(held);
         self.release_layer(&layer.key).await;
         Ok(())
     }
@@ -1151,7 +1151,8 @@ impl ImageService {
         images: Vec<&LazyLayer>,
     ) -> ImageResult<Vec<velarx_storage::Object>> {
         let verified = self.verify_files(layers, digests, images).await?;
-        self.link_verified(layers, verified, Vec::new()).await
+        let (objects, ()) = self.link_verified(layers, verified, Vec::new(), ()).await?;
+        Ok(objects)
     }
 
     /// The staging phase of [`LazyEngine::link_files`]: every staged file
@@ -1195,15 +1196,19 @@ impl ImageService {
         .map_err(|e| ImageError::Storage(e.to_string()))?
     }
 
-    /// The locked part of [`LazyEngine::link_files`].
-    async fn link_verified(
+    /// The locked part of [`LazyEngine::link_files`]: the locks `held` (of
+    /// the commit) are those of the thread that links, they are let go when
+    /// it ends whatever becomes of the caller, and given back with the
+    /// result.
+    async fn link_verified<H: Send + 'static>(
         &self,
         layers: &[LazyLayer],
         staged: StagedFiles,
         keep: Vec<LayerDone>,
-    ) -> ImageResult<Vec<velarx_storage::Object>> {
+        held: H,
+    ) -> ImageResult<(Vec<velarx_storage::Object>, H)> {
         let store = self.file_store.clone();
-        let (done, steps, refused) = tokio::task::spawn_blocking(move || {
+        let (placed, held) = blocking_holding(held, move || {
             let StagedFiles {
                 dirs,
                 wanted,
@@ -1213,8 +1218,8 @@ impl ImageService {
             } = staged;
             place_staged(verified, &dirs, &wanted, &store, &images, &objects, &keep)
         })
-        .await
-        .map_err(|e| ImageError::Storage(e.to_string()))??;
+        .await?;
+        let (done, steps, refused) = placed?;
         // (a file that is gone, has wrong bytes or lacks the seal the store
         // asks for fails the completion, naming the fetcher that staged it)
         // (a file whose name is gone because another completion committed it
@@ -1248,7 +1253,7 @@ impl ImageService {
                 }
             }
         }
-        Ok(done)
+        Ok((done, held))
     }
 
     /// Exclusive for the commit of one layer, across processes: held until
@@ -1267,6 +1272,18 @@ impl ImageService {
         .map_err(|e| ImageError::Storage(e.to_string()))?
         .map_err(ImageError::Io)
     }
+}
+
+/// `work` on a blocking thread, which keeps `held` until it ends: a caller
+/// that is dropped meanwhile (a cancel) does not let go of what `work`
+/// needs held.  `held` is given back with the result.
+async fn blocking_holding<H: Send + 'static, R: Send + 'static>(
+    held: H,
+    work: impl FnOnce() -> R + Send + 'static,
+) -> ImageResult<(R, H)> {
+    tokio::task::spawn_blocking(move || (work(), held))
+        .await
+        .map_err(|e| ImageError::Storage(e.to_string()))
 }
 
 /// The files `digests` split by the staging that holds each: a content is
@@ -1535,6 +1552,33 @@ struct Refused {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    /// The locks of a commit are let go when the thread that links ends, not
+    /// when the task that waits for it is dropped.
+    #[tokio::test]
+    async fn the_locks_of_a_commit_outlive_a_cancelled_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("commit-layer");
+        let held = velarx_storage::locks::lock(&path, true).unwrap().unwrap();
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (end_tx, end) = std::sync::mpsc::channel::<()>();
+        let task = tokio::spawn(blocking_holding(held, move || {
+            started_tx.send(()).unwrap();
+            end.recv().unwrap();
+        }));
+        tokio::task::spawn_blocking(move || started.recv().unwrap())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+        assert!(velarx_storage::locks::lock(&path, false).unwrap().is_none());
+        end_tx.send(()).unwrap();
+        let free = tokio::task::spawn_blocking(move || velarx_storage::locks::lock(&path, true))
+            .await
+            .unwrap();
+        assert!(free.unwrap().is_some());
+    }
+
     use velarx_storage::{FileStore, VerityMode};
 
     fn layer_of(files: &[(&str, &[u8])]) -> LazyLayer {
