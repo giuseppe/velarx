@@ -1050,4 +1050,25 @@ mod tests {
             "registry-1.docker.io"
         );
     }
+
+    /// The `location` of a block, a mirror and an alias of registries.conf
+    /// are a host and a path, as a reference is: a file that names what
+    /// would reach the host or the path of an endpoint as another thing
+    /// is refused when it is read.
+    #[test]
+    fn a_location_of_registries_conf_must_be_a_host_and_a_path() {
+        for (what, conf) in [
+            (
+                "a block",
+                "[[registry]]\nprefix = \"quay.io\"\nlocation = \"a b?c#d/..e\"",
+            ),
+            (
+                "a mirror",
+                "[[registry]]\nprefix = \"docker.io\"\n[[registry.mirror]]\nlocation = \"m ?/%2f\"",
+            ),
+            ("an alias", "[aliases]\nal = \"bad.host?x#y/z\""),
+        ] {
+            assert!(RegistriesConfig::parse(conf).is_err(), "{what}");
+        }
+    }
 }

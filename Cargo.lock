@@ -4779,6 +4779,7 @@ dependencies = [
  "thiserror 2.0.21",
  "velarx-idmap-core",
  "velarx-proto",
+ "velarx-ref-core",
  "velarx-sys",
 ]
 
@@ -5311,6 +5312,10 @@ name = "velarx-pull-core"
 version = "0.1.0"
 
 [[package]]
+name = "velarx-ref-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-registry"
 version = "0.1.0"
 dependencies = [
@@ -5472,6 +5477,7 @@ dependencies = [
  "tracing",
  "velarx-base",
  "velarx-policy-core",
+ "velarx-ref-core",
  "velarx-sigparse-core",
  "yaml-rust2",
  "zeroize",
@@ -5610,6 +5616,7 @@ dependencies = [
  "tokio-rusqlite",
  "velarx-base",
  "velarx-proto",
+ "velarx-ref-core",
 ]
 
 [[package]]

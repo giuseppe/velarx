@@ -248,7 +248,11 @@ localhost:5077/acme/app  1.0         b87c666fe32b  2 seconds ago  8.71 MB
 A scope is compared with the full normalized name of the image, so the
 official images of Docker Hub are `docker.io/library/NAME` (`image trust set`
 refuses a scope that can match no image: one without a registry host, or
-with `index.docker.io`).
+with `index.docker.io`).  A reference whose registry has a capital letter
+is refused, and the prefixes and the locations of registries.conf are read
+with the same grammar as an image reference.  An IPv6 registry is written as
+the address prints (`[::1]:5000`), and an IPv4-mapped address is refused in
+every spelling: write the IPv4 address.
 
 A refused image is not stored.  The same policy can be written by hand
 (`policy.json` is the format of containers-policy.json(5)); `sigstoreSigned`

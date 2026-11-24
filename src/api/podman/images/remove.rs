@@ -13,9 +13,9 @@ pub(crate) fn registry_name(spec: &str) -> ApiResult<String> {
 }
 
 pub(super) fn parse_name(name: &str) -> ApiResult<ImageReference> {
-    let r = ImageReference::parse(name)?;
-    r.validate()
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let refused = |e: velarx_types::ImageError| ApiError::bad_request(e.to_string());
+    let r = ImageReference::parse(name).map_err(refused)?;
+    r.validate().map_err(refused)?;
     Ok(r)
 }
 

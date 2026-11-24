@@ -673,10 +673,7 @@ mod tests {
             assert_eq!(ImageLocation::parse(s).unwrap(), reg(s), "{s}");
         }
         // (the registry parser refuses them later)
-        assert!(crate::ImageReference::parse(r"C:\images\a.tar")
-            .unwrap()
-            .validate()
-            .is_err());
+        assert!(crate::ImageReference::parse(r"C:\images\a.tar").is_err());
     }
 
     #[test]

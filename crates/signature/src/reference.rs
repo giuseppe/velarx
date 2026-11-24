@@ -15,171 +15,20 @@ pub struct DockerRef {
     pub digest: Option<String>,
 }
 
-const MAX_NAME: usize = 255;
-
-fn path_component_ok(c: &str) -> bool {
-    // [a-z0-9]+ separated by `.`, `_`, `__` or dashes
-    let b = c.as_bytes();
-    if b.is_empty() || !b[0].is_ascii_alphanumeric() || !b[b.len() - 1].is_ascii_alphanumeric() {
-        return false;
-    }
-    let mut i = 0;
-    while i < b.len() {
-        let ch = b[i];
-        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < b.len() && matches!(b[i], b'.' | b'_' | b'-') {
-            i += 1;
-        }
-        let sep = &c[start..i];
-        // anything else (an upper case letter...) is no separator
-        let ok = !sep.is_empty()
-            && (sep == "." || sep == "_" || sep == "__" || sep.bytes().all(|x| x == b'-'));
-        if !ok {
-            return false;
-        }
-    }
-    true
-}
-
-fn domain_ok(d: &str) -> bool {
-    let (host, port) = if let Some(rest) = d.strip_prefix('[') {
-        // [ipv6]:port
-        match rest.split_once(']') {
-            Some((ip, after)) => {
-                if ip.parse::<std::net::Ipv6Addr>().is_err() {
-                    return false;
-                }
-                match after.strip_prefix(':') {
-                    Some(p) => ("x", Some(p)),
-                    None if after.is_empty() => ("x", None),
-                    None => return false,
-                }
-            }
-            None => return false,
-        }
-    } else {
-        match d.rsplit_once(':') {
-            Some((h, p)) => (h, Some(p)),
-            None => (d, None),
-        }
-    };
-    if let Some(p) = port {
-        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
-            return false;
-        }
-    }
-    !host.is_empty()
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-        })
-}
-
-fn tag_ok(t: &str) -> bool {
-    !t.is_empty()
-        && t.len() <= 128
-        && (t.as_bytes()[0].is_ascii_alphanumeric() || t.as_bytes()[0] == b'_')
-        && t.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
-}
-
-fn digest_ok(d: &str) -> bool {
-    let Some((algo, hex)) = d.split_once(':') else {
-        return false;
-    };
-    let algo_ok = !algo.is_empty()
-        && algo.split(['+', '.', '_', '-']).all(|p| {
-            !p.is_empty()
-                && p.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        });
-    let hex_ok = hex.len() >= 32
-        && hex
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'=' | b'_' | b'-'));
-    let known = match algo {
-        "sha256" => hex.len() == 64,
-        "sha384" => hex.len() == 96,
-        "sha512" => hex.len() == 128,
-        _ => true,
-    };
-    algo_ok
-        && hex_ok
-        && known
-        && (!matches!(algo, "sha256" | "sha384" | "sha512")
-            || hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
-}
-
 impl DockerRef {
     /// Parse and normalize `s` as `ParseNormalizedNamed` does.
     pub fn parse_normalized(s: &str) -> Result<Self, String> {
-        let bad = || format!("invalid reference format: {s:?}");
-        let (rest, digest) = match s.split_once('@') {
-            Some((r, d)) => {
-                if !digest_ok(d) {
-                    return Err(bad());
-                }
-                (r, Some(d.to_string()))
-            }
-            None => (s, None),
-        };
-        let (name, tag) = match rest.rfind(':') {
-            Some(i) if !rest[i + 1..].contains('/') => {
-                let t = &rest[i + 1..];
-                if !tag_ok(t) {
-                    return Err(bad());
-                }
-                (&rest[..i], Some(t.to_string()))
-            }
-            _ => (rest, None),
-        };
-        if name.is_empty() || name.bytes().any(|b| b.is_ascii_uppercase()) && !name.contains('/') {
-            return Err(bad());
-        }
-        let (mut domain, mut path) = match name.split_once('/') {
-            Some((first, remainder))
-                if velarx_base::reference::is_registry_domain(first)
-                    || first.bytes().any(|b| b.is_ascii_uppercase()) =>
-            {
-                (first.to_string(), remainder.to_string())
-            }
-            _ => ("docker.io".to_string(), name.to_string()),
-        };
-        if domain == "index.docker.io" {
-            domain = "docker.io".into();
-        }
-        if domain == "docker.io" && !path.contains('/') {
-            path = format!("library/{path}");
-        }
-        if !domain_ok(&domain)
-            || !path.split('/').all(path_component_ok)
-            || domain.len() + 1 + path.len() > MAX_NAME
-        {
-            return Err(bad());
-        }
-        // a 64 hex name alone is an image id, not a name
-        if domain == "docker.io"
-            && path.len() == 72
-            && path.starts_with("library/")
-            && path[8..].bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return Err(bad());
-        }
+        let bytes = s.as_bytes();
+        let spans = velarx_base::reference::parse(bytes)
+            .map_err(|e| format!("invalid reference format: {s:?}: {e}"))?;
+        let name = velarx_ref_core::normalize(bytes, &spans);
+        // (an accepted string is ASCII: its spans are on characters)
+        let part = |r: Option<(usize, usize)>| r.map(|(from, to)| s[from..to].to_string());
         Ok(Self {
-            domain,
-            path,
-            tag,
-            digest,
+            domain: String::from_utf8_lossy(&name.host).into_owned(),
+            path: String::from_utf8_lossy(&name.path).into_owned(),
+            tag: part(spans.tag),
+            digest: part(spans.digest),
         })
     }
 
@@ -288,12 +137,9 @@ impl SignedIdentity {
     /// are a host or a repository.
     pub fn validate(&self) -> Result<(), String> {
         let prefix_ok = |p: &str| {
-            // `*.host`, a host, or a host and a path, all normalized
-            let name = p.strip_prefix("*.").unwrap_or(p);
-            !name.is_empty()
-                && (domain_ok(name) && !name.contains('/')
-                    || DockerRef::parse_normalized(name)
-                        .is_ok_and(|r| r.name() == name && r.name_only()))
+            // a host, or a host and a path, written as they are normalized
+            velarx_base::reference::host_ok(p.as_bytes())
+                || DockerRef::parse_normalized(p).is_ok_and(|r| r.name() == p && r.name_only())
         };
         match self {
             SignedIdentity::ExactReference { docker_reference } => {
@@ -558,12 +404,6 @@ mod tests {
         );
         assert!(remap("mirror.local/quay/a/b", "quay.io/x/y")
             .matches(&r("mirror.local/quay/a/b:v1"), "quay.io/x/y:v1"));
-        // a wildcard is never a prefix (`validate` accepts it): the image
-        // is judged as it is
-        let wild = remap("*.local", "quay.io");
-        assert!(wild.validate().is_ok());
-        assert!(wild.matches(&r("mirror.local/a:v1"), "mirror.local/a:v1"));
-        assert!(!wild.matches(&r("mirror.local/a:v1"), "quay.io/a:v1"));
     }
 
     /// The reference made by the replacement must be one as it is written:
@@ -577,5 +417,153 @@ mod tests {
         // the replacement that is a whole reference as written is fine
         let rule = remap("mirror.local", "docker.io");
         assert!(rule.matches(&r("mirror.local/a/b:v1"), "docker.io/a/b:v1"));
+    }
+
+    const D: &str = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    fn short(s: &str) -> String {
+        if s.len() > 40 {
+            format!("<{} bytes>", s.len())
+        } else {
+            format!("{s:?}")
+        }
+    }
+
+    /// What `parse_normalized` makes of `input`.
+    fn shown(input: &str) -> String {
+        match DockerRef::parse_normalized(input) {
+            Err(_) => "error".to_string(),
+            Ok(r) => format!(
+                "domain {} path {} tag {} digest {}",
+                short(&r.domain),
+                short(&r.path),
+                r.tag.as_deref().map_or("none".into(), short),
+                r.digest.as_deref().map_or("none".into(), |d| {
+                    let (algo, hex) = d.split_once(':').unwrap();
+                    format!("{algo}:{}", short(hex))
+                }),
+            ),
+        }
+    }
+
+    /// What the real code answers for the inputs of the table of the design of
+    /// image references: what `parse_normalized` makes of each, that is the
+    /// grammar of the identity rules of signatures (the domain, the path, the
+    /// tag and the digest of the normalized reference, or an error).
+    #[test]
+    fn parse_normalized_on_the_reference_table() {
+        let table: Vec<(String, &str)> = vec![
+            (
+                "x".to_string(),
+                "domain \"docker.io\" path \"library/x\" tag none digest none",
+            ),
+            (
+                "x:tag".to_string(),
+                "domain \"docker.io\" path \"library/x\" tag \"tag\" digest none",
+            ),
+            (
+                "x:5000".to_string(),
+                "domain \"docker.io\" path \"library/x\" tag \"5000\" digest none",
+            ),
+            (
+                "x:5000/y".to_string(),
+                "domain \"x:5000\" path \"y\" tag none digest none",
+            ),
+            (
+                "localhost/x".to_string(),
+                "domain \"localhost\" path \"x\" tag none digest none",
+            ),
+            (
+                "docker.io/alpine".to_string(),
+                "domain \"docker.io\" path \"library/alpine\" tag none digest none",
+            ),
+            (
+                "index.docker.io/a/b".to_string(),
+                "domain \"docker.io\" path \"a/b\" tag none digest none",
+            ),
+            (
+                "docker.io/a.b/c".to_string(),
+                "domain \"docker.io\" path \"a.b/c\" tag none digest none",
+            ),
+            ("Quay.IO/a/b".to_string(), "error"),
+            ("Foo/bar".to_string(), "error"),
+            ("quay.io/a..b".to_string(), "error"),
+            ("quay.io/a--_b".to_string(), "error"),
+            ("quay.io/a___b".to_string(), "error"),
+            (":5000/x".to_string(), "error"),
+            ("a.b:abc/x".to_string(), "error"),
+            ("a..b/x".to_string(), "error"),
+            ("a.-b/x".to_string(), "error"),
+            (
+                "[::1]:5000/a".to_string(),
+                "domain \"[::1]:5000\" path \"a\" tag none digest none",
+            ),
+            ("quay.io//a".to_string(), "error"),
+            ("a/".to_string(), "error"),
+            ("/a".to_string(), "error"),
+            ("a:".to_string(), "error"),
+            ("a:.x".to_string(), "error"),
+            ("../x".to_string(), "error"),
+            ("%2f".to_string(), "error"),
+            ("?".to_string(), "error"),
+            ("#".to_string(), "error"),
+            ("quay.io/a b".to_string(), "error"),
+            ("quay.io/a\0b".to_string(), "error"),
+            ("quay.io/caf\u{e9}".to_string(), "error"),
+            (format!("quay.io/a:{}", "t".repeat(129)), "error"),
+            (
+                format!("quay.io/a:t@{D}"),
+                "domain \"quay.io\" path \"a\" tag \"t\" digest sha256:<64 bytes>",
+            ),
+            (format!("quay.io/a:b c@{D}"), "error"),
+            (format!("x@y@{D}"), "error"),
+            (format!("a@{D1}@{D}"), "error"),
+            (format!("h.io@evil.com/a@{D}"), "error"),
+            (" alpine\n".to_string(), "error"),
+            ("a".repeat(258), "error"),
+            ("a".repeat(255), "error"),
+            (format!("quay.io/{}", "a".repeat(255)), "error"),
+            (format!("{}.io/x", "a".repeat(252)), "error"),
+            ("0123456789abcdef".repeat(4), "error"),
+            (
+                format!("a@sha384:{}", "ab".repeat(48)),
+                "domain \"docker.io\" path \"library/a\" tag none digest sha384:<96 bytes>",
+            ),
+            (format!("a@foo:{}", "z".repeat(32)), "error"),
+            (format!("a@sha256:{}", "A".repeat(64)), "error"),
+            ("a@sha256:abc".to_string(), "error"),
+            ("alpine@".to_string(), "error"),
+            (
+                format!("quay.io/a:v1@sha512:{}", "ab".repeat(64)),
+                "domain \"quay.io\" path \"a\" tag \"v1\" digest sha512:<128 bytes>",
+            ),
+        ];
+        for (input, expected) in &table {
+            assert_eq!(shown(input), *expected, "{input:?}");
+        }
+    }
+
+    /// An IPv6 host has one spelling: a scope written for `[::1]:5000` is
+    /// not escaped by `[0::1]:5000`.
+    #[test]
+    fn an_ipv6_host_has_one_spelling() {
+        assert_eq!(r("[::1]:5000/a:v1").string(), "[::1]:5000/a:v1");
+        for other in ["[0::1]:5000/a:v1", "[0:0::1]:5000/a:v1", "[:]/a:v1"] {
+            assert!(DockerRef::parse_normalized(other).is_err(), "{other}");
+        }
+        assert!(remap("[::1]:5000", "quay.io").validate().is_ok());
+        assert!(remap("[0::1]:5000", "quay.io").validate().is_err());
+    }
+
+    /// A prefix `*.host` of `remapIdentity` is refused when the policy is
+    /// read: `covers` never matches it, and the image would be judged as
+    /// itself.
+    #[test]
+    fn a_wildcard_prefix_of_remap_identity_is_refused() {
+        let rule = SignedIdentity::RemapIdentity {
+            prefix: "*.example.com".into(),
+            signed_prefix: "example.org".into(),
+        };
+        assert!(rule.validate().is_err());
     }
 }

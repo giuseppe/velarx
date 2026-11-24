@@ -385,12 +385,12 @@ pub(super) fn run_system_command(cmd: SystemCommands, inv: &Invocation<'_>) -> a
             }
             if !report.ok() {
                 // (objects without the fs-verity the store requires are whole)
-                let unmeasured = report
+                let undamaged = report
                     .problems
                     .iter()
                     .filter(|p| p.open())
-                    .all(|p| p.kind == "no_verity");
-                anyhow::bail!(match (repair || force, unmeasured) {
+                    .all(|p| !velarx_proto::system::kind_damages(&p.kind));
+                anyhow::bail!(match (repair || force, undamaged) {
                     (true, true) => "local storage still needs repair after repair attempt",
                     (true, false) => "damage in local storage still present after repair attempt",
                     (false, true) => "local storage needs repair",

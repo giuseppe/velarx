@@ -25,6 +25,7 @@ rustix = { workspace = true, features = ["fs", "process", "net", "pipe", "thread
 thiserror.workspace = true
 velarx-idmap-core = { path = "../idmap-core" }
 velarx-proto = { path = "../proto", default-features = false }
+velarx-ref-core = { path = "../ref-core" }
 libc.workspace = true
 velarx-sys = { path = "../sys" }
 serde = { workspace = true, features = ["derive"] }

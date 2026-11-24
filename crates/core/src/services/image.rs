@@ -854,7 +854,7 @@ impl ImageService {
         let parsed = ImageReference::parse(reference).ok()?;
         let tag = parsed.tag.clone().unwrap_or_else(|| "latest".into());
         let mut names = vec![parsed.name()];
-        if parsed.registry == "docker.io" && !reference.starts_with("docker.io/") {
+        if parsed.registry == "docker.io" && without_registry(reference) {
             if let Ok(local) = ImageReference::parse(&format!("localhost/{reference}")) {
                 names.push(local.name());
             }
@@ -938,7 +938,7 @@ impl ImageService {
             self.db.get_image_by_tag(&image_ref.name(), &tag).await
         };
         let parsed = ImageReference::parse(reference)?;
-        let unqualified = parsed.registry == "docker.io" && !reference.starts_with("docker.io/");
+        let unqualified = without_registry(reference);
         // NAME@DIGEST: the image that was pulled by that name, else the image
         // of that manifest when it has that name or no name at all
         if let Some(d) = &parsed.digest {
@@ -1064,7 +1064,7 @@ impl ImageService {
         let Ok(parsed) = ImageReference::parse(reference) else {
             return None;
         };
-        let unqualified = parsed.registry == "docker.io" && !reference.starts_with("docker.io/");
+        let unqualified = without_registry(reference);
         let tag = parsed.tag.clone().unwrap_or_else(|| "latest".into());
         let mut wanted = vec![parsed.name()];
         if unqualified {
@@ -1801,6 +1801,11 @@ mod tests {
         drop(rx);
         tx.report(progress(1));
     }
+}
+
+/// Whether `reference` is written without a registry.
+fn without_registry(reference: &str) -> bool {
+    velarx_base::reference::parse(reference.as_bytes()).is_ok_and(|spans| spans.host_end == 0)
 }
 
 /// The repository and the tag (`latest` by default) of a short name: a

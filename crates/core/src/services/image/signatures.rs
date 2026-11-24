@@ -809,16 +809,29 @@ mod tests {
         }
     }
 
+    /// A host in capitals is refused, and the message says to write it in
+    /// lower case: it would be the same registry for DNS and another one
+    /// for the scopes of the policy and the blocks of registries.conf,
+    /// which compare the text.
     #[tokio::test]
-    async fn an_uppercase_host_is_a_scope_of_its_own() {
+    async fn a_host_in_capitals_is_refused() {
         let (_tmp, service) = with_policy(
             r#"{"default": [{"type": "insecureAcceptAnything"}],
                 "transports": {"docker": {"quay.io/x": [{"type": "reject"}]}}}"#,
         )
         .await;
         assert_eq!(scope_of(&service, "quay.io/x/y"), "scope quay.io/x");
-        // as upstream: the host is not lowercased
-        assert_eq!(scope_of(&service, "Quay.io/x/y"), "the default");
+        let image = test_image();
+        service.db.insert_image(&image).await.unwrap();
+        let block = "[[registry]]\nprefix = \"quay.io\"\nblocked = true\n";
+        assert!(endpoints_of(block, "quay.io/x/y").is_err());
+        for name in ["Quay.io/x/y", "Quay.IO/x/y"] {
+            let e = ImageReference::parse(name).unwrap_err().to_string();
+            assert!(e.contains("host is written in lower case"), "{e}");
+            assert!(endpoints_of(block, name).is_err());
+            assert!(endpoints_of("", name).is_err());
+            assert!(service.tag(&image.id, name).await.is_err());
+        }
     }
 
     /// The image `quay.io/x/y:1` (its manifest is `{}`), as the create and
@@ -1148,5 +1161,233 @@ mod tests {
         let d = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let r = intended(&ImageReference::parse(&format!("quay.io/a/b@{d}")).unwrap()).unwrap();
         assert_eq!(r.string(), format!("quay.io/a/b@{d}"));
+    }
+
+    /// The (host, repository) pairs a pull of `name` asks, mirrors first,
+    /// with the registries.conf `conf`; or why it is refused.
+    fn endpoints_of(conf: &str, name: &str) -> Result<Vec<(String, String)>, String> {
+        let transport = velarx_registry::target::TransportConfig {
+            registries: velarx_registry::RegistriesConfig::parse(conf).unwrap(),
+            certs_dirs: Vec::new(),
+            tls_verify: true,
+        };
+        let r = ImageReference::parse(name).map_err(|e| e.to_string())?;
+        r.validate().map_err(|e| e.to_string())?;
+        transport
+            .endpoints(&r.registry, &r.repository, r.digest.is_some(), true)
+            .map(|endpoints| {
+                endpoints
+                    .into_iter()
+                    .map(|e| (e.host, e.repository))
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn pair(host: &str, repository: &str) -> (String, String) {
+        (host.to_string(), repository.to_string())
+    }
+
+    /// An image whose manifest is `{}`.
+    fn test_image() -> velarx_db::ImageRecord {
+        let manifest = "{}".to_string();
+        let digest = Digest::of(velarx_types::digest::Algorithm::Sha256, manifest.as_bytes());
+        velarx_db::ImageRecord {
+            id: "0".repeat(64),
+            manifest_digest: digest,
+            config_digest: digest,
+            manifest,
+            config: "{}".into(),
+            created_at: String::new(),
+            is_lazy: false,
+        }
+    }
+
+    /// `docker.io/alpine` and `docker.io/library/alpine` are one image for
+    /// the signature policy (the scope, the identity judged), but not for
+    /// the request (the path asked) nor for registries.conf (the prefix).
+    #[tokio::test]
+    async fn docker_io_alpine_is_judged_as_library_alpine_and_asked_as_alpine() {
+        let (_tmp, service) = with_policy(
+            r#"{"default": [{"type": "insecureAcceptAnything"}],
+                "transports": {"docker": {"docker.io/library/alpine": [{"type": "reject"}]}}}"#,
+        )
+        .await;
+        let hub = "registry-1.docker.io";
+        for (name, path) in [
+            ("alpine", "library/alpine"),
+            ("docker.io/library/alpine", "library/alpine"),
+            // Pins a disagreement: the request is for `alpine` (not `library/alpine`) though the policy judges it as `library/alpine`; a reader expects one name for both.
+            ("docker.io/alpine", "alpine"),
+        ] {
+            let r = ImageReference::parse(name).unwrap();
+            assert_eq!(scope_of(&service, name), "scope docker.io/library/alpine");
+            assert_eq!(
+                intended(&r).unwrap().string(),
+                "docker.io/library/alpine:latest"
+            );
+            assert!(service.policy_for(&r).is_err(), "{name}");
+            assert_eq!(endpoints_of("", name).unwrap(), [pair(hub, path)], "{name}");
+        }
+        // a block, or a mirror, written for the name the policy uses
+        let block = "[[registry]]\nprefix = \"docker.io/library/alpine\"\nblocked = true\n";
+        let mirror = "[[registry]]\nprefix = \"docker.io/library\"\n[[registry.mirror]]\nlocation = \"m.example/lib\"\n";
+        assert!(endpoints_of(block, "alpine").is_err());
+        assert!(endpoints_of(block, "docker.io/library/alpine").is_err());
+        // Pins a disagreement: the block of `docker.io/library/alpine` does not apply to `docker.io/alpine`; a reader expects it to be refused.
+        assert_eq!(
+            endpoints_of(block, "docker.io/alpine").unwrap(),
+            [pair(hub, "alpine")]
+        );
+        assert_eq!(
+            endpoints_of(mirror, "alpine").unwrap(),
+            [pair("m.example", "lib/alpine"), pair(hub, "library/alpine")]
+        );
+        // Pins a disagreement: the mirror of `docker.io/library` is not asked for `docker.io/alpine`; a reader expects it to be.
+        assert_eq!(
+            endpoints_of(mirror, "docker.io/alpine").unwrap(),
+            [pair(hub, "alpine")]
+        );
+    }
+
+    /// `index.docker.io` is `docker.io` for the signature policy, and a
+    /// registry of its own for registries.conf: a block of `docker.io` does
+    /// not refuse it, and a mirror of `docker.io` is not used.
+    #[tokio::test]
+    async fn index_docker_io_escapes_a_block_of_docker_io() {
+        let (_tmp, service) = with_policy(
+            r#"{"default": [{"type": "reject"}],
+                "transports": {"docker": {"docker.io/a": [{"type": "insecureAcceptAnything"}]}}}"#,
+        )
+        .await;
+        for name in ["docker.io/a/b", "index.docker.io/a/b"] {
+            assert_eq!(scope_of(&service, name), "scope docker.io/a", "{name}");
+            assert!(service
+                .policy_for(&ImageReference::parse(name).unwrap())
+                .is_ok());
+        }
+        let block = "[[registry]]\nprefix = \"docker.io\"\nblocked = true\n";
+        let e = endpoints_of(block, "docker.io/a/b").unwrap_err();
+        assert!(e.contains("is blocked in registries.conf"), "{e}");
+        // Pins a disagreement: the block of `docker.io` does not refuse `index.docker.io`, which the policy judges as `docker.io`; a reader expects it to be refused.
+        assert_eq!(
+            endpoints_of(block, "index.docker.io/a/b").unwrap(),
+            [pair("index.docker.io", "a/b")]
+        );
+        let mirror =
+            "[[registry]]\nprefix = \"docker.io\"\n[[registry.mirror]]\nlocation = \"m.example\"\n";
+        assert_eq!(
+            endpoints_of(mirror, "docker.io/a/b").unwrap(),
+            [
+                pair("m.example", "a/b"),
+                pair("registry-1.docker.io", "a/b")
+            ]
+        );
+        // Pins a disagreement: no mirror of `docker.io` is used for `index.docker.io`; a reader expects the same endpoints.
+        assert_eq!(
+            endpoints_of(mirror, "index.docker.io/a/b").unwrap(),
+            [pair("index.docker.io", "a/b")]
+        );
+    }
+
+    /// An image tagged `docker.io/a.b/c` is stored as `a.b/c`, and every
+    /// reader of the stored name takes `a.b` for a host: the signature
+    /// policy judges it by the scope `a.b`, and a pull by the name asks
+    /// that host.
+    #[tokio::test]
+    async fn a_docker_io_name_with_a_dotted_first_component_is_stored_as_another_host() {
+        let (_tmp, service) = with_policy(
+            r#"{"default": [{"type": "insecureAcceptAnything"}],
+                "transports": {"docker": {
+                    "a.b": [{"type": "reject"}],
+                    "docker.io/a.b": [{"type": "insecureAcceptAnything"}]}}}"#,
+        )
+        .await;
+        let image = test_image();
+        service.db.insert_image(&image).await.unwrap();
+        service.tag(&image.id, "docker.io/a.b/c").await.unwrap();
+        let tags = service.get_tags(&image.id).await.unwrap();
+        // Pins a disagreement: the repository stored is `a.b/c`, without the registry `docker.io`; a reader expects the name to be read back as it was written.
+        assert_eq!(
+            tags.iter()
+                .map(|t| (t.repository.as_str(), t.tag.as_str()))
+                .collect::<Vec<_>>(),
+            [("a.b/c", "latest")]
+        );
+        let stored = ImageReference::parse("a.b/c:latest").unwrap();
+        assert_eq!(
+            (stored.registry.as_str(), stored.repository.as_str()),
+            ("a.b", "c")
+        );
+        // the name written is found by its text, as is the stored one
+        assert_eq!(service.get("docker.io/a.b/c").await.unwrap().id, image.id);
+        assert_eq!(service.get("a.b/c").await.unwrap().id, image.id);
+        // the policy: the scope of the host `a.b`, not of `docker.io/a.b`
+        assert_eq!(scope_of(&service, "docker.io/a.b/c"), "scope docker.io/a.b");
+        assert_eq!(scope_of(&service, "a.b/c"), "scope a.b");
+        let e = service
+            .verify_pulled(
+                "a.b/c:latest",
+                &image,
+                &tags,
+                SignatureJudging::Check,
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("rejects it (scope a.b)"), "{e}");
+        // the request: the host a.b, not the registry of Docker Hub
+        assert_eq!(
+            endpoints_of("", "docker.io/a.b/c").unwrap(),
+            [pair("registry-1.docker.io", "a.b/c")]
+        );
+        assert_eq!(
+            endpoints_of("", "a.b/c:latest").unwrap(),
+            [pair("a.b", "c")]
+        );
+    }
+
+    /// `image tag` refuses a name that the grammar of the references
+    /// refuses, as a pull does: nothing is stored that no create could judge.
+    #[tokio::test]
+    async fn image_tag_refuses_the_names_that_a_pull_refuses() {
+        let d = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let long_tag = format!("a:{}", "t".repeat(129));
+        let (_tmp, service) =
+            with_policy(r#"{"default": [{"type": "insecureAcceptAnything"}]}"#).await;
+        let image = test_image();
+        service.db.insert_image(&image).await.unwrap();
+        for target in [
+            "Foo/bar",
+            "Quay.IO/a/b",
+            "quay.io//a",
+            "a/",
+            "/a",
+            "../x",
+            "quay.io/a b",
+            "quay.io/a?x=1",
+            "quay.io/a%2f..%2fb",
+            "a:",
+            "a:.x",
+            "quay.io/a..b",
+            ":5000/x",
+            " alpine\n",
+            &long_tag,
+            &format!("x@y@{d}"),
+        ] {
+            assert!(service.tag(&image.id, target).await.is_err(), "{target:?}");
+        }
+        assert!(service.get_tags(&image.id).await.unwrap().is_empty());
+        // (the tag before a digest is not stored: the digest names the image)
+        service
+            .tag(&image.id, &format!("quay.io/a:t@{d}"))
+            .await
+            .unwrap();
+        let tags = service.get_tags(&image.id).await.unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(
+            (tags[0].repository.as_str(), tags[0].tag.as_str()),
+            ("quay.io/a", "latest")
+        );
     }
 }

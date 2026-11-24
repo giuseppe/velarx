@@ -184,7 +184,8 @@ struct V1List {
     registries: Vec<String>,
 }
 
-/// A location or a prefix: no scheme, no trailing slash, not empty.
+/// A location or a prefix: no scheme, no trailing slash, a host or a host
+/// and a path (a prefix may be `*.` and a host).
 fn normalize_location(what: &str, value: &str) -> Result<String, String> {
     if value.contains("://") {
         return Err(format!(
@@ -194,6 +195,25 @@ fn normalize_location(what: &str, value: &str) -> Result<String, String> {
     let v = value.trim_end_matches('/');
     if v.is_empty() {
         return Err(format!("invalid empty {what}"));
+    }
+    let name = match v.strip_prefix("*.") {
+        Some(domain) if what == "prefix" => domain,
+        _ => v,
+    };
+    let why = if name.len() < v.len() {
+        (!velarx_base::reference::host_ok(name.as_bytes()))
+            .then(|| velarx_base::reference::why_not_a_host(name.as_bytes()))
+    } else {
+        (!velarx_base::reference::prefix_ok(v.as_bytes()))
+            .then(|| velarx_base::reference::why_not_a_prefix(v.as_bytes()))
+    };
+    if let Some(why) = why {
+        let after = if name.len() < v.len() {
+            " (after `*.`)"
+        } else {
+            ""
+        };
+        return Err(format!("invalid {what} `{value}`: {why}{after}"));
     }
     Ok(v.to_string())
 }
@@ -212,16 +232,11 @@ impl RegistryConfig {
             }
         } else {
             self.prefix = normalize_location("prefix", &self.prefix)?;
-            if let Some(domain) = self.prefix.strip_prefix('*') {
-                if !domain.starts_with('.') || domain.contains(['*', '/']) {
-                    return Err(format!("invalid wildcard prefix `{}`", self.prefix));
-                }
-                if self.location.is_some() {
-                    return Err(format!(
-                        "wildcard prefix `{}` cannot have a location",
-                        self.prefix
-                    ));
-                }
+            if self.prefix.starts_with("*.") && self.location.is_some() {
+                return Err(format!(
+                    "wildcard prefix `{}` cannot have a location",
+                    self.prefix
+                ));
             }
         }
         if !valid_pull_from_mirror(&self.pull_from_mirror) {
@@ -406,8 +421,14 @@ impl RegistriesConfig {
             warn!("{file_name}: additional-layer-store-auth-helper is not supported by velarx");
         }
         if let Some(list) = file.search_registries {
-            if let Some(bad) = list.iter().find(|r| r.contains('/') || r.is_empty()) {
-                return Err(format!("invalid unqualified search registry `{bad}`"));
+            if let Some(bad) = list
+                .iter()
+                .find(|r| !velarx_base::reference::host_ok(r.as_bytes()))
+            {
+                let why = velarx_base::reference::why_not_a_host(bad.as_bytes());
+                return Err(format!(
+                    "invalid unqualified search registry `{bad}`: {why}"
+                ));
             }
             self.search_registries = list;
             self.search_origin = Some(file_name.to_string());
@@ -432,7 +453,7 @@ impl RegistriesConfig {
             self.put_registry(reg);
         }
         for (name, value) in file.aliases.unwrap_or_default() {
-            if is_qualified(&name) || name.contains([':', '@']) || name.is_empty() {
+            if !is_short_name(&name) {
                 return Err(format!(
                     "alias `{name}` must be a short name without tag or digest"
                 ));
@@ -442,7 +463,7 @@ impl RegistriesConfig {
                 self.aliases.remove(&name);
                 continue;
             }
-            if !is_qualified(&value) || value.contains('@') {
+            if !is_qualified(&value) {
                 return Err(format!(
                     "alias `{name}` must point to a fully qualified reference without digest"
                 ));
@@ -535,18 +556,14 @@ impl RegistriesConfig {
     /// is an alias if it has one, else it is looked up in the unqualified
     /// search registries (none: no candidate).
     pub fn candidates(&self, reference: &str) -> Vec<String> {
-        let reference = reference.trim();
-        // The name ends at the digest or at the tag; the colon of a port
-        // is before the last slash.
-        let before_digest = reference.split_once('@').map_or(reference, |(n, _)| n);
-        let component = before_digest.rfind('/').map_or(0, |i| i + 1);
-        let name_end = before_digest[component..]
-            .find(':')
-            .map_or(before_digest.len(), |i| component + i);
-        let (name, rest) = reference.split_at(name_end);
-        if is_qualified(name) {
+        // The name ends at the digest or at the tag.
+        let Ok(spans) = velarx_base::reference::parse(reference.as_bytes()) else {
+            return Vec::new();
+        };
+        if spans.host_end > 0 {
             return vec![reference.to_string()];
         }
+        let (name, rest) = reference.split_at(spans.name_end);
         if let Some(target) = self.aliases.get(name) {
             return vec![format!("{target}{rest}")];
         }
@@ -569,6 +586,9 @@ impl RegistriesConfig {
     /// Velarx never asks.
     pub fn resolve(&self, reference: &str) -> Result<Vec<String>, String> {
         self.check()?;
+        if let Err(e) = velarx_base::reference::parse(reference.as_bytes()) {
+            return Err(format!("invalid reference `{reference}`: {e}"));
+        }
         let candidates = self.candidates(reference);
         if candidates.is_empty() {
             return Err(match &self.search_origin {
@@ -635,13 +655,17 @@ fn drop_ins(dirs: &[PathBuf]) -> Vec<PathBuf> {
     by_name.into_values().collect()
 }
 
-/// Whether the first component of a name is a registry: it has a dot or a
-/// port, or is `localhost`.
+/// Whether `name` is a reference with a registry and no digest.
 fn is_qualified(name: &str) -> bool {
-    match name.split_once('/') {
-        Some((first, _)) => velarx_base::reference::is_registry_domain(first),
-        None => false,
-    }
+    velarx_base::reference::parse(name.as_bytes())
+        .is_ok_and(|s| s.host_end > 0 && s.digest.is_none())
+}
+
+/// Whether `name` is a short name: a name without a registry, a tag or a
+/// digest.
+fn is_short_name(name: &str) -> bool {
+    velarx_base::reference::parse(name.as_bytes())
+        .is_ok_and(|s| s.host_end == 0 && s.tag.is_none() && s.digest.is_none())
 }
 
 /// Whether `prefix` of a [[registry]] block applies to the image name
@@ -845,11 +869,12 @@ insecure = true
             c.candidates("prom/prometheus:v2"),
             ["quay.io/prom/prometheus:v2", "docker.io/prom/prometheus:v2"]
         );
+        let d = format!("sha256:{}", "ab".repeat(32));
         assert_eq!(
-            c.candidates("alpine@sha256:abc"),
+            c.candidates(&format!("alpine@{d}")),
             [
-                "quay.io/alpine@sha256:abc",
-                "docker.io/library/alpine@sha256:abc"
+                format!("quay.io/alpine@{d}"),
+                format!("docker.io/library/alpine@{d}")
             ]
         );
         // Without search registries a name that is no alias has no candidate.
@@ -859,12 +884,13 @@ insecure = true
     #[test]
     fn test_qualified_names_are_not_searched() {
         let c = config(r#"unqualified-search-registries = ["quay.io"]"#);
+        let digested = format!("registry.example.com/img@sha256:{}", "ab".repeat(32));
         for name in [
             "quay.io/myuser/myrepo",
             "localhost/img:1",
             "localhost:5000/img",
             "127.0.0.1:5000/a/b:t",
-            "registry.example.com/img@sha256:00",
+            &digested,
         ] {
             assert_eq!(c.candidates(name), [name]);
         }
@@ -1223,6 +1249,7 @@ registries = ["evil.example"]
             "[[registry]]\nprefix = \"*.a.io\"\nlocation = \"b.io\"",
             "[[registry]]\nprefix = \"*a.io\"",
             "[[registry]]\nprefix = \"/\"",
+            "[[registry]]\nprefix = \"[0::1]:5000\"",
             "unqualified-search-registries = [\"a.io/x\"]",
             "short-name-mode = \"loose\"",
             "[aliases]\n\"a.io/x\" = \"b.io/x\"",
@@ -1232,6 +1259,24 @@ registries = ["evil.example"]
         ] {
             assert!(RegistriesConfig::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_capital_in_a_host_of_the_file_says_to_write_it_in_lower_case() {
+        let e = RegistriesConfig::parse("[[registry]]\nprefix = \"Quay.io\"").unwrap_err();
+        assert!(e.contains("lower case"), "{e}");
+        let e =
+            RegistriesConfig::parse("unqualified-search-registries = [\"Quay.io\"]").unwrap_err();
+        assert!(e.contains("lower case"), "{e}");
+    }
+
+    #[test]
+    fn where_a_wildcard_prefix_is_wrong_is_said() {
+        let e = RegistriesConfig::parse("[[registry]]\nprefix = \"*.Quay.io\"").unwrap_err();
+        assert!(
+            e.contains("lower case, at byte 0") && e.contains("after `*.`"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -1299,5 +1344,134 @@ registries = ["evil.example"]
                 a.path().join("20-y.conf")
             ]
         );
+    }
+
+    const D: &str = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const D1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn short(s: &str) -> String {
+        if s.len() > 40 {
+            format!("<{} bytes>", s.len())
+        } else {
+            format!("{s:?}")
+        }
+    }
+
+    /// What `candidates` makes of `input` with one search registry and the
+    /// alias `x`, and which block of a configuration with the prefixes
+    /// `docker.io`, `quay.io`, `localhost` and `x:5000` applies to each
+    /// candidate (`none`: no block).
+    fn shown(input: &str) -> String {
+        let config = RegistriesConfig::parse(
+            r#"
+unqualified-search-registries = ["example.org"]
+[aliases]
+alpine = "docker.io/library/alpine"
+[[registry]]
+prefix = "docker.io"
+[[registry]]
+prefix = "quay.io"
+[[registry]]
+prefix = "localhost"
+[[registry]]
+prefix = "x:5000"
+"#,
+        )
+        .unwrap();
+        let found = config
+            .candidates(input)
+            .iter()
+            .map(|c| {
+                let block = config
+                    .find_registry(c)
+                    .map_or("none", |r| r.prefix.as_str());
+                format!("{} block {block}", short(c))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if found.is_empty() {
+            "no candidate".to_string()
+        } else {
+            found
+        }
+    }
+
+    /// What the real code answers for the inputs of the table of the design of
+    /// image references: what `candidates` makes of each with one search
+    /// registry and the alias `alpine` (a name is qualified, an alias, or a short
+    /// name of the search registry), and which `[[registry]]` block of
+    /// registries.conf applies to each candidate, by the prefix match of
+    /// `find_registry`.
+    #[test]
+    fn candidates_on_the_reference_table() {
+        let table: Vec<(String, &str)> = vec![
+            ("x".to_string(), "\"example.org/x\" block none"),
+            ("x:tag".to_string(), "\"example.org/x:tag\" block none"),
+            ("x:5000".to_string(), "\"example.org/x:5000\" block none"),
+            ("x:5000/y".to_string(), "\"x:5000/y\" block x:5000"),
+            ("localhost/x".to_string(), "\"localhost/x\" block localhost"),
+            (
+                "docker.io/alpine".to_string(),
+                "\"docker.io/alpine\" block docker.io",
+            ),
+            // Pins a disagreement: index.docker.io matches no docker.io block, though it is docker.io.
+            (
+                "index.docker.io/a/b".to_string(),
+                "\"index.docker.io/a/b\" block none",
+            ),
+            (
+                "docker.io/a.b/c".to_string(),
+                "\"docker.io/a.b/c\" block docker.io",
+            ),
+            ("Quay.IO/a/b".to_string(), "no candidate"),
+            ("Foo/bar".to_string(), "no candidate"),
+            ("quay.io/a..b".to_string(), "no candidate"),
+            ("quay.io/a--_b".to_string(), "no candidate"),
+            ("quay.io/a___b".to_string(), "no candidate"),
+            (":5000/x".to_string(), "no candidate"),
+            ("a.b:abc/x".to_string(), "no candidate"),
+            ("a..b/x".to_string(), "no candidate"),
+            ("a.-b/x".to_string(), "no candidate"),
+            ("[::1]:5000/a".to_string(), "\"[::1]:5000/a\" block none"),
+            ("quay.io//a".to_string(), "no candidate"),
+            ("a/".to_string(), "no candidate"),
+            ("/a".to_string(), "no candidate"),
+            ("a:".to_string(), "no candidate"),
+            ("a:.x".to_string(), "no candidate"),
+            ("../x".to_string(), "no candidate"),
+            ("%2f".to_string(), "no candidate"),
+            ("?".to_string(), "no candidate"),
+            ("#".to_string(), "no candidate"),
+            ("quay.io/a b".to_string(), "no candidate"),
+            ("quay.io/a\0b".to_string(), "no candidate"),
+            ("quay.io/caf\u{e9}".to_string(), "no candidate"),
+            (format!("quay.io/a:{}", "t".repeat(129)), "no candidate"),
+            (format!("quay.io/a:t@{D}"), "<83 bytes> block quay.io"),
+            (format!("quay.io/a:b c@{D}"), "no candidate"),
+            (format!("x@y@{D}"), "no candidate"),
+            (format!("a@{D1}@{D}"), "no candidate"),
+            (format!("h.io@evil.com/a@{D}"), "no candidate"),
+            (" alpine\n".to_string(), "no candidate"),
+            ("a".repeat(258), "no candidate"),
+            ("a".repeat(255), "no candidate"),
+            (format!("quay.io/{}", "a".repeat(255)), "no candidate"),
+            (format!("{}.io/x", "a".repeat(252)), "no candidate"),
+            ("0123456789abcdef".repeat(4), "no candidate"),
+            (
+                format!("a@sha384:{}", "ab".repeat(48)),
+                "<117 bytes> block none",
+            ),
+            (format!("a@foo:{}", "z".repeat(32)), "no candidate"),
+            (format!("a@sha256:{}", "A".repeat(64)), "no candidate"),
+            ("a@sha256:abc".to_string(), "no candidate"),
+            ("alpine@".to_string(), "no candidate"),
+            (
+                format!("quay.io/a:v1@sha512:{}", "ab".repeat(64)),
+                "<148 bytes> block quay.io",
+            ),
+        ];
+        for (input, expected) in &table {
+            assert_eq!(shown(input), *expected, "{input:?}");
+        }
     }
 }

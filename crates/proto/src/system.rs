@@ -426,6 +426,23 @@ pub struct CheckProblem {
     pub action: CheckAction,
 }
 
+/// Whether a finding of this kind is damage to the store.  A file without
+/// the fs-verity that the store requires is whole (`no_verity`), and so is
+/// a volume whose directory is intact and whose row or mode is not what
+/// it says.
+pub fn kind_damages(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "no_verity"
+            | "orphan_volume"
+            | "stale_volume_row"
+            | "volume_row_mismatch"
+            | "unfinished_volume_removal"
+            | "stale_volume_temp"
+            | "volume_mode"
+    )
+}
+
 impl CheckProblem {
     /// Whether the store is still not as it should be because of it.
     pub fn open(&self) -> bool {

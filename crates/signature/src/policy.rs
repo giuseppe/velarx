@@ -580,10 +580,11 @@ mod tests {
 
     #[test]
     fn a_host_is_compared_as_written() {
-        // containers/image lowercases nothing either
+        // containers/image lowercases nothing either: a host in capitals
+        // is no reference, it does not get the default scope
         let policy = with_scopes(&["quay.io/x"]);
         assert_eq!(scope_of(&policy, "quay.io/x/y"), "scope quay.io/x");
-        assert_eq!(scope_of(&policy, "Quay.io/x/y"), "the default");
+        assert!(DockerRef::parse_normalized("Quay.io/x/y").is_err());
     }
 
     #[test]

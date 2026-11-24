@@ -1281,7 +1281,7 @@ const NO_VERITY: &str = "no_verity";
 /// Whether a finding of this kind means the object is damaged (and the
 /// image with it): a sound object without fs-verity is not.
 fn damages(kind: &str) -> bool {
-    kind != NO_VERITY
+    velarx_proto::system::kind_damages(kind)
 }
 
 /// Read the file and recompute its fs-verity digest, which must be the name
