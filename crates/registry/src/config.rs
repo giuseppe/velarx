@@ -232,6 +232,14 @@ impl RegistryConfig {
             }
         } else {
             self.prefix = normalize_location("prefix", &self.prefix)?;
+            // (a reference to index.docker.io is read as one to docker.io:
+            // a prefix that is written so is, not one that comes from a
+            // location)
+            if let Some(rest) = self.prefix.strip_prefix("index.docker.io") {
+                if rest.is_empty() || rest.starts_with('/') {
+                    self.prefix = format!("docker.io{rest}");
+                }
+            }
             if self.prefix.starts_with("*.") && self.location.is_some() {
                 return Err(format!(
                     "wildcard prefix `{}` cannot have a location",
@@ -448,8 +456,16 @@ impl RegistriesConfig {
             }
             self.credential_helpers = helpers;
         }
+        let mut seen: Vec<(String, String)> = Vec::new();
         for mut reg in file.registry {
+            let written = reg.prefix.clone();
             reg.normalize()?;
+            if let Some((_, other)) = seen.iter().find(|(p, w)| *p == reg.prefix && *w != written) {
+                return Err(format!(
+                    "the prefixes `{other}` and `{written}` of two blocks are the same registry"
+                ));
+            }
+            seen.push((reg.prefix.clone(), written));
             self.put_registry(reg);
         }
         for (name, value) in file.aliases.unwrap_or_default() {
@@ -561,22 +577,18 @@ impl RegistriesConfig {
             return Vec::new();
         };
         if spans.host_end > 0 {
-            return vec![reference.to_string()];
+            return full(reference).into_iter().collect();
         }
         let (name, rest) = reference.split_at(spans.name_end);
-        if let Some(target) = self.aliases.get(name) {
-            return vec![format!("{target}{rest}")];
-        }
-        self.search_registries
-            .iter()
-            .map(|registry| {
-                if registry == "docker.io" && !name.contains('/') {
-                    format!("{registry}/library/{name}{rest}")
-                } else {
-                    format!("{registry}/{name}{rest}")
-                }
-            })
-            .collect()
+        let named: Vec<String> = match self.aliases.get(name) {
+            Some(target) => vec![format!("{target}{rest}")],
+            None => self
+                .search_registries
+                .iter()
+                .map(|registry| format!("{registry}/{name}{rest}"))
+                .collect(),
+        };
+        named.iter().filter_map(|c| full(c)).collect()
     }
 
     /// Like [`candidates`](Self::candidates), but a short name that is no
@@ -653,6 +665,17 @@ fn drop_ins(dirs: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
     by_name.into_values().collect()
+}
+
+/// `reference` in its full form, after the defaults of docker.io: the one
+/// name that the request, registries.conf and the policy read.
+fn full(reference: &str) -> Option<String> {
+    let bytes = reference.as_bytes();
+    let spans = velarx_base::reference::parse(bytes).ok()?;
+    let name = velarx_ref_core::normalize(bytes, &spans);
+    let part = |r: Option<(usize, usize)>| r.map(|(from, to)| &bytes[from..to]);
+    let text = velarx_ref_core::print(&name, part(spans.tag), part(spans.digest));
+    String::from_utf8(text).ok()
 }
 
 /// Whether `name` is a reference with a registry and no digest.
@@ -1280,6 +1303,35 @@ registries = ["evil.example"]
     }
 
     #[test]
+    fn a_prefix_of_index_docker_io_is_one_of_docker_io() {
+        let c = RegistriesConfig::parse(
+            "[[registry]]\nprefix = \"index.docker.io/a\"\nblocked = true\n\
+             [[registry]]\nprefix = \"index.docker.io.example/a\"\ninsecure = true",
+        )
+        .unwrap();
+        assert_eq!(c.registry[0].prefix, "docker.io/a");
+        assert_eq!(c.registry[1].prefix, "index.docker.io.example/a");
+        assert!(c.is_blocked("docker.io/a/b"));
+    }
+
+    #[test]
+    fn two_blocks_of_one_registry_are_refused() {
+        let e = RegistriesConfig::parse(
+            "[[registry]]\nprefix = \"docker.io\"\n[[registry]]\nprefix = \"index.docker.io\"",
+        )
+        .unwrap_err();
+        assert!(e.contains("`docker.io` and `index.docker.io`"), "{e}");
+        // a block that has only a location keeps the prefix that the
+        // location is, as written: it is not read as docker.io
+        let c = RegistriesConfig::parse(
+            "[[registry]]\nlocation = \"index.docker.io\"\n[[registry]]\nprefix = \"docker.io\"",
+        )
+        .unwrap();
+        assert_eq!(c.registry[0].prefix, "index.docker.io");
+        assert_eq!(c.registry[1].prefix, "docker.io");
+    }
+
+    #[test]
     fn test_mirror_by_digest_only() {
         let c = RegistriesConfig::parse(
             "[[registry]]\nprefix = \"docker.io\"\nmirror-by-digest-only = true\n[[registry.mirror]]\nlocation = \"m.io\"",
@@ -1412,12 +1464,11 @@ prefix = "x:5000"
             ("localhost/x".to_string(), "\"localhost/x\" block localhost"),
             (
                 "docker.io/alpine".to_string(),
-                "\"docker.io/alpine\" block docker.io",
+                "\"docker.io/library/alpine\" block docker.io",
             ),
-            // Pins a disagreement: index.docker.io matches no docker.io block, though it is docker.io.
             (
                 "index.docker.io/a/b".to_string(),
-                "\"index.docker.io/a/b\" block none",
+                "\"docker.io/a/b\" block docker.io",
             ),
             (
                 "docker.io/a.b/c".to_string(),

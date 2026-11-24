@@ -5336,6 +5336,7 @@ dependencies = [
  "toml",
  "tracing",
  "velarx-base",
+ "velarx-ref-core",
  "velarx-sys",
  "velarx-types",
  "zeroize",

@@ -38,19 +38,7 @@ impl ImageReference {
             })?),
             None => None,
         };
-        let (registry, repository) = if spans.host_end > 0 {
-            (
-                &reference[..spans.host_end],
-                &reference[spans.host_end + 1..spans.name_end],
-            )
-        } else {
-            ("docker.io", &reference[..spans.name_end])
-        };
-        let repository = if spans.host_end == 0 && !repository.contains('/') {
-            format!("library/{repository}")
-        } else {
-            repository.to_string()
-        };
+        let name = velarx_ref_core::normalize(bytes, &spans);
         // NAME:TAG@DIGEST: the digest names the image, the tag goes, but
         // for a digest that is not a sha256 it locates the manifest
         let mut tag = part(spans.tag);
@@ -64,8 +52,8 @@ impl ImageReference {
             tag = Some("latest".to_string());
         }
         Ok(Self {
-            registry: registry.to_string(),
-            repository,
+            registry: String::from_utf8_lossy(&name.host).into_owned(),
+            repository: String::from_utf8_lossy(&name.path).into_owned(),
             tag,
             digest,
             locator_tag,
@@ -93,9 +81,12 @@ impl ImageReference {
     }
 
     /// The name without tag or digest, with the registry unless it is
-    /// docker.io: `localhost:5000/alpine`, `library/alpine`.
+    /// docker.io and the name reads back as it is: `localhost:5000/alpine`,
+    /// `library/alpine`, but `docker.io/a.b/c`, as `a.b/c` is of the host
+    /// `a.b`.
     pub fn name(&self) -> String {
-        if self.registry == "docker.io" {
+        let first = self.repository.split('/').next().unwrap_or_default();
+        if self.registry == "docker.io" && !velarx_ref_core::looks_like_host(first.as_bytes()) {
             self.repository.clone()
         } else {
             format!("{}/{}", self.registry, self.repository)
@@ -103,11 +94,7 @@ impl ImageReference {
     }
 
     pub fn full_name(&self) -> String {
-        let name = if self.registry == "docker.io" {
-            self.repository.clone()
-        } else {
-            format!("{}/{}", self.registry, self.repository)
-        };
+        let name = self.name();
 
         if let (Some(tag), Some(digest)) = (&self.locator_tag, &self.digest) {
             format!("{name}:{tag}@{digest}")
@@ -256,20 +243,17 @@ mod tests {
                 "localhost/x".to_string(),
                 "host \"localhost\" path \"x\" tag \"latest\" digest false locator none name \"localhost/x\" valid",
             ),
-            // Pins a disagreement: docker reads docker.io/alpine as library/alpine; the path here stays `alpine`.
             (
                 "docker.io/alpine".to_string(),
-                "host \"docker.io\" path \"alpine\" tag \"latest\" digest false locator none name \"alpine\" valid",
+                "host \"docker.io\" path \"library/alpine\" tag \"latest\" digest false locator none name \"library/alpine\" valid",
             ),
-            // Pins a disagreement: index.docker.io is docker.io for docker; the host is kept as written.
             (
                 "index.docker.io/a/b".to_string(),
-                "host \"index.docker.io\" path \"a/b\" tag \"latest\" digest false locator none name \"index.docker.io/a/b\" valid",
+                "host \"docker.io\" path \"a/b\" tag \"latest\" digest false locator none name \"a/b\" valid",
             ),
-            // Pins a disagreement: name() prints `a.b/c`, which reads back as host `a.b`; it should keep the host.
             (
                 "docker.io/a.b/c".to_string(),
-                "host \"docker.io\" path \"a.b/c\" tag \"latest\" digest false locator none name \"a.b/c\" valid",
+                "host \"docker.io\" path \"a.b/c\" tag \"latest\" digest false locator none name \"docker.io/a.b/c\" valid",
             ),
             (
                 "Quay.IO/a/b".to_string(),

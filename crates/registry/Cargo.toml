@@ -31,6 +31,7 @@ net = ["engine", "velarx-types/http", "dep:reqwest", "dep:tokio", "dep:percent-e
 
 [dependencies]
 velarx-base = { path = "../base" }
+velarx-ref-core = { path = "../ref-core" }
 velarx-types = { path = "../types", default-features = false, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
