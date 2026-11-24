@@ -10,6 +10,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use velarx_bpf_core as bpf;
 
 const CREATE_RULESET_VERSION: u32 = 1;
 const RULE_PATH_BENEATH: u32 = 1;
@@ -177,31 +178,10 @@ impl Ruleset {
     }
 }
 
-// The instructions of classic BPF that a filter needs: `BPF_LD | BPF_W |
-// BPF_ABS`, and `BPF_JMP | BPF_JEQ / BPF_JGE / BPF_JSET | BPF_K`, `BPF_RET |
-// BPF_K`.
-const BPF_LD_W_ABS: u16 = 0x20;
-const BPF_JEQ_K: u16 = 0x15;
-#[cfg(any(target_arch = "x86_64", feature = "seccompiler"))]
-const BPF_JGE_K: u16 = 0x35;
-const BPF_JSET_K: u16 = 0x45;
-const BPF_RET_K: u16 = 0x06;
-const RET_ALLOW: u32 = 0x7fff_0000;
-
-/// The flags of `clone` that make a namespace (`CLONE_NEWTIME`, 0x80,
-/// included).
-pub const CLONE_NEW_FLAGS: u32 = (libc::CLONE_NEWNS
-    | libc::CLONE_NEWCGROUP
-    | libc::CLONE_NEWUTS
-    | libc::CLONE_NEWIPC
-    | libc::CLONE_NEWUSER
-    | libc::CLONE_NEWPID
-    | libc::CLONE_NEWNET) as u32
-    | 0x80;
-
-fn op(code: u16, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
-    libc::sock_filter { code, jt, jf, k }
-}
+/// `CLONE_NEW_FLAGS`: the flags of `clone` that make a namespace
+/// (`CLONE_NEWTIME` included); `OnlyIf`: a call that is allowed only with
+/// some values of one argument.
+pub use velarx_bpf_core::{OnlyIf, CLONE_NEW_FLAGS};
 
 /// The architecture of the system calls of this build (`AUDIT_ARCH_*`).
 #[cfg(target_arch = "x86_64")]
@@ -217,76 +197,57 @@ compile_error!(
     "the confinement (the seccomp filters of the confined workers) is written for x86_64 and \
      aarch64 only"
 );
+// ... and the program reads the low word of an argument at its offset.
+#[cfg(target_endian = "big")]
+compile_error!("the confinement (the seccomp filters) is written for little endian only");
 
 /// A filter that answers `errno` to the system calls `denied`, `EPERM` to
 /// a `clone` that makes a process or a namespace (threads are allowed), `ENOSYS` to
 /// `clone3` (the C library falls back to `clone`), and `EPERM` to every
-/// call of another architecture or ABI (x32): the rest is allowed.
-pub fn deny_filter(denied: &[i64], denied_errno: u32) -> Vec<libc::sock_filter> {
+/// call of another architecture or ABI (x32): the rest is allowed.  An error
+/// when the table makes no program (see `velarx_bpf_core::Error`).
+pub fn deny_filter(denied: &[i64], denied_errno: u32) -> io::Result<Vec<libc::sock_filter>> {
     deny_filter_with(denied, &[], denied_errno)
-}
-
-/// A call that is allowed only with some values of one argument.
-#[derive(Clone, Copy, Debug)]
-pub struct OnlyIf {
-    /// The system call
-    pub nr: i64,
-    /// Which argument (0 to 5): its low word is compared
-    pub arg: usize,
-    /// The values it may have
-    pub values: &'static [u32],
 }
 
 /// [`deny_filter`] with calls that are allowed only when the low word of an
 /// argument is one of some values (`EPERM` otherwise): `socket` for
 /// `AF_UNIX` alone, `setns` for a network namespace alone.  The rules come
-/// before the one of `clone`.
+/// before the one of `clone`.  The program is `velarx_bpf_core`'s.
 pub fn deny_filter_with(
     denied: &[i64],
     only: &[OnlyIf],
     denied_errno: u32,
-) -> Vec<libc::sock_filter> {
-    let errno = |e: u32| op(BPF_RET_K, 0, 0, libc::SECCOMP_RET_ERRNO | (e & 0xffff));
-    let mut p = vec![
-        // seccomp_data: nr at 0, arch at 4, args at 16
-        op(BPF_LD_W_ABS, 0, 0, 4),
-        op(BPF_JEQ_K, 1, 0, ARCH),
-        errno(libc::EPERM as u32),
-        op(BPF_LD_W_ABS, 0, 0, 0),
-    ];
-    #[cfg(target_arch = "x86_64")]
-    {
-        // x32 calls have this bit
-        p.push(op(BPF_JGE_K, 0, 1, 0x4000_0000));
-        p.push(errno(libc::EPERM as u32));
-    }
-    for &nr in denied {
-        p.push(op(BPF_JEQ_K, 0, 1, nr as u32));
-        p.push(errno(denied_errno));
-    }
-    for rule in only {
-        let k = rule.values.len();
-        // the call, else past the block; the argument; one jump per value
-        // to the allow at the end; a refusal; the allow
-        p.push(op(BPF_JEQ_K, 0, (k + 3) as u8, rule.nr as u32));
-        p.push(op(BPF_LD_W_ABS, 0, 0, 16 + 8 * rule.arg as u32));
-        for (j, &v) in rule.values.iter().enumerate() {
-            p.push(op(BPF_JEQ_K, (k - j) as u8, 0, v));
-        }
-        p.push(errno(libc::EPERM as u32));
-        p.push(op(BPF_RET_K, 0, 0, RET_ALLOW));
-    }
-    p.push(op(BPF_JEQ_K, 0, 1, libc::SYS_clone3 as u32));
-    p.push(errno(libc::ENOSYS as u32));
-    // clone: the flags are its first argument (the low word on both
-    // little endian architectures); a thread, and no new namespace
-    p.push(op(BPF_JEQ_K, 0, 4, libc::SYS_clone as u32));
-    p.push(op(BPF_LD_W_ABS, 0, 0, 16));
-    p.push(op(BPF_JSET_K, 1, 0, CLONE_NEW_FLAGS));
-    p.push(op(BPF_JSET_K, 1, 0, libc::CLONE_THREAD as u32));
-    p.push(errno(libc::EPERM as u32));
-    p.push(op(BPF_RET_K, 0, 0, RET_ALLOW));
-    p
+) -> io::Result<Vec<libc::sock_filter>> {
+    let table = bpf::Table {
+        denied,
+        only,
+        errno: denied_errno,
+    };
+    let target = bpf::Target {
+        arch: ARCH,
+        // x32 calls have a bit of their own in the number
+        x32: cfg!(target_arch = "x86_64"),
+        clone: libc::SYS_clone as u32,
+        clone3: libc::SYS_clone3 as u32,
+    };
+    let program = bpf::deny_program(&table, &target).map_err(|e| {
+        let why = match e {
+            bpf::Error::Number => "a call number that is not 32 bits",
+            bpf::Error::Argument => "an argument above 5",
+            bpf::Error::Jump => "a rule with too many values",
+        };
+        io::Error::new(io::ErrorKind::InvalidInput, format!("seccomp: {why}"))
+    })?;
+    Ok(program
+        .into_iter()
+        .map(|i| libc::sock_filter {
+            code: i.code,
+            jt: i.jt,
+            jf: i.jf,
+            k: i.k,
+        })
+        .collect())
 }
 
 /// What the program of a seccomp filter answers to the call `nr` of the
@@ -301,40 +262,16 @@ pub fn seccomp_answer(
     arch: u32,
     args: [u64; 6],
 ) -> u32 {
-    const BPF_ALU_AND_K: u16 = 0x54;
-    const BPF_JGT_K: u16 = 0x25;
-    const BPF_JA: u16 = 0x05;
-    let (mut pc, mut a) = (0, 0u32);
-    loop {
-        let i = &program[pc];
-        pc += 1;
-        match i.code {
-            BPF_LD_W_ABS => {
-                a = match i.k {
-                    0 => nr,
-                    4 => arch,
-                    k @ 16..=63 => {
-                        let arg = args[(k as usize - 16) / 8];
-                        if k % 8 == 4 {
-                            (arg >> 32) as u32
-                        } else {
-                            arg as u32
-                        }
-                    }
-                    k => panic!("a load the test does not know: {k}"),
-                }
-            }
-            BPF_ALU_AND_K => a &= i.k,
-            BPF_JEQ_K if a == i.k => pc += usize::from(i.jt),
-            BPF_JGT_K if a > i.k => pc += usize::from(i.jt),
-            BPF_JGE_K if a >= i.k => pc += usize::from(i.jt),
-            BPF_JSET_K if a & i.k != 0 => pc += usize::from(i.jt),
-            BPF_JEQ_K | BPF_JGT_K | BPF_JGE_K | BPF_JSET_K => pc += usize::from(i.jf),
-            BPF_JA => pc += i.k as usize,
-            BPF_RET_K => return i.k,
-            code => panic!("an instruction the test does not know: {code:#x}"),
-        }
-    }
+    let program: Vec<bpf::Insn> = program
+        .iter()
+        .map(|i| bpf::Insn {
+            code: i.code,
+            jt: i.jt,
+            jf: i.jf,
+            k: i.k,
+        })
+        .collect();
+    bpf::run(&program, nr, arch, args).expect("a program of instructions that the test knows")
 }
 
 /// What the kernel answers to a call when `programs` are installed in this
@@ -355,7 +292,7 @@ pub fn seccomp_verdict(
             verdict = Some(ret);
         }
     }
-    verdict.unwrap_or(RET_ALLOW)
+    verdict.unwrap_or(bpf::RET_ALLOW)
 }
 
 /// Install `filter` on the calling thread (`no_new_privs` first).
@@ -405,9 +342,9 @@ fn refuse_x32(mut program: seccompiler::BpfProgram) -> Result<seccompiler::BpfPr
     // seccompiler's check of the architecture; what follows loads the
     // number again
     let arch = [
-        op(BPF_LD_W_ABS, 0, 0, 4),
-        op(BPF_JEQ_K, 1, 0, ARCH),
-        op(BPF_RET_K, 0, 0, libc::SECCOMP_RET_KILL_PROCESS),
+        op(bpf::LD_W_ABS, 0, 0, 4),
+        op(bpf::JEQ_K, 1, 0, ARCH),
+        op(bpf::RET_K, 0, 0, libc::SECCOMP_RET_KILL_PROCESS),
     ];
     if program.get(..arch.len()) != Some(&arch[..]) {
         return Err(
@@ -415,10 +352,10 @@ fn refuse_x32(mut program: seccompiler::BpfProgram) -> Result<seccompiler::BpfPr
         );
     }
     let x32 = [
-        op(BPF_LD_W_ABS, 0, 0, 0),
-        op(BPF_JGE_K, 0, 1, 0x4000_0000),
+        op(bpf::LD_W_ABS, 0, 0, 0),
+        op(bpf::JGE_K, 0, 1, bpf::X32),
         op(
-            BPF_RET_K,
+            bpf::RET_K,
             0,
             0,
             libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
@@ -431,6 +368,8 @@ fn refuse_x32(mut program: seccompiler::BpfProgram) -> Result<seccompiler::BpfPr
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "seccompiler")]
+    use bpf::RET_ALLOW;
 
     /// A process of one thread may confine itself; one with another thread
     /// (the harness has several) may not.
@@ -467,7 +406,8 @@ mod tests {
                         .unwrap();
                     r.restrict_thread().unwrap();
                 }
-                seccomp_thread(&deny_filter(&[libc::SYS_socket], libc::EPERM as u32)).unwrap();
+                seccomp_thread(&deny_filter(&[libc::SYS_socket], libc::EPERM as u32).unwrap())
+                    .unwrap();
                 let socket = std::os::unix::net::UnixDatagram::unbound();
                 let child = std::process::Command::new("/bin/true").status();
                 let read_in = std::fs::read(inside.join("f")).is_ok();
@@ -530,6 +470,7 @@ mod tests {
     #[test]
     fn the_deny_filter_lets_threads_through_and_no_namespace() {
         let program: Vec<_> = deny_filter(&[libc::SYS_unshare], libc::EPERM as u32)
+            .unwrap()
             .into_iter()
             .map(|i| seccompiler::sock_filter {
                 code: i.code,
@@ -573,6 +514,7 @@ mod tests {
             },
         ];
         let program: Vec<_> = deny_filter_with(&[libc::SYS_unshare], ONLY, libc::EPERM as u32)
+            .unwrap()
             .into_iter()
             .map(|i| seccompiler::sock_filter {
                 code: i.code,
@@ -611,6 +553,141 @@ mod tests {
             eperm,
             "a process is not made"
         );
+    }
+
+    /// The answers of the filters of the confined workers to the inputs a
+    /// table does not name: another architecture, an x32 number, the high
+    /// word of an argument, the order of the rules.
+    #[cfg(feature = "seccompiler")]
+    #[test]
+    fn the_deny_filter_answers_in_the_order_of_its_rules() {
+        const ONLY: &[OnlyIf] = &[
+            OnlyIf {
+                nr: libc::SYS_socket,
+                arg: 0,
+                values: &[libc::AF_UNIX as u32],
+            },
+            // the same call again: the first rule decides
+            OnlyIf {
+                nr: libc::SYS_socket,
+                arg: 0,
+                values: &[libc::AF_INET as u32],
+            },
+            // no value is allowed
+            OnlyIf {
+                nr: libc::SYS_setns,
+                arg: 1,
+                values: &[],
+            },
+            // a rule on `clone` goes before the rule of its flags
+            OnlyIf {
+                nr: libc::SYS_clone,
+                arg: 0,
+                values: &[libc::SIGCHLD as u32],
+            },
+        ];
+        // `clone3` is denied: its own rule is not reached
+        let denied = [libc::SYS_unshare, libc::SYS_clone3, libc::SYS_socket];
+        let program: Vec<_> = deny_filter_with(&denied, ONLY, 0x2_0005)
+            .unwrap()
+            .into_iter()
+            .map(|i| seccompiler::sock_filter {
+                code: i.code,
+                jt: i.jt,
+                jf: i.jf,
+                k: i.k,
+            })
+            .collect();
+        let answer = |nr: i64, arch: u32, a0: u64, a1: u64| {
+            seccomp_answer(&program, nr as u32, arch, [a0, a1, 0, 0, 0, 0])
+        };
+        let eperm = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        let denied_answer = libc::SECCOMP_RET_ERRNO | 5;
+        // the architecture first
+        for other in [0, ARCH ^ 1, 0x4000_0003, u32::MAX] {
+            for nr in [libc::SYS_getpid, libc::SYS_unshare, libc::SYS_clone] {
+                assert_eq!(answer(nr, other, 0, 0), eperm);
+            }
+        }
+        // the denied calls answer their errno (the low 16 bits), and come
+        // before the rules of the arguments and of `clone3`
+        assert_eq!(answer(libc::SYS_unshare, ARCH, 0, 0), denied_answer);
+        assert_eq!(answer(libc::SYS_clone3, ARCH, 0, 0), denied_answer);
+        assert_eq!(
+            answer(libc::SYS_socket, ARCH, libc::AF_UNIX as u64, 0),
+            denied_answer
+        );
+        // the first rule of a call decides; the high word is not looked at
+        // (the setns of the table has no value)
+        assert_eq!(answer(libc::SYS_setns, ARCH, 0, 0), eperm);
+        assert_eq!(answer(libc::SYS_setns, ARCH, 0, u64::MAX), eperm);
+        // (the rule of `clone` above)
+        assert_eq!(
+            answer(libc::SYS_clone, ARCH, libc::SIGCHLD as u64, 0),
+            RET_ALLOW
+        );
+        assert_eq!(
+            answer(libc::SYS_clone, ARCH, libc::SIGCHLD as u64 | 1 << 32, 0),
+            RET_ALLOW
+        );
+        assert_eq!(
+            answer(libc::SYS_clone, ARCH, libc::CLONE_THREAD as u64, 0),
+            eperm
+        );
+        // the rest is allowed, whatever the arguments
+        assert_eq!(
+            answer(libc::SYS_getpid, ARCH, u64::MAX, u64::MAX),
+            RET_ALLOW
+        );
+        // x32 numbers are refused on x86_64 only
+        let x32 = answer(libc::SYS_getpid, ARCH, 0, 0) == RET_ALLOW
+            && answer(libc::SYS_getpid | 0x4000_0000, ARCH, 0, 0) == eperm;
+        assert_eq!(x32, cfg!(target_arch = "x86_64"));
+    }
+
+    /// The flags of `clone` are the low word of its first argument; the
+    /// high word and the other arguments do not matter.
+    #[cfg(feature = "seccompiler")]
+    #[test]
+    fn the_flags_of_clone_are_the_low_word_of_the_first_argument() {
+        let program: Vec<_> = deny_filter(&[], libc::EPERM as u32)
+            .unwrap()
+            .into_iter()
+            .map(|i| seccompiler::sock_filter {
+                code: i.code,
+                jt: i.jt,
+                jf: i.jf,
+                k: i.k,
+            })
+            .collect();
+        let answer = |flags: u64, rest: u64| {
+            seccomp_answer(
+                &program,
+                libc::SYS_clone as u32,
+                ARCH,
+                [flags, rest, rest, rest, rest, rest],
+            )
+        };
+        let eperm = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        let thread = libc::CLONE_THREAD as u64;
+        // a flag of the high word is no thread and no namespace
+        assert_eq!(answer(thread | 1 << 32, u64::MAX), RET_ALLOW);
+        assert_eq!(answer(thread | 1 << 63, 0), RET_ALLOW);
+        assert_eq!(answer(1 << 32, 0), eperm);
+        // every flag that makes a namespace refuses, `CLONE_NEWTIME` too
+        for flag in [
+            0x2_0000,
+            0x200_0000,
+            0x400_0000,
+            0x800_0000,
+            0x1000_0000,
+            0x2000_0000,
+            0x4000_0000,
+            0x80,
+        ] {
+            assert_eq!(answer(thread | flag, 0), eperm, "{flag:#x}");
+        }
+        assert_eq!(answer(thread, 0), RET_ALLOW);
     }
 
     /// A call that a seccompiler filter refuses is refused as its x32 twin
@@ -676,6 +753,130 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         {
             assert_eq!(libc::SYS_fchmodat2, 452);
+        }
+    }
+
+    /// What the pure crate writes as digits is what the C headers say.
+    #[test]
+    fn the_numbers_of_the_program_are_the_kernels() {
+        assert_eq!(bpf::RET_ALLOW, libc::SECCOMP_RET_ALLOW);
+        assert_eq!(bpf::RET_ERRNO, libc::SECCOMP_RET_ERRNO);
+        assert_eq!(bpf::EPERM, libc::EPERM as u32);
+        assert_eq!(bpf::ENOSYS, libc::ENOSYS as u32);
+        assert_eq!(bpf::CLONE_THREAD, libc::CLONE_THREAD as u32);
+        let new = libc::CLONE_NEWNS
+            | libc::CLONE_NEWCGROUP
+            | libc::CLONE_NEWUTS
+            | libc::CLONE_NEWIPC
+            | libc::CLONE_NEWUSER
+            | libc::CLONE_NEWPID
+            | libc::CLONE_NEWNET;
+        assert_eq!(CLONE_NEW_FLAGS, new as u32 | 0x80);
+        assert_eq!(
+            bpf::LD_W_ABS,
+            (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16
+        );
+        assert_eq!(
+            bpf::JEQ_K,
+            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16
+        );
+        assert_eq!(
+            bpf::JGT_K,
+            (libc::BPF_JMP | libc::BPF_JGT | libc::BPF_K) as u16
+        );
+        assert_eq!(
+            bpf::JGE_K,
+            (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16
+        );
+        assert_eq!(
+            bpf::JSET_K,
+            (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16
+        );
+        assert_eq!(bpf::RET_K, (libc::BPF_RET | libc::BPF_K) as u16);
+        assert_eq!(
+            bpf::ALU_AND_K,
+            (libc::BPF_ALU | libc::BPF_AND | libc::BPF_K) as u16
+        );
+        assert_eq!(bpf::JA, (libc::BPF_JMP | libc::BPF_JA) as u16);
+    }
+
+    /// The kernel answers a call as the interpreter of the crate says:
+    /// a thread installs the filter, and makes raw calls (the filter is
+    /// the first to answer, so none of them does what it names).  An answer
+    /// of the filter is its errno; a call it allows is anything else.
+    #[test]
+    fn the_kernel_answers_what_the_interpreter_says() {
+        const ONLY: &[OnlyIf] = &[OnlyIf {
+            nr: libc::SYS_socket,
+            arg: 0,
+            values: &[libc::AF_UNIX as u32],
+        }];
+        let program = deny_filter_with(&[libc::SYS_unshare], ONLY, 0x2_0005).unwrap();
+        let insns: Vec<bpf::Insn> = program
+            .iter()
+            .map(|i| bpf::Insn {
+                code: i.code,
+                jt: i.jt,
+                jf: i.jf,
+                k: i.k,
+            })
+            .collect();
+        let unix = libc::AF_UNIX as u64 | 1 << 32;
+        let dgram = libc::SOCK_DGRAM as u64;
+        let mut calls = vec![
+            (libc::SYS_unshare, [0; 6]),
+            (libc::SYS_socket, [unix, dgram, 0, 0, 0, 0]),
+            (libc::SYS_socket, [libc::AF_INET as u64, dgram, 0, 0, 0, 0]),
+            (libc::SYS_clone3, [0; 6]),
+            // (not a thread: the kernel would refuse it with EINVAL)
+            (libc::SYS_clone, [libc::CLONE_THREAD as u64, 0, 0, 0, 0, 0]),
+            (
+                libc::SYS_clone,
+                [
+                    (libc::CLONE_THREAD | libc::CLONE_NEWNET) as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+        ];
+        #[cfg(target_arch = "x86_64")]
+        calls.push((libc::SYS_getpid | 0x4000_0000, [0; 6]));
+        let answers = std::thread::spawn(move || {
+            seccomp_thread(&program).unwrap();
+            calls
+                .into_iter()
+                .map(|(nr, a)| {
+                    // SAFETY: the calls of the test take no pointer that the
+                    // kernel reads (0 or flags); a descriptor that one makes
+                    // is closed below.
+                    let rc = unsafe { libc::syscall(nr, a[0], a[1], a[2], a[3], a[4], a[5]) };
+                    let errno = io::Error::last_os_error().raw_os_error().unwrap();
+                    if rc >= 0 {
+                        // SAFETY: the descriptor that the call made.
+                        drop(unsafe { OwnedFd::from_raw_fd(rc as i32) });
+                    }
+                    (nr, a, rc, errno)
+                })
+                .collect::<Vec<_>>()
+        })
+        .join()
+        .unwrap();
+        for (nr, args, rc, errno) in answers {
+            let said = bpf::run(&insns, nr as u32, ARCH, args).unwrap();
+            let kernel = if rc < 0 { errno } else { 0 };
+            if said & !0xffff == bpf::RET_ERRNO {
+                assert_eq!(kernel, (said & 0xffff) as i32, "call {nr:#x} {args:x?}");
+            } else {
+                assert_eq!(said, bpf::RET_ALLOW);
+                // (the errnos of the filter: its own, EPERM, ENOSYS)
+                assert!(
+                    ![5, 1, 38].contains(&kernel),
+                    "call {nr:#x} {args:x?}: {kernel}"
+                );
+            }
         }
     }
 }

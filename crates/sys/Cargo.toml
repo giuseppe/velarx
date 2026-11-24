@@ -30,6 +30,7 @@ seccompiler = ["dep:seccompiler"]
 landlock = ["dep:landlock"]
 
 [dependencies]
+velarx-bpf-core = { path = "../bpf-core" }
 tokio = { workspace = true, features = ["net"], optional = true }
 libc.workspace = true
 seccompiler = { workspace = true, optional = true }

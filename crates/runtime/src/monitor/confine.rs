@@ -156,7 +156,10 @@ const DENIED: &[i64] = &[
 
 fn filter() -> &'static [libc::sock_filter] {
     static FILTER: OnceLock<Vec<libc::sock_filter>> = OnceLock::new();
-    FILTER.get_or_init(|| sys::deny_filter(DENIED, libc::EPERM as u32))
+    FILTER.get_or_init(|| {
+        sys::deny_filter(DENIED, libc::EPERM as u32)
+            .expect("the table of the filter makes a program")
+    })
 }
 
 /// The rights beneath a directory where a fetching thread makes files (the
@@ -280,14 +283,10 @@ fn recording_rules(r: &Recording) -> Vec<(&Path, u64, bool)> {
     rules
 }
 
-/// The filter of a thread that makes the calls of `allowed` (of [`DENIED`])
-/// only with the arguments `only` says.
-fn limited_filter(
-    allowed: &[i64],
-    only: &'static [sys::OnlyIf],
-    keep_chmod: bool,
-) -> Vec<libc::sock_filter> {
-    let denied: Vec<i64> = DENIED
+/// The calls of [`DENIED`] that remain for a thread that makes `allowed`
+/// (with `keep_chmod`, the modes of files are not among them).
+fn limited_denied(allowed: &[i64], keep_chmod: bool) -> Vec<i64> {
+    DENIED
         .iter()
         .copied()
         .filter(|nr| !allowed.contains(nr))
@@ -307,8 +306,23 @@ fn limited_filter(
                         }
                     })
         })
-        .collect();
-    sys::deny_filter_with(&denied, only, libc::EPERM as u32)
+        .collect()
+}
+
+/// The filter of a thread that makes the calls of `allowed` (of [`DENIED`])
+/// only with the arguments `only` says.
+fn limited_filter(
+    allowed: &[i64],
+    only: &'static [sys::OnlyIf],
+    keep_chmod: bool,
+) -> Vec<libc::sock_filter> {
+    // (the tables are constants, and the tests make every one of them)
+    sys::deny_filter_with(
+        &limited_denied(allowed, keep_chmod),
+        only,
+        libc::EPERM as u32,
+    )
+    .expect("the table of the filter makes a program")
 }
 
 const AF_UNIX: &[sys::OnlyIf] = &[sys::OnlyIf {
@@ -338,10 +352,13 @@ pub fn record_thread(r: &Recording) -> io::Result<()> {
     sys::seccomp_thread(record_filter())
 }
 
+/// What the threads of unix sockets only make of [`DENIED`].
+const UNIX_CALLS: &[i64] = &[libc::SYS_socket, libc::SYS_connect];
+
 /// The filter of the record thread: unix sockets only.
 fn record_filter() -> &'static [libc::sock_filter] {
     static FILTER: OnceLock<Vec<libc::sock_filter>> = OnceLock::new();
-    FILTER.get_or_init(|| limited_filter(&[libc::SYS_socket, libc::SYS_connect], AF_UNIX, false))
+    FILTER.get_or_init(|| limited_filter(UNIX_CALLS, AF_UNIX, false))
 }
 
 /// What the thread of the end of a container reaches beyond [`Recording`]:
@@ -394,24 +411,21 @@ pub fn exit_thread(reach: &Releasing) -> io::Result<()> {
     sys::seccomp_thread(exit_filter())
 }
 
+/// What the exit thread makes of [`DENIED`].
+const EXIT_CALLS: &[i64] = &[
+    libc::SYS_socket,
+    libc::SYS_connect,
+    libc::SYS_bind,
+    libc::SYS_setns,
+    libc::SYS_pidfd_open,
+    libc::SYS_pidfd_send_signal,
+];
+
 /// The filter of the exit thread: netlink and unix sockets, `setns` into a
 /// network namespace, pidfds.
 fn exit_filter() -> &'static [libc::sock_filter] {
     static FILTER: OnceLock<Vec<libc::sock_filter>> = OnceLock::new();
-    FILTER.get_or_init(|| {
-        limited_filter(
-            &[
-                libc::SYS_socket,
-                libc::SYS_connect,
-                libc::SYS_bind,
-                libc::SYS_setns,
-                libc::SYS_pidfd_open,
-                libc::SYS_pidfd_send_signal,
-            ],
-            AF_UNIX_NETLINK,
-            false,
-        )
-    })
+    FILTER.get_or_init(|| limited_filter(EXIT_CALLS, AF_UNIX_NETLINK, false))
 }
 
 /// What the thread that removes a container reaches beyond [`Recording`].
@@ -463,7 +477,7 @@ fn remove_filter(root: bool) -> &'static [libc::sock_filter] {
     } else {
         (&FILTER_USER, true)
     };
-    cell.get_or_init(|| limited_filter(&[libc::SYS_socket, libc::SYS_connect], AF_UNIX, keep))
+    cell.get_or_init(|| limited_filter(UNIX_CALLS, AF_UNIX, keep))
 }
 
 /// Confine the calling thread for the FUSE session of a mount: it reads
@@ -545,6 +559,109 @@ mod tests {
                 eperm,
                 "{nr}"
             );
+        }
+    }
+
+    /// The length and the FNV-1a hash of the instructions of a program.
+    fn fingerprint(program: &[libc::sock_filter]) -> (usize, u64) {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for i in program {
+            let mut bytes = Vec::from(i.code.to_le_bytes());
+            bytes.extend([i.jt, i.jf]);
+            bytes.extend(i.k.to_le_bytes());
+            for b in bytes {
+                hash = (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        (program.len(), hash)
+    }
+
+    /// The programs of the filters are what they were: any change of the
+    /// generator, or of a table, shows here.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_programs_of_the_filters_are_pinned() {
+        for (name, program, want) in [
+            ("fuse", filter(), (200, 1670101401834716846)),
+            ("record", record_filter(), (201, 16209927425034214830)),
+            ("exit", exit_filter(), (199, 13994333819956319298)),
+            (
+                "remove (root)",
+                remove_filter(true),
+                (201, 16209927425034214830),
+            ),
+            (
+                "remove (user)",
+                remove_filter(false),
+                (193, 16003295455940468575),
+            ),
+        ] {
+            assert_eq!(fingerprint(program), want, "{name}");
+        }
+    }
+
+    /// The program of each filter is the one of its table, and answers what
+    /// the statement of `velarx_bpf_core::check` says to every call and
+    /// argument that matters, as the filter of the kernel will.
+    #[test]
+    fn the_filters_answer_what_their_tables_say() {
+        use velarx_bpf_core::{check, Insn, Table, Target};
+        let target = Target {
+            arch: sys::ARCH,
+            x32: cfg!(target_arch = "x86_64"),
+            clone: libc::SYS_clone as u32,
+            clone3: libc::SYS_clone3 as u32,
+        };
+        let none: &[sys::OnlyIf] = &[];
+        let tables = [
+            ("fuse", filter(), DENIED.to_vec(), none),
+            (
+                "record",
+                record_filter(),
+                limited_denied(UNIX_CALLS, false),
+                AF_UNIX,
+            ),
+            (
+                "exit",
+                exit_filter(),
+                limited_denied(EXIT_CALLS, false),
+                AF_UNIX_NETLINK,
+            ),
+            (
+                "remove (root)",
+                remove_filter(true),
+                limited_denied(UNIX_CALLS, false),
+                AF_UNIX,
+            ),
+            (
+                "remove (user)",
+                remove_filter(false),
+                limited_denied(UNIX_CALLS, true),
+                AF_UNIX,
+            ),
+        ];
+        for (name, program, denied, only) in tables {
+            let table = Table {
+                denied: &denied,
+                only,
+                errno: libc::EPERM as u32,
+            };
+            let made: Vec<Insn> = program
+                .iter()
+                .map(|i| Insn {
+                    code: i.code,
+                    jt: i.jt,
+                    jf: i.jf,
+                    k: i.k,
+                })
+                .collect();
+            assert_eq!(
+                velarx_bpf_core::deny_program(&table, &target).unwrap(),
+                made,
+                "{name}"
+            );
+            let asked = check::agrees(&table, &target).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(asked > 10_000, "{name}: {asked}");
         }
     }
 

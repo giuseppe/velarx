@@ -259,9 +259,14 @@ impl Decompressors {
                 Ok(program) => {
                     slots.push(Some(list.len()));
                     list.push(if confined {
-                        let filter =
-                            velarx_sys::confine::deny_filter(&DENIED_CALLS, libc::EPERM as u32);
-                        program.with_setup(move || velarx_sys::confine::seccomp_thread(&filter))
+                        match velarx_sys::confine::deny_filter(&DENIED_CALLS, libc::EPERM as u32) {
+                            Ok(filter) => program
+                                .with_setup(move || velarx_sys::confine::seccomp_thread(&filter)),
+                            Err(e) => {
+                                failure = Some(e.to_string());
+                                program
+                            }
+                        }
                     } else {
                         program
                     });
@@ -581,6 +586,45 @@ mod tests {
         let p = dir.join(name);
         velarx_base::testing::write_script(&p, body);
         p
+    }
+
+    /// The filter of the decompressors answers what its table says, to every
+    /// call that matters (`velarx_bpf_core::check`).
+    #[test]
+    fn the_filter_of_the_decompressors_answers_what_its_table_says() {
+        use velarx_bpf_core::{check, Table, Target};
+        let target = Target {
+            arch: velarx_sys::confine::ARCH,
+            x32: cfg!(target_arch = "x86_64"),
+            clone: libc::SYS_clone as u32,
+            clone3: libc::SYS_clone3 as u32,
+        };
+        let table = Table {
+            denied: &DENIED_CALLS,
+            only: &[],
+            errno: libc::EPERM as u32,
+        };
+        let asked = check::agrees(&table, &target).unwrap();
+        assert!(asked > 10_000, "{asked}");
+    }
+
+    /// The program of the filter is what it was (length and FNV-1a hash of
+    /// its instructions): any change of the generator or of the table shows
+    /// here.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_program_of_the_filter_of_the_decompressors_is_pinned() {
+        let program = velarx_sys::confine::deny_filter(&DENIED_CALLS, libc::EPERM as u32).unwrap();
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for i in &program {
+            let mut bytes = Vec::from(i.code.to_le_bytes());
+            bytes.extend([i.jt, i.jf]);
+            bytes.extend(i.k.to_le_bytes());
+            for b in bytes {
+                hash = (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        assert_eq!((program.len(), hash), (56, 10_693_042_240_523_993_239));
     }
 
     fn fake(path: PathBuf) -> Decompressors {

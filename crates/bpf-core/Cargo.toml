@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-bpf-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The seccomp program of a confined thread: the generator of the classic BPF instructions from a table of calls, and the interpreter that says what a program answers"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on slices and vectors: no dependency, no I/O, no libc.  The
+# shell that gives the tables, converts the instructions to `sock_filter` and
+# installs them is `velarx-sys` (`confine`).
+
+[features]
+# `check`: the statement of what a program answers (`check::expected`) and
+# the comparison of a program with it over the inputs that matter, which
+# the tests of the owners of real tables run
+check = []
+
+[lib]
+name = "velarx_bpf_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

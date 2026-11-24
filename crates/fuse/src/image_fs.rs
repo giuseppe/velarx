@@ -1950,7 +1950,7 @@ mod tests {
                     }
                     r.restrict_thread()?;
                 }
-                sys::seccomp_thread(&sys::deny_filter(&[libc::SYS_execve], libc::EPERM as u32))
+                sys::seccomp_thread(&sys::deny_filter(&[libc::SYS_execve], libc::EPERM as u32)?)
             }
         }));
         let Some(path) = mounted(
@@ -1970,7 +1970,7 @@ mod tests {
             sys::seccomp_thread(&sys::deny_filter(
                 &[libc::SYS_umount2, libc::SYS_execve],
                 libc::EPERM as u32,
-            ))?;
+            )?)?;
             Err(std::io::Error::other("no"))
         }));
         let e = mount_tocs(&refused, "img", &[("l0".to_string(), toc)], None)
@@ -2019,7 +2019,7 @@ mod tests {
                     }
                     r.restrict_thread()?;
                 }
-                sys::seccomp_thread(&sys::deny_filter(&[libc::SYS_execve], libc::EPERM as u32))
+                sys::seccomp_thread(&sys::deny_filter(&[libc::SYS_execve], libc::EPERM as u32)?)
             }));
             let built = crate::layer_erofs::layer_image(&toc.entries).unwrap();
             let tree = crate::erofs_tree::Layers::new(

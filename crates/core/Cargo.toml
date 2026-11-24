@@ -79,6 +79,7 @@ rayon.workspace = true
 chacha20poly1305.workspace = true
 
 [dev-dependencies]
+velarx-bpf-core = { path = "../bpf-core", features = ["check"] }
 velarx-graph = { path = "../graph", features = ["conformance"] }
 velarx-wire = { path = "../wire", features = ["test-support"] }
 velarx-storage = { path = "../storage", features = ["test-support"] }

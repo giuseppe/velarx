@@ -4795,6 +4795,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "velarx-bpf-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-caps-core"
 version = "0.1.0"
 
@@ -4888,6 +4892,7 @@ dependencies = [
  "toml",
  "tracing",
  "velarx-base",
+ "velarx-bpf-core",
  "velarx-config",
  "velarx-content",
  "velarx-db",
@@ -5374,6 +5379,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "velarx-base",
+ "velarx-bpf-core",
  "velarx-caps-core",
  "velarx-config",
  "velarx-content",
@@ -5531,6 +5537,7 @@ dependencies = [
  "seccompiler",
  "tempfile",
  "tokio",
+ "velarx-bpf-core",
 ]
 
 [[package]]

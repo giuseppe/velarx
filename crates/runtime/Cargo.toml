@@ -62,6 +62,7 @@ tempfile.workspace = true
 yaml-rust2.workspace = true
 
 [dev-dependencies]
+velarx-bpf-core = { path = "../bpf-core", features = ["check"] }
 velarx-storage = { path = "../storage", features = ["test-support"] }
 rand.workspace = true
 
