@@ -737,7 +737,7 @@ completion_in_progress () { # CALL
     sh_ image rm -f "$LAZY" > /dev/null
 }
 
-@test "a layer one completion released and the service lost: the completion of the second pull stages it again from the engine's copy" {
+@test "a layer one completion released and the service lost: the completion of the second pull fails, a cancel and a pull again make the image whole" {
     forget_all
     lazy_image
     LAZY=$E2E_REGISTRY/e2e/varlink-lazy:zstd
@@ -749,12 +749,16 @@ completion_in_progress () { # CALL
     check "two pulls share the layer" 2 "$(sh_ image pulls -q | wc -l)"
     out=$(timeout 120 "$SH" --socket "$ESOCK" image complete "$LAZY" 2>&1)
     check "the first completes ($out)" 0 $?
-    engine_copy_there "the second pull holds the layer"
     stop_storage
     rm -rf "$VDIR/root"
     start_storage 4
     out=$(timeout 120 "$SH" --socket "$ESOCK" image complete "$OTHER" 2>&1)
-    check "the second completes though the service lost the layer ($out)" 0 $?
+    check "the second completion fails ($out)" 125 $?
+    check_match "it names the layer and says what to do" 'layer toc:sha256:.*cancel the pull .* and pull the image again' "$out"
+    sh_ image pulls --cancel "$(sh_ image pulls -q)" > /dev/null 2>&1 || e2e_die "the cancel of the pull"
+    sh_ image pull --lazy --tls-verify=false "$OTHER" > /dev/null 2>&1 || e2e_die "the pull again"
+    out=$(timeout 120 "$SH" --socket "$ESOCK" image complete "$OTHER" 2>&1)
+    check "the completion of the pull again ($out)" 0 $?
     check "no pull is left" "" "$(sh_ image pulls -q)"
     check_match "the service has the layer again" '^toc:sha256:' "$(sqlite3 "$(sdir)/db" 'SELECT id FROM layers')"
     engine_copy_gone "no container was made"
