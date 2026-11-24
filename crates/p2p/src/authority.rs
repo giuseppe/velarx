@@ -50,6 +50,9 @@ use velarx_revoke_core::{Held, Part};
 const MAX_CERT_WIRE: usize = 8 << 10;
 /// How long the exchange of certificates on a connection may take.
 const EXCHANGE: Duration = Duration::from_secs(10);
+/// The most a list may take, refused before it is parsed or its signature
+/// hashed: a list of a million peers is about 60 MiB.
+const MAX_LIST_BYTES: usize = 64 << 20;
 /// The first line of a revocation list.
 pub const LIST_HEADER: &str = "velarx-revocations/1";
 /// The DER of an ed25519 SubjectPublicKeyInfo, before its 32 bytes.
@@ -394,8 +397,14 @@ impl RevocationList {
     /// One list of `text`, if its signature is of one of `authorities`.
     pub fn parse(text: &str, authorities: &[[u8; 32]]) -> Result<Self, Error> {
         let bad = |what: &str| Error::Malformed(format!("a revocation list: {what}"));
+        // (the list is kept with one newline after its signature, and the
+        // blanks after it are not part of it: what is kept must not be larger
+        // than a list may be, as the peers it is handed to check)
+        let text = text.trim_end();
+        if text.len() >= MAX_LIST_BYTES {
+            return Err(bad("too large"));
+        }
         let (body, signature) = text
-            .trim_end()
             .rsplit_once("\nsignature ")
             .ok_or_else(|| bad("no signature"))?;
         let signature = hex::decode(signature.trim()).map_err(|_| bad("the signature"))?;
@@ -467,17 +476,20 @@ impl RevocationList {
         (lists, ignored)
     }
 
-    /// The text before the first list, and the text of each list.
-    fn split(text: &str) -> (&str, Vec<&str>) {
-        let mut starts: Vec<usize> = text
+    /// The text before the first list, and the text of each list, one at a
+    /// time (a text is not scanned further than its reader asks).
+    fn split(text: &str) -> (&str, impl Iterator<Item = &str>) {
+        let mut starts = text
             .match_indices(LIST_HEADER)
             .filter(|(i, _)| *i == 0 || text.as_bytes()[i - 1] == b'\n')
             .map(|(i, _)| i)
-            .collect();
-        let first = starts.first().copied().unwrap_or(text.len());
-        starts.push(text.len());
-        let parts = starts.windows(2).map(|p| &text[p[0]..p[1]]).collect();
-        (&text[..first], parts)
+            .peekable();
+        let before = &text[..starts.peek().copied().unwrap_or(text.len())];
+        let parts = std::iter::from_fn(move || {
+            let start = starts.next()?;
+            Some(&text[start..starts.peek().copied().unwrap_or(text.len())])
+        });
+        (before, parts)
     }
 
     /// The issuer and the number a list says it has, not checked.
@@ -1801,6 +1813,63 @@ pub(crate) mod tests {
         let text = format!("{junk}{junk}{junk}{junk}{}", genuine.text());
         assert!(authority.adopt(&text));
         assert_eq!(authority.revoked_count(), 1);
+    }
+
+    /// Junk parts that name no authority are not checked, and a part larger
+    /// than a list may be is refused before it is parsed.
+    #[test]
+    fn a_hostile_text_costs_little() {
+        let swarm = Swarm::new();
+        let a = swarm.node("a", None, Role::Both);
+        let b = swarm.node("b", None, Role::Both);
+        let genuine = ca::revoke(&swarm.ca(), &[b.key.public().to_peer_id()]).unwrap();
+        let authority = a.authority();
+        let junk = format!("{LIST_HEADER}\n").repeat(200_000);
+        assert!(authority.adopt(&format!("{junk}{}", genuine.text())));
+        let keys = authority.state.read().unwrap().keys.clone();
+        let big = genuine.text().replace(
+            "\nsignature ",
+            &format!("\n{}\nsignature ", "r".repeat(MAX_LIST_BYTES)),
+        );
+        let blanks = format!("{}{}", genuine.text(), " ".repeat(MAX_LIST_BYTES));
+        assert!(RevocationList::parse(genuine.text(), &keys).is_ok());
+        // (blanks after a list are not part of it)
+        assert!(RevocationList::parse(&blanks, &keys).is_ok());
+        assert!(RevocationList::parse(&big, &keys).is_err());
+        assert_eq!(RevocationList::parse_all(&big, &keys).1, 1);
+        let text = format!("x\n{junk}");
+        let (before, parts) = RevocationList::split(&text);
+        assert_eq!((before, parts.count()), ("x\n", 200_000));
+    }
+
+    /// A list as large as a list may be, with its newline, is taken and
+    /// kept as it is, so that it parses again where it is handed to; one
+    /// byte more of body is refused even with no newline to make it larger.
+    #[test]
+    fn a_list_is_no_larger_when_kept_than_a_list_may_be() {
+        let ca = identity::ed25519::Keypair::generate();
+        let keys = [ca.public().to_bytes()];
+        let signed = |padding: usize, newline: &str| {
+            let body = format!(
+                "{LIST_HEADER}\nissuer {}\nnumber 1\nissued 1\nrevoke {}{}",
+                hex::encode(keys[0]),
+                PeerId::random(),
+                " ".repeat(padding)
+            );
+            format!(
+                "{body}\nsignature {}{newline}",
+                hex::encode(ca.sign(format!("{body}\n").as_bytes()))
+            )
+        };
+        let size = signed(0, "\n").len();
+        let exact = signed(MAX_LIST_BYTES - size, "\n");
+        assert_eq!(exact.len(), MAX_LIST_BYTES);
+        let list = RevocationList::parse(&exact, &keys).unwrap();
+        assert_eq!(list.text(), exact);
+        assert!(RevocationList::parse(list.text(), &keys).is_ok());
+        let larger = signed(MAX_LIST_BYTES - size + 1, "");
+        assert_eq!(larger.len(), MAX_LIST_BYTES);
+        assert!(RevocationList::parse(&larger, &keys).is_err());
     }
 
     #[test]
