@@ -7,11 +7,11 @@
 //! panic into a crash.  What a parser accepts is used a little (iterated,
 //! emitted again) so that the code after the parse runs too.
 
-use std::io::{BufReader, Cursor, Read};
+use std::io::{self, BufReader, Cursor, Read};
 
 /// The names of the targets, as `fuzz/fuzz_targets/NAME.rs` and the
 /// directories of `fuzz/corpus/` name them.
-pub const TARGETS: [&str; 23] = [
+pub const TARGETS: [&str; 24] = [
     "tar",
     "sparse",
     "tarsplit",
@@ -35,6 +35,7 @@ pub const TARGETS: [&str; 23] = [
     "api_body",
     "monitor_call",
     "digest",
+    "canonical_tar",
 ];
 
 /// Run the target `name` on `data`; false for a name that is no target.
@@ -63,6 +64,7 @@ pub fn run(name: &str, data: &[u8]) -> bool {
         "api_body" => api_body(data),
         "monitor_call" => monitor_call(data),
         "digest" => digest(data),
+        "canonical_tar" => canonical_tar(data),
         _ => return false,
     }
     true
@@ -108,6 +110,55 @@ pub fn tar(data: &[u8]) {
         }
     }
     let _ = r.finish();
+}
+
+/// A tar whose bytes are checked against the canonical rules, and the table
+/// of contents the same bytes make: a table that the rules accept has a tar
+/// that the check accepts and the length `stream_size` says.
+pub fn canonical_tar(data: &[u8]) {
+    use velarx_storage::canonical::{stream_size, validate_entries, validate_tar, write};
+    use velarx_storage::{TocEntry, TocEntryType as Kind};
+    let _ = validate_tar(data);
+    // an entry of 16 bytes: the length of the name, the kind, the mode, the
+    // ids, the size, the time and the device, each as the byte says
+    let mut entries: Vec<TocEntry> = Vec::new();
+    for (i, c) in data.as_chunks::<16>().0.iter().take(8).enumerate() {
+        let word = |at: usize| u32::from_le_bytes([c[at], c[at + 1], c[at + 2], c[at + 3]]);
+        let kind = [
+            Kind::Reg,
+            Kind::Dir,
+            Kind::Symlink,
+            Kind::Char,
+            Kind::Block,
+            Kind::Fifo,
+            Kind::Hardlink,
+        ][usize::from(c[1]) % 7];
+        let slash = if kind == Kind::Dir { "/" } else { "" };
+        let name = format!("./{i}{}{slash}", "a".repeat(usize::from(c[0]) * 2));
+        let mut e = TocEntry::new(name, kind);
+        (e.mode, e.uid, e.gid) = (word(2), word(6) << (c[10] % 24), word(6) >> (c[10] % 24));
+        e.size = u64::from(c[11]) * 3;
+        e.mod_time = velarx_storage::rfc3339((i64::from(word(2)) << (c[13] % 32), word(6)));
+        (e.dev_major, e.dev_minor) = (Some(u32::from(c[14]) << 14), Some(u32::from(c[15]) << 14));
+        match (kind, entries.last()) {
+            (Kind::Symlink, _) => e.link_name = Some("b".repeat(usize::from(c[0]) * 2)),
+            (Kind::Hardlink, Some(t)) => {
+                e.link_name = Some(t.name.clone());
+                (e.mode, e.uid, e.gid, e.mod_time) = (t.mode, t.uid, t.gid, t.mod_time.clone());
+            }
+            _ => {}
+        }
+        entries.push(e);
+    }
+    let mut tar = Vec::new();
+    let written = write(&entries, &mut tar, |e, out| {
+        io::copy(&mut io::repeat(0).take(e.size), out).map(|_| ())
+    });
+    if validate_entries(&entries).is_ok() {
+        written.expect("a table that is accepted has a tar");
+        assert_eq!(stream_size(&entries).ok(), Some(tar.len() as u64));
+        validate_tar(&tar[..]).expect("the tar of a table that is accepted is canonical");
+    }
 }
 
 /// A tar a user hands over (a build context, `cp`, a volume), its sparse

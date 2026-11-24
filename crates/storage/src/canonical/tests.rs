@@ -369,7 +369,7 @@ fn a_size_of_8_pow_11_is_a_pax_record_and_less_is_not() {
         (0o100_000_000_000, "19 size=8589934592\n", "00000000000"),
     ] {
         let mut out = Vec::new();
-        headers(&fields(&file("./big", size)), false, &mut out);
+        headers(&fields(&file("./big", size)), false, &mut out).unwrap();
         let h = header(
             b"./big",
             "0000644",
@@ -394,7 +394,7 @@ fn a_size_of_8_pow_11_is_a_pax_record_and_less_is_not() {
 fn the_time_is_in_the_field_or_a_pax_record_by_its_value() {
     let t = |s: &str| {
         let mut out = Vec::new();
-        headers(&fields(&timed(file("./t", 0), s)), false, &mut out);
+        headers(&fields(&timed(file("./t", 0), s)), false, &mut out).unwrap();
         out
     };
     let h = |mtime: &str| {
@@ -500,7 +500,7 @@ fn the_records_are_in_their_order_and_the_xattrs_are_sorted_by_key() {
 fn an_xattr_value_is_raw_bytes() {
     let e = xattr(file("./x", 0), "user.k", b"a\0b\nc");
     let mut out = Vec::new();
-    headers(&fields(&e), false, &mut out);
+    headers(&fields(&e), false, &mut out).unwrap();
     let record = b"29 SCHILY.xattr.user.k=a\0b\nc\n";
     assert_eq!(record.len(), 29);
     assert_eq!(&out[512..512 + record.len()], record);
@@ -978,7 +978,7 @@ fn every_byte_of_the_headers_and_the_padding_is_fixed() {
     for e in tar_entries(&entries) {
         let f = fields(e);
         let mut head = Vec::new();
-        headers(&f, at == 0, &mut head);
+        headers(&f, at == 0, &mut head).unwrap();
         if head[156] == b'x' {
             let n =
                 usize::from_str_radix(std::str::from_utf8(&head[124..135]).unwrap(), 8).unwrap();
@@ -1290,4 +1290,549 @@ fn what_validate_accepts_has_a_tar() {
             assert!(size <= max);
         }
     }
+}
+
+// The walk of the edges: tables of one to three entries over the values at
+// the edges of every field.  For each table:
+//
+// * `validate_entries(T)` holds exactly when `validate_tar(write(T))` does.
+//   For a table the headers give back as it is this is nearly the same
+//   check twice (`validate_tar` decodes, writes the headers again and runs
+//   the checker on the same fields): what it tests is the layout `write`
+//   makes of the headers, the contents and the padding.
+// * What does not repeat the checker: the headers read back by a decoder
+//   of this test give the fields; a table that is accepted is one whose
+//   headers read back as it is; the length `stream_size` gives is the
+//   bytes of `write`, of `reader` and, with the contents in place of their
+//   sizes, of `skeleton`; the tar of a table that is refused and is still
+//   accepted by `validate_tar` is the tar of another table the rules
+//   accept.
+
+/// A name of `len` bytes with the `./` and for a directory its `/`, with a
+/// `/` in the middle when `split`.
+fn named(len: usize, split: bool, dir: bool) -> String {
+    let mut name = format!("./{}", "a".repeat(len - 2));
+    if split {
+        name.replace_range(len / 2..len / 2 + 1, "/");
+    }
+    if dir {
+        name.replace_range(len - 1.., "/");
+    }
+    name
+}
+
+/// What a name or a target can be at the edges of the 100 bytes of the
+/// header and beyond them: the cut is inside a character, and 155 bytes
+/// is where a ustar prefix would end.
+fn edge_names(dir: bool) -> Vec<String> {
+    let mut v = Vec::new();
+    for len in [99, 100, 101, 155, 156, 257] {
+        for split in [false, true] {
+            v.push(named(len, split, dir));
+        }
+    }
+    if !dir {
+        v.push(format!("./{}é", "a".repeat(97)));
+    }
+    // the last component the name of an `x` header is cut to, and the
+    // longest path there is
+    for len in [87, 88] {
+        v.push(format!(
+            "./{}{}",
+            "a".repeat(len),
+            if dir { "/" } else { "" }
+        ));
+    }
+    for len in [MAX_PATH, MAX_PATH + 1] {
+        v.push(named(len, false, dir));
+    }
+    v
+}
+
+const EDGE_IDS: [u32; 4] = [MAX_ID_FIELD, MAX_ID_FIELD + 1, MAX_ID_FIELD + 2, u32::MAX];
+const EDGE_MODES: [u32; 7] = [
+    0,
+    0o644,
+    0o7777,
+    0o10000,
+    0o7_777_777,
+    0o10_000_000,
+    u32::MAX,
+];
+const EDGE_SIZES: [u64; 5] = [0, 1, 511, 512, 513];
+const BIG_SIZES: [u64; 2] = [MAX_OCTAL_11, MAX_OCTAL_11 + 1];
+const EDGE_SECS: [i64; 8] = [
+    -1,
+    0,
+    1,
+    MAX_OCTAL_11 as i64,
+    MAX_OCTAL_11 as i64 + 1,
+    FIRST_TIME,
+    FIRST_TIME - 1,
+    LAST_TIME,
+];
+const EDGE_NANOS: [u32; 3] = [0, 1, 500_000_000];
+const EDGE_DEVICES: [(u32, u32); 7] = [
+    (0, 1),
+    (1, 0),
+    (MAX_DEVICE, 0),
+    (0, MAX_DEVICE),
+    (MAX_DEVICE, MAX_DEVICE),
+    (MAX_DEVICE + 1, 0),
+    (0, MAX_DEVICE + 1),
+];
+
+fn at(secs: i64, nanos: u32) -> String {
+    chrono::DateTime::from_timestamp(secs, nanos)
+        .unwrap()
+        .to_rfc3339()
+}
+
+/// The entry of a kind that has every field in the rules.
+fn plain(kind: TocEntryType) -> TocEntry {
+    let name = if kind == DIR { "./e/" } else { "./e" };
+    let mut e = entry(name, kind);
+    match kind {
+        TocEntryType::Symlink => e.link_name = Some("t".into()),
+        TocEntryType::Char | TocEntryType::Block => (e.dev_major, e.dev_minor) = (Some(1), Some(2)),
+        _ => {}
+    }
+    e
+}
+
+/// `plain` and then each field alone at each of its edges, and what the
+/// rules refuse at them.
+fn varied(kind: TocEntryType) -> Vec<TocEntry> {
+    let mut v = vec![plain(kind)];
+    let mut vary = |f: &dyn Fn(&mut TocEntry)| {
+        let mut e = plain(kind);
+        f(&mut e);
+        v.push(e);
+    };
+    for n in edge_names(kind == DIR) {
+        vary(&|e| e.name = n.clone());
+    }
+    for id in EDGE_IDS {
+        vary(&|e| e.uid = id);
+        vary(&|e| e.gid = id);
+    }
+    for m in EDGE_MODES {
+        vary(&|e| e.mode = m);
+    }
+    for s in EDGE_SIZES {
+        vary(&|e| e.size = s);
+    }
+    vary(&|e| e.size = 1);
+    for secs in EDGE_SECS {
+        for nanos in EDGE_NANOS {
+            vary(&|e| e.mod_time = Some(at(secs, nanos)));
+        }
+    }
+    vary(&|e| e.mod_time = Some(at(LAST_TIME + 1, 0)));
+    vary(&|e| e.mod_time = Some("not a time".into()));
+    for d in EDGE_DEVICES.into_iter().chain([(0, 0)]) {
+        vary(&|e| (e.dev_major, e.dev_minor) = (Some(d.0), Some(d.1)));
+    }
+    vary(&|e| e.dev_major = Some(1));
+    // the length of a PAX record that has one digit more than a value
+    // shorter by one byte: 99 and 100, 999 and 1000
+    for n in [74, 75, 76, 973, 974, 975] {
+        vary(&|e| *e = xattr(e.clone(), "user.a", &vec![b'v'; n]));
+    }
+    for x in [
+        &[][..],
+        &[("user.a", &b""[..])],
+        &[("user.a", b"v"), ("user.b", b"\n\0\xff")],
+        &[("user.a=b", b"v")],
+        &[("", b"v")],
+        &[("trusted.overlay.x", b"v")],
+    ] {
+        vary(&|e| {
+            for (k, val) in x {
+                *e = xattr(e.clone(), k, val);
+            }
+        });
+    }
+    for l in ["", "a\0b"] {
+        vary(&|e| e.link_name = Some(l.into()));
+    }
+    vary(&|e| e.link_name = Some("t".into()));
+    if kind == TocEntryType::Symlink {
+        for l in edge_names(false) {
+            vary(&|e| e.link_name = Some(l.clone()));
+        }
+    }
+    v
+}
+
+/// What `headers` gives back when it is read as the stream does.
+fn read_back(head: &[u8]) -> Result<Fields, String> {
+    let (pax, block) = if head[156] == b'x' {
+        let size = octal(&head[124..136], "the size")? as usize;
+        let end = BLOCK + size.next_multiple_of(BLOCK);
+        (parse_pax(&head[BLOCK..BLOCK + size])?, &head[end..])
+    } else {
+        (Pax::default(), head)
+    };
+    decode(block.try_into().expect("one block"), &pax)
+}
+
+/// The entries of a canonical tar as its headers say them, the contents
+/// skipped.
+fn decode_tar(tar: &[u8]) -> Vec<Fields> {
+    let mut entries = Vec::new();
+    let mut at = 0;
+    while tar[at..at + BLOCK] != [0; BLOCK] {
+        let end = if tar[at + 156] == b'x' {
+            let size = octal(&tar[at + 124..at + 136], "the size").unwrap() as usize;
+            at + 2 * BLOCK + size.next_multiple_of(BLOCK)
+        } else {
+            at + BLOCK
+        };
+        let f = read_back(&tar[at..end]).unwrap();
+        at = end + f.size.next_multiple_of(BLOCK as u64) as usize;
+        entries.push(f);
+    }
+    entries
+}
+
+/// The entry of a table of contents that has the fields.
+fn entry_of(f: &Fields) -> TocEntry {
+    let mut e = TocEntry::new(f.name.clone(), f.kind);
+    (e.mode, e.uid, e.gid, e.size) = (f.mode, f.uid, f.gid, f.size);
+    e.link_name = f.link.clone();
+    e.mod_time = Some(at(f.mtime.0, f.mtime.1));
+    (e.dev_major, e.dev_minor) = (Some(f.device.0), Some(f.device.1));
+    for (k, v) in &f.xattrs {
+        e = xattr(e, k, v);
+    }
+    e
+}
+
+/// The bytes a reader gives, counted.
+struct Counting<R>(R, u64);
+
+impl<R: Read> Read for Counting<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.0.read(buf)?;
+        self.1 += n as u64;
+        Ok(n)
+    }
+}
+
+fn zeros_reader(entries: &[TocEntry]) -> impl Read + Send {
+    let toc = std::sync::Arc::new(crate::Toc {
+        version: crate::TOC_VERSION_CANONICAL,
+        entries: entries.to_vec(),
+        tar_split_digest: None,
+    });
+    reader(toc, |e| Ok(Box::new(io::repeat(0).take(e.size))))
+}
+
+/// The bytes of the tar by the parts of `skeleton`, with each content of
+/// its size in place of the 8 bytes of it.
+fn skeleton_size(entries: &[TocEntry]) -> u64 {
+    let mut n = 0;
+    skeleton(entries, |_, b| n += b.len() as u64).unwrap();
+    let content = |e: &&TocEntry| e.size > 0 && e.entry_type == REG;
+    let contents: Vec<u64> = tar_entries(entries)
+        .filter(content)
+        .map(|e| e.size)
+        .collect();
+    n - 8 * contents.len() as u64 + contents.iter().sum::<u64>()
+}
+
+/// A table with a non-regular entry that has a size is not one the rules
+/// accept, and its length is not the same in all the functions: see
+/// `a_size_of_a_directory_is_in_stream_size_and_not_in_the_bytes`.
+fn has_sized_non_file(entries: &[TocEntry]) -> bool {
+    entries.iter().any(|e| e.size > 0 && e.entry_type != REG)
+}
+
+#[derive(Default)]
+struct Walk {
+    tables: usize,
+    faithful: usize,
+    aliased: usize,
+    accepted: usize,
+}
+
+impl Walk {
+    fn table(&mut self, t: &[TocEntry]) {
+        self.tables += 1;
+        let what = || {
+            t.iter()
+                .map(|e| format!("{e:?}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let accepted = validate_entries(t).is_ok();
+        let Ok(size) = stream_size(t) else {
+            // a time that is not RFC 3339 or a number too wide for its field
+            // has no header: no function gives bytes, and the rules refuse it
+            assert!(!accepted, "{}", what());
+            assert!(write(t, io::sink(), |_, _| Ok(())).is_err(), "{}", what());
+            return;
+        };
+        let comparable = !has_sized_non_file(t);
+        if comparable {
+            assert_eq!(skeleton_size(t), size, "skeleton of\n{}", what());
+        }
+        let small = t.iter().all(|e| e.size < 1 << 20);
+        let mut tar = Vec::new();
+        let ok = if small {
+            write(t, &mut tar, |e, o| o.write_all(&vec![0; e.size as usize])).unwrap();
+            let mut streamed = Vec::new();
+            zeros_reader(t).read_to_end(&mut streamed).unwrap();
+            assert_eq!(tar, streamed, "reader of\n{}", what());
+            if comparable {
+                assert_eq!(tar.len() as u64, size, "write of\n{}", what());
+            }
+            validate_tar(&tar[..]).is_ok()
+        } else {
+            let mut counted = Counting(zeros_reader(t), 0);
+            let ok = validate_tar(&mut counted).is_ok();
+            if ok {
+                assert_eq!(counted.1, size, "reader of\n{}", what());
+            }
+            ok
+        };
+        // what the headers give back is the entry, or the table is refused
+        // (the headers do not tell two entries apart that the rules refuse:
+        // see `a_table_the_headers_cannot_tell_from_another_is_refused`)
+        let faithful = t
+            .iter()
+            .enumerate()
+            .all(|(i, e)| read_back(&super::header(e, i == 0).unwrap()).as_ref() == Ok(&fields(e)));
+        assert!(faithful || !accepted, "{}", what());
+        if faithful {
+            assert_eq!(
+                ok,
+                accepted,
+                "validate_tar and validate_entries of\n{}",
+                what()
+            );
+        }
+        if !faithful && ok {
+            // its tar is the canonical tar of another table, which the
+            // rules accept and which has this very tar
+            let other: Vec<TocEntry> = decode_tar(&tar).iter().map(entry_of).collect();
+            assert!(validate_entries(&other).is_ok(), "{}", what());
+            let mut again = Vec::new();
+            write(&other, &mut again, |e, o| {
+                o.write_all(&vec![0; e.size as usize])
+            })
+            .unwrap();
+            assert_eq!(again, tar, "{}", what());
+            self.aliased += 1;
+        }
+        self.faithful += usize::from(faithful);
+        self.accepted += usize::from(accepted);
+    }
+
+    /// A table that has a content too large to stream: the rules accept it
+    /// and `stream_size` is the length `skeleton` gives.
+    fn measured(&mut self, t: &[TocEntry]) {
+        self.tables += 1;
+        self.accepted += 1;
+        assert!(validate_entries(t).is_ok());
+        assert_eq!(skeleton_size(t), stream_size(t).unwrap());
+    }
+
+    /// The entry alone, as the first, and in the middle of a table of three.
+    fn positions(&mut self, e: &TocEntry) {
+        let root = entry("./", DIR);
+        self.table(std::slice::from_ref(e));
+        self.table(&[root.clone(), e.clone()]);
+        self.table(&[root, e.clone(), file("./z", 0)]);
+    }
+
+    /// The entry, and a hard link to it.
+    fn linked(&mut self, e: &TocEntry, name: &str) {
+        let mut l = TocEntry::new(name, TocEntryType::Hardlink);
+        (l.mode, l.uid, l.gid, l.mod_time) = (e.mode, e.uid, e.gid, e.mod_time.clone());
+        l.link_name = Some(e.name.clone());
+        self.table(&[e.clone(), l.clone()]);
+        self.table(&[entry("./", DIR), e.clone(), l]);
+    }
+}
+
+#[test]
+fn the_edges_of_every_field_agree_in_the_rules_the_bytes_and_the_headers() {
+    let start = std::time::Instant::now();
+    let mut w = Walk::default();
+    let kinds = [
+        REG,
+        DIR,
+        TocEntryType::Symlink,
+        TocEntryType::Char,
+        TocEntryType::Block,
+        TocEntryType::Fifo,
+    ];
+    for kind in kinds {
+        for e in varied(kind) {
+            w.positions(&e);
+            if kind != DIR {
+                w.linked(&e, "./z");
+            }
+        }
+    }
+    // the names of the link and of what it links to
+    for n in edge_names(false) {
+        w.linked(&file("./e", 1), &n);
+    }
+    // a hard link of other metadata than its target's, to a directory
+    let mut other = TocEntry::new("./z", TocEntryType::Hardlink);
+    other.link_name = Some("./e".into());
+    w.table(&[file("./e", 0), other.clone()]);
+    other.link_name = Some("./e/".into());
+    w.table(&[entry("./e/", DIR), other]);
+    // every field at once, for a regular file
+    for name in edge_names(false).iter().step_by(3) {
+        for uid in EDGE_IDS.iter().take(3) {
+            for gid in EDGE_IDS.iter().take(3) {
+                for mode in [0o644, 0o7777, 0o10000] {
+                    for secs in &EDGE_SECS[..5] {
+                        for nanos in &EDGE_NANOS[..2] {
+                            for xs in 0..3 {
+                                let mut e = file(name, 0);
+                                (e.uid, e.gid, e.mode) = (*uid, *gid, mode);
+                                e.mod_time = Some(at(*secs, *nanos));
+                                for x in 0..xs {
+                                    e = xattr(e, &format!("user.x{x}"), b"v");
+                                }
+                                w.positions(&e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // the sizes of the contents
+    for size in EDGE_SIZES {
+        w.positions(&file("./big", size));
+        w.table(&[file("./a", 513), file("./b", size)]);
+    }
+    // the largest are zeros read and not held: a table of one entry has
+    // them streamed, the others are only measured
+    for size in BIG_SIZES {
+        w.table(&[file("./big", size)]);
+        w.measured(&[entry("./", DIR), file("./big", size), file("./z", 513)]);
+    }
+    eprintln!(
+        "{} tables, {} faithful, {} accepted, {} of another table, {:?}",
+        w.tables,
+        w.faithful,
+        w.accepted,
+        w.aliased,
+        start.elapsed()
+    );
+}
+
+// What the walk found on today's code, each pinned as it is.
+
+#[test]
+fn a_size_of_a_directory_is_in_stream_size_and_not_in_the_bytes() {
+    // as it is today: `stream_size` and the checker add the padded size of
+    // every entry, `write`, `reader` and `skeleton` a content only for a
+    // regular file
+    let mut d = entry("./d/", DIR);
+    d.size = 5;
+    let entries = [d];
+    let mut out = Vec::new();
+    write(&entries, &mut out, content).unwrap();
+    let mut streamed = Vec::new();
+    zeros_reader(&entries).read_to_end(&mut streamed).unwrap();
+    assert_eq!(out, streamed);
+    assert_eq!(skeleton_size(&entries), out.len() as u64);
+    assert_eq!(stream_size(&entries).unwrap(), out.len() as u64 + 512);
+    assert!(validate_entries(&entries).is_err());
+}
+
+#[test]
+fn the_tar_of_a_refused_table_can_be_the_tar_of_another() {
+    // The headers do not tell two tables apart when the rules refuse one:
+    // a regular file with device numbers has the tar of the same file
+    // without them, and the xattr `user.a=b` of the value `v` has the tar
+    // of the xattr `user.a` of the value `b=v`.  `validate_tar` says yes to
+    // these tars, as they are canonical, and the walk checks that the table
+    // it finds in a tar is always one the rules accept.
+    let mut stray = file("./e", 0);
+    (stray.dev_major, stray.dev_minor) = (Some(0), Some(1));
+    let equal = xattr(file("./e", 0), "user.a=b", b"v");
+    for (refused, other) in [
+        (stray, file("./e", 0)),
+        (equal, xattr(file("./e", 0), "user.a", b"b=v")),
+    ] {
+        assert!(validate_entries(std::slice::from_ref(&refused)).is_err());
+        assert!(validate_entries(std::slice::from_ref(&other)).is_ok());
+        assert_eq!(tar(&[refused]), canonical(&[other]));
+    }
+}
+
+#[test]
+fn a_number_too_wide_for_its_field_is_an_error() {
+    let wide = |f: &dyn Fn(&mut TocEntry)| {
+        let mut e = plain(TocEntryType::Char);
+        f(&mut e);
+        let entries = [e];
+        assert!(super::header(&entries[0], false).is_err());
+        assert!(stream_size(&entries).is_err());
+        assert!(write(&entries, io::sink(), content).is_err());
+        assert!(zeros_reader(&entries).read_to_end(&mut Vec::new()).is_err());
+        assert!(skeleton(&entries, |_, _| {}).is_err());
+        assert!(validate_entries(&entries).is_err());
+    };
+    wide(&|e| e.mode = 0o10_000_000);
+    wide(&|e| e.mode = u32::MAX);
+    wide(&|e| e.dev_major = Some(MAX_DEVICE + 1));
+    wide(&|e| e.dev_minor = Some(MAX_DEVICE + 1));
+}
+
+#[test]
+fn a_tar_with_bytes_changed_is_checked_without_a_panic() {
+    use rand::{Rng, SeedableRng};
+    let mut l = TocEntry::new("./l", TocEntryType::Symlink);
+    l.link_name = Some("a".repeat(120));
+    let mut dev = TocEntry::new("./n", TocEntryType::Char);
+    (dev.dev_major, dev.dev_minor) = (Some(1), Some(2));
+    let mut big = file("./z", 3);
+    (big.uid, big.mod_time) = (u32::MAX, Some("1969-12-31T23:59:58.5Z".into()));
+    let seed = tar(&[
+        entry("./", DIR),
+        file("./a", 3),
+        xattr(l, "user.k", b"v"),
+        dev,
+        big,
+    ]);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x7a_c0);
+    for _ in 0..5_000 {
+        let mut d = seed.clone();
+        for _ in 0..rng.gen_range(1..4) {
+            if rng.gen() {
+                // a number of a header of 8 digits
+                let block = rng.gen_range(0..d.len() / BLOCK) * BLOCK;
+                let at = block + [100, 108, 116, 329, 337][rng.gen_range(0..5)];
+                d[at..at + 8].fill(b'7');
+            } else {
+                let at = rng.gen_range(0..d.len());
+                d[at] = if rng.gen() {
+                    rng.gen()
+                } else {
+                    b'0' + rng.gen_range(0..8)
+                };
+            }
+        }
+        let _ = validate_tar(&d[..]);
+    }
+}
+
+#[test]
+fn a_mode_of_8_digits_in_a_tar_is_not_canonical() {
+    // what the random test found in the debug_assert of the header: the
+    // mode of the header of `./a` is 77777777
+    let mut d = tar(&[entry("./", DIR), file("./a", 3)]);
+    d[2 * BLOCK + 100..2 * BLOCK + 108].fill(b'7');
+    assert!(not_canonical(&d).contains("does not fit"));
 }

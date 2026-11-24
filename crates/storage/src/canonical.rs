@@ -343,7 +343,7 @@ impl Checker {
             }
         }
         let mut head = Vec::new();
-        headers(f, self.previous.is_none(), &mut head);
+        headers(f, self.previous.is_none(), &mut head)?;
         // (what `stream_size` adds up)
         self.tar = f
             .size
@@ -484,11 +484,17 @@ impl Block {
     }
 
     /// `v` as octal digits in a field of `len` bytes, padded with zeros,
-    /// then a NUL.
-    fn octal(&mut self, at: usize, len: usize, v: u64) {
+    /// then a NUL; an error when the digits are more than the field has.
+    fn octal(&mut self, at: usize, len: usize, v: u64) -> Result<(), String> {
         let digits = format!("{v:0width$o}", width = len - 1);
-        debug_assert_eq!(digits.len(), len - 1, "{v} does not fit {len} bytes");
+        if digits.len() != len - 1 {
+            return Err(format!(
+                "{v} does not fit the {} digits of a field",
+                len - 1
+            ));
+        }
         self.bytes(at, digits.as_bytes());
+        Ok(())
     }
 
     fn finish(mut self) -> [u8; BLOCK] {
@@ -581,8 +587,8 @@ fn pad(out: &mut Vec<u8>) {
 
 /// The headers of an entry: the `x` entry when it needs records, then the
 /// header of the entry itself.  `first` is for the first entry of the
-/// stream.
-fn headers(f: &Fields, first: bool, out: &mut Vec<u8>) {
+/// stream.  A number that does not fit its field is an error.
+fn headers(f: &Fields, first: bool, out: &mut Vec<u8>) -> Result<(), String> {
     let pax = pax_data(f, first);
     if !pax.is_empty() {
         let key = f.key().unwrap_or("");
@@ -591,11 +597,11 @@ fn headers(f: &Fields, first: bool, out: &mut Vec<u8>) {
         let mut b = Block::new();
         b.bytes(0, b"PaxHeaders.0/");
         b.bytes(13, base);
-        b.octal(100, 8, 0o644);
-        b.octal(108, 8, 0);
-        b.octal(116, 8, 0);
-        b.octal(124, 12, pax.len() as u64);
-        b.octal(136, 12, 0);
+        b.octal(100, 8, 0o644)?;
+        b.octal(108, 8, 0)?;
+        b.octal(116, 8, 0)?;
+        b.octal(124, 12, pax.len() as u64)?;
+        b.octal(136, 12, 0)?;
         b.0[156] = b'x';
         out.extend_from_slice(&b.finish());
         out.extend_from_slice(&pax);
@@ -604,18 +610,18 @@ fn headers(f: &Fields, first: bool, out: &mut Vec<u8>) {
     let mut b = Block::new();
     let name = f.name.as_bytes();
     b.bytes(0, &name[..name.len().min(NAME_FIELD)]);
-    b.octal(100, 8, u64::from(f.mode));
+    b.octal(100, 8, u64::from(f.mode))?;
     b.octal(
         108,
         8,
         u64::from(if f.uid > MAX_ID_FIELD { 0 } else { f.uid }),
-    );
+    )?;
     b.octal(
         116,
         8,
         u64::from(if f.gid > MAX_ID_FIELD { 0 } else { f.gid }),
-    );
-    b.octal(124, 12, if f.size > MAX_OCTAL_11 { 0 } else { f.size });
+    )?;
+    b.octal(124, 12, if f.size > MAX_OCTAL_11 { 0 } else { f.size })?;
     let secs = f.mtime.0;
     b.octal(
         136,
@@ -625,17 +631,18 @@ fn headers(f: &Fields, first: bool, out: &mut Vec<u8>) {
         } else {
             0
         },
-    );
+    )?;
     b.0[156] = type_flag(f.kind);
     if let Some(l) = &f.link {
         let l = l.as_bytes();
         b.bytes(157, &l[..l.len().min(NAME_FIELD)]);
     }
     if matches!(f.kind, TocEntryType::Char | TocEntryType::Block) {
-        b.octal(329, 8, u64::from(f.device.0));
-        b.octal(337, 8, u64::from(f.device.1));
+        b.octal(329, 8, u64::from(f.device.0))?;
+        b.octal(337, 8, u64::from(f.device.1))?;
     }
     out.extend_from_slice(&b.finish());
+    Ok(())
 }
 
 /// The entries that are in the tar.
@@ -648,10 +655,8 @@ fn tar_entries(entries: &[TocEntry]) -> impl Iterator<Item = &TocEntry> {
 /// The number of bytes of the canonical tar of the entries.
 pub fn stream_size(entries: &[TocEntry]) -> io::Result<u64> {
     let mut size = END.len() as u64;
-    let mut head = Vec::new();
     for (i, e) in tar_entries(entries).enumerate() {
-        head.clear();
-        headers(&Fields::of(e).map_err(invalid)?, i == 0, &mut head);
+        let head = header(e, i == 0)?;
         // (the sizes of a table that was pulled are anything a u64 holds)
         size = e
             .size
@@ -667,7 +672,7 @@ pub fn stream_size(entries: &[TocEntry]) -> io::Result<u64> {
 /// for the first entry of the stream.
 pub fn header(e: &TocEntry, first: bool) -> io::Result<Vec<u8>> {
     let mut head = Vec::new();
-    headers(&Fields::of(e).map_err(invalid)?, first, &mut head);
+    headers(&Fields::of(e).map_err(invalid)?, first, &mut head).map_err(invalid)?;
     Ok(head)
 }
 
@@ -810,11 +815,8 @@ pub fn write<W: Write>(
     mut out: W,
     mut content: impl FnMut(&TocEntry, &mut dyn Write) -> io::Result<()>,
 ) -> io::Result<()> {
-    let mut head = Vec::new();
     for (i, e) in tar_entries(entries).enumerate() {
-        head.clear();
-        headers(&Fields::of(e).map_err(invalid)?, i == 0, &mut head);
-        out.write_all(&head)?;
+        out.write_all(&header(e, i == 0)?)?;
         if e.has_content() {
             let mut counted = Counted {
                 out: &mut out,
@@ -1049,7 +1051,7 @@ pub fn validate_tar(mut r: impl Read) -> io::Result<()> {
         }
         let f = decode(&block, &pax).map_err(|e| at(e, ""))?;
         expected.clear();
-        headers(&f, index == 0, &mut expected);
+        headers(&f, index == 0, &mut expected).map_err(|e| at(e, &f.name))?;
         if raw != expected {
             return Err(at(
                 "the headers are not what the rules make".into(),
