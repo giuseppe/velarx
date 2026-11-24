@@ -268,6 +268,8 @@ pub fn validate(maps: &[IdMapping]) -> IdMapResult<()> {
 }
 
 /// Sort by container id and merge the entries that continue each other.
+/// Two entries whose sizes do not fit one are left apart: the second is
+/// then past the last id and [`validate`] refuses it.
 pub fn sort_and_merge(maps: &[IdMapping]) -> Vec<IdMapping> {
     let mut sorted = maps.to_vec();
     sorted.sort_by_key(|m| m.container_id);
@@ -277,7 +279,8 @@ pub fn sort_and_merge(maps: &[IdMapping]) -> Vec<IdMapping> {
             Some(last)
                 if u64::from(last.container_id) + u64::from(last.size)
                     == u64::from(m.container_id)
-                    && u64::from(last.host_id) + u64::from(last.size) == u64::from(m.host_id) =>
+                    && u64::from(last.host_id) + u64::from(last.size) == u64::from(m.host_id)
+                    && last.size.checked_add(m.size).is_some() =>
             {
                 last.size += m.size;
             }
@@ -857,6 +860,14 @@ mod tests {
             sort_and_merge(&[m(4, 9, 4), m(1, 1, 3)]),
             [m(1, 1, 3), m(4, 9, 4)]
         );
+    }
+
+    #[test]
+    fn test_sort_and_merge_size_overflow() {
+        let maps = [m(0, 0, u32::MAX), m(u32::MAX, u32::MAX, 2)];
+        let merged = sort_and_merge(&maps);
+        assert_eq!(merged, maps);
+        assert!(validate(&merged).is_err());
     }
 
     #[test]
