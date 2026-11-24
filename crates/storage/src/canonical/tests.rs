@@ -1542,13 +1542,6 @@ fn skeleton_size(entries: &[TocEntry]) -> u64 {
     n - 8 * contents.len() as u64 + contents.iter().sum::<u64>()
 }
 
-/// A table with a non-regular entry that has a size is not one the rules
-/// accept, and its length is not the same in all the functions: see
-/// `a_size_of_a_directory_is_in_stream_size_and_not_in_the_bytes`.
-fn has_sized_non_file(entries: &[TocEntry]) -> bool {
-    entries.iter().any(|e| e.size > 0 && e.entry_type != REG)
-}
-
 #[derive(Default)]
 struct Walk {
     tables: usize,
@@ -1574,10 +1567,7 @@ impl Walk {
             assert!(write(t, io::sink(), |_, _| Ok(())).is_err(), "{}", what());
             return;
         };
-        let comparable = !has_sized_non_file(t);
-        if comparable {
-            assert_eq!(skeleton_size(t), size, "skeleton of\n{}", what());
-        }
+        assert_eq!(skeleton_size(t), size, "skeleton of\n{}", what());
         let small = t.iter().all(|e| e.size < 1 << 20);
         let mut tar = Vec::new();
         let ok = if small {
@@ -1585,9 +1575,7 @@ impl Walk {
             let mut streamed = Vec::new();
             zeros_reader(t).read_to_end(&mut streamed).unwrap();
             assert_eq!(tar, streamed, "reader of\n{}", what());
-            if comparable {
-                assert_eq!(tar.len() as u64, size, "write of\n{}", what());
-            }
+            assert_eq!(tar.len() as u64, size, "write of\n{}", what());
             validate_tar(&tar[..]).is_ok()
         } else {
             let mut counted = Counting(zeros_reader(t), 0);
@@ -1599,7 +1587,7 @@ impl Walk {
         };
         // what the headers give back is the entry, or the table is refused
         // (the headers do not tell two entries apart that the rules refuse:
-        // see `a_table_the_headers_cannot_tell_from_another_is_refused`)
+        // see `the_tar_of_a_refused_table_can_be_the_tar_of_another`)
         let faithful = t
             .iter()
             .enumerate()
@@ -1733,10 +1721,9 @@ fn the_edges_of_every_field_agree_in_the_rules_the_bytes_and_the_headers() {
 // What the walk found on today's code, each pinned as it is.
 
 #[test]
-fn a_size_of_a_directory_is_in_stream_size_and_not_in_the_bytes() {
-    // as it is today: `stream_size` and the checker add the padded size of
-    // every entry, `write`, `reader` and `skeleton` a content only for a
-    // regular file
+fn a_size_of_a_directory_is_no_content_for_any_function() {
+    // a table that the rules refuse: the content is of regular files only,
+    // in the length and in the bytes
     let mut d = entry("./d/", DIR);
     d.size = 5;
     let entries = [d];
@@ -1746,7 +1733,7 @@ fn a_size_of_a_directory_is_in_stream_size_and_not_in_the_bytes() {
     zeros_reader(&entries).read_to_end(&mut streamed).unwrap();
     assert_eq!(out, streamed);
     assert_eq!(skeleton_size(&entries), out.len() as u64);
-    assert_eq!(stream_size(&entries).unwrap(), out.len() as u64 + 512);
+    assert_eq!(stream_size(&entries).unwrap(), out.len() as u64);
     assert!(validate_entries(&entries).is_err());
 }
 

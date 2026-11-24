@@ -84,7 +84,7 @@
 //! The mapping from the entries of a foreign tar to a table of contents
 //! (what it keeps, clamps or refuses) is not part of these rules.
 
-use crate::{size_conflict, toc_time, TocEntry, TocEntryType};
+use crate::{content_size, size_conflict, toc_time, TocEntry, TocEntryType};
 use base64::Engine;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
@@ -345,8 +345,7 @@ impl Checker {
         let mut head = Vec::new();
         headers(f, self.previous.is_none(), &mut head)?;
         // (what `stream_size` adds up)
-        self.tar = f
-            .size
+        self.tar = content_size(f.kind, f.size)
             .checked_next_multiple_of(BLOCK as u64)
             .and_then(|n| n.checked_add(head.len() as u64))
             .and_then(|n| n.checked_add(self.tar))
@@ -436,7 +435,7 @@ pub fn validate_within(entries: &[TocEntry], max_tar: u64) -> Result<(), Invalid
         finish(&mut open)?;
         let f = Fields::of(e).map_err(|r| bad(i, r))?;
         checker.push(&f).map_err(|r| bad(i, r))?;
-        if f.kind == TocEntryType::Reg && f.size > 0 {
+        if content_size(f.kind, f.size) > 0 {
             if e.verity().is_none() {
                 return Err(bad(i, "a file with content has no fs-verity digest".into()));
             }
@@ -658,8 +657,7 @@ pub fn stream_size(entries: &[TocEntry]) -> io::Result<u64> {
     for (i, e) in tar_entries(entries).enumerate() {
         let head = header(e, i == 0)?;
         // (the sizes of a table that was pulled are anything a u64 holds)
-        size = e
-            .size
+        size = content_size(e.entry_type, e.size)
             .checked_next_multiple_of(BLOCK as u64)
             .and_then(|n| n.checked_add(head.len() as u64))
             .and_then(|n| n.checked_add(size))
@@ -694,11 +692,11 @@ pub fn skeleton(entries: &[TocEntry], mut part: impl FnMut(usize, &[u8])) -> io:
     for (i, e) in tar_entries(entries).enumerate() {
         part(i, &END[..pad]);
         part(i, &header(e, i == 0)?);
-        let has_content = e.size > 0 && e.entry_type == TocEntryType::Reg;
-        if has_content {
-            part(i, &e.size.to_le_bytes());
+        let size = content_size(e.entry_type, e.size);
+        if size > 0 {
+            part(i, &size.to_le_bytes());
         }
-        pad = if has_content { padding(e.size) } else { 0 };
+        pad = padding(size);
         n = i + 1;
     }
     part(n, &END[..pad]);
@@ -782,8 +780,9 @@ where
             self.buf = header(e, self.count == 0)?;
             self.pos = 0;
             self.count += 1;
-            if e.has_content() {
-                self.content = Some(((self.open)(e)?, e.size, padding(e.size)));
+            let size = content_size(e.entry_type, e.size);
+            if size > 0 {
+                self.content = Some(((self.open)(e)?, size, padding(size)));
             }
         }
     }
@@ -817,19 +816,20 @@ pub fn write<W: Write>(
 ) -> io::Result<()> {
     for (i, e) in tar_entries(entries).enumerate() {
         out.write_all(&header(e, i == 0)?)?;
-        if e.has_content() {
+        let size = content_size(e.entry_type, e.size);
+        if size > 0 {
             let mut counted = Counted {
                 out: &mut out,
                 written: 0,
             };
             content(e, &mut counted)?;
-            if counted.written != e.size {
+            if counted.written != size {
                 return Err(invalid(format!(
-                    "`{}` has {} bytes of content, not {}",
-                    e.name, counted.written, e.size
+                    "`{}` has {} bytes of content, not {size}",
+                    e.name, counted.written
                 )));
             }
-            out.write_all(&END[..padding(e.size)])?;
+            out.write_all(&END[..padding(size)])?;
         }
     }
     out.write_all(&END)
@@ -1059,12 +1059,12 @@ pub fn validate_tar(mut r: impl Read) -> io::Result<()> {
             ));
         }
         checker.push(&f).map_err(|e| at(e, &f.name))?;
-        let copied = io::copy(&mut r.by_ref().take(f.size), &mut io::sink())?;
-        if copied != f.size {
+        let size = content_size(f.kind, f.size);
+        let copied = io::copy(&mut r.by_ref().take(size), &mut io::sink())?;
+        if copied != size {
             return Err(at("the content is cut".into(), &f.name));
         }
-        zeros(&mut r, f.size.wrapping_neg() % BLOCK as u64)
-            .map_err(|e| at(e.to_string(), &f.name))?;
+        zeros(&mut r, padding(size) as u64).map_err(|e| at(e.to_string(), &f.name))?;
     }
     unreachable!("the loop returns at the end of the archive")
 }

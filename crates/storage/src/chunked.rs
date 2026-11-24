@@ -155,6 +155,15 @@ pub fn rfc3339((secs, nanos): (i64, u32)) -> Option<String> {
     chrono::DateTime::from_timestamp(secs, nanos).map(|t| t.to_rfc3339())
 }
 
+/// The length of the content of an entry: a regular file's size, else 0.
+pub(crate) fn content_size(kind: TocEntryType, size: u64) -> u64 {
+    if kind == TocEntryType::Reg {
+        size
+    } else {
+        0
+    }
+}
+
 impl TocEntry {
     /// The modification time: seconds since the epoch (before it for a
     /// time before 1970) and nanoseconds; `(0, 0)` when the entry has none
@@ -166,7 +175,7 @@ impl TocEntry {
 
     /// A regular file with content: the kind of entry a pull fetches.
     pub fn has_content(&self) -> bool {
-        self.entry_type == TocEntryType::Reg && self.size > 0
+        content_size(self.entry_type, self.size) > 0
     }
 
     /// The object digest (`sha256:HEX`) the TOC gives for the file, if it
