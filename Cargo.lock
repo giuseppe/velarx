@@ -4807,6 +4807,10 @@ name = "velarx-chunk-core"
 version = "0.1.0"
 
 [[package]]
+name = "velarx-commit-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-config"
 version = "0.1.0"
 dependencies = [
@@ -4849,6 +4853,7 @@ dependencies = [
  "tracing",
  "velarx-base",
  "velarx-chunk-core",
+ "velarx-commit-core",
  "velarx-config",
  "velarx-db",
  "velarx-fuse",

@@ -10,16 +10,18 @@
 //! (by the kernel's measure of its fs-verity digest where the file system has
 //! one, else by one read of its bytes: an implementation detail of the one
 //! check), and so is the staged image of a layer.  It needs no lock and
-//! names nothing.  [`commit_verified`] is the part that runs under the locks
-//! of the store: one `syncfs` of the staging file system, which makes all of
-//! it durable (one barrier when `[storage] sync` asks), the names (a file
-//! is linked into the store by its inode through [`Place`], the operation of
-//! the storage driver that keeps it: no copy, no second write, whatever the
-//! store's fs-verity; the staged images are renamed), and one `syncfs` of
-//! the store.  It reads no content, hashes nothing and copies nothing.
-//! Nothing has its name in the store before its bytes are on the disk.  A
-//! failed barrier fails the commit.  [`commit_layer`] is the two in a row,
-//! for a caller that holds no lock.
+//! names nothing new: the unlinks of a staged name whose object the store has
+//! already, and the link of a copy that is over the budget of descriptors
+//! (made durable by itself), are the exceptions.  [`commit_verified`] is the
+//! part that runs under the locks of the store: one `syncfs` of the staging
+//! file system, which makes all of it durable (one barrier when `[storage]
+//! sync` asks), the names (a file is linked into the store by its inode
+//! through [`Place`], the operation of the storage driver that keeps it: no
+//! copy, no second write, whatever the store's fs-verity; the staged images
+//! are renamed), and one `syncfs` of the store.  It reads no content, hashes
+//! nothing and copies nothing.  Nothing has its name in the store before its
+//! bytes are on the disk.  A failed barrier fails the commit.
+//! [`commit_layer`] is the two in a row, for a caller that holds no lock.
 //!
 //! The one copy that is left is a file of a staging in another file system
 //! than the store's, which cannot be linked: it is copied under no name,
@@ -38,9 +40,16 @@
 //!   file is read.
 //! * [`Check::Content`]: only the content digest is known.  The file is
 //!   read once, its digest must be that (unless a replay proved the
-//!   measure it must have); the object is named by the measure.
+//!   measure it must have, and the kernel measures it so); the object is
+//!   named by the measure.  Where the kernel measures nothing, a replay's
+//!   digest names a file unread only when the engine wrote it itself
+//!   ([`Want::own`]); another producer's is read.
 //! * [`Check::Engine`]: the engine wrote the file and proves it otherwise
 //!   (the diff id of the stream it was read from): named by its measure.
+//! * [`Check::Verified`]: where the kernel measures nothing, named by its
+//!   digest with no read: the engine read it when it handed it over, and a
+//!   writer that kept a descriptor could have changed it since
+//!   (THREAT-MODEL, "A store without fs-verity").
 //!
 //! A file is hashed once: by the kernel (fs-verity), or by one read of its
 //! bytes where the kernel does not measure it (which also computes its
@@ -54,7 +63,14 @@
 //! (never by a name a producer could replace), and a name the store has
 //! already is left as it is.  A file that is missing or wrong is reported
 //! and its name in the staging removed: the caller asks for it again, or
-//! fails.
+//! fails.  A refused file drops its staged name; an error (fs-verity is
+//! required and the kernel does not measure the file or the store's object,
+//! an I/O error) keeps it, and so does a staged file replaced before its
+//! link (it is another file's).
+//!
+//! What a file is, and what is done with it, is decided by
+//! `velarx_commit_core`, whose rules say it; this module opens, measures,
+//! reads, copies, links and removes names.
 
 use rayon::prelude::*;
 use rustix::fs::{linkat, renameat, statat, unlinkat, AtFlags, Mode, OFlags, ResolveFlags, CWD};
@@ -66,6 +82,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, warn};
+use velarx_commit_core::{
+    keep, plan, verdict, Claim, Dig, Facts, Held, Named, Plan, Proof, Seen, Verdict, Why,
+};
 use velarx_storage::{
     measure_file, FileStore, FsVerityHashAlgorithm, FsVerityManager, Object, VerityHasher,
 };
@@ -248,10 +267,12 @@ pub struct Verified {
 /// The staging phase of a commit: every file of every staging is opened,
 /// checked and verified (once: by the kernel's measure of its fs-verity
 /// digest where the file system has one, else by one read of its bytes), in
-/// parallel, and so is the staged image of a layer.  Nothing is named and
-/// nothing is written, and no lock of the store is needed: the reads and
-/// hashes of a commit are all here, so that the locked sections that follow
-/// ([`commit_verified`]) only link, rename and sync.
+/// parallel, and so is the staged image of a layer.  Nothing new is named
+/// but a copy that is over the budget of descriptors (it is made durable by
+/// itself and linked at once), and the staged names of files the store has
+/// already, or that are refused, are removed; no lock of the store is
+/// needed: the reads and hashes of a commit are all here, so that the locked
+/// sections that follow ([`commit_verified`]) only link, rename and sync.
 pub fn verify_layers(
     stagings: &[Staging<'_>],
     store: &FileStore,
@@ -527,13 +548,14 @@ fn storage_error(store: &FileStore, what: String) -> io::Error {
     io::Error::other(format!("{}: {what}", store.root().display()))
 }
 
-/// The object the store holds under `verity` ([`FileStore::holds`]),
-/// `checked` when the kernel measures it as its name.  A file the kernel
-/// measures as another object is an error of the store: a record names
-/// only the object that was measured.
-fn present(store: &FileStore, verity: &str, size: u64) -> io::Result<Option<Object>> {
+/// Whether the store holds the object `verity` ([`FileStore::holds`]), and
+/// whether the kernel measures it as its name.  It is made from a stat and a
+/// measure of the store, so it carries no evidence about a staged file.  A
+/// file the kernel measures as another object is an error of the store: a
+/// record names only the object that was measured.
+fn present(store: &FileStore, verity: &str, size: u64) -> io::Result<Held> {
     let Some(object) = Object::new(verity, false).filter(|_| store.holds(verity, size)) else {
-        return Ok(None);
+        return Ok(Held::Lacks);
     };
     let measured = store
         .local_path(verity)
@@ -544,10 +566,8 @@ fn present(store: &FileStore, verity: &str, size: u64) -> io::Result<Option<Obje
             store,
             format!("the object {verity} is measured by the kernel as {m}"),
         )),
-        m => Ok(Some(Object {
-            checked: m.is_some(),
-            ..object
-        })),
+        Some(_) => Ok(Held::Measures),
+        None => Ok(Held::Unmeasured),
     }
 }
 
@@ -559,17 +579,6 @@ pub(super) fn measure(file: &File, alg: Algorithm) -> Option<String> {
         .filter(|_| velarx_storage::canonical_digest(file, alg))
         .and_then(|m| m.object())
         .map(|o| o.to_string())
-}
-
-/// Whether the content of a file known by its digest has to be read by the
-/// commit: not when a replay read it and the kernel's measure now is the
-/// one it had then (the file is immutable); an error when it is another.
-fn content_read(replayed: Option<&str>, measured: Option<&str>) -> Result<bool, &'static str> {
-    match (replayed, measured) {
-        (Some(r), Some(m)) if r == m => Ok(false),
-        (Some(_), Some(_)) => Err("not the content a replay read"),
-        _ => Ok(true),
-    }
 }
 
 /// How many copies of files this process holds open at once, for all its
@@ -806,9 +815,114 @@ pub fn verify_file(
     Ok(Ok(verity))
 }
 
+/// The digest as the commit decision compares it.
+fn dig(d: &Digest) -> Dig {
+    let mut bytes = [0u8; 64];
+    bytes[..d.raw().len()].copy_from_slice(d.raw());
+    Dig {
+        verity: d.is_fsverity(),
+        alg: match d.alg() {
+            Algorithm::Sha256 => 0,
+            Algorithm::Sha512 => 1,
+        },
+        len: d.raw().len() as u8,
+        bytes,
+    }
+}
+
+fn dig_of(text: &str) -> Option<Dig> {
+    Digest::parse_key(text).ok().map(|d| dig(&d))
+}
+
+fn claim_of(want: &Want) -> Option<Claim> {
+    Some(match &want.check {
+        Check::Verity(v) => Claim::Verity(dig_of(v)?),
+        Check::Content(None) => Claim::Content(dig_of(&want.key)?),
+        Check::Content(Some(r)) => Claim::Replayed(dig_of(&want.key)?, dig_of(r)?),
+        Check::Engine => Claim::Engine,
+        Check::Verified(v) => Claim::Verified(dig_of(v)?),
+    })
+}
+
+/// The object the commit decision named.
+fn object_of(named: &Named) -> io::Result<Object> {
+    object_named(&named.verity(), named.checked())
+}
+
+fn object_named(d: &Dig, checked: bool) -> io::Result<Object> {
+    let alg = match d.alg {
+        0 => Algorithm::Sha256,
+        1 => Algorithm::Sha512,
+        _ => {
+            return Err(io::Error::other(format!(
+                "not an algorithm of fs-verity: {}",
+                d.alg
+            )))
+        }
+    };
+    let verity = Digest::fsverity(alg, &d.bytes[..usize::from(d.len)])
+        .map_err(|e| io::Error::other(format!("not an fs-verity digest: {e}")))?;
+    Ok(Object {
+        verity: verity.to_string(),
+        checked,
+    })
+}
+
+/// Why a file is refused.
+fn words(why: Why) -> &'static str {
+    match why {
+        Why::NotVerity => "not the fs-verity digest of its name",
+        Why::NotVerified => "not the fs-verity digest the engine verified",
+        Why::NotReplayed => "not the content a replay read",
+        Why::NotKnown => "not the fs-verity digest it is known by",
+        Why::NotContent => "not the content digest of its name",
+        Why::NoMeasure
+        | Why::StoreUnmeasured
+        | Why::NotFsVerity
+        | Why::Unread
+        | Why::NotPlanned => "not what the commit decided on",
+    }
+}
+
+/// The error of a commit that fails for the file `key`: `object` is the
+/// store's object that it asked about, and `cannot` why fs-verity could not
+/// be enabled on the copy of the file.
+fn failure(
+    store: &FileStore,
+    why: Why,
+    key: &str,
+    object: Option<&str>,
+    cannot: Option<&str>,
+) -> io::Error {
+    let path = object
+        .and_then(|o| Object::new(o, false))
+        .map_or(key.to_string(), |o| {
+            store.object_path(&o).display().to_string()
+        });
+    storage_error(
+        store,
+        match (why, cannot) {
+            (Why::StoreUnmeasured, _) => format!(
+                "fs-verity is required and the kernel does not measure the object {path}: \
+                 remove it, and it is fetched again"
+            ),
+            (Why::NoMeasure, Some(e)) => {
+                format!("fs-verity is required and cannot be enabled on {key}: {e}")
+            }
+            (Why::NoMeasure, None) => {
+                format!("fs-verity is required and the kernel does not measure {key} as its name")
+            }
+            _ => format!("{key}: {}", words(why)),
+        },
+    )
+}
+
 /// Check one file and make it ready (the first step of [`commit_layer`]):
 /// nothing is named here.  The file's name in the staging, and its metadata
-/// (to remove the name when it is still this inode), come with it.
+/// (to remove the name when it is still this inode), come with it.  What the
+/// file is to be named by, or why it is not, is the decision of
+/// `velarx_commit_core`: this function opens, measures, reads, copies and
+/// reports what it saw.
 fn prepare_one(
     dir: BorrowedFd<'_>,
     want: &Want,
@@ -820,6 +934,23 @@ fn prepare_one(
     let alg = want.alg;
     let key = want.key.as_str();
     let done = |step: Step| Ok(Prepared::Done(step));
+    let required = verity.is_some_and(|m| m.config().required);
+    let claim = claim_of(want).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("{key}: not a digest"))
+    })?;
+    let facts = Facts {
+        claim,
+        own: want.own,
+        same_fs,
+        required,
+    };
+    let mut seen = Seen {
+        kernel: None,
+        merkle: None,
+        content: None,
+        copy_kernel: None,
+        held: Held::Lacks,
+    };
     // the store's file is never replaced: it may have been optimized since
     // it was put there.  (A name in the store is a complete file: nothing
     // is given its name before its bytes are durable.)
@@ -830,12 +961,20 @@ fn prepare_one(
                 .ok()
                 .map(|s| s.st_size as u64)
         });
-        if let Some(object) = match size {
-            Some(size) => present(store, v, size)?,
-            None => None,
-        } {
-            let _ = unlinkat(dir, rel, AtFlags::empty());
-            return done(Step::Linked(object));
+        if let Some(size) = size {
+            seen.held = present(store, v, size)?;
+        }
+        if seen.held != Held::Lacks {
+            match verdict(&facts, &seen) {
+                Verdict::Keep(named) => {
+                    let _ = unlinkat(dir, rel, AtFlags::empty());
+                    return done(Step::Linked(object_of(&named)?));
+                }
+                Verdict::Fail(why) => {
+                    return Err(failure(store, why, key, Some(v), None));
+                }
+                _ => {}
+            }
         }
     }
     let mut file = match open_staged_file(dir, rel) {
@@ -856,11 +995,6 @@ fn prepare_one(
         drop_name(dir, rel, &meta);
         done(Step::Refused(Refusal::Wrong(why.to_string())))
     };
-    // (one read of the file's bytes)
-    let has_content_digest = |file: &File| -> io::Result<bool> {
-        let read = read_digests(file, alg, (false, true), &|n| store.note_hashed(n))?.1;
-        Ok(read.is_some_and(|r| r.to_string() == key))
-    };
     if !meta.file_type().is_file() {
         return wrong("not a regular file");
     }
@@ -873,7 +1007,6 @@ fn prepare_one(
         return wrong("not the size the table of contents gives");
     }
     let manager = verity.map(|m| m.for_algorithm(alg));
-    let required = verity.is_some_and(|m| m.config().required);
     // (a fetcher can neither change the mode of a file nor name it
     // elsewhere: its seccomp filter has no `chmod`, and it writes only
     // beneath its staging.  The one name is checked anyway: a file with
@@ -913,172 +1046,109 @@ fn prepare_one(
             }
         }
     }
+    seen.kernel = measured.as_deref().and_then(dig_of);
+    // (the store's object of a verity claim was asked above)
+    if let (Some(m), false) = (&measured, matches!(want.check, Check::Verity(_))) {
+        seen.held = present(store, m, meta.len())?;
+    }
     // the file itself is linked when its inode can be: it is in the store's
     // file system with one name.  Whether the kernel measures it only says
-    // how it is verified below (by the measure, or by one read of its
-    // bytes), never whether it is linked or copied
-    let links = same_fs;
-    let mut content = None;
-    match &want.check {
-        Check::Verity(v) => {
-            if measured.as_ref().is_some_and(|m| m != v) {
-                return wrong("not the fs-verity digest of its name");
-            }
-        }
-        Check::Content(replayed) => {
-            let read = match content_read(replayed.as_deref(), measured.as_deref()) {
-                Ok(read) => read,
-                Err(why) => return wrong(why),
-            };
-            if read && measured.is_some() && links {
-                // (fs-verity is enabled on it: nothing can change it between
-                // this read and the link)
-                if !has_content_digest(&file)? {
-                    return wrong("not the content digest of its name");
-                }
-                io::Seek::rewind(&mut file)?;
-            } else if read && !links {
-                // (a file in another file system: its content is hashed as
-                // it is copied below, and the copy is what is checked)
-                content = Some(velarx_types::digest::DigestWriter::new(alg));
-            }
-        }
-        Check::Engine => {}
-        Check::Verified(v) => {
-            if measured.as_ref().is_some_and(|m| m != v) {
-                return wrong("not the fs-verity digest the engine verified");
-            }
-        }
+    // how it is verified (by the measure, or by one read of its bytes),
+    // never whether it is linked or copied
+    let planned = plan(&facts, seen.kernel, seen.held);
+    let (merkle, content) = match planned {
+        Plan::Read { merkle, content } => (merkle, content),
+        Plan::Keep { content } => (false, content),
+        _ => (false, false),
+    };
+    if merkle || content {
+        let (m, c) = read_digests(&file, alg, (merkle, content), &|n| store.note_hashed(n))?;
+        seen.merkle = m.as_deref().and_then(dig_of);
+        seen.content = c.as_ref().map(dig);
     }
-    if let Some(m) = &measured {
-        if !matches!(want.check, Check::Verity(_)) {
-            if let Some(object) = present(store, m, meta.len())? {
-                if content.is_some() {
-                    // (the copy that would hash it is not made: the name
-                    // is proved here, as for a file that is linked)
-                    if !has_content_digest(&file)? {
-                        return wrong("not the content digest of its name");
-                    }
+    // a file that cannot be linked is made with no name (nothing of a crash
+    // is left, and no collection meets it), checked as it is written, then
+    // opened again read-only (no writer: fs-verity wants none)
+    let mut copy = None;
+    let mut cannot = None;
+    if let Plan::Copy { content } = planned {
+        io::Seek::rewind(&mut file)?;
+        let mut writer = super::unnamed::unnamed_to_link(store.root())?;
+        let mut verity = VerityHasher::new(alg);
+        let mut hash = content.then(|| velarx_types::digest::DigestWriter::new(alg));
+        velarx_storage::copy_sparse(&mut file, &writer, |b| {
+            store.note_hashed(b.len());
+            store.note_copied(b.len());
+            verity.update(b);
+            if let Some(c) = &mut hash {
+                c.update(b);
+            }
+        })?;
+        seen.merkle = dig_of(&verity.finish());
+        seen.content = hash.map(|c| dig(&c.finalize()));
+        io::Write::flush(&mut writer)?;
+        let tmp = velarx_sys::fd::reopen_read_only(&writer)?;
+        drop(writer);
+        match manager
+            .as_ref()
+            .map(|m| m.enable_file(&tmp, Path::new(rel)))
+        {
+            // (never a file of this hash without it: no change of hash, and
+            // no file unverified where it is enforced)
+            Some(Err(e @ velarx_storage::FsVerityError::AlgorithmUnavailable(_))) => {
+                return Err(storage_error(store, e.to_string()));
+            }
+            Some(Ok(())) => {
+                seen.copy_kernel = measure_file(&tmp)
+                    .ok()
+                    .and_then(|m| m.object())
+                    .and_then(|o| dig_of(&o.to_string()));
+            }
+            Some(Err(e)) => {
+                debug!("Cannot enable fs-verity on the copy of the staged file {key}: {e}");
+                cannot = Some(e.to_string());
+            }
+            None => {}
+        }
+        copy = Some(tmp);
+    }
+    // the digests that were reported are compared by the decision, and the
+    // store is asked again for a name that came from a read or a copy
+    let decided = match verdict(&facts, &seen) {
+        Verdict::Name(named) if named.proof() != Proof::Kernel => {
+            let object = object_of(&named)?;
+            match keep(&facts, named, present(store, &object.verity, meta.len())?) {
+                Verdict::Fail(why) => {
+                    return Err(failure(store, why, key, Some(&object.verity), None));
                 }
-                let _ = unlinkat(dir, rel, AtFlags::empty());
-                return done(Step::Linked(object));
+                decided => decided,
             }
         }
-    }
-    if measured.is_none() && links {
-        // the kernel does not measure it: verified by one read of its bytes
-        // (the engine's own file named by the digest it was written with is
-        // not read at all), and then linked as it is
-        if required {
-            return Err(storage_error(
+        decided => decided,
+    };
+    let named = match decided {
+        Verdict::Name(named) => named,
+        Verdict::Keep(named) => {
+            drop_name(dir, rel, &meta);
+            return done(Step::Linked(object_of(&named)?));
+        }
+        Verdict::Wrong(why) => return wrong(words(why)),
+        Verdict::Fail(why) => {
+            return Err(failure(
                 store,
-                format!("fs-verity is required and the kernel does not measure {key} as its name"),
+                why,
+                key,
+                measured.as_deref(),
+                cannot.as_deref(),
             ));
         }
-        let (computed, hashed) = match &want.check {
-            // (a replay of the engine read the whole file after it was
-            // staged and proved this measure: that read was the check)
-            Check::Content(Some(v)) | Check::Verified(v) => (v.clone(), None),
-            check => {
-                let content = matches!(check, Check::Content(_));
-                let (merkle, hashed) =
-                    read_digests(&file, alg, (true, content), &|n| store.note_hashed(n))?;
-                (merkle.expect("asked for"), hashed)
-            }
-        };
-        if hashed.is_some_and(|h| h.to_string() != key) {
-            return wrong("not the content digest of its name");
-        }
-        match &want.check {
-            Check::Verity(v) if *v != computed => {
-                return wrong("not the fs-verity digest it is known by");
-            }
-            _ => {}
-        }
-        let Some(object) = Object::new(&computed, false) else {
-            return wrong("not an fs-verity digest");
-        };
-        if let Some(object) = present(store, &object.verity, meta.len())? {
-            let _ = unlinkat(dir, rel, AtFlags::empty());
-            return done(Step::Linked(object));
-        }
-        return settle_staged(rel, &file, meta, object, store);
-    }
-    if links {
-        let Some(object) = measured.as_deref().and_then(|m| Object::new(m, true)) else {
-            return wrong("not an fs-verity digest");
-        };
-        return settle_staged(rel, &file, meta, object, store);
-    }
-    // made with no name (nothing of a crash is left, and no collection
-    // meets it), checked as it is written, then opened again read-only (no
-    // writer: fs-verity wants none)
-    io::Seek::rewind(&mut file)?;
-    let mut writer = super::unnamed::unnamed_to_link(store.root())?;
-    let mut verity = VerityHasher::new(alg);
-    velarx_storage::copy_sparse(&mut file, &writer, |b| {
-        store.note_hashed(b.len());
-        store.note_copied(b.len());
-        verity.update(b);
-        if let Some(c) = &mut content {
-            c.update(b);
-        }
-    })?;
-    let computed = verity.finish();
-    if content.is_some_and(|c| c.finalize().to_string() != key) {
-        return wrong("not the content digest of its name");
-    }
-    let expected = match &want.check {
-        Check::Verity(v) | Check::Content(Some(v)) | Check::Verified(v) => Some(v),
-        _ => None,
     };
-    if expected.is_some_and(|v| *v != computed) {
-        return wrong("not the fs-verity digest it is known by");
-    }
-    io::Write::flush(&mut writer)?;
-    let tmp = velarx_sys::fd::reopen_read_only(&writer)?;
-    drop(writer);
-    let enabled = match manager
-        .as_ref()
-        .map(|m| m.enable_file(&tmp, Path::new(rel)))
-    {
-        Some(Ok(())) => true,
-        // (never a file of this hash without it: no change of hash, and
-        // no file unverified where it is enforced)
-        Some(Err(e @ velarx_storage::FsVerityError::AlgorithmUnavailable(_))) => {
-            return Err(storage_error(store, e.to_string()));
-        }
-        // (where it is required no file takes its name without it)
-        Some(Err(e)) if required => {
-            return Err(storage_error(
-                store,
-                format!("fs-verity is required and cannot be enabled on {key}: {e}"),
-            ));
-        }
-        Some(Err(_)) | None => false,
+    let object = object_of(&named)?;
+    let Some(tmp) = copy else {
+        return settle_staged(rel, &file, meta, object, store);
     };
-    let kernel = enabled
-        .then(|| measure_file(&tmp).ok())
-        .flatten()
-        .and_then(|m| m.object())
-        .map(|o| o.to_string())
-        .filter(|m| *m == computed)
-        .and_then(|m| Object::new(&m, true));
     // read-only after: enabling fs-verity needs write access
     tmp.set_permissions(std::fs::Permissions::from_mode(0o444))?;
-    if required && kernel.is_none() {
-        return Err(storage_error(
-            store,
-            format!("fs-verity is required and the kernel does not measure {key} as its name"),
-        ));
-    }
-    let Some(object) = kernel.or_else(|| Object::new(&computed, false)) else {
-        return wrong("not an fs-verity digest");
-    };
-    if let Some(object) = present(store, &object.verity, meta.len())? {
-        drop_name(dir, rel, &meta);
-        return done(Step::Linked(object));
-    }
     if copies.take() {
         return Ok(Prepared::Copy {
             rel: rel.to_string(),
@@ -1222,7 +1292,10 @@ mod tests {
     }
 
     fn layer() -> Layer {
-        let dir = tempfile::tempdir().unwrap();
+        layer_in(tempfile::tempdir().unwrap())
+    }
+
+    fn layer_in(dir: tempfile::TempDir) -> Layer {
         let path = dir.path().join("files");
         std::fs::create_dir_all(&path).unwrap();
         let store = FileStore::new(dir.path().join("objects")).unwrap();
@@ -1232,6 +1305,29 @@ mod tests {
             store,
             path,
         }
+    }
+
+    /// A layer in `VELARX_VERITY_DIR`, a directory of a file system with
+    /// fs-verity (ext4 with 4 KiB blocks), where the kernel measures the
+    /// files the commit enables it on; none where the variable is not set.
+    /// fs-verity has to work there, or a test would pass for the wrong reason.
+    fn verity_layer() -> Option<Layer> {
+        let Some(base) = std::env::var_os("VELARX_VERITY_DIR") else {
+            eprintln!("VELARX_VERITY_DIR not set: skipped");
+            return None;
+        };
+        let l = layer_in(tempfile::tempdir_in(base).unwrap());
+        let probe = l.path.join("probe");
+        std::fs::write(&probe, b"probe").unwrap();
+        VerityMode::On
+            .manager()
+            .unwrap()
+            .for_algorithm(Algorithm::Sha256)
+            .enable(&probe)
+            .unwrap();
+        assert!(measure(&File::open(&probe).unwrap(), Algorithm::Sha256).is_some());
+        std::fs::remove_file(probe).unwrap();
+        Some(l)
     }
 
     /// A commit that stopped between the two renames of a layer's image and
@@ -1494,17 +1590,6 @@ mod tests {
         stage(&l, &w, b"world");
         let done = link_files(l.staging.as_fd(), &[w], &l.store, None).unwrap();
         assert_eq!(done.objects[0].1.verity, verity_of(b"world").to_string());
-    }
-
-    /// A file a replay read, whose measure is the one the replay had, is not
-    /// read again; any other is.
-    #[test]
-    fn a_file_a_replay_read_is_not_read_again() {
-        assert_eq!(content_read(Some("v"), Some("v")), Ok(false));
-        assert!(content_read(Some("v"), Some("w")).is_err());
-        assert_eq!(content_read(Some("v"), None), Ok(true));
-        assert_eq!(content_read(None, Some("v")), Ok(true));
-        assert_eq!(content_read(None, None), Ok(true));
     }
 
     /// The store the tests make is on a file system with no fs-verity
@@ -1820,6 +1905,377 @@ mod tests {
         }
     }
 
+    /// The two steps of a commit of `wants`, with the staging on the store's
+    /// file system or (`cross`) on another.
+    fn commit_files(
+        l: &Layer,
+        wants: &[Want],
+        verity: Option<&FsVerityManager>,
+        cross: bool,
+    ) -> io::Result<Linked> {
+        let dev = std::fs::metadata(l.store.root())?.dev() + u64::from(cross);
+        let prepared = prepare_files(
+            l.staging.as_fd(),
+            wants,
+            (&l.store, dev),
+            verity,
+            &CopyBudget::new(),
+        )?;
+        place_files(l.staging.as_fd(), prepared, &l.store)
+    }
+
+    const CLAIMED: &[u8] = b"claimed bytes";
+    /// (as long as `CLAIMED`)
+    const OTHER: &[u8] = b"another byte!";
+
+    /// A want of the file `tmp-1` that claims to be `CLAIMED`, checked as
+    /// `kind` says.
+    fn claim(kind: &str, own: bool) -> Want {
+        let verity = verity_of(CLAIMED).to_string();
+        let content = Digest::of(Algorithm::Sha256, CLAIMED).to_string();
+        let (key, check) = match kind {
+            "verity" => (verity.clone(), Check::Verity(verity)),
+            "content" => (content, Check::Content(None)),
+            "replayed" => (content, Check::Content(Some(verity))),
+            "verified" => (content, Check::Verified(verity)),
+            _ => (content, Check::Engine),
+        };
+        Want {
+            key,
+            alg: Algorithm::Sha256,
+            rel: "tmp-1".into(),
+            size: Some(CLAIMED.len() as u64),
+            check,
+            own,
+        }
+    }
+
+    /// Commit `tmp-1` of `staged` bytes as `kind` claims it, in a fresh
+    /// layer; the bytes the commit read to hash (none: refused) and the
+    /// object when named.  A file that is named is in the store, one that is
+    /// refused has no staged name.
+    fn try_claim(
+        l: &Layer,
+        (kind, own, cross): (&str, bool, bool),
+        staged: &[u8],
+        verity: Option<&FsVerityManager>,
+    ) -> Option<(u64, Object)> {
+        let w = claim(kind, own);
+        std::fs::write(l.path.join(&w.rel), staged).unwrap();
+        let done = commit_files(l, std::slice::from_ref(&w), verity, cross).unwrap();
+        let what = format!("{kind} own {own} cross {cross} staged {staged:?}");
+        match (done.objects.first(), done.refused.first()) {
+            (Some((_, object)), None) => {
+                assert!(l.store.object_path(object).is_file(), "{what}");
+                assert_eq!(object.verity, verity_of(CLAIMED).to_string(), "{what}");
+                Some((l.store.hashed(), object.clone()))
+            }
+            (None, Some((_, Refusal::Wrong(_)))) => {
+                assert!(!l.path.join(&w.rel).exists(), "{what}: name kept");
+                assert!(!l.store.root().read_dir().unwrap().any(|e| e.is_ok()));
+                None
+            }
+            _ => panic!("{what}: {done:?}"),
+        }
+    }
+
+    /// Where the kernel measures nothing, each check names the file as it
+    /// says: the bytes it read to hash, or none.  A replayed digest and an
+    /// engine-verified one are named unread on the store's file system
+    /// (whatever the bytes), read and compared in a copy.
+    #[test]
+    fn a_file_nothing_measures_is_named_as_its_check_says() {
+        let n = CLAIMED.len() as u64;
+        // (kind, staged bytes are the claimed ones, copied) -> read bytes
+        let table = [
+            ("verity", true, false, Some(n)),
+            ("verity", false, false, None),
+            ("verity", true, true, Some(n)),
+            ("verity", false, true, None),
+            ("content", true, false, Some(n)),
+            ("content", false, false, None),
+            ("content", true, true, Some(n)),
+            ("content", false, true, None),
+            ("replayed", true, false, Some(0)),
+            ("replayed", false, false, Some(0)),
+            ("replayed", true, true, Some(n)),
+            ("replayed", false, true, None),
+            ("verified", true, false, Some(0)),
+            ("verified", false, false, Some(0)),
+            ("verified", true, true, Some(n)),
+            ("verified", false, true, None),
+            ("engine", true, false, Some(n)),
+            ("engine", true, true, Some(n)),
+        ];
+        for own in [false, true] {
+            for (kind, right, cross, read) in table {
+                let staged = if right { CLAIMED } else { OTHER };
+                // (a replay's digest is believed unread only for a file of
+                // the engine's own: another producer's is read)
+                let read = match (kind, own, cross, right) {
+                    ("replayed", false, false, true) => Some(n),
+                    ("replayed", false, false, false) => None,
+                    _ => read,
+                };
+                let got = try_claim(&layer(), (kind, own, cross), staged, None);
+                let what = format!("{kind} own {own} right {right} cross {cross}");
+                assert_eq!(
+                    got.as_ref().map(|(r, o)| (*r, o.checked)),
+                    read.map(|r| (r, false)),
+                    "{what}"
+                );
+            }
+        }
+    }
+
+    /// A store that is not the one the commit is asked to check: a file the
+    /// kernel cannot measure where fs-verity is required is an error of the
+    /// commit, on either file system, and the staged name is kept (a hard
+    /// error is not a refusal: the caller may try again).
+    #[test]
+    fn a_required_store_that_cannot_measure_is_an_error_and_keeps_the_staged_name() {
+        let probe = layer();
+        let hit = probe.path.join("probe");
+        std::fs::write(&hit, b"probe").unwrap();
+        let _ = VerityMode::On
+            .manager()
+            .unwrap()
+            .for_algorithm(Algorithm::Sha256)
+            .enable(&hit);
+        if measure_file(&File::open(&hit).unwrap()).is_ok() {
+            eprintln!("the temporary directory has fs-verity: skipped");
+            return;
+        }
+        for cross in [false, true] {
+            let l = layer();
+            let w = claim("content", false);
+            std::fs::write(l.path.join(&w.rel), CLAIMED).unwrap();
+            let e = commit_files(
+                &l,
+                std::slice::from_ref(&w),
+                VerityMode::Require.manager().as_ref(),
+                cross,
+            )
+            .unwrap_err();
+            assert!(e.to_string().contains("fs-verity is required"), "{e}");
+            assert!(l.path.join(&w.rel).exists(), "cross {cross}: name dropped");
+            assert!(!l.store.root().read_dir().unwrap().any(|e| e.is_ok()));
+        }
+    }
+
+    /// A staged inode that is replaced between the check and the link is not
+    /// the file that was checked: refused, and its name is kept (it is
+    /// another file's).
+    #[test]
+    fn a_staged_file_replaced_before_its_link_is_refused_and_keeps_its_name() {
+        let l = layer();
+        let w = claim("content", false);
+        std::fs::write(l.path.join(&w.rel), CLAIMED).unwrap();
+        let dev = std::fs::metadata(l.store.root()).unwrap().dev();
+        let prepared = prepare_files(
+            l.staging.as_fd(),
+            std::slice::from_ref(&w),
+            (&l.store, dev),
+            None,
+            &CopyBudget::new(),
+        )
+        .unwrap();
+        std::fs::write(l.path.join("other"), OTHER).unwrap();
+        std::fs::rename(l.path.join("other"), l.path.join(&w.rel)).unwrap();
+        let done = place_files(l.staging.as_fd(), prepared, &l.store).unwrap();
+        assert!(done.objects.is_empty());
+        assert!(matches!(done.refused[0].1, Refusal::Wrong(_)));
+        assert_eq!(std::fs::read(l.path.join(&w.rel)).unwrap(), OTHER);
+    }
+
+    /// The store has the object a verity claim names, and fs-verity is
+    /// required, but the kernel does not measure it (the store's file system
+    /// gives none): an error that keeps the staged name, not a file reported
+    /// as linked.  The object may be named by another file it was never
+    /// checked against, so nothing is named.
+    #[test]
+    fn a_store_object_the_kernel_does_not_measure_is_an_error_when_required() {
+        let l = layer();
+        let w = claim("verity", false);
+        std::fs::write(l.path.join(&w.rel), CLAIMED).unwrap();
+        let object = Object::new(&w.key, false).unwrap();
+        let target = l.store.object_path(&object);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, OTHER).unwrap();
+        let ino = std::fs::metadata(&target).unwrap().ino();
+        let e = commit_files(
+            &l,
+            std::slice::from_ref(&w),
+            VerityMode::Require.manager().as_ref(),
+            false,
+        )
+        .unwrap_err();
+        let said = e.to_string();
+        assert!(said.contains("fs-verity is required"), "{said}");
+        // (it says which object, the one that asked: not the staged file)
+        assert!(said.contains(&target.display().to_string()), "{said}");
+        assert!(l.path.join(&w.rel).exists());
+        assert_eq!(std::fs::metadata(&target).unwrap().ino(), ino);
+        assert_eq!(std::fs::read(&target).unwrap(), OTHER);
+    }
+
+    /// The same for a file the kernel measures, whose object the store has
+    /// with no fs-verity of its own (written before it was required): an
+    /// error on either file system, the staged name kept.
+    #[test]
+    fn a_staged_file_measured_whose_store_object_is_not_is_an_error_when_required() {
+        for cross in [false, true] {
+            let Some(l) = verity_layer() else {
+                return;
+            };
+            let object = Object::new(&verity_of(CLAIMED).to_string(), false).unwrap();
+            let target = l.store.object_path(&object);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, CLAIMED).unwrap();
+            let w = claim("content", false);
+            std::fs::write(l.path.join(&w.rel), CLAIMED).unwrap();
+            let e = commit_files(
+                &l,
+                std::slice::from_ref(&w),
+                VerityMode::Require.manager().as_ref(),
+                cross,
+            )
+            .unwrap_err();
+            assert!(e.to_string().contains("fs-verity is required"), "{e}");
+            assert!(l.path.join(&w.rel).exists(), "cross {cross}");
+        }
+    }
+
+    /// A verity claim whose object the store has with no fs-verity of its
+    /// own, where fs-verity is required, in a directory where the kernel
+    /// measures the staged file: an error on either file system, the staged
+    /// name kept and the store's object not replaced (the object is
+    /// unmeasured as a file written before the requirement is).
+    #[test]
+    fn a_verity_claim_with_an_unmeasured_store_object_is_an_error_when_required() {
+        for cross in [false, true] {
+            let Some(l) = verity_layer() else {
+                return;
+            };
+            let w = claim("verity", false);
+            std::fs::write(l.path.join(&w.rel), CLAIMED).unwrap();
+            let object = Object::new(&w.key, false).unwrap();
+            let target = l.store.object_path(&object);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            // (of the same size, other bytes: replaced, if it were linked over)
+            std::fs::write(&target, OTHER).unwrap();
+            let ino = std::fs::metadata(&target).unwrap().ino();
+            let e = commit_files(
+                &l,
+                std::slice::from_ref(&w),
+                VerityMode::Require.manager().as_ref(),
+                cross,
+            )
+            .unwrap_err();
+            let said = e.to_string();
+            assert!(said.contains("fs-verity is required"), "{said}");
+            assert!(said.contains(&target.display().to_string()), "{said}");
+            assert!(l.path.join(&w.rel).exists(), "cross {cross}: name dropped");
+            assert_eq!(std::fs::metadata(&target).unwrap().ino(), ino);
+            assert_eq!(std::fs::read(&target).unwrap(), OTHER);
+        }
+    }
+
+    /// With the kernel's measure, each check holds the file to it, on the
+    /// store's file system and in a copy: right bytes are named by the
+    /// measure (checked), others refused.  `replayed` and `verified` read
+    /// nothing; the copy and the content check hash the bytes.
+    #[test]
+    fn with_the_kernel_measure_each_check_is_held_to_it() {
+        let Some(_) = verity_layer() else {
+            return;
+        };
+        let n = CLAIMED.len() as u64;
+        let table = [
+            ("verity", false, 0),
+            ("content", false, n),
+            ("replayed", false, 0),
+            ("verified", false, 0),
+            ("engine", false, 0),
+            ("verity", true, n),
+            ("content", true, n),
+            ("replayed", true, n),
+            ("verified", true, n),
+            ("engine", true, n),
+        ];
+        let manager = VerityMode::On.manager();
+        for own in [false, true] {
+            for (kind, cross, read) in table {
+                for right in [true, false] {
+                    if kind == "engine" && !right {
+                        continue;
+                    }
+                    let l = verity_layer().unwrap();
+                    let staged = if right { CLAIMED } else { OTHER };
+                    let got = try_claim(&l, (kind, own, cross), staged, manager.as_ref());
+                    let what = format!("{kind} own {own} right {right} cross {cross}");
+                    let want = right.then_some((read, true));
+                    assert_eq!(got.map(|(r, o)| (r, o.checked)), want, "{what}");
+                }
+            }
+        }
+    }
+
+    /// The store has the object the kernel measures: the staged file is not
+    /// named by it unless its claim holds, read first where the claim is a
+    /// content digest, on either file system; a right claim keeps the
+    /// store's inode.
+    #[test]
+    fn a_file_the_store_has_is_held_to_its_claim_all_the_same() {
+        let Some(_) = verity_layer() else {
+            return;
+        };
+        let manager = VerityMode::On.manager();
+        for cross in [false, true] {
+            for (kind, right) in [
+                ("content", true),
+                ("content", false),
+                ("replayed", true),
+                ("replayed", false),
+                ("verified", true),
+                ("verified", false),
+                ("engine", true),
+            ] {
+                let l = verity_layer().unwrap();
+                let object = Object::new(&verity_of(CLAIMED).to_string(), false).unwrap();
+                let target = l.store.object_path(&object);
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::fs::write(&target, CLAIMED).unwrap();
+                VerityMode::On
+                    .manager()
+                    .unwrap()
+                    .for_algorithm(Algorithm::Sha256)
+                    .enable(&target)
+                    .unwrap();
+                let before = std::fs::metadata(&target).unwrap().ino();
+                // (the staged bytes are always those the store has: the claim
+                // is what differs, as the content digest of other bytes)
+                let mut w = claim(kind, false);
+                if !right {
+                    w.key = Digest::of(Algorithm::Sha256, OTHER).to_string();
+                }
+                std::fs::write(l.path.join(&w.rel), CLAIMED).unwrap();
+                let done =
+                    commit_files(&l, std::slice::from_ref(&w), manager.as_ref(), cross).unwrap();
+                let what = format!("{kind} right {right} cross {cross}: {done:?}");
+                // (only a content claim reads the bytes: a replayed or
+                // verified one is held to the measure, not to its key)
+                let refused = !right && kind == "content";
+                assert_eq!(done.refused.len(), usize::from(refused), "{what}");
+                assert!(!l.path.join(&w.rel).exists(), "{what}");
+                if !refused {
+                    assert!(done.objects[0].1.checked, "{what}");
+                    assert_eq!(std::fs::metadata(&target).unwrap().ino(), before, "{what}");
+                }
+            }
+        }
+    }
+
     /// A file staged on another file system than the store, whose bytes are
     /// those of an object the store has, is not given the object under a
     /// name that is not its content digest.  The kernel has to measure the
@@ -1827,32 +2283,9 @@ mod tests {
     /// file system with fs-verity (ext4 with 4 KiB blocks), else not.
     #[test]
     fn a_staged_file_is_not_named_by_an_object_with_the_same_measure() {
-        let Some(base) = std::env::var_os("VELARX_VERITY_DIR") else {
-            eprintln!("VELARX_VERITY_DIR not set: skipped");
+        let Some(l) = verity_layer() else {
             return;
         };
-        let l = {
-            let dir = tempfile::tempdir_in(base).unwrap();
-            let path = dir.path().join("files");
-            std::fs::create_dir_all(&path).unwrap();
-            Layer {
-                staging: File::open(&path).unwrap(),
-                store: FileStore::new(dir.path().join("objects")).unwrap(),
-                _dir: dir,
-                path,
-            }
-        };
-        // (the directory is asked for: fs-verity has to work in it, or the
-        // test would pass for the wrong reason)
-        let probe = l.path.join("probe");
-        std::fs::write(&probe, b"probe").unwrap();
-        VerityMode::On
-            .manager()
-            .unwrap()
-            .for_algorithm(Algorithm::Sha256)
-            .enable(&probe)
-            .unwrap();
-        assert!(measure(&File::open(&probe).unwrap(), Algorithm::Sha256).is_some());
         let bytes = b"the bytes of another object";
         let object = Object::new(&verity_of(bytes).to_string(), false).unwrap();
         let target = l.store.object_path(&object);

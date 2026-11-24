@@ -35,6 +35,7 @@ velarx-fuse = { path = "../fuse" }
 velarx-wire = { path = "../wire" }
 velarx-tarsplit = { path = "../tarsplit" }
 velarx-chunk-core = { path = "../chunk-core" }
+velarx-commit-core = { path = "../commit-core" }
 velarx-tarsplit-header = { path = "../tarsplit-header" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process", "net", "signal", "fs", "io-util", "io-std"] }
 zlink = { workspace = true, features = ["tokio", "proxy", "service", "tracing"] }

@@ -304,6 +304,16 @@ yet in the store, is hashed on the descriptor that is served each time it is
 opened (by the FUSE file system, and when it is copied out of the image) and
 once more when the completion commits it.
 
+Where the kernel measures nothing, a file is named unread in two cases only:
+a file the engine wrote itself and hashed as it was written (the digest is
+the one a replay proved), and a file the engine verified and handed over (it
+read it before).  A producer that kept a descriptor open for writing can
+change the second after that read, as it can change any file linked after one
+check; a file of another producer with a replay's digest is read and compared
+like any other.  With `fsverity_require` nothing is named without the
+kernel's measure, and an object of the store that the kernel does not measure
+is an error, not a file reported as linked.
+
 ## Configuration choices that lower the guarantees
 
 | Setting | Effect |
