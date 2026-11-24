@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-caps-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The capability sets of a container process: what a request for capabilities gives, or why it is refused"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on bit masks (bit n is capability n): no dependency, no
+# I/O.  The shell that reads the names, the bounding set of the engine, and
+# builds the OCI capabilities is `velarx-runtime` (container/caps.rs).
+
+[lib]
+name = "velarx_caps_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

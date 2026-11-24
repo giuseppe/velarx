@@ -33,6 +33,7 @@ velarx-proto = { path = "../proto", default-features = false, features = ["proxy
 velarx-config = { path = "../config", features = ["engine"] }
 velarx-db = { path = "../db" }
 velarx-nsid = { path = "../nsid" }
+velarx-caps-core = { path = "../caps-core" }
 velarx-netkernel = { path = "../netkernel" }
 velarx-netdetach = { path = "../netdetach" }
 velarx-storage = { path = "../storage" }

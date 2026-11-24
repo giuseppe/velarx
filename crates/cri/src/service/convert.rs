@@ -725,6 +725,11 @@ pub fn container_create_of(
                 c.cap_ambient = cap.add_ambient_capabilities.clone();
                 c.cap_add = cap.add_capabilities.clone();
                 c.cap_drop = cap.drop_capabilities.clone();
+                // dropping ALL wins over adding ALL, as in CRI-O (the engine
+                // refuses both); what is added by name stays
+                if c.cap_drop.iter().any(|n| n.eq_ignore_ascii_case("all")) {
+                    c.cap_add.retain(|n| !n.eq_ignore_ascii_case("all"));
+                }
             }
             c.user = user_of(cfg)?;
             c.groups_strict =
@@ -1593,6 +1598,30 @@ mod tests {
             (c.cgroups, c.userns_mode),
             (CgroupsMode::Enabled, UsernsChoice::Host)
         );
+    }
+
+    #[test]
+    fn dropping_all_capabilities_wins_over_adding_all() {
+        let caps = |add: &[&str], drop: &[&str]| {
+            let c = container(|c| {
+                c.linux = Some(cri::LinuxContainerConfig {
+                    security_context: Some(cri::LinuxContainerSecurityContext {
+                        capabilities: Some(cri::Capability {
+                            add_capabilities: add.iter().map(|s| s.to_string()).collect(),
+                            drop_capabilities: drop.iter().map(|s| s.to_string()).collect(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            })
+            .unwrap();
+            (c.cap_add, c.cap_drop)
+        };
+        assert_eq!(caps(&["ALL", "NET_RAW"], &["all"]).0, ["NET_RAW"]);
+        assert_eq!(caps(&["ALL"], &["CHOWN"]).0, ["ALL"]);
+        assert_eq!(caps(&["ALL"], &[]).0, ["ALL"]);
     }
 
     #[test]

@@ -4795,6 +4795,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "velarx-caps-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-config"
 version = "0.1.0"
 dependencies = [
@@ -5370,6 +5374,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "velarx-base",
+ "velarx-caps-core",
  "velarx-config",
  "velarx-content",
  "velarx-db",

@@ -6,10 +6,19 @@
 //! applied.  Root gets it as its effective and permitted sets, with empty
 //! inheritable and ambient sets (CVE-2022-27651).  Another user gets only the
 //! capabilities it was given with `--cap-add`, in every set: ambient ones
-//! survive the exec of the command.
+//! survive the exec of the command.  A capability that is both added and
+//! dropped is dropped (podman refuses it: a deliberate difference).
+//!
+//! A default capability that the engine lacks is left out (an engine that
+//! itself runs confined has a smaller bounding set); an added one is an error,
+//! and so is adding all with dropping all, as in podman.
+//!
+//! The computation is `velarx-caps-core`, on masks; this is the shell: the
+//! names, the bounding set of the engine, and the OCI types.
 
 use oci_spec::runtime::{Capability, LinuxCapabilities, LinuxCapabilitiesBuilder};
 use std::collections::HashSet;
+use velarx_caps_core::{Refusal, Request};
 
 /// The names and numbers of the capabilities that the OCI spec knows.
 const CAPABILITIES: [(&str, u32, Capability); 41] = [
@@ -56,29 +65,19 @@ const CAPABILITIES: [(&str, u32, Capability); 41] = [
     ("CHECKPOINT_RESTORE", 40, Capability::CheckpointRestore),
 ];
 
-/// podman's default capabilities.
-pub const DEFAULT_CAPABILITIES: [Capability; 11] = [
-    Capability::Chown,
-    Capability::DacOverride,
-    Capability::Fowner,
-    Capability::Fsetid,
-    Capability::Kill,
-    Capability::NetBindService,
-    Capability::Setfcap,
-    Capability::Setgid,
-    Capability::Setpcap,
-    Capability::Setuid,
-    Capability::SysChroot,
-];
+/// podman's default capabilities, as a mask: CHOWN, DAC_OVERRIDE, FOWNER,
+/// FSETID, KILL, SETGID, SETUID, SETPCAP, NET_BIND_SERVICE, SYS_CHROOT and
+/// SETFCAP (`names` checks the list).
+const DEFAULT_CAPABILITIES: u64 = 0x8004_05fb;
 
-/// A capability name, with or without `CAP_`, in any case.
-pub fn parse_capability(name: &str) -> Result<Capability, String> {
+/// The number of a capability name, with or without `CAP_`, in any case.
+fn parse_capability(name: &str) -> Result<u32, String> {
     let upper = name.to_ascii_uppercase();
     let short = upper.strip_prefix("CAP_").unwrap_or(&upper);
     CAPABILITIES
         .iter()
         .find(|(n, _, _)| *n == short)
-        .map(|(_, _, c)| *c)
+        .map(|(_, n, _)| *n)
         .ok_or_else(|| format!("unknown capability `{name}`"))
 }
 
@@ -104,6 +103,11 @@ pub fn all_capabilities() -> HashSet<Capability> {
     bounding().map(|(_, _, c)| *c).collect()
 }
 
+/// [`all_capabilities`] as a mask.
+fn bounding_mask() -> u64 {
+    bounding().fold(0, |mask, (_, n, _)| mask | 1u64 << n)
+}
+
 /// [`all_capabilities`] by name (`CAP_CHOWN`), as a spec has them.
 pub fn bounding_names() -> Vec<String> {
     bounding().map(|(n, _, _)| format!("CAP_{n}")).collect()
@@ -122,7 +126,7 @@ pub fn build_capabilities(
     root_user: bool,
 ) -> Result<LinuxCapabilities, String> {
     build_with(
-        all_capabilities(),
+        bounding_mask(),
         privileged,
         cap_add,
         cap_drop,
@@ -143,7 +147,7 @@ pub fn build_capabilities_with_ambient(
     root_user: bool,
 ) -> Result<LinuxCapabilities, String> {
     build_with(
-        all_capabilities(),
+        bounding_mask(),
         privileged,
         cap_add,
         cap_drop,
@@ -152,9 +156,43 @@ pub fn build_capabilities_with_ambient(
     )
 }
 
-/// `build_capabilities` with `all` the bounding set of the engine.
+/// The capabilities of a mask, bit n being capability n.
+fn capabilities(mask: u64) -> HashSet<Capability> {
+    let have = |n: u32| mask & (1u64 << n) != 0;
+    CAPABILITIES
+        .iter()
+        .filter(|(_, n, _)| have(*n))
+        .map(|(_, _, c)| *c)
+        .collect()
+}
+
+/// The mask of capability names, and whether `all` is among them.
+fn parse_mask(names: &[String]) -> Result<(u64, bool), String> {
+    let mut mask = 0;
+    let mut all = false;
+    for name in names {
+        if is_all(name) {
+            all = true;
+        } else {
+            mask |= 1u64 << parse_capability(name)?;
+        }
+    }
+    Ok((mask, all))
+}
+
+/// The names (`CAP_CHOWN`) of the capabilities of a mask.
+fn listed(mask: u64) -> String {
+    let names: Vec<_> = CAPABILITIES
+        .iter()
+        .filter(|(_, n, _)| mask & (1u64 << n) != 0)
+        .map(|(name, _, _)| format!("CAP_{name}"))
+        .collect();
+    names.join(", ")
+}
+
+/// `build_capabilities` with `bounding` the bounding set of the engine, as a mask.
 fn build_with(
-    all: HashSet<Capability>,
+    bounding: u64,
     privileged: bool,
     cap_add: &[String],
     cap_drop: &[String],
@@ -169,70 +207,44 @@ fn build_with(
             .filter(|x| !x.is_empty())
             .collect()
     };
-    let (cap_add, cap_drop) = (split(cap_add), split(cap_drop));
-    let mut added = HashSet::new();
-    for name in cap_add.iter().filter(|n| !is_all(n)) {
-        let cap = parse_capability(name)?;
-        // the runtime could not give it: the create fails, not the start
-        if !all.contains(&cap) {
-            return Err(format!(
-                "the capability `{}` is not in the bounding set of the engine",
-                capability_name(cap)
-            ));
-        }
-        added.insert(cap);
-    }
-    let mut dropped = HashSet::new();
-    for name in cap_drop.iter().filter(|n| !is_all(n)) {
-        dropped.insert(parse_capability(name)?);
-    }
-    let mut kept = HashSet::new();
+    let (add, add_all) = parse_mask(&split(cap_add))?;
+    let (drop, drop_all) = parse_mask(&split(cap_drop))?;
+    let mut kept = 0;
     for name in split(ambient) {
-        let cap = parse_capability(&name)?;
-        if !all.contains(&cap) {
-            return Err(format!(
-                "the ambient capability `{}` is not in the bounding set of the engine",
-                capability_name(cap)
-            ));
+        kept |= 1u64 << parse_capability(&name)?;
+    }
+    let request = Request {
+        bounding,
+        defaults: DEFAULT_CAPABILITIES,
+        privileged,
+        root: root_user,
+        add,
+        add_all,
+        drop,
+        drop_all,
+        ambient: kept,
+    };
+    let sets = velarx_caps_core::sets(&request).map_err(|refusal| match refusal {
+        Refusal::AddAndDropAll => {
+            "adding all capabilities and dropping all of them is not allowed".to_string()
         }
-        kept.insert(cap);
-    }
-
-    let add_all = cap_add.iter().any(|n| is_all(n));
-    let mut caps: HashSet<Capability> = if privileged || add_all {
-        all.clone()
-    } else if cap_drop.iter().any(|n| is_all(n)) {
-        HashSet::new()
-    } else {
-        DEFAULT_CAPABILITIES.into_iter().collect()
-    };
-    caps.extend(added.iter().copied());
-    if !privileged {
-        caps.retain(|c| !dropped.contains(c));
-        kept.retain(|c| !dropped.contains(c));
-    }
-    caps.extend(kept.iter().copied());
-
-    let builder = LinuxCapabilitiesBuilder::default().bounding(caps.clone());
-    let builder = if root_user {
-        builder
-            .effective(caps.clone())
-            .permitted(caps)
-            .inheritable(kept.clone())
-            .ambient(kept)
-    } else {
-        let mut given: HashSet<Capability> = match add_all {
-            true => caps,
-            false => caps.intersection(&added).copied().collect(),
-        };
-        given.extend(kept);
-        builder
-            .effective(given.clone())
-            .permitted(given.clone())
-            .inheritable(given.clone())
-            .ambient(given)
-    };
-    builder.build().map_err(|e| e.to_string())
+        Refusal::Add(lacking) => format!(
+            "capabilities not in the bounding set of the engine: {}",
+            listed(lacking)
+        ),
+        Refusal::Ambient(lacking) => format!(
+            "ambient capabilities not in the bounding set of the engine: {}",
+            listed(lacking)
+        ),
+    })?;
+    LinuxCapabilitiesBuilder::default()
+        .bounding(capabilities(sets.bounding))
+        .effective(capabilities(sets.effective))
+        .permitted(capabilities(sets.permitted))
+        .inheritable(capabilities(sets.inheritable))
+        .ambient(capabilities(sets.ambient))
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -254,6 +266,11 @@ mod tests {
         CAPABILITIES.iter().map(|(_, _, c)| *c).collect()
     }
 
+    fn mask_of(caps: &HashSet<Capability>) -> u64 {
+        let number = |c: &Capability| CAPABILITIES.iter().find(|e| e.2 == *c).unwrap().1;
+        caps.iter().fold(0, |mask, c| mask | 1u64 << number(c))
+    }
+
     fn build_capabilities(
         privileged: bool,
         cap_add: &[String],
@@ -261,7 +278,7 @@ mod tests {
         root_user: bool,
     ) -> Result<LinuxCapabilities, String> {
         build_with(
-            all_capabilities(),
+            mask_of(&all_capabilities()),
             privileged,
             cap_add,
             cap_drop,
@@ -278,7 +295,7 @@ mod tests {
         root_user: bool,
     ) -> Result<LinuxCapabilities, String> {
         build_with(
-            all_capabilities(),
+            mask_of(&all_capabilities()),
             privileged,
             cap_add,
             cap_drop,
@@ -287,19 +304,295 @@ mod tests {
         )
     }
 
+    /// The names of a list of capabilities, as a set.
+    fn named(names: &[&str]) -> HashSet<Capability> {
+        capabilities(
+            names
+                .iter()
+                .fold(0, |mask, n| mask | 1u64 << parse_capability(n).unwrap()),
+        )
+    }
+
+    /// The default capabilities with these added and these taken away.
+    fn defaults_with(add: &[&str], take: &[&str]) -> HashSet<Capability> {
+        let mut caps = capabilities(DEFAULT_CAPABILITIES);
+        caps.extend(named(add));
+        caps.retain(|c| !named(take).contains(c));
+        caps
+    }
+
+    /// Every capability but these.
+    fn all_but(take: &[&str]) -> HashSet<Capability> {
+        let mut caps = all_capabilities();
+        caps.retain(|c| !named(take).contains(c));
+        caps
+    }
+
+    /// What the five sets are for a request: privileged, root, `--cap-add`,
+    /// `--cap-drop`, and the bounding set of the engine; then the bounding,
+    /// effective, permitted, inheritable and ambient sets.
+    #[test]
+    fn the_sets_of_every_kind_of_request() {
+        type Sets = [HashSet<Capability>; 5];
+        let every = |s: &HashSet<Capability>| -> Sets { std::array::from_fn(|_| s.clone()) };
+        let none = HashSet::new;
+        // root: the bounding set is its effective and permitted set
+        let root = |b: HashSet<Capability>| -> Sets { [b.clone(), b.clone(), b, none(), none()] };
+        // another user: the added capabilities are in every set but the bounding one
+        let user = |b: HashSet<Capability>, given: HashSet<Capability>| -> Sets {
+            [b, given.clone(), given.clone(), given.clone(), given]
+        };
+        let small = named(&["chown", "kill", "net_raw"]);
+        type Row<'a> = (
+            bool,
+            bool,
+            &'a [&'a str],
+            &'a [&'a str],
+            HashSet<Capability>,
+            Sets,
+        );
+        let rows: Vec<Row> = vec![
+            // (privileged, root, add, drop, engine's bounding set, sets)
+            (
+                false,
+                true,
+                &[],
+                &[],
+                all_capabilities(),
+                root(defaults_with(&[], &[])),
+            ),
+            (
+                false,
+                true,
+                &["net_raw"],
+                &[],
+                all_capabilities(),
+                root(defaults_with(&["net_raw"], &[])),
+            ),
+            (
+                false,
+                true,
+                &[],
+                &["chown"],
+                all_capabilities(),
+                root(defaults_with(&[], &["chown"])),
+            ),
+            (false, true, &[], &["all"], all_capabilities(), root(none())),
+            (
+                false,
+                true,
+                &["kill"],
+                &["all"],
+                all_capabilities(),
+                root(named(&["kill"])),
+            ),
+            (
+                false,
+                true,
+                &["all"],
+                &[],
+                all_capabilities(),
+                root(all_capabilities()),
+            ),
+            (
+                false,
+                true,
+                &["all"],
+                &["sys_admin"],
+                all_capabilities(),
+                root(all_but(&["sys_admin"])),
+            ),
+            (
+                true,
+                true,
+                &[],
+                &[],
+                all_capabilities(),
+                root(all_capabilities()),
+            ),
+            (
+                true,
+                true,
+                &[],
+                &["chown"],
+                all_capabilities(),
+                root(all_capabilities()),
+            ),
+            (
+                true,
+                true,
+                &["all"],
+                &["all"],
+                all_capabilities(),
+                root(all_capabilities()),
+            ),
+            (
+                false,
+                false,
+                &[],
+                &[],
+                all_capabilities(),
+                user(defaults_with(&[], &[]), none()),
+            ),
+            (
+                false,
+                false,
+                &["net_raw"],
+                &[],
+                all_capabilities(),
+                user(defaults_with(&["net_raw"], &[]), named(&["net_raw"])),
+            ),
+            (
+                false,
+                false,
+                &["all"],
+                &[],
+                all_capabilities(),
+                every(&all_capabilities()),
+            ),
+            (
+                false,
+                false,
+                &["all"],
+                &["sys_admin"],
+                all_capabilities(),
+                user(all_but(&["sys_admin"]), all_but(&["sys_admin"])),
+            ),
+            (
+                false,
+                false,
+                &["kill"],
+                &["all"],
+                all_capabilities(),
+                user(named(&["kill"]), named(&["kill"])),
+            ),
+            (
+                false,
+                true,
+                &["kill"],
+                &["kill"],
+                all_capabilities(),
+                root(defaults_with(&[], &["kill"])),
+            ),
+            (
+                false,
+                false,
+                &["chown"],
+                &["chown"],
+                all_capabilities(),
+                user(defaults_with(&[], &["chown"]), none()),
+            ),
+            (
+                true,
+                false,
+                &[],
+                &[],
+                all_capabilities(),
+                user(all_capabilities(), none()),
+            ),
+            (
+                true,
+                false,
+                &["net_raw"],
+                &[],
+                all_capabilities(),
+                user(all_capabilities(), named(&["net_raw"])),
+            ),
+            (
+                true,
+                false,
+                &["chown"],
+                &["chown"],
+                all_capabilities(),
+                user(all_capabilities(), named(&["chown"])),
+            ),
+            // an engine with a smaller bounding set: the defaults it lacks are
+            // left out (an added one it lacks is an error, below)
+            (
+                false,
+                true,
+                &[],
+                &[],
+                small.clone(),
+                root(named(&["chown", "kill"])),
+            ),
+            (
+                false,
+                true,
+                &["net_raw"],
+                &[],
+                small.clone(),
+                root(named(&["chown", "kill", "net_raw"])),
+            ),
+            (
+                false,
+                false,
+                &[],
+                &[],
+                small.clone(),
+                user(named(&["chown", "kill"]), none()),
+            ),
+            (
+                false,
+                true,
+                &["all"],
+                &[],
+                small.clone(),
+                root(small.clone()),
+            ),
+            (true, true, &[], &[], small.clone(), root(small.clone())),
+            (
+                true,
+                false,
+                &["kill"],
+                &[],
+                small.clone(),
+                user(small.clone(), named(&["kill"])),
+            ),
+        ];
+        for (privileged, root_user, add, drop, bounding, want) in rows {
+            let c = build_with(
+                mask_of(&bounding),
+                privileged,
+                &s(add),
+                &s(drop),
+                &[],
+                root_user,
+            )
+            .unwrap();
+            let got: Sets = [
+                c.bounding(),
+                c.effective(),
+                c.permitted(),
+                c.inheritable(),
+                c.ambient(),
+            ]
+            .map(set);
+            assert_eq!(
+                got, want,
+                "privileged {privileged} root {root_user} add {add:?} drop {drop:?}"
+            );
+        }
+    }
+
     #[test]
     fn names() {
-        assert_eq!(parse_capability("CAP_NET_ADMIN"), Ok(Capability::NetAdmin));
-        assert_eq!(parse_capability("net_admin"), Ok(Capability::NetAdmin));
-        assert_eq!(parse_capability("cap_sys_admin"), Ok(Capability::SysAdmin));
+        assert_eq!(parse_capability("CAP_NET_ADMIN"), Ok(12));
+        assert_eq!(parse_capability("net_admin"), Ok(12));
+        assert_eq!(parse_capability("cap_sys_admin"), Ok(21));
         assert!(parse_capability("CAP_NOPE").is_err());
         assert!(parse_capability("").is_err());
         assert!(parse_capability("CAP_").is_err());
-        assert_eq!(capability_name(Capability::Bpf), "CAP_BPF");
-        for (n, _, c) in CAPABILITIES {
-            assert_eq!(parse_capability(n), Ok(c));
-            assert_eq!(capability_name(c), format!("CAP_{n}"));
+        assert_eq!(listed(1 << 39), "CAP_BPF");
+        for (name, n, _) in CAPABILITIES {
+            assert_eq!(parse_capability(name), Ok(n));
+            assert_eq!(listed(1 << n), format!("CAP_{name}"));
         }
+        assert_eq!(
+            listed(DEFAULT_CAPABILITIES),
+            "CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_FSETID, CAP_KILL, CAP_SETGID, \
+             CAP_SETUID, CAP_SETPCAP, CAP_NET_BIND_SERVICE, CAP_SYS_CHROOT, CAP_SETFCAP"
+        );
         // the numbers are those of the kernel, in order
         for (i, (_, n, _)) in CAPABILITIES.iter().enumerate() {
             assert_eq!(*n as usize, i);
@@ -347,7 +640,7 @@ mod tests {
     #[test]
     fn defaults_for_root() {
         let c = build_capabilities(false, &[], &[], true).unwrap();
-        let want: HashSet<_> = DEFAULT_CAPABILITIES.into_iter().collect();
+        let want = capabilities(DEFAULT_CAPABILITIES);
         assert_eq!(set(c.bounding()), want);
         assert_eq!(set(c.effective()), want);
         assert_eq!(set(c.permitted()), want);
@@ -360,7 +653,10 @@ mod tests {
     #[test]
     fn a_user_gets_only_the_added_capabilities() {
         let c = build_capabilities(false, &[], &[], false).unwrap();
-        assert_eq!(set(c.bounding()).len(), DEFAULT_CAPABILITIES.len());
+        assert_eq!(
+            set(c.bounding()).len(),
+            DEFAULT_CAPABILITIES.count_ones() as usize
+        );
         assert!(set(c.effective()).is_empty());
         assert!(set(c.permitted()).is_empty());
         assert!(set(c.ambient()).is_empty());
@@ -418,14 +714,24 @@ mod tests {
     #[test]
     fn only_what_the_engine_has() {
         let some: HashSet<_> = [Capability::Chown, Capability::Kill].into_iter().collect();
-        assert!(build_with(some.clone(), false, &s(&["kill"]), &[], &[], true).is_ok());
-        let e = build_with(some.clone(), false, &s(&["sys_admin"]), &[], &[], true).unwrap_err();
+        assert!(build_with(mask_of(&some), false, &s(&["kill"]), &[], &[], true).is_ok());
+        let e = build_with(mask_of(&some), false, &s(&["sys_admin"]), &[], &[], true).unwrap_err();
         assert!(e.contains("bounding set"), "{e}");
         // `all` and --privileged are what there is
-        let c = build_with(some.clone(), true, &[], &[], &[], true).unwrap();
-        let e = build_with(some.clone(), false, &[], &[], &s(&["sys_admin"]), true).unwrap_err();
+        let c = build_with(mask_of(&some), true, &[], &[], &[], true).unwrap();
+        let e = build_with(mask_of(&some), false, &[], &[], &s(&["sys_admin"]), true).unwrap_err();
         assert!(e.contains("CAP_SYS_ADMIN"), "{e}");
         assert_eq!(set(c.bounding()), some);
+    }
+
+    #[test]
+    fn all_added_and_all_dropped_is_refused_as_podman_does() {
+        for root in [true, false] {
+            let e = build_capabilities(false, &s(&["all"]), &s(&["ALL"]), root).unwrap_err();
+            assert!(e.contains("all"), "{e}");
+        }
+        // --privileged has no drop
+        assert!(build_capabilities(true, &s(&["all"]), &s(&["all"]), true).is_ok());
     }
 
     #[test]
