@@ -18,6 +18,7 @@ use openssl::nid::Nid;
 use openssl::pkey::{Id, PKey, Public};
 use openssl::sign::Verifier;
 use std::io::Read;
+use velarx_sigparse_core as sigparse;
 
 /// Largest signed content (the JSON of a simple signing signature is
 /// a few hundred bytes), and what all the compressed packets of a message
@@ -26,8 +27,6 @@ const MAX_CONTENT: u64 = 4 << 20;
 /// Largest compressed or literal data accepted, and nesting of compressed
 /// packets.
 const MAX_DEPTH: usize = 2;
-/// Packets of a message or keyring at most.
-const MAX_PACKETS: usize = 100_000;
 
 const TAG_SIGNATURE: u8 = 2;
 const TAG_ONE_PASS: u8 = 4;
@@ -68,6 +67,23 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl From<sigparse::Error> for Error {
+    fn from(e: sigparse::Error) -> Self {
+        use sigparse::Error as E;
+        Error(match e {
+            E::Truncated => "truncated OpenPGP data".into(),
+            E::NotAPacket => "not an OpenPGP packet".into(),
+            E::TooManyPackets => "too many OpenPGP packets".into(),
+            E::PartialLength => "a partial length for a packet that cannot have one".into(),
+            E::Version(v) => format!("version {v} signatures are not supported"),
+            E::EmptySubpacket => "an empty signature subpacket".into(),
+            E::BadTime => "an invalid time subpacket".into(),
+            E::UnknownCritical(k) => format!("an unknown critical signature subpacket {k}"),
+            E::Algorithm(n) => format!("unsupported signature algorithm {n}"),
+        })
+    }
+}
+
 fn err<T>(msg: impl Into<String>) -> Result<T, Error> {
     Err(Error(msg.into()))
 }
@@ -80,10 +96,6 @@ struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self { data }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.data.is_empty()
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
@@ -128,64 +140,15 @@ struct Packet {
     body: Vec<u8>,
 }
 
-/// The packets of `data`, in order.
+/// The packets of `data`, in order (partial lengths joined).
 fn packets(data: &[u8]) -> Result<Vec<Packet>, Error> {
-    let mut c = Cursor::new(data);
     let mut out = Vec::new();
-    while !c.is_empty() {
-        if out.len() >= MAX_PACKETS {
-            return err("too many OpenPGP packets");
+    for p in sigparse::packets(data)? {
+        let mut body = p.body.of(data).to_vec();
+        for piece in &p.more {
+            body.extend_from_slice(piece.of(data));
         }
-        let first = c.u8()?;
-        if first & 0x80 == 0 {
-            return err("not an OpenPGP packet");
-        }
-        if first & 0x40 == 0 {
-            // old format
-            let tag = (first >> 2) & 0x0f;
-            let len = match first & 0x03 {
-                0 => usize::from(c.u8()?),
-                1 => usize::from(c.u16()?),
-                2 => c.u32()? as usize,
-                // indeterminate: up to the end
-                _ => c.data.len(),
-            };
-            out.push(Packet {
-                tag,
-                body: c.take(len)?.to_vec(),
-            });
-        } else {
-            let tag = first & 0x3f;
-            let mut body = Vec::new();
-            loop {
-                let o1 = c.u8()?;
-                match o1 {
-                    0..=191 => {
-                        body.extend_from_slice(c.take(usize::from(o1))?);
-                        break;
-                    }
-                    192..=223 => {
-                        let o2 = c.u8()?;
-                        let len = ((usize::from(o1) - 192) << 8) + usize::from(o2) + 192;
-                        body.extend_from_slice(c.take(len)?);
-                        break;
-                    }
-                    255 => {
-                        let len = c.u32()? as usize;
-                        body.extend_from_slice(c.take(len)?);
-                        break;
-                    }
-                    // a partial body: more follows
-                    _ => {
-                        if !matches!(tag, TAG_COMPRESSED | TAG_LITERAL) {
-                            return err("a partial length for a packet that cannot have one");
-                        }
-                        body.extend_from_slice(c.take(1usize << (o1 & 0x1f))?);
-                    }
-                }
-            }
-            out.push(Packet { tag, body });
-        }
+        out.push(Packet { tag: p.tag, body });
     }
     Ok(out)
 }
@@ -341,7 +304,6 @@ fn fingerprint(body: &[u8]) -> Result<[u8; 20], Error> {
 }
 
 /// What the subpackets of a signature say.
-#[derive(Default)]
 struct Subpackets {
     created: Option<u32>,
     expires: Option<u32>,
@@ -351,65 +313,6 @@ struct Subpackets {
     issuer_fpr: Option<Vec<u8>>,
     /// Embedded signatures (the back-signatures of signing subkeys).
     embedded: Vec<Vec<u8>>,
-}
-
-fn parse_subpackets(data: &[u8], hashed: bool, out: &mut Subpackets) -> Result<(), Error> {
-    let mut c = Cursor::new(data);
-    while !c.is_empty() {
-        let o1 = c.u8()?;
-        let len = match o1 {
-            0..=191 => usize::from(o1),
-            192..=254 => ((usize::from(o1) - 192) << 8) + usize::from(c.u8()?) + 192,
-            255 => c.u32()? as usize,
-        };
-        if len == 0 {
-            return err("an empty signature subpacket");
-        }
-        let sp = c.take(len)?;
-        let (kind, value) = (sp[0], &sp[1..]);
-        let critical = kind & 0x80 != 0;
-        let be32 = |v: &[u8]| -> Result<u32, Error> {
-            match v {
-                [a, b, c, d] => Ok(u32::from_be_bytes([*a, *b, *c, *d])),
-                _ => err("an invalid time subpacket"),
-            }
-        };
-        match kind & 0x7f {
-            // only what is in the hashed part is said by the signer
-            2 if hashed => out.created = Some(be32(value)?),
-            3 if hashed => out.expires = Some(be32(value)?),
-            9 if hashed => out.key_expires = Some(be32(value)?),
-            27 if hashed => out.key_flags = value.first().copied(),
-            16 => {
-                if let Ok(id) = <[u8; 8]>::try_from(value) {
-                    out.issuer = Some(id);
-                }
-            }
-            33 => {
-                if let [4, fpr @ ..] = value {
-                    out.issuer_fpr = Some(fpr.to_vec());
-                }
-            }
-            32 => out.embedded.push(value.to_vec()),
-            // what a verifier must understand to accept the signature;
-            // notations, policy URIs, signer's user ID, features and
-            // preferences are known, with nothing to check here
-            _ if critical
-                && hashed
-                && !matches!(
-                    kind & 0x7f,
-                    4 | 5 | 7 | 11 | 12 | 20 | 21 | 22 | 23 | 25 | 26 | 28 | 29 | 30 | 31 | 34
-                ) =>
-            {
-                return err(format!(
-                    "an unknown critical signature subpacket {}",
-                    kind & 0x7f
-                ));
-            }
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 /// A v4 signature packet.
@@ -427,47 +330,28 @@ struct Signature {
 }
 
 fn parse_signature(body: &[u8]) -> Result<Signature, Error> {
-    let mut c = Cursor::new(body);
-    let version = c.u8()?;
-    if version != 4 {
-        return err(format!("version {version} signatures are not supported"));
-    }
-    let sig_type = c.u8()?;
-    let algo = c.u8()?;
-    let hash = c.u8()?;
-    let hashed_len = usize::from(c.u16()?);
-    let hashed = c.take(hashed_len)?;
-    let mut sub = Subpackets::default();
-    parse_subpackets(hashed, true, &mut sub)?;
-    let unhashed_len = usize::from(c.u16()?);
-    parse_subpackets(c.take(unhashed_len)?, false, &mut sub)?;
-    let left = c.take(2)?;
-    let n_mpis = match algo {
-        ALGO_RSA | ALGO_RSA_SIGN => 1,
-        ALGO_DSA | ALGO_ECDSA | ALGO_EDDSA_LEGACY => 2,
-        ALGO_ED25519 => 0,
-        n => return err(format!("unsupported signature algorithm {n}")),
-    };
-    let mut mpis = Vec::new();
-    if algo == ALGO_ED25519 {
-        mpis.push(c.take(64)?.to_vec());
-    } else {
-        for _ in 0..n_mpis {
-            mpis.push(c.mpi()?.to_vec());
-        }
-    }
-    let hashed_part = &body[..6 + hashed_len];
+    let f = sigparse::signature(body)?;
+    let bytes = |s: &sigparse::Span| s.of(body).to_vec();
+    let hashed_part = &body[..f.hashed.end()];
     let mut trailer = hashed_part.to_vec();
     trailer.extend_from_slice(&[0x04, 0xff]);
     trailer.extend_from_slice(&(hashed_part.len() as u32).to_be_bytes());
     Ok(Signature {
-        sig_type,
-        algo,
-        hash,
+        sig_type: f.sig_type,
+        algo: f.algo,
+        hash: f.hash,
         trailer,
-        left16: [left[0], left[1]],
-        mpis,
-        sub,
+        left16: f.left16,
+        mpis: f.values.iter().map(bytes).collect(),
+        sub: Subpackets {
+            created: f.sub.created,
+            expires: f.sub.expires,
+            key_expires: f.sub.key_expires,
+            key_flags: f.sub.key_flags,
+            issuer: f.sub.issuer,
+            issuer_fpr: f.sub.issuer_fpr.as_ref().map(bytes),
+            embedded: f.sub.embedded.iter().map(bytes).collect(),
+        },
     })
 }
 
@@ -697,7 +581,12 @@ fn verified(by: &Key, raw: &[u8], types: &[u8], data: &[u8]) -> Option<Signature
 /// without a valid self-signature cannot sign, a subkey without a valid
 /// binding (and back-signature, for signing) is left out.  A revocation
 /// revokes, even one that does not parse or verify (the keyring is the
-/// configuration: failing closed is what it would want).
+/// configuration: failing closed is what it would want).  A self-signature
+/// that cannot be read (an unknown critical subpacket, say) is skipped and
+/// an older one supplies the expiry and the flags, where go-crypto refuses
+/// the key.  That is the safer side: the older signature only says what the
+/// owner had said before, and the key is not used for more than that, while
+/// a revocation that cannot be read still revokes.
 fn parse_keys(data: &[u8], keys: &mut Vec<Key>) -> Result<(), Error> {
     for block in blocks(data)? {
         let Some(mut primary) = new_key(&block.primary, None)? else {
@@ -990,6 +879,7 @@ pub fn verify_message(keys: &[Key], message: &[u8], now: u64) -> Result<(Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sigparse::MAX_PACKETS;
 
     macro_rules! fixture {
         ($name:literal) => {
@@ -1263,6 +1153,823 @@ mod tests {
         let k = fixture!("key-rsa.gpg");
         for n in 0..k.len() {
             let _ = parse_keyring(&k[..n]);
+        }
+    }
+
+    // The reading of packets and signature fields, pinned as it is.
+
+    /// An old format packet of `tag`; `lt` is the length type: 0, 1 and 2
+    /// give a length of 1, 2 and 4 octets, 3 has none (up to the end).
+    fn old(tag: u8, lt: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x80 | (tag << 2) | lt];
+        match lt {
+            0 => out.push(body.len() as u8),
+            1 => out.extend_from_slice(&(body.len() as u16).to_be_bytes()),
+            2 => out.extend_from_slice(&(body.len() as u32).to_be_bytes()),
+            _ => {}
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn file(name: &str) -> Vec<u8> {
+        std::fs::read(format!(
+            "{}/tests/fixtures/signature/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    fn texts(data: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, String> {
+        packets(data)
+            .map(|v| v.into_iter().map(|p| (p.tag, p.body)).collect())
+            .map_err(|e| e.0)
+    }
+
+    #[test]
+    fn packets_of_every_length_form() {
+        let body = vec![7u8; 300];
+        for lt in 0..3 {
+            let b = if lt == 0 { &body[..100] } else { &body[..] };
+            assert_eq!(texts(&old(6, lt, b)).unwrap(), [(6, b.to_vec())]);
+        }
+        // up to the end of the data
+        assert_eq!(texts(&old(11, 3, &body)).unwrap(), [(11, body.clone())]);
+        let mut two = old(6, 0, b"ab");
+        two.extend(old(13, 3, b"rest"));
+        assert_eq!(
+            texts(&two).unwrap(),
+            [(6, b"ab".to_vec()), (13, b"rest".to_vec())]
+        );
+        // new format: one octet up to 191, two octets from 192 to 8383,
+        // five octets for any
+        for (n, head) in [
+            (0, vec![0]),
+            (191, vec![191]),
+            (192, vec![192, 0]),
+            (8383, vec![223, 255]),
+        ] {
+            let mut p = vec![0xc0 | 6];
+            p.extend(head);
+            p.extend(vec![1u8; n]);
+            assert_eq!(texts(&p).unwrap(), [(6, vec![1u8; n])], "{n}");
+        }
+        assert_eq!(texts(&packet(6, &body)).unwrap(), [(6, body.clone())]);
+        // a five octet length of a short body is as good as a short one
+        assert_eq!(texts(&packet(6, b"")).unwrap(), [(6, vec![])]);
+    }
+
+    #[test]
+    fn partial_lengths_join_for_compressed_and_literal_data_only() {
+        // 2^1 and 2^2 octets, then a final length of 3
+        let mut p = vec![
+            0xc0 | TAG_LITERAL,
+            224 | 1,
+            1,
+            2,
+            224 | 2,
+            3,
+            4,
+            5,
+            6,
+            3,
+            7,
+            8,
+            9,
+        ];
+        assert_eq!(
+            texts(&p).unwrap(),
+            [(TAG_LITERAL, vec![1, 2, 3, 4, 5, 6, 7, 8, 9])]
+        );
+        p[0] = 0xc0 | TAG_COMPRESSED;
+        assert!(texts(&p).is_ok());
+        for tag in [TAG_SIGNATURE, TAG_PUBLIC_KEY, TAG_USER_ID, TAG_MARKER] {
+            p[0] = 0xc0 | tag;
+            assert_eq!(
+                texts(&p).unwrap_err(),
+                "a partial length for a packet that cannot have one"
+            );
+        }
+        // the partial lengths end only with another kind of length
+        let cut = [0xc0 | TAG_LITERAL, 224 | 1, 1, 2];
+        assert_eq!(texts(&cut).unwrap_err(), "truncated OpenPGP data");
+        // a partial piece longer than what is left
+        let lie = [0xc0 | TAG_LITERAL, 224 | 3, 1, 2];
+        assert_eq!(texts(&lie).unwrap_err(), "truncated OpenPGP data");
+        // the largest, 2^30, is a length like any other
+        let big = [0xc0 | TAG_LITERAL, 224 | 30, 1];
+        assert_eq!(texts(&big).unwrap_err(), "truncated OpenPGP data");
+        // old format has no partial lengths: the type 3 reads to the end
+        assert_eq!(
+            texts(&[0x80 | (TAG_LITERAL << 2) | 3, 0xe1, 1]).unwrap(),
+            [(TAG_LITERAL, vec![0xe1, 1])]
+        );
+    }
+
+    #[test]
+    fn zero_length_packets_and_the_empty_input() {
+        assert_eq!(texts(b"").unwrap(), []);
+        let mut all = old(2, 0, b"");
+        all.extend(old(2, 1, b""));
+        all.extend(old(2, 2, b""));
+        all.extend(old(2, 3, b""));
+        all.extend([0xc2, 0]);
+        // the type 3 packet takes what follows: it is the last
+        assert_eq!(texts(&all).unwrap().len(), 4);
+        let mut all = old(2, 0, b"");
+        all.extend(old(2, 1, b""));
+        all.extend(old(2, 2, b""));
+        all.extend([0xc2, 0]);
+        assert_eq!(texts(&all).unwrap(), vec![(2, vec![]); 4]);
+    }
+
+    #[test]
+    fn the_number_of_packets_is_bounded() {
+        let at_most: Vec<u8> = std::iter::repeat_n([0xc2, 0], MAX_PACKETS)
+            .flatten()
+            .collect();
+        assert_eq!(packets(&at_most).unwrap().len(), MAX_PACKETS);
+        let mut more = at_most.clone();
+        more.extend([0xc2, 0]);
+        assert_eq!(texts(&more).unwrap_err(), "too many OpenPGP packets");
+        // the one too many is refused before it is read
+        let mut more = at_most;
+        more.push(0x00);
+        assert_eq!(texts(&more).unwrap_err(), "too many OpenPGP packets");
+    }
+
+    #[test]
+    fn lengths_that_lie_and_bytes_that_are_no_packet() {
+        let t = "truncated OpenPGP data";
+        for (data, want) in [
+            (&[0x80 | (6 << 2)][..], t),
+            (&[0x80 | (6 << 2) | 1, 0], t),
+            (&[0x80 | (6 << 2) | 2, 0, 0, 0], t),
+            (&[0x80 | (6 << 2), 2, 1], t),
+            (&[0x80 | (6 << 2) | 2, 0xff, 0xff, 0xff, 0xff, 1], t),
+            (&[0xc6], t),
+            (&[0xc6, 2, 1], t),
+            (&[0xc6, 192], t),
+            (&[0xc6, 223, 255, 1], t),
+            (&[0xc6, 255, 0, 0, 0], t),
+            (&[0xc6, 255, 0, 0, 0, 2, 1], t),
+            (&[0xc6, 255, 0xff, 0xff, 0xff, 0xff, 1], t),
+            // no high bit: not a packet
+            (&[0x00], "not an OpenPGP packet"),
+            (&[0x7f, 0], "not an OpenPGP packet"),
+            // trailing garbage after good packets is refused, never ignored
+            (&[0xc6, 0, 0x00], "not an OpenPGP packet"),
+            (&[0xc6, 0, 0xc6], t),
+        ] {
+            assert_eq!(texts(data).unwrap_err(), want, "{data:02x?}");
+        }
+    }
+
+    #[test]
+    fn real_files_cut_at_every_byte() {
+        for name in [
+            "key-rsa.gpg",
+            "key-ed.gpg",
+            "key-ec.gpg",
+            "key-sub.gpg",
+            "key-old.gpg",
+            "msg-rsa.sig",
+            "msg-ed.sig",
+            "msg-ec.sig",
+            "msg-sub.sig",
+        ] {
+            let data = file(name);
+            let whole = texts(&data).unwrap();
+            for n in 0..data.len() {
+                // a cut is refused, or it falls between two packets and
+                // leaves the packets before it
+                if let Ok(part) = texts(&data[..n]) {
+                    // an old format packet of no length takes what is there
+                    let Some((last, init)) = part.split_last() else {
+                        continue;
+                    };
+                    assert!(whole.starts_with(init), "{name} cut at {n}");
+                    if let Some(w) = whole.get(init.len()) {
+                        assert!(w.0 == last.0 && w.1.starts_with(&last.1), "{name} {n}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The body of a signature packet by the Ed25519 key `key`: `data` is
+    /// what it hashes before the subpackets.
+    fn ed_signature(
+        key: &PKey<openssl::pkey::Private>,
+        sig_type: u8,
+        data: &[u8],
+        hashed: &[u8],
+    ) -> Vec<u8> {
+        let mut body = vec![4, sig_type, ALGO_ED25519, 8];
+        body.extend_from_slice(&(hashed.len() as u16).to_be_bytes());
+        body.extend_from_slice(hashed);
+        let mut h = openssl::hash::Hasher::new(MessageDigest::sha256()).unwrap();
+        h.update(data).unwrap();
+        h.update(&body).unwrap();
+        h.update(&[4, 0xff]).unwrap();
+        h.update(&(body.len() as u32).to_be_bytes()).unwrap();
+        let digest = h.finish().unwrap();
+        let sig = openssl::sign::Signer::new_without_digest(key)
+            .unwrap()
+            .sign_oneshot_to_vec(&digest)
+            .unwrap();
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&digest[..2]);
+        body.extend(sig);
+        body
+    }
+
+    /// A keyring of one Ed25519 key whose user ID is certified with the
+    /// key flags subpacket `flags` (none: no such subpacket), and a signed
+    /// message of `PAYLOAD` by it; `cert_extra` and `msg_extra` are more
+    /// hashed subpackets of the two signatures.
+    fn self_made(flags: Option<&[u8]>, cert_extra: &[u8], msg_extra: &[u8]) -> (Vec<Key>, Vec<u8>) {
+        let key = PKey::generate_ed25519().unwrap();
+        let created = (NOW - 1000) as u32;
+        let mut public = vec![4];
+        public.extend_from_slice(&created.to_be_bytes());
+        public.push(ALGO_ED25519);
+        public.extend(key.raw_public_key().unwrap());
+        let uid = b"a <a@example.com>";
+        let mut data = framed_key(&public).unwrap();
+        data.extend(framed_id(TAG_USER_ID, uid).unwrap());
+        let mut hashed = sp(2, &created.to_be_bytes());
+        if let Some(f) = flags {
+            hashed.extend(sp(27, f));
+        }
+        hashed.extend_from_slice(cert_extra);
+        let mut ring = packet(TAG_PUBLIC_KEY, &public);
+        ring.extend(packet(TAG_USER_ID, uid));
+        ring.extend(packet(
+            TAG_SIGNATURE,
+            &ed_signature(&key, 0x13, &data, &hashed),
+        ));
+        let mut hashed = sp(2, &(NOW as u32).to_be_bytes());
+        hashed.extend_from_slice(msg_extra);
+        let mut msg = literal(PAYLOAD);
+        msg.extend(packet(
+            TAG_SIGNATURE,
+            &ed_signature(&key, 0, PAYLOAD, &hashed),
+        ));
+        (parse_keyring(&ring).unwrap(), msg)
+    }
+
+    /// A keyring of an Ed25519 primary key that certifies and a signing
+    /// subkey, and a message signed by the subkey.  `primary_extra`,
+    /// `binding_extra` and `back_extra` are more hashed subpackets of the
+    /// self-signature, the binding and the back-signature.
+    fn with_subkey(
+        primary_extra: &[u8],
+        binding_extra: &[u8],
+        back_extra: &[u8],
+    ) -> (Vec<Key>, Vec<u8>) {
+        let created = (NOW - 1000) as u32;
+        let public = |key: &PKey<openssl::pkey::Private>| {
+            let mut p = vec![4];
+            p.extend_from_slice(&created.to_be_bytes());
+            p.push(ALGO_ED25519);
+            p.extend(key.raw_public_key().unwrap());
+            p
+        };
+        let (primary, subkey) = (
+            PKey::generate_ed25519().unwrap(),
+            PKey::generate_ed25519().unwrap(),
+        );
+        let (pub_primary, pub_sub) = (public(&primary), public(&subkey));
+        let uid = b"a <a@example.com>";
+        let mut uid_data = framed_key(&pub_primary).unwrap();
+        uid_data.extend(framed_id(TAG_USER_ID, uid).unwrap());
+        let mut hashed = sp(2, &created.to_be_bytes());
+        hashed.extend(sp(27, &[0x01]));
+        hashed.extend_from_slice(primary_extra);
+        let mut key_data = framed_key(&pub_primary).unwrap();
+        key_data.extend(framed_key(&pub_sub).unwrap());
+        let mut back_hashed = sp(2, &created.to_be_bytes());
+        back_hashed.extend_from_slice(back_extra);
+        let back = ed_signature(&subkey, 0x19, &key_data, &back_hashed);
+        let mut bind_hashed = sp(2, &created.to_be_bytes());
+        bind_hashed.extend(sp(27, &[0x02]));
+        bind_hashed.extend_from_slice(binding_extra);
+        let mut unhashed = vec![];
+        unhashed.extend(sp(32, &back));
+        let mut binding = ed_signature(&primary, 0x18, &key_data, &bind_hashed);
+        append_unhashed(&mut binding, &unhashed);
+        let mut ring = packet(TAG_PUBLIC_KEY, &pub_primary);
+        ring.extend(packet(TAG_USER_ID, uid));
+        ring.extend(packet(
+            TAG_SIGNATURE,
+            &ed_signature(&primary, 0x13, &uid_data, &hashed),
+        ));
+        ring.extend(packet(TAG_PUBLIC_SUBKEY, &pub_sub));
+        ring.extend(packet(TAG_SIGNATURE, &binding));
+        let mut msg = literal(PAYLOAD);
+        let hashed = sp(2, &(NOW as u32).to_be_bytes());
+        msg.extend(packet(
+            TAG_SIGNATURE,
+            &ed_signature(&subkey, 0, PAYLOAD, &hashed),
+        ));
+        (parse_keyring(&ring).unwrap(), msg)
+    }
+
+    /// A subpacket of a one octet length.
+    fn sp(kind: u8, value: &[u8]) -> Vec<u8> {
+        let mut out = vec![(value.len() + 1) as u8, kind];
+        out.extend_from_slice(value);
+        out
+    }
+
+    /// A notation subpacket: flags, the lengths of the name and the value,
+    /// then both.
+    fn notation(critical: bool, name: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x80, 0, 0, 0, 0, name.len() as u8, 0, value.len() as u8];
+        v.extend_from_slice(name);
+        v.extend_from_slice(value);
+        sp(if critical { 0x80 | 20 } else { 20 }, &v)
+    }
+
+    #[test]
+    fn a_critical_notation_refuses_the_signature_that_has_it() {
+        let critical = notation(true, b"hold@example.com", b"1");
+        let plain = notation(false, b"hold@example.com", b"1");
+        // a notation that is not critical is a note
+        let (k, msg) = self_made(None, &plain, &plain);
+        verify_message(&k, &msg, NOW).unwrap();
+        // in the message signature
+        let (k, msg) = self_made(None, &[], &critical);
+        let e = verify_message(&k, &msg, NOW).unwrap_err();
+        assert_eq!(e.0, "an unknown critical signature subpacket 20");
+        // in the self-signature of the key: it does not count, so the key
+        // has no valid self-signature and cannot sign
+        let (k, msg) = self_made(None, &critical, &[]);
+        let e = verify_message(&k, &msg, NOW).unwrap_err();
+        assert!(e.0.contains("is not for signing"), "{e}");
+        // in the unhashed part it is not the signer's: it counts for nothing
+        assert!(parse_signature(&sig_body(&[], &critical)).is_ok());
+        // in the binding of a subkey: the subkey is left out
+        let (k, _) = with_subkey(&[], &critical, &[]);
+        assert_eq!(k.len(), 1);
+        // in its back-signature: the subkey cannot sign
+        let (k, msg) = with_subkey(&[], &[], &critical);
+        assert_eq!(k.len(), 2);
+        let e = verify_message(&k, &msg, NOW).unwrap_err();
+        assert!(e.0.contains("is not for signing"), "{e}");
+        // without it the subkey signs
+        let (k, msg) = with_subkey(&[], &plain, &plain);
+        verify_message(&k, &msg, NOW).unwrap();
+    }
+
+    #[test]
+    fn what_the_key_flags_of_a_self_signature_allow() {
+        // no flags subpacket: the key may do what its algorithm does
+        for flags in [None, Some(&[0x03][..]), Some(&[0x02, 0xff])] {
+            let (k, msg) = self_made(flags, &[], &[]);
+            assert_eq!(k.len(), 1);
+            verify_message(&k, &msg, NOW).unwrap();
+        }
+        // flags that do not say signing, or say nothing at all
+        for flags in [&[0x01][..], &[0x00], &[]] {
+            let (k, msg) = self_made(Some(flags), &[], &[]);
+            let got = verify_message(&k, &msg, NOW);
+            let e = got.err().unwrap_or_else(|| panic!("{flags:02x?} signs"));
+            assert!(e.0.contains("is not for signing"), "{flags:02x?}: {e}");
+        }
+    }
+
+    /// The body of a v4 Ed25519 signature packet with these subpacket areas.
+    fn sig_body(hashed: &[u8], unhashed: &[u8]) -> Vec<u8> {
+        let mut body = vec![4, 0, ALGO_ED25519, 8];
+        body.extend_from_slice(&(hashed.len() as u16).to_be_bytes());
+        body.extend_from_slice(hashed);
+        body.extend_from_slice(&(unhashed.len() as u16).to_be_bytes());
+        body.extend_from_slice(unhashed);
+        body.extend_from_slice(&[0xab, 0xcd]);
+        body.extend(std::iter::repeat_n(0x11u8, 64));
+        body
+    }
+
+    fn sig_err(body: &[u8]) -> String {
+        parse_signature(body).err().expect("refused").0
+    }
+
+    /// The signature packets of a file, in order.
+    fn sig_bodies(name: &str) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for p in packets(&file(name)).unwrap() {
+            if p.tag == TAG_COMPRESSED {
+                // the signature of `msg-rsa.sig` is inside
+                let mut inner = Vec::new();
+                match p.body[0] {
+                    1 => flate2::read::DeflateDecoder::new(&p.body[1..]).read_to_end(&mut inner),
+                    _ => flate2::read::ZlibDecoder::new(&p.body[1..]).read_to_end(&mut inner),
+                }
+                .unwrap();
+                out.extend(
+                    packets(&inner)
+                        .unwrap()
+                        .into_iter()
+                        .filter(|p| p.tag == TAG_SIGNATURE)
+                        .map(|p| p.body),
+                );
+            } else if p.tag == TAG_SIGNATURE {
+                out.push(p.body);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_fields_of_real_signatures() {
+        for (name, algo) in [
+            ("msg-rsa.sig", ALGO_RSA),
+            ("msg-ed.sig", ALGO_EDDSA_LEGACY),
+            ("msg-ec.sig", ALGO_ECDSA),
+        ] {
+            let bodies = sig_bodies(name);
+            assert_eq!(bodies.len(), 1, "{name}");
+            let sig = parse_signature(&bodies[0]).unwrap();
+            assert_eq!((sig.sig_type, sig.algo, sig.hash), (0, algo, sig.hash));
+            assert!(sig.sub.created.is_some(), "{name}");
+            assert!(sig.sub.issuer.is_some() || sig.sub.issuer_fpr.is_some());
+            assert_eq!(sig.mpis.len(), if algo == ALGO_RSA { 1 } else { 2 });
+            let hashed_len = usize::from(u16::from_be_bytes([bodies[0][4], bodies[0][5]]));
+            assert_eq!(sig.trailer.len(), 6 + hashed_len + 6);
+            assert_eq!(sig.trailer[..6 + hashed_len], bodies[0][..6 + hashed_len]);
+            // every cut of the packet body is refused
+            for n in 0..bodies[0].len() {
+                assert!(parse_signature(&bodies[0][..n]).is_err(), "{name} {n}");
+            }
+        }
+        // a binding signature of a subkey carries the back-signature
+        let sigs = sig_bodies("key-sub.gpg");
+        let sub = sigs
+            .iter()
+            .map(|b| parse_signature(b).unwrap())
+            .find(|s| s.sig_type == 0x18)
+            .unwrap();
+        assert_eq!(sub.sub.key_flags.map(|f| f & 2), Some(2));
+        assert_eq!(sub.sub.embedded.len(), 1);
+    }
+
+    #[test]
+    fn creation_time_expiry_and_flags_are_of_the_hashed_part_only() {
+        let t = |v: u32| v.to_be_bytes();
+        let mut hashed = sp(2, &t(1000));
+        hashed.extend(sp(3, &t(50)));
+        hashed.extend(sp(9, &t(60)));
+        hashed.extend(sp(27, &[0x02]));
+        let sub = parse_signature(&sig_body(&hashed, b"")).unwrap().sub;
+        assert_eq!(
+            (sub.created, sub.expires, sub.key_expires, sub.key_flags),
+            (Some(1000), Some(50), Some(60), Some(2))
+        );
+        // the same in the unhashed part says nothing
+        let sub = parse_signature(&sig_body(b"", &hashed)).unwrap().sub;
+        assert_eq!(
+            (sub.created, sub.expires, sub.key_expires, sub.key_flags),
+            (None, None, None, None)
+        );
+        // and does not change what the hashed part says
+        let mut unhashed = sp(2, &t(1));
+        unhashed.extend(sp(3, &t(1)));
+        unhashed.extend(sp(9, &t(1)));
+        unhashed.extend(sp(27, &[0xff]));
+        let sub = parse_signature(&sig_body(&hashed, &unhashed)).unwrap().sub;
+        assert_eq!(
+            (sub.created, sub.expires, sub.key_expires, sub.key_flags),
+            (Some(1000), Some(50), Some(60), Some(2))
+        );
+        // a creation time in the unhashed part only: none
+        let sub = parse_signature(&sig_body(&sp(3, &t(5)), &sp(2, &t(1000))))
+            .unwrap()
+            .sub;
+        assert_eq!((sub.created, sub.expires), (None, Some(5)));
+    }
+
+    #[test]
+    fn a_duplicate_hashed_subpacket_is_taken_from_the_last() {
+        let t = |v: u32| v.to_be_bytes();
+        let mut hashed = sp(2, &t(1000));
+        hashed.extend(sp(2, &t(2000)));
+        hashed.extend(sp(27, &[0x02]));
+        // empty flags are flags of 0: they replace the ones before them
+        hashed.extend(sp(27, &[]));
+        let sub = parse_signature(&sig_body(&hashed, b"")).unwrap().sub;
+        assert_eq!((sub.created, sub.key_flags), (Some(2000), Some(0)));
+        // the first octet of the flags is the flags
+        let sub = parse_signature(&sig_body(&sp(27, &[0x02, 0xff]), b""))
+            .unwrap()
+            .sub;
+        assert_eq!(sub.key_flags, Some(2));
+    }
+
+    #[test]
+    fn a_time_subpacket_of_another_size_is_refused_in_the_hashed_part_only() {
+        for kind in [2, 3, 9] {
+            for value in [&[][..], &[1, 2, 3], &[1, 2, 3, 4, 5]] {
+                let bad = sp(kind, value);
+                assert_eq!(
+                    sig_err(&sig_body(&bad, b"")),
+                    "an invalid time subpacket",
+                    "{kind}"
+                );
+                assert!(parse_signature(&sig_body(b"", &bad)).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_critical_subpacket_refuses_the_signature_in_the_hashed_part() {
+        // 0, 1, 3 and 8 are not subpackets, 100 neither; a critical bit
+        // on those, and on the reserved and the unsupported ones
+        for kind in [0u8, 1, 6, 8, 13, 14, 15, 17, 18, 19, 24, 35, 100, 127] {
+            let critical = sp(0x80 | kind, &[1, 2]);
+            assert_eq!(
+                sig_err(&sig_body(&critical, b"")),
+                format!("an unknown critical signature subpacket {kind}"),
+                "{kind}"
+            );
+            // not critical: ignored
+            assert!(parse_signature(&sig_body(&sp(kind, &[1, 2]), b"")).is_ok());
+            // critical in the unhashed part: the signer did not say it
+            assert!(parse_signature(&sig_body(b"", &critical)).is_ok(), "{kind}");
+        }
+        // the ones that are known are accepted with the bit
+        for kind in [4u8, 5, 7, 11, 12, 21, 22, 23, 25, 26, 28, 29, 30, 31, 34] {
+            let known = sp(0x80 | kind, &[1, 2]);
+            assert!(parse_signature(&sig_body(&known, b"")).is_ok(), "{kind}");
+        }
+        // an unknown critical subpacket after good ones, and after a
+        // creation time
+        let mut hashed = sp(2, &1000u32.to_be_bytes());
+        hashed.extend(sp(0x80 | 100, &[]));
+        assert!(sig_err(&sig_body(&hashed, b"")).contains("critical"));
+        // the critical bit on what is read is no different
+        let mut hashed = sp(0x80 | 2, &1000u32.to_be_bytes());
+        hashed.extend(sp(0x80 | 16, &[1; 8]));
+        let sub = parse_signature(&sig_body(&hashed, b"")).unwrap().sub;
+        assert_eq!((sub.created, sub.issuer), (Some(1000), Some([1; 8])));
+    }
+
+    #[test]
+    fn the_issuer_is_taken_from_either_part_and_is_a_hint() {
+        let id = [1, 2, 3, 4, 5, 6, 7, 8];
+        let hashed = sp(16, &id);
+        let a = parse_signature(&sig_body(&hashed, b"")).unwrap().sub;
+        let b = parse_signature(&sig_body(b"", &hashed)).unwrap().sub;
+        assert_eq!((a.issuer, b.issuer), (Some(id), Some(id)));
+        // the last one wins, whichever part it is in
+        let c = parse_signature(&sig_body(&hashed, &sp(16, &[9; 8])))
+            .unwrap()
+            .sub;
+        assert_eq!(c.issuer, Some([9; 8]));
+        // a size that is not 8 is ignored
+        let d = parse_signature(&sig_body(&sp(16, &[1; 7]), b""))
+            .unwrap()
+            .sub;
+        assert_eq!(d.issuer, None);
+        // the fingerprint: version 4 and then any octets
+        let mut fpr = vec![4];
+        fpr.extend([0xaa; 20]);
+        for (value, want) in [
+            (&fpr[..], Some(fpr[1..].to_vec())),
+            (&[4][..], Some(vec![])),
+            (&[5, 1][..], None),
+            (&[][..], None),
+        ] {
+            let s = parse_signature(&sig_body(b"", &sp(33, value))).unwrap().sub;
+            assert_eq!(s.issuer_fpr, want);
+        }
+        // embedded signatures: of either part
+        let s = parse_signature(&sig_body(&sp(32, &[1, 2]), &sp(32, &[3])))
+            .unwrap()
+            .sub;
+        assert_eq!(s.embedded, [vec![1, 2], vec![3]]);
+    }
+
+    #[test]
+    fn subpacket_lengths_of_every_form_and_lies() {
+        // two octets: 192 bytes, the kind and 191 of value
+        let mut long = vec![192, 0, 0x80 | 26];
+        long.extend(vec![0u8; 191]);
+        assert!(parse_signature(&sig_body(&long, b"")).is_ok());
+        // five octets, even for a short one
+        let five = [255, 0, 0, 0, 2, 26, 0];
+        assert!(parse_signature(&sig_body(&five, b"")).is_ok());
+        let five_time = [255, 0, 0, 0, 5, 2, 0, 0, 3, 232];
+        let sub = parse_signature(&sig_body(&five_time, b"")).unwrap().sub;
+        assert_eq!(sub.created, Some(1000));
+        // a length of zero
+        for a in [vec![0u8], sp(2, &[0; 4]).into_iter().chain([0]).collect()] {
+            assert_eq!(sig_err(&sig_body(&a, b"")), "an empty signature subpacket");
+            assert_eq!(sig_err(&sig_body(b"", &a)), "an empty signature subpacket");
+        }
+        // a length past the area, even when the signature has the bytes
+        for lie in [
+            vec![5, 26, 0],
+            vec![2],
+            vec![192],
+            vec![192, 0, 26],
+            vec![255, 0, 0, 0],
+            vec![255, 0, 0, 0, 9, 26],
+            vec![255, 255, 255, 255, 255, 26],
+        ] {
+            assert_eq!(sig_err(&sig_body(&lie, b"")), "truncated OpenPGP data");
+            assert_eq!(sig_err(&sig_body(b"", &lie)), "truncated OpenPGP data");
+        }
+        // the bytes after the area are the signature's, not the area's
+        let mut body = sig_body(&[1, 26], b"");
+        assert!(parse_signature(&body).is_ok());
+        body[5] = 1;
+        assert_eq!(sig_err(&body), "truncated OpenPGP data");
+    }
+
+    #[test]
+    fn the_areas_and_the_values_of_a_signature_are_bounded() {
+        let body = sig_body(&sp(2, &[0; 4]), &sp(26, &[1]));
+        // every cut
+        for n in 0..body.len() {
+            assert!(parse_signature(&body[..n]).is_err(), "{n}");
+        }
+        // bytes after the signature value are not looked at
+        let mut more = body.clone();
+        more.extend([1, 2, 3]);
+        assert!(parse_signature(&more).is_ok());
+        // an area longer than the packet
+        let mut lie = body.clone();
+        lie[4] = 0xff;
+        lie[5] = 0xff;
+        assert_eq!(sig_err(&lie), "truncated OpenPGP data");
+        // the algorithm decides the values: RSA has one, DSA two
+        let rsa = |algo: u8, mpis: &[&[u8]]| {
+            let mut b = vec![4, 0, algo, 8, 0, 0, 0, 0, 0xab, 0xcd];
+            for m in mpis {
+                b.extend_from_slice(&((m.len() * 8) as u16).to_be_bytes());
+                b.extend_from_slice(m);
+            }
+            b
+        };
+        assert_eq!(
+            parse_signature(&rsa(1, &[&[7; 4]])).unwrap().mpis,
+            [vec![7; 4]]
+        );
+        assert_eq!(parse_signature(&rsa(3, &[&[7; 4]])).unwrap().mpis.len(), 1);
+        for algo in [17, 19, 22] {
+            let two = parse_signature(&rsa(algo, &[&[1; 2], &[2; 3]])).unwrap();
+            assert_eq!(two.mpis, [vec![1; 2], vec![2; 3]]);
+            assert_eq!(sig_err(&rsa(algo, &[&[1; 2]])), "truncated OpenPGP data");
+        }
+        // the bit count rounds up, and the leading bits are not checked
+        let mut odd = rsa(1, &[]);
+        odd.extend([0, 9, 0xff, 0xff]);
+        assert_eq!(parse_signature(&odd).unwrap().mpis, [vec![0xff, 0xff]]);
+        let mut zero = rsa(1, &[]);
+        zero.extend([0, 0]);
+        assert_eq!(parse_signature(&zero).unwrap().mpis, [Vec::<u8>::new()]);
+        let mut short = rsa(1, &[]);
+        short.extend([0xff, 0xff, 1]);
+        assert_eq!(sig_err(&short), "truncated OpenPGP data");
+        for algo in [0u8, 2, 16, 18, 20, 21, 23, 28, 255] {
+            assert_eq!(
+                sig_err(&rsa(algo, &[&[1]])),
+                format!("unsupported signature algorithm {algo}")
+            );
+        }
+    }
+
+    #[test]
+    fn signatures_of_other_versions_are_refused() {
+        let mut body = sig_body(&sp(2, &[0; 4]), b"");
+        for v in [0u8, 1, 2, 3, 5, 6, 255] {
+            body[0] = v;
+            assert_eq!(
+                sig_err(&body),
+                format!("version {v} signatures are not supported")
+            );
+        }
+        // a v3 packet: version, length 5, type, time, issuer, algorithm,
+        // hash, left 16 bits, the value
+        let mut v3 = vec![
+            3, 5, 0, 0, 0, 0, 1, 1, 2, 3, 4, 5, 6, 7, 8, 1, 8, 0xab, 0xcd,
+        ];
+        v3.extend([0, 8, 0xff]);
+        assert_eq!(sig_err(&v3), "version 3 signatures are not supported");
+        assert_eq!(sig_err(&[]), "truncated OpenPGP data");
+        assert_eq!(sig_err(&[4]), "truncated OpenPGP data");
+        // what a keyring says of the type of one that does not parse
+        assert_eq!(signature_type(&v3), Some(0));
+        assert_eq!(signature_type(&[4, 0x18]), Some(0x18));
+        assert_eq!(signature_type(&[3]), None);
+        assert_eq!(signature_type(&[]), None);
+    }
+
+    /// The message `msg-ed.sig` with `edit` applied to the body of its
+    /// signature packet.
+    fn edited_message(edit: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
+        let data = fixture!("msg-ed.sig");
+        let mut out = Vec::new();
+        for mut p in packets(data).unwrap() {
+            if p.tag == TAG_SIGNATURE {
+                edit(&mut p.body);
+            }
+            out.extend(packet(p.tag, &p.body));
+        }
+        out
+    }
+
+    /// The signature body with `extra` after its unhashed subpackets.
+    fn append_unhashed(body: &mut Vec<u8>, extra: &[u8]) {
+        let hashed = usize::from(u16::from_be_bytes([body[4], body[5]]));
+        let at = 6 + hashed;
+        let unhashed = u16::from_be_bytes([body[at], body[at + 1]]);
+        let end = at + 2 + usize::from(unhashed);
+        body.splice(end..end, extra.iter().copied());
+        let new = unhashed + extra.len() as u16;
+        body[at..at + 2].copy_from_slice(&new.to_be_bytes());
+    }
+
+    #[test]
+    fn what_is_appended_to_the_unhashed_part_of_a_valid_signature() {
+        let k = keys(fixture!("key-ed.gpg"));
+        let plain = edited_message(|_| {});
+        verify_message(&k, &plain, NOW).unwrap();
+        // a creation time before the key, an expiry in the past, another
+        // issuer, flags: none of them is the signer's
+        let mut extra = sp(2, &1u32.to_be_bytes());
+        extra.extend(sp(3, &1u32.to_be_bytes()));
+        extra.extend(sp(9, &1u32.to_be_bytes()));
+        extra.extend(sp(27, &[0]));
+        extra.extend(sp(16, &[9; 8]));
+        extra.extend(sp(0x80 | 100, &[1]));
+        let msg = edited_message(|b| append_unhashed(b, &extra));
+        let (content, by) = verify_message(&k, &msg, NOW).unwrap();
+        assert_eq!(content, PAYLOAD);
+        assert_eq!(by.fingerprint, k[0].fingerprint);
+        // anything in the hashed part is not what was signed
+        let msg = edited_message(|b| {
+            let hashed = usize::from(u16::from_be_bytes([b[4], b[5]]));
+            b.splice(6 + hashed..6 + hashed, sp(26, &[1]));
+            let new = (hashed + 3) as u16;
+            b[4..6].copy_from_slice(&new.to_be_bytes());
+        });
+        let e = verify_message(&k, &msg, NOW).unwrap_err();
+        assert!(e.0.contains("no trusted key"), "{e}");
+        // an unknown critical subpacket there refuses it before that
+        let msg = edited_message(|b| {
+            let hashed = usize::from(u16::from_be_bytes([b[4], b[5]]));
+            b.splice(6 + hashed..6 + hashed, sp(0x80 | 100, &[1]));
+            let new = (hashed + 3) as u16;
+            b[4..6].copy_from_slice(&new.to_be_bytes());
+        });
+        let e = verify_message(&k, &msg, NOW).unwrap_err();
+        assert_eq!(e.0, "an unknown critical signature subpacket 100");
+    }
+
+    #[test]
+    fn a_signature_without_a_hashed_creation_time_is_not_used() {
+        let k = keys(fixture!("key-ed.gpg"));
+        // the creation time only where the signer did not say it
+        let body = sig_body(&sp(16, &[1; 8]), &sp(2, &(NOW as u32).to_be_bytes()));
+        let mut msg = literal(PAYLOAD);
+        msg.extend(packet(TAG_SIGNATURE, &body));
+        let e = verify_message(&k, &msg, NOW).unwrap_err();
+        assert_eq!(e.0, "a signature without its creation time");
+    }
+
+    #[test]
+    fn the_signed_message_is_read_with_its_limits() {
+        let k = keys(fixture!("key-ed.gpg"));
+        // more packets than a message has
+        let many: Vec<u8> = std::iter::repeat_n(old(TAG_ONE_PASS, 0, b""), 65)
+            .flatten()
+            .collect();
+        let e = verify_message(&k, &many, NOW).unwrap_err();
+        assert_eq!(e.0, "a signed message with too many packets");
+        let e = verify_message(&k, &old(TAG_ONE_PASS, 0, b""), NOW).unwrap_err();
+        assert_eq!(e.0, "the signature has no signed content");
+        let mut m = literal(b"x");
+        m.extend(literal(b"y"));
+        let e = verify_message(&k, &m, NOW).unwrap_err();
+        assert_eq!(e.0, "a message with two literal data packets");
+        let e = verify_message(&k, &literal(b"x"), NOW).unwrap_err();
+        assert_eq!(e.0, "the message is not signed");
+        let mut m = literal(b"x");
+        m.extend(packet(TAG_SIGNATURE, &[3, 5]));
+        let e = verify_message(&k, &m, NOW).unwrap_err();
+        assert_eq!(e.0, "version 3 signatures are not supported");
+        // trailing garbage after the signature
+        let mut m = fixture!("msg-ed.sig").to_vec();
+        m.push(0);
+        let e = verify_message(&k, &m, NOW).unwrap_err();
+        assert_eq!(e.0, "not an OpenPGP packet");
+        // a literal packet whose header is cut
+        for body in [&[][..], b"b", &[b'b', 5, 1], &[b'b', 0, 1, 2, 3]] {
+            let e = verify_message(&k, &packet(TAG_LITERAL, body), NOW).unwrap_err();
+            assert_eq!(e.0, "truncated OpenPGP data");
         }
     }
 }

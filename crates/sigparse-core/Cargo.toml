@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-sigparse-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The reading of untrusted signatures: OpenPGP packets, the fields and subpackets of a signature packet, and DER lengths"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on byte slices: no dependency, no I/O, no cryptography.
+# The shell that checks the signatures with OpenSSL and decides which key
+# may make them is `velarx-signature`.
+
+[lib]
+name = "velarx_sigparse_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

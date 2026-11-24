@@ -5452,9 +5452,14 @@ dependencies = [
  "tracing",
  "velarx-base",
  "velarx-policy-core",
+ "velarx-sigparse-core",
  "yaml-rust2",
  "zeroize",
 ]
+
+[[package]]
+name = "velarx-sigparse-core"
+version = "0.1.0"
 
 [[package]]
 name = "velarx-storage"

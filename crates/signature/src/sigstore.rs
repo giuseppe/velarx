@@ -16,6 +16,7 @@ use openssl::stack::Stack;
 use openssl::x509::store::X509StoreBuilder;
 use openssl::x509::{X509StoreContext, X509VerifyResult, X509};
 use std::collections::BTreeMap;
+use velarx_sigparse_core as sigparse;
 
 pub const SIGNATURE_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
 pub const CERTIFICATE_ANNOTATION: &str = "dev.sigstore.cosign/certificate";
@@ -596,40 +597,19 @@ const OID_ANY_EKU: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
 /// The tag, the content and the rest of the DER element at the start of
 /// `data`.
 fn der(data: &[u8]) -> Result<(u8, &[u8], &[u8]), Error> {
-    let bad = || Error("invalid DER in the certificate".into());
-    let (&tag, rest) = data.split_first().ok_or_else(bad)?;
-    let (&l, rest) = rest.split_first().ok_or_else(bad)?;
-    let (len, rest) = if l < 0x80 {
-        (usize::from(l), rest)
-    } else {
-        let n = usize::from(l & 0x7f);
-        if n == 0 || n > 4 || rest.len() < n {
-            return Err(bad());
-        }
-        let len = rest[..n]
-            .iter()
-            .fold(0usize, |a, b| (a << 8) | usize::from(*b));
-        (len, &rest[n..])
-    };
-    if rest.len() < len {
-        return Err(bad());
-    }
-    Ok((tag, &rest[..len], &rest[len..]))
+    let (tag, content) =
+        sigparse::der::element(data).map_err(|_| Error("invalid DER in the certificate".into()))?;
+    Ok((tag, content.of(data), &data[content.end()..]))
 }
 
 /// The contents of the elements of a DER SEQUENCE.
 fn der_sequence_items(data: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
-    let (tag, mut content, _) = der(data)?;
-    if tag != 0x30 {
-        return err("invalid DER sequence");
+    use sigparse::der::DerError;
+    match sigparse::der::sequence_items(data) {
+        Ok(items) => Ok(items.iter().map(|i| i.of(data).to_vec()).collect()),
+        Err(DerError::NotSequence) => err("invalid DER sequence"),
+        Err(_) => err("invalid DER in the certificate"),
     }
-    let mut out = Vec::new();
-    while !content.is_empty() {
-        let (_, item, rest) = der(content)?;
-        out.push(item.to_vec());
-        content = rest;
-    }
-    Ok(out)
 }
 
 /// An extension of a certificate: its OID, whether it is critical, its
@@ -1362,5 +1342,148 @@ pub(crate) mod tests {
         for n in 0..der.len() {
             let _ = extensions(&der[..n]);
         }
+    }
+
+    // The DER of certificates, pinned as it is read.
+
+    fn der_err(data: &[u8]) -> String {
+        der(data).expect_err("refused").0
+    }
+
+    #[test]
+    fn der_lengths_of_every_form() {
+        // the short form, up to 127
+        assert_eq!(der(&[4, 2, 7, 8, 9]).unwrap(), (4, &[7, 8][..], &[9][..]));
+        assert_eq!(der(&[4, 0]).unwrap(), (4, &[][..], &[][..]));
+        let mut long = vec![4, 127];
+        long.extend([1u8; 127]);
+        assert_eq!(der(&long).unwrap().1.len(), 127);
+        // the long form of 1 to 4 octets
+        for (head, n) in [
+            (vec![0x81, 200], 200),
+            (vec![0x82, 1, 0], 256),
+            (vec![0x83, 0, 1, 0], 256),
+            (vec![0x84, 0, 0, 1, 0], 256),
+        ] {
+            let mut d = vec![4];
+            d.extend(head);
+            d.extend(vec![1u8; n]);
+            d.push(9);
+            assert_eq!(der(&d).unwrap().1.len(), n);
+            assert_eq!(der(&d).unwrap().2, [9]);
+        }
+        // not minimal, and accepted: a long form of a short length, and
+        // leading zeros
+        assert_eq!(der(&[4, 0x81, 2, 7, 8]).unwrap().1, [7, 8]);
+        assert_eq!(der(&[4, 0x82, 0, 2, 7, 8]).unwrap().1, [7, 8]);
+        assert_eq!(der(&[4, 0x84, 0, 0, 0, 2, 7, 8]).unwrap().1, [7, 8]);
+        assert_eq!(der(&[4, 0x81, 0]).unwrap().1, [] as [u8; 0]);
+        // the tag is one octet, whatever it is
+        assert_eq!(der(&[0x1f, 1, 7]).unwrap(), (0x1f, &[7][..], &[][..]));
+        assert_eq!(der(&[0xff, 1, 7]).unwrap().0, 0xff);
+    }
+
+    #[test]
+    fn der_lengths_that_are_refused() {
+        let bad = "invalid DER in the certificate";
+        for d in [
+            &[][..],
+            &[4],
+            // indefinite
+            &[0x30, 0x80, 4, 1, 7, 0, 0],
+            &[0x30, 0x80],
+            // more octets of length than 4, with leading zeros too
+            &[4, 0x85, 0, 0, 0, 0, 1, 7],
+            &[4, 0xff, 1],
+            &[4, 0x88, 0, 0, 0, 0, 0, 0, 0, 1, 7],
+            // octets of length that are not there
+            &[4, 0x81],
+            &[4, 0x84, 0, 0, 1],
+            // a length past the data
+            &[4, 1],
+            &[4, 2, 7],
+            &[4, 0x81, 200, 1],
+            &[4, 0x84, 0xff, 0xff, 0xff, 0xff, 1],
+        ] {
+            assert_eq!(der_err(d), bad, "{d:02x?}");
+        }
+        // every cut of a longer element is refused
+        let mut d = vec![0x30, 0x82, 1, 0];
+        d.extend(vec![4u8; 256]);
+        for n in 0..d.len() {
+            assert!(der(&d[..n]).is_err(), "{n}");
+        }
+        assert!(der(&d).is_ok());
+    }
+
+    #[test]
+    fn der_sequences() {
+        // the contents of the elements; their tags are not looked at
+        let seq = [0x30, 9, 6, 2, 1, 2, 4, 1, 9, 5, 0];
+        assert_eq!(
+            der_sequence_items(&seq).unwrap(),
+            [vec![1, 2], vec![9], vec![]]
+        );
+        assert_eq!(
+            der_sequence_items(&[0x30, 0]).unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        // what follows the sequence is not looked at
+        assert_eq!(
+            der_sequence_items(&[0x30, 2, 4, 0, 0xff, 0xff]).unwrap(),
+            [Vec::<u8>::new()]
+        );
+        // long forms and non minimal ones are read in an item too
+        assert_eq!(
+            der_sequence_items(&[0x30, 0x82, 0, 5, 4, 0x81, 2, 7, 8]).unwrap(),
+            [vec![7, 8]]
+        );
+        // another tag
+        for tag in [0x31, 0x04, 0xa0, 0x00, 0x10] {
+            assert_eq!(
+                der_sequence_items(&[tag, 0]).err().unwrap().0,
+                "invalid DER sequence"
+            );
+        }
+        // an item that runs past the sequence, though the data has it
+        assert_eq!(
+            der_sequence_items(&[0x30, 2, 4, 3, 1, 2, 3])
+                .err()
+                .unwrap()
+                .0,
+            "invalid DER in the certificate"
+        );
+        // an item with an indefinite length
+        assert!(der_sequence_items(&[0x30, 3, 4, 0x80, 0]).is_err());
+        assert!(der_sequence_items(&[0x30, 5, 4, 1, 1]).is_err());
+        assert!(der_sequence_items(&[]).is_err());
+        // a sequence that is longer than its data
+        assert!(der_sequence_items(&[0x30, 4, 4, 0]).is_err());
+    }
+
+    #[test]
+    fn extensions_of_a_certificate_that_is_cut_or_changed() {
+        let ca_key = ec_key();
+        let ca_cert = ca(&ca_key);
+        let cert = leaf(&ca_key, &ca_cert, &ec_key(), "a@b", Some("https://x"), true);
+        let der = cert.to_der().unwrap();
+        let all = extensions(&der).unwrap();
+        assert!(all.iter().any(|(oid, _, _)| oid == OID_EKU), "{all:02x?}");
+        // the data after the certificate is not looked at
+        let mut more = der.clone();
+        more.extend([1, 2, 3]);
+        assert_eq!(extensions(&more).unwrap(), all);
+        // a cut anywhere is refused: the lengths of the outer elements
+        // run past the data
+        for n in 0..der.len() {
+            assert!(extensions(&der[..n]).is_err(), "{n}");
+        }
+        // an indefinite length in the outer element
+        let mut open = der.clone();
+        open[1] = 0x80;
+        assert!(extensions(&open).is_err());
+        // a certificate without extensions has none
+        assert!(extensions(&[0x30, 2, 0x30, 0]).unwrap().is_empty());
+        assert!(extensions(&[0x30, 0]).is_err());
     }
 }

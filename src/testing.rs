@@ -323,7 +323,7 @@ mod tests {
 
     /// The lines that may hold them: interoperability with other tools or
     /// systems (file, text of the line, why).
-    const ALLOWED: [(&str, &str, &str); 6] = [
+    const ALLOWED: [(&str, &str, &str); 9] = [
         (
             "src/cli/layout.rs",
             "\"migrate\"",
@@ -348,6 +348,21 @@ mod tests {
             "crates/signature/src/openpgp.rs",
             "// old format",
             "RFC 4880 old-format packet headers of the keys of gpg",
+        ),
+        (
+            "crates/signature/src/openpgp.rs",
+            "old format packet",
+            "RFC 4880 old-format packets, the tests build them",
+        ),
+        (
+            "crates/sigparse-core/src/packet.rs",
+            "old format",
+            "RFC 4880 old-format packet headers of the signatures of gpg",
+        ),
+        (
+            "crates/sigparse-core/src/sig.rs",
+            "LEGACY",
+            "OpenPGP's legacy EdDSA (algorithm 22) of the ed25519 signatures of gpg",
         ),
         (
             "crates/proto/src/request.rs",

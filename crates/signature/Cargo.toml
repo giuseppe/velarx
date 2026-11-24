@@ -21,6 +21,7 @@ doctest = false
 [dependencies]
 velarx-base = { path = "../base" }
 velarx-policy-core = { path = "../policy-core" }
+velarx-sigparse-core = { path = "../sigparse-core" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
