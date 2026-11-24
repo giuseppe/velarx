@@ -1,0 +1,153 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Translates a crate to Lean (Charon, then Aeneas) and checks its proofs
+# in a container.  On demand only: no build, test or CI job runs it.
+# Needs velarx (or podman, see RUNTIME) and the network (the first run
+# builds the image and downloads Mathlib, ~7 GB of cache per crate).
+#
+#   tools/verify/run CRATE
+#
+# The crates it supports are the directories of tools/verify/.  Each
+# has its Lean proofs in lean/, with lean/Models.lean (if it needs any),
+# the functions of the standard library written by hand (every other one
+# Aeneas has no model of is an axiom nothing is known of), and, optionally, the
+# Charon and Aeneas options of the crate in options.  The run ends on
+# lean/Theorems.lean, which names what is proved: a line `#proved T` for
+# each claim of the Spec.lean of the crate (Proved.lean; ProvedTest.lean
+# checks its refusals first).  For each theorem it prints the claim it
+# proves and what it rests on, and fails on a sorry or an axiom of the
+# proofs.  Then Lean reads `#all_claims_proved` after Theorems.lean (in
+# AllClaims.lean, which the run writes): it lists the claims from what
+# Spec.lean declares, fails unless each is proved, and prints the line
+# "all N claims of M.Spec are proved" (M: the directory of Spec.lean)
+# the run ends on.  A warning
+# "declaration uses `sorry`" is an error anywhere in the Lean of the crate.
+# Ok.lean, the notion "if it returns" that the proofs of the crates that
+# need it are written in, is shared.  The versions of the tools are in
+# pins.
+#
+# The source is mounted read-only.  What is generated (the Lean of the
+# crate, the axioms, the versions lake locks) is in
+# $VERIFY_CACHE/CRATE/work, not in the tree; the run ends by printing where
+# (Extracted/Funs.lean has the functions as Lean sees them, Types.lean the types).
+#
+# VERIFY_CACHE: Mathlib, cargo and the generated files
+#               (default: $XDG_CACHE_HOME/velarx-verify)
+# RUNTIME: the engine that builds the image and runs the container,
+#          with its options: velarx (the default) or a command that
+#          takes the same arguments (e.g. "podman --root DIR")
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+top=$(cd "$here/../.." && pwd)
+runtime=${RUNTIME:-velarx}
+cache=${VERIFY_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/velarx-verify}
+crate=${1:-}
+if [ -z "$crate" ] || [ ! -d "$here/$crate/lean" ]; then
+    [ -z "$crate" ] || echo "verify: unsupported crate: $crate" >&2
+    echo "supported crates:" >&2
+    for d in "$here"/*/; do [ ! -d "$d" ] || basename "$d"; done >&2
+    exit 1
+fi
+lean=$here/$crate/lean
+# one Spec.lean (its module has the claims); nothing of the harness or of
+# what the run generates is shipped by the crate; and none of the ways
+# around the kernel or the warning of a sorry is written
+specs=$(cd "$lean" && find . -name Spec.lean)
+if [ "$(wc -l <<<"$specs")" != 1 ] || [[ $specs != ./*/Spec.lean ]] ||
+   [[ $specs == ./*/*/* ]]; then
+    echo "verify: $crate needs one lean/*/Spec.lean, not:" $specs >&2
+    exit 1
+fi
+spec=$(basename "$(dirname "$specs")").Spec
+for f in Proved.lean ProvedTest.lean ProvedTest Ok.lean AllClaims.lean Extracted; do
+    if [ -e "$lean/$f" ]; then
+        echo "verify: $crate ships lean/$f, which the run writes" >&2
+        exit 1
+    fi
+done
+if grep -rnE 'debug\.skipKernelTC|addDeclWithoutChecking|addDeclCore|warn\.sorry' \
+        --include='*.lean' "$lean" >&2; then
+    echo "verify: $crate goes around the kernel or hides a sorry (above)" >&2
+    exit 1
+fi
+CHARON_FLAGS= AENEAS_FLAGS=
+[ ! -f "$here/$crate/options" ] || . "$here/$crate/options"
+. "$here/pins"
+image=localhost/velarx-verify:$(cat "$here/Containerfile" "$here/pins" | sha256sum | cut -c1-12)
+
+if ! $runtime image exists "$image"; then
+    $runtime image build -t "$image" -f "$here/Containerfile" \
+        --build-arg CHARON=$CHARON --build-arg AENEAS=$AENEAS \
+        --build-arg RUST=$RUST --build-arg LEAN=$LEAN "$here"
+fi
+cache=$cache/$crate
+mkdir -p "$cache"/{work,xdg,cargo,target}
+
+status=0
+$runtime container run --rm --userns=keep-id --security-opt label=disable \
+    -v "$top:/src:ro" -v "$cache/work:/work" -v "$cache/xdg:/xdg" \
+    -v "$cache/cargo:/cargo" -v "$cache/target:/target" \
+    -e XDG_CACHE_HOME=/xdg -e CHARON_CACHE_DIR=/xdg/charon \
+    -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target \
+    -e CRATE=$crate -e SPEC=$spec -e AENEAS=$AENEAS -e LEAN=$LEAN \
+    -e CHARON_FLAGS="$CHARON_FLAGS" -e AENEAS_FLAGS="$AENEAS_FLAGS" \
+    -w /src/crates/$crate "$image" bash -euc '
+        charon cargo --preset=aeneas $CHARON_FLAGS --dest-file /target/$CRATE.llbc
+        # (.lake, the built Mathlib, stays)
+        find /work -mindepth 1 -maxdepth 1 ! -name .lake -exec rm -rf {} +
+        # (the files of the harness last)
+        cp -r /src/tools/verify/$CRATE/lean/. /work
+        cp -r /src/tools/verify/Proved.lean /src/tools/verify/ProvedTest.lean \
+            /src/tools/verify/ProvedTest /src/tools/verify/Ok.lean /work
+        cd /work
+        # (a warning of a sorry is an error in every module of the crate)
+        sed -e "s/@AENEAS@/$AENEAS/" \
+            -e "s/^package .*/& where\n  moreLeanArgs := #[\"-E\", \"hasSorry\"]/" \
+            lakefile.lean.in > lakefile.lean
+        grep -q moreLeanArgs lakefile.lean ||
+            { echo "verify: lakefile.lean.in has no line package" >&2; exit 1; }
+        echo "$LEAN" > lean-toolchain
+        rm -rf Extracted
+        aeneas -backend lean -split-files $AENEAS_FLAGS \
+            -abort-on-error -no-progress-bar \
+            -dest . -subdir Extracted /target/$CRATE.llbc
+        cd Extracted
+        # (a crate that uses no type of the library has no template)
+        [ ! -f TypesExternal_Template.lean ] || mv TypesExternal_Template.lean TypesExternal.lean
+        if [ -f FunsExternal_Template.lean ]; then
+            awk -f /src/tools/verify/externals.awk ../Models.lean \
+                FunsExternal_Template.lean > FunsExternal.lean
+            rm FunsExternal_Template.lean
+        fi
+        cd ..
+        # (with no manifest, lake takes the versions Aeneas locks, and
+        # Mathlib downloads what is built of it)
+        lake build
+        # (Theorems.lean, ProvedTest/*.lean are modules others import)
+        lib=.lake/build/lib/lean
+        mkdir -p $lib/ProvedTest
+        for m in Spec Fake; do
+            lake env lean -o $lib/ProvedTest/$m.olean ProvedTest/$m.lean
+        done
+        lake env lean ProvedTest.lean
+        rm -f $lib/Theorems.olean
+        lake env lean -E hasSorry -o $lib/Theorems.olean Theorems.lean
+        printf "import Theorems\n#all_claims_proved %s\n" $SPEC > AllClaims.lean
+        lake env lean -E hasSorry AllClaims.lean > allclaims.out ||
+            { cat allclaims.out; exit 1; }
+    ' || status=$?
+# Lean read #all_claims_proved to its end: its line is the last one
+if [ $status = 0 ]; then
+    last=$(tail -n 1 "$cache/work/allclaims.out")
+    if [[ $last =~ ^all\ [0-9]+\ claims\ of\ ${spec/./\\.}\ are\ proved$ ]]; then
+        echo "$last"
+    else
+        cat "$cache/work/allclaims.out" >&2
+        echo "verify: the claims of $spec are not all proved" >&2
+        status=1
+    fi
+fi
+# where to read what Lean sees of the crate (Funs.lean has `step`)
+echo "verify: the Lean of $crate is in $cache/work/Extracted" >&2
+exit $status

@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+# The toolchains of tools/verify/run: Charon (Rust to LLBC),
+# Aeneas (LLBC to Lean) and Lean.  Mathlib and the Lean library of
+# Aeneas are built in a cache the script mounts, not in the image.
+FROM registry.fedoraproject.org/fedora:43
+
+RUN dnf -y install --setopt=install_weak_deps=False \
+        gcc gcc-c++ make git curl patch unzip m4 diffutils which \
+        pkgconf-pkg-config gmp-devel opam bubblewrap rsync xz \
+    && dnf clean all
+
+# The versions are in ./pins
+ARG CHARON
+ARG AENEAS
+ARG RUST
+ARG LEAN
+
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo \
+    OPAMROOT=/opt/opam ELAN_HOME=/opt/elan \
+    RUSTUP_TOOLCHAIN=$RUST
+ENV PATH=/opt/cargo/bin:/opt/elan/bin:$PATH
+
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path \
+        --profile minimal --default-toolchain none \
+    && rustup toolchain install $RUST --profile minimal \
+        -c rustc-dev -c llvm-tools -c rust-src -c miri
+
+RUN opam init -y --disable-sandboxing --bare \
+    && opam switch create -y 5.3.0 \
+    && opam install -y -j8 dune calendar domainslib easy_logging logs \
+        menhir ocamlgraph ppx_deriving ppx_deriving_yojson \
+        ppx_deriving_hash ppxlib progress unionFind visitors yojson zarith \
+    && opam clean -a -c -s --logs
+
+RUN git clone https://github.com/AeneasVerif/aeneas /opt/aeneas \
+    && git -C /opt/aeneas checkout -q $AENEAS \
+    && test "$(tail -1 /opt/aeneas/charon-pin)" = $CHARON \
+    && git clone https://github.com/AeneasVerif/charon /opt/aeneas/charon \
+    && cd /opt/aeneas/charon && git checkout -q $CHARON \
+    && grep -q "\"$RUST\"" charon/rust-toolchain \
+    && git submodule update --init --recursive \
+    && cd charon && cargo build --release -j8 \
+    && mkdir -p ../bin && cp target/release/charon target/release/charon-driver ../bin \
+    && cargo clean && rm -rf /opt/cargo/registry /opt/cargo/git
+
+RUN cd /opt/aeneas/charon && opam exec -- make charon-ml/src/CharonVersion.ml \
+    && cd /opt/aeneas && opam exec -- make build-bin build-lib \
+    && mkdir -p bin && cp -f src/_build/default/main.exe bin/aeneas \
+    && rm -rf src/_build
+
+RUN curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+        | sh -s -- -y --no-modify-path --default-toolchain none \
+    && elan toolchain install $LEAN && elan default $LEAN
+
+ENV PATH=/opt/aeneas/bin:/opt/aeneas/charon/bin:$PATH

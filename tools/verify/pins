@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# The versions of the tools of ./run, in one place (sourced by ./run and
+# passed to the Containerfile).  Mathlib is the one Aeneas requires at
+# AENEAS (lake takes it from the manifest of Aeneas).
+CHARON=695be3d6292e988eedd8afcb7a709146a0ff4f01
+AENEAS=fb44cb400eb6bfe7dce97422ebe8fa748b7e4f9b
+# (the nightly of rust-toolchain of CHARON)
+RUST=nightly-2026-09-17
+LEAN=leanprover/lean4:v4.36.0
