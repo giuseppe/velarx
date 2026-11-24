@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 use velarx_content::fetcher::fetch::Urgency;
+use velarx_group_core::{Do, Group};
 
 /// Providers asked for a chunk, in turn
 const MAX_PROVIDERS: usize = 3;
@@ -767,6 +768,8 @@ struct Attempt {
 struct Received {
     request: u64,
     peer: PeerId,
+    /// When the peer began to answer the request
+    started: tokio::time::Instant,
     digest: String,
     data: Vec<u8>,
     matches: bool,
@@ -781,6 +784,9 @@ struct Answers {
     valid: std::collections::HashMap<u64, (usize, u64)>,
     /// The chunks of each request whose bytes were not them
     wrong: std::collections::HashMap<u64, u64>,
+    /// The requests that sent chunks and are not settled: the peer and
+    /// when it began to answer
+    sending: std::collections::HashMap<u64, (PeerId, tokio::time::Instant)>,
     requests: u64,
 }
 
@@ -792,6 +798,7 @@ impl Answers {
             rx,
             valid: Default::default(),
             wrong: Default::default(),
+            sending: Default::default(),
             requests: 0,
         }
     }
@@ -805,6 +812,11 @@ enum Taken {
     Failed,
     /// The peer had no room: it is asked again when something completed
     Busy,
+}
+
+/// How many of the items of a group were passed on.
+fn passed_on(sent: &[bool]) -> usize {
+    sent.iter().filter(|s| **s).count()
 }
 
 /// The peers a group asks at most, hedges and replacements included.
@@ -1172,6 +1184,7 @@ impl PeerSource {
                                 .send(Received {
                                     request,
                                     peer,
+                                    started,
                                     digest,
                                     data,
                                     matches,
@@ -1583,27 +1596,18 @@ impl PeerSource {
             return Ok(());
         }
         let first = &items[0].digest;
-        // The next peers are looked for beside the requests under way (a
-        // round of probes or a walk of the DHT takes seconds): an answer that
-        // comes meanwhile is taken at once, and timed by when it came.  The
-        // search owns what the group asked while it runs.
-        let mut got: Option<Asked> = None;
-        let mut searching = Some(self.search(layer, first, Asked::default()));
-        // (whether it was started because the one asked last is slow: what
-        // it finds is asked at once then)
-        let mut hedged = false;
-        let mut next: std::collections::VecDeque<PeerId> = Default::default();
+        // The turns (whom to ask, when to search, when to stop) are the
+        // core's; the peers it numbers are the ones the searches found, in
+        // that order.  The next peers are looked for beside the requests
+        // under way (a round of probes or a walk of the DHT takes seconds):
+        // an answer that comes meanwhile is taken at once, and timed by when
+        // it came.  The search owns what the group asked while it runs.
+        let (mut group, mut todo) = Group::new(items.len(), passed_on(sent), MAX_ASKED);
+        let mut peers: Vec<PeerId> = Vec::new();
+        let mut asked = Some(Asked::default());
+        let mut searching = None;
         let mut running: futures::stream::FuturesUnordered<_> = Default::default();
         let mut answers = Answers::new();
-        let mut waiting_for: Option<PeerId> = None;
-        // the peers whose requests are under way
-        let mut asking: Vec<PeerId> = Vec::new();
-        // The peers that had no room, and how many chunks were in by then:
-        // when more came since (a request completed, and the peer may have
-        // room now) they are asked again, once the others were
-        let mut busy: Vec<PeerId> = Vec::new();
-        let mut in_when_busy = 0usize;
-        let may_search = |got: &Option<Asked>| got.as_ref().is_some_and(Asked::more);
         let began = self.begin();
         let started = began.at;
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -1613,122 +1617,86 @@ impl PeerSource {
         let mut ticked = false;
 
         loop {
+            match todo {
+                Do::Finish => {
+                    self.settle_sending(items, sent, layer, &mut answers, out)
+                        .await?;
+                    return Ok(());
+                }
+                Do::Search => {
+                    let got = asked.take().expect("one search at a time");
+                    searching = Some(self.search(layer, first, got));
+                }
+                Do::Ask(peer) => {
+                    let wanted = (0..items.len())
+                        .filter(|&i| !sent[i])
+                        .map(|i| (items[i].digest.clone(), items[i].size))
+                        .collect();
+                    if group.under_way().len() > 1 {
+                        debug!(
+                            "P2P: asking {} too, the one asked last is slow",
+                            peers[peer]
+                        );
+                    }
+                    running.push(self.ask(&mut answers, peers[peer], urgency, wanted));
+                }
+                Do::Wait => {}
+            }
             if !std::mem::take(&mut ticked) {
                 since = tokio::time::Instant::now();
             }
-            let remaining: Vec<(String, Option<u64>)> = (0..items.len())
-                .filter(|&i| !sent[i])
-                .map(|i| (items[i].digest.clone(), items[i].size))
-                .collect();
-            if remaining.is_empty() {
-                return Ok(());
-            }
-            // a peer is asked when nobody is, or when the last one asked is
-            // slow
-            if running.is_empty() {
-                if next.is_empty() && searching.is_none() {
-                    if let Some(asked) = got.take_if(|g| g.more()) {
-                        searching = Some(self.search(layer, first, asked));
-                        hedged = false;
-                    }
-                }
-                if next.is_empty() && searching.is_none() {
-                    let in_now = sent.iter().filter(|s| **s).count();
-                    if !busy.is_empty() && in_now > in_when_busy {
-                        next.extend(busy.drain(..));
-                    }
-                }
-                match next.pop_front() {
-                    Some(peer) => {
-                        running.push(self.ask(&mut answers, peer, urgency, remaining.clone()));
-                        asking.push(peer);
-                        waiting_for = Some(peer);
-                    }
-                    // (nobody left to ask)
-                    None if searching.is_none() => return Ok(()),
-                    None => {}
-                }
-            }
-            let hedge = match (self.policy.hedge, waiting_for) {
-                (true, Some(peer))
-                    if !running.is_empty()
-                        && searching.is_none()
-                        && (!next.is_empty() || may_search(&got)) =>
-                {
+            let hedge = group
+                .hedge()
+                .filter(|_| self.policy.hedge)
+                .map(|(peer, under_way)| {
                     let delay = self
                         .policy
                         .hedge_delay
-                        .unwrap_or_else(|| self.knowledge.hedge_delay(&peer));
+                        .unwrap_or_else(|| self.knowledge.hedge_delay(&peers[peer]));
                     // each request beside the first waits twice as long as
                     // the one before it (at most the longest hedge delay): a
                     // swarm that is slow everywhere is not asked the same
                     // chunks eight times at once
-                    let spaced = delay.saturating_mul(1 << (running.len() - 1).min(5));
-                    Some(spaced.min(delay.max(super::knowledge::HEDGE_MAX)))
-                }
-                _ => None,
-            };
-            let attempt = tokio::select! {
+                    let spaced = delay.saturating_mul(1 << (under_way - 1).min(5));
+                    spaced.min(delay.max(super::knowledge::HEDGE_MAX))
+                });
+            todo = tokio::select! {
                 // (an answer that is in counts before a timer that fired
                 // with it)
                 biased;
                 // (the chunks of an answer are taken before it is done with)
                 Some(received) = answers.rx.recv() => {
                     self.accept(items, sent, &mut answers, received, out).await?;
-                    continue;
+                    group.chunk(passed_on(sent))
                 }
-                attempt = futures::StreamExt::next(&mut running), if !running.is_empty() => attempt,
+                Some(attempt) = futures::StreamExt::next(&mut running), if !running.is_empty() => {
+                    let peer = peers.iter().position(|p| *p == attempt.peer).expect("a peer of the group");
+                    let taken = self
+                        .settle(items, sent, layer, &mut answers, attempt, out)
+                        .await?;
+                    group.ended(peer, matches!(taken, Taken::Busy), passed_on(sent))
+                }
                 _ = tick.tick() => {
                     if self.slow(&began) {
+                        let asking: Vec<PeerId> =
+                            group.under_way().iter().map(|&p| peers[p]).collect();
                         self.skip(&asking);
                         return Ok(());
                     }
                     ticked = true;
-                    continue;
+                    Do::Wait
                 }
-                (asked, found) = async { searching.as_mut().expect("a search").await },
+                (got, found) = async { searching.as_mut().expect("a search").await },
                     if searching.is_some() => {
                     searching = None;
-                    got = Some(asked);
-                    next.extend(found.into_iter().map(|(p, _)| p));
-                    if hedged && !running.is_empty() {
-                        if let Some(peer) = next.pop_front() {
-                            debug!("P2P: asking {peer} too, the one asked last is slow");
-                            running.push(self.ask(&mut answers, peer, urgency, remaining));
-                            asking.push(peer);
-                            waiting_for = Some(peer);
-                        }
-                    }
-                    continue;
+                    asked = Some(got);
+                    let n = found.len();
+                    peers.extend(found.into_iter().map(|(p, _)| p));
+                    group.found(n)
                 }
                 _ = tokio::time::sleep_until(since + hedge.unwrap_or_default()),
-                    if hedge.is_some() => {
-                    if let Some(peer) = next.pop_front() {
-                        debug!("P2P: asking {peer} too, {:?} passed without an answer", hedge);
-                        running.push(self.ask(&mut answers, peer, urgency, remaining));
-                        asking.push(peer);
-                        waiting_for = Some(peer);
-                    } else if let Some(asked) = got.take() {
-                        searching = Some(self.search(layer, first, asked));
-                        hedged = true;
-                    }
-                    continue;
-                }
+                    if hedge.is_some() => group.hedge_due(),
             };
-            let Some(attempt) = attempt else {
-                continue;
-            };
-            let peer = attempt.peer;
-            asking.retain(|p| *p != peer);
-            if let Taken::Busy = self
-                .settle(items, sent, layer, &mut answers, attempt, out)
-                .await?
-            {
-                if !busy.contains(&peer) {
-                    busy.push(peer);
-                }
-                in_when_busy = sent.iter().filter(|s| **s).count();
-            }
         }
     }
 
@@ -2008,6 +1976,7 @@ impl PeerSource {
         let Received {
             request,
             peer,
+            started,
             digest: wanted,
             data,
             matches,
@@ -2015,6 +1984,7 @@ impl PeerSource {
         if !matches {
             debug!(%peer, "the bytes sent for {} are not it", short(&wanted));
             *answers.wrong.entry(request).or_default() += 1;
+            answers.sending.entry(request).or_insert((peer, started));
             return Ok(());
         }
         let mut asked = false;
@@ -2031,6 +2001,7 @@ impl PeerSource {
             let (n, bytes) = answers.valid.entry(request).or_default();
             *n += 1;
             *bytes += data.len() as u64;
+            answers.sending.entry(request).or_insert((peer, started));
         }
         // (what is in the pipe is passed on together)
         if answers.rx.is_empty() {
@@ -2062,6 +2033,7 @@ impl PeerSource {
         } = attempt;
         let (n, bytes) = answers.valid.remove(&request).unwrap_or_default();
         let wrong = answers.wrong.remove(&request).unwrap_or_default();
+        answers.sending.remove(&request);
         if wrong > 0 {
             warn!(%peer, "P2P: {wrong} chunks sent did not match their digests");
             self.knowledge.wrong(peer, wrong);
@@ -2138,6 +2110,35 @@ impl PeerSource {
             self.knowledge.served(layer, peer, took);
         }
         Ok(Taken::Sent(n))
+    }
+
+    /// Settle the requests still under way that sent chunks, when the group
+    /// is done: the last chunk can come before its request is over.  Each
+    /// is taken as an answer that ended well, timed until now (its last
+    /// chunk is in).
+    async fn settle_sending(
+        &self,
+        items: &[Item],
+        sent: &mut [bool],
+        layer: Option<&str>,
+        answers: &mut Answers,
+        out: &mut dyn Sink,
+    ) -> Result<(), String> {
+        while let Ok(received) = answers.rx.try_recv() {
+            self.accept(items, sent, answers, received, out).await?;
+        }
+        let sending: Vec<(u64, (PeerId, tokio::time::Instant))> = answers.sending.drain().collect();
+        for (request, (peer, started)) in sending {
+            let attempt = Attempt {
+                request,
+                peer,
+                took: started.elapsed(),
+                result: Ok(()),
+            };
+            self.settle(items, sent, layer, answers, attempt, out)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -2934,6 +2935,81 @@ mod tests {
         }
     }
 
+    /// Peers that send the chunks asked of them and never end their
+    /// answer.
+    struct Unfinished(Vec<PeerId>, Vec<(String, Vec<u8>)>);
+
+    #[async_trait]
+    impl Peers for Unfinished {
+        async fn connected(&self) -> Vec<PeerId> {
+            self.0.clone()
+        }
+        async fn layer_providers(&self, _: &str) -> Vec<PeerId> {
+            Vec::new()
+        }
+        async fn request(
+            &self,
+            _: PeerId,
+            asked: &[(String, Option<u64>)],
+            _: Urgency,
+            out: crate::ChunkTx,
+        ) -> Result<(), PeerError> {
+            for chunk in self
+                .1
+                .iter()
+                .filter(|(d, _)| asked.iter().any(|(a, _)| a == d))
+            {
+                let _ = out.send(chunk.clone()).await;
+            }
+            std::future::pending().await
+        }
+        async fn index(&self, _: PeerId, _: &str, _: u64) -> Result<Option<Vec<u8>>, PeerError> {
+            Ok(None)
+        }
+        async fn has(&self, _: PeerId, _: &str) -> Result<Presence, String> {
+            Ok(Presence::Has)
+        }
+        async fn profile(&self, _: PeerId, _: &str, _: u64) -> Result<Option<Vec<u8>>, PeerError> {
+            Ok(None)
+        }
+        async fn signatures(
+            &self,
+            _: PeerId,
+            _: &str,
+            _: u64,
+        ) -> Result<Option<Vec<u8>>, PeerError> {
+            Ok(None)
+        }
+    }
+
+    /// A group that has every chunk is done, and the peer that sent them
+    /// is counted and believed to hold the layer, though its answer is
+    /// not over.
+    #[tokio::test]
+    async fn the_chunks_of_an_answer_not_over_are_counted() {
+        let c = chunks(4);
+        let peer = PeerId::random();
+        let s = PeerSource::with_peers(Arc::new(Unfinished(vec![peer], c.clone())));
+        let mut out = Collect::default();
+        s.fetch_group(&items(&c), Some(LAYER), &mut out)
+            .await
+            .unwrap();
+        assert_eq!(digests_of(&out), sorted(&c));
+        let traffic = s.knowledge().traffic();
+        assert_eq!(traffic.len(), 1);
+        assert_eq!(traffic[0].0, peer);
+        let bytes: usize = c.iter().map(|(_, d)| d.len()).sum();
+        assert_eq!(
+            (
+                traffic[0].1.requests,
+                traffic[0].1.chunks,
+                traffic[0].1.bytes
+            ),
+            (1, 4, bytes as u64)
+        );
+        assert_eq!(s.knowledge().providers(LAYER), [peer]);
+    }
+
     /// The requests nobody waits for take at most half of the places of a
     /// peer: however many are under way, one that is waited for has a place.
     #[tokio::test]
@@ -3303,6 +3379,34 @@ mod tests {
             .map(|(p, t)| (p, (t.chunks, t.wrong)))
             .collect();
         assert_eq!((wrong[&liar], wrong[&good]), ((0, 1), (1, 0)));
+    }
+
+    /// A sink that cannot take a chunk ends the group with its error: the
+    /// next peer is not asked for what the sink refused.
+    #[tokio::test]
+    async fn a_sink_that_fails_ends_the_group_with_its_error() {
+        struct Refusing;
+
+        #[async_trait]
+        impl Sink for Refusing {
+            async fn put(&mut self, _: &str, _: &[u8]) -> Result<(), String> {
+                Err("disk full".into())
+            }
+        }
+
+        let fake = Arc::new(Fake::default());
+        let c = chunks(2);
+        let first = fake.peer(0, Ok(c.clone()));
+        fake.peer(0, Ok(c.clone()));
+        let s = source(&fake, None);
+        s.knowledge()
+            .served(Some(LAYER), first, Duration::from_micros(1));
+        let err = s
+            .fetch_group(&items(&c), Some(LAYER), &mut Refusing)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "disk full");
+        assert_eq!(fake.asked.lock().unwrap().clone(), [first]);
     }
 
     #[tokio::test]

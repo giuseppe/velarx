@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-group-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The turns of a group fetch of the peer-to-peer provider: whom to ask, when to search, when to stop"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on the state of one group, called by the loop of the
+# peer-to-peer provider (provider.rs) after each event: no dependency, no
+# I/O, no clock.  The shell keeps the search, the requests, the check of
+# the bytes and every timer.
+
+[lib]
+name = "velarx_group_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

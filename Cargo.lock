@@ -5058,6 +5058,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "velarx-group-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-kube"
 version = "0.1.0"
 dependencies = [
@@ -5211,6 +5215,7 @@ dependencies = [
  "velarx-core",
  "velarx-db",
  "velarx-fuse",
+ "velarx-group-core",
  "velarx-netdetach",
  "velarx-netkernel",
  "velarx-proto",
