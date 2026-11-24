@@ -114,7 +114,7 @@
 
 #![warn(missing_docs)]
 
-pub mod crc64;
+pub use velarx_tarsplit_header::crc64;
 pub mod decompress;
 mod split;
 pub mod tar;

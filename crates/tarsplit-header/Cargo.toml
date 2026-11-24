@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-tarsplit-header"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The arithmetic of a tar header: number fields, checksum, padding and the CRC-64 of tar-split"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# No dependency and plain loops over bytes, so that the code can be
+# translated and proved: it reads the headers of archives that are not
+# trusted.
+
+[lib]
+name = "velarx_tarsplit_header"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

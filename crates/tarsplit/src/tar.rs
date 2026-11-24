@@ -11,7 +11,10 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read};
 
-const BLOCK: usize = 512;
+use velarx_tarsplit_header::{
+    self as header, checksum_ok, cstr, decimal, padding, pax_record, pax_time, NumError, PaxError,
+    BLOCK,
+};
 
 /// Longest path or link target accepted.
 pub const MAX_NAME_LEN: usize = 4096;
@@ -91,48 +94,17 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-/// A NUL terminated string field.
-fn cstr(field: &[u8]) -> &[u8] {
-    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
-    &field[..end]
-}
-
 /// An octal or base-256 number field.
 fn number(field: &[u8], what: &str) -> io::Result<u64> {
-    if field[0] & 0x80 != 0 {
-        // Base-256: big endian, the first byte without the marker bit.  A
-        // negative value (0xff first byte) is not valid for any field here.
-        if field[0] & 0x40 != 0 {
-            return Err(invalid(format!("negative {what}")));
-        }
-        let mut value: u64 = u64::from(field[0] & 0x3f);
-        for &b in &field[1..] {
-            if value >> 56 != 0 {
-                return Err(invalid(format!("{what} overflows")));
-            }
-            value = (value << 8) | u64::from(b);
-        }
-        return Ok(value);
-    }
-    let s = cstr(field);
-    let s = std::str::from_utf8(s).map_err(|_| invalid(format!("invalid {what}")))?;
-    let s = s.trim_matches(|c| c == ' ' || c == '\0');
-    if s.is_empty() {
-        return Ok(0);
-    }
-    u64::from_str_radix(s, 8).map_err(|_| invalid(format!("invalid {what}")))
+    header::number(field).map_err(|e| num_error(e, what))
 }
 
-fn checksum_ok(block: &[u8; BLOCK]) -> io::Result<bool> {
-    let stored = number(&block[148..156], "checksum")?;
-    let mut unsigned: u64 = 0;
-    let mut signed: i64 = 0;
-    for (i, &b) in block.iter().enumerate() {
-        let b = if (148..156).contains(&i) { b' ' } else { b };
-        unsigned += u64::from(b);
-        signed += i64::from(b as i8);
-    }
-    Ok(stored == unsigned || i64::try_from(stored).is_ok_and(|s| s == signed))
+fn num_error(e: NumError, what: &str) -> io::Error {
+    invalid(match e {
+        NumError::Negative => format!("negative {what}"),
+        NumError::Overflow => format!("{what} overflows"),
+        NumError::Invalid => format!("invalid {what}"),
+    })
 }
 
 fn utf8(bytes: &[u8], what: &str) -> io::Result<String> {
@@ -152,68 +124,24 @@ struct Overrides {
     xattr_bytes: usize,
 }
 
-/// A PAX time, `[-]seconds[.fraction]`, as seconds (rounded down) and the
-/// nanoseconds after them.  Digits of the fraction beyond the ninth are
-/// dropped; an empty fraction is 0, as Go reads it.
-fn pax_time(value: &[u8]) -> Option<(i64, u32)> {
-    let s = std::str::from_utf8(value).ok()?;
-    let (negative, s) = s.strip_prefix('-').map_or((false, s), |s| (true, s));
-    let (secs, fraction) = s.split_once('.').unwrap_or((s, ""));
-    if !fraction.bytes().all(|b| b.is_ascii_digit()) || !secs.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let secs: i64 = secs.parse().ok()?;
-    let f = &fraction[..fraction.len().min(9)];
-    let nanos = match f {
-        "" => 0,
-        f => f.parse::<u32>().ok()? * 10u32.pow(9 - f.len() as u32),
-    };
-    match (negative, nanos) {
-        (false, n) => Some((secs, n)),
-        (true, 0) => Some((secs.checked_neg()?, 0)),
-        (true, n) => Some((secs.checked_neg()?.checked_sub(1)?, 1_000_000_000 - n)),
-    }
-}
-
 /// Parse `len key=value\n` records.
 fn parse_pax(data: &[u8], out: &mut Overrides) -> io::Result<()> {
     let mut rest = data;
     while !rest.is_empty() {
-        let space = rest
-            .iter()
-            .position(|&b| b == b' ')
-            .ok_or_else(|| invalid("invalid PAX record"))?;
-        let len: usize = std::str::from_utf8(&rest[..space])
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| invalid("invalid PAX record length"))?;
-        if len <= space + 1 || len > rest.len() || rest[len - 1] != b'\n' {
-            return Err(invalid("invalid PAX record"));
-        }
-        let record = &rest[space + 1..len - 1];
-        rest = &rest[len..];
-        let eq = record
-            .iter()
-            .position(|&b| b == b'=')
-            .ok_or_else(|| invalid("invalid PAX record"))?;
-        let (key, value) = (&record[..eq], &record[eq + 1..]);
-        let key = std::str::from_utf8(key).map_err(|_| invalid("PAX key is not UTF-8"))?;
+        let record = pax_record(rest).map_err(|e| match e {
+            PaxError::Length => invalid("invalid PAX record length"),
+            PaxError::Record => invalid("invalid PAX record"),
+        })?;
+        let key =
+            std::str::from_utf8(&rest[record.key]).map_err(|_| invalid("PAX key is not UTF-8"))?;
+        let value = &rest[record.value];
+        rest = &rest[record.len..];
         match key {
             "path" => out.path = Some(utf8(value, "PAX path")?),
             "linkpath" => out.link = Some(utf8(value, "PAX linkpath")?),
-            "size" => {
-                out.size = Some(
-                    std::str::from_utf8(value)
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .ok_or_else(|| invalid("invalid PAX size"))?,
-                )
-            }
+            "size" => out.size = Some(decimal(value).map_err(|_| invalid("invalid PAX size"))?),
             "uid" | "gid" => {
-                let v: u64 = std::str::from_utf8(value)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| invalid("invalid PAX id"))?;
+                let v = decimal(value).map_err(|_| invalid("invalid PAX id"))?;
                 if key == "uid" {
                     out.uid = Some(v)
                 } else {
@@ -221,7 +149,7 @@ fn parse_pax(data: &[u8], out: &mut Overrides) -> io::Result<()> {
                 }
             }
             "mtime" => {
-                out.mtime = Some(pax_time(value).ok_or_else(|| invalid("invalid PAX mtime"))?);
+                out.mtime = Some(pax_time(value).map_err(|_| invalid("invalid PAX mtime"))?);
             }
             // the formats of GNU tar that store a file with holes as a
             // regular entry of its packed data: as the sparse type, refused
@@ -421,7 +349,7 @@ impl<R: Read, S: Sink> TarReader<R, S> {
                 self.finished = true;
                 return Ok(None);
             };
-            if !checksum_ok(&block)? {
+            if !checksum_ok(&block).map_err(|e| num_error(e, "checksum"))? {
                 return Err(invalid("invalid tar header checksum"));
             }
             let size = number(&block[124..136], "size")?;
@@ -536,11 +464,8 @@ impl<R: Read, S: Sink> TarReader<R, S> {
             (0, 0)
         };
 
-        let padded = size
-            .checked_next_multiple_of(BLOCK as u64)
-            .ok_or_else(|| invalid("tar entry size is too large"))?;
+        self.padding = padding(size).ok_or_else(|| invalid("tar entry size is too large"))?;
         self.remaining = size;
-        self.padding = padded - size;
         let header = Header {
             path,
             kind,
@@ -647,32 +572,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pax_times() {
-        let t = |s: &str| pax_time(s.as_bytes());
-        assert_eq!(t("5"), Some((5, 0)));
-        assert_eq!(t("1.5"), Some((1, 500_000_000)));
-        assert_eq!(t("1.000000005"), Some((1, 5)));
-        assert_eq!(t("1.1234567891"), Some((1, 123_456_789)));
-        assert_eq!(t("-1"), Some((-1, 0)));
-        assert_eq!(t("-1.5"), Some((-2, 500_000_000)));
-        assert_eq!(t("-0.25"), Some((-1, 750_000_000)));
-        assert_eq!(t("7."), Some((7, 0)));
-        for bad in [
-            "",
-            "-",
-            ".5",
-            "1.5x",
-            "1e3",
-            "+1",
-            "--1",
-            "1.-5",
-            "99999999999999999999",
-        ] {
-            assert_eq!(t(bad), None, "{bad}");
-        }
-    }
-
-    #[test]
     fn test_mtime_from_pax() {
         let mut pax = tar::Builder::new(Vec::new());
         pax.append_pax_extensions([("mtime", b"1700000000.25".as_slice())])
@@ -760,20 +659,6 @@ mod tests {
         assert_eq!((entries[1].0.dev_major, entries[1].0.dev_minor), (1, 3));
     }
 
-    #[test]
-    fn test_base256_size() {
-        let mut block = [0u8; 12];
-        block[0] = 0x80;
-        block[11] = 0x10;
-        block[10] = 0x01;
-        assert_eq!(number(&block, "size").unwrap(), 0x110);
-        block[0] = 0xff;
-        assert!(number(&block, "size").is_err());
-        let mut block = [0xffu8; 12];
-        block[0] = 0x80;
-        assert!(number(&block, "size").is_err());
-    }
-
     /// A size whose padding does not fit in 64 bits is an error, in the
     /// header and in a PAX record.
     #[test]
@@ -858,6 +743,15 @@ mod tests {
         assert!(err.to_string().contains("too large"));
     }
 
+    /// The PAX record of `key=value`, with its length.
+    fn record_of(kv: &str) -> Vec<u8> {
+        let mut len = kv.len() + 3;
+        while format!("{len} {kv}\n").len() != len {
+            len += 1;
+        }
+        format!("{len} {kv}\n").into_bytes()
+    }
+
     #[test]
     fn test_pax_limits() {
         let mut ov = Overrides::default();
@@ -866,12 +760,36 @@ mod tests {
         assert!(parse_pax(b"nonsense", &mut Overrides::default()).is_err());
         let mut many = Vec::new();
         for i in 0..=MAX_XATTRS {
-            let rec = format!(" SCHILY.xattr.k{i}=v\n");
-            let mut len = rec.len() + 1;
-            len += len.to_string().len().saturating_sub(1);
-            many.extend_from_slice(format!("{len}{rec}").as_bytes());
+            many.extend(record_of(&format!("SCHILY.xattr.k{i}=v")));
         }
         assert!(parse_pax(&many, &mut Overrides::default()).is_err());
+    }
+
+    /// `str::parse` took a leading `+` in the length of a record and in
+    /// `size`, `uid` and `gid`; they are refused now, as the numbers of a
+    /// header are (`mtime` refused it before).
+    #[test]
+    fn test_pax_plus_is_refused() {
+        for kv in ["size=+5", "uid=+5", "gid=+5", "mtime=+5"] {
+            let mut ov = Overrides::default();
+            assert!(parse_pax(&record_of(kv), &mut ov).is_err(), "{kv}");
+        }
+        assert!(parse_pax(b"+7 a=b\n", &mut Overrides::default()).is_err());
+    }
+
+    #[test]
+    fn test_pax_numbers() {
+        let mut ov = Overrides::default();
+        let mut all = Vec::new();
+        for kv in ["size=42", "uid=7", "gid=8", "mtime=-1.5"] {
+            all.extend(record_of(kv));
+        }
+        parse_pax(&all, &mut ov).unwrap();
+        assert_eq!((ov.size, ov.uid, ov.gid), (Some(42), Some(7), Some(8)));
+        assert_eq!(ov.mtime, Some((-2, 500_000_000)));
+        for kv in ["size=4x", "size=", "uid=-1", "mtime=x"] {
+            assert!(parse_pax(&record_of(kv), &mut Overrides::default()).is_err());
+        }
     }
 
     #[test]

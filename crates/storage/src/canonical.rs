@@ -88,6 +88,8 @@ use crate::{content_size, size_conflict, toc_time, TocEntry, TocEntryType};
 use base64::Engine;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
+use velarx_tarsplit_header::emit::{put_decimal, put_octal, put_time, record_len, seal};
+use velarx_tarsplit_header::{cstr, decimal, number, pax_time, PaxError};
 
 const BLOCK: usize = 512;
 /// The value of the PAX record that marks a canonical stream.
@@ -485,32 +487,26 @@ impl Block {
     /// `v` as octal digits in a field of `len` bytes, padded with zeros,
     /// then a NUL; an error when the digits are more than the field has.
     fn octal(&mut self, at: usize, len: usize, v: u64) -> Result<(), String> {
-        let digits = format!("{v:0width$o}", width = len - 1);
-        if digits.len() != len - 1 {
-            return Err(format!(
+        if put_octal(&mut self.0[at..at + len], v) {
+            Ok(())
+        } else {
+            Err(format!(
                 "{v} does not fit the {} digits of a field",
                 len - 1
-            ));
+            ))
         }
-        self.bytes(at, digits.as_bytes());
-        Ok(())
     }
 
     fn finish(mut self) -> [u8; BLOCK] {
-        self.0[148..156].fill(b' ');
-        let sum: u32 = self.0.iter().map(|&b| u32::from(b)).sum();
-        self.bytes(148, format!("{sum:06o}\0 ").as_bytes());
+        seal(&mut self.0);
         self.0
     }
 }
 
 fn pax_record(out: &mut Vec<u8>, key: &str, value: &[u8]) {
-    let rest = key.len() + value.len() + 3; // the space, `=` and the newline
-    let mut digits = rest.to_string().len();
-    while (rest + digits).to_string().len() != digits {
-        digits += 1;
-    }
-    out.extend_from_slice((rest + digits).to_string().as_bytes());
+    // (the space, `=` and the newline are the 3)
+    let len = record_len(key.len() + value.len() + 3).expect("a record fits in memory");
+    put_decimal(out, len as u64);
     out.push(b' ');
     out.extend_from_slice(key.as_bytes());
     out.push(b'=');
@@ -518,13 +514,10 @@ fn pax_record(out: &mut Vec<u8>, key: &str, value: &[u8]) {
     out.push(b'\n');
 }
 
-/// `seconds.fraction`, the fraction as nine digits without trailing zeros.
-fn pax_time(secs: u64, nanos: u32) -> String {
-    if nanos == 0 {
-        return secs.to_string();
-    }
-    let fraction = format!("{nanos:09}");
-    format!("{secs}.{}", fraction.trim_end_matches('0'))
+fn pax_number(out: &mut Vec<u8>, key: &str, n: u64) {
+    let mut value = Vec::new();
+    put_decimal(&mut value, n);
+    pax_record(out, key, &value);
 }
 
 fn type_flag(kind: TocEntryType) -> u8 {
@@ -552,27 +545,19 @@ fn pax_data(f: &Fields, first: bool) -> Vec<u8> {
         pax_record(&mut out, "linkpath", l.as_bytes());
     }
     if f.size > MAX_OCTAL_11 {
-        pax_record(&mut out, "size", f.size.to_string().as_bytes());
+        pax_number(&mut out, "size", f.size);
     }
     if f.uid > MAX_ID_FIELD {
-        pax_record(&mut out, "uid", f.uid.to_string().as_bytes());
+        pax_number(&mut out, "uid", u64::from(f.uid));
     }
     if f.gid > MAX_ID_FIELD {
-        pax_record(&mut out, "gid", f.gid.to_string().as_bytes());
+        pax_number(&mut out, "gid", u64::from(f.gid));
     }
     let (secs, nanos) = f.mtime;
     if secs < 0 || secs as u64 > MAX_OCTAL_11 || nanos != 0 {
-        let value = if secs >= 0 {
-            pax_time(secs as u64, nanos)
-        } else if nanos == 0 {
-            format!("-{}", pax_time(secs.unsigned_abs(), 0))
-        } else {
-            format!(
-                "-{}",
-                pax_time(secs.unsigned_abs() - 1, 1_000_000_000 - nanos)
-            )
-        };
-        pax_record(&mut out, "mtime", value.as_bytes());
+        let mut value = Vec::new();
+        put_time(&mut value, secs, nanos);
+        pax_record(&mut out, "mtime", &value);
     }
     for (k, v) in &f.xattrs {
         pax_record(&mut out, &format!("SCHILY.xattr.{k}"), v);
@@ -835,37 +820,6 @@ pub fn write<W: Write>(
     out.write_all(&END)
 }
 
-/// A decimal number of digits only.
-fn decimal(v: &[u8]) -> Option<u64> {
-    if v.is_empty() || !v.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    std::str::from_utf8(v).ok()?.parse().ok()
-}
-
-/// `seconds[.fraction]` with a `-` for a time before 1970.
-fn parse_time(v: &[u8]) -> Option<(i64, u32)> {
-    let (negative, v) = match v.strip_prefix(b"-") {
-        Some(v) => (true, v),
-        None => (false, v),
-    };
-    let (secs, fraction) = match v.iter().position(|&b| b == b'.') {
-        Some(p) => (&v[..p], Some(&v[p + 1..])),
-        None => (v, None),
-    };
-    let secs = i64::try_from(decimal(secs)?).ok()?;
-    let nanos = match fraction {
-        None => 0,
-        Some(f) if f.len() <= 9 => decimal(f)? as u32 * 10u32.pow(9 - f.len() as u32),
-        Some(_) => return None,
-    };
-    Some(match (negative, nanos) {
-        (false, n) => (secs, n),
-        (true, 0) => (-secs, 0),
-        (true, n) => (-secs - 1, 1_000_000_000 - n),
-    })
-}
-
 /// The records of an `x` entry the stream can have.
 #[derive(Default)]
 struct Pax {
@@ -884,23 +838,14 @@ fn parse_pax(mut data: &[u8]) -> Result<Pax, String> {
         String::from_utf8(v.to_vec()).map_err(|_| "a PAX value is not UTF-8".to_string())
     };
     while !data.is_empty() {
-        let space = data
-            .iter()
-            .position(|&b| b == b' ')
-            .ok_or("bad PAX record")?;
-        let len = decimal(&data[..space]).ok_or("bad PAX record length")? as usize;
-        if len <= space + 1 || len > data.len() || data[len - 1] != b'\n' {
-            return Err("bad PAX record".into());
-        }
-        let record = &data[space + 1..len - 1];
-        data = &data[len..];
-        let eq = record
-            .iter()
-            .position(|&b| b == b'=')
-            .ok_or("bad PAX record")?;
-        let (key, value) = (&record[..eq], &record[eq + 1..]);
+        let record = velarx_tarsplit_header::pax_record(data).map_err(|e| match e {
+            PaxError::Length => "bad PAX record length",
+            PaxError::Record => "bad PAX record",
+        })?;
+        let (key, value) = (&data[record.key], &data[record.value]);
+        data = &data[record.len..];
         let key = std::str::from_utf8(key).map_err(|_| "a PAX key is not UTF-8")?;
-        let number = |v: &[u8]| decimal(v).ok_or_else(|| format!("bad PAX {key}"));
+        let number = |v: &[u8]| decimal(v).map_err(|_| format!("bad PAX {key}"));
         match key {
             "comment" if value == MARKER.1.as_bytes() => {}
             "path" => pax.path = Some(text(value)?),
@@ -908,7 +853,7 @@ fn parse_pax(mut data: &[u8]) -> Result<Pax, String> {
             "size" => pax.size = Some(number(value)?),
             "uid" => pax.uid = Some(number(value)?),
             "gid" => pax.gid = Some(number(value)?),
-            "mtime" => pax.mtime = Some(parse_time(value).ok_or("bad PAX mtime")?),
+            "mtime" => pax.mtime = Some(pax_time(value).map_err(|_| "bad PAX mtime")?),
             _ => match key.strip_prefix("SCHILY.xattr.") {
                 Some(name) => {
                     pax.xattrs.insert(name.to_string(), value.to_vec());
@@ -920,18 +865,11 @@ fn parse_pax(mut data: &[u8]) -> Result<Pax, String> {
     Ok(pax)
 }
 
-/// A NUL terminated field.
-fn cstr(field: &[u8]) -> &[u8] {
-    &field[..field.iter().position(|&b| b == 0).unwrap_or(field.len())]
-}
-
-fn octal(field: &[u8], what: &str) -> Result<u64, String> {
-    let digits = cstr(field);
-    if digits.is_empty() || !digits.iter().all(|b| (b'0'..=b'7').contains(b)) {
-        return Err(format!("{what} is not octal digits"));
-    }
-    u64::from_str_radix(std::str::from_utf8(digits).unwrap_or("0"), 8)
-        .map_err(|_| format!("{what} is too large"))
+/// A number field as `number` reads it, which takes more spellings than the
+/// writer makes (spaces, base 256): the check that the headers are what the
+/// rules make refuses them all, as it does any other byte that differs.
+fn header_number(field: &[u8], what: &str) -> Result<u64, String> {
+    number(field).map_err(|_| format!("{what} is not a number"))
 }
 
 /// The entry a header describes, with the records before it.
@@ -951,13 +889,13 @@ fn decode(h: &[u8; BLOCK], pax: &Pax) -> Result<Fields, String> {
     let id = |p: Option<u64>, at: usize, what: &str| {
         let v = match p {
             Some(v) => v,
-            None => octal(&h[at..at + 8], what)?,
+            None => header_number(&h[at..at + 8], what)?,
         };
         u32::try_from(v).map_err(|_| format!("{what} is too large"))
     };
     let mtime = match pax.mtime {
         Some(t) => t,
-        None => (octal(&h[136..148], "the time")? as i64, 0),
+        None => (header_number(&h[136..148], "the time")? as i64, 0),
     };
     let link = match (&pax.link, kind) {
         (Some(l), _) => Some(l.clone()),
@@ -978,13 +916,13 @@ fn decode(h: &[u8; BLOCK], pax: &Pax) -> Result<Fields, String> {
             None => text(cstr(&h[..NAME_FIELD]))?,
         },
         kind,
-        mode: u32::try_from(octal(&h[100..108], "the mode")?)
+        mode: u32::try_from(header_number(&h[100..108], "the mode")?)
             .map_err(|_| "the mode is too large")?,
         uid: id(pax.uid, 108, "the uid")?,
         gid: id(pax.gid, 116, "the gid")?,
         size: match pax.size {
             Some(s) => s,
-            None => octal(&h[124..136], "the size")?,
+            None => header_number(&h[124..136], "the size")?,
         },
         link,
         mtime,
@@ -1038,7 +976,8 @@ pub fn validate_tar(mut r: impl Read) -> io::Result<()> {
         raw.extend_from_slice(&block);
         let mut pax = Pax::default();
         if block[156] == b'x' {
-            let size = octal(&block[124..136], "the size of the records").map_err(|e| at(e, ""))?;
+            let size = header_number(&block[124..136], "the size of the records")
+                .map_err(|e| at(e, ""))?;
             if size > MAX_PAX_DATA {
                 return Err(at("the PAX records are too large".into(), ""));
             }

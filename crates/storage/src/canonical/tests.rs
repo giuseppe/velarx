@@ -1012,6 +1012,32 @@ fn a_header_that_names_more_than_the_rules_allow_is_not_canonical() {
     assert!(not_canonical(&out).contains("UTF-8"));
 }
 
+/// `number` reads a field with spaces around the digits, or in base 256; the
+/// check of the headers refuses what the writer would spell otherwise.
+#[test]
+fn a_number_the_writer_never_spells_is_refused() {
+    let good = canonical(&[entry("./", DIR), file("./a", 0)]);
+    validate_tar(&good[..]).unwrap();
+    assert_eq!(&good[1536 + 100..1536 + 108], b"0000644\0");
+    for spelling in [
+        b" 000644\0",
+        b"000644 \0",
+        b"0000644 ",
+        b"\x80\0\0\0\0\0\x01\xa4",
+    ] {
+        let mut bad = good.clone();
+        bad[1536 + 100..1536 + 108].copy_from_slice(spelling);
+        let sum: u32 = bad[1536..2048]
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| u32::from(if (148..156).contains(&i) { b' ' } else { b }))
+            .sum();
+        bad[1536 + 148..1536 + 156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        let e = not_canonical(&bad);
+        assert!(e.contains("the headers are not what the rules make"), "{e}");
+    }
+}
+
 #[test]
 fn a_pax_record_the_rules_never_write_is_refused() {
     let stream = |extra: &[u8]| {
@@ -1040,6 +1066,34 @@ fn a_pax_record_the_rules_never_write_is_refused() {
     ] {
         let e = not_canonical(&stream(record.as_bytes()));
         assert!(e.contains("is not allowed"), "{record}: {e}");
+    }
+}
+
+/// `pax_time` reads a time the writer never spells (an empty fraction, more
+/// than nine digits of it); the check of the headers refuses it all the same.
+#[test]
+fn a_time_the_writer_never_spells_is_refused() {
+    let stream = |record: &[u8]| {
+        cat(&[
+            &pax(b"a", &cat(&[MARKER_RECORD, record])),
+            &header(
+                b"./a",
+                "0000644",
+                "0000000",
+                "0000000",
+                "00000000000",
+                "00000000000",
+                b'0',
+                b"",
+                None,
+            ),
+            END,
+        ])
+    };
+    validate_tar(&stream(b"12 mtime=-1\n")[..]).unwrap();
+    for record in ["13 mtime=-1.\n", "23 mtime=-1.0000000000\n"] {
+        let e = not_canonical(&stream(record.as_bytes()));
+        assert!(e.contains("the headers are not what the rules make"), "{e}");
     }
 }
 
@@ -1468,7 +1522,7 @@ fn varied(kind: TocEntryType) -> Vec<TocEntry> {
 /// What `headers` gives back when it is read as the stream does.
 fn read_back(head: &[u8]) -> Result<Fields, String> {
     let (pax, block) = if head[156] == b'x' {
-        let size = octal(&head[124..136], "the size")? as usize;
+        let size = header_number(&head[124..136], "the size")? as usize;
         let end = BLOCK + size.next_multiple_of(BLOCK);
         (parse_pax(&head[BLOCK..BLOCK + size])?, &head[end..])
     } else {
@@ -1484,7 +1538,7 @@ fn decode_tar(tar: &[u8]) -> Vec<Fields> {
     let mut at = 0;
     while tar[at..at + BLOCK] != [0; BLOCK] {
         let end = if tar[at + 156] == b'x' {
-            let size = octal(&tar[at + 124..at + 136], "the size").unwrap() as usize;
+            let size = header_number(&tar[at + 124..at + 136], "the size").unwrap() as usize;
             at + 2 * BLOCK + size.next_multiple_of(BLOCK)
         } else {
             at + BLOCK

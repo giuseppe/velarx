@@ -5446,6 +5446,7 @@ dependencies = [
  "tracing",
  "velarx-base",
  "velarx-sys",
+ "velarx-tarsplit-header",
  "velarx-types",
 ]
 
@@ -5527,8 +5528,13 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tar",
+ "velarx-tarsplit-header",
  "zstd",
 ]
+
+[[package]]
+name = "velarx-tarsplit-header"
+version = "0.1.0"
 
 [[package]]
 name = "velarx-types"
