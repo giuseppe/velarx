@@ -225,7 +225,12 @@ member:
     (the file is what survives a restart).  A revoked peer is refused at once
     and its connections are closed at the next sweep (`ca_sweep_secs`, 10 s),
     which also cuts off expired certificates.  A revoked key does not come
-    back: a new key needs a new certificate.  A list that is set and cannot
+    back unless the authority signs a newer list without it (a node that
+    adopts such a list warns): a new key needs a new certificate.  The
+    number is what orders the lists, so an authority whose state was rolled
+    back signs numbers that nodes already hold, and the nodes ignore those
+    lists: keep the state of the authority (the directory of `ca init`)
+    durable.  A list that is set and cannot
     be read or is not valid stops the start; one that cannot be read later
     keeps the last good list (a warning).  `revocation_max_age_secs` (0: off)
     makes the node admit nobody new when the file was not read for that long

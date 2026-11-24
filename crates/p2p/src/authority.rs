@@ -351,8 +351,9 @@ pub fn pem_certificate(der: &[u8]) -> String {
 /// ```
 ///
 /// The signature covers every line before its own.  A list of the same
-/// issuer with a higher number replaces the older: it holds every peer
-/// revoked so far.
+/// issuer with a higher number replaces the older: `ca revoke` makes it hold
+/// every peer revoked so far, so a key stays revoked unless the authority
+/// signs a newer list without it (a node adopts such a list and warns).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevocationList {
     pub issuer: [u8; 32],
@@ -795,6 +796,17 @@ impl Authority {
         for i in velarx_revoke_core::adopt(&state.held(), &parts) {
             if let Some(list) = lists[i].take() {
                 numbers.push(list.number);
+                let kept: HashSet<&PeerId> = list.peers.iter().collect();
+                let dropped = state.lists.get(&list.issuer).map_or(0, |old| {
+                    old.peers.iter().filter(|p| !kept.contains(p)).count()
+                });
+                if dropped > 0 {
+                    warn!(
+                        "The revocation list (number {}) no longer revokes {dropped} peer(s) \
+                         the one held did: they are admitted again",
+                        list.number
+                    );
+                }
                 state.lists.insert(list.issuer, list);
             }
         }
