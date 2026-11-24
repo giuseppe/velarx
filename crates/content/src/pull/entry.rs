@@ -505,7 +505,7 @@ impl FileUse {
     pub fn of_toc(toc: &Toc) -> Vec<FileUse> {
         toc.entries
             .iter()
-            .filter(|e| e.entry_type == velarx_storage::TocEntryType::Reg && e.size > 0)
+            .filter(|e| e.has_content())
             .filter_map(|e| {
                 e.content_key().map(|digest| FileUse {
                     digest,

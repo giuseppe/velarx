@@ -43,7 +43,7 @@ pub struct LazyLayer {
 pub fn without_verity(toc: &Toc) -> Option<&TocEntry> {
     toc.entries
         .iter()
-        .find(|e| e.entry_type == TocEntryType::Reg && e.size > 0 && e.fsverity.is_none())
+        .find(|e| e.has_content() && e.fsverity.is_none())
 }
 
 /// File contents made of zeros: the headers of a tar-split are read without

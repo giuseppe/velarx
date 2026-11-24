@@ -12,7 +12,7 @@
 //! the layer, up to the setting.
 
 use std::collections::{HashMap, HashSet};
-use velarx_storage::{Toc, TocEntryType};
+use velarx_storage::Toc;
 
 /// How much is fetched with a missed file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,16 +57,17 @@ const LOOK_FACTOR: usize = 8;
 /// (its first entry): a file found at once, not by walking the table.
 pub fn file_positions(toc: &Toc) -> HashMap<String, usize> {
     let mut at = HashMap::new();
-    for (i, e) in toc.entries.iter().enumerate().filter(|(_, e)| is_file(e)) {
+    for (i, e) in toc
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.has_content())
+    {
         if let Some(d) = e.verity() {
             at.entry(d).or_insert(i);
         }
     }
     at
-}
-
-fn is_file(e: &velarx_storage::TocEntry) -> bool {
-    e.entry_type == TocEntryType::Reg && e.size > 0
 }
 
 /// The directory of an entry.
@@ -105,7 +106,7 @@ pub fn select(
         if out.len() >= window.files {
             break;
         }
-        if !is_file(e) || parent(&e.name) != dir {
+        if !e.has_content() || parent(&e.name) != dir {
             continue;
         }
         let Some(d) = e.verity() else {
@@ -165,7 +166,7 @@ pub fn follow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use velarx_storage::TocEntry;
+    use velarx_storage::{TocEntry, TocEntryType};
 
     fn entry(name: &str, kind: TocEntryType, size: u64, d: Option<&str>) -> TocEntry {
         TocEntry {

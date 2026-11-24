@@ -571,7 +571,7 @@ fn object(src: &TocSource<'_>, e: &TocEntry) -> io::Result<File> {
 pub fn verify_objects(toc: &Toc, src: &TocSource<'_>) -> io::Result<()> {
     let mut seen = std::collections::HashSet::new();
     for e in &toc.entries {
-        if e.entry_type != TocEntryType::Reg || e.size == 0 {
+        if !e.has_content() {
             continue;
         }
         if let Some(d) = e.verity() {
@@ -599,7 +599,7 @@ pub fn verify_objects(toc: &Toc, src: &TocSource<'_>) -> io::Result<()> {
 pub fn missing_objects(toc: &Toc, store: &FileStore, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
     for e in &toc.entries {
-        if e.entry_type != TocEntryType::Reg || e.size == 0 {
+        if !e.has_content() {
             continue;
         }
         match e.verity() {

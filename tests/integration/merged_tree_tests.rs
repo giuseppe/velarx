@@ -87,7 +87,7 @@ fn seen(e: &TocEntry) -> Seen {
             String::new()
         },
         rdev: (e.dev_major.unwrap_or(0), e.dev_minor.unwrap_or(0)),
-        digest: if e.entry_type == TocEntryType::Reg && e.size > 0 {
+        digest: if e.has_content() {
             e.verity().unwrap_or_default()
         } else {
             String::new()

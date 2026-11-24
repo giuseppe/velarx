@@ -164,6 +164,11 @@ impl TocEntry {
         toc_time(self.mod_time.as_deref()).unwrap_or((0, 0))
     }
 
+    /// A regular file with content: the kind of entry a pull fetches.
+    pub fn has_content(&self) -> bool {
+        self.entry_type == TocEntryType::Reg && self.size > 0
+    }
+
     /// The object digest (`sha256:HEX`) the TOC gives for the file, if it
     /// gives one of the kind the store uses.
     pub fn verity(&self) -> Option<String> {
@@ -216,7 +221,7 @@ impl Toc {
         let mut seen = std::collections::HashSet::new();
         self.entries
             .iter()
-            .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+            .filter(|e| e.has_content())
             .filter_map(|e| e.verity())
             .filter(|d| seen.insert(d.clone()))
             .collect()
@@ -251,7 +256,7 @@ impl Toc {
 pub fn size_conflict(entries: &[TocEntry]) -> Option<(usize, String)> {
     let mut sizes: HashMap<Digest, u64> = HashMap::new();
     entries.iter().enumerate().find_map(|(i, e)| {
-        if e.entry_type != TocEntryType::Reg || e.size == 0 {
+        if !e.has_content() {
             return None;
         }
         let key = e.fsverity?;

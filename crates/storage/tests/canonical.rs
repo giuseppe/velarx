@@ -801,7 +801,7 @@ fn random_layer(rng: &mut StdRng) -> (Vec<TocEntry>, Contents) {
     let mut out: Vec<TocEntry> = Vec::new();
     let mut files: Vec<usize> = Vec::new();
     for mut e in entries {
-        if e.entry_type == TocEntryType::Reg && e.size > 0 {
+        if e.has_content() {
             let mut data = vec![0u8; e.size as usize];
             rng.fill(&mut data[..]);
             e.fsverity = to_toc(&fsverity_digest_of(Algorithm::Sha256, &data));

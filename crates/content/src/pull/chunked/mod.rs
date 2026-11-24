@@ -766,7 +766,7 @@ impl TocChunks {
     /// chunk entries), `None` when it has none or they do not cover it.
     fn of(entries: &[TocEntry], i: usize) -> Option<Self> {
         let e = entries.get(i)?;
-        if e.entry_type != TocEntryType::Reg || e.size == 0 || e.chunk_digest.is_none() {
+        if !e.has_content() || e.chunk_digest.is_none() {
             return None;
         }
         let key = e.content_key()?;
@@ -983,7 +983,7 @@ pub(crate) fn make_plan(
     let mut plan = Plan::new(alg);
     let mut seen: HashSet<String> = HashSet::new();
     for (i, e) in toc.entries.iter().enumerate() {
-        if e.entry_type != TocEntryType::Reg || e.size == 0 {
+        if !e.has_content() {
             continue;
         }
         // (an fs-verity digest of the other algorithm than the layer's is
@@ -2333,7 +2333,7 @@ async fn unpack_by_index(
         // files the store, the session of the pull and its parent lack
         let (mut total, mut seen, mut missing) = (0u64, HashSet::new(), Vec::new());
         for e in &toc.entries {
-            if e.entry_type != TocEntryType::Reg || e.size == 0 {
+            if !e.has_content() {
                 continue;
             }
             let (Some(_), Some(object)) = (&e.digest, e.verity()) else {
@@ -2691,7 +2691,7 @@ pub fn file_chunks(
     let e = toc
         .entries
         .get(at)
-        .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+        .filter(|e| e.has_content())
         .ok_or_else(|| fail(format!("entry {at} of the table is no regular file")))?;
     let mut plan = Plan::new(alg);
     plan_file(&mut plan, &toc.entries, at, blob_size, max_chunk)?;

@@ -400,11 +400,7 @@ impl<'a> Layers<'a> {
     fn contents(&self) -> HashMap<String, (usize, u64)> {
         let mut at = HashMap::new();
         for (layer, toc) in self.tocs.iter().enumerate() {
-            for e in toc
-                .entries
-                .iter()
-                .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
-            {
+            for e in toc.entries.iter().filter(|e| e.has_content()) {
                 if let Some(d) = e.verity() {
                     at.entry(d).or_insert((layer, e.size));
                 }

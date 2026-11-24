@@ -163,7 +163,7 @@ impl Feed {
             let toc = index.toc_z.to_vec();
             let mut keys = HashMap::new();
             for e in &index.toc.entries {
-                if e.entry_type == velarx_storage::TocEntryType::Reg && e.size > 0 {
+                if e.has_content() {
                     if let Some(k) = e.content_key() {
                         keys.insert(k, e.size);
                     }

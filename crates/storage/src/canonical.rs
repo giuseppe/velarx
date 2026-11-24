@@ -777,7 +777,7 @@ where
             self.buf = header(e, self.count == 0)?;
             self.pos = 0;
             self.count += 1;
-            if e.size > 0 && e.entry_type == TocEntryType::Reg {
+            if e.has_content() {
                 self.content = Some(((self.open)(e)?, e.size, padding(e.size)));
             }
         }
@@ -815,7 +815,7 @@ pub fn write<W: Write>(
         head.clear();
         headers(&Fields::of(e).map_err(invalid)?, i == 0, &mut head);
         out.write_all(&head)?;
-        if e.size > 0 && e.entry_type == TocEntryType::Reg {
+        if e.has_content() {
             let mut counted = Counted {
                 out: &mut out,
                 written: 0,

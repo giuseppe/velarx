@@ -894,7 +894,7 @@ impl ImageService {
         let files: Vec<(String, u64)> = toc
             .entries
             .iter()
-            .filter(|e| e.entry_type == velarx_storage::TocEntryType::Reg && e.size > 0)
+            .filter(|e| e.has_content())
             .filter_map(|e| Some((e.verity()?, e.size)))
             .collect();
         let stored_conflict = db.file_size_conflict(files.clone()).await?;

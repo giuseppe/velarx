@@ -444,12 +444,7 @@ impl ImageService {
             let mut tables: Vec<Vec<velarx_plan_core::File>> = Vec::new();
             for layer in l.iter() {
                 let mut table = Vec::new();
-                for e in layer
-                    .toc
-                    .entries
-                    .iter()
-                    .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
-                {
+                for e in layer.toc.entries.iter().filter(|e| e.has_content()) {
                     let d = e.verity().ok_or_else(|| {
                         ImageError::Layer(format!(
                             "layer {}: `{}` has no fs-verity digest in the table",

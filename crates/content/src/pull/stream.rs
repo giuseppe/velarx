@@ -929,7 +929,7 @@ mod tests {
             .toc
             .entries
             .iter()
-            .filter(|e| e.entry_type == velarx_storage::TocEntryType::Reg && e.size > 0)
+            .filter(|e| e.has_content())
             .all(|e| e.verity().is_some() && e.digest.is_some());
         assert!(named);
     }

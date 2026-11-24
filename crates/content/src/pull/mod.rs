@@ -423,7 +423,7 @@ impl LayerDone {
             .collect();
         let mut ids: HashMap<String, String> = HashMap::new();
         for e in &mut Arc::make_mut(&mut self.toc).entries {
-            if e.entry_type != velarx_storage::TocEntryType::Reg || e.size == 0 {
+            if !e.has_content() {
                 continue;
             }
             let id = match (e.verity(), e.digest.as_deref()) {
@@ -722,7 +722,7 @@ pub fn layer_commit(done: &LayerDone, registry_ref: Option<&str>) -> ImageResult
     let mut counts: HashMap<String, (i64, u64)> = HashMap::new();
     if done.files.is_empty() {
         for e in &done.toc.entries {
-            if e.entry_type != velarx_storage::TocEntryType::Reg || e.size == 0 {
+            if !e.has_content() {
                 continue;
             }
             if let Some(d) = e.verity() {

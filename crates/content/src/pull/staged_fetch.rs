@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 use velarx_proto::transfer::{next, Failure, FailureClass, Step};
-use velarx_storage::{Toc, TocEntryType};
+use velarx_storage::Toc;
 use velarx_types::digest::Digest;
 use velarx_types::{ImageError, ImageResult, OciDescriptor};
 
@@ -919,7 +919,7 @@ impl StagedFetch {
             Some(_) => toc
                 .entries
                 .iter()
-                .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0 && e.verity().is_some())
+                .filter(|e| e.has_content() && e.verity().is_some())
                 .filter_map(|e| Some((e.content_key()?, e.name.clone())))
                 .collect(),
             None => Default::default(),

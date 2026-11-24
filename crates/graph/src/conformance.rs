@@ -1633,9 +1633,11 @@ pub async fn pull_check_sees_the_layers_first(f: &Factory) {
                 *seen2.lock().unwrap() = Some((
                     layers.iter().map(|l| l.key).collect::<Vec<_>>(),
                     // (settled: the files have the names of what they hold)
-                    layers[0].toc.entries.iter().all(|e| {
-                        e.entry_type != TocEntryType::Reg || e.size == 0 || e.verity().is_some()
-                    }),
+                    layers[0]
+                        .toc
+                        .entries
+                        .iter()
+                        .all(|e| !e.has_content() || e.verity().is_some()),
                     driver.usage().unwrap(),
                     // (the feed was ended before the files were committed)
                     meddle.finished.load(std::sync::atomic::Ordering::Relaxed),
@@ -1822,7 +1824,7 @@ pub async fn a_refusal_of_the_engine_leaves_nothing_visible(f: &Factory) {
                 *files.lock().unwrap() = layers
                     .iter()
                     .flat_map(|l| l.toc.entries.iter())
-                    .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+                    .filter(|e| e.has_content())
                     .filter_map(|e| Some((e.content_key()?, e.size)))
                     .collect();
                 Err(ImageError::Manifest("the manifest says no".into()))
@@ -2198,7 +2200,7 @@ pub async fn a_feed_writes_into_the_files_a_driver_hands_over(f: &Factory) {
         .toc
         .entries
         .iter()
-        .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+        .filter(|e| e.has_content())
         .map(|e| (e.content_key().unwrap(), e.size))
         .collect();
     assert_eq!(keys.len(), 3);
@@ -2266,12 +2268,7 @@ pub async fn a_feed_writes_into_the_files_a_driver_hands_over(f: &Factory) {
     want.sort();
     assert_eq!(got, want, "every object was told whole");
     // the bytes are in the places, and they are the files of the layer
-    for e in index
-        .toc
-        .entries
-        .iter()
-        .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
-    {
+    for e in index.toc.entries.iter().filter(|e| e.has_content()) {
         let (file, base, size) = &places[&e.content_key().unwrap()];
         let mut bytes = vec![0u8; *size as usize];
         file.read_exact_at(&mut bytes, *base).unwrap();
@@ -2808,7 +2805,7 @@ pub async fn a_feed_writes_a_layer_read_whole_into_the_files_a_driver_hands_over
         .toc
         .entries
         .iter()
-        .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+        .filter(|e| e.has_content())
         .map(|e| (e.content_key().unwrap(), e.size, e.name.clone()))
         .collect();
     assert_eq!(entries.len(), 3);
@@ -2952,7 +2949,7 @@ pub async fn a_feed_writes_a_layer_read_whole_into_the_files_a_driver_hands_over
         .toc
         .entries
         .iter()
-        .find(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+        .find(|e| e.has_content())
         .and_then(|e| e.content_key())
         .expect("the key of the file");
     let dirty = tempfile::tempfile().unwrap();
@@ -3017,7 +3014,7 @@ pub async fn a_layer_read_whole_tells_its_holes_and_frees_its_spool(f: &Factory)
         .toc
         .entries
         .iter()
-        .find(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+        .find(|e| e.has_content())
         .and_then(|e| e.content_key())
         .expect("the key of the file");
     let spools = || {
@@ -4284,7 +4281,7 @@ pub async fn a_lazy_pull_is_staged_by_the_engine_and_completed_into_the_driver(f
         .toc
         .entries
         .iter()
-        .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+        .filter(|e| e.has_content())
         .filter_map(|e| {
             Some(ObjectRange {
                 key: e.content_key()?,
@@ -7001,7 +6998,7 @@ mod feed_tests {
             .toc
             .entries
             .iter()
-            .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
+            .filter(|e| e.has_content())
             .filter_map(|e| e.content_key())
             .filter(|k| !store.contains(k))
             .collect()
@@ -7024,12 +7021,7 @@ mod feed_tests {
         feed.begin(&SessionIncoming::of(session)).await.unwrap();
         let index = feed.index(&l2).await.unwrap().expect("an index");
         assert_eq!(
-            index
-                .toc
-                .entries
-                .iter()
-                .filter(|e| e.entry_type == TocEntryType::Reg && e.size > 0)
-                .count(),
+            index.toc.entries.iter().filter(|e| e.has_content()).count(),
             2
         );
         assert!(!index.tarsplit.is_empty());

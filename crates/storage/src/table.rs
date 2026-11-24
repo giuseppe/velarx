@@ -936,7 +936,7 @@ pub fn encode(toc: &Toc, alg: Algorithm) -> Result<Vec<u8>, String> {
     let mut files: BTreeMap<Vec<u8>, Placed> = BTreeMap::new();
     for &i in &tar_order {
         let e = &entries[i];
-        if e.entry_type != TocEntryType::Reg || e.size == 0 {
+        if !e.has_content() {
             continue;
         }
         let key = verity(e)?.raw().to_vec();

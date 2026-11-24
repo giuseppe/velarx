@@ -5,7 +5,7 @@
 
 pub use velarx_tarsplit::*;
 
-use velarx_storage::{Toc, TocEntryType};
+use velarx_storage::Toc;
 
 /// The regular files of `toc`, in the order of the layer, by the key their
 /// content is found by: the fs-verity digest of the file, or the sha256 of
@@ -13,7 +13,7 @@ use velarx_storage::{Toc, TocEntryType};
 /// pulled).  The slot of a file is the index of its TOC entry.
 pub fn content_index(toc: &Toc) -> ContentIndex {
     ContentIndex::new(toc.entries.iter().enumerate().filter_map(|(slot, e)| {
-        if e.entry_type != TocEntryType::Reg || e.size == 0 {
+        if !e.has_content() {
             return None;
         }
         Some(ContentFile {

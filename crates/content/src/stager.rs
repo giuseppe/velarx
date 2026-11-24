@@ -533,7 +533,7 @@ impl LayerToc {
         };
         let mut at = std::collections::HashMap::new();
         for (i, e) in toc.entries.iter().enumerate() {
-            if e.entry_type == velarx_storage::TocEntryType::Reg && e.size > 0 {
+            if e.has_content() {
                 if let Some((k, _)) = name_of(e) {
                     at.entry(k).or_insert(i);
                 }
