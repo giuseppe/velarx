@@ -773,10 +773,12 @@ impl ImageService {
         image_ref: &ImageReference,
     ) -> ImageResult<Vec<velarx_signature::PolicyRequirement>> {
         let requirements = self.requirements_of(image_ref)?;
-        if let Some(why) = velarx_signature::evaluate::refusal(&requirements) {
+        use velarx_signature::evaluate::{precheck, refusal, Mode, Pre};
+        if let Pre::Refuse { why, .. } = precheck(Mode::Whole, &requirements) {
             return Err(ImageError::Registry(format!(
-                "{}: the signature policy {why}",
-                image_ref.name()
+                "{}: the signature policy {}",
+                image_ref.name(),
+                refusal(why)
             )));
         }
         Ok(requirements)
@@ -816,7 +818,8 @@ impl ImageService {
     /// signatures (search, manifest lists, a copy between registries): an
     /// image whose policy requires signatures is refused, failing closed.
     pub(super) fn check_policy(&self, image_ref: &ImageReference) -> ImageResult<()> {
-        if velarx_signature::evaluate::needs_signatures(&self.policy_for(image_ref)?) {
+        use velarx_signature::evaluate::{needs_signatures, Mode};
+        if needs_signatures(Mode::Whole, &self.policy_for(image_ref)?) {
             return Err(ImageError::Registry(format!(
                 "the signature policy requires {} to be signed, and this operation does not verify signatures",
                 image_ref.name()

@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, info};
+use velarx_policy_core::select;
 
 /// Largest policy.json read.
 const MAX_POLICY_SIZE: u64 = 4 << 20;
@@ -282,40 +283,16 @@ impl SignaturePolicy {
         let Some(scopes) = self.transports.get(transport) else {
             return ("the default".to_string(), &self.default);
         };
-        let name = reference.name();
-        let full = match (&reference.digest, &reference.tag) {
-            (Some(d), _) => Some(format!("{name}@{d}")),
-            (None, Some(t)) => Some(format!("{name}:{t}")),
-            _ => None,
-        };
-        let mut candidates: Vec<String> = full.into_iter().collect();
-        let mut n = name.as_str();
-        loop {
-            candidates.push(n.to_string());
-            match n.rsplit_once('/') {
-                Some((parent, _)) => n = parent,
-                None => break,
-            }
-        }
-        // (the port is not part of what `*.domain` matches)
-        let host = reference
-            .domain
-            .split_once(':')
-            .map_or(reference.domain.as_str(), |(h, _)| h);
-        candidates.extend(
-            host.match_indices('.')
-                .map(|(i, _)| format!("*{}", &host[i..])),
-        );
-        candidates.push(String::new());
-        for scope in candidates {
-            if let Some(reqs) = scopes.get(&scope) {
-                debug!("Policy scope `{scope}` applies to {name}");
-                let scope = match scope.is_empty() {
-                    true => format!("the default of the {transport} transport"),
-                    false => format!("scope {scope}"),
-                };
-                return (scope, reqs);
-            }
+        let keys: Vec<&String> = scopes.keys().collect();
+        let bytes: Vec<Vec<u8>> = keys.iter().map(|k| k.as_bytes().to_vec()).collect();
+        if let Some(i) = select(&bytes, &reference.to_core()) {
+            let scope = keys[i];
+            debug!("Policy scope `{scope}` applies to {}", reference.name());
+            let scope_name = match scope.is_empty() {
+                true => format!("the default of the {transport} transport"),
+                false => format!("scope {scope}"),
+            };
+            return (scope_name, &scopes[scope]);
         }
         ("the default".to_string(), &self.default)
     }

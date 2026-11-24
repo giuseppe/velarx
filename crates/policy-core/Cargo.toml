@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-policy-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The decision of a signature policy: which scope applies, and whether the signatures of an image satisfy its requirements"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on bytes and vectors: no dependency, no I/O, no clock.  The
+# shell that reads policy.json, loads the keys, checks the signatures and
+# writes the messages is `velarx-signature`, and `velarx-core` for the
+# pull and the create.
+
+[lib]
+name = "velarx_policy_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

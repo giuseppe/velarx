@@ -10,6 +10,8 @@ use super::policy::{FulcioConfig, KeyType, PkiConfig, PolicyRequirement};
 use super::reference::{DockerRef, SignedIdentity};
 use super::sigstore::{self, Signature, TrustRoot};
 use base64::Engine;
+use velarx_policy_core::{decide, Fact, Item, Outcome, Rule};
+pub use velarx_policy_core::{Mode, Pre, Why};
 
 /// Largest key, keyring or certificate file read.
 const MAX_KEY_FILE: u64 = 4 << 20;
@@ -46,87 +48,92 @@ pub struct Image<'a> {
 /// containers/image).
 pub const NO_SIGNATURE: &str = "a signature was required, but no signature exists";
 
-/// Why `requirements` refuse an image whatever its signatures: a `reject`,
-/// or a `signedBaseLayer` (which containers/image does not implement
-/// either).
-pub fn refusal(requirements: &[PolicyRequirement]) -> Option<&'static str> {
-    requirements.iter().find_map(|r| match r {
-        PolicyRequirement::Reject => Some("rejects it"),
-        PolicyRequirement::SignedBaseLayer { .. } => {
-            Some("has a signedBaseLayer requirement, which is not implemented")
-        }
-        _ => None,
-    })
-}
-
-/// Whether any of `requirements` needs the signatures of the image.
-pub fn needs_signatures(requirements: &[PolicyRequirement]) -> bool {
-    requirements.iter().any(|r| {
-        matches!(
-            r,
-            PolicyRequirement::SignedBy { .. } | PolicyRequirement::SigstoreSigned { .. }
-        )
-    })
-}
-
-/// The signature requirements of `requirements` only (signedBy,
-/// sigstoreSigned).
-pub fn signature_requirements(requirements: &[PolicyRequirement]) -> Vec<PolicyRequirement> {
-    requirements
+/// What `requirements` say of an image before any signature is read, as
+/// `mode` judges it.
+pub fn precheck(mode: Mode, requirements: &[PolicyRequirement]) -> Pre {
+    let kinds: Vec<Item> = requirements
         .iter()
-        .filter(|r| needs_signatures(std::slice::from_ref(*r)))
-        .cloned()
-        .collect()
+        .map(|r| match r {
+            PolicyRequirement::InsecureAcceptAnything => Item::AcceptAnything,
+            PolicyRequirement::Reject => Item::Reject,
+            PolicyRequirement::SignedBaseLayer { .. } => Item::Unimplemented,
+            PolicyRequirement::SignedBy { .. } | PolicyRequirement::SigstoreSigned { .. } => {
+                Item::Signed(Rule::Nothing, Vec::new())
+            }
+        })
+        .collect();
+    velarx_policy_core::precheck(mode, &kinds)
+}
+
+/// Whether the signatures matter to the image, as `mode` judges: false only
+/// when the requirements accept it whatever they are (what refuses fails
+/// closed, as a caller that fetches nothing must not take it as "no").
+pub fn needs_signatures(mode: Mode, requirements: &[PolicyRequirement]) -> bool {
+    !matches!(precheck(mode, requirements), Pre::Accept)
+}
+
+/// What a refusal before any signature is read says, to follow "the
+/// signature policy" (containers/image does not implement `signedBaseLayer`
+/// either).  `Empty`, `Unusable` and `NoSignature` cannot come from the
+/// pre-check: a list is never empty here (the policy refuses it when it is
+/// read), and whether a key is usable or a signature exists is known only
+/// when the signatures are read.
+pub fn refusal(why: Why) -> &'static str {
+    match why {
+        Why::Rejected => "rejects it",
+        Why::Unimplemented => "has a signedBaseLayer requirement, which is not implemented",
+        Why::NotSigned => "accepts it without a signature",
+        Why::Empty => "has no requirement",
+        Why::Unusable | Why::NoSignature => "has a requirement that is not satisfied",
+    }
 }
 
 /// Ok when every requirement accepts `image` at `now` (seconds since the
 /// epoch); else why one does not.
 #[cfg(test)]
 fn allows(requirements: &[PolicyRequirement], image: &Image, now: i64) -> Result<(), String> {
-    accepted(requirements, image, now).map(|_| ())
+    accepted(Mode::Whole, requirements, image, now).map(|_| ())
 }
 
-/// Like `allows`, with the indexes in `image.signatures` of the signatures
-/// that satisfied the signature requirements.
+/// Like `allows` as `mode` judges, with the indexes in `image.signatures`
+/// of the signatures that satisfied the signature requirements.
 pub fn accepted(
+    mode: Mode,
     requirements: &[PolicyRequirement],
     image: &Image,
     now: i64,
 ) -> Result<Vec<usize>, String> {
-    accepted_at(requirements, image, now).map(|(used, _)| used)
+    accepted_at(mode, requirements, image, now).map(|(used, _)| used)
+}
+
+/// What a signature requirement that cannot be used is, and why.
+fn unusable(why: String) -> (Item, String) {
+    (Item::Unusable, why)
 }
 
 /// Like `accepted`, with when the image was signed: for each requirement
 /// its newest signature, and of those the oldest time (0 when none needs
 /// a signature).
 pub fn accepted_at(
+    mode: Mode,
     requirements: &[PolicyRequirement],
     image: &Image,
     now: i64,
 ) -> Result<(Vec<usize>, i64), String> {
-    if requirements.is_empty() {
-        return Err("no requirement applies".into());
-    }
-    let mut used: Vec<(usize, i64)> = Vec::new();
+    // (with each requirement, why no signature satisfies it)
+    let (mut items, mut notes) = (Vec::new(), Vec::new());
     for r in requirements {
-        match r {
-            PolicyRequirement::InsecureAcceptAnything => {}
-            PolicyRequirement::Reject => {
-                return Err(format!(
-                    "{} is rejected by policy",
-                    image.reference.string()
-                ))
-            }
-            PolicyRequirement::SignedBaseLayer { .. } => {
-                return Err("signedBaseLayer requirements are not implemented".into())
-            }
+        let (item, note) = match r {
+            PolicyRequirement::InsecureAcceptAnything => (Item::AcceptAnything, String::new()),
+            PolicyRequirement::Reject => (Item::Reject, String::new()),
+            PolicyRequirement::SignedBaseLayer { .. } => (Item::Unimplemented, String::new()),
             PolicyRequirement::SignedBy {
                 key_type,
                 key_path,
                 key_paths,
                 key_data,
                 signed_identity,
-            } => used.push(signed_by(
+            } => signed_by(
                 *key_type,
                 key_path.as_deref(),
                 key_paths.as_deref(),
@@ -134,7 +141,8 @@ pub fn accepted_at(
                 signed_identity.as_ref(),
                 image,
                 now,
-            )?),
+            )
+            .unwrap_or_else(unusable),
             PolicyRequirement::SigstoreSigned {
                 key_path,
                 key_paths,
@@ -147,48 +155,53 @@ pub fn accepted_at(
                 rekor_public_key_datas,
                 pki,
                 signed_identity,
-            } => {
-                let root = (|| -> Result<TrustRoot, String> {
-                    let keys = sources(
-                        key_path.as_deref(),
-                        key_paths.as_deref(),
-                        key_data.as_deref(),
-                        key_datas.as_deref(),
-                    )?;
-                    let rekor = sources(
-                        rekor_public_key_path.as_deref(),
-                        rekor_public_key_paths.as_deref(),
-                        rekor_public_key_data.as_deref(),
-                        rekor_public_key_datas.as_deref(),
-                    )?;
-                    Ok(TrustRoot {
-                        public_keys: keys
-                            .iter()
-                            .map(|k| sigstore::public_key_from_pem(k).map_err(|e| e.0))
-                            .collect::<Result<_, _>>()?,
-                        fulcio: fulcio.as_deref().map(fulcio_root).transpose()?,
-                        rekor_keys: rekor
-                            .iter()
-                            .map(|k| sigstore::public_key_from_pem(k).map_err(|e| e.0))
-                            .collect::<Result<_, _>>()?,
-                        pki: pki.as_deref().map(pki_root).transpose()?,
-                    })
-                })()?;
+            } => (|| {
+                let keys = sources(
+                    key_path.as_deref(),
+                    key_paths.as_deref(),
+                    key_data.as_deref(),
+                    key_datas.as_deref(),
+                )?;
+                let rekor = sources(
+                    rekor_public_key_path.as_deref(),
+                    rekor_public_key_paths.as_deref(),
+                    rekor_public_key_data.as_deref(),
+                    rekor_public_key_datas.as_deref(),
+                )?;
+                let root = TrustRoot {
+                    public_keys: keys
+                        .iter()
+                        .map(|k| sigstore::public_key_from_pem(k).map_err(|e| e.0))
+                        .collect::<Result<_, _>>()?,
+                    fulcio: fulcio.as_deref().map(fulcio_root).transpose()?,
+                    rekor_keys: rekor
+                        .iter()
+                        .map(|k| sigstore::public_key_from_pem(k).map_err(|e| e.0))
+                        .collect::<Result<_, _>>()?,
+                    pki: pki.as_deref().map(pki_root).transpose()?,
+                };
                 root.check().map_err(|e| e.0)?;
-                used.push(sigstore_signed(
-                    &root,
-                    signed_identity.as_ref(),
-                    image,
-                    now,
-                )?)
-            }
-        }
+                Ok(sigstore_signed(&root, signed_identity.as_ref(), image, now))
+            })()
+            .unwrap_or_else(unusable),
+        };
+        items.push(item);
+        notes.push(note);
     }
-    let signed = used.iter().map(|(_, t)| *t).min().unwrap_or(0);
-    let mut used: Vec<usize> = used.into_iter().map(|(i, _)| i).collect();
-    used.sort_unstable();
-    used.dedup();
-    Ok((used, signed))
+    match decide(mode, &image.reference.to_core(), &items) {
+        Outcome::Accept { mut used, signed } => {
+            used.sort_unstable();
+            used.dedup();
+            Ok((used, signed))
+        }
+        Outcome::Refuse { at, why } => Err(match why {
+            Why::Rejected => format!("{} is rejected by policy", image.reference.string()),
+            Why::Unimplemented => "signedBaseLayer requirements are not implemented".into(),
+            Why::Empty => "no requirement applies".into(),
+            Why::Unusable | Why::NoSignature => std::mem::take(&mut notes[at]),
+            Why::NotSigned => refusal(why).into(),
+        }),
+    }
 }
 
 fn read(path: &str) -> Result<Vec<u8>, String> {
@@ -282,27 +295,39 @@ fn pki_root(p: &PkiConfig) -> Result<sigstore::Pki, String> {
     })
 }
 
-/// The manifest and the reference of a verified payload must be the
-/// image's.
-fn check_payload(
+/// The fact a verified payload is: it must name the manifest and the
+/// reference of the image, and when it does not, the reason is kept in
+/// `rejections`.
+fn payload_fact(
     payload: &sigstore::Payload,
     identity: Option<&SignedIdentity>,
     image: &Image,
-) -> Result<i64, String> {
-    if !image.manifest.has_digest(&payload.manifest_digest) {
-        return Err(format!(
+    rejections: &mut Vec<String>,
+) -> Fact {
+    let digest_matches = image.manifest.has_digest(&payload.manifest_digest);
+    if !digest_matches {
+        rejections.push(format!(
             "signature for digest {} does not match",
             payload.manifest_digest
         ));
-    }
-    let identity = identity.cloned().unwrap_or_default();
-    if !identity.matches(image.reference, &payload.docker_reference) {
-        return Err(format!(
+    } else if !identity
+        .cloned()
+        .unwrap_or_default()
+        .matches(image.reference, &payload.docker_reference)
+    {
+        rejections.push(format!(
             "signature for identity {:?} is not accepted",
             payload.docker_reference
         ));
     }
-    Ok(payload.timestamp)
+    match DockerRef::parse_normalized(&payload.docker_reference) {
+        Ok(signed) => Fact::Verified {
+            digest_matches,
+            signed: signed.to_core(),
+            time: payload.timestamp,
+        },
+        Err(_) => Fact::Unverified,
+    }
 }
 
 /// The summary of the reasons the signatures were refused.
@@ -325,7 +350,7 @@ fn signed_by(
     identity: Option<&SignedIdentity>,
     image: &Image,
     now: i64,
-) -> Result<(usize, i64), String> {
+) -> Result<(Item, String), String> {
     if key_type != KeyType::GpgKeys {
         return Err(format!("unimplemented keyType {key_type:?}"));
     }
@@ -340,24 +365,30 @@ fn signed_by(
     if keys.is_empty() {
         return Err("no public keys imported".into());
     }
-    let (mut rejections, mut newest) = (Vec::new(), None);
-    for (i, sig) in image.signatures.iter().enumerate() {
+    let (mut rejections, mut facts) = (Vec::new(), Vec::new());
+    for sig in image.signatures {
         let Signature::Simple(blob) = sig else {
+            facts.push(Fact::Unverified);
             continue;
         };
         let result = openpgp::verify_message(&keys, blob, u64::try_from(now).unwrap_or(0))
             .map_err(|e| e.0)
             .and_then(|(content, _)| {
                 sigstore::parse_payload(&content, sigstore::SIMPLE_SIGNING_TYPE).map_err(|e| e.0)
-            })
-            .and_then(|payload| check_payload(&payload, identity, image));
-        match result {
-            Ok(signed) if newest.is_none_or(|(_, t)| signed > t) => newest = Some((i, signed)),
-            Ok(_) => {}
-            Err(e) => rejections.push(e),
-        }
+            });
+        facts.push(match result {
+            Ok(payload) => payload_fact(&payload, identity, image, &mut rejections),
+            Err(e) => {
+                rejections.push(e);
+                Fact::Unverified
+            }
+        });
     }
-    newest.ok_or_else(|| summary(rejections, NO_SIGNATURE.into()))
+    let rule = identity.cloned().unwrap_or_default().rule(image.reference);
+    Ok((
+        Item::Signed(rule, facts),
+        summary(rejections, NO_SIGNATURE.into()),
+    ))
 }
 
 fn sigstore_signed(
@@ -365,37 +396,35 @@ fn sigstore_signed(
     identity: Option<&SignedIdentity>,
     image: &Image,
     now: i64,
-) -> Result<(usize, i64), String> {
-    let (mut rejections, mut newest) = (Vec::new(), None);
+) -> (Item, String) {
+    let (mut rejections, mut facts) = (Vec::new(), Vec::new());
     let (mut others, mut attachments) = (0, 0);
-    for (i, sig) in image.signatures.iter().enumerate() {
+    for sig in image.signatures {
         let Signature::Sigstore(s) = sig else {
             others += 1;
+            facts.push(Fact::Unverified);
             continue;
         };
         if s.mime_type != sigstore::SIGSTORE_MEDIA_TYPE {
             attachments += 1;
+            facts.push(Fact::Unverified);
             continue;
         }
-        let result = root
-            .verify(s, now)
-            .map_err(|e| e.0)
-            .and_then(|payload| check_payload(&payload, identity, image));
-        match result {
-            Ok(signed) if newest.is_none_or(|(_, t)| signed > t) => newest = Some((i, signed)),
-            Ok(_) => {}
-            Err(e) => rejections.push(e),
-        }
-    }
-    if let Some(newest) = newest {
-        return Ok(newest);
+        facts.push(match root.verify(s, now) {
+            Ok(payload) => payload_fact(&payload, identity, image, &mut rejections),
+            Err(e) => {
+                rejections.push(e.0);
+                Fact::Unverified
+            }
+        });
     }
     let none = if others + attachments == 0 {
         NO_SIGNATURE.to_string()
     } else {
         format!("{NO_SIGNATURE} ({others} non-sigstore signatures, {attachments} sigstore non-signature attachments)")
     };
-    Err(summary(rejections, none))
+    let rule = identity.cloned().unwrap_or_default().rule(image.reference);
+    (Item::Signed(rule, facts), summary(rejections, none))
 }
 
 #[cfg(test)]
@@ -443,7 +472,7 @@ mod tests {
             r#"[{{"type": "signedBy", "keyType": "GPGKeys", "keyData": "{}"}}]"#,
             b64(fixture!("key-rsa.gpg"))
         ));
-        assert!(needs_signatures(&r));
+        assert!(needs_signatures(Mode::Whole, &r));
         let sigs = [Signature::Simple(fixture!("msg-rsa.sig").to_vec())];
         let reference = DockerRef::parse_normalized("localhost:5000/signed/image:v1").unwrap();
         // msg-rsa signs a digest no manifest has
@@ -471,6 +500,7 @@ mod tests {
         let mixed = [sigs[0].clone(), good[0].clone()];
         // only the signature that verified is reported, to be kept
         let used = accepted(
+            Mode::Whole,
             &r,
             &Image {
                 reference: &reference,
@@ -604,5 +634,208 @@ mod tests {
             NOW,
         )
         .unwrap();
+    }
+
+    /// A sigstoreSigned requirement of `key`.
+    fn trusting(key: &openssl::pkey::PKey<openssl::pkey::Private>) -> Vec<PolicyRequirement> {
+        reqs(&format!(
+            r#"[{{"type": "sigstoreSigned", "keyData": "{}"}}]"#,
+            b64(&key.public_key_to_pem().unwrap())
+        ))
+    }
+
+    /// A signedBy requirement of the key of the fixtures `keys`.
+    fn trusting_gpg(keys: &[u8]) -> Vec<PolicyRequirement> {
+        reqs(&format!(
+            r#"[{{"type": "signedBy", "keyType": "GPGKeys", "keyData": "{}"}}]"#,
+            b64(keys)
+        ))
+    }
+
+    /// The payload of a sigstore signature for `name`, signed at `time`.
+    fn payload_at(digest: &str, name: &str, time: i64) -> Vec<u8> {
+        String::from_utf8(payload(sigstore::SIGSTORE_TYPE, name))
+            .unwrap()
+            .replace(crate::sigstore::tests::DIGEST, digest)
+            .replace(r#""creator":"test""#, &format!(r#""timestamp":{time}"#))
+            .into_bytes()
+    }
+
+    /// Every requirement of the list must accept the image, in whatever
+    /// order and whatever the kind: a signature of a trusted key for the
+    /// manifest and the name satisfies a requirement, and the signatures
+    /// that satisfied them are the ones reported.  A `reject`, a
+    /// `signedBaseLayer` and a requirement that cannot be used refuse the
+    /// image whatever the signatures.
+    #[test]
+    fn the_requirements_of_a_list_all_have_to_accept() {
+        let (good, other) = (ec_key(), ec_key());
+        let manifest = br#"{"schemaVersion":2}"#;
+        let digest = format!("sha256:{}", hex::encode(openssl::sha::sha256(manifest)));
+        let name = "localhost:5000/signed/image:v1";
+        let reference = DockerRef::parse_normalized(name).unwrap();
+        // the signatures of the image: 0 is by a key of OpenPGP, 1 by `good`
+        let sigs = [
+            Signature::Simple(fixture!("msg-rsa-manifest.sig").to_vec()),
+            Signature::Sigstore(signature(&good, &payload_at(&digest, name, 1), None)),
+        ];
+        let image = Image {
+            reference: &reference,
+            manifest: Manifest::Bytes(manifest),
+            signatures: &sigs,
+        };
+        let gpg = || trusting_gpg(fixture!("key-rsa.gpg"));
+        let gpg_other = || trusting_gpg(fixture!("key-ed.gpg"));
+        let anything = || reqs(r#"[{"type": "insecureAcceptAnything"}]"#);
+        let reject = || reqs(r#"[{"type": "reject"}]"#);
+        let base_layer = || reqs(r#"[{"type": "signedBaseLayer"}]"#);
+        let unusable =
+            || reqs(r#"[{"type": "sigstoreSigned", "keyPath": "/nonexistent/key.pem"}]"#);
+        let cases = vec![
+            ("only insecureAcceptAnything", anything(), Some(vec![])),
+            ("sigstoreSigned", trusting(&good), Some(vec![1])),
+            ("signedBy", gpg(), Some(vec![0])),
+            (
+                "both kinds",
+                [gpg(), trusting(&good)].concat(),
+                Some(vec![0, 1]),
+            ),
+            (
+                "insecureAcceptAnything beside a signature",
+                [anything(), trusting(&good)].concat(),
+                Some(vec![1]),
+            ),
+            (
+                "the same requirement twice",
+                [trusting(&good), trusting(&good)].concat(),
+                Some(vec![1]),
+            ),
+            ("a key that did not sign", trusting(&other), None),
+            ("signedBy of another key", gpg_other(), None),
+            (
+                "one that holds, one that does not",
+                [trusting(&good), trusting(&other)].concat(),
+                None,
+            ),
+            (
+                "one that does not, one that holds",
+                [trusting(&other), trusting(&good)].concat(),
+                None,
+            ),
+            (
+                "signedBy that holds, sigstoreSigned that does not",
+                [gpg(), trusting(&other)].concat(),
+                None,
+            ),
+            ("reject", reject(), None),
+            (
+                "reject after a signature that holds",
+                [trusting(&good), reject()].concat(),
+                None,
+            ),
+            (
+                "reject before a signature that holds",
+                [reject(), trusting(&good)].concat(),
+                None,
+            ),
+            ("signedBaseLayer", base_layer(), None),
+            (
+                "signedBaseLayer beside a signature that holds",
+                [trusting(&good), base_layer()].concat(),
+                None,
+            ),
+            ("a key that cannot be loaded", unusable(), None),
+            (
+                "a key that cannot be loaded, after one that holds",
+                [trusting(&good), unusable()].concat(),
+                None,
+            ),
+            ("no requirement", Vec::new(), None),
+        ];
+        for (what, requirements, expected) in cases {
+            let got = accepted(Mode::Whole, &requirements, &image, NOW).ok();
+            assert_eq!(got, expected, "{what}");
+        }
+    }
+
+    /// The time an image was signed at is, for each signature requirement,
+    /// its newest signature, and of those the oldest; 0 when no requirement
+    /// needs a signature.
+    #[test]
+    fn the_time_of_signing_is_the_oldest_of_the_newest_of_each_requirement() {
+        let (first, second) = (ec_key(), ec_key());
+        let name = "quay.io/a/b:v1";
+        let reference = DockerRef::parse_normalized(name).unwrap();
+        let digest = crate::sigstore::tests::DIGEST;
+        let sigs = [
+            Signature::Sigstore(signature(&first, &payload_at(digest, name, 100), None)),
+            Signature::Sigstore(signature(&first, &payload_at(digest, name, 300), None)),
+            Signature::Sigstore(signature(&second, &payload_at(digest, name, 200), None)),
+        ];
+        let image = Image {
+            reference: &reference,
+            manifest: Manifest::Digest(digest),
+            signatures: &sigs,
+        };
+        let both = [trusting(&first), trusting(&second)].concat();
+        assert_eq!(
+            accepted_at(Mode::Whole, &both, &image, NOW).unwrap(),
+            (vec![1, 2], 200)
+        );
+        assert_eq!(
+            accepted_at(Mode::Whole, &trusting(&first), &image, NOW).unwrap(),
+            (vec![1], 300)
+        );
+        let anything = reqs(r#"[{"type": "insecureAcceptAnything"}]"#);
+        assert_eq!(
+            accepted_at(Mode::Whole, &anything, &image, NOW).unwrap(),
+            (vec![], 0)
+        );
+    }
+
+    /// What each kind of requirement says before any signature is fetched,
+    /// as a pull and as the create of a stored image judge it.
+    #[test]
+    fn the_kinds_of_requirement_say_what_they_need_before_the_signatures() {
+        let said = |mode, r: &[PolicyRequirement]| match precheck(mode, r) {
+            Pre::Accept => "accepts".to_string(),
+            Pre::NeedsSignatures => "needs signatures".to_string(),
+            Pre::Refuse { at, why } => format!("{at}: {}", refusal(why)),
+        };
+        for (json, pull, create) in [
+            (
+                r#"{"type": "insecureAcceptAnything"}"#,
+                "accepts",
+                "accepts",
+            ),
+            (r#"{"type": "reject"}"#, "0: rejects it", "accepts"),
+            (
+                r#"{"type": "signedBaseLayer"}"#,
+                "0: has a signedBaseLayer requirement, which is not implemented",
+                "accepts",
+            ),
+            (
+                r#"{"type": "signedBy", "keyType": "GPGKeys", "keyPath": "/k"}"#,
+                "needs signatures",
+                "needs signatures",
+            ),
+            (
+                r#"{"type": "sigstoreSigned", "keyPath": "/k"}"#,
+                "needs signatures",
+                "needs signatures",
+            ),
+        ] {
+            let r = reqs(&format!("[{json}]"));
+            assert_eq!(said(Mode::Whole, &r), pull, "{json}");
+            assert_eq!(said(Mode::SignaturesOnly, &r), create, "{json}");
+        }
+        // the first of a mixed list that refuses says why
+        let mixed = reqs(
+            r#"[{"type": "sigstoreSigned", "keyPath": "/a"}, {"type": "reject"},
+                {"type": "insecureAcceptAnything"}, {"type": "signedBy", "keyType": "GPGKeys", "keyPath": "/b"}]"#,
+        );
+        assert!(needs_signatures(Mode::Whole, &mixed));
+        assert_eq!(said(Mode::Whole, &mixed), "1: rejects it");
+        assert_eq!(said(Mode::SignaturesOnly, &mixed), "needs signatures");
     }
 }

@@ -4,6 +4,8 @@
 //! default registry, `library/`), with or without a tag or a digest, and
 //! the `signedIdentity` rules of policy.json.
 
+use velarx_policy_core::{covers, identity_matches, Ref, Rule};
+
 /// A normalized reference: `domain/path[:tag][@digest]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockerRef {
@@ -203,20 +205,14 @@ impl DockerRef {
     pub fn name_only(&self) -> bool {
         self.tag.is_none() && self.digest.is_none()
     }
-}
 
-/// `matchRepoDigestOrExact`: the same reference when the image is asked
-/// by tag, the same repository when it is asked by digest.
-fn repo_digest_or_exact(intended: &DockerRef, signed: &DockerRef) -> bool {
-    if signed.name_only() {
-        return false;
-    }
-    if intended.tag.is_some() {
-        signed.string() == intended.string()
-    } else if intended.digest.is_some() {
-        signed.name() == intended.name()
-    } else {
-        false
+    /// The reference as the decision of velarx-policy-core has it.
+    pub fn to_core(&self) -> Ref {
+        Ref {
+            name: self.name().into_bytes(),
+            tag: self.tag.clone().map(String::into_bytes),
+            digest: self.digest.clone().map(String::into_bytes),
+        }
     }
 }
 
@@ -244,55 +240,48 @@ pub enum SignedIdentity {
     },
 }
 
-/// Whether `name` starts with `prefix` as a whole host or path component.
-fn has_prefix(name: &str, prefix: &str) -> bool {
-    name == prefix || (name.starts_with(prefix) && name.as_bytes().get(prefix.len()) == Some(&b'/'))
-}
-
 impl SignedIdentity {
-    /// Whether a signature for `signed` is a signature for the image the
-    /// user asked as `intended`.
-    pub fn matches(&self, intended: &DockerRef, signed: &str) -> bool {
-        let Ok(signed) = DockerRef::parse_normalized(signed) else {
-            return false;
-        };
+    /// The rule of velarx-policy-core for the image asked by `intended`.
+    /// One that cannot be a reference (a reference that does not parse, a
+    /// prefix replaced by what is not one as written) matches nothing.
+    pub fn rule(&self, intended: &DockerRef) -> Rule {
+        let reference = |r: &str| DockerRef::parse_normalized(r).map(|r| r.to_core());
         match self {
-            SignedIdentity::MatchExact => {
-                !intended.name_only() && !signed.name_only() && signed.string() == intended.string()
-            }
-            SignedIdentity::MatchRepoDigestOrExact => repo_digest_or_exact(intended, &signed),
-            SignedIdentity::MatchRepository => signed.name() == intended.name(),
+            SignedIdentity::MatchExact => Rule::Exact,
+            SignedIdentity::MatchRepoDigestOrExact => Rule::RepoDigestOrExact,
+            SignedIdentity::MatchRepository => Rule::Repository,
             SignedIdentity::ExactReference { docker_reference } => {
-                match DockerRef::parse_normalized(docker_reference) {
-                    Ok(r) => !r.name_only() && !signed.name_only() && signed.string() == r.string(),
-                    Err(_) => false,
-                }
+                reference(docker_reference).map_or(Rule::Nothing, Rule::ExactReference)
             }
             SignedIdentity::ExactRepository { docker_repository } => {
-                match DockerRef::parse_normalized(docker_repository) {
-                    Ok(r) => signed.name() == r.name(),
-                    Err(_) => false,
-                }
+                DockerRef::parse_normalized(docker_repository).map_or(Rule::Nothing, |r| {
+                    Rule::ExactRepository(r.name().into_bytes())
+                })
             }
             SignedIdentity::RemapIdentity {
                 prefix,
                 signed_prefix,
-            } => {
-                let mut intended = intended.clone();
-                if has_prefix(&intended.name(), prefix) {
-                    let s = intended
-                        .string()
-                        .replacen(prefix.as_str(), signed_prefix, 1);
-                    // the result must be a reference as it is, not one that
-                    // normalization changes
-                    match DockerRef::parse_normalized(&s) {
-                        Ok(r) if r.string() == s => intended = r,
-                        _ => return false,
-                    }
+            } if covers(prefix.as_bytes(), intended.name().as_bytes()) => {
+                let s = intended
+                    .string()
+                    .replacen(prefix.as_str(), signed_prefix, 1);
+                // the result must be a reference as it is, not one that
+                // normalization changes
+                match DockerRef::parse_normalized(&s) {
+                    Ok(r) if r.string() == s => Rule::Remapped(r.to_core()),
+                    _ => Rule::Nothing,
                 }
-                repo_digest_or_exact(&intended, &signed)
             }
+            SignedIdentity::RemapIdentity { .. } => Rule::RepoDigestOrExact,
         }
+    }
+
+    /// Whether a signature for `signed` is a signature for the image the
+    /// user asked as `intended`.
+    pub fn matches(&self, intended: &DockerRef, signed: &str) -> bool {
+        DockerRef::parse_normalized(signed).is_ok_and(|signed| {
+            identity_matches(&self.rule(intended), &intended.to_core(), &signed.to_core())
+        })
     }
 
     /// Whether the rule is usable: references that parse, prefixes that
@@ -425,5 +414,168 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    const D1: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const D2: &str = "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    /// The references a signature can name, in the order the tables list
+    /// them.
+    fn signed_names() -> [String; 8] {
+        [
+            "quay.io/a/b:v1".into(),
+            "quay.io/a/b:v2".into(),
+            "quay.io/a/b".into(),
+            format!("quay.io/a/b@{D1}"),
+            format!("quay.io/a/b@{D2}"),
+            format!("quay.io/a/b:v1@{D1}"),
+            "quay.io/a/c:v1".into(),
+            "quay.io/a/bb:v1".into(),
+        ]
+    }
+
+    /// The signed references of `signed_names` that the rule accepts for
+    /// the image asked by `intended`, by their index.
+    fn accepted_by(rule: &SignedIdentity, intended: &str) -> Vec<usize> {
+        let intended = r(intended);
+        (0..8)
+            .filter(|i| rule.matches(&intended, &signed_names()[*i]))
+            .collect()
+    }
+
+    /// Each rule against each way of asking: by tag, by digest, by both,
+    /// by the name alone.
+    #[test]
+    fn each_identity_rule_against_each_way_of_asking() {
+        let (tag, digest, both, bare) = (
+            "quay.io/a/b:v1",
+            &format!("quay.io/a/b@{D1}"),
+            &format!("quay.io/a/b:v1@{D1}"),
+            "quay.io/a/b",
+        );
+        let exact = SignedIdentity::MatchExact;
+        assert_eq!(accepted_by(&exact, tag), [0]);
+        assert_eq!(accepted_by(&exact, digest), [3]);
+        assert_eq!(accepted_by(&exact, both), [5]);
+        assert!(accepted_by(&exact, bare).is_empty());
+        // a tag is the same reference, a digest the same repository
+        let default = SignedIdentity::MatchRepoDigestOrExact;
+        assert_eq!(accepted_by(&default, tag), [0]);
+        assert_eq!(accepted_by(&default, digest), [0, 1, 3, 4, 5]);
+        assert_eq!(accepted_by(&default, both), [5]);
+        assert!(accepted_by(&default, bare).is_empty());
+        // the repository, with or without a tag or a digest
+        let repository = SignedIdentity::MatchRepository;
+        for intended in [tag, digest, both, bare] {
+            assert_eq!(accepted_by(&repository, intended), [0, 1, 2, 3, 4, 5]);
+        }
+        // the rules that name the reference or the repository do not look
+        // at the image
+        let reference = SignedIdentity::ExactReference {
+            docker_reference: "quay.io/a/b:v1".into(),
+        };
+        let name_only = SignedIdentity::ExactReference {
+            docker_reference: "quay.io/a/b".into(),
+        };
+        let repo = SignedIdentity::ExactRepository {
+            docker_repository: "quay.io/a/b".into(),
+        };
+        for intended in [tag, digest, both, bare, "quay.io/x/y:z"] {
+            assert_eq!(accepted_by(&reference, intended), [0]);
+            // (a name alone is not a reference: `validate` refuses it, and
+            // it accepts nothing)
+            assert!(accepted_by(&name_only, intended).is_empty());
+            assert_eq!(accepted_by(&repo, intended), [0, 1, 2, 3, 4, 5]);
+        }
+    }
+
+    /// A signature whose reference is not one is for no image, under every
+    /// rule.
+    #[test]
+    fn a_signed_reference_that_does_not_parse_matches_no_rule() {
+        let rules = [
+            SignedIdentity::MatchExact,
+            SignedIdentity::MatchRepoDigestOrExact,
+            SignedIdentity::MatchRepository,
+            SignedIdentity::ExactReference {
+                docker_reference: "quay.io/a/b:v1".into(),
+            },
+            SignedIdentity::ExactRepository {
+                docker_repository: "quay.io/a/b".into(),
+            },
+            SignedIdentity::RemapIdentity {
+                prefix: "quay.io".into(),
+                signed_prefix: "quay.io".into(),
+            },
+        ];
+        for rule in rules {
+            for bad in ["", "Quay.io/A/B:v1", "quay.io/a/b:", "quay.io//a"] {
+                assert!(!rule.matches(&r("quay.io/a/b:v1"), bad), "{rule:?} {bad:?}");
+            }
+        }
+        // and a rule that names a reference that does not parse, none
+        let broken = SignedIdentity::ExactReference {
+            docker_reference: "Not A Reference".into(),
+        };
+        assert!(accepted_by(&broken, "quay.io/a/b:v1").is_empty());
+    }
+
+    fn remap(prefix: &str, signed_prefix: &str) -> SignedIdentity {
+        SignedIdentity::RemapIdentity {
+            prefix: prefix.into(),
+            signed_prefix: signed_prefix.into(),
+        }
+    }
+
+    /// `remapIdentity`: the image's reference with its prefix replaced is
+    /// judged as `matchRepoDigestOrExact` does; an image the prefix is not
+    /// a prefix of is judged as it is.
+    #[test]
+    fn remap_identity_replaces_the_prefix_of_the_image() {
+        let rule = remap("mirror.local/quay", "quay.io");
+        let yes = |intended: &str, signed: &str| rule.matches(&r(intended), signed);
+        // by tag: the same reference after the replacement
+        assert!(yes("mirror.local/quay/a/b:v1", "quay.io/a/b:v1"));
+        assert!(!yes("mirror.local/quay/a/b:v1", "quay.io/a/b:v2"));
+        assert!(!yes("mirror.local/quay/a/b:v1", "quay.io/a/b"));
+        assert!(!yes("mirror.local/quay/a/b:v1", "quay.io/a/c:v1"));
+        // by digest: the same repository after the replacement
+        let digested = format!("mirror.local/quay/a/b@{D1}");
+        assert!(yes(&digested, "quay.io/a/b:anything"));
+        assert!(yes(&digested, &format!("quay.io/a/b@{D2}")));
+        assert!(!yes(&digested, "quay.io/a/c:v1"));
+        // by name alone: nothing names it
+        assert!(!yes("mirror.local/quay/a/b", "quay.io/a/b"));
+        assert!(!yes("mirror.local/quay/a/b", "quay.io/a/b:v1"));
+        // a signature for the mirror itself is not for the image
+        assert!(!yes("mirror.local/quay/a/b:v1", "mirror.local/quay/a/b:v1"));
+        // not a prefix of the image: the image is judged as it is
+        assert!(yes("other.local/a:v1", "other.local/a:v1"));
+        assert!(!yes("other.local/a:v1", "quay.io/a:v1"));
+        // a host is a prefix, and so is a whole name
+        assert!(
+            remap("mirror.local", "quay.io").matches(&r("mirror.local/a/b:v1"), "quay.io/a/b:v1")
+        );
+        assert!(remap("mirror.local/quay/a/b", "quay.io/x/y")
+            .matches(&r("mirror.local/quay/a/b:v1"), "quay.io/x/y:v1"));
+        // a wildcard is never a prefix (`validate` accepts it): the image
+        // is judged as it is
+        let wild = remap("*.local", "quay.io");
+        assert!(wild.validate().is_ok());
+        assert!(wild.matches(&r("mirror.local/a:v1"), "mirror.local/a:v1"));
+        assert!(!wild.matches(&r("mirror.local/a:v1"), "quay.io/a:v1"));
+    }
+
+    /// The reference made by the replacement must be one as it is written:
+    /// one that normalization changes accepts nothing.
+    #[test]
+    fn a_remap_whose_result_is_not_normalized_accepts_nothing() {
+        let rule = remap("mirror.local", "index.docker.io");
+        for signed in ["index.docker.io/a/b:v1", "docker.io/a/b:v1"] {
+            assert!(!rule.matches(&r("mirror.local/a/b:v1"), signed), "{signed}");
+        }
+        // the replacement that is a whole reference as written is fine
+        let rule = remap("mirror.local", "docker.io");
+        assert!(rule.matches(&r("mirror.local/a/b:v1"), "docker.io/a/b:v1"));
     }
 }

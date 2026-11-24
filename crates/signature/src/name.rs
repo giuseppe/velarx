@@ -3,10 +3,11 @@
 //! with the signatures made for it, and a tag is taken from the newest
 //! record that the policy accepts for exactly that name.
 
-use super::evaluate::{self, Image, Manifest};
+use super::evaluate::{self, Image, Manifest, Mode};
 use super::policy::PolicyRequirement;
 use super::reference::{DockerRef, SignedIdentity};
 use super::sigstore::Signature;
+use velarx_policy_core::{pick, Picked, Signed};
 
 /// A manifest digest and the signatures that name it (untrusted: a
 /// peer's claim until the policy has judged them).
@@ -53,44 +54,39 @@ pub fn newest(
     records: Vec<Record>,
     now: i64,
 ) -> Result<Option<Named>, String> {
-    let requirements = exact(&evaluate::signature_requirements(requirements));
-    if requirements.is_empty() {
+    if !evaluate::needs_signatures(Mode::SignaturesOnly, requirements) {
         return Ok(None);
     }
-    let mut best: Option<Named> = None;
-    // (another digest signed at the time of `best`)
-    let mut tie = None;
+    let requirements = exact(requirements);
+    // the records the policy accepts, with when each was signed
+    let mut accepted = Vec::new();
+    let mut signed = Vec::new();
     for record in records {
         let image = Image {
             reference,
             manifest: Manifest::Digest(&record.digest),
             signatures: &record.signatures,
         };
-        let Ok((_, signed)) = evaluate::accepted_at(&requirements, &image, now) else {
-            continue;
-        };
-        match &best {
-            Some(have) if signed < have.signed => continue,
-            Some(have) if signed == have.signed => {
-                if record.digest != have.digest {
-                    tie = Some(record.digest);
-                }
-                continue;
-            }
-            _ => {}
+        if let Ok((_, time)) =
+            evaluate::accepted_at(Mode::SignaturesOnly, &requirements, &image, now)
+        {
+            signed.push(Signed {
+                time,
+                digest: record.digest.as_bytes().to_vec(),
+            });
+            accepted.push(record.digest);
         }
-        tie = None;
-        best = Some(Named {
-            signed,
-            digest: record.digest,
-        });
     }
-    match (best, tie) {
-        (Some(have), Some(other)) => Err(format!(
-            "two records signed at the same time name {} and {other}",
-            have.digest
+    match pick(&signed) {
+        Picked::Nothing => Ok(None),
+        Picked::One(i) => Ok(Some(Named {
+            digest: accepted.swap_remove(i),
+            signed: signed[i].time,
+        })),
+        Picked::Tie(i, j) => Err(format!(
+            "two records signed at the same time name {} and {}",
+            accepted[i], accepted[j]
         )),
-        (best, _) => Ok(best),
     }
 }
 
@@ -222,9 +218,31 @@ mod tests {
             serde_json::from_str(r#"[{"type": "insecureAcceptAnything"}]"#).unwrap();
         let records = || vec![record(&key, (NAME, DIGEST), 10)];
         assert!(newest(&anything, &name, records(), 0).unwrap().is_none());
+        assert!(newest(&[], &name, records(), 0).unwrap().is_none());
         let mixed = [anything, requirements(&key, "")].concat();
         let got = newest(&mixed, &name, records(), 0).unwrap().unwrap();
         assert_eq!(got.digest, DIGEST);
+    }
+
+    /// A record names the tag only when every signature requirement
+    /// accepts it; a `reject` beside them is not a signature requirement.
+    #[test]
+    fn a_record_must_satisfy_every_signature_requirement() {
+        let (first, second) = (ec_key(), ec_key());
+        let name = DockerRef::parse_normalized(NAME).unwrap();
+        let both = [requirements(&first, ""), requirements(&second, "")].concat();
+        let by_first = || record(&first, (NAME, DIGEST), 10);
+        assert!(newest(&both, &name, vec![by_first()], 0).unwrap().is_none());
+        let mut by_both = by_first();
+        by_both
+            .signatures
+            .extend(record(&second, (NAME, DIGEST), 20).signatures);
+        let got = newest(&both, &name, vec![by_both], 0).unwrap().unwrap();
+        // (the oldest of the newest signature of each requirement)
+        assert_eq!((got.digest.as_str(), got.signed), (DIGEST, 10));
+        let rejecting = [requirements(&first, ""), vec![PolicyRequirement::Reject]].concat();
+        let got = newest(&rejecting, &name, vec![by_first()], 0).unwrap();
+        assert_eq!(got.map(|n| n.digest).as_deref(), Some(DIGEST));
     }
 
     #[test]
@@ -251,5 +269,89 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(same.digest, DIGEST);
+    }
+
+    /// Which digest and time a list of (digest, time) names, or the error,
+    /// whatever the order of arrival.
+    fn named_in_every_order(
+        key: &PKey<Private>,
+        list: &[(&str, i64)],
+    ) -> Vec<Result<(String, i64), String>> {
+        let mut orders: Vec<Vec<usize>> = vec![Vec::new()];
+        for _ in list {
+            let mut longer = Vec::new();
+            for order in &orders {
+                for i in (0..list.len()).filter(|i| !order.contains(i)) {
+                    longer.push([order.clone(), vec![i]].concat());
+                }
+            }
+            orders = longer;
+        }
+        orders
+            .iter()
+            .map(|o| {
+                let records = o.iter().map(|&i| record(key, (NAME, list[i].0), list[i].1));
+                newest_of(key, records.collect()).map(|n| n.map(|n| (n.digest, n.signed)).unwrap())
+            })
+            .collect()
+    }
+
+    /// Pins the pick: a record strictly later than the others names the
+    /// tag wherever it arrives, and below it a tie does not matter.
+    #[test]
+    fn a_strictly_later_record_wins_in_every_order() {
+        let key = ec_key();
+        let list = [(DIGEST, 10), (OTHER, 10), (OTHER, 20), (DIGEST, 5)];
+        for got in named_in_every_order(&key, &list) {
+            assert_eq!(got, Ok((OTHER.to_string(), 20)));
+        }
+    }
+
+    /// Pins the pick: a tie of the latest time is an error in every order,
+    /// and a record of the same digest among them does not undo it
+    /// (`A, B, A` at one time).
+    #[test]
+    fn a_tie_at_the_latest_time_is_an_error_in_every_order() {
+        let key = ec_key();
+        for list in [
+            vec![(DIGEST, 10), (OTHER, 10)],
+            vec![(DIGEST, 10), (OTHER, 10), (DIGEST, 10)],
+            vec![(DIGEST, 10), (OTHER, 10), (DIGEST, 5)],
+        ] {
+            for got in named_in_every_order(&key, &list) {
+                let e = got.unwrap_err();
+                assert!(e.contains(DIGEST) && e.contains(OTHER), "{e}");
+            }
+        }
+    }
+
+    /// Pins the pick: equal records of one time name that digest in every
+    /// order, a record refused by the policy takes no part (not even as a
+    /// later one), and no record names nothing.
+    #[test]
+    fn equal_records_name_their_digest_and_refused_ones_take_no_part() {
+        let key = ec_key();
+        let list = [(OTHER, 10), (OTHER, 10), (OTHER, 10)];
+        for got in named_in_every_order(&key, &list) {
+            assert_eq!(got, Ok((OTHER.to_string(), 10)));
+        }
+        let other = ec_key();
+        for records in [
+            vec![
+                record(&other, (NAME, DIGEST), 99),
+                record(&key, (NAME, OTHER), 10),
+                record(&other, (NAME, OTHER), 99),
+            ],
+            vec![
+                record(&key, (NAME, OTHER), 10),
+                record(&other, (NAME, DIGEST), 10),
+            ],
+        ] {
+            let got = newest_of(&key, records).unwrap().unwrap();
+            assert_eq!((got.digest.as_str(), got.signed), (OTHER, 10));
+        }
+        assert!(newest_of(&key, vec![record(&other, (NAME, DIGEST), 10)])
+            .unwrap()
+            .is_none());
     }
 }

@@ -7,7 +7,7 @@
 use super::*;
 use velarx_content::fetcher::fetch::SignedRecord;
 use velarx_content::pull::net::Net;
-use velarx_signature::evaluate::{self, Image, Manifest};
+use velarx_signature::evaluate::{self, Image, Manifest, Mode, Pre, Why};
 use velarx_signature::name;
 use velarx_signature::reference::DockerRef;
 use velarx_signature::registries_d::{self, RegistriesD};
@@ -42,6 +42,7 @@ fn now() -> i64 {
 /// `reference` and `manifest` (their indexes), computed on a blocking
 /// thread, in VERIFY_TIMEOUT at most.
 async fn accepted_blocking(
+    mode: Mode,
     requirements: Vec<PolicyRequirement>,
     reference: DockerRef,
     manifest: Vec<u8>,
@@ -49,6 +50,7 @@ async fn accepted_blocking(
 ) -> ImageResult<Vec<usize>> {
     let job = tokio::task::spawn_blocking(move || {
         evaluate::accepted(
+            mode,
             &requirements,
             &Image {
                 reference: &reference,
@@ -170,7 +172,7 @@ impl ImageService {
             if source == "registry" {
                 return Ok(None);
             }
-            if !evaluate::needs_signatures(requirements) {
+            if !evaluate::needs_signatures(Mode::Whole, requirements) {
                 why = "the signature policy names no key for it, so no signature says what the tag names".into();
                 continue;
             }
@@ -215,7 +217,7 @@ impl ImageService {
         requirements: &[PolicyRequirement],
     ) -> ImageResult<Vec<Signature>> {
         let text = digest.to_string();
-        if !evaluate::needs_signatures(requirements) {
+        if !evaluate::needs_signatures(Mode::Whole, requirements) {
             return Ok(Vec::new());
         }
         let reference = intended(image_ref)?;
@@ -253,6 +255,7 @@ impl ImageService {
                 .any(|s| matches!(s, Signature::Sigstore(_))))
         .then(|| reference.string());
         let used = accepted_blocking(
+            Mode::Whole,
             requirements.to_vec(),
             reference,
             manifest.to_vec(),
@@ -409,33 +412,36 @@ impl ImageService {
                 shown_id(image)
             )));
         }
+        let mode = match judging {
+            SignatureJudging::Policy => Mode::SignaturesOnly,
+            SignatureJudging::Check => Mode::Whole,
+            SignatureJudging::Require(_) => Mode::MustBeSigned,
+        };
         let mut signatures: Option<Vec<Signature>> = None;
         for name in names {
-            let (scope, all) = self.scoped_requirements_of(&name)?;
-            if let Some(why) =
-                evaluate::refusal(&all).filter(|_| judging != SignatureJudging::Policy)
-            {
-                return Err(ImageError::Registry(format!(
-                    "{}: the signature policy ({}) {why} ({scope})",
-                    name.full_name(),
-                    self.policy_location()
-                )));
-            }
-            let requirements = evaluate::signature_requirements(&all);
-            if requirements.is_empty() {
-                if let Some(why) = require {
+            let (scope, requirements) = self.scoped_requirements_of(&name)?;
+            match evaluate::precheck(mode, &requirements) {
+                Pre::Accept => continue,
+                Pre::NeedsSignatures => {}
+                Pre::Refuse { why, .. } => {
+                    let said = match (why, require) {
+                        (Why::NotSigned, Some(because)) => {
+                            format!("accepts it without a signature, and {because}")
+                        }
+                        _ => format!("{} ({scope})", evaluate::refusal(why)),
+                    };
                     return Err(ImageError::Registry(format!(
-                        "{}: the signature policy ({}) accepts it without a signature, and {why}",
+                        "{}: the signature policy ({}) {said}",
                         name.full_name(),
                         self.policy_location()
                     )));
                 }
-                continue;
             }
             if signatures.is_none() {
                 signatures = Some(signatures_of(&pulled)?);
             }
             accepted_blocking(
+                mode,
                 requirements,
                 intended(&name)?,
                 image.manifest.as_bytes().to_vec(),
@@ -815,9 +821,14 @@ mod tests {
         assert_eq!(scope_of(&service, "Quay.io/x/y"), "the default");
     }
 
-    /// The image `quay.io/x/y:1`, as the create and the start judge it.
-    async fn judged(policy: &str, judging: SignatureJudging) -> ImageResult<()> {
-        let (_tmp, service) = with_policy(policy).await;
+    /// The image `quay.io/x/y:1` (its manifest is `{}`), as the create and
+    /// the start judge it, with `signatures` as its pulls found them.
+    async fn judged_with(
+        service: &ImageService,
+        judging: SignatureJudging,
+        names: &[&str],
+        signatures: &[Signature],
+    ) -> ImageResult<()> {
         let manifest = "{}".to_string();
         let digest = Digest::of(velarx_types::digest::Algorithm::Sha256, manifest.as_bytes());
         let image = velarx_db::ImageRecord {
@@ -829,14 +840,37 @@ mod tests {
             created_at: String::new(),
             is_lazy: false,
         };
-        let tags = [ImageTag {
-            repository: "quay.io/x/y".into(),
-            tag: "1".into(),
-            image_id: image.id.clone(),
-        }];
+        let tags: Vec<ImageTag> = names
+            .iter()
+            .map(|name| {
+                let (repository, tag) = name.rsplit_once(':').unwrap();
+                ImageTag {
+                    repository: repository.into(),
+                    tag: tag.into(),
+                    image_id: image.id.clone(),
+                }
+            })
+            .collect();
+        let pulled = match signatures.is_empty() {
+            true => Vec::new(),
+            false => vec![service
+                .pull_record(&ImageReference::parse("quay.io/x/y:1").unwrap(), signatures)
+                .unwrap()],
+        };
         service
-            .verify_pulled("quay.io/x/y:1", &image, &tags, judging, Vec::new())
+            .verify_pulled(
+                names.first().copied().unwrap_or(""),
+                &image,
+                &tags,
+                judging,
+                pulled,
+            )
             .await
+    }
+
+    async fn judged(policy: &str, judging: SignatureJudging) -> ImageResult<()> {
+        let (_tmp, service) = with_policy(policy).await;
+        judged_with(&service, judging, &["quay.io/x/y:1"], &[]).await
     }
 
     #[tokio::test]
@@ -867,6 +901,191 @@ mod tests {
         assert!(e.to_string().contains("rejects it"), "{e}");
     }
 
+    /// The signature `signer` makes of the manifest `{}` for `name`.
+    fn signed_by(signer: &velarx_signature::sign::Signer, name: &str) -> Signature {
+        let digest = Digest::of(velarx_types::digest::Algorithm::Sha256, b"{}");
+        Signature::Sigstore(
+            signer
+                .sign_manifest(&digest.to_string(), name, "test", 100)
+                .unwrap(),
+        )
+    }
+
+    /// What a pull decides of `quay.io/x/y:1` given `signatures`: the
+    /// pre-check, and when it asks for signatures, their evaluation.
+    async fn pulled_with(service: &ImageService, signatures: &[Signature]) -> ImageResult<()> {
+        let image_ref = ImageReference::parse("quay.io/x/y:1").unwrap();
+        let requirements = service.policy_for(&image_ref)?;
+        if !evaluate::needs_signatures(Mode::Whole, &requirements) {
+            return Ok(());
+        }
+        accepted_blocking(
+            Mode::Whole,
+            requirements,
+            intended(&image_ref)?,
+            b"{}".to_vec(),
+            signatures.to_vec(),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// The decision on a list of requirements of one scope, for the pull and
+    /// for each way the create and the start judge, with the image signed
+    /// by the key `good` and not by `other` (every row: what the list is, and
+    /// whether the pull, `Policy`, `Check` and `Require` accept).  The pull
+    /// and `Check` are the same decision.
+    #[tokio::test]
+    async fn a_list_of_requirements_is_judged_by_the_pull_and_by_each_judging() {
+        let (signer, good) = signer();
+        let (_, other) = self::signer();
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, key) in [("good", &good), ("other", &other)] {
+            std::fs::write(tmp.path().join(name), key).unwrap();
+        }
+        let dir = tmp.path().display();
+        let key =
+            |name: &str| format!(r#"{{"type": "sigstoreSigned", "keyPath": "{dir}/{name}"}}"#);
+        let anything = r#"{"type": "insecureAcceptAnything"}"#;
+        let reject = r#"{"type": "reject"}"#;
+        let base_layer = r#"{"type": "signedBaseLayer"}"#;
+        let missing = format!(r#"{{"type": "sigstoreSigned", "keyPath": "{dir}/missing"}}"#);
+        let elsewhere = format!(
+            r#"{{"type": "sigstoreSigned", "keyPath": "{dir}/good",
+                "signedIdentity": {{"type": "exactReference", "dockerReference": "quay.io/x/y:2"}}}}"#
+        );
+        let (good, other) = (key("good"), key("other"));
+        // pull, Policy, Check, Require
+        let rows: Vec<(&str, Vec<&str>, [bool; 4])> = vec![
+            (
+                "only insecureAcceptAnything",
+                vec![anything],
+                [true, true, true, false],
+            ),
+            ("reject", vec![reject], [false, true, false, false]),
+            (
+                "signedBaseLayer",
+                vec![base_layer],
+                [false, true, false, false],
+            ),
+            (
+                "reject and a signature that holds",
+                vec![reject, &good],
+                [false, true, false, false],
+            ),
+            (
+                "reject and one that does not",
+                vec![reject, &other],
+                [false; 4],
+            ),
+            (
+                "signedBaseLayer and a signature that holds",
+                vec![base_layer, &good],
+                [false, true, false, false],
+            ),
+            ("a key that cannot be loaded", vec![&missing], [false; 4]),
+            ("a signature that holds", vec![&good], [true; 4]),
+            ("one that does not", vec![&other], [false; 4]),
+            (
+                "a signature of another reference",
+                vec![&elsewhere],
+                [false; 4],
+            ),
+            ("both, the first holds", vec![&good, &other], [false; 4]),
+            ("both, the second holds", vec![&other, &good], [false; 4]),
+            ("the same twice", vec![&good, &good], [true; 4]),
+            (
+                "insecureAcceptAnything and a signature that holds",
+                vec![anything, &good],
+                [true; 4],
+            ),
+            (
+                "insecureAcceptAnything and one that does not",
+                vec![anything, &other],
+                [false; 4],
+            ),
+        ];
+        let signatures = [signed_by(&signer, "quay.io/x/y:1")];
+        for (what, list, expected) in rows {
+            let (_tmp, service) = with_policy(&format!(
+                r#"{{"default": [{anything}],
+                    "transports": {{"docker": {{"quay.io/x": [{}]}}}}}}"#,
+                list.join(",")
+            ))
+            .await;
+            let mut got = vec![pulled_with(&service, &signatures).await.is_ok()];
+            for judging in [
+                SignatureJudging::Policy,
+                SignatureJudging::Check,
+                SignatureJudging::Require("why"),
+            ] {
+                let result = judged_with(&service, judging, &["quay.io/x/y:1"], &signatures).await;
+                got.push(result.is_ok());
+            }
+            assert_eq!(got, expected, "{what}");
+        }
+    }
+
+    /// An image without a name cannot be judged by `Check` and `Require`;
+    /// `Policy` accepts it.
+    #[tokio::test]
+    async fn an_image_with_no_name_is_judged_by_the_policy_only() {
+        let (_tmp, service) = with_policy(r#"{"default": [{"type": "reject"}]}"#).await;
+        judged_with(&service, SignatureJudging::Policy, &[], &[])
+            .await
+            .unwrap();
+        for judging in [SignatureJudging::Check, SignatureJudging::Require("why")] {
+            let e = judged_with(&service, judging, &[], &[]).await.unwrap_err();
+            assert!(e.to_string().contains("has no name"), "{e}");
+        }
+    }
+
+    /// Every name of the image is judged, each by the requirements of its
+    /// own scope; one that is refused refuses the image.
+    #[tokio::test]
+    async fn every_name_of_an_image_is_judged() {
+        let (signer, public) = signer();
+        let tmp = tempfile::tempdir().unwrap();
+        let key = tmp.path().join("key");
+        std::fs::write(&key, public).unwrap();
+        let signed = format!(
+            r#"[{{"type": "sigstoreSigned", "keyPath": "{}"}}]"#,
+            key.display()
+        );
+        let (_tmp, service) = with_policy(&format!(
+            r#"{{"default": [{{"type": "insecureAcceptAnything"}}],
+                "transports": {{"docker": {{"quay.io/x": {signed}, "quay.io/w": {signed}}}}}}}"#
+        ))
+        .await;
+        let both = ["quay.io/x/y:1", "quay.io/w/z:1"];
+        let signatures = [signed_by(&signer, "quay.io/x/y:1")];
+        let free = ["quay.io/x/y:1", "quay.io/free/z:1"];
+        for judging in [
+            SignatureJudging::Policy,
+            SignatureJudging::Check,
+            SignatureJudging::Require("why"),
+        ] {
+            // a name that needs a signature for it
+            let e = judged_with(&service, judging, &both, &signatures)
+                .await
+                .unwrap_err();
+            assert!(e.to_string().contains("is not accepted"), "{e}");
+            // the signature of the first name does not accept the second
+            judged_with(&service, judging, &free[..1], &signatures)
+                .await
+                .unwrap();
+        }
+        // a name that the policy accepts without a signature
+        let result = |judging| judged_with(&service, judging, &free, &signatures);
+        result(SignatureJudging::Policy).await.unwrap();
+        result(SignatureJudging::Check).await.unwrap();
+        let e = result(SignatureJudging::Require("why")).await.unwrap_err();
+        assert!(
+            e.to_string().contains("accepts it without a signature"),
+            "{e}"
+        );
+    }
+
     #[tokio::test]
     async fn a_pull_refuses_reject_and_signed_base_layer() {
         for (rule, said) in [
@@ -885,6 +1104,38 @@ mod tests {
             service
                 .policy_for(&ImageReference::parse("quay.io/z/y:1").unwrap())
                 .unwrap();
+        }
+    }
+
+    /// The pre-check of a pull answers before any signature is fetched: a
+    /// list with a `reject` is refused whatever else it holds; the other
+    /// lists give their requirements.
+    #[tokio::test]
+    async fn the_pre_check_of_a_pull_sees_the_whole_list() {
+        let signed = r#"{"type": "signedBy", "keyType": "GPGKeys", "keyPath": "/k"}"#;
+        let anything = r#"{"type": "insecureAcceptAnything"}"#;
+        for (list, refused) in [
+            (vec![anything], false),
+            (vec![signed], false),
+            (vec![anything, signed], false),
+            (vec![signed, r#"{"type": "reject"}"#], true),
+            (vec![r#"{"type": "reject"}"#, signed], true),
+            (
+                vec![anything, r#"{"type": "signedBaseLayer"}"#, signed],
+                true,
+            ),
+        ] {
+            let (_tmp, service) = with_policy(&format!(
+                r#"{{"default": [{anything}],
+                    "transports": {{"docker": {{"quay.io/x": [{}]}}}}}}"#,
+                list.join(",")
+            ))
+            .await;
+            let got = service.policy_for(&ImageReference::parse("quay.io/x/y:1").unwrap());
+            assert_eq!(got.is_err(), refused, "{list:?}");
+            if let Ok(requirements) = got {
+                assert_eq!(requirements.len(), list.len(), "{list:?}");
+            }
         }
     }
 

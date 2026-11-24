@@ -5251,6 +5251,10 @@ name = "velarx-plan-core"
 version = "0.1.0"
 
 [[package]]
+name = "velarx-policy-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-proto"
 version = "0.1.0"
 dependencies = [
@@ -5426,6 +5430,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "velarx-base",
+ "velarx-policy-core",
  "yaml-rust2",
  "zeroize",
 ]
