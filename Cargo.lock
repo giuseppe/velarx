@@ -4777,6 +4777,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.21",
+ "velarx-idmap-core",
  "velarx-proto",
  "velarx-sys",
 ]
@@ -5082,6 +5083,10 @@ dependencies = [
 
 [[package]]
 name = "velarx-group-core"
+version = "0.1.0"
+
+[[package]]
+name = "velarx-idmap-core"
 version = "0.1.0"
 
 [[package]]

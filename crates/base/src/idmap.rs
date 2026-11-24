@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Id mappings of user namespaces: the syntax of `--userns`, `--uidmap` and
-//! the `idmap` mount option, the arithmetic on mappings and the layout of
-//! the automatic ranges.  Nothing here does I/O: the callers pass what they
-//! read from `/proc/self/{uid,gid}_map` and `/etc/sub{u,g}id`.
+//! the `idmap` mount option, and the glue to the arithmetic on mappings and
+//! the layout of the automatic ranges, which is `velarx-idmap-core`.  Nothing
+//! here does I/O: the callers pass what they read from
+//! `/proc/self/{uid,gid}_map` and `/etc/sub{u,g}id`.
 //!
 //! The semantics are those of podman (`pkg/util`, `storage/userns.go`,
 //! `storage/idset.go`).  A mapping is `(container id, parent id, size)`, with
@@ -12,15 +13,12 @@
 //! rootless mapping needs no composition with the daemon's.
 
 use thiserror::Error;
+use velarx_idmap_core as core;
+use velarx_idmap_core::{AutoFault, Fault, Map};
 use velarx_proto::modes::UsernsChoice;
 use velarx_proto::pod::IdMapping;
 
-/// Ids are 32 bits and `u32::MAX` is not a valid id: a mapping must end at
-/// `u32::MAX` at the latest (`0 0 4294967295` is the identity).
-pub const ID_LIMIT: u64 = u32::MAX as u64;
-
-/// The kernel accepts this many lines in a `uid_map` (since Linux 4.15).
-pub const MAX_EXTENTS: usize = 340;
+pub use velarx_idmap_core::{IdSet, ID_LIMIT, MAX_EXTENTS};
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum IdMapError {
@@ -38,153 +36,57 @@ fn invalid<T>(msg: impl Into<String>) -> IdMapResult<T> {
     Err(IdMapError::Invalid(msg.into()))
 }
 
-fn map(container_id: u64, host_id: u64, size: u64) -> IdMapping {
+fn map(container_id: u64, host_id: u64, size: u64) -> Map {
     // Callers only build mappings from values below `ID_LIMIT`.
-    IdMapping {
+    Map {
         container_id: container_id as u32,
-        host_id: host_id as u32,
+        parent_id: host_id as u32,
         size: size as u32,
     }
 }
 
-/// A set of ids as sorted, disjoint and non adjacent intervals `[start, end)`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct IdSet {
-    intervals: Vec<(u64, u64)>,
+fn to_core(maps: &[IdMapping]) -> Vec<Map> {
+    maps.iter()
+        .map(|m| Map {
+            container_id: m.container_id,
+            parent_id: m.host_id,
+            size: m.size,
+        })
+        .collect()
 }
 
-impl IdSet {
-    pub fn from_intervals(intervals: impl IntoIterator<Item = (u64, u64)>) -> Self {
-        let mut v: Vec<(u64, u64)> = intervals.into_iter().filter(|(s, e)| s < e).collect();
-        v.sort_unstable();
-        let mut out: Vec<(u64, u64)> = Vec::with_capacity(v.len());
-        for (s, e) in v {
-            match out.last_mut() {
-                Some(last) if s <= last.1 => last.1 = last.1.max(e),
-                _ => out.push((s, e)),
-            }
+fn from_core(maps: Vec<Map>) -> Vec<IdMapping> {
+    maps.into_iter()
+        .map(|m| IdMapping {
+            container_id: m.container_id,
+            host_id: m.parent_id,
+            size: m.size,
+        })
+        .collect()
+}
+
+/// The error for the entry of `maps` that `validate` of the core names.
+fn fault(f: Fault, maps: &[IdMapping]) -> IdMapError {
+    match f {
+        Fault::TooMany(n) => {
+            IdMapError::Invalid(format!("{n} id mappings, the kernel accepts {MAX_EXTENTS}"))
         }
-        Self { intervals: out }
-    }
-
-    /// The parent (host) ids of `maps`.
-    pub fn of_host_ids(maps: &[IdMapping]) -> Self {
-        Self::from_intervals(maps.iter().map(|m| {
-            (
-                u64::from(m.host_id),
-                u64::from(m.host_id) + u64::from(m.size),
-            )
-        }))
-    }
-
-    /// The container ids of `maps`.
-    pub fn of_container_ids(maps: &[IdMapping]) -> Self {
-        Self::from_intervals(maps.iter().map(|m| {
-            (
-                u64::from(m.container_id),
-                u64::from(m.container_id) + u64::from(m.size),
-            )
-        }))
-    }
-
-    pub fn intervals(&self) -> &[(u64, u64)] {
-        &self.intervals
-    }
-
-    pub fn size(&self) -> u64 {
-        self.intervals.iter().map(|(s, e)| e - s).sum()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.intervals.is_empty()
-    }
-
-    #[cfg(test)]
-    pub fn contains(&self, id: u64) -> bool {
-        self.intervals.iter().any(|&(s, e)| s <= id && id < e)
-    }
-
-    /// Whether every id of `[start, start + len)` is in the set.
-    pub fn contains_range(&self, start: u64, len: u64) -> bool {
-        len == 0
-            || self
-                .intervals
-                .iter()
-                .any(|&(s, e)| s <= start && start + len <= e)
-    }
-
-    pub fn union(&self, other: &IdSet) -> IdSet {
-        Self::from_intervals(self.intervals.iter().chain(&other.intervals).copied())
-    }
-
-    pub fn subtract(&self, other: &IdSet) -> IdSet {
-        let mut out = Vec::new();
-        for &(s, e) in &self.intervals {
-            let mut start = s;
-            for &(os, oe) in &other.intervals {
-                if oe <= start {
-                    continue;
-                }
-                if os >= e {
-                    break;
-                }
-                if os > start {
-                    out.push((start, os));
-                }
-                start = start.max(oe);
-                if start >= e {
-                    break;
-                }
-            }
-            if start < e {
-                out.push((start, e));
-            }
+        Fault::Empty(i) => IdMapError::Invalid(format!("the id mapping {} is empty", maps[i])),
+        Fault::PastLimit(i) => {
+            IdMapError::Invalid(format!("the id mapping {} is past the last id", maps[i]))
         }
-        IdSet { intervals: out }
+        Fault::Overlap(i) => IdMapError::Overlap(maps[i].to_string()),
     }
+}
 
-    /// The first `n` ids of the set (they may come from several intervals,
-    /// like `findAvailable` of c/storage).
-    pub fn find_available(&self, n: u64) -> IdMapResult<IdSet> {
-        let mut left = n;
-        let mut out = Vec::new();
-        for &(s, e) in &self.intervals {
-            if left == 0 {
-                break;
-            }
-            let end = e.min(s + left);
-            out.push((s, end));
-            left -= end - s;
-        }
-        if left > 0 {
-            return Err(IdMapError::NoSpace(n));
-        }
-        Ok(IdSet { intervals: out })
-    }
+/// The parent (host) ids of `maps`.
+pub fn host_ids(maps: &[IdMapping]) -> IdSet {
+    IdSet::of_parent_ids(&to_core(maps))
+}
 
-    /// Pair the ids of `self` (parent ids) with the container ids in `container`,
-    /// both in ascending order, until one runs out.
-    pub fn zip(&self, container: &IdSet) -> Vec<IdMapping> {
-        let mut out = Vec::new();
-        let mut hosts = self.intervals.iter().copied();
-        let mut ctrs = container.intervals.iter().copied();
-        let (mut h, mut c) = (hosts.next(), ctrs.next());
-        while let (Some((hs, he)), Some((cs, ce))) = (h, c) {
-            let n = (he - hs).min(ce - cs);
-            out.push(map(cs, hs, n));
-            h = if hs + n < he {
-                Some((hs + n, he))
-            } else {
-                hosts.next()
-            };
-            c = if cs + n < ce {
-                Some((cs + n, ce))
-            } else {
-                ctrs.next()
-            };
-        }
-        out
-    }
+/// The container ids of `maps`.
+pub fn container_ids(maps: &[IdMapping]) -> IdSet {
+    IdSet::of_container_ids(&to_core(maps))
 }
 
 /// The parent id of the container id `id`, if mapped.
@@ -208,137 +110,20 @@ pub fn to_container(maps: &[IdMapping], id: u32) -> Option<u32> {
 /// outside) end.  The kernel refuses a line whose parent ids are in two
 /// extents of the parent's map, even when the ids are contiguous.
 pub fn split_on(maps: &[IdMapping], parent: &[IdMapping]) -> Vec<IdMapping> {
-    let mut cuts: Vec<u64> = parent
-        .iter()
-        .map(|p| u64::from(p.container_id) + u64::from(p.size))
-        .collect();
-    cuts.sort_unstable();
-    let mut out = Vec::new();
-    for m in maps {
-        let (mut c, mut h, mut left) = (
-            u64::from(m.container_id),
-            u64::from(m.host_id),
-            u64::from(m.size),
-        );
-        while left > 0 {
-            // the next end of an extent after h, if inside this entry
-            let n = cuts
-                .iter()
-                .find(|&&e| e > h && e - h < left)
-                .map_or(left, |e| e - h);
-            out.push(map(c, h, n));
-            c += n;
-            h += n;
-            left -= n;
-        }
-    }
-    out
+    from_core(core::split_on(&to_core(maps), &to_core(parent)))
 }
 
 /// Check a mapping: no empty entry, nothing past `ID_LIMIT`, no overlap in
 /// the container ids or in the parent ids, at most `MAX_EXTENTS` entries.
 pub fn validate(maps: &[IdMapping]) -> IdMapResult<()> {
-    if maps.len() > MAX_EXTENTS {
-        return invalid(format!(
-            "{} id mappings, the kernel accepts {MAX_EXTENTS}",
-            maps.len()
-        ));
-    }
-    for m in maps {
-        if m.size == 0 {
-            return invalid(format!("the id mapping {m} is empty"));
-        }
-        if u64::from(m.container_id) + u64::from(m.size) > ID_LIMIT
-            || u64::from(m.host_id) + u64::from(m.size) > ID_LIMIT
-        {
-            return invalid(format!("the id mapping {m} is past the last id"));
-        }
-    }
-    for (i, a) in maps.iter().enumerate() {
-        for b in &maps[..i] {
-            let (ac, bc) = (u64::from(a.container_id), u64::from(b.container_id));
-            let (ah, bh) = (u64::from(a.host_id), u64::from(b.host_id));
-            let (asz, bsz) = (u64::from(a.size), u64::from(b.size));
-            if (ac < bc + bsz && bc < ac + asz) || (ah < bh + bsz && bh < ah + asz) {
-                return Err(IdMapError::Overlap(a.to_string()));
-            }
-        }
-    }
-    Ok(())
+    core::validate(&to_core(maps)).map_err(|f| fault(f, maps))
 }
 
 /// Sort by container id and merge the entries that continue each other.
 /// Two entries whose sizes do not fit one are left apart: the second is
 /// then past the last id and [`validate`] refuses it.
 pub fn sort_and_merge(maps: &[IdMapping]) -> Vec<IdMapping> {
-    let mut sorted = maps.to_vec();
-    sorted.sort_by_key(|m| m.container_id);
-    let mut out: Vec<IdMapping> = Vec::with_capacity(sorted.len());
-    for m in sorted {
-        match out.last_mut() {
-            Some(last)
-                if u64::from(last.container_id) + u64::from(last.size)
-                    == u64::from(m.container_id)
-                    && u64::from(last.host_id) + u64::from(last.size) == u64::from(m.host_id)
-                    && last.size.checked_add(m.size).is_some() =>
-            {
-                last.size += m.size;
-            }
-            _ => out.push(m),
-        }
-    }
-    out
-}
-
-/// Remove from `mapping` the parts that overlap `ext` in the container or
-/// the parent ids, then add `ext` (podman `breakInsert`).
-fn break_insert(mapping: &[IdMapping], ext: IdMapping) -> Vec<IdMapping> {
-    let mut out = Vec::new();
-    let (ec, eh, en) = (
-        i64::from(ext.container_id),
-        i64::from(ext.host_id),
-        i64::from(ext.size),
-    );
-    for p in mapping {
-        let (pc, ph, n) = (
-            i64::from(p.container_id),
-            i64::from(p.host_id),
-            i64::from(p.size),
-        );
-        // What the extension covers of the piece, in offsets from its start.
-        let mut cuts: Vec<(i64, i64)> = [(ec - pc, ec - pc + en), (eh - ph, eh - ph + en)]
-            .into_iter()
-            .map(|(a, b)| (a.max(0), b.min(n)))
-            .filter(|(a, b)| a < b)
-            .collect();
-        cuts.sort_unstable();
-        let mut pos = 0;
-        let mut keep = |from: i64, to: i64| {
-            if from < to {
-                out.push(map(
-                    (pc + from) as u64,
-                    (ph + from) as u64,
-                    (to - from) as u64,
-                ));
-            }
-        };
-        for (a, b) in cuts {
-            keep(pos, a);
-            pos = pos.max(b);
-        }
-        keep(pos, n);
-    }
-    out.push(ext);
-    out
-}
-
-/// Give the container ids that `idmap` leaves unmapped, starting from zero,
-/// the parent ids of `available` in order (podman `fillIDMap`).
-fn fill(idmap: &[IdMapping], available: &IdSet) -> Vec<IdMapping> {
-    let free = IdSet::from_intervals([(0, ID_LIMIT)]).subtract(&IdSet::of_container_ids(idmap));
-    let mut out = idmap.to_vec();
-    out.extend(available.zip(&free));
-    sort_and_merge(&out)
+    from_core(core::sort_and_merge(&to_core(maps)))
 }
 
 /// uid or gid: the entries of a `--uidmap` that apply to one of them.
@@ -400,7 +185,7 @@ pub fn parse_id_map(
     parent: &[IdMapping],
     rootless: bool,
 ) -> IdMapResult<Vec<IdMapping>> {
-    let mut idmap: Vec<IdMapping> = Vec::new();
+    let mut idmap: Vec<Map> = Vec::new();
     let mut fill_map = false;
     for spec in specs.iter().filter(|s| !s.is_empty()) {
         let mut parts: Vec<&str> = spec.split(':').collect();
@@ -469,21 +254,15 @@ pub fn parse_id_map(
                 if idmap.is_empty() && rootless {
                     fill_map = true;
                 }
-                idmap = break_insert(&idmap, e);
+                idmap = core::break_insert(&idmap, e);
             }
         }
     }
     if fill_map {
-        let inside = IdSet::from_intervals(parent.iter().map(|m| {
-            (
-                u64::from(m.container_id),
-                u64::from(m.container_id) + u64::from(m.size),
-            )
-        }));
-        let available = inside.subtract(&IdSet::of_host_ids(&idmap));
-        idmap = fill(&idmap, &available);
+        let available = container_ids(parent).subtract(&IdSet::of_parent_ids(&idmap));
+        idmap = core::fill(&idmap, &available);
     }
-    Ok(sort_and_merge(&idmap))
+    Ok(from_core(core::sort_and_merge(&idmap)))
 }
 
 /// `uidmapping=` and `gidmapping=` of `--userns=auto`: one triple
@@ -601,23 +380,10 @@ pub fn keep_id(
     sub_gid: u32,
     size: Option<u32>,
 ) -> (Vec<IdMapping>, Vec<IdMapping>) {
-    let one = |id: u32, sub: u32| {
-        let mut max = u64::from(sub);
-        if let Some(s) = size.filter(|s| *s > 0) {
-            max = max.min(u64::from(s) - 1);
-        }
-        let id = u64::from(id);
-        let mut out = Vec::new();
-        if sub > 0 && id != 0 && max.min(id) > 0 {
-            out.push(map(0, 1, max.min(id)));
-        }
-        out.push(map(id, 0, 1));
-        if max > id {
-            out.push(map(id + 1, id + 1, max - id));
-        }
-        out
-    };
-    (one(uid, sub_uid), one(gid, sub_gid))
+    (
+        from_core(core::keep_id(uid, sub_uid, size)),
+        from_core(core::keep_id(gid, sub_gid, size)),
+    )
 }
 
 /// The mappings of `--userns=nomap`: everything but the user, from `0`.
@@ -626,8 +392,8 @@ pub fn no_map(sub_uid: u32, sub_gid: u32) -> IdMapResult<(Vec<IdMapping>, Vec<Id
         return invalid("nomap needs sub ids in /etc/subuid and /etc/subgid");
     }
     Ok((
-        vec![map(0, 1, sub_uid.into())],
-        vec![map(0, 1, sub_gid.into())],
+        from_core(vec![map(0, 1, sub_uid.into())]),
+        from_core(vec![map(0, 1, sub_gid.into())]),
     ))
 }
 
@@ -640,17 +406,13 @@ pub fn auto_map(
     used: &IdSet,
     extra: &[IdMapping],
 ) -> IdMapResult<Vec<IdMapping>> {
-    let target = IdSet::from_intervals([(0, u64::from(size))]);
-    let wanted = target.subtract(&IdSet::of_container_ids(extra));
-    let free = pool
-        .subtract(used)
-        .subtract(&IdSet::of_host_ids(extra))
-        .find_available(wanted.size())?;
-    let mut maps = free.zip(&wanted);
-    maps.extend_from_slice(extra);
-    let maps = sort_and_merge(&maps);
-    validate(&maps)?;
-    Ok(maps)
+    core::auto_map(size, pool, used, &to_core(extra))
+        .map(from_core)
+        .map_err(|e| match e {
+            AutoFault::NoSpace(n) => IdMapError::NoSpace(n),
+            AutoFault::Invalid(f) => fault(f, extra),
+            AutoFault::TooMany(n) => fault(Fault::TooMany(n), extra),
+        })
 }
 
 /// The number of ids to give to an automatic namespace: the request, else
@@ -744,9 +506,9 @@ pub fn parse_mount_idmap(
                     return invalid(format!("the range `{r}` of `{option}` is empty"));
                 }
                 if relative {
-                    let Some(p) = to_parent(ctr, h) else {
+                    let Some(p) = core::range_to_parent(&to_core(ctr), h, size) else {
                         return invalid(format!(
-                            "the id {h} of `{option}` is not mapped in the user namespace of the container"
+                            "the ids {h}+{size} of `{option}` are not in one range of the user namespace of the container"
                         ));
                     };
                     h = p;
@@ -839,19 +601,6 @@ mod tests {
     }
 
     // The cases of podman `pkg/util/utils_test.go`.
-
-    #[test]
-    fn test_break_insert() {
-        let r = break_insert(&[m(1000, 1000, 1)], m(2, 2, 1));
-        assert_eq!(r, [m(1000, 1000, 1), m(2, 2, 1)]);
-        let r = break_insert(&[m(4, 5, 4)], m(1, 1, 3));
-        assert_eq!(r, [m(4, 5, 4), m(1, 1, 3)]);
-        let r = break_insert(&[m(0, 0, 20)], m(10, 1, 1));
-        assert_eq!(
-            sort_and_merge(&r),
-            [m(0, 0, 1), m(2, 2, 8), m(10, 1, 1), m(11, 11, 9)]
-        );
-    }
 
     #[test]
     fn test_sort_and_merge() {
@@ -963,44 +712,6 @@ mod tests {
         // Not rootless: no fill.
         let r = parse_id_map(&strs(&["+0:@1000:1"]), Kind::Uid, &parent, false).unwrap();
         assert_eq!(r, [m(0, 0, 1)]);
-    }
-
-    #[test]
-    fn test_fill_id_map() {
-        let avail = IdSet::from_intervals([(0, 10), (10000, 20000)]);
-        let r = fill(&[m(1, 1000, 10), m(30, 2000, 20)], &avail);
-        assert_eq!(
-            r,
-            [
-                m(0, 0, 1),
-                m(1, 1000, 10),
-                m(11, 1, 9),
-                m(20, 10000, 10),
-                m(30, 2000, 20),
-                m(50, 10010, 9990)
-            ]
-        );
-    }
-
-    #[test]
-    fn test_available_ranges() {
-        let all = IdSet::from_intervals([(0, 30), (50, 70)]);
-        let used = IdSet::from_intervals([(2, 4), (25, 55)]);
-        assert_eq!(all.subtract(&used).intervals(), [(0, 2), (4, 25), (55, 70)]);
-    }
-
-    #[test]
-    fn test_find_available_spans_intervals() {
-        let s = IdSet::from_intervals([(0, 2), (10, 20)]);
-        assert_eq!(s.find_available(5).unwrap().intervals(), [(0, 2), (10, 13)]);
-        assert_eq!(s.find_available(12).unwrap().size(), 12);
-        assert_eq!(s.find_available(13), Err(IdMapError::NoSpace(13)));
-        assert_eq!(
-            s.find_available(5)
-                .unwrap()
-                .zip(&IdSet::from_intervals([(0, 5)])),
-            [m(0, 0, 2), m(2, 10, 3)]
-        );
     }
 
     #[test]
@@ -1130,30 +841,30 @@ mod tests {
     #[test]
     fn test_auto_map() {
         // Rootless: the ids 1..=65536 of the namespace.
-        let pool = IdSet::from_intervals([(1, 65537)]);
+        let pool = IdSet::from_intervals(&[(1, 65537)]);
         let none = IdSet::default();
         let first = auto_map(1024, &pool, &none, &[]).unwrap();
         assert_eq!(first, [m(0, 1, 1024)]);
-        let used = IdSet::of_host_ids(&first);
+        let used = host_ids(&first);
         let second = auto_map(2000, &pool, &used, &[]).unwrap();
         assert_eq!(second, [m(0, 1025, 2000)]);
         // The range of the first container is free again.
-        let used = IdSet::of_host_ids(&second);
+        let used = host_ids(&second);
         assert_eq!(auto_map(100, &pool, &used, &[]).unwrap(), [m(0, 1, 100)]);
         // A hole is used with what follows it.
-        let used = IdSet::from_intervals([(1, 11), (21, 40000)]);
+        let used = IdSet::from_intervals(&[(1, 11), (21, 40000)]);
         assert_eq!(
             auto_map(30, &pool, &used, &[]).unwrap(),
             [m(0, 11, 10), m(10, 40000, 20)]
         );
         // Not enough ids.
-        let used = IdSet::from_intervals([(1, 65000)]);
+        let used = IdSet::from_intervals(&[(1, 65000)]);
         assert_eq!(
             auto_map(1024, &pool, &used, &[]),
             Err(IdMapError::NoSpace(1024))
         );
         // Root: the sub ids of `containers`.
-        let pool = IdSet::from_intervals([(786432, 786432 + 65536)]);
+        let pool = IdSet::from_intervals(&[(786432, 786432 + 65536)]);
         assert_eq!(
             auto_map(65536, &pool, &none, &[]).unwrap(),
             [m(0, 786432, 65536)]
@@ -1162,7 +873,7 @@ mod tests {
 
     #[test]
     fn test_auto_map_with_extra_mappings() {
-        let pool = IdSet::from_intervals([(1, 100)]);
+        let pool = IdSet::from_intervals(&[(1, 100)]);
         // Container id 5 is mapped by hand to parent id 2: the automatic range
         // takes neither.
         let extra = [m(5, 2, 1)];
@@ -1239,6 +950,30 @@ mod tests {
     }
 
     #[test]
+    fn test_mount_idmap_relative_range_in_one_extent() {
+        // container ids 0..1000 are the parent ids 1..1001, 1000 is 0
+        let ctr = [m(0, 1, 1000), m(1000, 0, 1), m(2000, 5000, 10)];
+        let one = |o: &str| parse_mount_idmap(o, &ctr, &ctr).map(|(u, _)| u);
+        // the whole range is in an extent: the parent ids follow the start
+        assert_eq!(one("idmap=uids=@7-998-2").unwrap(), [m(7, 999, 2)]);
+        assert_eq!(one("idmap=uids=@7-0-1000").unwrap(), [m(7, 1, 1000)]);
+        assert_eq!(one("idmap=uids=@7-2005-5").unwrap(), [m(7, 5005, 5)]);
+        // the last id of an extent, and one id past it
+        assert_eq!(one("idmap=uids=@7-999-1").unwrap(), [m(7, 1000, 1)]);
+        // a range that runs past its extent would map parent ids that the
+        // container does not own: 1001 (not mapped) or 0 (another id)
+        for bad in [
+            "idmap=uids=@7-999-2",
+            "idmap=uids=@7-0-1001",
+            "idmap=uids=@7-500-501",
+            "idmap=uids=@7-2005-6",
+            "idmap=uids=@7-998-3#@8-0-1",
+        ] {
+            assert!(one(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn test_mount_idmap() {
         let ctr_u = [m(0, 1, 1000), m(1000, 0, 1)];
         let ctr_g = [m(0, 1, 1000), m(1000, 0, 1)];
@@ -1308,16 +1043,255 @@ mod tests {
         );
     }
 
+    // The tables below pin the arithmetic at its edges: empty, adjacent and
+    // overlapping ranges, and ids next to `u32::MAX`.
+
+    const MAX: u32 = u32::MAX;
+
     #[test]
-    fn test_idset_ops() {
-        let a = IdSet::from_intervals([(5, 10), (0, 3), (3, 4), (9, 12)]);
-        assert_eq!(a.intervals(), [(0, 4), (5, 12)]);
-        assert!(a.contains(11) && !a.contains(4) && !a.contains(12));
-        assert!(a.contains_range(5, 7) && !a.contains_range(3, 3) && a.contains_range(9, 0));
-        let b = IdSet::from_intervals([(2, 7)]);
-        assert_eq!(a.subtract(&b).intervals(), [(0, 2), (7, 12)]);
-        assert_eq!(a.union(&b).intervals(), [(0, 12)]);
-        assert_eq!(a.size(), 11);
-        assert!(IdSet::default().is_empty());
+    fn table_sort_and_merge() {
+        for (input, want) in [
+            (vec![], vec![]),
+            (vec![m(5, 5, 1)], vec![m(5, 5, 1)]),
+            // continue each other in both ids: one
+            (vec![m(0, 0, 2), m(2, 2, 2), m(4, 4, 2)], vec![m(0, 0, 6)]),
+            // in the container ids only, or in the parent ids only: two
+            (vec![m(0, 0, 2), m(2, 9, 2)], vec![m(0, 0, 2), m(2, 9, 2)]),
+            (vec![m(0, 0, 2), m(5, 2, 2)], vec![m(0, 0, 2), m(5, 2, 2)]),
+            // out of order
+            (vec![m(2, 2, 2), m(0, 0, 2)], vec![m(0, 0, 4)]),
+            // overlapping entries are left alone, for validate to refuse
+            (vec![m(0, 0, 4), m(2, 2, 4)], vec![m(0, 0, 4), m(2, 2, 4)]),
+            // the same container id twice: the order of the input stays
+            (vec![m(1, 7, 1), m(1, 3, 1)], vec![m(1, 7, 1), m(1, 3, 1)]),
+            // empty entries are kept, and do not merge unless they continue
+            (vec![m(0, 0, 2), m(2, 2, 0)], vec![m(0, 0, 2)]),
+            (vec![m(0, 0, 0), m(0, 0, 3)], vec![m(0, 0, 3)]),
+            // sizes that add up to the last id merge, one more does not
+            (
+                vec![m(0, 0, MAX - 1), m(MAX - 1, MAX - 1, 1)],
+                vec![m(0, 0, MAX)],
+            ),
+            (
+                vec![m(0, 0, MAX), m(MAX, MAX, 1)],
+                vec![m(0, 0, MAX), m(MAX, MAX, 1)],
+            ),
+            (
+                vec![m(0, 0, MAX - 1), m(MAX - 1, MAX - 1, 2)],
+                vec![m(0, 0, MAX - 1), m(MAX - 1, MAX - 1, 2)],
+            ),
+        ] {
+            assert_eq!(sort_and_merge(&input), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn table_split_on() {
+        let parent = [m(0, 100, 5), m(5, 200, 5), m(20, 300, 10)];
+        for (input, want) in [
+            (vec![], vec![]),
+            // inside one extent
+            (vec![m(0, 1, 3)], vec![m(0, 1, 3)]),
+            // ends exactly at the end of an extent
+            (vec![m(0, 2, 3)], vec![m(0, 2, 3)]),
+            // one more id: two entries
+            (vec![m(0, 2, 4)], vec![m(0, 2, 3), m(3, 5, 1)]),
+            // across two extents and into the third
+            // (the cuts are at the ends of the extents: 5, 10 and 30)
+            (
+                vec![m(0, 3, 20)],
+                vec![m(0, 3, 2), m(2, 5, 5), m(7, 10, 13)],
+            ),
+            // starts at the beginning of an extent
+            (vec![m(7, 5, 5)], vec![m(7, 5, 5)]),
+            // one id
+            (vec![m(9, 9, 1)], vec![m(9, 9, 1)]),
+            // empty entries vanish
+            (vec![m(3, 3, 0), m(4, 4, 1)], vec![m(4, 4, 1)]),
+            // each entry on its own
+            (
+                vec![m(0, 4, 2), m(10, 9, 2)],
+                vec![m(0, 4, 1), m(1, 5, 1), m(10, 9, 1), m(11, 10, 1)],
+            ),
+        ] {
+            assert_eq!(split_on(&input, &parent), want, "{input:?}");
+        }
+        // no extents, no cuts
+        assert_eq!(split_on(&[m(0, 0, MAX)], &[]), [m(0, 0, MAX)]);
+        // near the last id
+        let top = [m(0, 0, MAX - 1), m(MAX - 1, MAX - 1, 1)];
+        assert_eq!(
+            split_on(&[m(MAX - 4, MAX - 4, 4)], &top),
+            [m(MAX - 4, MAX - 4, 3), m(MAX - 1, MAX - 1, 1)]
+        );
+        assert_eq!(split_on(&[m(0, 0, MAX)], &[m(0, 0, MAX)]), [m(0, 0, MAX)]);
+    }
+
+    #[test]
+    fn table_auto_map_edges() {
+        let set = |v: &[(u64, u64)]| IdSet::from_intervals(v);
+        let top = u64::from(MAX);
+        let none = IdSet::default();
+        // no ids asked
+        assert_eq!(auto_map(0, &set(&[(1, 9)]), &none, &[]), Ok(vec![]));
+        // the whole range of ids, and one too many
+        assert_eq!(
+            auto_map(MAX, &set(&[(0, top)]), &none, &[]),
+            Ok(vec![m(0, 0, MAX)])
+        );
+        assert_eq!(
+            auto_map(MAX, &set(&[(1, top)]), &none, &[]),
+            Err(IdMapError::NoSpace(top))
+        );
+        // the pool is used from its first id; the used ids of the middle are skipped
+        assert_eq!(
+            auto_map(3, &set(&[(10, 20)]), &set(&[(11, 12)]), &[]),
+            Ok(vec![m(0, 10, 1), m(1, 12, 2)])
+        );
+        // exactly enough, one less
+        assert_eq!(
+            auto_map(3, &set(&[(10, 12), (20, 21)]), &none, &[]),
+            Ok(vec![m(0, 10, 2), m(2, 20, 1)])
+        );
+        assert_eq!(
+            auto_map(3, &set(&[(10, 12), (20, 21)]), &set(&[(20, 21)]), &[]),
+            Err(IdMapError::NoSpace(3))
+        );
+        // the used ids may be outside the pool
+        assert_eq!(
+            auto_map(2, &set(&[(10, 12)]), &set(&[(0, 5), (50, 60)]), &[]),
+            Ok(vec![m(0, 10, 2)])
+        );
+        // the pool ends at the last id: a range that goes past it is refused
+        assert!(auto_map(2, &set(&[(top - 1, top + 1)]), &none, &[]).is_err());
+        // extra mappings: their ids are not given twice, the NoSpace count is
+        // of the ids that are left to map
+        assert_eq!(
+            auto_map(4, &set(&[(10, 12)]), &none, &[m(0, 10, 1)]),
+            Err(IdMapError::NoSpace(3))
+        );
+        assert_eq!(
+            auto_map(4, &set(&[(10, 14)]), &none, &[m(0, 10, 1)]),
+            Ok(vec![m(0, 10, 4)])
+        );
+        // an extra mapping beyond the size is kept
+        assert_eq!(
+            auto_map(2, &set(&[(10, 20)]), &none, &[m(50, 3, 1)]),
+            Ok(vec![m(0, 10, 2), m(50, 3, 1)])
+        );
+        // extra mappings that overlap each other are refused
+        assert!(matches!(
+            auto_map(2, &set(&[(10, 20)]), &none, &[m(5, 3, 2), m(6, 30, 1)]),
+            Err(IdMapError::Overlap(_))
+        ));
+        // so is one that is empty
+        assert!(auto_map(2, &set(&[(10, 20)]), &none, &[m(5, 3, 0)]).is_err());
+    }
+
+    #[test]
+    fn table_keep_id_edges() {
+        // (id, sub, size) -> entries
+        for (id, sub, size, want) in [
+            (0, 0, None, vec![m(0, 0, 1)]),
+            (5, 0, None, vec![m(5, 0, 1)]),
+            (0, 3, None, vec![m(0, 0, 1), m(1, 1, 3)]),
+            (1, 3, None, vec![m(0, 1, 1), m(1, 0, 1), m(2, 2, 2)]),
+            (3, 3, None, vec![m(0, 1, 3), m(3, 0, 1)]),
+            (4, 3, None, vec![m(0, 1, 3), m(4, 0, 1)]),
+            // `size` 0 is no limit
+            (1, 3, Some(0), vec![m(0, 1, 1), m(1, 0, 1), m(2, 2, 2)]),
+            // the highest id is size - 1: the sub ids are cut
+            (1, 3, Some(3), vec![m(0, 1, 1), m(1, 0, 1), m(2, 2, 1)]),
+            (1, 3, Some(2), vec![m(0, 1, 1), m(1, 0, 1)]),
+            // the user stays, wherever
+            (7, 3, Some(2), vec![m(0, 1, 1), m(7, 0, 1)]),
+            (7, 3, Some(1), vec![m(7, 0, 1)]),
+            (0, 3, Some(1), vec![m(0, 0, 1)]),
+            (0, 3, Some(2), vec![m(0, 0, 1), m(1, 1, 1)]),
+            // a size above the sub ids changes nothing
+            (1, 3, Some(100), vec![m(0, 1, 1), m(1, 0, 1), m(2, 2, 2)]),
+            // the last ids
+            (MAX, 3, None, vec![m(0, 1, 3), m(MAX, 0, 1)]),
+            (0, MAX, None, vec![m(0, 0, 1), m(1, 1, MAX)]),
+            (
+                MAX - 1,
+                MAX,
+                None,
+                vec![m(0, 1, MAX - 1), m(MAX - 1, 0, 1), m(MAX, MAX, 1)],
+            ),
+        ] {
+            let (u, g) = keep_id(id, id, sub, sub, size);
+            assert_eq!(u, want, "{id} {sub} {size:?}");
+            assert_eq!(g, want);
+        }
+        // the uid and the gid do not mix
+        let (u, g) = keep_id(2, 5, 3, 1, Some(10));
+        assert_eq!(u, [m(0, 1, 2), m(2, 0, 1), m(3, 3, 1)]);
+        assert_eq!(g, [m(0, 1, 1), m(5, 0, 1)]);
+    }
+
+    #[test]
+    fn table_validate_edges() {
+        let top = MAX - 1;
+        for (maps, ok) in [
+            (vec![], true),
+            (vec![m(0, 0, 1)], true),
+            // adjacent, in either order, in one id space only
+            (vec![m(0, 0, 2), m(2, 2, 2)], true),
+            (vec![m(2, 2, 2), m(0, 0, 2)], true),
+            (vec![m(0, 5, 2), m(2, 0, 2)], true),
+            // one id in common, in the container ids or the parent ids
+            (vec![m(0, 0, 3), m(2, 10, 1)], false),
+            (vec![m(2, 10, 1), m(0, 0, 3)], false),
+            (vec![m(0, 0, 3), m(10, 2, 1)], false),
+            // the same entry twice, one inside the other
+            (vec![m(1, 1, 1), m(1, 1, 1)], false),
+            (vec![m(0, 0, 10), m(3, 30, 2)], false),
+            // the last ids: the last valid one, and the first past them
+            (vec![m(top, top, 1)], true),
+            (vec![m(MAX, 0, 1)], false),
+            (vec![m(0, MAX, 1)], false),
+            (vec![m(0, 0, MAX)], true),
+            (vec![m(1, 0, MAX)], false),
+            (vec![m(0, 1, MAX)], false),
+            (vec![m(MAX, MAX, MAX)], false),
+            (vec![m(0, 0, 1), m(0, 0, 0)], false),
+        ] {
+            assert_eq!(validate(&maps).is_ok(), ok, "{maps:?}");
+        }
+        // an empty entry is named before an overlap that comes first
+        assert!(matches!(
+            validate(&[m(0, 0, 2), m(1, 5, 1), m(9, 9, 0)]),
+            Err(IdMapError::Invalid(_))
+        ));
+        // the first entry that overlaps an earlier one is the one named
+        assert_eq!(
+            validate(&[m(0, 0, 2), m(5, 5, 1), m(1, 9, 1), m(5, 7, 1)]),
+            Err(IdMapError::Overlap("1:9:1".into()))
+        );
+    }
+
+    #[test]
+    fn table_to_parent_and_container_edges() {
+        let maps = [m(0, MAX - 3, 3), m(MAX - 1, 0, 1), m(10, 20, 5)];
+        assert_eq!(to_parent(&maps, 0), Some(MAX - 3));
+        assert_eq!(to_parent(&maps, 2), Some(MAX - 1));
+        assert_eq!(to_parent(&maps, 3), None);
+        assert_eq!(to_parent(&maps, MAX - 1), Some(0));
+        assert_eq!(to_parent(&maps, MAX), None);
+        assert_eq!(to_parent(&maps, 14), Some(24));
+        assert_eq!(to_parent(&maps, 15), None);
+        assert_eq!(to_container(&maps, MAX - 1), Some(2));
+        assert_eq!(to_container(&maps, MAX), None);
+        assert_eq!(to_container(&maps, 0), Some(MAX - 1));
+        assert_eq!(to_container(&maps, 24), Some(14));
+        // an entry that runs past the last id (validate refuses it): the ids
+        // that 32 bits cannot name are unmapped, `u32::MAX` is not
+        let past = [m(MAX - 1, MAX - 1, 5)];
+        assert_eq!(to_parent(&past, MAX - 1), Some(MAX - 1));
+        assert_eq!(to_parent(&past, MAX), Some(MAX));
+        assert_eq!(to_container(&past, MAX), Some(MAX));
+        // an empty entry maps nothing
+        assert_eq!(to_parent(&[m(3, 3, 0)], 3), None);
     }
 }

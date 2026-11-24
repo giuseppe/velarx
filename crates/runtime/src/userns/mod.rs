@@ -204,7 +204,7 @@ impl DaemonIds {
 
     /// The ids inside the daemon's namespace that map to something.
     pub fn granted(&self, gid: bool) -> IdSet {
-        IdSet::of_container_ids(self.map(gid))
+        idmap::container_ids(self.map(gid))
     }
 
     /// The id outside the namespace of its root (the user that started it).
@@ -336,7 +336,7 @@ impl UserNamespaceManager {
             let pool = self
                 .ids
                 .granted(gid)
-                .subtract(&IdSet::from_intervals([(0, 1)]));
+                .subtract(&IdSet::from_intervals(&[(0, 1)]));
             if pool.is_empty() {
                 return Err(UsernsError::NoAvailableRanges(
                     "the daemon has only the id of its user: add the user to /etc/subuid and /etc/subgid and install newuidmap and newgidmap".into(),
@@ -355,7 +355,7 @@ impl UserNamespaceManager {
                 let r = IdRange::parse(r)?;
                 intervals.push((u64::from(r.start), u64::from(r.start) + u64::from(r.count)));
             }
-            return Ok(IdSet::from_intervals(intervals));
+            return Ok(IdSet::from_intervals(&intervals));
         }
         let path = if gid { &self.subgid } else { &self.subuid };
         let content = read_sub_ids(path)?;
@@ -368,9 +368,10 @@ impl UserNamespaceManager {
             )));
         }
         Ok(IdSet::from_intervals(
-            ranges
+            &ranges
                 .into_iter()
-                .map(|(s, c)| (u64::from(s), u64::from(s) + u64::from(c))),
+                .map(|(s, c)| (u64::from(s), u64::from(s) + u64::from(c)))
+                .collect::<Vec<_>>(),
         ))
     }
 
@@ -392,16 +393,16 @@ impl UserNamespaceManager {
             uids.extend_from_slice(&cfg.uid_mappings);
             gids.extend_from_slice(&cfg.gid_mappings);
         }
-        let mut uid_set = IdSet::of_host_ids(&uids);
-        let mut gid_set = IdSet::of_host_ids(&gids);
+        let mut uid_set = idmap::host_ids(&uids);
+        let mut gid_set = idmap::host_ids(&gids);
         for (s, n) in self.db.get_allocated_uid_ranges().await? {
-            uid_set = uid_set.union(&IdSet::from_intervals([(
+            uid_set = uid_set.union(&IdSet::from_intervals(&[(
                 u64::from(s),
                 u64::from(s) + u64::from(n),
             )]));
         }
         for (s, n) in self.db.get_allocated_gid_ranges().await? {
-            gid_set = gid_set.union(&IdSet::from_intervals([(
+            gid_set = gid_set.union(&IdSet::from_intervals(&[(
                 u64::from(s),
                 u64::from(s) + u64::from(n),
             )]));
@@ -436,8 +437,8 @@ impl UserNamespaceManager {
             .insert(
                 key,
                 Held {
-                    uid: IdSet::of_host_ids(&uid),
-                    gid: IdSet::of_host_ids(&gid),
+                    uid: idmap::host_ids(&uid),
+                    gid: idmap::host_ids(&gid),
                 },
             );
         Ok((

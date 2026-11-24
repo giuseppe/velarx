@@ -60,6 +60,11 @@ as root in the initial one; rootless, as root of the daemon's namespace
 | `container:ID` | the user namespace of the running container `ID` |
 | `ns:/proc/PID/ns/user` | the user namespace of a process |
 
+`uidmapping=` and `gidmapping=` of `auto` (`CONTAINER:[@]PARENT[:SIZE]`) are
+used exactly as given: the automatic ranges take other ids, but a mapping
+asked for by hand may use parent ids that another container already holds
+(podman does the same: it is a forced mapping).
+
 `--uidmap`/`--gidmap` (`[+ug]CONTAINER:[@]PARENT[:SIZE]`, repeatable, several
 triples per value) give the mappings by hand and imply `private`; one of them
 alone implies the other.  A leading `+` removes what the earlier entries map

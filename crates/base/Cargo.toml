@@ -23,6 +23,7 @@ doctest = false
 [dependencies]
 rustix = { workspace = true, features = ["fs", "process", "net", "pipe", "thread", "time", "event", "mount", "rand"] }
 thiserror.workspace = true
+velarx-idmap-core = { path = "../idmap-core" }
 velarx-proto = { path = "../proto", default-features = false }
 libc.workspace = true
 velarx-sys = { path = "../sys" }

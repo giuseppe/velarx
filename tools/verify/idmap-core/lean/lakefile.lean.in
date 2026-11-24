@@ -1,0 +1,21 @@
+-- SPDX-License-Identifier: Apache-2.0
+import Lake
+open Lake DSL
+
+-- (AENEAS of ../pins)
+require aeneas from git
+  "https://github.com/AeneasVerif/aeneas" @ "@AENEAS@" / "backends/lean"
+
+package «idmap-core»
+
+-- What Aeneas made of crates/idmap-core (../../run puts it there)
+lean_lib Extracted where
+  globs := #[.submodules `Extracted]
+
+lean_lib Models
+
+-- `#proved` (../../Proved.lean)
+@[default_target] lean_lib Proved
+
+@[default_target] lean_lib IdmapCore where
+  globs := #[.submodules `IdmapCore]

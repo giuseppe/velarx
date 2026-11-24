@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-idmap-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The id mappings of a user namespace: what is a mapping, the sets of ids, the automatic and keep-id layouts"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on lists of `(container id, parent id, size)` and on sets
+# of ids: no dependency, no I/O.  The syntax of the options, the files of
+# `/etc/subuid` and `/proc/self/uid_map`, and the database of what is in use
+# stay in `velarx-base` (idmap.rs) and `velarx-runtime` (userns).
+
+[lib]
+name = "velarx_idmap_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
