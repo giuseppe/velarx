@@ -1043,13 +1043,28 @@ impl Staging {
     /// while the files go would make a lease file again, and the directory
     /// would stay.
     pub fn remove_pull(&self, id: &str) -> io::Result<()> {
+        self.remove_pull_if(id, |_| true).map(drop)
+    }
+
+    /// Remove the pull if it failed, as [`Self::remove_pull`]; whether it
+    /// was removed.  The state is read under the lock of the directory: a
+    /// pull that was started over meanwhile, or removed and published anew,
+    /// is not removed.
+    pub fn remove_failed_pull(&self, id: &str) -> io::Result<bool> {
+        self.remove_pull_if(id, |s| matches!(s, PullState::Failed { .. }))
+    }
+
+    fn remove_pull_if(&self, id: &str, remove: impl Fn(&PullState) -> bool) -> io::Result<bool> {
         let _dir = match self.lock_pull_dir(id) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             other => other?,
         };
+        if !remove(&self.state(id)?.state) {
+            return Ok(false);
+        }
         match velarx_base::tree::remove_dir_all(self.image_dir(id)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+            _ => Ok(true),
         }
     }
 
@@ -1319,6 +1334,24 @@ mod tests {
             .unwrap();
         area.publish_pull(&pull(1, "latest")).unwrap();
         assert_eq!(area.state(&id).unwrap().state, PullState::Queued);
+    }
+
+    #[test]
+    fn only_a_failed_pull_is_removed_as_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let area = Staging::new(tmp.path());
+        let p = pull(1, "latest");
+        assert!(!area.remove_failed_pull(&p.id).unwrap());
+        area.publish_pull(&p).unwrap();
+        for state in [PullState::Queued, PullState::Running, PullState::Cancelled] {
+            area.set_state(&p.id, state, None).unwrap();
+            assert!(!area.remove_failed_pull(&p.id).unwrap());
+            assert!(area.pull(&p.id).unwrap().is_some());
+        }
+        area.set_state(&p.id, PullState::Failed { reason: "x".into() }, None)
+            .unwrap();
+        assert!(area.remove_failed_pull(&p.id).unwrap());
+        assert!(area.pull(&p.id).unwrap().is_none());
     }
 
     #[test]

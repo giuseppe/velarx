@@ -476,7 +476,7 @@ impl ImageService {
                     continue;
                 }
                 return Err(ImageError::Layer(format!(
-                    "layer {key} is neither in the store nor staged: cancel the pull (`velarx image pulls --cancel`) and pull the image again"
+                    "layer {key} is neither in the store nor staged: pull the image again"
                 )));
             };
             let mut tarsplit = bytes::Bytes::from(tarsplit);

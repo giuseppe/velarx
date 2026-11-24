@@ -270,7 +270,13 @@ impl ImageService {
         if let Err(e) = area.remove_pull(&pull.id) {
             warn!("Cannot remove the staging of the pull {}: {e}", pull.id);
         }
-        // (one a process fetches into goes with the next collection)
+        self.discard_unnamed_layers().await;
+    }
+
+    /// Remove the staged layers no pull names, with their files; one a
+    /// process fetches into goes with the next collection.
+    pub(super) async fn discard_unnamed_layers(&self) {
+        let area = self.staging_area();
         for key in area.unnamed_layers() {
             // (the fetchers forget a layer that went)
             if matches!(area.remove_layer_unless_leased(&key), Ok(true)) {

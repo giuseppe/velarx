@@ -1041,8 +1041,11 @@ impl ImageService {
 
     /// A pull of an image whose pull is in progress joins it: its names and
     /// signatures are added to the staged ones, and an eager pull completes
-    /// it (the files are not fetched a second time).  None: there is no such
-    /// pull.
+    /// it (the files are not fetched a second time).  A pull that failed is
+    /// not joined: it is discarded, as joining it would fail again on what
+    /// it lacks (a layer lost from the storage service), and the new pull
+    /// starts over; unless a container is made on it, whose files its
+    /// staging serves.  None: there is no such pull.
     async fn join_staged(
         &self,
         id: &str,
@@ -1053,6 +1056,12 @@ impl ImageService {
     ) -> ImageResult<Option<PullResult>> {
         use velarx_content::pull::staged as st;
         let area = self.staging_area();
+        // (removed first, then read: a pull that another command discarded
+        // meanwhile is not published again from what was read of it)
+        if !self.containers_use(id).await? && area.remove_failed_pull(id)? {
+            self.discard_unnamed_layers().await;
+            return Ok(None);
+        }
         let Some(there) = area.pull(id)? else {
             return Ok(None);
         };
