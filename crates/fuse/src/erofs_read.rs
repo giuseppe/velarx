@@ -97,14 +97,6 @@ pub(crate) fn metacopy_digest(value: &[u8]) -> Option<String> {
         .map(|d| d.to_string())
 }
 
-/// `new_decode_dev` of the kernel.
-pub(crate) fn decode_dev(rdev: u32) -> (u32, u32) {
-    (
-        (rdev >> 8) & 0xfff,
-        (rdev & 0xff) | ((rdev >> 12) & 0xfff00),
-    )
-}
-
 /// The directory entries (not `.` and `..`) of a directory inode.
 #[cfg(test)]
 pub(crate) fn dir_entries(img: &Image, inode: &InodeType) -> Result<Vec<(Vec<u8>, u64)>, String> {

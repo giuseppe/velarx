@@ -28,6 +28,7 @@
 //! they fit, and the stubs as a single chunk that is a hole.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use velarx_overlay_core::{class, rdev, Class};
 use velarx_storage::canonical::MAX_ENTRIES;
 use velarx_storage::{FsVerityHashAlgorithm, TocEntry, TocEntryType};
 use velarx_types::digest::Digest;
@@ -53,10 +54,14 @@ pub const XATTR_METACOPY: &str = "trusted.overlay.metacopy";
 pub const XATTR_REDIRECT: &str = "trusted.overlay.redirect";
 pub const XATTR_OPAQUE: &str = "trusted.overlay.opaque";
 
-/// The prefixes of the attribute names EROFS knows, by index.
-const PREFIXES: [(&[u8], u8); 6] = [
+/// The names of the ACLs, which EROFS knows by their index alone.
+const EXACT: [(&[u8], u8); 2] = [
     (b"system.posix_acl_access", 2),
     (b"system.posix_acl_default", 3),
+];
+
+/// The prefixes of the other attribute names EROFS knows, by index.
+const PREFIXES: [(&[u8], u8); 4] = [
     (b"security.", 6),
     (b"trusted.", 4),
     (b"user.", 1),
@@ -177,9 +182,35 @@ pub(crate) fn components(path: &str) -> Result<Vec<&str>, String> {
     Ok(out)
 }
 
-/// `new_encode_dev` of the kernel.
-fn encode_dev(major: u32, minor: u32) -> u32 {
-    (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12)
+/// The `rdev` of a device entry: an error when its numbers do not fit.
+fn device_of(e: &TocEntry) -> Result<u32, String> {
+    let (major, minor) = (e.dev_major.unwrap_or(0), e.dev_minor.unwrap_or(0));
+    rdev(major, minor).ok_or_else(|| {
+        format!(
+            "`{}`: the device {major}:{minor} is not one an image can have (a major below 4096 and a minor below 2^20)",
+            e.name
+        )
+    })
+}
+
+/// What an entry may not have, for every reader of its layer: an attribute
+/// with no name, a device that is not one.
+fn judge(e: &TocEntry) -> Result<(), String> {
+    if let Some(k) = e
+        .xattrs
+        .keys()
+        .find(|k| matches!(class(k.as_bytes()), Class::Refused(_)))
+    {
+        return Err(format!(
+            "`{}`: `{}` is not the name of an attribute",
+            e.name,
+            k.escape_debug()
+        ));
+    }
+    if matches!(e.entry_type, TocEntryType::Char | TocEntryType::Block) {
+        device_of(e)?;
+    }
+    Ok(())
 }
 
 /// The time of an inode: the seconds are the 64 bits of a signed number, as
@@ -267,14 +298,8 @@ fn node_of(e: &TocEntry) -> Result<Node, String> {
             Some(target) => Kind::Symlink(target.clone().into_bytes()),
             None => return Err(format!("`{}` is a symlink with no target", e.name)),
         },
-        TocEntryType::Char => Kind::Char(encode_dev(
-            e.dev_major.unwrap_or(0),
-            e.dev_minor.unwrap_or(0),
-        )),
-        TocEntryType::Block => Kind::Block(encode_dev(
-            e.dev_major.unwrap_or(0),
-            e.dev_minor.unwrap_or(0),
-        )),
+        TocEntryType::Char => Kind::Char(device_of(e)?),
+        TocEntryType::Block => Kind::Block(device_of(e)?),
         TocEntryType::Fifo => Kind::Fifo,
         TocEntryType::Hardlink | TocEntryType::Chunk => {
             return Err(format!("`{}` is not a file of its own", e.name))
@@ -351,7 +376,10 @@ pub(crate) fn resolve_entries(entries: &[TocEntry]) -> Result<Resolved<'_>, Stri
                     r.whiteouts.insert((d, hidden));
                 }
             }
-            _ => r.put(i, &parts)?,
+            _ => {
+                judge(e)?;
+                r.put(i, &parts)?
+            }
         }
         if r.paths.len() - 1 > MAX_ENTRIES {
             return Err(format!("the layer has more than {MAX_ENTRIES} paths"));
@@ -574,6 +602,24 @@ fn dir_block_len(names: &[(Vec<u8>, Option<usize>)]) -> usize {
     names.iter().map(|(n, _)| 12 + n.len()).sum()
 }
 
+/// The index of an attribute name and the rest of it that the record
+/// keeps: nothing for the name of an ACL, and a name of at least one byte
+/// after any other prefix, as a name of length 0 is read as the ACL of
+/// that index.
+fn split_name(name: &[u8]) -> Result<(&[u8], u8), String> {
+    if let Some((_, i)) = EXACT.iter().find(|(n, _)| name == *n) {
+        return Ok((&[], *i));
+    }
+    match PREFIXES.iter().find(|(p, _)| name.starts_with(p)) {
+        Some((p, _)) if name.len() == p.len() => Err(format!(
+            "the attribute name {} has nothing after its prefix",
+            name.escape_ascii()
+        )),
+        Some((p, i)) => Ok((&name[p.len()..], *i)),
+        None => Ok((name, 0)),
+    }
+}
+
 fn xattr_body(xattrs: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<Vec<u8>, String> {
     if xattrs.is_empty() {
         return Ok(Vec::new());
@@ -586,10 +632,7 @@ fn xattr_body(xattrs: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(12 + size);
     out.resize(12, 0);
     for (name, value) in xattrs {
-        let (suffix, index) = PREFIXES
-            .iter()
-            .find(|(p, _)| name.starts_with(p))
-            .map_or((&name[..], 0), |(p, i)| (&name[p.len()..], *i));
+        let (suffix, index) = split_name(name)?;
         let name_len = u8::try_from(suffix.len())
             .map_err(|_| format!("the attribute name {} is too long", name.escape_ascii()))?;
         let value_len = u16::try_from(value.len())
@@ -826,6 +869,158 @@ pub(crate) mod tests {
         e.mode = if t == TocEntryType::Dir { 0o755 } else { 0o644 };
         e.mod_time = Some("2024-01-02T03:04:05.25+00:00".into());
         e
+    }
+
+    fn device(name: &str, char: bool, major: u32, minor: u32) -> TocEntry {
+        let t = if char {
+            TocEntryType::Char
+        } else {
+            TocEntryType::Block
+        };
+        let mut d = entry(name, t);
+        (d.dev_major, d.dev_minor) = (Some(major), Some(minor));
+        d
+    }
+
+    /// The `rdev` of the node of `path` in an image.
+    fn rdev_in(image: &[u8], path: &str) -> String {
+        let l = listing(image);
+        let l = l
+            .iter()
+            .find(|l| l.starts_with(&format!("{path} ")))
+            .unwrap();
+        l.split(' ').nth(6).unwrap().to_string()
+    }
+
+    /// A device the numbers of which do not fit the image is an error that
+    /// names the entry: it is not made into another device or into a
+    /// whiteout.  The numbers at the edge that fit are kept.
+    #[test]
+    fn a_device_that_does_not_fit_is_refused() {
+        for (major, minor) in [(4096, 0), (0, 1 << 20), (8192, 5), (1 << 20, 1 << 20)] {
+            let e = layer_image(&[device("dev/x", true, major, minor)])
+                .err()
+                .unwrap();
+            assert!(
+                e.contains("`dev/x`") && e.contains(&format!("{major}:{minor}")),
+                "{e}"
+            );
+        }
+        let e = layer_image(&[device("dev/b", false, 4096, 0)])
+            .err()
+            .unwrap();
+        assert!(e.contains("`dev/b`"), "{e}");
+        let image = layer_image(&[
+            device("a", false, 0, 0),
+            device("b", true, 4095, (1 << 20) - 1),
+            device("c", true, 1, 3),
+        ])
+        .unwrap()
+        .image;
+        assert_eq!(rdev_in(&image, "/a"), "0");
+        assert_eq!(rdev_in(&image, "/b"), u32::MAX.to_string());
+        assert_eq!(rdev_in(&image, "/c"), "259");
+    }
+
+    /// The merged view of the layers refuses what the image refuses, so
+    /// that a device is the same in both.
+    #[test]
+    fn the_merged_view_refuses_the_device_of_no_image() {
+        let low = file("x", 1, 3);
+        let e = crate::merged::MergedTree::build_entries(&[
+            std::slice::from_ref(&low),
+            &[device("x", true, 4096, 0)],
+        ])
+        .err()
+        .unwrap();
+        assert!(e.contains("layer 1") && e.contains("`x`"), "{e}");
+        let wh = entry(".wh.x", TocEntryType::Reg);
+        let m = crate::merged::MergedTree::build_entries(&[&[low], &[wh]]).unwrap();
+        assert_eq!(m.lookup(crate::merged::ROOT, "x"), None);
+    }
+
+    /// A character device 0:0 in a layer is a whiteout, in the image (the
+    /// node of the number 0 that the overlay reads so) and in the merged
+    /// view (it hides the file below it), like a `.wh.` name.
+    #[test]
+    fn a_character_device_0_0_is_a_whiteout_in_the_image_and_the_view() {
+        let low = file("x", 1, 3);
+        let wh = device("x", true, 0, 0);
+        let image = layer_image(std::slice::from_ref(&wh)).unwrap().image;
+        assert_eq!(rdev_in(&image, "/x"), "0");
+        let l = listing(&image);
+        let l = l.iter().find(|l| l.starts_with("/x ")).unwrap();
+        assert!(l.split(' ').nth(1).unwrap().starts_with("20"), "{l}");
+        let m = crate::merged::MergedTree::build_entries(&[&[low], &[wh]]).unwrap();
+        assert_eq!(m.lookup(crate::merged::ROOT, "x"), None);
+    }
+
+    /// The record of an attribute keeps what follows its prefix, and a
+    /// name of length 0 only for the two ACLs, which are exact names: a
+    /// longer name that begins with one is kept whole, and a prefix with
+    /// nothing after it is an error.
+    #[test]
+    fn an_attribute_name_is_never_written_empty_but_for_an_acl() {
+        let split = |n: &str| split_name(n.as_bytes()).map(|(s, i)| (s.to_vec(), i));
+        assert_eq!(split("system.posix_acl_access"), Ok((vec![], 2)));
+        assert_eq!(split("system.posix_acl_default"), Ok((vec![], 3)));
+        assert_eq!(
+            split("system.posix_acl_accessX"),
+            Ok((b"system.posix_acl_accessX".to_vec(), 0))
+        );
+        assert_eq!(
+            split("system.posix_acl_default.x"),
+            Ok((b"system.posix_acl_default.x".to_vec(), 0))
+        );
+        assert_eq!(split("user.a"), Ok((b"a".to_vec(), 1)));
+        assert_eq!(split("trusted.a"), Ok((b"a".to_vec(), 4)));
+        assert_eq!(split("lustre.a"), Ok((b"a".to_vec(), 5)));
+        assert_eq!(split("security.a"), Ok((b"a".to_vec(), 6)));
+        assert_eq!(split("other.a"), Ok((b"other.a".to_vec(), 0)));
+        for n in ["user.", "trusted.", "security.", "lustre."] {
+            let e = split(n).unwrap_err();
+            assert!(e.contains(n) && e.contains("nothing after"), "{e}");
+        }
+        let mut x = BTreeMap::new();
+        x.insert(b"lustre.".to_vec(), b"v".to_vec());
+        assert!(xattr_body(&x).is_err());
+    }
+
+    /// The attributes an image keeps are the plain ones: those of the
+    /// overlay, in any namespace and nested, and the label of the engine
+    /// are not, and a name that is only a namespace is an error.
+    #[test]
+    fn the_attributes_of_the_overlay_do_not_reach_the_image() {
+        let attrs = |name: &str| {
+            let mut f = file("f", 1, 3);
+            f.xattrs.insert(name.into(), "eQ==".into());
+            let image = layer_image(&[f])?.image;
+            let l = listing(&image);
+            let l = l.iter().find(|l| l.starts_with("/f ")).unwrap().clone();
+            Ok::<_, String>(l.contains(&format!("{name}=y")))
+        };
+        for name in [
+            "trusted.overlay.redirect",
+            "trusted.overlay.metacopy",
+            "trusted.overlay.overlay.opaque",
+            "user.overlay.redirect",
+            "user.overlay.overlay.x",
+            "security.overlay.x",
+            "system.overlay.x",
+            "security.selinux",
+        ] {
+            assert_eq!(attrs(name), Ok(false), "{name}");
+        }
+        for name in ["user.x", "security.selinuxx", "user.overlay", "overlay.x"] {
+            assert_eq!(attrs(name), Ok(true), "{name}");
+        }
+        for name in ["user.", "trusted.", "security.", "system.", ""] {
+            let e = attrs(name).err().unwrap();
+            assert!(
+                e.contains("`f`") && e.contains("not the name"),
+                "{name}: {e}"
+            );
+        }
     }
 
     /// The chunks of a file are not entries of the layer: its image and its

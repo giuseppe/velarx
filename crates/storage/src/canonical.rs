@@ -88,6 +88,7 @@ use crate::{content_size, size_conflict, toc_time, TocEntry, TocEntryType};
 use base64::Engine;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
+use velarx_overlay_core::{class, rdev, whiteout, Class};
 use velarx_tarsplit_header::emit::{
     path_order, put_decimal, put_octal, put_time, record_len, seal,
 };
@@ -100,8 +101,6 @@ const MARKER: (&str, &str) = ("comment", "canonical-tar=1");
 const MAX_OCTAL_11: u64 = 0o77_777_777_777;
 /// The ids of the header go up to this, 7 digits.
 const MAX_ID_FIELD: u32 = 0o7_777_777;
-/// The largest number of a device, 7 digits.
-const MAX_DEVICE: u32 = 0o7_777_777;
 /// What a `name` or a `linkname` of the header holds.
 const NAME_FIELD: usize = 100;
 /// What of the last component goes in the name of an `x` header.
@@ -208,12 +207,6 @@ fn components(key: &str) -> impl Iterator<Item = &str> {
         .flatten()
 }
 
-fn is_overlay_xattr(name: &str) -> bool {
-    ["trusted.overlay.", "user.overlay."]
-        .iter()
-        .any(|p| name.starts_with(p))
-}
-
 /// What the entries before a hard link say of what it can link to.
 struct Seen {
     kind: TocEntryType,
@@ -286,10 +279,10 @@ impl Checker {
         if !is_device && f.device != (0, 0) {
             return Err("only a device has device numbers".into());
         }
-        if f.device.0 > MAX_DEVICE || f.device.1 > MAX_DEVICE {
+        if rdev(f.device.0, f.device.1).is_none() {
             return Err("a device number does not fit the header".into());
         }
-        if f.kind == TocEntryType::Char && f.device == (0, 0) {
+        if whiteout(f.kind == TocEntryType::Char, f.device.0, f.device.1) {
             return Err("the character device 0/0 is a whiteout of the overlay file system".into());
         }
         if f.xattrs.len() > MAX_XATTRS {
@@ -299,13 +292,16 @@ impl Checker {
             return Err(format!("a path is longer than {MAX_PATH} bytes"));
         }
         for (k, v) in &f.xattrs {
-            if k.is_empty() || k.len() > MAX_XATTR_NAME || k.contains(['=', '\0']) {
+            if k.len() > MAX_XATTR_NAME
+                || k.contains('=')
+                || matches!(class(k.as_bytes()), Class::Refused(_))
+            {
                 return Err(format!("`{k}` is not a name an xattr can have"));
             }
             if v.len() > MAX_XATTR_VALUE {
                 return Err(format!("the value of xattr `{k}` is too large"));
             }
-            if is_overlay_xattr(k) {
+            if matches!(class(k.as_bytes()), Class::Overlay) {
                 return Err(format!("the overlay xattr `{k}` is not allowed"));
             }
         }

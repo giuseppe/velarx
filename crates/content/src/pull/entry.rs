@@ -5,6 +5,7 @@ use super::tar::{normalize_path, Header, Kind, MAX_NAME_LEN, MAX_XATTRS, MAX_XAT
 use base64::Engine;
 use std::collections::HashMap;
 use std::io;
+use velarx_overlay_core::{class, Class};
 use velarx_storage::{rfc3339, toc_time, Toc, TocEntry, TocEntryType};
 use velarx_types::digest::{Algorithm, Digest};
 
@@ -29,16 +30,6 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 
 /// Largest value of an extended attribute kept.
 const MAX_XATTR_VALUE: usize = 64 * 1024;
-
-/// Extended attributes of the overlay file system, in any of its namespaces.
-fn is_overlay_xattr(name: &str) -> bool {
-    ["trusted.", "user.", "security.", "system."]
-        .iter()
-        .any(|ns| {
-            name.strip_prefix(ns)
-                .is_some_and(|n| n.starts_with("overlay."))
-        })
-}
 
 /// The name a layer gives the entry at `path` (the root directory of the
 /// layer is `./`).
@@ -91,10 +82,11 @@ fn layer_entry(e: TocEntry) -> io::Result<TocEntry> {
     let mut xattrs = HashMap::new();
     let mut bytes = 0;
     for (i, (k, v)) in e.xattrs.iter().enumerate() {
+        let class = class(k.as_bytes());
         let value = STANDARD
             .decode(v)
             .ok()
-            .filter(|_| !k.is_empty() && !k.contains('\0'));
+            .filter(|_| !matches!(class, Class::Refused(_)));
         let Some(value) = value else {
             return Err(invalid(format!(
                 "`{name}` has an invalid extended attribute `{}`",
@@ -107,7 +99,7 @@ fn layer_entry(e: TocEntry) -> io::Result<TocEntry> {
                 "`{name}` has too many extended attributes"
             )));
         }
-        if !is_overlay_xattr(k) && value.len() <= MAX_XATTR_VALUE {
+        if !matches!(class, Class::Overlay) && value.len() <= MAX_XATTR_VALUE {
             xattrs.insert(k.clone(), STANDARD.encode(value));
         }
     }
@@ -362,6 +354,9 @@ mod tests {
             "trusted.overlay.redirect",
             "user.overlay.metacopy",
             "trusted.overlay.opaque",
+            "trusted.overlay.overlay.opaque",
+            "security.overlay.redirect",
+            "system.overlay.redirect",
             "user.keep",
             "security.capability",
         ] {
@@ -373,6 +368,19 @@ mod tests {
         let mut keys: Vec<_> = e.xattrs.keys().cloned().collect();
         keys.sort();
         assert_eq!(keys, ["security.capability", "user.keep"]);
+    }
+
+    #[test]
+    fn test_a_namespace_with_no_name_is_refused() {
+        for k in ["user.", "trusted.", "security.", "system.", "user.a\0b"] {
+            let mut h = header("f", Kind::Regular);
+            h.xattrs.insert(k.into(), b"x".to_vec());
+            let e = from_header(&h, Some(&crate::sha256_text(b""))).unwrap_err();
+            assert!(
+                e.to_string().contains("invalid extended attribute"),
+                "{k}: {e}"
+            );
+        }
     }
 
     #[test]

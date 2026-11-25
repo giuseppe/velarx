@@ -22,6 +22,7 @@ doctest = false
 velarx-base = { path = "../base" }
 velarx-storage = { path = "../storage" }
 velarx-types = { path = "../types" }
+velarx-overlay-core = { path = "../overlay-core" }
 velarx-proto = { path = "../proto", default-features = false }
 fuser = { version = "0.16", features = ["abi-7-40"] }
 composefs.workspace = true

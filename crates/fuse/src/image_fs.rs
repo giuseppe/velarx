@@ -205,11 +205,13 @@ impl ImageFs {
 
 /// Attributes of an image that are not shown: the overlay's own (an
 /// image could make the overlay over it see opaque directories,
-/// redirects or metacopies) and the SELinux label (the engine labels).
+/// redirects or metacopies), the SELinux label (the engine labels) and
+/// names that are none ([`velarx_overlay_core::class`]).
 pub fn hidden_xattr(name: &str) -> bool {
-    name.starts_with("trusted.overlay.")
-        || name.starts_with("user.overlay.")
-        || name.starts_with("security.selinux")
+    !matches!(
+        velarx_overlay_core::class(name.as_bytes()),
+        velarx_overlay_core::Class::Plain
+    )
 }
 
 /// `count` threads named `name-N` that run the jobs sent to the channel
@@ -1223,10 +1225,17 @@ mod tests {
             "trusted.overlay.opaque",
             "user.overlay.redirect",
             "security.selinux",
+            "system.overlay.x",
+            "user.",
         ] {
             assert!(hidden_xattr(n), "{n}");
         }
-        for n in ["user.k", "security.capability", "trusted.other"] {
+        for n in [
+            "user.k",
+            "security.capability",
+            "trusted.other",
+            "security.selinuxx",
+        ] {
             assert!(!hidden_xattr(n), "{n}");
         }
     }

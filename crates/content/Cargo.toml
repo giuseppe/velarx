@@ -32,6 +32,7 @@ velarx-config = { path = "../config", features = ["engine"] }
 velarx-db = { path = "../db" }
 velarx-storage = { path = "../storage" }
 velarx-fuse = { path = "../fuse" }
+velarx-overlay-core = { path = "../overlay-core" }
 velarx-wire = { path = "../wire" }
 velarx-tarsplit = { path = "../tarsplit" }
 velarx-chunk-core = { path = "../chunk-core" }

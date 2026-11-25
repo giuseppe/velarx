@@ -761,7 +761,7 @@ fn random_layer(rng: &mut StdRng) -> (Vec<TocEntry>, Contents) {
             }
             TocEntryType::Char => {
                 e.dev_major = Some(rng.gen_range(1..4096));
-                e.dev_minor = Some(rng.gen_range(0..2_097_152));
+                e.dev_minor = Some(rng.gen_range(0..1 << 20));
             }
             _ => {}
         }

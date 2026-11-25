@@ -21,7 +21,7 @@
 //! read from the store; with the digests enforced each is opened and
 //! measured as the kernel would (`verity::Verity`, `enforced`).
 
-use super::erofs_read::{decode_dev, xattrs};
+use super::erofs_read::xattrs;
 use super::tree::{Attr, FileRef, Tree};
 use composefs::erofs::format::{
     FileType as ErofsFileType, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
@@ -32,6 +32,7 @@ use fuser::FileType;
 use std::io;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
+use velarx_overlay_core::major_minor;
 use velarx_storage::FsVerityHashAlgorithm;
 use velarx_types::digest::{Algorithm, Digest};
 use zerocopy::FromBytes as _;
@@ -401,7 +402,7 @@ impl Layer {
         let size = inode.size();
         let rdev = match kind {
             FileType::CharDevice | FileType::BlockDevice => {
-                let (major, minor) = decode_dev(inode.u());
+                let (major, minor) = major_minor(inode.u());
                 libc::makedev(major, minor) as u32
             }
             _ => 0,

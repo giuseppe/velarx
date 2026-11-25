@@ -24,6 +24,7 @@ test-support = []
 [dependencies]
 velarx-base = { path = "../base" }
 velarx-types = { path = "../types" }
+velarx-overlay-core = { path = "../overlay-core" }
 velarx-tarsplit-header = { path = "../tarsplit-header" }
 rustix = { workspace = true, features = ["fs", "process"] }
 velarx-sys = { path = "../sys" }

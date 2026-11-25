@@ -59,6 +59,7 @@ use crate::{rfc3339, toc_time, Toc, TocEntry, TocEntryType, TOC_VERSION, TOC_VER
 use base64::Engine;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use velarx_overlay_core::{class, rdev, Class};
 use velarx_types::digest::{Algorithm, Digest};
 
 pub const MAGIC: &[u8; 8] = b"ZCTABLE1";
@@ -80,7 +81,6 @@ const MAX_XATTR_VALUE: usize = 65536;
 const MAX_XATTR_BYTES: usize = 1 << 20;
 /// The most components of a path, as a tar header has (`velarx_tarsplit`).
 pub const MAX_DEPTH: usize = 512;
-const MAX_DEVICE: u32 = 0o7_777_777;
 const FIRST_TIME: i64 = -62_135_596_800; // 0001-01-01T00:00:00Z
 const LAST_TIME: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
 /// The most entries of a table, as many as a layer has.
@@ -267,15 +267,6 @@ struct Chunk<'a> {
     digest: &'a [u8],
 }
 
-fn is_overlay_xattr(name: &str) -> bool {
-    ["trusted.", "user.", "security.", "system."]
-        .iter()
-        .any(|ns| {
-            name.strip_prefix(ns)
-                .is_some_and(|n| n.starts_with("overlay."))
-        })
-}
-
 /// The sets of extended attributes of section 5, checked: sorted, distinct,
 /// of names a layer keeps, of at most `MAX_XATTR_BYTES` of names and
 /// values each.  The extent of each in the section.
@@ -310,8 +301,8 @@ fn xattr_sets(b: &[u8]) -> Result<Vec<(usize, usize)>, String> {
                 return bad("the names of a set are not sorted");
             }
             last = Some(name);
-            let kept =
-                std::str::from_utf8(name).is_ok_and(|n| !n.contains('\0') && !is_overlay_xattr(n));
+            let kept = std::str::from_utf8(name).is_ok()
+                && matches!(class(name), Class::Plain | Class::Label);
             if !kept {
                 return bad("an attribute a layer does not have");
             }
@@ -516,7 +507,7 @@ impl<'a> Table<'a> {
                     target_at += b;
                 }
                 3 if a < n && b == 0 => {}
-                4 | 5 if e.a <= MAX_DEVICE && e.b <= MAX_DEVICE => {}
+                4 | 5 if rdev(e.a, e.b).is_some() => {}
                 6 if a == 0 && b == 0 => {}
                 _ => return bad("an invalid kind or fields of its kind"),
             }
@@ -1027,9 +1018,8 @@ pub fn encode(toc: &Toc, alg: Algorithm) -> Result<Vec<u8>, String> {
                         .ok()
                         .filter(|v| {
                             v.len() <= MAX_XATTR_VALUE
-                                && (1..=MAX_NAME).contains(&k.len())
-                                && !k.contains('\0')
-                                && !is_overlay_xattr(k)
+                                && k.len() <= MAX_NAME
+                                && matches!(class(k.as_bytes()), Class::Plain | Class::Label)
                         })
                         .ok_or_else(|| format!("`{}` has the xattr `{k}`", e.name))?;
                     set.push((k, v));
@@ -1085,7 +1075,7 @@ pub fn encode(toc: &Toc, alg: Algorithm) -> Result<Vec<u8>, String> {
                 TocEntryType::Char | TocEntryType::Block => {
                     raw.a = e.dev_major.unwrap_or(0);
                     raw.b = e.dev_minor.unwrap_or(0);
-                    if raw.a > MAX_DEVICE || raw.b > MAX_DEVICE {
+                    if rdev(raw.a, raw.b).is_none() {
                         return bad("has a device number that is too large");
                     }
                 }
@@ -1299,7 +1289,7 @@ mod tests {
     fn test_a_table_of_contents_that_cannot_have_a_table() {
         let alg = Algorithm::Sha256;
         type Edit = fn(&mut Toc);
-        let cases: [(&str, Edit); 8] = [
+        let cases: [(&str, Edit); 12] = [
             ("twice", |t| {
                 let d = t.entries[10].clone();
                 t.entries.push(d);
@@ -1312,6 +1302,16 @@ mod tests {
             ("hard link", |t| t.entries[5].link_name = Some("./e".into())),
             ("permission", |t| t.entries[1].mode = 0o40755),
             ("not a path", |t| t.entries[10].name = "./x/../d".into()),
+            ("the xattr", |t| {
+                let x = &mut t.entries[2].xattrs;
+                x.insert("security.overlay.x".into(), "eQ==".into());
+            }),
+            ("the xattr", |t| {
+                let x = &mut t.entries[2].xattrs;
+                x.insert("user.".into(), "eQ==".into());
+            }),
+            ("too large", |t| t.entries[7].dev_major = Some(4096)),
+            ("too large", |t| t.entries[7].dev_minor = Some(1 << 20)),
             ("sha512", |t| {
                 t.entries[2].fsverity = Some(verity(Algorithm::Sha512, b"f"))
             }),
@@ -1450,10 +1450,12 @@ mod tests {
             ("flags", Box::new(ent(4, 7)), vec![2]),
             ("kind", Box::new(ent(4, 6)), vec![7]),
             ("kind", Box::new(ent(4, 20)), 1u32.to_le_bytes().to_vec()),
+            // a device the image cannot have: a major of 4096, a minor of 2^20
+            ("kind", Box::new(ent(2, 20)), 4096u32.to_le_bytes().to_vec()),
             (
                 "kind",
-                Box::new(ent(2, 20)),
-                (MAX_DEVICE + 1).to_le_bytes().to_vec(),
+                Box::new(ent(2, 24)),
+                (1u32 << 20).to_le_bytes().to_vec(),
             ),
             (
                 "sorted",

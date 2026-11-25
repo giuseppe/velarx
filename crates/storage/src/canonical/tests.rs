@@ -518,7 +518,7 @@ fn links_and_special_files_have_their_type_link_and_device_fields() {
     let mut chr = entry("./c", TocEntryType::Char);
     (chr.dev_major, chr.dev_minor) = (Some(1), Some(3));
     let mut blk = entry("./b", TocEntryType::Block);
-    (blk.dev_major, blk.dev_minor) = (Some(8), Some(2_097_151));
+    (blk.dev_major, blk.dev_minor) = (Some(8), Some(MAX_MINOR));
     let fifo = entry("./f", TocEntryType::Fifo);
     let out = canonical(&[blk, chr, fifo, long, sym]);
     let h = |n: &[u8], mode: &str, typ: u8, link: &[u8], dev| {
@@ -540,7 +540,7 @@ fn links_and_special_files_have_their_type_link_and_device_fields() {
         out,
         cat(&[
             &pax(b"b", MARKER_RECORD),
-            &h(b"./b", "0000644", b'4', b"", Some(("0000010", "7777777"))),
+            &h(b"./b", "0000644", b'4', b"", Some(("0000010", "3777777"))),
             &h(b"./c", "0000644", b'3', b"", Some(("0000001", "0000003"))),
             &h(b"./f", "0000644", b'6', b"", None),
             &pax(b"l", record.as_bytes()),
@@ -811,13 +811,21 @@ fn the_character_device_0_0_and_the_overlay_xattrs_are_refused() {
         "trusted.overlay.opaque",
         "user.overlay.redirect",
         "trusted.overlay.x",
+        "trusted.overlay.overlay.x",
+        "security.overlay.x",
+        "system.overlay.x",
+        // a namespace and no name
+        "user.",
+        "trusted.",
+        "security.",
+        "system.",
     ] {
         assert!(
             validate(&[xattr(file("./a", 0), name, b"y")]).is_err(),
             "{name}"
         );
     }
-    ok(&[xattr(file("./a", 0), "security.overlay.x", b"y")]);
+    ok(&[xattr(file("./a", 0), "security.selinuxx", b"y")]);
     ok(&[xattr(file("./a", 0), "user.overlaid", b"y")]);
 }
 
@@ -835,9 +843,12 @@ fn the_limits_of_xattrs_devices_times_and_modes() {
     assert!(validate(&[bad]).is_err());
 
     let mut d = entry("./d", TocEntryType::Block);
-    (d.dev_major, d.dev_minor) = (Some(1), Some(2_097_151));
+    (d.dev_major, d.dev_minor) = (Some(MAX_MAJOR), Some(MAX_MINOR));
     ok(&[d.clone()]);
-    d.dev_minor = Some(2_097_152);
+    // the numbers the image cannot have, though the header could
+    d.dev_minor = Some(MAX_MINOR + 1);
+    assert!(validate(&[d.clone()]).is_err());
+    (d.dev_major, d.dev_minor) = (Some(MAX_MAJOR + 1), Some(0));
     assert!(validate(&[d]).is_err());
     let mut f = file("./f", 0);
     f.dev_major = Some(1);
@@ -1426,14 +1437,17 @@ const EDGE_SECS: [i64; 8] = [
     LAST_TIME,
 ];
 const EDGE_NANOS: [u32; 3] = [0, 1, 500_000_000];
+/// The largest major and minor of a device an image can have.
+const MAX_MAJOR: u32 = (1 << 12) - 1;
+const MAX_MINOR: u32 = (1 << 20) - 1;
 const EDGE_DEVICES: [(u32, u32); 7] = [
     (0, 1),
     (1, 0),
-    (MAX_DEVICE, 0),
-    (0, MAX_DEVICE),
-    (MAX_DEVICE, MAX_DEVICE),
-    (MAX_DEVICE + 1, 0),
-    (0, MAX_DEVICE + 1),
+    (MAX_MAJOR, 0),
+    (0, MAX_MINOR),
+    (MAX_MAJOR, MAX_MINOR),
+    (MAX_MAJOR + 1, 0),
+    (0, MAX_MINOR + 1),
 ];
 
 fn at(secs: i64, nanos: u32) -> String {
@@ -1827,8 +1841,8 @@ fn a_number_too_wide_for_its_field_is_an_error() {
     };
     wide(&|e| e.mode = 0o10_000_000);
     wide(&|e| e.mode = u32::MAX);
-    wide(&|e| e.dev_major = Some(MAX_DEVICE + 1));
-    wide(&|e| e.dev_minor = Some(MAX_DEVICE + 1));
+    wide(&|e| e.dev_major = Some(1 << 21));
+    wide(&|e| e.dev_minor = Some(1 << 21));
 }
 
 #[test]

@@ -35,9 +35,14 @@ pub fn dir_entry(name: &str) -> TocEntry {
     }
 }
 
-/// Whether the entry is a whiteout of the image of a layer: a device 0:0.
+/// Whether the entry is a whiteout of the image of a layer: a device 0:0
+/// (the engine makes it for a `.wh.` name, and a layer may carry one).
 fn is_whiteout(e: &TocEntry) -> bool {
-    e.entry_type == TocEntryType::Char && e.dev_major == Some(0) && e.dev_minor == Some(0)
+    velarx_overlay_core::whiteout(
+        e.entry_type == TocEntryType::Char,
+        e.dev_major.unwrap_or(0),
+        e.dev_minor.unwrap_or(0),
+    )
 }
 
 impl MergedTree {

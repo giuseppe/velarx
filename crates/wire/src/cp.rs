@@ -26,6 +26,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use velarx_base::walk::{Visit, Walk};
+use velarx_overlay_core::{class, Class};
 use velarx_sys::fs::{open_beneath, openat2_retry, Beneath};
 
 /// The deepest directory tree archived or extracted.
@@ -573,17 +574,15 @@ fn layer_xattrs<R: Read>(entry: &mut tar::Entry<'_, R>) -> io::Result<Vec<(Vec<u
         let Some(name) = ext.key_bytes().strip_prefix(b"SCHILY.xattr.") else {
             continue;
         };
-        if name.starts_with(b"trusted.overlay.")
-            || name.starts_with(b"user.overlay.")
-            || name == b"security.selinux"
-        {
-            continue;
-        }
-        if name.is_empty() || name.contains(&0) {
-            return Err(invalid(format!(
-                "invalid xattr name `{}` in the archive",
-                String::from_utf8_lossy(name)
-            )));
+        match class(name) {
+            Class::Overlay | Class::Label => continue,
+            Class::Refused(_) => {
+                return Err(invalid(format!(
+                    "invalid xattr name `{}` in the archive",
+                    String::from_utf8_lossy(name)
+                )))
+            }
+            Class::Plain => {}
         }
         out.push((name.to_vec(), ext.value_bytes().to_vec()));
     }
@@ -2034,6 +2033,42 @@ mod tests {
         for p in ["e/.wh.gone", "o/.wh..wh..opq", ".wh.dd"] {
             assert!(!d.path().join(p).exists(), "{p}");
         }
+    }
+
+    /// The attributes of an entry of a layer: the plain ones are kept, those
+    /// of the overlay in any namespace and the label are skipped, and a
+    /// name that is only a namespace is an error.
+    #[test]
+    fn the_xattrs_of_an_entry_of_a_layer_are_judged_by_their_names() {
+        let xattrs = |names: &[&str]| {
+            let mut b = tar::Builder::new(Vec::new());
+            let x: Vec<_> = names
+                .iter()
+                .map(|n| (format!("SCHILY.xattr.{n}"), &b"v"[..]))
+                .collect();
+            b.append_pax_extensions(x.iter().map(|(k, v)| (k.as_str(), *v)))
+                .unwrap();
+            let mut h = tar::Header::new_ustar();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(0);
+            b.append_data(&mut h, "f", &b""[..]).unwrap();
+            let tar = b.into_inner().unwrap();
+            let mut ar = tar::Archive::new(&tar[..]);
+            let mut entry = ar.entries().unwrap().next().unwrap().unwrap();
+            layer_xattrs(&mut entry)
+        };
+        let kept = xattrs(&[
+            "user.a",
+            "security.overlay.x",
+            "system.overlay.x",
+            "security.selinux",
+            "security.selinuxx",
+        ])
+        .unwrap();
+        let names: Vec<_> = kept.iter().map(|(k, _)| &k[..]).collect();
+        assert_eq!(names, [&b"user.a"[..], b"security.selinuxx"]);
+        let e = xattrs(&["user."]).unwrap_err();
+        assert!(e.to_string().contains("invalid xattr name `user.`"), "{e}");
     }
 
     #[test]

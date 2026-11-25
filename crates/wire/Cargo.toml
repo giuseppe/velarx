@@ -21,6 +21,7 @@ doctest = false
 velarx-base = { path = "../base" }
 velarx-sys = { path = "../sys" }
 velarx-registry = { path = "../registry" }
+velarx-overlay-core = { path = "../overlay-core" }
 velarx-proto = { path = "../proto", default-features = false, features = ["proxy"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
