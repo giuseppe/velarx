@@ -167,6 +167,11 @@ pub(super) fn publish_exposed<'a>(
         ))
     };
     let exposed: Vec<String> = image.cloned().chain(req.expose.iter().cloned()).collect();
+    let mut mapped: std::collections::HashSet<(u16, String)> = req
+        .ports
+        .iter()
+        .map(|m| (m.container_port, m.protocol.clone()))
+        .collect();
     for e in exposed {
         let (ports, proto) = e.split_once('/').unwrap_or((e.as_str(), "tcp"));
         let proto = if proto.is_empty() { "tcp" } else { proto };
@@ -189,11 +194,7 @@ pub(super) fn publish_exposed<'a>(
             return Err(invalid(&e));
         }
         for p in lo..=hi {
-            if !req
-                .ports
-                .iter()
-                .any(|m| m.container_port == p && m.protocol == proto)
-            {
+            if mapped.insert((p, proto.to_string())) {
                 req.ports.push(PortMapping {
                     container_port: p,
                     host_port: None,

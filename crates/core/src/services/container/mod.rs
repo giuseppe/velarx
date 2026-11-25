@@ -1036,6 +1036,105 @@ mod tests {
         }
     }
 
+    /// `publish_exposed` as it was before the set of mapped ports: each port
+    /// looked for in the list of mappings it grows.  The oracle of the test
+    /// below.
+    fn publish_exposed_quadratic<'a>(
+        req: &mut CreateContainerRequest,
+        image: impl Iterator<Item = &'a String>,
+    ) -> Result<(), ()> {
+        let exposed: Vec<String> = image.cloned().chain(req.expose.iter().cloned()).collect();
+        for e in exposed {
+            let (ports, proto) = e.split_once('/').unwrap_or((e.as_str(), "tcp"));
+            let proto = if proto.is_empty() { "tcp" } else { proto };
+            if proto == "sctp" {
+                continue;
+            }
+            if !matches!(proto, "tcp" | "udp") {
+                return Err(());
+            }
+            let port = |p: &str| p.trim().parse::<u16>().ok().filter(|p| *p > 0);
+            let (lo, hi) = match ports.split_once('-') {
+                Some((a, b)) => (port(a), port(b)),
+                None => (port(ports), port(ports)),
+            };
+            let (Some(lo), Some(hi)) = (lo, hi) else {
+                return Err(());
+            };
+            if lo > hi {
+                return Err(());
+            }
+            for p in lo..=hi {
+                if !req
+                    .ports
+                    .iter()
+                    .any(|m| m.container_port == p && m.protocol == proto)
+                {
+                    req.ports.push(PortMapping {
+                        container_port: p,
+                        host_port: None,
+                        host_ip: String::new(),
+                        protocol: proto.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn publish_all_makes_the_mappings_of_the_quadratic_search() {
+        // small ports, so that ranges overlap, the same port comes with
+        // both protocols and the request maps some of them already
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let protos = ["", "/tcp", "/udp", "/", "/sctp", "/icmp"];
+        for _ in 0..5000 {
+            let entry = |next: &mut dyn FnMut(u64) -> u64| {
+                let lo = next(13);
+                let range = if next(2) == 0 {
+                    format!("{lo}-{}", lo + next(6))
+                } else {
+                    lo.to_string()
+                };
+                format!("{range}{}", protos[next(6) as usize])
+            };
+            let image: Vec<String> = (0..next(5)).map(|_| entry(&mut next)).collect();
+            let req = CreateContainerRequest {
+                expose: (0..next(3)).map(|_| entry(&mut next)).collect(),
+                ports: (0..next(4))
+                    .map(|_| PortMapping {
+                        container_port: next(13) as u16,
+                        host_port: Some(8000 + next(100) as u16),
+                        host_ip: String::new(),
+                        protocol: ["tcp", "udp", "TCP"][next(3) as usize].into(),
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let (mut got, mut want) = (req.clone(), req);
+            let result = publish_exposed(&mut got, image.iter()).map_err(|_| ());
+            assert_eq!(
+                result,
+                publish_exposed_quadratic(&mut want, image.iter()),
+                "{image:?} {:?}",
+                want.expose
+            );
+            let pairs = |r: &CreateContainerRequest| -> Vec<(u16, Option<u16>, String)> {
+                r.ports
+                    .iter()
+                    .map(|p| (p.container_port, p.host_port, p.protocol.clone()))
+                    .collect()
+            };
+            assert_eq!(pairs(&got), pairs(&want), "{image:?} {:?}", want.expose);
+        }
+    }
+
     #[test]
     fn the_runtime_tells_only_pauses() {
         use crate::container::ContainerState as Oci;
