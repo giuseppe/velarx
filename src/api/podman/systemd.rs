@@ -76,13 +76,43 @@ fn executable(state: &AppState) -> String {
     }
 }
 
-/// podman's `escapeSystemdArg`.
+/// One word of an `ExecStart=` line (systemd.service(5), "Command lines"):
+/// `$` is doubled, as it starts a variable there, and a lone `;`, which
+/// ends a command, is `\;`; the rest as [`escape_word`].
 pub(crate) fn escape_arg(arg: &str) -> String {
-    let arg = arg.replace('$', "$$").replace('%', "%%");
-    if arg.contains([' ', '\t', '"']) {
-        format!("{arg:?}")
+    if arg == ";" {
+        return "\\;".to_string();
+    }
+    escape_word(&arg.replace('$', "$$"))
+}
+
+/// One word of an `Environment=` line, where `$` is not special, or of a
+/// command line (systemd.syntax(7), "Quoting"): `%` is doubled, a backslash
+/// is escaped, and a word that is empty or has a blank, a quote or a control
+/// character is quoted with the C escapes systemd reads, so a newline stays
+/// on its line.
+fn escape_word(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    for c in word.chars() {
+        match c {
+            '%' => out.push_str("%%"),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_ascii_control() => out.push_str(&format!("\\x{:02x}", c as u8)),
+            c => out.push(c),
+        }
+    }
+    let quote = word.is_empty()
+        || word
+            .chars()
+            .any(|c| c.is_ascii_whitespace() || c.is_ascii_control() || matches!(c, '"' | '\''));
+    if quote {
+        format!("\"{out}\"")
     } else {
-        arg.replace('\\', "\\\\")
+        out
     }
 }
 
@@ -170,7 +200,7 @@ impl Unit<'_> {
         }
         s += "\n[Service]\nEnvironment=PODMAN_SYSTEMD_UNIT=%n\n";
         for e in &o.env {
-            s += &format!("Environment={}\n", escape_arg(e));
+            s += &format!("Environment={}\n", escape_word(e));
         }
         s += &format!("Restart={}\n", o.restart_policy);
         if o.restart_sec > 0 {
@@ -461,10 +491,87 @@ mod tests {
             .starts_with("# container-web.service\n\n[Unit]\n"));
     }
 
+    /// The words of a command line as systemd reads them: split on blanks,
+    /// quotes group, C escapes everywhere, `$$` and `%%` are `$` and `%`.
+    fn systemd_words(line: &str) -> Vec<Vec<u8>> {
+        let mut words = Vec::new();
+        let mut cur: Option<Vec<u8>> = None;
+        let mut quote = None;
+        let mut it = line.chars().peekable();
+        while let Some(c) = it.next() {
+            let w = cur.get_or_insert_with(Vec::new);
+            match c {
+                c if quote.is_none() && c.is_ascii_whitespace() => {
+                    words.extend(cur.take());
+                }
+                '"' | '\'' if quote == Some(c) => quote = None,
+                '"' | '\'' if quote.is_none() => quote = Some(c),
+                '$' | '%' if it.peek() == Some(&c) => {
+                    it.next();
+                    w.push(c as u8);
+                }
+                '\\' => match it.next().unwrap() {
+                    'n' => w.push(b'\n'),
+                    't' => w.push(b'\t'),
+                    'r' => w.push(b'\r'),
+                    'x' => {
+                        let hex: String = [it.next().unwrap(), it.next().unwrap()].iter().collect();
+                        w.push(u8::from_str_radix(&hex, 16).unwrap());
+                    }
+                    e => w.extend(e.to_string().bytes()),
+                },
+                c => w.extend(c.to_string().bytes()),
+            }
+        }
+        assert!(quote.is_none(), "unterminated quote in {line:?}");
+        words.extend(cur);
+        words
+    }
+
+    #[test]
+    fn arguments_round_trip_through_systemd_rules() {
+        let args = [
+            "a",
+            "",
+            "a b",
+            "a\nb",
+            "a\tb",
+            "say \"hi\"",
+            "it's",
+            "back\\slash",
+            "\\n",
+            "$HOME %h",
+            "esc\u{1b}[0m",
+            "nul\u{7f}",
+            "h\u{e9}llo \u{1f600}",
+            "\u{85}",
+            ";",
+            "--opt=a b\nc",
+        ];
+        let line = args.map(escape_arg).join(" ");
+        assert!(!line.contains(['\n', '\u{1b}']), "{line:?}");
+        let got = systemd_words(&line);
+        let want: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
+        assert_eq!(got.len(), want.len(), "{line:?}");
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(String::from_utf8_lossy(g), String::from_utf8_lossy(w));
+        }
+    }
+
+    /// systemd expands no variable in `Environment=`: a `$$` there stays.
+    #[test]
+    fn an_environment_value_keeps_its_dollar() {
+        assert_eq!(escape_word("A=$B %n"), "\"A=$B %%n\"");
+        assert_eq!(escape_word("A=$$"), "A=$$");
+    }
+
     #[test]
     fn arguments_are_escaped_as_podman_does() {
         assert_eq!(escape_arg("a"), "a");
         assert_eq!(escape_arg("a b"), "\"a b\"");
+        assert_eq!(escape_arg("a\nb"), "\"a\\nb\"");
+        assert_eq!(escape_arg("\u{1b}x"), "\"\\x1bx\"");
+        assert_eq!(escape_arg(""), "\"\"");
         assert_eq!(escape_arg("$X%"), "$$X%%");
         assert_eq!(escape_arg("a\\b"), "a\\\\b");
         assert_eq!(service_name("", "-", "x"), "x");
