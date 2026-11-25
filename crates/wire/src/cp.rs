@@ -509,6 +509,8 @@ pub struct ExtractOptions {
     /// A directory may be replaced by what is not one, and the other way
     /// round (podman cp --overwrite, Docker's noOverwriteDirNonDir=false).
     pub overwrite_dir_non_dir: bool,
+    /// The setuid and setgid bits of the entries are not set.
+    pub mask_setid: bool,
 }
 
 /// Remove `name` of `dir` and, for a directory, what is below it, without
@@ -751,12 +753,26 @@ fn set_link_times(dir: &OwnedFd, name: &OsStr, stamp: &Timestamps) -> io::Result
 }
 
 /// Extract the tar read from `r` below the directory `base`.  Hard links,
-/// devices and fifos are skipped, but for a layer (`opts.layer`), whose hard
-/// links, fifos and devices are made (a device only where this process may
-/// make one).  The directories get the times of the
-/// archive at the end, when nothing more is made in them (as podman's and
-/// Docker's extraction).
+/// devices and fifos are skipped with a warning, but for a layer
+/// (`opts.layer`), whose hard links, fifos and devices are made (a device
+/// only where this process may make one).  The directories get the times of
+/// the archive at the end, when nothing more is made in them (as podman's
+/// and Docker's extraction).
 pub fn extract<R: Read>(r: R, base: BorrowedFd<'_>, opts: &ExtractOptions) -> io::Result<()> {
+    for (rel, kind) in extract_with(r, base, opts)? {
+        tracing::warn!("cp: entry {} of type {kind:?} skipped", rel.display());
+    }
+    Ok(())
+}
+
+/// `extract`, the entries it skips returned (their path below the base and
+/// their type) instead of warned of.
+pub fn extract_with<R: Read>(
+    r: R,
+    base: BorrowedFd<'_>,
+    opts: &ExtractOptions,
+) -> io::Result<Vec<(PathBuf, tar::EntryType)>> {
+    let mut skipped = Vec::new();
     let mut ar = crate::sparse::archive(r);
     let mut dir_times: Vec<(PathBuf, i64)> = Vec::new();
     let mut root_time = None;
@@ -844,7 +860,8 @@ pub fn extract<R: Read>(r: R, base: BorrowedFd<'_>, opts: &ExtractOptions) -> io
             }
         }
         let owner = owner_of(entry.header(), opts);
-        let mode = Mode::from_raw_mode(entry.header().mode().unwrap_or(0o644) & 0o7777);
+        let kept = if opts.mask_setid { 0o1777 } else { 0o7777 };
+        let mode = Mode::from_raw_mode(entry.header().mode().unwrap_or(0o644) & kept);
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
                 let mut opaque = false;
@@ -1025,7 +1042,7 @@ pub fn extract<R: Read>(r: R, base: BorrowedFd<'_>, opts: &ExtractOptions) -> io
             | tar::EntryType::XHeader
             | tar::EntryType::GNULongName
             | tar::EntryType::GNULongLink => {}
-            other => tracing::warn!("cp: entry {} of type {:?} skipped", rel.display(), other),
+            other => skipped.push((rel, other)),
         }
     }
     if let Some(mtime) = root_time {
@@ -1060,7 +1077,7 @@ pub fn extract<R: Read>(r: R, base: BorrowedFd<'_>, opts: &ExtractOptions) -> io
             AtFlags::empty(),
         )?;
     }
-    Ok(())
+    Ok(skipped)
 }
 
 /// The owner the entry with the header `h` is given: its own, translated to

@@ -643,6 +643,7 @@ pub(crate) async fn archive_put_of(
             layer: false,
             whiteouts: Default::default(),
             overwrite_dir_non_dir: opts.overwrite_dir_non_dir,
+            mask_setid: false,
         };
         cp::extract(
             decompressed(ChanReader {

@@ -14,6 +14,7 @@ use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
+use crate::cp::{extract_with, ExtractOptions};
 use crate::sbom::SbomResolve;
 pub use velarx_proto::buildspec::BuildFlags;
 
@@ -340,22 +341,29 @@ impl Output {
             }
             Output::Dir(dir) => {
                 std::fs::create_dir_all(dir).map_err(|e| named(dir, e))?;
-                let mut archive = tar::Archive::new(reader);
-                archive.set_preserve_permissions(true);
-                archive.set_overwrite(true);
-                for entry in archive.entries()? {
-                    let mut entry = entry?;
-                    let kind = entry.header().entry_type();
-                    if kind.is_block_special() || kind.is_character_special() {
+                let base = std::fs::File::open(dir).map_err(|e| named(dir, e))?;
+                // (an image's setuid files are not made setuid in the
+                // directory of the user who asked for the files)
+                let opts = ExtractOptions {
+                    overwrite_dir_non_dir: true,
+                    mask_setid: true,
+                    ..Default::default()
+                };
+                let skipped =
+                    extract_with(reader, base.as_fd(), &opts).map_err(|e| named(dir, e))?;
+                for (rel, kind) in skipped {
+                    let what = match kind {
                         // (an unprivileged user makes no device node, nor
                         // does buildah's local output)
-                        warn(format!(
-                            "WARNING: --output: the device node {} is not written",
-                            entry.path()?.display()
-                        ));
-                        continue;
-                    }
-                    entry.unpack_in(dir).map_err(|e| named(dir, e))?;
+                        tar::EntryType::Char | tar::EntryType::Block => "the device node",
+                        tar::EntryType::Fifo => "the fifo",
+                        tar::EntryType::Link => "the hard link",
+                        _ => "the entry",
+                    };
+                    warn(format!(
+                        "WARNING: --output: {what} {} is not written",
+                        rel.display()
+                    ));
                 }
                 Ok(())
             }
@@ -439,6 +447,76 @@ mod tests {
         assert!(flags(Some(true), Some(0), None).identity());
         assert!(flags(Some(true), None, Some(5)).identity());
         assert!(!flags(Some(false), None, None).identity());
+    }
+
+    #[test]
+    fn a_directory_output_has_no_setuid_and_nothing_outside() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut b = tar::Builder::new(Vec::new());
+        let file = |b: &mut tar::Builder<Vec<u8>>, path: &str, mode, kind, link: &str| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(kind);
+            h.set_mode(mode);
+            h.set_size(if kind == tar::EntryType::Regular {
+                1
+            } else {
+                0
+            });
+            if !link.is_empty() {
+                h.set_link_name(link).unwrap();
+            }
+            b.append_data(&mut h, path, &b"x"[..kind.is_file() as usize])
+                .unwrap();
+        };
+        let reg = tar::EntryType::Regular;
+        file(&mut b, "suid", 0o4755, reg, "");
+        file(&mut b, "sgid", 0o2755, reg, "");
+        file(&mut b, "esc", 0o777, tar::EntryType::Symlink, "../outside");
+        file(&mut b, "esc/pwned", 0o644, reg, "");
+        let d = tempfile::tempdir().unwrap();
+        let out = d.path().join("out");
+        // (the entry below the link is refused)
+        assert!(Output::Dir(out.clone())
+            .write(&b.into_inner().unwrap()[..], &mut |w| panic!("{w}"))
+            .is_err());
+        let mode = |n: &str| std::fs::metadata(out.join(n)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode("suid"), 0o755);
+        assert_eq!(mode("sgid"), 0o755);
+        assert!(!d.path().join("outside").exists());
+        assert!(!d.path().join("pwned").exists());
+    }
+
+    /// What a directory output does not make is told: a device node, a
+    /// fifo.
+    #[test]
+    fn a_directory_output_tells_what_it_does_not_write() {
+        let mut b = tar::Builder::new(Vec::new());
+        for (path, kind) in [
+            ("dev/null", tar::EntryType::Char),
+            ("fifo", tar::EntryType::Fifo),
+            ("file", tar::EntryType::Regular),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(kind);
+            h.set_mode(0o644);
+            h.set_size(0);
+            b.append_data(&mut h, path, &b""[..]).unwrap();
+        }
+        let d = tempfile::tempdir().unwrap();
+        let mut told = Vec::new();
+        Output::Dir(d.path().to_path_buf())
+            .write(&b.into_inner().unwrap()[..], &mut |w| told.push(w))
+            .unwrap();
+        assert_eq!(
+            told,
+            [
+                "WARNING: --output: the device node dev/null is not written",
+                "WARNING: --output: the fifo fifo is not written",
+            ]
+        );
+        assert!(d.path().join("file").is_file());
+        assert!(!d.path().join("dev/null").exists());
+        assert!(!d.path().join("fifo").exists());
     }
 
     #[test]
