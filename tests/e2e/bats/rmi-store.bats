@@ -53,3 +53,17 @@ db_bytes () {
     check "the prune gives back the pages of its rows ($before bytes before the pull, $pulled after, $(db_bytes) now)" 1 \
           "$([ "$(db_bytes)" -lt $(((before + pulled) / 2)) ] && echo 1)"
 }
+
+@test "rmi of every image leaves no layer image before any gc, and the store is consistent" {
+    local ref
+    for ref in "$IMAGE" "$E2E_REGISTRY/e2e/alpine:gzip" "$E2E_REGISTRY/e2e/alpine:pushed"; do
+        sh_ image pull --tls-verify=false "$ref" > /dev/null 2>&1
+        check "pull of $ref" 0 $?
+    done
+    check "the pulled layers have images" 1 "$([ "$(layer_images)" -gt 0 ] && echo 1)"
+    sh_ image rm -af > /dev/null 2>&1
+    check "rmi -af" 0 $?
+    check "no layer image is left" 0 "$(layer_images)"
+    sh_ system check > /dev/null 2>&1
+    check "system check" 0 $?
+}
