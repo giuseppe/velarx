@@ -53,7 +53,7 @@ teardown_file () {
     check_match "the store id" '"store": "[0-9a-f]{32}"' "$out"
     check_match "the capabilities (lazy is the engine's)" 'lazy yes, rootless yes, fs-verity at pull only' "$out"
     check "the driver is recorded in the store" varlink "$(sqlite3 "$(store)/db.sqlite" "SELECT value FROM store_settings WHERE key = 'driver'")"
-    check "the schema is version 2" 2 "$(sqlite3 "$(store)/db.sqlite" 'PRAGMA user_version')"
+    check "the schema is version 1" 1 "$(sqlite3 "$(store)/db.sqlite" 'PRAGMA user_version')"
     id=$(cat "$(store)/varlink/store-id")
     check_match "the id of the store is a file of the graph root" '^[0-9a-f]{32}$' "$id"
     check "and is not in the database" 0 "$(sqlite3 "$(store)/db.sqlite" "SELECT count(*) FROM store_settings WHERE value = '$id'")"

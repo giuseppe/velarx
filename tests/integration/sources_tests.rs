@@ -762,52 +762,6 @@ async fn test_a_pull_with_credentials_asks_the_peer_source() {
     assert!(e.store.contains(&vid(&sample_big())));
 }
 
-/// A store of version 1, with the two tables of what could be given to
-/// peers, loses them when it is opened, and pulls as any other.
-#[tokio::test]
-async fn test_a_store_with_the_old_tables_opens_and_pulls() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("db.sqlite");
-    let old = velarx_db::Database::open(&path).await.unwrap();
-    old.conn()
-        .call(|c| {
-            Ok(c.execute_batch(
-                "CREATE TABLE shared_layers (layer_id TEXT PRIMARY KEY, proven INTEGER);
-                 CREATE TABLE shared_images (image_id TEXT, repository TEXT, tag TEXT);
-                 INSERT INTO shared_layers VALUES ('l', 1);
-                 INSERT INTO shared_images VALUES ('i', '', '');
-                 PRAGMA user_version = 1;",
-            )?)
-        })
-        .await
-        .unwrap();
-    old.close().await.unwrap();
-    let db = velarx_db::Database::open(&path).await.unwrap();
-    let e = env_on(
-        db,
-        velarx_config::PullConfig::default(),
-        velarx_config::PushConfig::default(),
-        Fetchers::default(),
-        None,
-    )
-    .await;
-    e.publish(&[&build_chunked(&sample())], &[ZSTD]);
-    e.pull().await.unwrap();
-    let tables: i64 =
-        e.db.conn()
-            .call(|c| {
-                Ok(c.query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE name LIKE 'shared_%'",
-                    [],
-                    |r| r.get(0),
-                )?)
-            })
-            .await
-            .unwrap();
-    assert_eq!(tables, 0);
-    assert!(e.store.contains(&vid(&sample_big())));
-}
-
 /// The index of the table of contents `toc` and the tar-split `ts`.
 fn index_of_toc(toc: &velarx_storage::Toc, ts: &[u8]) -> Vec<u8> {
     let toc_z = zstd::encode_all(&serde_json::to_vec(toc).unwrap()[..], 3).unwrap();

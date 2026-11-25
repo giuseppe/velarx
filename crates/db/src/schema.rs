@@ -3,17 +3,10 @@ use rusqlite::{Connection, TransactionBehavior};
 
 /// The version of the schema, kept in `PRAGMA user_version`: a database of
 /// another version is not opened, and a new file (`user_version` 0, no table)
-/// is told from a made one.  Version 2 dropped the two tables of what could
-/// be given to peers: a store of version 1 becomes 2 when it is opened, so
-/// that a velarx of version 1 refuses it with the error of its version, and
-/// a read-only store of version 1 is read as it is (it only has those two
-/// tables more, which nothing reads).  Other changes edit the schema in
-/// place with no bump: a store made by another build is not told when it is
-/// opened, it fails at the first statement that needs the new shape.
-pub const SCHEMA_VERSION: i64 = 2;
-
-/// The oldest version a read-only store is read at.
-pub const OLDEST_READ_ONLY_VERSION: i64 = 1;
+/// is told from a made one.  It stays 1: a change of the schema edits it in
+/// place with no bump, and a store made by another build is not told when it
+/// is opened, it fails at the first statement that needs the new shape.
+pub const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaError {
@@ -28,8 +21,7 @@ pub enum SchemaError {
 
 /// The tables of the database.  `PRAGMA user_version` is 0 for a file with
 /// no table of ours; it is then made, in one transaction that the processes
-/// opening it together wait for.  A store of version 1 loses the two tables
-/// of what could be given to peers (`shared_layers`, `shared_images`), once.
+/// opening it together wait for.
 pub(super) fn init(conn: &mut Connection) -> Result<(), SchemaError> {
     let found: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if found == SCHEMA_VERSION {
@@ -38,16 +30,6 @@ pub(super) fn init(conn: &mut Connection) -> Result<(), SchemaError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let found: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if found == SCHEMA_VERSION {
-        return Ok(());
-    }
-    if found == 1 {
-        tx.execute_batch(&format!(
-            "DROP TABLE IF EXISTS shared_layers; DROP TABLE IF EXISTS shared_images;
-             PRAGMA user_version = {SCHEMA_VERSION};"
-        ))?;
-        tx.commit()?;
-        // (no row was counted: a table dropped is a write that must survive)
-        super::volatile::mark_durable();
         return Ok(());
     }
     let tables: i64 = tx.query_row(

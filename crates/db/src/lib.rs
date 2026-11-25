@@ -3961,53 +3961,6 @@ mod tests {
         assert_eq!(found(Digest::of(Algorithm::Sha256, b"p")).await, None);
     }
 
-    /// A store of version 1, with the two tables of what could be given to
-    /// peers, loses them when it is opened, and is then of this version.
-    #[tokio::test]
-    async fn a_store_with_the_old_tables_loses_them_at_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db.sqlite");
-        let db = Database::open(&path).await.unwrap();
-        db.insert_image(&record("a")).await.unwrap();
-        db.conn()
-            .call(|conn| {
-                Ok(conn.execute_batch(
-                    "CREATE TABLE shared_layers (
-                         layer_id TEXT PRIMARY KEY REFERENCES layers(id) ON DELETE CASCADE,
-                         proven INTEGER NOT NULL DEFAULT 0
-                     );
-                     CREATE TABLE shared_images (
-                         image_id TEXT NOT NULL REFERENCES images(id) ON DELETE CASCADE,
-                         repository TEXT NOT NULL DEFAULT '',
-                         tag TEXT NOT NULL DEFAULT '',
-                         PRIMARY KEY (image_id, repository, tag)
-                     );
-                     INSERT INTO shared_images VALUES ('a', '', '');
-                     PRAGMA user_version = 1;",
-                )?)
-            })
-            .await
-            .unwrap();
-        db.close().await.unwrap();
-        let db = Database::open(&path).await.unwrap();
-        let (tables, version): (i64, i64) = db
-            .conn()
-            .call(|conn| {
-                Ok((
-                    conn.query_row(
-                        "SELECT count(*) FROM sqlite_master WHERE name LIKE 'shared_%'",
-                        [],
-                        |r| r.get(0),
-                    )?,
-                    conn.query_row("PRAGMA user_version", [], |r| r.get(0))?,
-                ))
-            })
-            .await
-            .unwrap();
-        assert_eq!((tables, version), (0, SCHEMA_VERSION));
-        assert_eq!(db.list_images().await.unwrap().len(), 1);
-    }
-
     /// A layer is sealed only when its commit says so, a layer pulled again
     /// keeps what it had, and the seal of one layer can be set.
     #[tokio::test]

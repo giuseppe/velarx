@@ -15,8 +15,7 @@ use rusqlite::{OpenFlags, OptionalExtension};
 use tokio_rusqlite::Connection;
 
 use super::{
-    layer_files, Database, ImageRecord, ImageTag, LayerRecord, LayerState,
-    OLDEST_READ_ONLY_VERSION, SCHEMA_VERSION,
+    layer_files, Database, ImageRecord, ImageTag, LayerRecord, LayerState, SCHEMA_VERSION,
 };
 use velarx_storage::Object;
 use velarx_types::digest::Digest;
@@ -98,7 +97,7 @@ impl Database {
             .call(|conn| Ok(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?))
             .await
             .map_err(DbError::Sqlite)?;
-        if !(OLDEST_READ_ONLY_VERSION..=SCHEMA_VERSION).contains(&version) {
+        if version != SCHEMA_VERSION {
             return Err(other(format!(
                 "{}: the store has schema version {version}, this velarx uses \
                  {SCHEMA_VERSION}",
@@ -964,31 +963,6 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(e.contains("schema version 99"), "{e}");
-    }
-
-    /// A read-only store of version 1 is read: it only has the two tables
-    /// of what could be given to peers more.
-    #[tokio::test]
-    async fn a_read_only_store_of_version_1_is_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("old.sqlite");
-        {
-            let db = Database::open(&p).await.unwrap();
-            db.insert_image(&image("a")).await.unwrap();
-            db.conn()
-                .call(|c| {
-                    Ok(c.execute_batch(
-                        "CREATE TABLE shared_layers (layer_id TEXT PRIMARY KEY);
-                         CREATE TABLE shared_images (image_id TEXT);
-                         PRAGMA user_version = 1;",
-                    )?)
-                })
-                .await
-                .unwrap();
-            db.checkpoint().await.unwrap();
-        }
-        let db = Database::open_read_only(&p).await.unwrap();
-        assert_eq!(db.list_images().await.unwrap().len(), 1);
     }
 
     #[test]
