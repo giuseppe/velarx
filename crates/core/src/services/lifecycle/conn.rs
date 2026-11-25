@@ -418,7 +418,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_is_written_as_the_pipe_takes_it() {
-        let (r, w) = rustix::pipe::pipe().unwrap();
+        let (r, w) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
         rustix::pipe::fcntl_setpipe_size(&w, 4096).unwrap();
         let mut input = input_of(w);
         let want: Vec<u8> = (0..1_000_000u32).map(|i| (i % 253) as u8).collect();

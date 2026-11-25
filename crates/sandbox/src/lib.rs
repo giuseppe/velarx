@@ -596,11 +596,16 @@ mod tests {
     /// may be the process 1 of a container); one that holds it is not.
     #[test]
     fn a_daemon_is_gone_when_its_socket_is_closed() {
-        let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        ensure_daemon_present(theirs.as_fd()).unwrap();
-        drop(mine);
-        let e = ensure_daemon_present(theirs.as_fd()).unwrap_err();
-        assert_eq!(e, "the daemon is gone");
+        // (in a process of its own: a process another test of this one
+        // starts holds a copy of the descriptor until it executes, and the
+        // end is not closed while a copy lives)
+        velarx_base::testing::in_child(|| {
+            let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            ensure_daemon_present(theirs.as_fd()).unwrap();
+            drop(mine);
+            let e = ensure_daemon_present(theirs.as_fd()).unwrap_err();
+            assert_eq!(e, "the daemon is gone");
+        });
     }
 
     fn verdict(nr: i64, args: [u64; 6]) -> u32 {

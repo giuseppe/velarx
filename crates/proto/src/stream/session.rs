@@ -997,7 +997,7 @@ mod tests {
     }
 
     fn pipe(size: usize) -> (OwnedFd, OwnedFd) {
-        let (r, w) = rustix::pipe::pipe().unwrap();
+        let (r, w) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
         rustix::pipe::fcntl_setpipe_size(&r, size).unwrap();
         (r, w)
     }
@@ -1362,10 +1362,13 @@ mod tests {
         let waited = tokio::time::timeout(Duration::from_millis(200), &mut left).await;
         assert!(waited.is_err(), "a half close is not leaving");
         drop(b);
-        assert!(hung_up(a.as_fd()));
         tokio::time::timeout(Duration::from_secs(5), left)
             .await
             .expect("the full close is seen without polling");
+        // (asked once the close was seen: a process another test starts
+        // holds a copy of `b` until it executes, and the end is not closed
+        // while a copy lives)
+        assert!(hung_up(a.as_fd()));
         let waited = tokio::time::timeout(Duration::from_millis(50), hang_up(None)).await;
         assert!(waited.is_err(), "no socket: it cannot tell");
     }

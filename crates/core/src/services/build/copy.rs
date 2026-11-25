@@ -1698,7 +1698,7 @@ mod tests {
         j.items[0].origin = "src/dir".into();
         j.ignore = vec!["src/dir/sub/*.log".into(), "src/dir/one.txt".into()];
         let out = open(&s.out);
-        let (r, w) = rustix::pipe::pipe().unwrap();
+        let (r, w) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
         std::fs::File::from(w).write_all(&bytes).unwrap();
         run(&j, out.as_fd(), r, &Cancel::default()).unwrap();
         assert!(!s.out.join("t/one.txt").exists());
