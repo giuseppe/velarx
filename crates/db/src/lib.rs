@@ -2059,36 +2059,48 @@ impl Database {
 
     /// The signatures kept with the pulls of `reference`: a manifest digest
     /// (the pulls of that image), or a name with a tag (the pulls of it, also
-    /// by a digest).  For each manifest digest, the signatures of
-    /// all its pulls (JSON, `signatures`), at most `limit` digests, those
-    /// first pulled last.
-    pub async fn signed_pulls(
-        &self,
-        reference: &str,
-        limit: usize,
-    ) -> DbResult<Vec<(String, Vec<Vec<u8>>)>> {
+    /// by a digest).  For each manifest digest, its `os/arch` (as the
+    /// configuration of the stored image says) and the signatures of all
+    /// its pulls (JSON, `signatures`), at most `limit` digests, those first
+    /// pulled last.
+    pub async fn signed_pulls(&self, reference: &str, limit: usize) -> DbResult<Vec<SignedPull>> {
         let reference = reference.to_string();
         Ok(self
             .conn
             .call(move |conn| {
                 let mut stmt = conn.prepare_cached(
-                    "SELECT manifest_digest, signatures FROM pulled_images
-                     WHERE manifest_digest = ?1 OR reference = ?1
-                        OR substr(reference, 1, length(?1) + 1) = ?1 || '@'
-                     ORDER BY rowid DESC",
+                    "SELECT p.manifest_digest, p.signatures,
+                            json_extract(i.config, '$.os') || '/'
+                                || json_extract(i.config, '$.architecture')
+                     FROM pulled_images p
+                     LEFT JOIN images i ON i.manifest_digest = p.manifest_digest
+                     WHERE p.manifest_digest = ?1 OR p.reference = ?1
+                        OR substr(p.reference, 1, length(?1) + 1) = ?1 || '@'
+                     ORDER BY p.rowid DESC",
                 )?;
                 let rows = stmt
                     .query_map([&reference], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Vec<u8>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut out: std::collections::BTreeMap<String, Vec<Vec<u8>>> = Default::default();
-                for (digest, signatures) in rows {
+                let mut out: std::collections::BTreeMap<String, SignedPull> = Default::default();
+                for (digest, signatures, platform) in rows {
                     if out.len() < limit || out.contains_key(&digest) {
-                        out.entry(digest).or_default().push(signatures);
+                        out.entry(digest.clone())
+                            .or_insert_with(|| SignedPull {
+                                digest,
+                                platform,
+                                signatures: Vec::new(),
+                            })
+                            .signatures
+                            .push(signatures);
                     }
                 }
-                Ok(out.into_iter().collect())
+                Ok(out.into_values().collect())
             })
             .await?)
     }
@@ -3771,11 +3783,23 @@ mod tests {
 
     /// The signatures of a pull are found by the digest of its manifest, and
     /// by its name and tag (also when it was pulled by a digest as well), not
-    /// by the name of another tag or of a longer one.
+    /// by the name of another tag or of a longer one; each manifest comes
+    /// with the platform of its image, when the image is stored.
     #[tokio::test]
     async fn signed_pulls_are_found_by_digest_and_by_name() {
         let db = Database::open_in_memory().await.unwrap();
         let (m, n) = (m_digest(), Digest::of(Algorithm::Sha256, b"n"));
+        db.insert_image(&ImageRecord {
+            id: "img".into(),
+            manifest_digest: m,
+            config_digest: Digest::of(Algorithm::Sha256, b"c"),
+            manifest: "{}".into(),
+            config: r#"{"os": "linux", "architecture": "arm64"}"#.into(),
+            created_at: "now".into(),
+            is_lazy: false,
+        })
+        .await
+        .unwrap();
         for (digest, reference, sigs) in [
             (&m, "r.io/a:1", "one"),
             (&m, "r.io/a:1@sha256:00", "two"),
@@ -3788,31 +3812,36 @@ mod tests {
                 .unwrap();
         }
         let by_name = db.signed_pulls("r.io/a:1", 8).await.unwrap();
-        let shown: Vec<(String, Vec<String>)> = by_name
+        let shown: Vec<(String, Option<String>, Vec<String>)> = by_name
             .into_iter()
-            .map(|(d, sigs)| {
-                let mut sigs: Vec<String> = sigs
+            .map(|p| {
+                let mut sigs: Vec<String> = p
+                    .signatures
                     .into_iter()
                     .map(|s| String::from_utf8(s).unwrap())
                     .collect();
                 sigs.sort();
-                (d, sigs)
+                (p.digest, p.platform, sigs)
             })
             .collect();
         let mut want = vec![
-            (m.to_string(), vec!["one".to_string(), "two".to_string()]),
-            (n.to_string(), vec!["five".to_string()]),
+            (
+                m.to_string(),
+                Some("linux/arm64".to_string()),
+                vec!["one".to_string(), "two".to_string()],
+            ),
+            (n.to_string(), None, vec!["five".to_string()]),
         ];
         want.sort();
         assert_eq!(shown, want);
         // by the digest: every pull of that manifest
         let by_digest = db.signed_pulls(&m.to_string(), 8).await.unwrap();
         assert_eq!(by_digest.len(), 1);
-        assert_eq!(by_digest[0].1.len(), 3);
+        assert_eq!(by_digest[0].signatures.len(), 3);
         // (the limit keeps the digest pulled last)
         let last = db.signed_pulls("r.io/a:1", 1).await.unwrap();
         assert_eq!(last.len(), 1);
-        assert_eq!(last[0].0, n.to_string());
+        assert_eq!(last[0].digest, n.to_string());
         assert!(db.signed_pulls("r.io/b:1", 8).await.unwrap().is_empty());
     }
 

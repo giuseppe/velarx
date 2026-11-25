@@ -839,13 +839,14 @@ impl StoreService {
             .await
             .map_err(|e| unavailable(&e))?;
         let mut records = Vec::new();
-        for (digest, rows) in pulls {
+        for pull in pulls {
             // (each row is a JSON array of the signatures of a pull)
-            for row in rows {
+            for row in pull.signatures {
                 let signatures: Vec<String> =
                     serde_json::from_slice(&row).map_err(|e| unavailable(&e))?;
                 records.push(SignedRecord {
-                    digest: digest.clone(),
+                    digest: pull.digest.clone(),
+                    platform: pull.platform.clone(),
                     signatures,
                 });
             }

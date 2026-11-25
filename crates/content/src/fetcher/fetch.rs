@@ -230,23 +230,29 @@ pub struct ProbeReply {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedRecord {
     pub digest: String,
+    /// The `os/arch` of the image of the manifest, as its configuration
+    /// says: a node takes a tag only from the records of its platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
     pub signatures: Vec<String>,
 }
 
 impl SignedRecord {
-    /// `records` with those of one digest made one, each signature once.
+    /// `records` with those of one digest and platform made one, each
+    /// signature once.
     pub fn merged(records: impl IntoIterator<Item = SignedRecord>) -> Vec<SignedRecord> {
         let mut by_digest = std::collections::BTreeMap::<_, std::collections::BTreeSet<_>>::new();
         for record in records {
             by_digest
-                .entry(record.digest)
+                .entry((record.digest, record.platform))
                 .or_default()
                 .extend(record.signatures);
         }
         by_digest
             .into_iter()
-            .map(|(digest, signatures)| SignedRecord {
+            .map(|((digest, platform), signatures)| SignedRecord {
                 digest,
+                platform,
                 signatures: signatures.into_iter().collect(),
             })
             .collect()
@@ -583,5 +589,48 @@ mod unknown_tests {
     fn an_event_of_an_unknown_kind_is_read_as_unknown() {
         let kind: EventKind = serde_json::from_str("\"resumed\"").unwrap();
         assert_eq!(kind, EventKind::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod signed_record_tests {
+    use super::SignedRecord;
+
+    fn record(digest: &str, platform: Option<&str>, signatures: &[&str]) -> SignedRecord {
+        SignedRecord {
+            digest: digest.into(),
+            platform: platform.map(str::to_string),
+            signatures: signatures.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// The platform is part of what a record is: one digest on two
+    /// platforms stays two records, and a record without a platform is
+    /// written and read without one.
+    #[test]
+    fn a_record_keeps_its_platform_through_merge_and_json() {
+        let merged = SignedRecord::merged([
+            record("d", Some("linux/amd64"), &["a"]),
+            record("d", Some("linux/amd64"), &["a", "b"]),
+            record("d", Some("linux/arm64"), &["c"]),
+            record("d", None, &["d"]),
+        ]);
+        assert_eq!(
+            merged,
+            [
+                record("d", None, &["d"]),
+                record("d", Some("linux/amd64"), &["a", "b"]),
+                record("d", Some("linux/arm64"), &["c"]),
+            ]
+        );
+        let text = SignedRecord::encoded(merged.clone(), 4096).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Vec<SignedRecord>>(&text).unwrap(),
+            merged
+        );
+        let bare = serde_json::to_string(&record("d", None, &["a"])).unwrap();
+        assert_eq!(bare, r#"{"digest":"d","signatures":["a"]}"#);
+        let read: SignedRecord = serde_json::from_str(&bare).unwrap();
+        assert_eq!(read.platform, None);
     }
 }

@@ -359,6 +359,16 @@ use serde::{Deserialize, Serialize};
 use velarx_types::digest::Digest;
 pub use velarx_types::LayerKey;
 
+/// The pulls of one manifest, as `Database::signed_pulls` gives them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedPull {
+    pub digest: String,
+    /// The `os/arch` of the image, as its configuration says
+    pub platform: Option<String>,
+    /// The signatures of each pull (JSON)
+    pub signatures: Vec<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageRecord {
     pub id: String,

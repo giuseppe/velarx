@@ -412,10 +412,13 @@ resolve to the older image.  The time is the one in the signed payload, as the
 signer wrote it: a signature with none (cosign writes none) is of time 0, one
 dated in the future wins over all those made before that date, and two records
 of the same time for two digests are an error.  A record names the manifest of
-one platform, the one the peer pulled: among peers of several architectures a
-tag may resolve to the image of another platform, and a publisher that signed
-two platforms in the same second makes it an error.  A member that asks a node
-for a name learns that it has it.
+one platform, the one the peer pulled, and carries its `os/arch`: a node takes
+the tag from the records of the platform it pulls for (`--platform`, else the
+host's), so a publisher that signed two platforms in the same second makes no
+error, and a record with no platform is taken for none.  The platform is the
+word of the peer, not signed: a peer that lies about it can make a node pull
+the image of another platform that the publisher signed for the tag.  A member
+that asks a node for a name learns that it has it.
 
 ## Troubleshooting
 

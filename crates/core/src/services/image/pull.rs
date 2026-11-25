@@ -1165,7 +1165,11 @@ impl ImageService {
         // goes on by that digest; the image is still asked for by its tag,
         // which the signatures are judged for and the image is named by)
         let pinned = match (&image_ref.tag, &image_ref.digest) {
-            (Some(_), None) => self.resolve_tag(&image_ref, &requirements).await?,
+            (Some(_), None) => {
+                let platform = platform.clone().unwrap_or_else(Platform::host);
+                self.resolve_tag(&image_ref, &platform, &requirements)
+                    .await?
+            }
             _ => None,
         };
         let fetched_ref = ImageReference {

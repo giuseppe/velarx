@@ -3,7 +3,8 @@
 # image and answers for its name; node b has `[pull] sources = ["p2p"]` and
 # `names = ["p2p"]` (no registry in either), a signature policy that names the
 # key of the publisher, and pulls (and runs, lazily too) the image by its tag.
-# The tag is taken from the signed record only: other nodes show that with
+# The tag is taken from the signed record of the platform pulled for only
+# (a pull for another platform finds none): other nodes show that with
 # `names` off the tag is not resolved, that a node that does not serve names
 # gives none, that a key the policy does not name is not believed, and that a
 # name whose policy asks for no signature has nobody to say what it names.  A
@@ -168,6 +169,15 @@ joined () {
     sh_ b image rm -f "$REPO/app:1" > /dev/null 2>&1
     out=$(sh_ b container run --rm --lazy --network none "$REPO/app:1" sh -c 'cat /etc/alpine-release; echo done' 2>&1)
     check_match "its lazy container runs, the files coming from node a" "[0-9]+\.[0-9]+.*done$" "$(echo "$out" | tr '\n' ' ' | sed 's/ *$//')"
+}
+
+@test "a tag is not taken from the record of another platform" {
+    local out
+    [ -n "${peer_id:-}" ] || { echo "no peer id of node a (the first test failed or did not run)" >&2; exit 1; }
+    # (the record of node a is of the image of this host's platform)
+    out=$(sh_ b image pull --tls-verify=false --platform linux/s390x "$REPO/app:1" 2>&1)
+    check "node b does not pull the tag for linux/s390x" 125 $?
+    check_match "it says no record is for that platform" "no source has a signed record of the tag for linux/s390x" "$out"
 }
 
 @test "with names off the tag is not resolved, the digest is, by its signatures from the peers" {

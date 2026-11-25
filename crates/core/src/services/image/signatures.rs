@@ -85,6 +85,16 @@ async fn newest_blocking(
     }
 }
 
+/// Whether the image of `record` is one that `platform` accepts: a record
+/// that names no platform is for none.
+fn is_for(platform: &Platform, record: &SignedRecord) -> bool {
+    record
+        .platform
+        .as_deref()
+        .and_then(|p| Platform::parse(p).ok())
+        .is_some_and(|p| platform.matches(&p.os, &p.arch, None))
+}
+
 /// The signatures of `record` that read as signatures, in what is left of
 /// `budget`: what a fetcher sends is not an error when it is junk or too
 /// much, it is left out.
@@ -158,10 +168,12 @@ impl ImageService {
     /// in the order of the list: None when the registry is to say (it comes
     /// first); a source that is not the registry is believed for nothing,
     /// the tag is the newest record signed for exactly this name and tag by
-    /// a key the policy (`requirements`) accepts.
+    /// a key the policy (`requirements`) accepts, among the records of an
+    /// image that `platform` accepts.
     pub(super) async fn resolve_tag(
         &self,
         image_ref: &ImageReference,
+        platform: &Platform,
         requirements: &[PolicyRequirement],
     ) -> ImageResult<Option<Digest>> {
         use velarx_content::pull::net::origin::MetadataSources;
@@ -177,9 +189,10 @@ impl ImageService {
                 continue;
             }
             let links = self.source_links(std::slice::from_ref(&source)).await;
-            let given = MetadataSources::open(links).await.signatures(&name).await;
+            let mut given = MetadataSources::open(links).await.signatures(&name).await;
+            given.retain(|r| is_for(platform, r));
             if given.is_empty() {
-                why = "no source has a signed record of the tag".into();
+                why = format!("no source has a signed record of the tag for {platform}");
                 continue;
             }
             let given_count = given.len();
@@ -626,7 +639,7 @@ mod tests {
     const SECOND: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 
     /// The base64 blob of the signature of `digest` for `docker.io/acme/app:1`
-    /// by `signer` at `time`.
+    /// by `signer` at `time`, the record of a linux/amd64 image.
     fn record_of(signer: &velarx_signature::sign::Signer, digest: &str, time: i64) -> SignedRecord {
         use base64::Engine;
         let signature = signer
@@ -634,6 +647,7 @@ mod tests {
             .unwrap();
         SignedRecord {
             digest: digest.into(),
+            platform: Some("linux/amd64".into()),
             signatures: vec![base64::engine::general_purpose::STANDARD
                 .encode(Signature::Sigstore(signature).to_blob())],
         }
@@ -712,9 +726,54 @@ mod tests {
     }
 
     async fn resolved(service: &ImageService, name: &str) -> ImageResult<Option<Digest>> {
+        resolved_for(service, name, "linux/amd64").await
+    }
+
+    async fn resolved_for(
+        service: &ImageService,
+        name: &str,
+        platform: &str,
+    ) -> ImageResult<Option<Digest>> {
         let image_ref = ImageReference::parse(name).unwrap();
         let requirements = service.policy_for(&image_ref)?;
-        service.resolve_tag(&image_ref, &requirements).await
+        let platform = Platform::parse(platform).unwrap();
+        service
+            .resolve_tag(&image_ref, &platform, &requirements)
+            .await
+    }
+
+    /// A tag is resolved among the records of the platform of the node:
+    /// records of two platforms signed at the same time are no tie, a newer
+    /// record of another platform does not win, and a record that names no
+    /// platform is for none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tag_is_resolved_by_the_records_of_the_platform_of_the_node() {
+        let (mine, public) = signer();
+        let on = |platform: Option<&str>, mut record: SignedRecord| {
+            record.platform = platform.map(str::to_string);
+            record
+        };
+        let records = [
+            on(Some("linux/amd64"), record_of(&mine, FIRST, 100)),
+            on(Some("linux/arm64"), record_of(&mine, SECOND, 100)),
+        ];
+        let (_tmp, service, _served) = resolving(&public, &records, &["peer"]).await;
+        for (platform, want) in [("linux/amd64", FIRST), ("linux/arm64", SECOND)] {
+            let got = resolved_for(&service, "acme/app:1", platform).await;
+            assert_eq!(got.unwrap().map(|d| d.to_string()).as_deref(), Some(want));
+        }
+        let e = resolved_for(&service, "acme/app:1", "linux/s390x")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("for linux/s390x"), "{e}");
+        let records = [
+            on(Some("linux/amd64"), record_of(&mine, FIRST, 100)),
+            on(Some("linux/arm64"), record_of(&mine, SECOND, 300)),
+            on(None, record_of(&mine, SECOND, 400)),
+        ];
+        let (_tmp, service, _served) = resolving(&public, &records, &["peer"]).await;
+        let got = resolved_for(&service, "acme/app:1", "linux/amd64").await;
+        assert_eq!(got.unwrap().map(|d| d.to_string()).as_deref(), Some(FIRST));
     }
 
     /// A tag is the digest of the newest record a key of the policy signed
