@@ -106,7 +106,6 @@ impl Database {
         }
         Ok(Self {
             conn: Arc::new(super::Conn::new(conn, false, None)),
-            lease_dir: Arc::new(super::leases::lock_dir(Some(path))),
             files: layer_files::of_directory(path.parent()),
             path: Some(Arc::new(path.to_path_buf())),
             more: Arc::new(Vec::new()),

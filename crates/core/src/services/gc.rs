@@ -45,8 +45,6 @@ pub struct GcReport {
     pub layers_removed: usize,
     /// Number of unreferenced files removed
     pub files_removed: usize,
-    /// Leases of pulls that are gone, removed
-    pub leases_removed: usize,
     /// Staging directories of pulls that are gone, removed
     pub staging_removed: usize,
     /// The bytes the store freed: the objects (each file once, by its length
@@ -563,10 +561,9 @@ impl GcService {
             }
         }
         info!(
-            "Garbage collection complete: {} layers, {} files, {} leases, {} staging directories removed, {} bytes freed",
+            "Garbage collection complete: {} layers, {} files, {} staging directories removed, {} bytes freed",
             report.layers_removed,
             report.files_removed,
-            report.leases_removed,
             report.staging_removed,
             report.bytes_freed
         );

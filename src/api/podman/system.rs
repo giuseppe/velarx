@@ -1114,7 +1114,6 @@ pub(crate) async fn collect_of(
     Ok(GcReport {
         files_removed: report.files_removed as u64,
         layers_removed: report.layers_removed as u64,
-        leases_removed: report.leases_removed as u64,
         staging_removed: report.staging_removed as u64,
         bytes_freed: report.bytes_freed,
         errors: report.errors,

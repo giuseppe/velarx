@@ -2282,8 +2282,6 @@ type CheckReport (
 type GcReport (
 	files_removed: int,
 	layers_removed: int,
-	# Leases of pulls that are gone
-	leases_removed: int,
 	# Staging directories of pulls that are gone
 	staging_removed: int,
 	bytes_freed: int,

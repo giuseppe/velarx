@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Random bytes of the kernel's pool: the names of leases, staging
+//! Random bytes of the kernel's pool: the names of holds, staging
 //! directories, scopes and allocations, that must differ from every other
 //! and say nothing, and the keys that seal what a checkpoint share carries.
 

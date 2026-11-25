@@ -53,10 +53,9 @@ pub(super) fn init(conn: &mut Connection) -> Result<(), SchemaError> {
 /// Every schema `init` makes, in order: `SCHEMA` and the tables of the
 /// other modules.  A table of the store is made here, never by its service
 /// when it starts.
-pub(super) const SCHEMAS: [&str; 9] = [
+pub(super) const SCHEMAS: [&str; 8] = [
     SCHEMA,
     super::container_ext::SCHEMA,
-    super::leases::SCHEMA,
     super::manifests::SCHEMA,
     super::build_cache::SCHEMA,
     super::checks::SCHEMA,

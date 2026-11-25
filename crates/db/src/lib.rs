@@ -4,7 +4,6 @@ mod changes;
 pub use changes::ChangeWatch;
 mod checks;
 pub mod layer_files;
-mod leases;
 mod manifests;
 pub mod namespaces;
 mod schema;
@@ -36,7 +35,6 @@ fn io_error(path: &Path, e: std::io::Error) -> DbError {
 use velarx_storage::Object;
 
 pub use build_cache::SCRATCH as BUILD_SCRATCH;
-pub use leases::{Lease, LEASE_IMAGE, LEASE_LAYER};
 pub use manifests::ManifestListRecord;
 pub use schema::*;
 pub use staged::StagedImageCommit;
@@ -57,8 +55,6 @@ pub struct Database {
     /// The databases of the read-only stores under this one, whose
     /// images, layers and files are found when this one has not got them
     more: Arc<Vec<Database>>,
-    /// Where the locks of the leases are (see `leases`)
-    lease_dir: Arc<leases::LockDir>,
 }
 
 /// A container by its ID or its name (`?2`: the name without the `/` that
@@ -362,7 +358,6 @@ impl Database {
         });
         let db = Self {
             conn,
-            lease_dir: Arc::new(leases::lock_dir(Some(&path))),
             files: layer_files::of_directory(path.parent()),
             path: Some(Arc::new(path)),
             more: Arc::new(Vec::new()),
@@ -382,7 +377,6 @@ impl Database {
             conn: Arc::new(Conn::new(conn, false, None)),
             path: None,
             files: layer_files::of_directory(None),
-            lease_dir: Arc::new(leases::lock_dir(None)),
             more: Arc::new(Vec::new()),
         };
         db.init_pragmas().await?;

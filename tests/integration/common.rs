@@ -835,33 +835,6 @@ pub fn unlock(file: &impl std::os::fd::AsFd) {
     rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock).unwrap();
 }
 
-/// The lease `id` of a pull that was killed: its row, and no process that
-/// holds its lock.  (A lease taken and dropped here would not do: a thread
-/// of the test binary that starts a program holds a copy of the lock until
-/// the program is executed, so for a moment the lease would still be held.)
-pub async fn stale_lease(db: &Database, id: &str, items: &[(&str, &str)]) {
-    let (id, items): (String, Vec<(String, String)>) = (
-        id.to_string(),
-        items
-            .iter()
-            .map(|(k, d)| (k.to_string(), d.to_string()))
-            .collect(),
-    );
-    db.conn()
-        .call(move |conn| {
-            conn.execute("INSERT INTO leases (id, pid) VALUES (?1, 0)", [&id])?;
-            for (kind, digest) in &items {
-                conn.execute(
-                    "INSERT INTO lease_items (lease_id, kind, digest) VALUES (?1, ?2, ?3)",
-                    [&id, kind, digest],
-                )?;
-            }
-            Ok(())
-        })
-        .await
-        .unwrap();
-}
-
 pub async fn start_registry() -> (String, Arc<Registry>) {
     let reg = Arc::new(Registry {
         mine: AtomicUsize::new(0),

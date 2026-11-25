@@ -499,8 +499,6 @@ pub struct SystemChecked {
 pub struct GcReport {
     pub files_removed: u64,
     pub layers_removed: u64,
-    /// Leases of pulls that are gone
-    pub leases_removed: u64,
     /// Staging directories of pulls that are gone
     pub staging_removed: u64,
     pub bytes_freed: u64,
