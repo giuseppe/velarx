@@ -90,9 +90,13 @@ pub struct Taken {
 /// caller passed.
 pub fn take(startup: &velarx_sys::fd::Startup, fds: u32, list: &[u32]) -> Result<Taken, Failed> {
     // (what the caller passed: a descriptor this process opened since, the
-    // store's connection of the namespaces, is not one)
-    validate(fds, list, |fd| {
-        i32::try_from(fd).is_ok_and(|fd| startup.is_inherited(fd))
+    // store's connection of the namespaces, is not one; the standard streams
+    // are not the token's, they are open or not, and validate refuses the
+    // option that names one of them)
+    validate(fds, list, |fd| match i32::try_from(fd) {
+        Ok(fd) if fd < 3 => std::path::Path::new(&format!("/proc/self/fd/{fd}")).exists(),
+        Ok(fd) => startup.is_inherited(fd),
+        Err(_) => false,
     })?;
     let plan = plan(fds, list)?;
     let mut taken = Taken {
