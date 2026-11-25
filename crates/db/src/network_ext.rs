@@ -48,6 +48,9 @@ CREATE TABLE IF NOT EXISTS host_ports (
     PRIMARY KEY (host_ip, proto, port)
 );
 CREATE INDEX IF NOT EXISTS idx_host_ports_container ON host_ports(container_id);
+-- (a port is looked for on every address: the primary key, address first,
+-- cannot find it)
+CREATE INDEX IF NOT EXISTS idx_host_ports_port ON host_ports(proto, port);
 -- The last address given on a network: the next is the one after it, as in
 -- podman's IPAM (`getFreeIPFromBucket` of netavark's, its `lastIP`), so
 -- that the address of a container that just went is not given again while
@@ -143,6 +146,12 @@ fn row_to_attachment(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentRow>
 }
 
 const ATTACHMENT_COLUMNS: &str = "container_id, network_id, idx, ip, aliases, ip6";
+
+/// Whether the host port `?2` of the protocol `?1` is held on the address of
+/// a new mapping (`?3`: every address) or on every address.
+const HOST_PORT_TAKEN: &str =
+    "SELECT EXISTS (SELECT 1 FROM host_ports WHERE proto = ?1 AND port = ?2
+     AND (?3 OR host_ip IN ('', '0.0.0.0', '::')))";
 
 /// The addresses `first..=last` as numbers, from the one after `after` (the
 /// last given) on, then from the first up to it: an address is given again
@@ -367,8 +376,7 @@ impl Database {
                     // (a port on every address is taken on each of them too)
                     let every = ip.is_empty() || ip == "0.0.0.0" || ip == "::";
                     let overlaps: bool = tx.query_row(
-                        "SELECT EXISTS (SELECT 1 FROM host_ports WHERE proto = ?1 AND port = ?2
-                         AND (?3 OR host_ip IN ('', '0.0.0.0', '::')))",
+                        HOST_PORT_TAKEN,
                         rusqlite::params![proto, port, every],
                         |r| r.get(0),
                     )?;
@@ -775,6 +783,28 @@ mod tests {
             .net_reserve_host_ports("d", &p("", "sctp"))
             .await
             .is_err());
+    }
+
+    /// A host port is looked for by an index, not in every row: `-P` of an
+    /// image that exposes thousands of ports records each of them.
+    #[tokio::test]
+    async fn a_taken_host_port_is_found_by_an_index() {
+        let db = db_with(&[]).await;
+        let plan: Vec<String> = db
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {HOST_PORT_TAKEN}"))?;
+                let plan = stmt
+                    .query_map(rusqlite::params!["tcp", 80, false], |r| r.get(3))?
+                    .collect::<Result<Vec<String>, _>>()?;
+                Ok(plan)
+            })
+            .await
+            .unwrap();
+        assert!(
+            !plan.iter().any(|p| p.starts_with("SCAN host_ports")),
+            "{plan:?}"
+        );
     }
 
     #[tokio::test]
