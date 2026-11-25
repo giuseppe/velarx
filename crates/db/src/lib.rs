@@ -1280,6 +1280,30 @@ impl Database {
     }
 
     pub async fn insert_container(&self, container: &ContainerRecord) -> DbResult<()> {
+        self.insert_container_in(container, None).await
+    }
+
+    /// Insert the container, but only if its SELinux level (`selinux_level`)
+    /// is not `taken` by the level of a container there is: `taken(level,
+    /// used)` is asked of each of the levels in use.  The check runs in the
+    /// transaction that inserts (a write lock taken first), so two creations
+    /// that chose their level before either was recorded cannot both keep
+    /// it.  [`DbError::LevelTaken`] when it is taken.  For a level the
+    /// engine allocated: one the user gave, or the one of a pod, is shared
+    /// on purpose and goes through [`Database::insert_container`].
+    pub async fn insert_container_distinct(
+        &self,
+        container: &ContainerRecord,
+        taken: fn(&str, &str) -> bool,
+    ) -> DbResult<()> {
+        self.insert_container_in(container, Some(taken)).await
+    }
+
+    async fn insert_container_in(
+        &self,
+        container: &ContainerRecord,
+        distinct: Option<fn(&str, &str) -> bool>,
+    ) -> DbResult<()> {
         // the image of a container is an image of this store
         self.import_image(&container.image_id).await?;
         let container = container.clone();
@@ -1288,7 +1312,20 @@ impl Database {
         self.conn
             .call(move |conn| {
                 volatile::run(conn, removed, |conn| {
-                let tx = conn.transaction()?;
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                if let (Some(taken), Some(level)) = (distinct, &selinux_level) {
+                    let mut stmt = tx.prepare(
+                        "SELECT selinux_level FROM containers WHERE selinux_level IS NOT NULL",
+                    )?;
+                    let used = stmt
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if used.iter().any(|u| taken(level, u)) {
+                        return Err(tokio_rusqlite::Error::Other(Box::new(LevelTaken(
+                            level.clone(),
+                        ))));
+                    }
+                }
                 tx.execute(
                     "INSERT INTO containers (id, name, image_id, config, state, pid, created_at, started_at, finished_at, exit_code, selinux_level)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -1316,7 +1353,8 @@ impl Database {
                 Ok(())
                 })
             })
-            .await?;
+            .await
+            .map_err(|e| refusal(e, String::new))?;
         Ok(())
     }
 
@@ -2488,6 +2526,19 @@ impl std::fmt::Display for AlreadyExists {
 
 impl std::error::Error for AlreadyExists {}
 
+/// The refusal of a container whose SELinux level is taken (its text is
+/// the level).
+#[derive(Debug)]
+struct LevelTaken(String);
+
+impl std::fmt::Display for LevelTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LevelTaken {}
+
 fn already_exists(why: String) -> tokio_rusqlite::Error {
     tokio_rusqlite::Error::Other(Box::new(AlreadyExists(why)))
 }
@@ -2517,6 +2568,9 @@ fn refusal(e: tokio_rusqlite::Error, what: impl FnOnce() -> String) -> DbError {
         }
         if let Some(AlreadyExists(why)) = inner.downcast_ref::<AlreadyExists>() {
             return DbError::AlreadyExists(why.clone());
+        }
+        if let Some(LevelTaken(level)) = inner.downcast_ref::<LevelTaken>() {
+            return DbError::LevelTaken(level.clone());
         }
     }
     DbError::Sqlite(e)
@@ -3661,6 +3715,58 @@ mod tests {
         assert!(db.delete_image("img").await.is_err());
         assert_eq!(db.pulled_image(&m_digest()).await.unwrap().len(), 1);
         assert!(db.get_image("img").await.is_ok());
+    }
+
+    /// Two handles of one file (two processes) that both read the levels in
+    /// use and both choose the same one: the insert of the second is
+    /// refused and leaves nothing, a level that is not checked (a pod's, the
+    /// user's) is kept by any number of containers.
+    #[tokio::test]
+    async fn the_insert_refuses_a_level_another_handle_recorded() {
+        fn same(a: &str, b: &str) -> bool {
+            a == b
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let (one, two) = (
+            Database::open(&path).await.unwrap(),
+            Database::open(&path).await.unwrap(),
+        );
+        one.insert_image(&ImageRecord {
+            id: "img".into(),
+            manifest_digest: m_digest(),
+            config_digest: Digest::of(Algorithm::Sha256, b"c"),
+            manifest: "{}".into(),
+            config: "{}".into(),
+            created_at: "now".into(),
+            is_lazy: false,
+        })
+        .await
+        .unwrap();
+        let container = |id: &str| ContainerRecord {
+            id: id.into(),
+            name: Some(id.into()),
+            image_id: "img".into(),
+            config: r#"{"selinux":{"level":"s0:c1,c2"}}"#.into(),
+            state: RecordState::Created,
+            created_at: "now".into(),
+            ..Default::default()
+        };
+        // both have read that nothing is in use
+        assert!(one.container_selinux_levels().await.unwrap().is_empty());
+        assert!(two.container_selinux_levels().await.unwrap().is_empty());
+        one.insert_container_distinct(&container("a"), same)
+            .await
+            .unwrap();
+        let err = two
+            .insert_container_distinct(&container("b"), same)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::LevelTaken(l) if l == "s0:c1,c2"));
+        assert!(two.get_container("b").await.is_err());
+        // shared on purpose: not judged
+        two.insert_container(&container("c")).await.unwrap();
+        assert_eq!(two.container_selinux_levels().await.unwrap().len(), 2);
     }
 
     /// The signatures of a pull are found by the digest of its manifest, and

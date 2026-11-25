@@ -934,8 +934,9 @@ impl ContainerService {
             .clone()
             .or(Some(dump.name).filter(|n| !n.is_empty()));
         // the level of the archive if it is of the allocator's form and no
-        // container's level overlaps it (create checks, in its lock), else
-        // one of its own: the restore gives the processes the new label
+        // container's level overlaps it (the insert of the container
+        // judges), else one of its own: the restore gives the processes
+        // the new label
         req.preferred_selinux_level = dump
             .selinux_level
             .filter(|l| crate::container::selinux::is_allocated_form(l));

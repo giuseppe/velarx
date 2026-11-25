@@ -58,6 +58,29 @@ impl CreateUndo {
     }
 }
 
+/// How many attempts a create makes when its SELinux level is taken by
+/// another create at the same time: each picks a level again.
+const LEVEL_ATTEMPTS: u32 = 8;
+
+/// Run `attempt` (which undoes what it made when it fails) until it does
+/// not fail with a taken SELinux level, at most `LEVEL_ATTEMPTS` times.
+/// The store is locked shared: creates run at the same time and one may
+/// record the level another chose.  That is rare and the next pick is
+/// another level, so the create is made again, from nothing.
+async fn retry_on_level_taken<T, F, Fut>(mut attempt: F) -> ContainerResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ContainerResult<T>>,
+{
+    for _ in 0..LEVEL_ATTEMPTS {
+        match attempt().await {
+            Err(ContainerError::Database(velarx_types::DbError::LevelTaken(_))) => {}
+            result => return result,
+        }
+    }
+    Err(ContainerError::LevelsTaken(LEVEL_ATTEMPTS))
+}
+
 impl ContainerService {
     pub async fn create(
         self: &Arc<Self>,
@@ -87,10 +110,17 @@ impl ContainerService {
         .map_err(ContainerError::InvalidArgument)?;
         let _store = self.lock_store().await?;
         let image_name = req.image.clone();
-        let mut undo = CreateUndo::default();
-        // (boxed: the future of a create is large, and the stack of a thread
-        // that polls it is not)
-        let result = Box::pin(self.create_inner(req, &mut undo)).await;
+        let result = retry_on_level_taken(|| async {
+            let mut undo = CreateUndo::default();
+            // (boxed: the future of a create is large, and the stack of a
+            // thread that polls it is not)
+            let result = Box::pin(self.create_inner(req.clone(), &mut undo)).await;
+            if result.is_err() {
+                undo.rollback(self).await;
+            }
+            result
+        })
+        .await;
         // (a storage error: if a layer of the image lost its EROFS image, the
         // layer is marked incomplete and the error says so; only this path
         // looks)
@@ -103,9 +133,6 @@ impl ContainerService {
                 )))),
             other => other,
         };
-        if result.is_err() {
-            undo.rollback(self).await;
-        }
         if let Ok(id) = &result {
             self.notify_action_of(id, "create", Vec::new()).await;
         }
@@ -1045,7 +1072,7 @@ impl ContainerService {
             .map(str::to_string)
             // the containers of a pod have the label of its infra container
             .or_else(|| req.selinux_share_with.clone());
-        config.selinux = self
+        let (selinux, fresh_level) = self
             .selinux_config(
                 &so,
                 req.privileged,
@@ -1054,6 +1081,7 @@ impl ContainerService {
                 req.preferred_selinux_level.as_deref(),
             )
             .await?;
+        config.selinux = selinux;
         if systemd && !req.privileged {
             // systemd needs the init domain of the policy, as podman's
             // InitLabel: it manages cgroups, mounts and its own journal
@@ -1371,7 +1399,15 @@ impl ContainerService {
             ..Default::default()
         };
 
-        self.db.insert_container(&record).await?;
+        // a level chosen here is judged by the insert: a create that chose
+        // it at the same time may have been recorded first
+        if fresh_level {
+            self.db
+                .insert_container_distinct(&record, crate::container::selinux::level_taken)
+                .await?;
+        } else {
+            self.db.insert_container(&record).await?;
+        }
         // what `restore --import` makes it again from: the secrets by
         // name, not their values
         let kept = req.without_secret_values(&self.secrets_dir_of(&container_id));
@@ -1832,5 +1868,63 @@ mod default_network_tests {
         assert_eq!(networks_to_set_up(&config), vec![NetworkMode::Bridge(None)]);
         config.networks = vec!["pasta".into()];
         assert_eq!(networks_to_set_up(&config), vec![NetworkMode::Pasta(None)]);
+    }
+}
+
+#[cfg(test)]
+mod level_retry_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn taken() -> ContainerError {
+        ContainerError::Database(velarx_types::DbError::LevelTaken("s0:c1,c2".into()))
+    }
+
+    /// A taken level is picked again, each failed attempt undone, until one
+    /// is recorded.
+    #[tokio::test]
+    async fn a_taken_level_is_picked_again() {
+        let (ran, undone) = (Cell::new(0), Cell::new(0));
+        let result = retry_on_level_taken(|| async {
+            ran.set(ran.get() + 1);
+            if ran.get() <= 2 {
+                undone.set(undone.get() + 1);
+                return Err(taken());
+            }
+            Ok("id")
+        })
+        .await;
+        assert_eq!(result.unwrap(), "id");
+        assert_eq!((ran.get(), undone.get()), (3, 2));
+    }
+
+    /// When every attempt loses its level the create fails and says so.
+    #[tokio::test]
+    async fn the_attempts_run_out() {
+        let ran = Cell::new(0);
+        let result: ContainerResult<()> = retry_on_level_taken(|| async {
+            ran.set(ran.get() + 1);
+            Err(taken())
+        })
+        .await;
+        assert_eq!(ran.get(), LEVEL_ATTEMPTS);
+        let err = result.unwrap_err();
+        assert!(matches!(err, ContainerError::LevelsTaken(LEVEL_ATTEMPTS)));
+        assert!(err
+            .to_string()
+            .starts_with("cannot pick a free SELinux level"));
+    }
+
+    /// Any other error ends the create at once.
+    #[tokio::test]
+    async fn another_error_is_not_retried() {
+        let ran = Cell::new(0);
+        let result: ContainerResult<()> = retry_on_level_taken(|| async {
+            ran.set(ran.get() + 1);
+            Err(ContainerError::InvalidArgument("no".into()))
+        })
+        .await;
+        assert_eq!(ran.get(), 1);
+        assert!(matches!(result, Err(ContainerError::InvalidArgument(_))));
     }
 }

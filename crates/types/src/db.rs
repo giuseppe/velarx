@@ -13,6 +13,10 @@ pub enum DbError {
     NotFound(String),
     #[error("already exists: {0}")]
     AlreadyExists(String),
+    /// The SELinux level a new container was given is taken by another
+    /// container that was recorded since it was chosen.
+    #[error("the SELinux level {0} is taken by another container")]
+    LevelTaken(String),
 }
 
 impl DbError {

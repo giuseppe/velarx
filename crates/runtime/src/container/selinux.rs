@@ -368,6 +368,20 @@ pub fn levels_overlap(a: &str, b: &str) -> bool {
     velarx_mcs_core::overlap(a.as_bytes(), b.as_bytes())
 }
 
+/// Whether the fresh level `fresh`, chosen by `allocate_level`, is no longer
+/// free because of `used`, the level of a container recorded since: `used`
+/// has categories and is equal to `fresh` or inside it.  This is the rule
+/// that holds for the result of both passes of the allocator: the first
+/// avoids every level that reaches another, the second (when a wide level in
+/// use, `s0:c0.c1023`, makes every pair reach it) only an equal or a
+/// containing one.  A `fresh` pair inside a wide level in use is accepted,
+/// as the allocator accepts it.  Two creations that chose at the same time
+/// collide only when their pairs are equal, which this sees.  A level in
+/// use that does not parse is ignored, as the second pass does.
+pub fn level_taken(fresh: &str, used: &str) -> bool {
+    velarx_mcs_core::contains(fresh.as_bytes(), used.as_bytes())
+}
+
 /// `level` is of the form the allocator gives, `s0:cA,cB` with A < B.
 pub fn is_allocated_form(level: &str) -> bool {
     velarx_mcs_core::read_pair(level.as_bytes()).is_some()
@@ -1364,6 +1378,27 @@ mod tests {
         assert!(levels_overlap("s0:c1,c2", "junk"));
         assert!(levels_overlap("junk", "s0"));
         assert!(levels_overlap("", ""));
+    }
+
+    /// What the insert of a container judges (`level_taken`): the level in
+    /// use that is equal to the fresh pair or inside it, and no other.
+    #[test]
+    fn a_fresh_level_taken_at_the_insert() {
+        // every pair is inside a wide level in use, and is accepted
+        let fresh = allocate_level(&["s0:c0.c1023".to_string()]).unwrap();
+        assert!(!level_taken(&fresh, "s0:c0.c1023"));
+        // the same pair recorded by a create at the same time
+        assert!(level_taken("s0:c1,c5", "s0:c1,c5"));
+        assert!(level_taken("s0:c1,c5", "s0:c5,c1"));
+        // a level in use with one category of the pair
+        assert!(level_taken("s0:c1,c5", "s0:c1"));
+        // the first pass of the allocator avoids a pair that contains
+        // another level in use when it can; this one is not inside the pair
+        assert!(!level_taken("s0:c1,c2", "s0:c1,c2,c3"));
+        assert!(!level_taken("s0:c1,c2", "s0:c3,c4"));
+        // no categories, and what is not a level, are ignored
+        assert!(!level_taken("s0:c1,c2", "s0"));
+        assert!(!level_taken("s0:c1,c2", "junk"));
     }
 
     /// The level of a fresh container is `s0:cA,cB` with A < B, and reaches

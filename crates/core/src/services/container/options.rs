@@ -337,7 +337,11 @@ impl ContainerService {
 
     /// The SELinux settings of a new container: `label=` and, when SELinux
     /// is enabled and the container is confined, a level no other
-    /// container has.
+    /// container has.  The second of the pair says that the level was
+    /// chosen here (not given by the user, not the one of a target): it is
+    /// only a choice until the container is recorded, where it is checked
+    /// again (`insert_container_distinct`), for another create may have
+    /// chosen it meanwhile.
     pub(super) async fn selinux_config(
         &self,
         so: &SecurityOptions,
@@ -345,7 +349,7 @@ impl ContainerService {
         host_ns: bool,
         share_with: Option<&str>,
         preferred: Option<&str>,
-    ) -> ContainerResult<Option<crate::container::selinux::SelinuxConfig>> {
+    ) -> ContainerResult<(Option<crate::container::selinux::SelinuxConfig>, bool)> {
         use crate::container::selinux;
         // an explicit level, label=files, label=disable or the namespaces of the
         // host win
@@ -362,7 +366,7 @@ impl ContainerService {
                 // a privileged target is not confined: the container is, with
                 // the level of the target's files (or one of its own)
                 Some(t) if !t.disable && t.level.is_none() => shared_level = t.file_level,
-                theirs => return Ok(theirs),
+                theirs => return Ok((theirs, false)),
             }
         }
         let mut s = selinux::SelinuxConfig {
@@ -380,14 +384,13 @@ impl ContainerService {
         };
         s.validate().map_err(ContainerError::InvalidArgument)?;
         if s.disable || !selinux::enabled() {
-            return Ok(Some(s).filter(|s| s.disable));
+            return Ok((Some(s).filter(|s| s.disable), false));
         }
         // the level of the process of a confined container, of the files of a
         // privileged one that asks for them labelled
         let needs_level = s.level.is_none() && (!privileged || s.files);
         if needs_level {
             let used = self.db.container_selinux_levels().await?;
-            // (in the lock of the store: no create in between)
             let level = match preferred {
                 Some(p) if !used.iter().any(|u| selinux::levels_overlap(p, u)) => p.to_string(),
                 _ => selinux::allocate_level(&used).map_err(ContainerError::InvalidArgument)?,
@@ -398,7 +401,7 @@ impl ContainerService {
                 s.level = Some(level);
             }
         }
-        Ok(Some(s))
+        Ok((Some(s), needs_level))
     }
 
     /// The namespace `kind` (`pid`, `ipc`...) of `--pid` and the like:

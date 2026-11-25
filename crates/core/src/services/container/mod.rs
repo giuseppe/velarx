@@ -79,6 +79,10 @@ pub enum ContainerError {
     Network(#[from] velarx_netkernel::error::NetworkError),
     #[error("{0}")]
     InvalidArgument(String),
+    /// Every pick of a SELinux level was taken by a container created at
+    /// the same time.
+    #[error("cannot pick a free SELinux level: {0} picks in a row were taken by containers created at the same time; try again")]
+    LevelsTaken(u32),
     /// The container has no checkpoint to restore
     #[error("{0}")]
     NoCheckpoint(String),
