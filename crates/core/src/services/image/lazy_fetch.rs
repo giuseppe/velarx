@@ -689,16 +689,21 @@ impl ImageService {
             self.funnel.walkers.lock().await.remove(&ctx.walk);
         }
         if staged.is_err() {
-            // (the next fetch reads the layer and opens the list again: a
-            // pull since may have changed how its registry is reached)
-            self.funnel.walkers.lock().await.remove(&ctx.walk);
-            self.funnel
-                .layers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(key);
+            self.reach_again(key, &ctx.walk).await;
         }
         staged
+    }
+
+    /// A fetch of `key` failed: the next one reads the layer and opens the
+    /// list again (a pull since may have changed how its registry is
+    /// reached).
+    async fn reach_again(&self, key: &LayerKey, walk: &WalkKey) {
+        self.funnel.walkers.lock().await.remove(walk);
+        self.funnel
+            .layers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
     }
 
     /// The compressed tar-split of the lazily staged layer `key` (its table
@@ -710,13 +715,25 @@ impl ImageService {
         toc: &Toc,
     ) -> ImageResult<bytes::Bytes> {
         let ctx = self.lazy_layer_ctx(key).await?;
-        let walker = self.lazy_walker((&ctx.walk, &ctx.manifest)).await?;
-        let (_, ts_z) = walker
-            .probe(&ctx.desc, false, Parts::Tarsplit)
-            .await?
-            .ok_or_else(|| {
+        let fetched = async {
+            let walker = self.lazy_walker((&ctx.walk, &ctx.manifest)).await?;
+            let mut found = walker.probe(&ctx.desc, false, Parts::Tarsplit).await?;
+            // (a fetcher of the list went during the probe, with the scope
+            // of the pull: asked once more through a list opened anew, so
+            // a fetcher that ended is followed by the one started now)
+            if found.is_none() && walker.stale() {
+                let walker = self.lazy_walker((&ctx.walk, &ctx.manifest)).await?;
+                found = walker.probe(&ctx.desc, false, Parts::Tarsplit).await?;
+            }
+            found.ok_or_else(|| {
                 ImageError::Layer(format!("layer {key}: no fetcher gave its tar-split"))
-            })?;
+            })
+        }
+        .await;
+        if fetched.is_err() {
+            self.reach_again(key, &ctx.walk).await;
+        }
+        let (_, ts_z) = fetched?;
         velarx_content::pull::chunked::check_tarsplit(toc, &ts_z)
             .map_err(|e| velarx_content::pull::chunked::naming(&ctx.desc.digest, e))?;
         Ok(ts_z.into())
