@@ -903,13 +903,49 @@ fn normalize_arch(arch: &str) -> &str {
     }
 }
 
+/// The variant of an arm CPU, from the text of /proc/cpuinfo as
+/// containers/image reads it (`getCPUVariantArm`): the architecture the
+/// kernel reports, and for a 7 the model name, to tell the ARMv6 cores the
+/// kernel calls 7.
+pub(crate) fn cpu_variant(cpuinfo: &str) -> Option<&'static str> {
+    let field = |name: &str| {
+        cpuinfo.lines().find_map(|l| {
+            let (key, value) = l.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    };
+    match field("CPU architecture")?.to_ascii_lowercase().as_str() {
+        "8" | "aarch64" => Some("v8"),
+        "7m" | "?(12)" | "?(13)" | "?(14)" | "?(15)" | "?(16)" | "?(17)" => Some("v7"),
+        "7" => {
+            let model = field("model name")?.to_ascii_lowercase();
+            Some(if model.starts_with("armv6-compatible") {
+                "v6"
+            } else {
+                "v7"
+            })
+        }
+        "6" | "6tej" => Some("v6"),
+        "5" | "5t" | "5te" | "5tej" => Some("v5"),
+        "4" | "4t" => Some("v4"),
+        "3" => Some("v3"),
+        _ => None,
+    }
+}
+
 impl Platform {
-    /// linux on the architecture of this host.
+    /// linux on the architecture of this host, with the variant of its
+    /// CPU on arm (none when /proc/cpuinfo does not tell).
     pub fn host() -> Self {
+        let arch = host_arch();
+        let cpu = match arch {
+            "arm" | "arm64" => std::fs::read_to_string("/proc/cpuinfo").ok(),
+            _ => None,
+        };
         Self {
             os: "linux".into(),
-            arch: host_arch().into(),
-            variant: None,
+            arch: arch.into(),
+            variant: cpu.as_deref().and_then(cpu_variant).map(str::to_string),
         }
     }
 

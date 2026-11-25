@@ -2884,6 +2884,43 @@ mod tests {
         assert_eq!(select(index, "unknown/unknown"), None);
     }
 
+    /// The variant of the host from /proc/cpuinfo, as containers/image
+    /// reads it; the wanted platforms of a host then run from its variant
+    /// down, and never to a variant its CPU cannot run.
+    #[test]
+    fn test_the_arm_variant_of_the_host() {
+        let v7 = "processor\t: 0\nmodel name\t: ARMv7 Processor rev 4 (v7l)\nBogoMIPS\t: 108.00\nCPU architecture: 7\nCPU variant\t: 0x0\n";
+        let pi_zero = "processor\t: 0\nmodel name\t: ARMv6-compatible processor rev 7 (v6l)\nCPU architecture: 7\n";
+        let v6 = "model name\t: ARM1176JZF-S\nCPU architecture: 6\n";
+        let v8 =
+            "processor\t: 0\nBogoMIPS\t: 50.00\nCPU implementer\t: 0x41\nCPU architecture: 8\n";
+        let v5 = "Processor\t: Feroceon 88FR131 rev 1 (v5l)\nCPU architecture: 5TE\n";
+        for (text, variant) in [
+            (v7, Some("v7")),
+            (pi_zero, Some("v6")),
+            (v6, Some("v6")),
+            (v8, Some("v8")),
+            (v5, Some("v5")),
+            ("CPU architecture: 7M\n", Some("v7")),
+            ("CPU architecture: AArch64\n", Some("v8")),
+            ("CPU architecture: 7\n", None),
+            ("CPU architecture: 9\nmodel name: x\n", None),
+            ("model name: x86\n", None),
+            ("", None),
+        ] {
+            assert_eq!(cpu_variant(text), variant, "{text}");
+        }
+        // the entries of an index: a host takes its own variant, or the
+        // best one below it
+        let arm = r#"[
+            {"digest":"sha256:a","platform":{"os":"linux","architecture":"arm","variant":"v5"}},
+            {"digest":"sha256:b","platform":{"os":"linux","architecture":"arm","variant":"v6"}},
+            {"digest":"sha256:c","platform":{"os":"linux","architecture":"arm","variant":"v7"}}]"#;
+        assert_eq!(select(arm, "linux/arm/v7").as_deref(), Some("sha256:c"));
+        assert_eq!(select(arm, "linux/arm/v6").as_deref(), Some("sha256:b"));
+        assert_eq!(select(arm, "linux/arm/v5").as_deref(), Some("sha256:a"));
+    }
+
     /// Rust's `powerpc64` is both endiannesses; the big-endian one is
     /// `ppc64`.
     #[test]
