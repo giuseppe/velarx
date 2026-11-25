@@ -32,6 +32,7 @@ mod secrets;
 mod server;
 mod supervise;
 mod unowned;
+mod volcheck;
 pub mod volcopy;
 mod volume;
 
@@ -62,4 +63,5 @@ pub use server::*;
 pub use velarx_wire::request::*;
 
 pub use supervise::{Supervision, SystemdCgroups};
+pub use volcheck::{VolumeCheck, VolumeFinding};
 pub use volume::*;

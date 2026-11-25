@@ -1212,8 +1212,8 @@ pub fn is_mount_point(path: &Path) -> io::Result<bool> {
 
 /// Volume service for managing named volumes
 pub struct VolumeService {
-    db: Database,
-    volumes_dir: PathBuf,
+    pub(super) db: Database,
+    pub(super) volumes_dir: PathBuf,
     /// `<root>/volumes.lock`: held shared by whoever changes a volume
     /// directory or a row and by a container create while it names
     /// volumes, exclusive by `rename` and by the check, after the lock of
@@ -1644,7 +1644,7 @@ impl VolumeService {
     }
 
     /// Store a volume in the database
-    async fn store_volume(&self, volume: &Volume) -> VolumeResult<()> {
+    pub(super) async fn store_volume(&self, volume: &Volume) -> VolumeResult<()> {
         let row = velarx_db::volumes::VolumeRow::from(volume);
         self.db
             .conn()

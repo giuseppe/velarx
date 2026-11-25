@@ -67,6 +67,17 @@ layer. An opaque marker (`.wh..wh..opq`) in the root of a layer hides
 nothing, as in the kernel's overlay, whose root is the merge of the roots of
 all its layers.
 
+A named volume is a directory `volumes/NAME` (0700) next to the store, holding
+`_data` (the volume's files) and `volume.json` (its labels, options, creation
+time and state). The directory is the volume; its database row is a copy.
+`system check` holds `volumes.lock` exclusive and reports what a change that
+died leaves: a directory without a row or a row without a directory, a row or
+a `volume.json` that differs or is missing, the shell of a removal or of a
+create, a mode other than 0700, and anything else under `volumes`.
+`--repair` makes the rows and files say what the directories say and removes
+only shells, with `unlink` and `rmdir`: it never deletes data, and what is
+not a volume is left untouched.
+
 The driver is chosen by `[storage] driver` or `--storage-driver`: `composefs`
 (the default), `vfs` and `varlink` (never chosen for you). A store keeps the
 driver it was made with; opening it with another is an error that names both.

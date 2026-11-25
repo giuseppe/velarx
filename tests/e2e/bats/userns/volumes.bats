@@ -40,6 +40,12 @@ teardown_file () {
     runo "$MAPOPTS -v mapped:/etc" true > /dev/null
     check "volume owner under a mapping" "$HOST0:$HOST0" "$(stat -c %u:%g "$VOLS/mapped/_data")"
     check "copied files have the ids of the container" "$HOST0:$((HOST0 + 42))" "$(stat -c %u:%g "$VOLS/mapped/_data/shadow")"
+    # (the data is the container's, the directory of the volume the
+    # engine's: the check finds nothing, also for an anonymous volume)
+    id=$(bg "$MAPOPTS -v /anon" sleep 60)
+    check "a volume of a mapped container is no finding" "null" \
+        "$(sh_ system check --quick --format json | jq -c .Volumes)"
+    sh_ container rm -t 0 -f -v "$id" > /dev/null
 }
 
 @test "anonymous volumes" {

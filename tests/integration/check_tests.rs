@@ -1133,3 +1133,300 @@ async fn a_repair_enables_the_required_fs_verity() {
     let r = requiring(&e).check(&request(false, false)).await.unwrap();
     assert!(r.problems.is_empty(), "{:?}", r.problems);
 }
+
+// The volumes: a directory is the volume, the row a copy.  Each state a
+// change of a volume that died can leave is made by the real code (with
+// the statements on the rows ignored, as a process that dies between the
+// directory and the row), then checked, repaired and checked again.
+
+/// The volumes of the environment, and its checker that looks at them.
+fn volumes_of(e: &Env) -> (Arc<velarx_core::services::VolumeService>, CheckService) {
+    let volumes = Arc::new(
+        velarx_core::services::VolumeService::new(e.db.clone(), e._tmp.path().join("volumes"))
+            .unwrap(),
+    );
+    (volumes.clone(), checker(e).with_volumes(volumes))
+}
+
+/// Make the statements of `kind` (`INSERT`, `DELETE`) on the rows of the
+/// volumes do nothing and say nothing.
+async fn ignore(e: &Env, kind: &'static str) {
+    e.db.conn()
+        .call(move |c| {
+            Ok(c.execute_batch(&format!(
+                "CREATE TRIGGER ignored_{kind} BEFORE {kind} ON volumes \
+                 BEGIN SELECT RAISE(IGNORE); END"
+            ))?)
+        })
+        .await
+        .unwrap();
+}
+
+async fn unignore(e: &Env, kind: &'static str) {
+    e.db.conn()
+        .call(move |c| Ok(c.execute_batch(&format!("DROP TRIGGER ignored_{kind}"))?))
+        .await
+        .unwrap();
+}
+
+/// The kinds of the report, each with its volume.
+fn volume_kinds(r: &CheckReport) -> Vec<(&str, &str)> {
+    let mut k: Vec<_> = r
+        .problems
+        .iter()
+        .map(|p| (p.kind.as_str(), p.volume.as_deref().unwrap_or("")))
+        .collect();
+    k.sort();
+    k
+}
+
+/// Check, repair (every problem is repaired, and the report is fine), check
+/// again (nothing).
+async fn repaired(svc: &CheckService, found: &[(&str, &str)]) {
+    let r = svc.check(&request(true, false)).await.unwrap();
+    assert_eq!(volume_kinds(&r), found, "{:?}", r.problems);
+    assert!(!r.ok());
+    let r = svc.check(&request(true, true)).await.unwrap();
+    assert_eq!(volume_kinds(&r), found);
+    assert!(r.ok(), "{:?}", r.problems);
+    assert!(r.problems.iter().all(|p| p.action == CheckAction::Repaired));
+    let r = svc.check(&request(true, false)).await.unwrap();
+    assert!(r.ok() && r.problems.is_empty(), "{:?}", r.problems);
+}
+
+fn labels(k: &str, v: &str) -> std::collections::HashMap<String, String> {
+    [(k.to_string(), v.to_string())].into()
+}
+
+#[tokio::test]
+async fn a_create_killed_before_its_row_is_completed() {
+    let e = env().await;
+    let (volumes, svc) = volumes_of(&e);
+    ignore(&e, "INSERT").await;
+    let me = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(e._tmp.path()).unwrap());
+    let made = volumes
+        .create(
+            "a",
+            Default::default(),
+            labels("k", "v"),
+            labels("uid", &me.to_string()),
+        )
+        .await
+        .unwrap();
+    std::fs::write(made.mountpoint.join("file"), b"data").unwrap();
+    unignore(&e, "INSERT").await;
+    assert!(volumes.get("a").await.is_err());
+
+    repaired(&svc, &[("orphan_volume", "a")]).await;
+    let back = volumes.get("a").await.unwrap();
+    assert_eq!(back.labels, made.labels);
+    assert_eq!(back.options, made.options);
+    assert_eq!(back.created_at, made.created_at);
+    assert_eq!(volumes.list().await.unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read(made.mountpoint.join("file")).unwrap(),
+        b"data"
+    );
+}
+
+#[tokio::test]
+async fn a_create_killed_while_building_leaves_nothing_to_keep() {
+    let e = env().await;
+    let (volumes, svc) = volumes_of(&e);
+    let building = volumes.volumes_dir().join(".new-0123");
+    std::fs::create_dir_all(building.join("_data")).unwrap();
+    std::fs::write(building.join("volume.json"), b"{").unwrap();
+    repaired(&svc, &[("stale_volume_temp", ".new-0123")]).await;
+    assert!(!building.exists());
+}
+
+#[tokio::test]
+async fn a_rename_killed_after_its_directory_moves_is_completed_under_the_new_name() {
+    let e = env().await;
+    let (volumes, svc) = volumes_of(&e);
+    let made = volumes
+        .create(
+            "old",
+            Default::default(),
+            labels("k", "v"),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    std::fs::write(made.mountpoint.join("file"), b"data").unwrap();
+    ignore(&e, "DELETE").await;
+    ignore(&e, "INSERT").await;
+    volumes.rename("old", "new").await.unwrap();
+    unignore(&e, "DELETE").await;
+    unignore(&e, "INSERT").await;
+    assert!(volumes.get("old").await.is_ok() && volumes.get("new").await.is_err());
+
+    repaired(
+        &svc,
+        &[("orphan_volume", "new"), ("stale_volume_row", "old")],
+    )
+    .await;
+    assert!(volumes.get("old").await.is_err());
+    let new = volumes.get("new").await.unwrap();
+    assert_eq!(new.labels, made.labels);
+    assert_eq!(std::fs::read(new.mountpoint.join("file")).unwrap(), b"data");
+}
+
+#[tokio::test]
+async fn a_rename_killed_after_its_file_says_the_volume_is_named() {
+    let e = env().await;
+    let (volumes, svc) = volumes_of(&e);
+    let made = volumes
+        .create_with(velarx_core::services::CreateVolume {
+            name: Some("a".into()),
+            anonymous: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut meta = velarx_core::services::VolumeMeta::of(&made);
+    meta.state.anonymous = false;
+    meta.write(&volumes.volumes_dir().join("a")).unwrap();
+    assert!(volumes.get("a").await.unwrap().state.anonymous);
+
+    repaired(&svc, &[("volume_row_mismatch", "a")]).await;
+    assert!(!volumes.get("a").await.unwrap().state.anonymous);
+}
+
+#[tokio::test]
+async fn a_removal_killed_after_its_data_or_its_directory_is_finished() {
+    let e = env().await;
+    let (volumes, svc) = volumes_of(&e);
+    // after the data: the directory is left with its file
+    volumes
+        .create(
+            "a",
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    std::fs::remove_dir(volumes.volumes_dir().join("a").join("_data")).unwrap();
+    repaired(&svc, &[("unfinished_volume_removal", "a")]).await;
+    assert!(!volumes.volumes_dir().join("a").exists());
+    assert!(volumes.get("a").await.is_err());
+
+    // after the directory: the row is left
+    volumes
+        .create(
+            "b",
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    ignore(&e, "DELETE").await;
+    volumes.remove("b", false).await.unwrap();
+    unignore(&e, "DELETE").await;
+    repaired(&svc, &[("stale_volume_row", "b")]).await;
+    assert!(volumes.get("b").await.is_err());
+}
+
+#[tokio::test]
+async fn a_state_killed_between_its_file_and_its_row_is_written_again() {
+    let e = env().await;
+    let (volumes, svc) = volumes_of(&e);
+    let made = volumes
+        .create(
+            "a",
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let mut state = made.state.clone();
+    state.copied_up = true;
+    state.needs_copy_up = false;
+    ignore(&e, "UPDATE").await;
+    volumes.set_state("a", &state).await.unwrap();
+    unignore(&e, "UPDATE").await;
+    assert_eq!(volumes.get("a").await.unwrap().state, made.state);
+
+    repaired(&svc, &[("volume_row_mismatch", "a")]).await;
+    assert_eq!(volumes.get("a").await.unwrap().state, state);
+}
+
+#[tokio::test]
+async fn a_volume_of_an_older_build_gets_its_file() {
+    let e = env().await;
+    let (volumes, svc) = volumes_of(&e);
+    let made = volumes
+        .create(
+            "a",
+            Default::default(),
+            labels("k", "v"),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    std::fs::remove_file(volumes.volumes_dir().join("a").join("volume.json")).unwrap();
+    assert!(volumes.set_state("a", &made.state).await.is_err());
+
+    repaired(&svc, &[("bad_volume_metadata", "a")]).await;
+    volumes.set_state("a", &made.state).await.unwrap();
+    assert_eq!(volumes.get("a").await.unwrap().labels, made.labels);
+}
+
+#[tokio::test]
+async fn what_the_check_cannot_repair_keeps_the_exit_open() {
+    let e = env().await;
+    let (volumes, svc) = volumes_of(&e);
+    let junk = volumes.volumes_dir().join("junk");
+    std::fs::write(&junk, b"x").unwrap();
+    let r = svc.check(&request(true, true)).await.unwrap();
+    assert_eq!(volume_kinds(&r), [("bad_volume_directory", "junk")]);
+    assert!(!r.ok());
+    assert_eq!(r.problems[0].action, CheckAction::None);
+    assert_eq!(std::fs::read(&junk).unwrap(), b"x");
+    std::fs::remove_file(&junk).unwrap();
+    assert!(svc.check(&request(true, true)).await.unwrap().ok());
+}
+
+#[tokio::test]
+async fn a_check_of_the_volumes_waits_for_a_change_and_a_change_for_it() {
+    let e = env().await;
+    let (volumes, svc) = volumes_of(&e);
+    let svc = Arc::new(svc);
+    let lock = volumes.lock_path().to_path_buf();
+
+    // a change holds the lock shared: the check waits for it
+    let change = StorageLock::shared(&lock).await.unwrap();
+    let checking = {
+        let svc = svc.clone();
+        tokio::spawn(async move { svc.check(&request(true, false)).await.unwrap() })
+    };
+    crate::common::wait_for_lock_waiter(&lock).await;
+    assert!(!checking.is_finished());
+    drop(change);
+    assert!(checking.await.unwrap().ok());
+
+    // the check holds it exclusive: a create waits for it
+    let held = StorageLock::exclusive(&lock).await.unwrap();
+    let creating = {
+        let volumes = volumes.clone();
+        tokio::spawn(async move {
+            volumes
+                .create(
+                    "a",
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                )
+                .await
+                .unwrap()
+        })
+    };
+    crate::common::wait_for_lock_waiter(&lock).await;
+    assert!(!creating.is_finished());
+    assert!(!volumes.volumes_dir().join("a").exists());
+    drop(held);
+    creating.await.unwrap();
+}

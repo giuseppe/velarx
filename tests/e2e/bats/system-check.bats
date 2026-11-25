@@ -2,7 +2,8 @@
 # `system check`: a whole store passes, damage is found (quick and full),
 # a repair makes the composefs image again, removes leftovers and removes
 # the images that cannot be repaired without a pull, but not one a
-# container uses.  Rootless.
+# container uses.  The volumes are looked at too: the directory is the
+# volume, the row a copy, and a repair never deletes data.  Rootless.
 #
 #   VELARX_BINDIR=target/debug bats tests/e2e/bats/system-check.bats
 #   (IMAGE=... for another image than $E2E_REGISTRY/alpine:chunked)
@@ -11,6 +12,8 @@ load helpers
 
 sh_ () { "$BIN/velarx" --socket "$ESOCK" "$@"; }
 images () { sh_ image list --format '{{.Repository}}:{{.Tag}}' 2>&1; }
+vols () { echo "$WORKDIR/root/volumes"; }
+volumes () { sh_ volume ls --format '{{.Name}}' | sort | tr '\n' ' '; }
 biggest () { find "$WORKDIR/store/objects" -type f -printf '%s %p\n' | sort -n | tail -1 | cut -d' ' -f2; }
 
 setup_file () {
@@ -194,4 +197,125 @@ teardown () {
     # stale pull directory goes)
     check "the staging directory is gone" 0 "$(ls "$WORKDIR/store/staging" | grep -cv '^\(incoming\|layers\|meta\|boot\)$')"
     check "and the temporary file" 0 "$(ls -A "$WORKDIR/store/objects/ab" | grep -c tmpleft)"
+}
+
+# the directory of a volume is the volume: renamed behind the engine's
+# back, it is registered under its new name, with what it holds
+@test "volumes: a directory no row names is registered, its data intact" {
+    sh_ volume create --label k=v oa > /dev/null
+    echo precious > "$(vols)/oa/_data/file"
+    out=$(sh_ system check 2>&1); rc=$?
+    check "a whole volume passes" 0 $rc
+    check "silently" "" "$out"
+    mv "$(vols)/oa" "$(vols)/ob"
+    out=$(sh_ system check 2>&1); rc=$?
+    check "a directory without a row and a row without a directory" 125 $rc
+    check_match "it says the store needs repair" "Error: local storage needs repair" "$out"
+    check_match "it names the volume" "Damaged volume ob:" "$out"
+    check_match "the directory no row names" "orphan_volume" "$out"
+    check_match "the row no directory has" "Damaged volume oa:" "$out"
+    check_match "and says so" "stale_volume_row" "$out"
+    check "a check does not repair" "oa " "$(volumes)"
+    out=$(sh_ system check --repair 2>&1); rc=$?
+    check "a repair succeeds" 0 $rc
+    check_match "it says which volume" "Repaired volume: ob" "$out"
+    check "the volume is under its new name" "ob " "$(volumes)"
+    check "with its label" "v" "$(sh_ volume inspect ob --format '{{index .Labels "k"}}')"
+    check "the data is there" "precious" "$(cat "$(vols)/ob/_data/file")"
+    sh_ system check > /dev/null 2>&1
+    check "and the store passes" 0 $?
+    sh_ volume rm ob > /dev/null
+}
+
+@test "volumes: a row without a directory is deleted, and its name is free" {
+    sh_ volume create rx > /dev/null
+    rm -rf "$(vols)/rx"
+    sh_ system check > /dev/null 2>&1
+    check "a row without a directory fails the check" 125 $?
+    sh_ system check --repair > /dev/null 2>&1
+    check "a repair succeeds" 0 $?
+    check "the row is gone" "" "$(volumes)"
+    sh_ volume create rx > /dev/null 2>&1
+    check "the name can be used again" 0 $?
+    sh_ volume rm rx > /dev/null
+}
+
+@test "volumes: a row that differs from its directory is written again" {
+    sh_ volume create --label k=v mm > /dev/null
+    jq '.labels.k = "edited"' "$(vols)/mm/volume.json" > "$WORKDIR/mm.json"
+    cat "$WORKDIR/mm.json" > "$(vols)/mm/volume.json"
+    out=$(sh_ system check 2>&1); rc=$?
+    check "the check fails" 125 $rc
+    check_match "it says what differs" "volume_row_mismatch.*labels" "$out"
+    sh_ system check --repair > /dev/null 2>&1
+    check "a repair succeeds" 0 $?
+    check "the directory said edited" "edited" "$(sh_ volume inspect mm --format '{{index .Labels "k"}}')"
+    sh_ volume rm mm > /dev/null
+}
+
+@test "volumes: a lost volume.json is made again, from the row or with defaults" {
+    sh_ volume create --label k=v fl > /dev/null
+    rm "$(vols)/fl/volume.json"
+    out=$(sh_ system check 2>&1); rc=$?
+    check "the check fails" 125 $rc
+    check_match "it is damage" "Error: damage detected in local storage" "$out"
+    check_match "it says what" "bad_volume_metadata.*volume.json of fl is missing" "$out"
+    sh_ system check --repair > /dev/null 2>&1
+    check "a repair succeeds" 0 $?
+    check "the file says what the row said" "v" "$(jq -r .labels.k "$(vols)/fl/volume.json")"
+    # a directory no engine made: no row, no file, data in it
+    mkdir -p "$(vols)/foreign/_data"
+    echo keep > "$(vols)/foreign/_data/f"
+    chmod 700 "$(vols)/foreign"
+    sh_ system check > /dev/null 2>&1
+    check "a foreign directory fails the check" 125 $?
+    sh_ system check --repair > /dev/null 2>&1
+    check "and is repaired" 0 $?
+    check "it is a volume" "fl foreign " "$(volumes)"
+    check "its data is there" "keep" "$(cat "$(vols)/foreign/_data/f")"
+    sh_ system check > /dev/null 2>&1
+    check "the store passes" 0 $?
+    sh_ volume rm fl foreign > /dev/null
+}
+
+@test "volumes: the shell of a removal and the build of a create are removed" {
+    sh_ volume create un > /dev/null
+    rm -rf "$(vols)/un/_data"
+    mkdir -p "$(vols)/.new-1/_data"
+    out=$(sh_ system check 2>&1); rc=$?
+    check "the check fails" 125 $rc
+    check_match "a removal that did not finish" "unfinished_volume_removal" "$out"
+    check_match "a create that did not finish" "stale_volume_temp" "$out"
+    sh_ system check --repair > /dev/null 2>&1
+    check "a repair succeeds" 0 $?
+    check "the volume is gone" "" "$(volumes)"
+    test ! -e "$(vols)/un" -a ! -e "$(vols)/.new-1"
+    check "with its directory and the temporary one" 0 $?
+}
+
+@test "volumes: a directory with another mode is set to 0700" {
+    sh_ volume create md > /dev/null
+    chmod 755 "$(vols)/md"
+    out=$(sh_ system check 2>&1); rc=$?
+    check "the check fails" 125 $rc
+    check_match "it says the mode" "volume_mode.*755" "$out"
+    sh_ system check --repair > /dev/null 2>&1
+    check "a repair succeeds" 0 $?
+    check "the mode is 700" "700" "$(stat -c %a "$(vols)/md")"
+    sh_ volume rm md > /dev/null
+}
+
+@test "volumes: what is no volume stays open and untouched; the json has Volumes" {
+    echo x > "$(vols)/junk"
+    out=$(sh_ system check --repair 2>&1); rc=$?
+    check "a repair cannot repair it" 125 $rc
+    check_match "it says so" "Error: damage in local storage still present after repair attempt" "$out"
+    check_match "it names the file" "Damaged volume junk:" "$out"
+    check "the file is untouched" "x" "$(cat "$(vols)/junk")"
+    out=$(sh_ system check --format json 2>&1)
+    check "the json has the volume" "bad_volume_directory" "$(echo "$out" | jq -r '.Volumes.junk[0]' | cut -d: -f1)"
+    check "and Errors" "true" "$(echo "$out" | jq -r .Errors)"
+    rm "$(vols)/junk"
+    sh_ system check > /dev/null 2>&1
+    check "the store passes" 0 $?
 }

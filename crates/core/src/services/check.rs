@@ -11,6 +11,9 @@
 //! rows of files that are gone, temporary files, the staging directories of
 //! pulls and builds that died.
 //!
+//! The volumes are looked at last, under the lock of the volumes (see
+//! `volcheck`): the directories are the truth, the rows a copy.
+//!
 //! The images are checked under the shared lock of the store, the oldest
 //! checked first, as many as the timeout leaves time for.  A repair takes the
 //! exclusive lock for what it removes in the store; it makes the composefs
@@ -148,6 +151,7 @@ pub struct CheckService {
     staging: PathBuf,
     grace: Duration,
     containers: Option<Arc<crate::services::ContainerService>>,
+    volumes: Option<Arc<crate::services::VolumeService>>,
 }
 
 impl CheckService {
@@ -166,7 +170,14 @@ impl CheckService {
             staging,
             grace: LEFTOVER_GRACE,
             containers: None,
+            volumes: None,
         }
+    }
+
+    /// The service whose volumes are checked too.
+    pub fn with_volumes(mut self, volumes: Arc<crate::services::VolumeService>) -> Self {
+        self.volumes = Some(volumes);
+        self
     }
 
     /// The service that removes the containers of a lossy repair.
@@ -236,14 +247,44 @@ impl CheckService {
                     .into_iter()
                     .map(|f| f.into_problem(CheckAction::None)),
             );
+            self.check_volumes(false, &mut report).await?;
             report.elapsed_ms = started.elapsed().as_millis() as u64;
             return Ok(report);
         }
         drop(shared);
         self.repair(checked, full, req.repair_lossy, &run, &mut report)
             .await?;
+        self.check_volumes(true, &mut report).await?;
         report.elapsed_ms = started.elapsed().as_millis() as u64;
         Ok(report)
+    }
+
+    /// The volumes, with no lock of the store held (the lock of the
+    /// volumes is taken after it where both are).
+    async fn check_volumes(&self, repair: bool, report: &mut CheckReport) -> CheckResult<()> {
+        let Some(volumes) = &self.volumes else {
+            return Ok(());
+        };
+        let check = volumes
+            .check(repair)
+            .await
+            .map_err(|e| CheckError::Other(e.to_string()))?;
+        report.volumes_checked = check.checked as u64;
+        report
+            .problems
+            .extend(check.findings.into_iter().map(|f| CheckProblem {
+                volume: Some(f.name),
+                kind: f.kind.to_string(),
+                message: f.message,
+                path: Some(f.path.display().to_string()),
+                action: if f.repaired {
+                    CheckAction::Repaired
+                } else {
+                    CheckAction::None
+                },
+                ..Default::default()
+            }));
+        Ok(())
     }
 
     /// Remove the containers of a lossy repair (a running one stays: the

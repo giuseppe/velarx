@@ -1101,7 +1101,8 @@ fn checker(
     .with_grace(grace.unwrap_or(std::time::Duration::from_secs(
         state.config.storage.check_leftover_age_secs,
     )))
-    .with_containers(state.container_service.clone()))
+    .with_containers(state.container_service.clone())
+    .with_volumes(state.volume_service.clone()))
 }
 
 /// `SystemCheck`: the checker takes the lock of the store it needs.
