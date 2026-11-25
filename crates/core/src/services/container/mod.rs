@@ -1367,11 +1367,24 @@ mod tests {
         let user = resolve_container_user(passwd, group, &config, &no_passwd, None).unwrap();
         assert!(user.passwd.is_none());
         // keep-id: the names of the host
-        let user =
-            resolve_container_user(passwd, group, &config, &req, Some(("me", "us"))).unwrap();
+        let host = |uid| HostUser {
+            uid,
+            gid: 0,
+            name: "me",
+            group: "us",
+        };
+        let user = resolve_container_user(passwd, group, &config, &req, Some(&host(4242))).unwrap();
         assert_eq!(
             user.passwd.as_deref(),
             Some(&b"root:x:0:0:root:/root:/bin/sh\nme:*:4242:0::/:/bin/sh\n"[..])
+        );
+        // another user is given: the host user has its entry too
+        let user = resolve_container_user(passwd, group, &config, &req, Some(&host(1000))).unwrap();
+        assert_eq!(
+            user.passwd.as_deref(),
+            Some(
+                &b"root:x:0:0:root:/root:/bin/sh\nme:*:1000:0::/:/bin/sh\n4242:*:4242:0:container user:/:/bin/sh\n"[..]
+            )
         );
         // an unknown name fails
         let config = ContainerConfig {

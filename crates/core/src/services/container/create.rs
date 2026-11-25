@@ -1020,8 +1020,19 @@ impl ContainerService {
             Some(dir) => dir.users()?,
             None => self.image_users(&layers, &config)?,
         };
-        let identity = keep_id_user.and_then(|(uid, gid)| host_identity(uid, gid));
-        let identity = identity.as_ref().map(|(n, h)| (n.as_str(), h.as_str()));
+        // (keep-id with ids of its own keeps no user of the host)
+        let host_ids = userns.user.filter(
+            |_| matches!(&userns.spec, UsernsSpec::KeepId(o) if o.uid.is_none() && o.gid.is_none()),
+        );
+        let host_names = host_ids.and_then(|(uid, gid)| host_identity(uid, gid));
+        let host_user = host_ids
+            .zip(host_names.as_ref())
+            .map(|((uid, gid), (name, group))| HostUser {
+                uid,
+                gid,
+                name,
+                group,
+            });
         let with_hosts = if req.host_users.is_empty() {
             passwd.clone()
         } else {
@@ -1045,12 +1056,16 @@ impl ContainerService {
             )?
         };
         let (mut user, user_error) =
-            resolve_container_user_later(&with_hosts, &group, &config, &req, identity)?;
+            resolve_container_user_later(&with_hosts, &group, &config, &req, host_user.as_ref())?;
         config.user_error = user_error;
         // keep-id: a volume mounted at the home of the user of the host (the
         // HOME of this process, as podman reads it) makes it the home of the
         // user in the container too
-        if identity.is_some() && user.user.home.is_none() {
+        if host_user
+            .as_ref()
+            .is_some_and(|h| (h.uid, h.gid) == (user.user.uid, user.user.gid))
+            && user.user.home.is_none()
+        {
             if let Some(home) = std::env::var("HOME")
                 .ok()
                 .filter(|h| h.starts_with('/') && config.mounts.iter().any(|m| m.target == *h))

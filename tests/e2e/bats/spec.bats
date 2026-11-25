@@ -100,6 +100,10 @@ HOME=/tmp
 HOME=/
 $(id -un):*:$(id -u):$(id -g)::/:/bin/sh
 $(id -gn):x:$(id -g):$(id -un)" --userns=keep-id -- sh -c "$ID; tail -1 /etc/passwd; tail -1 /etc/group"
+        # (--user root: the user of the host has its entry all the same)
+        run_ctr "keep-id with --user" "root
+$(id -un):*:$(id -u):$(id -g)::/:/bin/sh
+$(id -gn):x:$(id -g):$(id -un)" --userns=keep-id --user root -- sh -c "id -un; tail -1 /etc/passwd; tail -1 /etc/group"
     fi
 }
 

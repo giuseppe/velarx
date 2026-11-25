@@ -114,14 +114,25 @@ pub(super) struct ContainerUser {
     pub(super) group: Option<Vec<u8>>,
 }
 
-/// `identity` is the name and home of the passwd entry for a user the
-/// image lacks (`--userns=keep-id` gives those of the user on the host).
+/// The user of the host that `--userns=keep-id` runs the container as
+/// unless one is given: its ids and the names of its passwd and group
+/// entries.
+pub(super) struct HostUser<'a> {
+    pub(super) uid: u32,
+    pub(super) gid: u32,
+    pub(super) name: &'a str,
+    pub(super) group: &'a str,
+}
+
+/// `host` is the user of the host under `--userns=keep-id`: when the image
+/// has no entry for its ids, it gets them, with its names, before those of
+/// the user the container runs as, whichever that is.
 pub(super) fn resolve_container_user(
     passwd: &[u8],
     group: &[u8],
     config: &ContainerConfig,
     req: &CreateContainerRequest,
-    identity: Option<(&str, &str)>,
+    host: Option<&HostUser<'_>>,
 ) -> Result<ContainerUser, crate::container::userspec::UserError> {
     use crate::container::userspec;
     let user = userspec::resolve_user_groups(
@@ -134,12 +145,36 @@ pub(super) fn resolve_container_user(
     let wants_entries =
         !config.user.is_empty() || req.passwd_entry.is_some() || req.group_entry.is_some();
     let (passwd, group) = if wants_entries && !req.no_passwd {
-        let opts = userspec::EntryOptions {
+        let mut opts = userspec::EntryOptions {
             passwd_template: req.passwd_entry.as_deref(),
             group_template: req.group_entry.as_deref(),
-            identity,
+            identity: None,
         };
-        userspec::added_entries(passwd, group, &user, &config.working_dir, &opts)?
+        // the entries of the user of the host first, then those of the
+        // user the container runs as when its ids still have none
+        let (host_passwd, host_group) = match host {
+            Some(h) => {
+                let ids = userspec::ResolvedUser {
+                    uid: h.uid,
+                    gid: h.gid,
+                    ..Default::default()
+                };
+                opts.identity = Some((h.name, h.group));
+                let added =
+                    userspec::added_entries(passwd, group, &ids, &config.working_dir, &opts)?;
+                opts.identity = None;
+                added
+            }
+            None => (None, None),
+        };
+        let (new_passwd, new_group) = userspec::added_entries(
+            host_passwd.as_deref().unwrap_or(passwd),
+            host_group.as_deref().unwrap_or(group),
+            &user,
+            &config.working_dir,
+            &opts,
+        )?;
+        (new_passwd.or(host_passwd), new_group.or(host_group))
     } else {
         (None, None)
     };
@@ -160,15 +195,15 @@ pub(super) fn resolve_container_user_later(
     group: &[u8],
     config: &ContainerConfig,
     req: &CreateContainerRequest,
-    identity: Option<(&str, &str)>,
+    host: Option<&HostUser<'_>>,
 ) -> ContainerResult<(ContainerUser, Option<String>)> {
     use crate::container::userspec::UserError;
-    match resolve_container_user(passwd, group, config, req, identity) {
+    match resolve_container_user(passwd, group, config, req, host) {
         Err(e @ (UserError::NoUser(_) | UserError::NoGroup(_))) => {
             let mut plain = config.clone();
             plain.user.clear();
             plain.group_add.clear();
-            let user = resolve_container_user(passwd, group, &plain, req, identity)?;
+            let user = resolve_container_user(passwd, group, &plain, req, host)?;
             Ok((user, Some(e.to_string())))
         }
         other => Ok((other?, None)),
