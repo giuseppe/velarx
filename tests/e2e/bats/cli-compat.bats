@@ -693,7 +693,10 @@ v2" "$out"
     check "the containers that joined it keep it" hi "$(sh_ container exec shj cat /dev/shm/f 2>&1)"
     sh_ container start shd > /dev/null
     check "a start mounts it again" 1 "$(shm_mounts)"
-    sh_ container rm -f -t 0 shj shd shp > /dev/null
+    # (the containers of one rm are removed at once: the one that joined shd
+    # goes first, in a command of its own)
+    sh_ container rm -f -t 0 shj shp > /dev/null
+    sh_ container rm -f -t 0 shd > /dev/null
     check "and a removal takes it" 0 "$(shm_mounts)"
     # the mounts of the user keep their place
     out=$(sh_ container run --rm --network none --tmpfs /dev/shm:rw,size=1m "$IMAGE" df -k /dev/shm 2>&1 | tail -1 | awk '{print $2}')
