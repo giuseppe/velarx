@@ -339,15 +339,21 @@ fn lookaside_dir_of(
 pub fn lookaside_url(base: &str, digest: &str, index: usize) -> Result<String, String> {
     let (algo, hex) = digest
         .split_once(':')
-        .filter(|(a, h)| {
-            !a.is_empty()
-                && !h.is_empty()
-                && a.bytes()
-                    .chain(h.bytes())
-                    .all(|b| b.is_ascii_alphanumeric())
-        })
+        .filter(|&(algo, hex)| is_content_digest(algo, hex))
         .ok_or_else(|| format!("invalid digest {digest:?}"))?;
     Ok(format!("{base}@{algo}={hex}/signature-{}", index + 1))
+}
+
+/// Whether `algo:hex` is the text of a content digest: an algorithm of
+/// the store and as many lowercase hex digits as its hash has, so no `/`,
+/// `..` or other name is part of a path or a URL.
+fn is_content_digest(algo: &str, hex: &str) -> bool {
+    let len = match algo {
+        "sha256" => 64,
+        "sha512" => 128,
+        _ => return false,
+    };
+    hex.len() == len && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Write `blob` as the first `signature-N` of the manifest `digest` that is
@@ -393,12 +399,16 @@ mod tests {
     fn signatures_are_written_to_the_next_free_file() {
         let dir = tempfile::tempdir().unwrap();
         let base = format!("file://{}/org/app", dir.path().display());
-        write_lookaside(&base, "sha256:ab", b"one").unwrap();
-        write_lookaside(&base, "sha256:ab", b"two").unwrap();
-        let file = |n| dir.path().join(format!("org/app@sha256=ab/signature-{n}"));
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        write_lookaside(&base, &digest, b"one").unwrap();
+        write_lookaside(&base, &digest, b"two").unwrap();
+        let file = |n| {
+            dir.path()
+                .join(format!("org/app@sha256={}/signature-{n}", "ab".repeat(32)))
+        };
         assert_eq!(std::fs::read(file(1)).unwrap(), b"one");
         assert_eq!(std::fs::read(file(2)).unwrap(), b"two");
-        assert!(write_lookaside("https://x/y", "sha256:ab", b"").is_err());
+        assert!(write_lookaside("https://x/y", &digest, b"").is_err());
     }
 
     fn r(s: &str) -> DockerRef {
@@ -479,11 +489,28 @@ docker:
         assert!(c.use_sigstore_attachments(&r("quay.io/team/app")));
         assert!(c.use_sigstore_attachments(&r("quay.io/team/special/x")));
         assert!(!c.use_sigstore_attachments(&r("quay.io/other")));
+        let hex = "ab".repeat(32);
         assert_eq!(
-            lookaside_url("https://s/a", "sha256:abcd", 0).unwrap(),
-            "https://s/a@sha256=abcd/signature-1"
+            lookaside_url("https://s/a", &format!("sha256:{hex}"), 0).unwrap(),
+            format!("https://s/a@sha256={hex}/signature-1")
         );
-        assert!(lookaside_url("https://s/a", "sha256:../x", 0).is_err());
+        let long = "0f".repeat(64);
+        assert_eq!(
+            lookaside_url("https://s/a", &format!("sha512:{long}"), 1).unwrap(),
+            format!("https://s/a@sha512={long}/signature-2")
+        );
+        // (a digest of the exact length and lowercase hex only)
+        for bad in [
+            "sha256:../x".to_string(),
+            "sha256:abcd".to_string(),
+            format!("sha256:{}", hex.to_uppercase()),
+            format!("sha256:{hex}/x"),
+            format!("sha512:{hex}"),
+            format!("md5:{hex}"),
+            hex.clone(),
+        ] {
+            assert!(lookaside_url("https://s/a", &bad, 0).is_err(), "{bad}");
+        }
     }
 
     #[test]
