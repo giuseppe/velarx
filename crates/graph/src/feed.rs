@@ -18,7 +18,7 @@
 //! The flow of [`StorageDriver::pull`]:
 //!
 //! 1. the driver opens its pull ([`PullFeed::begin`]: the engine holds a
-//!    lease on it while it lives);
+//!    hold on it while it lives);
 //! 2. it asks the feed for each layer ([`PullFeed::fetch`], at most
 //!    [`PullFeed::parallel`] at a time): the feed plans what the driver
 //!    wants, merges the ranges, fetches, verifies and gives the bytes to
@@ -120,7 +120,7 @@ pub trait Incoming: Send + Sync {
     /// store to say it has it).
     fn wants(&self, key: &str, size: u64) -> bool;
 
-    /// The id of this pull: what the engine's lease on it is named by, and
+    /// The id of this pull: what the engine's hold on it is named by, and
     /// what a driver whose store is in another process calls the pull
     /// (`BeginPull`).  A random id made for each attempt (a v4 UUID, 122
     /// random bits: [`new_pull_id`], or for a driver of the engine's process
@@ -252,7 +252,7 @@ impl Incoming for Wanted {
 #[async_trait]
 pub trait PullFeed: Send + Sync {
     /// The driver opened its pull in `into`: the engine takes what it holds
-    /// for a pull (the lease, named by [`Incoming::pull_id`], that pins the
+    /// for a pull (the hold, named by [`Incoming::pull_id`], that pins the
     /// layers and keeps the staging directory from a sweep).  Before any other
     /// call.  A feed that cannot receive the bytes in `into` refuses here,
     /// naming the reason.

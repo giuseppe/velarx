@@ -59,7 +59,8 @@ enum Fix {
     /// Nothing can be done here.
     None,
     RemoveFile(PathBuf),
-    RemoveDir(PathBuf),
+    /// Remove the hold in this directory, if nobody holds it.
+    RemoveHold(PathBuf),
     /// Forget the rows of these files, which are not in the store.
     DropRows(Vec<String>),
     /// Make the composefs images of the image again.
@@ -699,35 +700,30 @@ impl CheckService {
     }
 
     /// The staging directories of pulls that died and of containers that
-    /// are gone, and the leases of pulls that died.
+    /// are gone, and the leases of builds that died.
     async fn scan_staging(&self, scan: &mut Scan) -> CheckResult<()> {
-        use velarx_content::pull::session::Session;
-        let (held, stale) = self.db.partition_leases().await?;
-        let live: HashSet<String> = held.into_iter().map(|l| l.id).collect();
+        let (_, stale) = self.db.partition_leases().await?;
         for l in &stale {
             scan.findings.push(
                 Finding::of_store(
                     "stale_lease",
-                    format!("the lease {} of a pull that is gone (pid {})", l.id, l.pid),
+                    format!("the lease {} of a build that is gone (pid {})", l.id, l.pid),
                     None,
                 )
                 .with(Fix::ReleaseLease(l.id.clone())),
             );
         }
-        if let Ok(entries) = std::fs::read_dir(&self.staging) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if Session::is_session_name(&name) && !live.contains(&name) {
-                    scan.findings.push(
-                        Finding::of_store(
-                            "stale_staging",
-                            "the staging directory of a pull that is gone",
-                            Some(entry.path()),
-                        )
-                        .with(Fix::RemoveDir(entry.path())),
-                    );
-                }
-            }
+        // (a hold nobody holds is what a process that died left, whatever
+        // it did meanwhile: nothing makes one live again)
+        for dir in velarx_content::pull::holds::stale(&self.staging)? {
+            scan.findings.push(
+                Finding::of_store(
+                    "stale_staging",
+                    "the staging directory of a pull that is gone",
+                    Some(dir.clone()),
+                )
+                .with(Fix::RemoveHold(dir)),
+            );
         }
         self.scan_lazy(scan).await?;
         Ok(())
@@ -1051,12 +1047,15 @@ impl CheckService {
             for f in scan.findings {
                 let action = match &f.fix {
                     Fix::RemoveFile(p) => remove(|| std::fs::remove_file(p), p),
-                    Fix::RemoveDir(p) => {
-                        let dir = p.clone();
-                        let removed =
-                            crate::off_thread(move || velarx_base::tree::remove_dir_all(dir)).await;
-                        remove(|| removed, p)
-                    }
+                    Fix::RemoveHold(p) => match remove_hold(p).await {
+                        Ok(true) => true,
+                        // (in use now, or gone: the finding no longer holds)
+                        Ok(false) => continue,
+                        Err(e) => {
+                            warn!("Cannot remove {}: {e}", p.display());
+                            false
+                        }
+                    },
                     Fix::DropRows(d) => d.iter().all(|d| dropped.contains(d)),
                     Fix::ReleaseLease(id) => self.db.release_lease(id).await.is_ok(),
                     Fix::RemakeStaged(id) => self.images.remake_staged_images(id).await.is_ok(),
@@ -1157,6 +1156,12 @@ impl CheckService {
 struct Scan {
     findings: Vec<Finding>,
     rows: Vec<String>,
+}
+
+/// Remove the hold in `dir` if nobody holds it now: whether it was.
+async fn remove_hold(dir: &Path) -> std::io::Result<bool> {
+    let dir = dir.to_path_buf();
+    crate::off_thread(move || velarx_content::pull::holds::remove_stale(&dir)).await
 }
 
 fn remove(f: impl FnOnce() -> std::io::Result<()>, path: &Path) -> bool {
@@ -1484,5 +1489,20 @@ mod tests {
             Err(Unenabled::Damaged(_))
         ));
         assert_eq!(kinds_at(&other, b"data", true), ["verity_mismatch"]);
+    }
+
+    /// A hold that became live between the scan and the repair is left
+    /// alone and is not a repair; one nobody holds is removed.
+    #[tokio::test]
+    async fn a_hold_that_became_live_is_not_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = velarx_content::pull::holds::Hold::create(dir.path(), "pull-aa").unwrap();
+        assert!(!remove_hold(live.path()).await.unwrap());
+        assert!(live.path().exists());
+        let dead = dir.path().join("pull-bb");
+        std::fs::create_dir_all(dead.join("sub")).unwrap();
+        assert!(remove_hold(&dead).await.unwrap());
+        assert!(!dead.exists());
+        assert!(!remove_hold(&dead).await.unwrap());
     }
 }

@@ -13,6 +13,7 @@
 //! verified: there is no `fsync` per file, and nothing a failed pull wrote is ever visible.  The directory
 //! is removed when the session is dropped.
 
+use super::holds::{self, Hold};
 use super::staged_fetch::LayerStaging;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -26,6 +27,9 @@ use velarx_storage::{FileStore, FsVerityManager, Object};
 
 pub struct Session {
     dir: PathBuf,
+    /// What tells the others the session is live (none for a scratch
+    /// session, which the hold of its parent covers)
+    hold: Option<Hold>,
     store: Arc<FileStore>,
     /// Content staged by this session: what it is known by -> its size and
     /// the name it waits under (`tmp-N` of the directory of the session,
@@ -79,23 +83,37 @@ struct Staged {
 /// The directories of a session that its temporary files are spread over.
 const SHARDS: u64 = 64;
 
+/// A directory only the owner may see or touch: what is being pulled.
+fn private() -> fs::DirBuilder {
+    let mut dir = fs::DirBuilder::new();
+    std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+    dir
+}
+
 impl Session {
-    /// Create `<staging_root>/<random>`.
+    /// Create the session `<staging_root>/pull-<random>`: a hold, live while
+    /// the session is.
     pub fn create(staging_root: &Path, store: Arc<FileStore>) -> io::Result<Arc<Self>> {
         fs::create_dir_all(staging_root)?;
-        let dir = staging_root.join(format!("pull-{}", velarx_base::random::uuid()));
-        // Only the owner may see or touch what is being pulled.
-        let private = || {
-            let mut dir = fs::DirBuilder::new();
-            std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
-            dir
-        };
+        let hold = Hold::create(staging_root, &holds::new_name("pull"))?;
+        Self::made(hold.path().to_path_buf(), Some(hold), store)
+    }
+
+    /// Create the directory `<staging_root>/pull-<random>` of a session
+    /// inside another one.
+    fn nested(staging_root: &Path, store: Arc<FileStore>) -> io::Result<Arc<Self>> {
+        let dir = staging_root.join(holds::new_name("pull"));
         private().create(&dir)?;
+        Self::made(dir, None, store)
+    }
+
+    fn made(dir: PathBuf, hold: Option<Hold>, store: Arc<FileStore>) -> io::Result<Arc<Self>> {
         for shard in 0..SHARDS {
             private().create(dir.join(format!("{shard:02x}")))?;
         }
         Ok(Arc::new(Self {
             dir,
+            hold,
             store,
             staged: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
@@ -122,35 +140,12 @@ impl Session {
         self.temp_dirs().into_iter().flat_map(in_dir).collect()
     }
 
-    /// Remove the sessions left by pulls that stopped in the middle: those
-    /// whose lease `held` does not say a process holds.  Only call it with
-    /// the lock of the store held exclusive: no pull starts meanwhile (one
-    /// that runs holds the lock of its lease, not the one of the store,
-    /// through its download).
-    pub fn sweep(staging_root: &Path, held: impl Fn(&str) -> bool) {
-        let Ok(entries) = fs::read_dir(staging_root) else {
-            return;
-        };
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if Self::is_session_name(&name) && !held(&name) {
-                if let Err(err) = velarx_base::tree::remove_dir_all(e.path()) {
-                    warn!(
-                        "Cannot remove the stale pull session {:?}: {}",
-                        e.path(),
-                        err
-                    );
-                }
-            }
-        }
-    }
-
     /// A session inside this one, of the same store, for what is not
-    /// checked yet: it sees what this one staged, and the lease of this one
+    /// checked yet: it sees what this one staged, and the hold of this one
     /// keeps it (a sweep or a collection looks at the sessions of the
     /// staging directory only).
     pub fn scratch(self: &Arc<Self>) -> io::Result<Arc<Session>> {
-        let s = Session::create(&self.dir, self.store.clone())?;
+        let s = Session::nested(&self.dir, self.store.clone())?;
         let _ = s.parent.set(self.clone());
         Ok(s)
     }
@@ -232,13 +227,6 @@ impl Session {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default()
-    }
-
-    /// Whether `name` is the name of a session directory.
-    pub fn is_session_name(name: &str) -> bool {
-        name.strip_prefix("pull-").is_some_and(|id| {
-            !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
-        })
     }
 
     pub fn store(&self) -> &FileStore {
@@ -982,7 +970,13 @@ pub fn start_writeback(f: &File) {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Err(e) = velarx_base::tree::remove_dir_all(&self.dir) {
+        // (a hold keeps its pins until the last user lets go, and goes
+        // with it)
+        let removed = match &self.hold {
+            Some(hold) => hold.clear(),
+            None => velarx_base::tree::remove_dir_all(&self.dir),
+        };
+        if let Err(e) = removed {
             if e.kind() != io::ErrorKind::NotFound {
                 warn!("Cannot remove the pull session {:?}: {}", self.dir, e);
             }
@@ -1734,13 +1728,16 @@ mod tests {
         assert!(p.exists());
     }
 
+    /// A session is a hold: live while it is, and its name is the hold's.
     #[test]
-    fn test_session_names() {
-        let (_tmp, s) = session();
-        assert!(Session::is_session_name(&s.name()));
-        assert!(!Session::is_session_name("pull-"));
-        assert!(!Session::is_session_name("pull-../x"));
-        assert!(!Session::is_session_name("other"));
+    fn a_session_is_a_live_hold() {
+        let (tmp, s) = session();
+        assert!(holds::is_hold_name(&s.name()));
+        assert!(matches!(holds::probe(s.dir()).unwrap(), holds::Probe::Live));
+        let dir = s.dir().to_path_buf();
+        drop(s);
+        assert!(!dir.exists());
+        drop(tmp);
     }
 
     /// A commit has two barriers (the staging, then the store) and none
@@ -1915,23 +1912,6 @@ mod tests {
         }
     }
 
-    /// The sweep removes the sessions of pulls that ended, not those of a
-    /// pull that holds its lease (nor what is no session).
-    #[test]
-    fn test_sweep_removes_only_sessions() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join("pull-0a1d/x")).unwrap();
-        fs::create_dir_all(tmp.path().join("pull-11fe/x")).unwrap();
-        // (a directory that only starts as a session does is not one)
-        fs::create_dir_all(tmp.path().join("pull-other/x")).unwrap();
-        fs::create_dir_all(tmp.path().join("other")).unwrap();
-        Session::sweep(tmp.path(), |s| s == "pull-11fe");
-        assert!(!tmp.path().join("pull-0a1d").exists());
-        assert!(tmp.path().join("pull-11fe/x").exists());
-        assert!(tmp.path().join("pull-other/x").exists());
-        assert!(tmp.path().join("other").exists());
-    }
-
     /// A scratch session is inside its parent: what keeps the parent keeps
     /// it, and it goes with it.
     #[test]
@@ -1940,7 +1920,7 @@ mod tests {
         let scratch = parent.scratch().unwrap();
         assert_eq!(scratch.dir().parent(), Some(parent.dir()));
         let staging = parent.dir().parent().unwrap().to_path_buf();
-        Session::sweep(&staging, |s| s == parent.name());
+        holds::sweep(&staging);
         assert!(scratch.dir().is_dir());
         drop(scratch);
         assert_eq!(parent.temp_files().len(), 0);

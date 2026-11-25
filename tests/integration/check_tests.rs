@@ -374,9 +374,8 @@ async fn what_may_belong_to_a_running_process_is_left_alone() {
     let tmp = e.store.root().join("ab").join(".tmpX1y2z3");
     std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
     std::fs::write(&tmp, b"being written").unwrap();
-    let live = e.staging.join("pull-0123abcd");
-    std::fs::create_dir_all(&live).unwrap();
-    let _held = e.db.create_lease("pull-0123abcd", vec![]).await.unwrap();
+    let held = velarx_content::pull::holds::Hold::create(&e.staging, "pull-0123abcd").unwrap();
+    let live = held.path().to_path_buf();
     let svc = CheckService::new(
         e.db.clone(),
         Arc::new((*e.service).clone()),

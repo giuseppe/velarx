@@ -5,9 +5,10 @@ use super::seal;
 use super::*;
 use async_trait::async_trait;
 use std::collections::HashSet;
+use velarx_content::pull::holds::{self, Hold};
 use velarx_content::pull::net::Net;
 use velarx_content::pull::{self, layer_commit, LayerDone, Limits, Source};
-use velarx_db::{BlobSource, ImageRecord, ImageTag, LayerKey, LayerReach, Lease, PullCommit};
+use velarx_db::{BlobSource, ImageRecord, ImageTag, LayerKey, LayerReach, PullCommit};
 use velarx_graph::feed::{
     CheckId, Checked, ContentFeed, FeedLayer, Identities, Incoming as DriverIncoming, LayerIndex,
     PullFeed, Pulled, Settled, Settlement, Verdict,
@@ -23,16 +24,15 @@ const PROGRESS_STEP: u64 = 256 * 1024;
 
 /// The engine's side of a pull as a storage driver sees it: the pull code
 /// ([`ContentFeed`]), and what the engine holds for the pull while it runs
-/// (the lease on the layers, the store for the commit).
+/// (the hold that pins the layers, the store for the commit).
 struct EngineFeed {
     inner: ContentFeed,
-    db: velarx_db::Database,
     staging_dir: std::path::PathBuf,
     expected: Vec<LayerKey>,
-    /// The store, held from the check of what it has to the lease
+    /// The store, held from the check of what it has to the hold
     store: std::sync::Mutex<Option<velarx_storage::StorageLock>>,
-    /// The lease of the pull, taken when the driver opens it
-    lease: std::sync::Mutex<Option<Lease>>,
+    /// The hold of the pull, taken when the driver opens it
+    hold: std::sync::Mutex<Option<Hold>>,
     /// The store, held from the commit of the files to the record of the
     /// image (until the feed is dropped)
     commit_lock: std::sync::Mutex<Option<velarx_storage::StorageLock>>,
@@ -42,10 +42,24 @@ struct EngineFeed {
 impl PullFeed for EngineFeed {
     async fn begin(&self, into: &Arc<dyn DriverIncoming>) -> ImageResult<()> {
         self.inner.begin(into).await?;
-        // (the layers stored are pinned by the lease, the files fetched by
-        // the live lease of the staging)
-        let lease = Lease::take(&self.db, &into.pull_id(), &self.expected).await?;
-        *self.lease.lock().unwrap_or_else(|e| e.into_inner()) = Some(lease);
+        // (the layers stored are pinned by the hold, the files fetched by
+        // the live hold of the staging: the session of a driver of this
+        // process is the hold, one that has its files elsewhere has none)
+        let id = into.pull_id();
+        let name = if id.starts_with("pull-") {
+            id
+        } else {
+            format!("pull-{id}")
+        };
+        // (a name that is no hold name would make a hold no look finds)
+        if !holds::is_hold_name(&name) {
+            return Err(ImageError::Storage(format!(
+                "the pull {name:?} has no name a hold can have"
+            )));
+        }
+        let hold = Hold::join_or_create(&self.staging_dir, &name)?;
+        hold.pin(holds::LAYER, &self.expected)?;
+        *self.hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(hold);
         // (a removal of another image, or a collection, would wait for every
         // pull in progress if the lock were held through the download)
         drop(self.store.lock().unwrap_or_else(|e| e.into_inner()).take());
@@ -94,14 +108,14 @@ impl PullFeed for EngineFeed {
     }
 }
 
-/// Drops what an [`EngineFeed`] holds for its pull (the lease, the locks of
+/// Drops what an [`EngineFeed`] holds for its pull (the hold, the locks of
 /// the store) when the install that made it ends, whatever the way.
 struct LetGo<'a>(&'a EngineFeed);
 
 impl Drop for LetGo<'_> {
     fn drop(&mut self) {
         let f = self.0;
-        drop(f.lease.lock().unwrap_or_else(|e| e.into_inner()).take());
+        drop(f.hold.lock().unwrap_or_else(|e| e.into_inner()).take());
         drop(f.store.lock().unwrap_or_else(|e| e.into_inner()).take());
         drop(
             f.commit_lock
@@ -1409,8 +1423,8 @@ impl ImageService {
                     .unwrap_or_else(|| LayerKey::expected(l))
             })
             .collect();
-        // What the store has stays until the lease below pins it: the lock is
-        // held from the check to the lease and from the commit to the record,
+        // What the store has stays until the hold below pins it: the lock is
+        // held from the check to the hold and from the commit to the record,
         // not through the download (a removal or a collection would wait for
         // every pull); layers another pull fetches are waited for before it.
         // (a merged EROFS digest the layers cannot check: refused before any
@@ -1599,11 +1613,10 @@ impl ImageService {
         }
         let feed = Arc::new(EngineFeed {
             inner: content,
-            db: self.db.clone(),
             staging_dir: self.staging_dir.clone(),
             expected: expected.clone(),
             store: std::sync::Mutex::new(Some(store)),
-            lease: std::sync::Mutex::new(None),
+            hold: std::sync::Mutex::new(None),
             commit_lock: std::sync::Mutex::new(None),
         });
         // (what the feed holds for the pull goes with this call, also when
@@ -1625,12 +1638,12 @@ impl ImageService {
         let driven = self.storage.pull(&driver_feed, &to_fetch, settled).await?;
         velarx_base::trace::point("pull erofs made");
         drop(driver_feed);
-        let lease = feed
-            .lease
+        let hold = feed
+            .hold
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
-            .ok_or_else(|| ImageError::Storage("the pull took no lease".into()))?;
+            .ok_or_else(|| ImageError::Storage("the pull took no hold".into()))?;
         let Pulled {
             layers: driven_layers,
             artifacts: recorded,
@@ -1797,9 +1810,7 @@ impl ImageService {
             // the publish point: from here on the pull is visible, and its
             // layers are pinned by it
             area.publish_pull_after(&staged, barrier)?;
-            if let Err(e) = lease.release().await {
-                warn!("Cannot remove the lease of the pull: {e}");
-            }
+            drop(hold);
             velarx_base::trace::point("pull layers staged");
             if let Some((from, layers, walker, planned)) = set {
                 let first = planned.await.unwrap_or_default();
@@ -1820,9 +1831,7 @@ impl ImageService {
                     pulled,
                 })
                 .await?;
-            if let Err(e) = lease.release().await {
-                warn!("Cannot remove the lease of the pull: {e}");
-            }
+            drop(hold);
 
             debug!("Database updated after {:?}", start.elapsed());
         }

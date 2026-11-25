@@ -6,6 +6,7 @@ use crate::common::*;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use velarx_config::StorageConfig;
+use velarx_content::pull::holds;
 use velarx_core::services::{GcOptions, GcService};
 use velarx_db::{Database, RecordState};
 use velarx_storage::StorageLock;
@@ -75,17 +76,17 @@ async fn gc_during_a_pull_never_removes_its_files() {
     };
     // the pull found the shared layer stored and fetches the new one
     let new_digest = sha(&new.blob);
-    // (its metadata is asked before the pull is leased; a lease is a row of
-    // the database, nothing says it is taken)
-    crate::common::poll_until("the pull fetches the layer and has a lease", || async {
+    // (its metadata is asked before the pull is held)
+    crate::common::poll_until("the pull fetches the layer and has a hold", || async {
         e.reg.hits.lock().unwrap().contains_key(&new_digest)
-            && !e.db.list_leases().await.unwrap().is_empty()
+            && holds::pinned(&e.staging)
+                .unwrap()
+                .layers
+                .contains(&shared.key().to_string())
     })
     .await;
     assert!(e.reg.hits.lock().unwrap().contains_key(&new_digest));
-    let leases = e.db.list_leases().await.unwrap();
-    assert_eq!(leases.len(), 1, "the pull has a lease");
-    // the pull takes the lease under the lock of the store and lets go of
+    // the pull takes the hold under the lock of the store and lets go of
     // it right after: the lock is free once it is ours, and the pull
     // downloads (for the delay of the registry) until the commit asks for it
     // (unlocked, not only closed: a program that another test starts holds
@@ -106,7 +107,7 @@ async fn gc_during_a_pull_never_removes_its_files() {
         .unwrap()
         .unwrap();
 
-    // the download holds no lock: a collection runs, and the lease keeps
+    // the download holds no lock: a collection runs, and the hold keeps
     // what the pull uses
     let quick = gc(&e)
         .collect(GcOptions {
@@ -122,7 +123,7 @@ async fn gc_during_a_pull_never_removes_its_files() {
     assert!(!report.skipped);
     assert_eq!(report.layers_removed, 0);
     all_files_stored(&e.db, &e.store, &second.id).await;
-    assert!(e.db.list_leases().await.unwrap().is_empty());
+    assert!(!holds::any_live(&e.staging).unwrap());
     assert_eq!(e.staged_leftovers(), 0);
 
     e.service.remove(&second.id, true).await.unwrap();
@@ -156,13 +157,11 @@ async fn removing_an_image_does_not_wait_for_a_pull_in_progress() {
             service.pull_with_client(&client, &image, tx).await
         })
     };
-    // the pull downloads: its layers are pinned by its lease
+    // the pull downloads: its layers are pinned by its hold
     let new_digest = sha(&new.blob);
-    // (its metadata is asked before the pull is leased; a lease is a row of
-    // the database, nothing says it is taken)
-    crate::common::poll_until("the pull fetches the layer and has a lease", || async {
-        e.reg.hits.lock().unwrap().contains_key(&new_digest)
-            && !e.db.list_leases().await.unwrap().is_empty()
+    // (its metadata is asked before the pull is held)
+    crate::common::poll_until("the pull fetches the layer and has a hold", || async {
+        e.reg.hits.lock().unwrap().contains_key(&new_digest) && holds::any_live(&e.staging).unwrap()
     })
     .await;
     assert!(e.reg.hits.lock().unwrap().contains_key(&new_digest));
@@ -286,13 +285,8 @@ async fn removing_an_image_releases_the_layers_no_other_image_uses() {
     all_files_stored(&e.db, &e.store, &second.id).await;
 
     // a layer a lease pins (a pull in progress) stays
-    let held =
-        e.db.create_lease(
-            "pull-0000cafe",
-            vec![("layer".into(), other.key().to_string())],
-        )
-        .await
-        .unwrap();
+    let held = holds::Hold::create(&e.staging, "pull-0000cafe").unwrap();
+    held.pin(holds::LAYER, [other.key()]).unwrap();
     e.service.remove(&second.id, false).await.unwrap();
     assert!(
         e.db.get_layer(&other.key()).await.is_ok(),
@@ -307,7 +301,6 @@ async fn removing_an_image_releases_the_layers_no_other_image_uses() {
     // no orphans)
     gc(&e).collect(GcOptions::default()).await.unwrap();
     assert!(e.store.contains(&vid(&[5u8; 20_000])));
-    e.db.release_lease("pull-0000cafe").await.unwrap();
     drop(held);
     gc(&e).collect(GcOptions::default()).await.unwrap();
     assert!(!e.store.contains(&vid(&[5u8; 20_000])));
@@ -370,48 +363,39 @@ async fn removing_images_frees_each_layer_once() {
     assert!(pruned.iter().any(|(id, _)| *id == second.id));
 }
 
+/// The collection removes what no process holds: the staging directories of
+/// pulls that died and the leftovers of a birth that did not end, and leaves
+/// the one a process holds and what is no hold.
 #[tokio::test]
-async fn stale_leases_and_staging_are_swept() {
+async fn stale_holds_are_swept() {
     let e = env().await;
     std::fs::create_dir_all(&e.staging).unwrap();
-    let dead = "pull-0000dead";
-    let live = "pull-0000a11e";
-    let orphan = "pull-0000beef";
-    for d in [dead, live, orphan, "not-a-session"] {
+    let (dead, orphan, born) = ("pull-0000dead", "build-0000beef", ".new-0000cafe");
+    for d in [dead, orphan, born, "not-a-session"] {
         std::fs::create_dir_all(e.staging.join(d).join("sub")).unwrap();
     }
-    // (no process holds the lock of the lease of `dead`: its pull was killed)
-    stale_lease(&e.db, dead, &[("layer", "sha256:x")]).await;
-    let _held = e.db.create_lease(live, vec![]).await.unwrap();
+    let live = holds::Hold::create(&e.staging, "pull-0000a11e").unwrap();
 
     let report = gc(&e).collect(GcOptions::default()).await.unwrap();
-    assert_eq!(report.leases_removed, 1);
-    assert_eq!(report.staging_removed, 2);
+    assert_eq!(report.staging_removed, 3);
     assert!(!e.staging.join(dead).exists());
     assert!(!e.staging.join(orphan).exists());
-    assert!(e.staging.join(live).exists());
+    assert!(!e.staging.join(born).exists());
+    assert!(live.path().exists());
     assert!(e.staging.join("not-a-session").exists());
-    let left: Vec<_> =
-        e.db.list_leases()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|l| l.id)
-            .collect();
-    assert_eq!(left, [live]);
 }
 
-/// A command that starts while a pull downloads (the pull holds its lease,
+/// A command that starts while a pull downloads (the pull holds its hold,
 /// not the lock of the store) leaves the session of that pull alone; the
 /// session of a pull that ended goes, and so does the staging of a layer no
 /// process holds the lease of.
 #[tokio::test]
 async fn a_new_service_sweeps_the_sessions_of_dead_pulls_only() {
     let e = env().await;
-    let (live, dead) = ("pull-0000a11e", "pull-0000dead");
-    for d in [live, dead] {
-        std::fs::create_dir_all(e.staging.join(d).join("sub")).unwrap();
-    }
+    let dead = "pull-0000dead";
+    std::fs::create_dir_all(e.staging.join(dead).join("sub")).unwrap();
+    let live = holds::Hold::create(&e.staging, "pull-0000a11e").unwrap();
+    std::fs::create_dir_all(live.path().join("sub")).unwrap();
     let (fetching, left) = ("sha256-0a11", "sha256-0dead");
     for l in [fetching, left] {
         std::fs::create_dir_all(e.staging.join("layers").join(l).join("files")).unwrap();
@@ -419,8 +403,6 @@ async fn a_new_service_sweeps_the_sessions_of_dead_pulls_only() {
     std::fs::create_dir_all(e.staging.join("meta").join(fetching)).unwrap();
     let lease = std::fs::File::create(e.staging.join("meta").join(fetching).join("lease")).unwrap();
     rustix::fs::flock(&lease, rustix::fs::FlockOperation::LockExclusive).unwrap();
-    let _held = e.db.create_lease(live, vec![]).await.unwrap();
-    stale_lease(&e.db, dead, &[]).await;
     // The service sweeps only when nobody holds the lock of the store, and
     // a copy of a descriptor of it that another test of this process took
     // with a fork keeps it held until that child execs: wait until it is
@@ -440,7 +422,7 @@ async fn a_new_service_sweeps_the_sessions_of_dead_pulls_only() {
             break;
         }
     }
-    assert!(e.staging.join(live).join("sub").exists());
+    assert!(live.path().join("sub").exists());
     assert!(!e.staging.join(dead).exists());
     assert!(e
         .staging
@@ -470,15 +452,12 @@ async fn a_leased_layer_is_kept_and_chunk_locations_go_with_their_file() {
     // the row alone: the collection is what is tested
     e.db.delete_image(&pulled.id).await.unwrap();
 
-    let held =
-        e.db.create_lease("pull-00aa", vec![("layer".into(), digest.to_string())])
-            .await
-            .unwrap();
+    let held = holds::Hold::create(&e.staging, "pull-00aa").unwrap();
+    held.pin(holds::LAYER, [digest]).unwrap();
     let report = gc(&e).collect(GcOptions::default()).await.unwrap();
     assert_eq!(report.layers_removed, 0);
     assert!(e.store.contains(&file));
 
-    e.db.release_lease("pull-00aa").await.unwrap();
     drop(held);
     let report = gc(&e).collect(GcOptions::default()).await.unwrap();
     assert_eq!(report.layers_removed, 1);

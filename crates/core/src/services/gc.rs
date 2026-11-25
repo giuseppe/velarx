@@ -15,9 +15,9 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use velarx_config::StorageConfig;
-use velarx_content::pull::session::Session;
+use velarx_content::pull::holds;
 use velarx_content::pull::staged::{PullState, Staging};
-use velarx_db::{Database, LEASE_LAYER};
+use velarx_db::Database;
 use velarx_storage::{FileStore, Object, StorageLock};
 
 #[derive(Error, Debug)]
@@ -88,14 +88,13 @@ impl GcReport {
     }
 }
 
-/// The layers no image and no container uses and no lease (`?1`: the kind
-/// of the layer leases) pins.
+/// The layers no image and no container uses (what a pull in progress pins
+/// is left out by the caller).
 /// A container keeps the layers it was made from even when its image
 /// was removed (`container_layers`).
 const UNREFERENCED_LAYERS: &str = "SELECT l.id, l.stream_size FROM layers l
      WHERE NOT EXISTS (SELECT 1 FROM image_layers il WHERE il.layer_id = l.id)
-       AND NOT EXISTS (SELECT 1 FROM container_layers cl WHERE cl.layer_id = l.id)
-       AND NOT EXISTS (SELECT 1 FROM lease_items li WHERE li.kind = ?1 AND li.digest = l.id)";
+       AND NOT EXISTS (SELECT 1 FROM container_layers cl WHERE cl.layer_id = l.id)";
 
 /// Forget a layer (`?1`, its key): its files, and the repositories of its
 /// blob when no other layer is of that blob (a layer of its TOC and one
@@ -188,6 +187,16 @@ impl GcService {
     /// The staging area of lazy pulls.
     fn staging(&self) -> Staging {
         Staging::new(&self.staging_dir)
+    }
+
+    /// The layers a pull in progress pins: the complete layers of a lazy
+    /// pull (by its record), and those a live pull holds.
+    /// A staging directory that cannot be read is an error: nothing is
+    /// removed on a guess.
+    fn pinned_layers(&self) -> GcResult<HashSet<String>> {
+        let mut pinned: HashSet<String> = self.staging().pinned_layers().into_iter().collect();
+        pinned.extend(holds::pinned(&self.staging_dir)?.layers);
+        Ok(pinned)
     }
 
     /// Drop the copy of its own files that the driver keeps of `layers` (the
@@ -310,7 +319,7 @@ impl GcService {
     }
 
     /// After images were removed: remove the layers no image uses and no
-    /// lease pins, then the files only those layers had.  Waits for the
+    /// pull pins, then the files only those layers had.  Waits for the
     /// pulls and commits in progress (the exclusive lock of the store).
     pub async fn release_unused_layers(&self) -> GcResult<GcReport> {
         let _lock = StorageLock::exclusive(&self.lock_path).await?;
@@ -321,13 +330,12 @@ impl GcService {
             .call(|conn| {
                 let mut stmt = conn.prepare(UNREFERENCED_LAYERS)?;
                 let layers = stmt
-                    .query_map([LEASE_LAYER], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(layers)
             })
             .await?;
-        // (the complete layers of a pulling image are pinned by its pull)
-        let pinned = self.staging().pinned_layers();
+        let pinned = self.pinned_layers()?;
         let layers: Vec<(String, i64)> = layers
             .into_iter()
             .filter(|(d, _)| !pinned.contains(d))
@@ -409,7 +417,7 @@ impl GcService {
         digests: Vec<String>,
         report: &mut GcReport,
     ) -> GcResult<()> {
-        // A pull in progress (it holds a live lease, not the lock) may use
+        // A pull in progress (it holds a live hold, not the lock) may use
         // a file of the store that no layer of its image has, one it found
         // there for a file of its own: the files stay until no pull runs,
         // the next collection removes them.
@@ -542,7 +550,7 @@ impl GcService {
             // them, not with the next collection.
             self.collect_storage(&mut report).await?;
             // (an index is kept for the images it lists, those of the staged
-            // pulls included; a pull that holds its lease has kept its
+            // pulls included; a pull in progress has kept its
             // indexes and not recorded its image yet)
             if let Err(e) = self.collect_indexes().await {
                 report.errors.push(format!("the kept indexes: {e}"));
@@ -582,24 +590,24 @@ impl GcService {
         Ok(())
     }
 
-    /// Whether a pull holds a lease (a process holds its lock).
+    /// Whether a pull or a build is in progress: a process holds its hold
+    /// or its lease.
     async fn pull_in_progress(&self) -> GcResult<bool> {
-        Ok(!self.db.partition_leases().await?.0.is_empty())
+        Ok(holds::any_live(&self.staging_dir)? || !self.db.partition_leases().await?.0.is_empty())
     }
 
-    /// Remove the leases of the pulls whose process is gone (nothing holds
-    /// their lock), and the staging directories no live lease owns (the
-    /// lease of a pull is taken under the lock of the store, which this
-    /// holds exclusive).
+    /// Remove the leases of the builds whose process is gone (nothing holds
+    /// their lock), the staging of the layers whose stager died, and the
+    /// holds nobody holds with what they staged (a pull is held from the
+    /// birth of its directory, which the lock of the store this holds
+    /// exclusive keeps from happening meanwhile; a leftover birth goes too).
     async fn collect_stale_staging(&self, report: &mut GcReport) -> GcResult<()> {
-        let (held, stale) = self.db.partition_leases().await?;
-        let live: HashSet<String> = held.into_iter().map(|l| l.id).collect();
+        let (_, stale) = self.db.partition_leases().await?;
         for lease in stale {
             debug!("Removing the stale lease {}", lease.id);
             self.db.release_lease(&lease.id).await?;
             report.leases_removed += 1;
         }
-        // (the staging of the layers whose stager died)
         let root = self.staging_dir.clone();
         match crate::off_thread(move || velarx_content::pull::staged_fetch::sweep(&root)).await {
             Ok(n) => report.staging_removed += n,
@@ -607,27 +615,14 @@ impl GcService {
                 .errors
                 .push(format!("cannot remove the staging of a layer: {e}")),
         }
-        let entries = match std::fs::read_dir(&self.staging_dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !Session::is_session_name(&name) || live.contains(&name) {
-                continue;
-            }
-            let path = entry.path();
-            match crate::off_thread(move || velarx_base::tree::remove_dir_all(path)).await {
-                Ok(()) => report.staging_removed += 1,
-                Err(e) => {
-                    warn!("Cannot remove the stale pull session {name}: {e}");
-                    report
-                        .errors
-                        .push(format!("cannot remove the staging directory {name}: {e}"));
-                }
-            }
+        let root = self.staging_dir.clone();
+        let (removed, errors) = crate::off_thread(move || Ok(holds::sweep(&root))).await?;
+        report.staging_removed += removed;
+        for e in errors {
+            warn!("Cannot remove a stale hold: {e}");
+            report
+                .errors
+                .push(format!("cannot remove a staging directory: {e}"));
         }
         Ok(())
     }
@@ -734,7 +729,7 @@ impl GcService {
         }
     }
 
-    /// Remove the layers no image uses and no lease pins.  A dry run removes
+    /// Remove the layers no image uses and no pull pins.  A dry run removes
     /// nothing and returns the layers it would remove, so that the files only
     /// they have are counted as the collection frees them.
     async fn collect_unreferenced_layers(
@@ -750,13 +745,12 @@ impl GcService {
             .call(|conn| {
                 let mut stmt = conn.prepare(UNREFERENCED_LAYERS)?;
                 let layers = stmt
-                    .query_map([LEASE_LAYER], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(layers)
             })
             .await?;
-        // (the complete layers of a pulling image are pinned by its pull)
-        let pinned = self.staging().pinned_layers();
+        let pinned = self.pinned_layers()?;
         let unreferenced: Vec<(String, i64)> = unreferenced
             .into_iter()
             .filter(|(d, _)| !pinned.contains(d))
@@ -1829,6 +1823,7 @@ mod freed_tests {
         _dir: tempfile::TempDir,
         db: velarx_db::Database,
         files: Arc<FileStore>,
+        staging: PathBuf,
         gc: GcService,
     }
 
@@ -1851,6 +1846,7 @@ mod freed_tests {
             _dir: dir,
             db,
             files,
+            staging,
             gc,
         }
     }
@@ -1983,15 +1979,15 @@ mod freed_tests {
             ..Default::default()
         };
 
-        let lease = s.db.create_lease("pulling", Vec::new()).await.unwrap();
+        std::fs::create_dir_all(&s.staging).unwrap();
+        let held = holds::Hold::create(&s.staging, "pull-0000cafe").unwrap();
         let pulling = s.gc.collect(dry.clone()).await.unwrap();
         assert_eq!(pulling.bytes_freed, 70, "{pulling:?}");
         assert!(orphan.exists());
         let report = s.gc.collect(GcOptions::default()).await.unwrap();
         assert_eq!(report.bytes_freed, pulling.bytes_freed, "{report:?}");
         assert!(s.files.contains(&name(1)) && !orphan.exists());
-        drop(lease);
-        s.db.release_lease("pulling").await.unwrap();
+        drop(held);
 
         let predicted = s.gc.collect(dry).await.unwrap();
         assert_eq!(predicted.bytes_freed, 100, "{predicted:?}");

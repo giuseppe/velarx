@@ -357,9 +357,9 @@ impl ImageService {
             ))
         })?;
         // Only when no one holds the lock of the store (the collection
-        // sweeps otherwise), and not the sessions of the pulls that hold
-        // their lease: a pull holds the lock of the store only to start and
-        // to commit, not through its download.  The stagings of the layers
+        // sweeps otherwise), and not the holds a process has (a pull's
+        // session): a pull holds the lock of the store only to start and to
+        // commit, not through its download.  The stagings of the layers
         // of a process that died with them go too, and the lazy pulls of an
         // earlier boot (the first process of a boot is alone).  What an
         // earlier boot left is not used by anything: a process that finds it
@@ -375,9 +375,9 @@ impl ImageService {
                 if let Err(e) = area.forget_earlier_boots() {
                     warn!("Cannot remove the lazy pulls of an earlier boot: {e}");
                 }
-                velarx_content::pull::session::Session::sweep(&staging_dir, |s| {
-                    db.lease_is_held(s)
-                });
+                for e in velarx_content::pull::holds::sweep(&staging_dir).1 {
+                    warn!("Cannot remove a stale hold: {e}");
+                }
                 if let Err(e) = velarx_content::pull::staged_fetch::sweep(&staging_dir) {
                     warn!("Cannot remove the staging of a layer: {e}");
                 }
