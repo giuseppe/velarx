@@ -22,9 +22,11 @@ pub(crate) fn container_status(e: &ContainerError) -> StatusCode {
         }
         E::AlreadyExists(_) | E::Database(DbError::AlreadyExists(_)) => StatusCode::CONFLICT,
         E::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
-        E::NotRunning(_) | E::AlreadyRunning(_) | E::MonitorLost(_) | E::MonitorVersion { .. } => {
-            StatusCode::CONFLICT
-        }
+        E::NotRunning(_)
+        | E::AlreadyRunning(_)
+        | E::InvalidState(_)
+        | E::MonitorLost(_)
+        | E::MonitorVersion { .. } => StatusCode::CONFLICT,
         E::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
         E::Network(n) => network_status(n),
         E::InvalidArgument(_) => StatusCode::BAD_REQUEST,
@@ -37,9 +39,11 @@ pub(crate) fn container_status(e: &ContainerError) -> StatusCode {
 pub(crate) fn container_state(e: &ContainerError) -> bool {
     use ContainerError as E;
     match e {
-        E::NotRunning(_) | E::AlreadyRunning(_) | E::MonitorLost(_) | E::MonitorVersion { .. } => {
-            true
-        }
+        E::NotRunning(_)
+        | E::AlreadyRunning(_)
+        | E::InvalidState(_)
+        | E::MonitorLost(_)
+        | E::MonitorVersion { .. } => true,
         E::Network(n) => network_state(n),
         _ => false,
     }

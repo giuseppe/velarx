@@ -33,6 +33,12 @@ impl Status {
             typed::RunState::Running | typed::RunState::Paused | typed::RunState::Stopping
         )
     }
+
+    /// A start has nothing to do with it: it runs, or is stopping.  Not a
+    /// paused one, which a start refuses.
+    pub fn started(&self) -> bool {
+        self.alive() && self.state != typed::RunState::Paused
+    }
 }
 
 /// The configuration stored with a container; one that does not parse is an
@@ -222,7 +228,8 @@ pub async fn start(
     rec: &ContainerRecord,
     check: &StartCheck,
 ) -> ApiResult<Started> {
-    if status(state, rec).await.alive() || monitor_runs(state, &rec.id).await {
+    let status = status(state, rec).await;
+    if status.started() || (!status.alive() && monitor_runs(state, &rec.id).await) {
         check.refuse_running(
             rec.name.as_deref().unwrap_or(&rec.id),
             "it runs, on the file systems its monitor mounted when it started",

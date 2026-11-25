@@ -310,7 +310,7 @@ impl From<velarx_core::services::ContainerError> for ApiError {
             E::AlreadyExists(_) => Self::new(409, e.to_string()),
             E::InvalidArgument(_) => Self::bad_request(e.to_string()),
             E::MonitorLost(_) | E::MonitorVersion { .. } => Self::invalid_state(e.to_string()),
-            E::NotRunning(_) | E::AlreadyRunning(_) => {
+            E::NotRunning(_) | E::AlreadyRunning(_) | E::InvalidState(_) => {
                 Self::invalid_state(e.to_string()).with_cause("container state improper")
             }
             E::Database(velarx_types::DbError::NotFound(_)) => Self::new(404, e.to_string()),

@@ -60,6 +60,9 @@ pub enum ContainerError {
         id: String,
         source: Box<ContainerError>,
     },
+    /// The container is in a state that does not allow what is asked
+    #[error("{0}")]
+    InvalidState(String),
     #[error("image not found: {0}")]
     ImageNotFound(String),
     #[error("{0}")]

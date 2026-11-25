@@ -668,6 +668,32 @@ hooks_dir = [\"$hd\"]"
     sh_ container rm -t 0 -f pls > /dev/null
 }
 
+# A paused container is alive, its monitor holds it: a start of it is
+# refused as podman's, before anything is made, and what a container needs
+# when it joins its namespaces does not start it either.  It stays paused,
+# keeps its network, and unpause works.
+@test "the start of a paused container is refused" {
+    sh_ container run -d --name stp "$IMAGE" sleep 300 > /dev/null
+    pid=$(inspect_of stp pid)
+    nets () { sh_ container exec stp ls /sys/class/net | tr '\n' ' '; }
+    net=$(nets)
+    sh_ pause stp > /dev/null 2>&1 || e2e_die "pause of stp failed"
+    out=$(sh_ container start stp 2>&1)
+    check "the start fails" 125 $?
+    id=$(inspect_of stp id)
+    check "and says why" "Error: unable to start container \"$id\": container $id must be in Created or Stopped state to be started: container state improper" "$out"
+    out=$(sh_ container run --rm --pid container:stp "$IMAGE" true 2>&1)
+    check "a container that joins it fails" 125 $?
+    check_match "and says why too" "must be in Created or Stopped state to be started" "$out"
+    check "it stays paused" paused "$(state_of stp)"
+    check "its monitor is the only one" 1 "$(pgrep -fc -- "^velarx-monitor: $(inspect_of stp id | cut -c1-12) ")"
+    sh_ unpause stp > /dev/null
+    check "unpause works" running "$(state_of stp)"
+    check "it is the same process" "$pid" "$(inspect_of stp pid)"
+    check "it has its network" "$net" "$(nets)"
+    sh_ container rm -t 0 -f stp > /dev/null
+}
+
 # the shutdown timeout: a client that stays is cut at its end
 @test "the shutdown timeout" {
     stop_daemon

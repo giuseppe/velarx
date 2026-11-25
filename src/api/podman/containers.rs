@@ -642,7 +642,7 @@ pub(crate) async fn start_attached_of(
 ) -> ApiResult<(String, std::path::PathBuf, bool)> {
     let rec = lifecycle::resolve(state, name).await?;
     let dir = state.container_service.mon_dir(&rec.id);
-    if lifecycle::status(state, &rec).await.alive() {
+    if lifecycle::status(state, &rec).await.started() {
         check.refuse_unchecked(
             rec.name.as_deref().unwrap_or(&rec.id),
             "it runs, on the file systems its monitor mounted when it started",

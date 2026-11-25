@@ -1377,6 +1377,14 @@ impl ContainerService {
             )?;
             return Err(ContainerError::AlreadyRunning(id.to_string()));
         }
+        // (its monitor holds it: another would take the network of the
+        // container away, and wait for the first to end)
+        if container.state == RecordState::Paused {
+            return Err(ContainerError::InvalidState(format!(
+                "container {id} must be in Created or Stopped state to be started",
+                id = container.id
+            )));
+        }
         if let Some(restart) = restart {
             let ext = self.db.get_container_ext(&container.id).await?;
             if ext.stopped_by_user
@@ -2522,7 +2530,8 @@ impl ContainerService {
         if status.restarting.is_none() {
             // its restart policy started it again, and the record does not
             // say so yet: a second monitor would find it in the runtime
-            if status.state == RunState::Running && status.exit.is_none() {
+            if matches!(status.state, RunState::Running | RunState::Paused) && status.exit.is_none()
+            {
                 check.refuse_running(
                     id,
                     "it runs, on the file systems its monitor mounted when it started",
