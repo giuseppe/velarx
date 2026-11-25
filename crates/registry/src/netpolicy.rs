@@ -7,6 +7,7 @@
 //! changes its answer cannot get round the check.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::Ordering::Relaxed;
 
 /// Whether `host` names this machine or a private network (an address of
 /// the table of `velarx_addr_core`, or `localhost`).
@@ -71,12 +72,21 @@ impl std::error::Error for LookupError {
     }
 }
 
+/// The registry's own name was connected to, at a local address.
+const REACHED_LOCAL: u8 = 1;
+/// ... at a public address.
+const REACHED_PUBLIC: u8 = 2;
+
 /// The rule of one registry.
 pub struct Policy {
     /// The registry's host, without the port.
     registry: String,
     allow: bool,
-    private: tokio::sync::OnceCell<bool>,
+    /// What the connections made to the registry's own name went to
+    /// (`REACHED_*`).  Taken from the addresses that were used, not asked
+    /// again, so that a name that changes its answer cannot make a public
+    /// registry private.
+    reached: std::sync::atomic::AtomicU8,
 }
 
 impl Policy {
@@ -88,44 +98,26 @@ impl Policy {
         Self {
             registry,
             allow,
-            private: tokio::sync::OnceCell::new(),
+            reached: Default::default(),
         }
     }
 
-    /// Whether private addresses are allowed: the registry is on one (by
-    /// its address or because its name resolves to one) or the user said so.
-    async fn private_allowed(&self) -> bool {
-        *self
-            .private
-            .get_or_init(|| async {
-                if self.allow || local_host(&self.registry) {
-                    return true;
-                }
-                let bare = self.registry.trim_start_matches('[').trim_end_matches(']');
-                if bare.parse::<IpAddr>().is_ok() {
-                    return false;
-                }
-                match lookup(bare, 443).await {
-                    Ok(addrs) => {
-                        let local = addrs.iter().any(|a| local_ip(a.ip()));
-                        #[cfg(test)]
-                        let local = local && !crate::client::hint_tests::pretend_public(bare);
-                        local
-                    }
-                    Err(_) => false,
-                }
-            })
-            .await
+    /// Whether private addresses are allowed: the user said so, the
+    /// registry is on one by its address, or every address it was reached
+    /// at is one (a registry that was reached at a public address, once,
+    /// is public).
+    pub fn private_allowed(&self) -> bool {
+        self.allow || local_host(&self.registry) || self.reached.load(Relaxed) == REACHED_LOCAL
     }
 
     /// Refuse a URL whose host is a private address written out (a name is
     /// checked when it is resolved).
-    pub async fn check_url(&self, url: &reqwest::Url) -> Result<(), String> {
+    pub fn check_url(&self, url: &reqwest::Url) -> Result<(), String> {
         let Some(host) = url.host_str() else {
             return Err(format!("`{url}` has no host"));
         };
         let local = local_host(host);
-        if local && !self.private_allowed().await {
+        if local && !self.private_allowed() {
             return Err(format!(
                 "refusing {}: a private address, and the registry {} is not on one \
                  (`allow-private-addresses = true` in the block of registries.conf of \
@@ -136,20 +128,30 @@ impl Policy {
         Ok(())
     }
 
-    /// The addresses of `name` that may be connected to.
-    pub async fn filter(
-        &self,
-        name: &str,
-        addrs: Vec<SocketAddr>,
-    ) -> std::io::Result<Vec<SocketAddr>> {
-        if name == self.registry || self.private_allowed().await {
+    /// The addresses of `name` that may be connected to.  The registry's
+    /// own name is the first to say what the registry is: one that has a
+    /// public address is public, and then it too is held to its public
+    /// addresses.
+    pub fn filter(&self, name: &str, addrs: Vec<SocketAddr>) -> std::io::Result<Vec<SocketAddr>> {
+        let local = |a: &SocketAddr| {
+            let local = local_ip(a.ip());
+            // (a test names the loopback address it can reach public)
+            #[cfg(test)]
+            let local = local && !crate::client::hint_tests::pretend_public(name);
+            local
+        };
+        if name == self.registry && !addrs.is_empty() {
+            let reached = if addrs.iter().all(local) {
+                REACHED_LOCAL
+            } else {
+                REACHED_PUBLIC
+            };
+            self.reached.fetch_or(reached, Relaxed);
+        }
+        if self.private_allowed() {
             return Ok(addrs);
         }
-        let public: Vec<SocketAddr> = addrs
-            .iter()
-            .filter(|a| !local_ip(a.ip()))
-            .copied()
-            .collect();
+        let public: Vec<SocketAddr> = addrs.iter().filter(|a| !local(a)).copied().collect();
         if public.is_empty() && !addrs.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -264,5 +266,37 @@ mod tests {
         for (a, answered) in rows {
             assert_eq!(local_ip(a.parse().unwrap()), answered, "{a}");
         }
+    }
+
+    #[test]
+    fn a_registry_is_private_when_every_address_it_was_reached_at_is() {
+        let at = |a: &str| vec![a.parse::<SocketAddr>().unwrap()];
+        let policy = Policy::new("reg.example", false);
+        assert!(!policy.private_allowed(), "not reached yet");
+        policy.filter("reg.example", at("10.0.0.1:443")).unwrap();
+        assert!(policy.private_allowed());
+        // one public address makes it public, for good, and then its own
+        // name is held to its public addresses too
+        policy.filter("reg.example", at("8.8.8.8:443")).unwrap();
+        assert!(!policy.private_allowed());
+        assert!(policy.filter("reg.example", at("10.0.0.1:443")).is_err());
+        assert!(!policy.private_allowed());
+        assert!(policy
+            .filter("reg.example", at("169.254.169.254:80"))
+            .is_err());
+        let mixed = vec![
+            "10.0.0.1:443".parse().unwrap(),
+            "8.8.8.8:443".parse().unwrap(),
+        ];
+        assert_eq!(
+            policy.filter("reg.example", mixed).unwrap(),
+            at("8.8.8.8:443")
+        );
+        let url = reqwest::Url::parse("http://169.254.169.254/").unwrap();
+        assert!(policy.check_url(&url).is_err());
+        // an address written out, and the setting, decide without a connection
+        assert!(Policy::new("10.0.0.1", false).private_allowed());
+        assert!(!Policy::new("8.8.8.8", false).private_allowed());
+        assert!(Policy::new("reg.example", true).private_allowed());
     }
 }

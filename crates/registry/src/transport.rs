@@ -119,7 +119,7 @@ impl reqwest::dns::Resolve for PinResolver {
                 Some(addrs) => addrs,
                 None => {
                     let addrs = super::netpolicy::lookup(&name, 0).await?;
-                    policy.filter(&name, addrs).await?
+                    policy.filter(&name, addrs)?
                 }
             };
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
@@ -219,11 +219,14 @@ impl HostTransport {
 
     /// Refuse a URL that a registry gave (a token realm, a redirect) when it
     /// is a private address and the registry is not on one.
-    pub async fn check_url(&self, url: &reqwest::Url) -> ImageResult<()> {
-        self.policy
-            .check_url(url)
-            .await
-            .map_err(ImageError::Registry)
+    pub fn check_url(&self, url: &reqwest::Url) -> ImageResult<()> {
+        self.policy.check_url(url).map_err(ImageError::Registry)
+    }
+
+    /// Whether the registry may send the client to private addresses (see
+    /// `Policy::private_allowed`).
+    pub fn private_allowed(&self) -> bool {
+        self.policy.private_allowed()
     }
 
     /// How many names are pinned.

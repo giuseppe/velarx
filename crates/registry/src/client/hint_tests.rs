@@ -887,6 +887,55 @@ async fn a_refused_redirect_is_not_used_by_the_next_request() {
     assert_eq!(hits.load(Ordering::SeqCst), 0);
 }
 
+/// `name:port` for the registry at `host` (a loopback address), a name
+/// that resolves to `host` and to `others`, with no word that it is public.
+fn name_of_addresses(host: &str, name: &str, others: &[&str]) -> String {
+    let port = port_of(host);
+    let mut addrs: Vec<std::net::SocketAddr> = vec![host.parse().unwrap()];
+    for a in others {
+        addrs.push(format!("{a}:{port}").parse().unwrap());
+    }
+    name_resolves_to(name, addrs);
+    format!("{name}:{port}")
+}
+
+#[tokio::test]
+async fn a_registry_that_has_a_public_address_among_private_ones_is_public() {
+    let (auth, auth_counts) = auth_host("good", AxStatus::OK).await;
+    let (host, _c) = registry(format!("http://{auth}/token"), "good", false).await;
+    let name = name_of_addresses(&host, "mixed.registry.test", &["10.9.8.7"]);
+    say_public("mixed.registry.test");
+    let (client, t) = client(spec(&name, None));
+    let e = blob_error(&client, &t).await;
+    assert!(e.contains("refusing"), "{e}");
+    assert_eq!(auth_counts.token.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_registry_that_has_private_addresses_only_may_send_the_client_there() {
+    let (cdn, hits) = start_cdn(AxStatus::OK).await;
+    let host = redirecting_registry(&cdn).await;
+    let name = name_of_addresses(&host, "private.registry.test", &["10.9.8.7"]);
+    let (client, t) = client(spec(&name, None));
+    get_blob(&client, &t).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_hinted_registry_on_private_addresses_only_takes_its_private_realm() {
+    // (with the scheme known and a hint, the token is asked for before any
+    // connection to the registry, at a realm that is the registry's own
+    // name: nothing is known of the name yet)
+    let (host, c) = registry("http://unused.invalid/token".into(), "good", false).await;
+    let name = name_of_addresses(&host, "hinted.private.test", &[]);
+    let mut s = spec(&name, Some(bearer(format!("http://{name}/token"))));
+    s.scheme = Some(crate::target::Scheme::Http);
+    let (client, t) = client(s);
+    get_blob(&client, &t).await;
+    assert_eq!(c.token.load(Ordering::SeqCst), 1);
+    assert!(hint_notices(&client).is_empty(), "the hint was not dropped");
+}
+
 #[tokio::test]
 async fn a_registry_on_a_private_address_may_send_the_client_there() {
     let (cdn, hits) = start_cdn(AxStatus::OK).await;

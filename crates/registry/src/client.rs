@@ -665,7 +665,7 @@ impl RegistryClient {
         if !matches!(parsed.scheme(), "https" | "http") || (secure && parsed.scheme() != "https") {
             return;
         }
-        if self.may_redirect_to(t, &parsed).await {
+        if self.may_redirect_to(t, &parsed) {
             self.redirects.put(&t.blob_key(digest), url);
         }
     }
@@ -673,9 +673,9 @@ impl RegistryClient {
     /// Whether the policy of the registry of `t` lets a request go to `url`
     /// (a private address only for a registry that is on one): a redirect
     /// is remembered, and used again, only if it does.
-    async fn may_redirect_to(&self, t: &Target, url: &reqwest::Url) -> bool {
+    fn may_redirect_to(&self, t: &Target, url: &reqwest::Url) -> bool {
         match self.host(t) {
-            Ok(host) => host.check_url(url).await.is_ok(),
+            Ok(host) => host.check_url(url).is_ok(),
             Err(_) => false,
         }
     }
@@ -747,10 +747,7 @@ impl RegistryClient {
         };
         let Ok(host) = self.host(t) else { return };
         let secure = host.base_url().await.is_ok_and(|b| b.starts_with("https:"));
-        let registry_local = reqwest::Url::parse(&format!("https://{}/", t.endpoint.host))
-            .ok()
-            .and_then(|u| u.host_str().map(local_host))
-            .unwrap_or(false);
+        let registry_local = host.private_allowed();
         if !matches!(url.scheme(), "https" | "http")
             || (secure && url.scheme() != "https")
             || url
@@ -968,7 +965,7 @@ impl RegistryClient {
                 "refusing the token realm `{realm}`: not HTTPS"
             )));
         }
-        self.host(t)?.check_url(&url).await?;
+        self.host(t)?.check_url(&url)?;
         let scope = format!("repository:{}:{}", t.endpoint.repository, actions);
         let mount_scope = t
             .mount_from
@@ -1499,7 +1496,7 @@ impl RegistryClient {
         let key = t.blob_key(digest);
         let cached = match self.redirects.get(&key) {
             Some(c) => match reqwest::Url::parse(&c) {
-                Ok(url) if self.may_redirect_to(t, &url).await => Some(c),
+                Ok(url) if self.may_redirect_to(t, &url) => Some(c),
                 _ => {
                     self.redirects.drop_key(&key);
                     None
@@ -2220,7 +2217,7 @@ async fn judge(
     let refusal = if is_home {
         None
     } else {
-        host.check_url(url).await.err()
+        host.check_url(url).err()
     };
     let target = send_core::Target {
         home: is_home,
