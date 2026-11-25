@@ -84,7 +84,8 @@ platform.  The toolchain is the one `rust-toolchain.toml` pins, which is the
 user namespace or a kernel feature the machine lacks prints `skipped: ...`
 and passes; a change to the runtime, the monitor, storage, networking or
 the systemd integration also runs the end to end tier (`make e2e`) and says
-in its pull request what it ran.
+in its pull request what it ran.  A change to a crate with Lean proofs (the
+directories of `tools/verify`) runs `tools/verify/run` for that crate.
 
 The integration tests are modules of `tests/integration/main.rs`: one
 binary, all tests in parallel in one process.  A test must not change the
