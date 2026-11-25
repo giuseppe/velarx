@@ -69,7 +69,8 @@ pub struct Header {
     pub path: String,
     /// The type of the entry.
     pub kind: Kind,
-    /// The size of the content that follows the header, as declared.
+    /// The size of the content that follows the header: as declared for a
+    /// regular file, 0 for every other kind.
     pub size: u64,
     /// The permission bits, with setuid, setgid and sticky.
     pub mode: u32,
@@ -383,6 +384,10 @@ impl<R: Read, S: Sink> TarReader<R, S> {
         Err(invalid("too many tar extension headers"))
     }
 
+    /// The header of an entry once its extensions are known. The type and
+    /// the size are read as Go's `archive/tar` does (`reader.go` 146-152
+    /// and 179-183, `common.go` 742-749): a `\0` entry whose name ends with
+    /// `/` is a directory, and only a regular file has data.
     fn finish_header(
         &mut self,
         block: &[u8; BLOCK],
@@ -391,7 +396,7 @@ impl<R: Read, S: Sink> TarReader<R, S> {
         gnu_path: Option<String>,
         gnu_link: Option<String>,
     ) -> io::Result<Header> {
-        let kind = match block[156] {
+        let mut kind = match block[156] {
             0 | b'0' | b'7' => Kind::Regular,
             b'1' => Kind::Hardlink,
             b'2' => Kind::Symlink,
@@ -415,6 +420,10 @@ impl<R: Read, S: Sink> TarReader<R, S> {
                 format!("{}/{}", utf8(prefix, "path prefix")?, utf8(name, "path")?)
             }
         };
+        // An old-style regular file named like a directory is one.
+        if block[156] == 0 && path.ends_with('/') {
+            kind = Kind::Directory;
+        }
         let link = match ov.link.or(gnu_link) {
             Some(l) => Some(l),
             None => {
@@ -440,7 +449,12 @@ impl<R: Read, S: Sink> TarReader<R, S> {
             return Err(invalid("tar path contains a NUL"));
         }
 
-        let size = ov.size.unwrap_or(size);
+        // Only a regular file has data, whatever the size field says.
+        let size = if kind == Kind::Regular {
+            ov.size.unwrap_or(size)
+        } else {
+            0
+        };
         let uid = ov.uid.map_or_else(|| number(&block[108..116], "uid"), Ok)?;
         let gid = ov.gid.map_or_else(|| number(&block[116..124], "gid"), Ok)?;
         let mtime = match ov.mtime {
@@ -750,6 +764,87 @@ mod tests {
             len += 1;
         }
         format!("{len} {kv}\n").into_bytes()
+    }
+
+    /// A raw header block of `typeflag`, `name` and a size field.
+    fn raw(name: &str, typeflag: u8, size: u64) -> Vec<u8> {
+        let mut h = tar::Header::new_ustar();
+        h.set_path(name).unwrap();
+        h.set_mode(0o644);
+        h.set_size(size);
+        h.as_old_mut().linkname[..1].copy_from_slice(b"t");
+        h.as_mut_bytes()[156] = typeflag;
+        h.set_cksum();
+        h.as_bytes().to_vec()
+    }
+
+    fn finished(mut stream: Vec<u8>) -> Vec<u8> {
+        stream.extend(vec![0u8; 1024]);
+        stream
+    }
+
+    #[test]
+    fn test_old_style_entry_named_like_a_directory() {
+        let mut stream = raw("d/", 0, 0);
+        stream.extend(raw("f", 0, 0));
+        stream.extend(raw("e/", b'0', 0));
+        let entries = read_all(finished(stream)).unwrap();
+        assert_eq!(entries[0].0.kind, Kind::Directory);
+        assert_eq!(entries[1].0.kind, Kind::Regular);
+        assert_eq!(entries[2].0.kind, Kind::Regular);
+    }
+
+    /// No data follows a header of a type without any, whatever its size.
+    #[test]
+    fn test_header_only_types_have_no_data() {
+        for typeflag in [b'1', b'2', b'3', b'4', b'5', b'6', 0] {
+            let name = if typeflag == 0 { "d/" } else { "x" };
+            let mut stream = raw(name, typeflag, 512);
+            stream.extend(raw("next", b'0', 0));
+            let entries = read_all(finished(stream)).unwrap();
+            assert_eq!(entries.len(), 2, "type {typeflag}");
+            assert_eq!(entries[0].0.size, 0, "type {typeflag}");
+            assert_eq!(entries[1].0.path, "next", "type {typeflag}");
+        }
+    }
+
+    #[test]
+    fn test_header_only_types_ignore_a_pax_size() {
+        let pax = record_of("size=512");
+        let mut stream = raw("p", b'x', pax.len() as u64);
+        stream.extend(&pax);
+        stream.resize(stream.len().next_multiple_of(BLOCK), 0);
+        stream.extend(raw("d", b'5', 0));
+        stream.extend(raw("next", b'0', 0));
+        let entries = read_all(finished(stream)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0.size, 0);
+        assert_eq!(entries[1].0.path, "next");
+    }
+
+    /// A header with a size on a symlink is replayed byte for byte.
+    #[test]
+    fn test_tarsplit_of_a_header_with_a_stray_size() {
+        use crate::{decoder, Entries, Recorder, Replay, MAX_SIZE};
+        struct NoContents;
+        impl crate::Contents for NoContents {
+            fn open(&mut self, _: &str, _: u64) -> io::Result<Box<dyn Read + Send>> {
+                Err(invalid("no content"))
+            }
+        }
+        let mut stream = raw("l", b'2', 512);
+        stream.extend(raw("next", b'0', 0));
+        let stream = finished(stream);
+        let mut r = TarReader::with_sink(Cursor::new(stream.clone()), Recorder::new().unwrap());
+        while r.next_entry().unwrap().is_some() {}
+        let (_, recorder) = r.finish().unwrap();
+        let recorded = recorder.finish().unwrap();
+        let input = decoder(recorded.compressed, MAX_SIZE).unwrap();
+        let mut out = Vec::new();
+        Replay::new(Entries::new(input), NoContents)
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, stream);
     }
 
     #[test]
