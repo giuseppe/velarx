@@ -8,8 +8,8 @@
 //! where the file has fs-verity; where the store requires fs-verity, a whole
 //! file the kernel does not measure is reported as `no_verity`), and
 //! its composefs image.  The store is looked at too: objects no row knows,
-//! rows of files that are gone, temporary files, pull and container
-//! staging directories of nothing, leases of pulls that died.
+//! rows of files that are gone, temporary files, the staging directories of
+//! pulls and builds that died.
 //!
 //! The images are checked under the shared lock of the store, the oldest
 //! checked first, as many as the timeout leaves time for.  A repair takes the
@@ -69,7 +69,6 @@ enum Fix {
     RemakeStaged(String),
     /// Finish the pull `id`: nothing completes it.
     Complete(String),
-    ReleaseLease(String),
     /// Enable fs-verity on the object, which is the file named by this
     /// digest and whole.
     EnableVerity(String, Object),
@@ -700,21 +699,11 @@ impl CheckService {
     }
 
     /// The staging directories of pulls that died and of containers that
-    /// are gone, and the leases of builds that died.
+    /// are gone.
     async fn scan_staging(&self, scan: &mut Scan) -> CheckResult<()> {
-        let (_, stale) = self.db.partition_leases().await?;
-        for l in &stale {
-            scan.findings.push(
-                Finding::of_store(
-                    "stale_lease",
-                    format!("the lease {} of a build that is gone (pid {})", l.id, l.pid),
-                    None,
-                )
-                .with(Fix::ReleaseLease(l.id.clone())),
-            );
-        }
         // (a hold nobody holds is what a process that died left, whatever
-        // it did meanwhile: nothing makes one live again)
+        // it did meanwhile: nothing makes one live again; a build leaves one
+        // too)
         for dir in velarx_content::pull::holds::stale(&self.staging)? {
             scan.findings.push(
                 Finding::of_store(
@@ -1057,7 +1046,6 @@ impl CheckService {
                         }
                     },
                     Fix::DropRows(d) => d.iter().all(|d| dropped.contains(d)),
-                    Fix::ReleaseLease(id) => self.db.release_lease(id).await.is_ok(),
                     Fix::RemakeStaged(id) => self.images.remake_staged_images(id).await.is_ok(),
                     Fix::Complete(id) => {
                         completing.push(id.clone());

@@ -246,7 +246,7 @@ impl ContainerService {
             digest,
             names: req.image.iter().cloned().collect(),
             walk,
-            lease: None,
+            hold: None,
             platform: None,
             progress,
             squash_all: req.squash,

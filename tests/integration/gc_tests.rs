@@ -681,10 +681,10 @@ async fn an_image_a_build_uses_is_not_pruned_until_the_build_is_gone() {
         .await
         .unwrap();
 
-    let build = e.service.take_lease("build-0000b017").await.unwrap();
+    let build = e.service.hold_build().unwrap();
     let got = e
         .service
-        .build_cache_get(velarx_db::BUILD_SCRATCH, "step", build.id())
+        .build_cache_get(velarx_db::BUILD_SCRATCH, "step", build.name())
         .await
         .unwrap();
     assert_eq!(got.as_deref(), Some(id.as_str()));
@@ -696,4 +696,31 @@ async fn an_image_a_build_uses_is_not_pruned_until_the_build_is_gone() {
     let pruned = e.service.prune(true, &[]).await.unwrap();
     assert_eq!(pruned.len(), 1);
     assert_eq!(pruned[0].0, id);
+}
+
+/// A removal that waits for the lock while another removes the image
+/// answers that the image is not there, as one that comes after it does,
+/// not an error of the database: concurrent removals of one image are
+/// what a CRI client does.
+#[tokio::test]
+async fn a_removal_that_waited_for_another_finds_no_image() {
+    let e = env().await;
+    let l = layer("etc/r", &[7u8; 20_000]);
+    e.publish(&[&l], &[ZSTD]);
+    let id = e.pull().await.unwrap().id;
+    let lock = StorageLock::path_of_staging(&e.staging);
+    let held = StorageLock::exclusive(&lock).await.unwrap();
+    let service = e.service.clone();
+    let removing = {
+        let id = id.clone();
+        tokio::spawn(async move { service.remove(&id, false).await })
+    };
+    wait_for_lock_waiter(&lock).await;
+    // (the other removal, done while this one waits)
+    e.db.delete_image(&id).await.unwrap();
+    drop(held);
+    match removing.await.unwrap() {
+        Err(velarx_types::ImageError::NotFound(what)) => assert_eq!(what, id),
+        other => panic!("not NotFound: {other:?}"),
+    }
 }

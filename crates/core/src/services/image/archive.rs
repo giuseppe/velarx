@@ -289,7 +289,7 @@ impl ImageService {
             reach: Default::default(),
             seal: false,
             states: true,
-            lease: None,
+            hold: None,
             pulled: Vec::new(),
             access: None,
             indexes: Vec::new(),

@@ -299,13 +299,13 @@ async fn test_failed_commits_leave_nothing() {
 }
 
 #[tokio::test]
-async fn test_a_leased_commit_is_not_pruned() {
+async fn test_a_pinned_commit_is_not_pruned() {
     let e = source().await;
-    let lease = e.service.take_lease("build-test").await.unwrap();
+    let hold = e.service.hold_build().unwrap();
     let dir = tempfile::tempdir().unwrap();
     changes(dir.path());
     let opts = CommitOptions {
-        lease: Some(lease.id().to_string()),
+        hold: Some(hold.name().to_string()),
         ..options(&[])
     };
     let id = e
@@ -317,7 +317,7 @@ async fn test_a_leased_commit_is_not_pruned() {
         )
         .await
         .unwrap();
-    // Untagged, but leased: a prune leaves it.
+    // Untagged, but pinned: a prune leaves it.
     let pruned: Vec<String> = e
         .service
         .prune(true, &[])
@@ -328,7 +328,7 @@ async fn test_a_leased_commit_is_not_pruned() {
         .collect();
     assert!(!pruned.contains(&id), "{pruned:?}");
     assert!(e.service.get(&id).await.is_ok());
-    lease.release().await.unwrap();
+    drop(hold);
     let pruned: Vec<String> = e
         .service
         .prune(false, &[])

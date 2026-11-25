@@ -834,11 +834,14 @@ async fn test_the_credentials_of_an_add_url_are_hidden() {
     );
 }
 
-/// What a cancelled build leaves: nothing in the staging area, no lease,
+/// What a cancelled build leaves: nothing in the staging area, no hold,
 /// no container, no image, nothing in its work directory.
 async fn assert_nothing_left(e: &common::Env, dir: &Path) {
     assert_eq!(e.staged_leftovers(), 0, "files of the staging area");
-    assert!(e.db.list_leases().await.unwrap().is_empty(), "a lease");
+    assert!(
+        !velarx_content::pull::holds::any_live(&e.staging).unwrap(),
+        "a hold"
+    );
     assert!(e.db.list_containers(true).await.unwrap().is_empty());
     assert!(e.db.list_images().await.unwrap().is_empty(), "an image");
     // (one directory for the process, then one for each build)
@@ -1599,4 +1602,65 @@ async fn test_a_stage_built_again_is_the_same_image() {
         m["annotations"]["org.opencontainers.image.created"],
         "1970-01-01T00:00:00Z"
     );
+}
+
+/// The base image of a build that the store already had stays while the build
+/// runs, whatever a prune does meanwhile, and `image rm` refuses it unless
+/// forced; the build ends and the base can be removed.
+#[tokio::test]
+async fn test_a_prune_and_a_remove_leave_the_base_of_a_build_in_progress() {
+    use crate::common::{build_chunked, env, sample, ZSTD};
+    use velarx_core::services::build::{BuildContext, BuildOptions, BuildProgress};
+    let e = env().await;
+    e.publish(&[&build_chunked(&sample())], &[ZSTD]);
+    let base = e.pull().await.unwrap().id;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = build_service(&e, tmp.path());
+    let context = tmp.path().join("context");
+    std::fs::create_dir(&context).unwrap();
+    std::fs::write(
+        context.join("Containerfile"),
+        format!(
+            "FROM {}/test:latest\nLABEL a=b\nLABEL c=d\nLABEL e=f\nLABEL g=h\n",
+            e.host
+        ),
+    )
+    .unwrap();
+    let ctx = BuildContext::new(&context, None).unwrap();
+    let opts = BuildOptions {
+        tls_verify: false,
+        tags: vec!["localhost/kept:1".into()],
+        ..Default::default()
+    };
+
+    // The build waits for this task to read what it reports, so it is
+    // between steps while the prune runs.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let service = e.service.clone();
+    let id = base.clone();
+    let pruner = tokio::spawn(async move {
+        let mut pruned = None;
+        while let Some(p) = rx.recv().await {
+            if matches!(&p, BuildProgress::StepStarted { step: 2, .. }) {
+                pruned = Some(service.prune(true, &[]).await.unwrap());
+                let refused = service.remove(&id, false).await.unwrap_err();
+                assert!(
+                    refused.to_string().contains("build in progress"),
+                    "{refused}"
+                );
+            }
+        }
+        pruned.expect("the build has a second step")
+    });
+    svc.build(&ctx, &opts, Some(tx), Default::default())
+        .await
+        .unwrap();
+    let pruned = pruner.await.unwrap();
+    assert!(
+        pruned.iter().all(|(id, _)| *id != base),
+        "the prune took the base of the build: {pruned:?}"
+    );
+
+    e.service.remove(&base, false).await.unwrap();
 }

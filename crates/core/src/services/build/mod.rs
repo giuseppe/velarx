@@ -896,9 +896,9 @@ struct Build<'a> {
     work: tempfile::TempDir,
     seq: usize,
     /// Keeps the intermediate images from a prune until the build ends.
-    lease: Option<velarx_db::Lease>,
-    /// The id of the lease (the stages that run at the same time use it).
-    lease_id: Option<String>,
+    hold: Option<velarx_content::pull::holds::Hold>,
+    /// The name of the hold (the stages that run at the same time use it).
+    hold_name: Option<String>,
     /// The scratch space of the --squash directory.
     squash_space: Reservation,
     /// The platform the build is for, if one was asked.
@@ -1528,8 +1528,8 @@ impl BuildService {
                 .prefix("build-")
                 .tempdir_in(&self.work_dir)?,
             seq: 0,
-            lease: None,
-            lease_id: None,
+            hold: None,
+            hold_name: None,
             squash_space: self.scratch.reservation(),
             platform,
             file,
@@ -1537,12 +1537,9 @@ impl BuildService {
             target,
         };
         let needed = b.plan(target)?;
-        let lease = self
-            .image_service
-            .take_lease(&format!("build-{}", velarx_base::random::uuid()))
-            .await?;
-        b.lease_id = Some(lease.id().to_string());
-        b.lease = Some(lease);
+        let hold = self.image_service.hold_build()?;
+        b.hold_name = Some(hold.name().to_string());
+        b.hold = Some(hold);
         b.send(BuildProgress::Started {
             total_steps: n_steps,
         })
@@ -1724,8 +1721,8 @@ impl<'a> Build<'a> {
                 .prefix("stage-")
                 .tempdir_in(self.work.path())?,
             seq: 0,
-            lease: None,
-            lease_id: self.lease_id.clone(),
+            hold: None,
+            hold_name: self.hold_name.clone(),
             squash_space: self.svc.scratch.reservation(),
             platform: self.platform.clone(),
             run_dir: None,
@@ -1959,7 +1956,25 @@ impl<'a> Build<'a> {
         .await
     }
 
+    /// The id of the image `reference` (pulled if the store has not the one
+    /// asked), pinned by the hold of the build: a prune leaves it alone as
+    /// long as the build runs.
     async fn ensure_image(&self, reference: &str, platform: Option<&str>) -> BuildResult<String> {
+        let id = self.pull_missing(reference, platform).await?;
+        let Some(hold) = &self.hold_name else {
+            return Ok(id);
+        };
+        match self.svc.image_service.pin_image(hold, id.clone()).await? {
+            Some(id) => Ok(id),
+            None => Err(ImageError::NotFound(format!(
+                "the image {reference} ({id:.12}) was removed before the build could hold it: \
+                 run the build again"
+            ))
+            .into()),
+        }
+    }
+
+    async fn pull_missing(&self, reference: &str, platform: Option<&str>) -> BuildResult<String> {
         let reference = velarx_types::transport::ImageLocation::local(reference, "FROM")
             .map_err(|e| BuildError::Parse(e.to_string()))?;
         let reference = reference.as_str();
@@ -2031,7 +2046,7 @@ impl<'a> Build<'a> {
                 || async {
                     let (tx, forwarded) = self.blobs();
                     // (a pull that is dropped leaves nothing: its files are in
-                    // the staging area until it is done, and its lease goes
+                    // the staging area until it is done, and its hold goes
                     // with it)
                     let r = self
                         .svc
@@ -2441,7 +2456,7 @@ impl<'a> Build<'a> {
             created_by: "velarx build --squash-all".into(),
             author: st.author.clone(),
             digest: Some(self.digest),
-            lease: self.lease_id.clone(),
+            hold: self.hold_name.clone(),
             platform: self.platform.clone(),
             progress: Some(progress),
             squash_all: true,
@@ -2724,18 +2739,18 @@ impl<'a> Build<'a> {
         if self.opts.no_cache || !self.caching(st) {
             return Ok(None);
         }
-        let Some(lease) = self.lease_id.clone() else {
+        let Some(hold) = self.hold_name.clone() else {
             return Ok(None);
         };
         let parent = st.image.as_deref().unwrap_or(velarx_db::BUILD_SCRATCH);
         let local = self
             .svc
             .image_service
-            .build_cache_get(parent, key, &lease)
+            .build_cache_get(parent, key, &hold)
             .await?;
         let id = match local {
             Some(id) => id,
-            None => match self.pull_cached(parent, key, &lease).await? {
+            None => match self.pull_cached(parent, key, &hold).await? {
                 Some(id) => id,
                 None => return Ok(None),
             },
@@ -2764,7 +2779,7 @@ impl<'a> Build<'a> {
         &self,
         parent: &str,
         key: &str,
-        lease: &str,
+        hold: &str,
     ) -> BuildResult<Option<String>> {
         let images = &self.svc.image_service;
         for repository in &self.opts.flags.cache_from {
@@ -2802,7 +2817,7 @@ impl<'a> Build<'a> {
                 continue;
             }
             images.build_cache_put(parent, key, &image.id).await?;
-            if let Some(id) = images.build_cache_get(parent, key, lease).await? {
+            if let Some(id) = images.build_cache_get(parent, key, hold).await? {
                 return Ok(Some(id));
             }
         }
@@ -2896,7 +2911,7 @@ impl<'a> Build<'a> {
             walk,
             created: self.created(),
             omit_history: self.opts.flags.omit_history,
-            lease: self.lease_id.clone(),
+            hold: self.hold_name.clone(),
             platform: self.platform.clone(),
             progress: Some(progress),
             cancel: self.cancel.clone(),
@@ -4043,11 +4058,7 @@ impl<'a> Build<'a> {
                 warn!("Cannot remove the intermediate image {id}: {e}");
             }
         }
-        if let Some(lease) = self.lease.take() {
-            if let Err(e) = lease.release().await {
-                warn!("Cannot remove the lease of the build: {e}");
-            }
-        }
+        drop(self.hold.take());
         info!("Build in {} done", self.work.path().display());
     }
 }

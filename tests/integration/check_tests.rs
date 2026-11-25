@@ -332,17 +332,6 @@ async fn the_store_is_looked_at() {
     // staging of a pull that died
     let pull = e.staging.join("pull-0123abcd");
     std::fs::create_dir_all(pull.join("files")).unwrap();
-    // a lease of a process that is gone
-    e.db.conn()
-        .call(|c| {
-            c.execute(
-                "INSERT INTO leases (id, pid) VALUES ('pull-feed', 2147483647)",
-                [],
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
 
     let r = check(&e, true, false).await;
     assert!(!r.ok());
@@ -351,18 +340,16 @@ async fn the_store_is_looked_at() {
     assert_eq!(by("stale_temp"), 2, "{:?}", r.problems);
     assert_eq!(by("stale_row"), 1, "{:?}", r.problems);
     assert_eq!(by("stale_staging"), 1, "{:?}", r.problems);
-    assert_eq!(by("stale_lease"), 1, "{:?}", r.problems);
     assert!(r.problems.iter().all(|p| p.image.is_none()));
     assert!(orphan.exists() && tmp.exists() && pull.exists());
 
     let r = check(&e, true, true).await;
     assert!(r.ok(), "{:?}", r.problems);
-    assert_eq!(r.problems.len(), 6, "{:?}", r.problems);
+    assert_eq!(r.problems.len(), 5, "{:?}", r.problems);
     for p in [&orphan, &tmp, &cfs_tmp, &pull] {
         assert!(!p.exists(), "{}", p.display());
     }
     assert!(e.db.file_objects(vec![gone]).await.unwrap().is_empty());
-    assert!(e.db.list_leases().await.unwrap().is_empty());
     assert!(e.db.get_image(&id).await.is_ok());
     let r = check(&e, false, false).await;
     assert!(r.ok() && r.problems.is_empty(), "{:?}", r.problems);

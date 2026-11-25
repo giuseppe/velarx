@@ -1168,6 +1168,26 @@ impl ImageService {
     /// smaller the images of the store got, not what a registry would say the
     /// image weighs.
     pub async fn remove(&self, reference: &str, force: bool) -> ImageResult<u64> {
+        Ok(self
+            .remove_checked(reference, force, false)
+            .await?
+            .unwrap_or(0))
+    }
+
+    /// [`Self::remove`] of an image (forced) that no live hold pins, which
+    /// is asked again under the exclusive lock of the store that the row is
+    /// removed under: a build that pins an image holds the lock shared while
+    /// it pins it and looks that it is still there.  None: it is pinned.
+    pub async fn remove_unless_pinned(&self, reference: &str) -> ImageResult<Option<u64>> {
+        self.remove_checked(reference, true, true).await
+    }
+
+    async fn remove_checked(
+        &self,
+        reference: &str,
+        force: bool,
+        unless_pinned: bool,
+    ) -> ImageResult<Option<u64>> {
         let image = self.get(reference).await?;
         if let Some(store) = self.db.read_only_store_of(&image.id).await {
             return Err(ImageError::ReadOnly(format!(
@@ -1189,18 +1209,43 @@ impl ImageService {
                 }
             )));
         }
-        self.db.delete_image(&image.id).await?;
+        // (a build that pins the image holds the lock shared while it does:
+        // asked under the exclusive one, the image is pinned or still free)
+        let exclusive = if unless_pinned || !force {
+            let lock = StorageLock::exclusive(&StorageLock::path_of_staging(&self.staging_dir))
+                .await
+                .map_err(|e| ImageError::Storage(format!("cannot lock the store: {e}")))?;
+            if self.image_is_pinned(&image.id)? {
+                if unless_pinned {
+                    return Ok(None);
+                }
+                return Err(ImageError::Storage(
+                    "image is in use by a build in progress: wait for it, or force".into(),
+                ));
+            }
+            Some(lock)
+        } else {
+            None
+        };
+        // (a removal that had the lock first may have removed it: then it
+        // is not there, as for a removal that comes after)
+        self.db.delete_image(&image.id).await.map_err(|e| match e {
+            e if e.is_not_found() => ImageError::NotFound(reference.to_string()),
+            e => e.into(),
+        })?;
         // (what the driver keeps of the image is forgotten; one it cannot
         // remove now goes with the next collection, which keeps only what the
         // images have: the removal of the image, recorded above, stands)
         if let Err(e) = self.storage.remove_image(&image.id) {
             warn!("Image {}: {e}", image.id);
         }
+        // (the layers are released under the lock of their own)
+        drop(exclusive);
         // The layers no other image and no container uses go too: a pull of
         // the image downloads them again.  The containers of a forced
         // removal keep theirs (`container_layers`).
         let layers = self.release_unused_layers(&image.id).await;
-        Ok(image.metadata_size().saturating_add(layers))
+        Ok(Some(image.metadata_size().saturating_add(layers)))
     }
 
     /// Release the layers no image and no container uses, for the image
@@ -1428,6 +1473,8 @@ impl ImageService {
         deleted: &mut Vec<(String, u64)>,
     ) -> ImageResult<()> {
         let images = self.list().await?;
+        // (read once for the pass; asked again before each removal)
+        let pinned = velarx_content::pull::holds::pinned(&self.staging_dir)?.images;
         let intermediate = if all {
             Default::default()
         } else {
@@ -1445,12 +1492,7 @@ impl ImageService {
             // containers may use)
             let has_containers = self.db.image_has_containers(&image.id).await?;
             // The intermediate images of a build in progress.
-            let leased = self
-                .db
-                .is_leased(velarx_db::LEASE_IMAGE, &image.id)
-                .await
-                .unwrap_or(true);
-            if has_containers || leased {
+            if has_containers || pinned.contains(&image.id) {
                 debug!(
                     "Skipping image {} - still referenced by containers or a build",
                     &image.id[..12.min(image.id.len())]
@@ -1461,8 +1503,9 @@ impl ImageService {
             let named = self.db.image_is_named(&image.id).await.unwrap_or(true);
 
             if !named || all {
-                match self.remove(&image.id, true).await {
-                    Ok(freed) => deleted.push((image.id.clone(), freed)),
+                match self.remove_unless_pinned(&image.id).await {
+                    Ok(Some(freed)) => deleted.push((image.id.clone(), freed)),
+                    Ok(None) => debug!("Skipping image {}: a build pinned it", image.id),
                     Err(e) => warn!("The image {} was not removed: {e}", image.id),
                 }
             }

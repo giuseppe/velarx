@@ -254,8 +254,8 @@ pub(super) struct Incoming {
     /// An image made here (a commit, an import): the manifest states the
     /// digest of the EROFS image of each layer, which is not checked.
     pub states: bool,
-    /// A lease that takes the image before it is recorded.
-    pub lease: Option<String>,
+    /// The hold (by its name) that pins the image before it is recorded.
+    pub hold: Option<String>,
     /// How the image was pulled and the signatures found, recorded with the
     /// image (a lazy pull's: the staging area keeps them until the image is
     /// committed).
@@ -1310,7 +1310,7 @@ impl ImageService {
             reach,
             seal: false,
             states: false,
-            lease: None,
+            hold: None,
             pulled: signed,
             indexes,
             access: Some(velarx_content::pull::access::access_for(
@@ -1366,7 +1366,7 @@ impl ImageService {
             reach,
             seal,
             states,
-            lease: image_lease,
+            hold: image_hold,
             pulled,
             indexes,
             access,
@@ -1697,13 +1697,8 @@ impl ImageService {
             }
         }
         // under the store lock, before it is recorded: no prune takes it
-        if let Some(l) = &image_lease {
-            self.db
-                .add_lease_items(
-                    l,
-                    vec![(velarx_db::LEASE_IMAGE.to_string(), image_id.clone())],
-                )
-                .await?;
+        if let Some(h) = &image_hold {
+            holds::pin(&self.staging_dir.join(h), holds::IMAGE, [&image_id])?;
         }
 
         debug!("Files committed after {:?}", start.elapsed());

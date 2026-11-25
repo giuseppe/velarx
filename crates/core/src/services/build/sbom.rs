@@ -223,7 +223,7 @@ impl Build<'_> {
             let opts = CommitOptions {
                 created_by: "velarx build --sbom".into(),
                 digest: Some(self.digest),
-                lease: self.lease.as_ref().map(|l| l.id().to_string()),
+                hold: self.hold.as_ref().map(|h| h.name().to_string()),
                 platform: self.platform.clone(),
                 progress: Some(progress),
                 created: self.created(),

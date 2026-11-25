@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Garbage collection of the store: mark and sweep under the exclusive lock
 //! of the store ([`StorageLock`]), so it never runs while a pull or a fetch
-//! holds it shared.  In order: the leases of pulls that died and their
-//! staging directories (and staging directories without a lease), the
-//! expired chunks, the layers no image uses and no lease pins, the files no
+//! holds it shared.  In order: the staging directories of pulls and builds
+//! that died (nothing holds them), the
+//! expired chunks, the layers no image uses and no pull pins, the files no
 //! layer references (with their chunk locations), the files on disk the
 //! database does not know, and the kept indexes that list no image.
 
@@ -428,7 +428,7 @@ impl GcService {
             .into_iter()
             .filter(|d| !wanted.contains_key(d))
             .collect();
-        if !digests.is_empty() && self.pull_in_progress().await? {
+        if !digests.is_empty() && self.pull_in_progress()? {
             debug!(
                 "{} unreferenced files kept: a pull is in progress",
                 digests.len()
@@ -576,7 +576,7 @@ impl GcService {
     /// Forget the kept indexes that list no image of the store nor of a
     /// staged pull, unless a pull is in progress.
     async fn collect_indexes(&self) -> GcResult<()> {
-        if self.pull_in_progress().await? {
+        if self.pull_in_progress()? {
             return Ok(());
         }
         let staged = self
@@ -590,24 +590,15 @@ impl GcService {
         Ok(())
     }
 
-    /// Whether a pull or a build is in progress: a process holds its hold
-    /// or its lease.
-    async fn pull_in_progress(&self) -> GcResult<bool> {
-        Ok(holds::any_live(&self.staging_dir)? || !self.db.partition_leases().await?.0.is_empty())
+    /// Whether a pull or a build is in progress: a process holds its hold.
+    fn pull_in_progress(&self) -> GcResult<bool> {
+        Ok(holds::any_live(&self.staging_dir)?)
     }
 
-    /// Remove the leases of the builds whose process is gone (nothing holds
-    /// their lock), the staging of the layers whose stager died, and the
-    /// holds nobody holds with what they staged (a pull is held from the
-    /// birth of its directory, which the lock of the store this holds
-    /// exclusive keeps from happening meanwhile; a leftover birth goes too).
+    /// Remove the staging of the layers whose stager died, and the holds
+    /// nobody holds with what they staged (a pull is held from the birth of
+    /// its directory; a leftover birth goes too).
     async fn collect_stale_staging(&self, report: &mut GcReport) -> GcResult<()> {
-        let (_, stale) = self.db.partition_leases().await?;
-        for lease in stale {
-            debug!("Removing the stale lease {}", lease.id);
-            self.db.release_lease(&lease.id).await?;
-            report.leases_removed += 1;
-        }
         let root = self.staging_dir.clone();
         match crate::off_thread(move || velarx_content::pull::staged_fetch::sweep(&root)).await {
             Ok(n) => report.staging_removed += n,
@@ -857,7 +848,7 @@ impl GcService {
         let mut unreferenced = Vec::new();
         // (a dry run counts what the collection would remove: nothing of
         // the files with a row while a pull runs, `remove_files_if_unused`)
-        let pulling = options.dry_run && self.pull_in_progress().await?;
+        let pulling = options.dry_run && self.pull_in_progress()?;
         for (digest, size) in all_files {
             if referenced.contains(&digest) {
                 continue;

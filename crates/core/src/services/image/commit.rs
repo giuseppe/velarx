@@ -123,9 +123,9 @@ pub struct CommitOptions {
     pub names: Vec<String>,
     /// How the directory is read.
     pub walk: dirtar::Options,
-    /// A lease that takes the new image before it is recorded (the
-    /// intermediate images of a build: a prune does not remove them).
-    pub lease: Option<String>,
+    /// The hold (by its name) that pins the new image before it is recorded
+    /// (the intermediate images of a build: a prune does not remove them).
+    pub hold: Option<String>,
     /// The platform of the image (that of the parent, or of this host,
     /// if none): what a build for a platform makes.
     pub platform: Option<velarx_registry::target::Platform>,
@@ -161,7 +161,7 @@ impl Default for CommitOptions {
             digest: None,
             names: Vec::new(),
             walk: dirtar::Options::default(),
-            lease: None,
+            hold: None,
             platform: None,
             progress: None,
             squash_all: false,
@@ -483,33 +483,55 @@ pub(super) fn new_config(
 }
 
 impl ImageService {
-    /// A lease named `name` of this process, which holds nothing yet.
-    pub async fn take_lease(&self, name: &str) -> ImageResult<velarx_db::Lease> {
-        Ok(velarx_db::Lease::take_items(&self.db, name, Vec::new()).await?)
+    /// A hold for a build of this process, which pins nothing yet: live
+    /// while it exists.
+    pub fn hold_build(&self) -> ImageResult<velarx_content::pull::holds::Hold> {
+        use velarx_content::pull::holds;
+        std::fs::create_dir_all(&self.staging_dir)?;
+        Ok(holds::Hold::create(
+            &self.staging_dir,
+            &holds::new_name("build"),
+        )?)
+    }
+
+    /// Whether a live hold pins the image `id`.
+    pub fn image_is_pinned(&self, id: &str) -> ImageResult<bool> {
+        Ok(velarx_content::pull::holds::pinned(&self.staging_dir)?
+            .images
+            .contains(id))
     }
 
     /// The image the build cache has for a step of key `key` on `parent`
-    /// (an image id, or [`velarx_db::BUILD_SCRATCH`]), taken by the lease
-    /// `lease` first so that a prune leaves it alone.
+    /// (an image id, or [`velarx_db::BUILD_SCRATCH`]), pinned by the hold
+    /// `hold` first so that a prune leaves it alone.
     pub async fn build_cache_get(
         &self,
         parent: &str,
         key: &str,
-        lease: &str,
+        hold: &str,
     ) -> ImageResult<Option<String>> {
         let Some(id) = self.db.build_cache_get(parent, key).await? else {
             return Ok(None);
         };
-        self.db
-            .add_lease_items(
-                lease,
-                vec![(velarx_db::LEASE_IMAGE.to_string(), id.clone())],
-            )
-            .await?;
-        // Removed before the lease took it: not in the cache any more.
+        self.pin_image(hold, id).await
+    }
+
+    /// Pin the image `id` in the hold `hold`, so that a prune leaves it
+    /// alone: the image, or None if it was removed before it was pinned.
+    pub async fn pin_image(&self, hold: &str, id: String) -> ImageResult<Option<String>> {
+        // (a prune removes an image under the exclusive lock, after it asked
+        // the holds: pinned and looked at under the shared one, the image is
+        // either pinned for it or gone)
+        let _store = self.lock_store().await?;
+        velarx_content::pull::holds::pin(
+            &self.staging_dir.join(hold),
+            velarx_content::pull::holds::IMAGE,
+            [&id],
+        )?;
         match self.db.get_image(&id).await {
             Ok(_) => Ok(Some(id)),
-            _ => Ok(None),
+            Err(velarx_types::db::DbError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -542,11 +564,12 @@ impl ImageService {
         loop {
             let lineage = self.db.build_lineage().await?;
             let parents: std::collections::HashSet<&String> = lineage.values().collect();
+            let pinned = velarx_content::pull::holds::pinned(&self.staging_dir)?.images;
             let mut removed = false;
             for id in lineage.keys().filter(|id| !parents.contains(id)) {
                 if self.db.image_is_named(id).await?
                     || self.db.image_has_containers(id).await?
-                    || self.db.is_leased(velarx_db::LEASE_IMAGE, id).await?
+                    || pinned.contains(id.as_str())
                 {
                     continue;
                 }
@@ -557,7 +580,9 @@ impl ImageService {
                     .iter()
                     .map(|l| l.size)
                     .sum();
-                self.remove(id, true).await?;
+                if self.remove_unless_pinned(id).await?.is_none() {
+                    continue;
+                }
                 deleted.push(id.clone());
                 space += size.max(0) as u64;
                 removed = true;
@@ -788,9 +813,9 @@ impl ImageService {
             reach: Default::default(),
             seal: true,
             states: true,
-            // leased before it is recorded, under the store lock: there is
+            // pinned before it is recorded, under the store lock: there is
             // no time when a prune could take it
-            lease: opts.lease.clone(),
+            hold: opts.hold.clone(),
             pulled: Vec::new(),
             indexes: Vec::new(),
             access: None,
