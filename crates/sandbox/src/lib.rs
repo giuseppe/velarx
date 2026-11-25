@@ -28,6 +28,7 @@
 //! error, and the pull fails.
 
 pub mod fetch;
+pub mod resolver;
 pub mod tunables;
 
 use landlock::{AccessFs, AccessNet, ABI};
@@ -229,6 +230,26 @@ pub(crate) fn ensure_daemon_present(socket: BorrowedFd<'_>) -> Result<(), String
     Ok(())
 }
 
+/// Become `nobody`, with no supplementary group, when the process is root
+/// of the host (whether it did: the capabilities went with root).
+pub(crate) fn become_nobody() -> Result<bool, String> {
+    if !rustix::process::geteuid().is_root()
+        || velarx_base::ids::in_user_namespace().map_err(|e| e.to_string())?
+    {
+        return Ok(false);
+    }
+    let nobody = (
+        rustix::process::Uid::from_raw(NOBODY),
+        rustix::process::Gid::from_raw(NOBODY),
+    );
+    rustix::thread::set_thread_groups(&[]).map_err(|e| format!("setgroups: {e}"))?;
+    rustix::thread::set_thread_res_gid(nobody.1, nobody.1, nobody.1)
+        .map_err(|e| format!("setresgid: {e}"))?;
+    rustix::thread::set_thread_res_uid(nobody.0, nobody.0, nobody.0)
+        .map_err(|e| format!("setresuid: {e}"))?;
+    Ok(true)
+}
+
 /// The user namespace the worker was started in, to tell it left it.
 static OUTER_USERNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -264,19 +285,7 @@ pub(crate) fn user_namespace(required: bool, nobody: bool) -> Result<(), String>
     OUTER_USERNS.store(userns_inode(), std::sync::atomic::Ordering::Relaxed);
     // Root of the host only: in the user namespace of a rootless
     // engine, root is the user already (and nobody may be unmapped).
-    if nobody
-        && rustix::process::geteuid().is_root()
-        && !velarx_base::ids::in_user_namespace().map_err(|e| e.to_string())?
-    {
-        let nobody = (
-            rustix::process::Uid::from_raw(NOBODY),
-            rustix::process::Gid::from_raw(NOBODY),
-        );
-        rustix::thread::set_thread_groups(&[]).map_err(|e| format!("setgroups: {e}"))?;
-        rustix::thread::set_thread_res_gid(nobody.1, nobody.1, nobody.1)
-            .map_err(|e| format!("setresgid: {e}"))?;
-        rustix::thread::set_thread_res_uid(nobody.0, nobody.0, nobody.0)
-            .map_err(|e| format!("setresuid: {e}"))?;
+    if nobody && become_nobody()? {
         // A change of user made the process not dumpable, and its
         // /proc files root's: it could not write its maps.
         // process_limits makes it not dumpable again.
