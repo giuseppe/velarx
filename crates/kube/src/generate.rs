@@ -3,6 +3,7 @@
 //! as podman writes them.  The callers describe what a container was made
 //! with; this module only shapes the documents.
 
+use crate::engine::Error;
 use serde_json::{json, Map, Value};
 
 /// A published port.
@@ -378,7 +379,12 @@ fn pod_spec(pod: &Pod, kind: Kind, service: bool) -> Value {
 
 /// The documents of a pod: the pod or the workload around it, and with
 /// `service` a Service of its published ports.
-pub fn pod_documents(pod: &Pod, kind: Kind, replicas: u32, service: bool) -> Vec<Value> {
+pub fn pod_documents(
+    pod: &Pod,
+    kind: Kind,
+    replicas: u32,
+    service: bool,
+) -> Result<Vec<Value>, Error> {
     let name = dns_label(&pod.name);
     let labels = app_labels(pod);
     let mut meta = Map::new();
@@ -434,15 +440,15 @@ pub fn pod_documents(pod: &Pod, kind: Kind, replicas: u32, service: bool) -> Vec
                 if p.host_port != 0 {
                     m.insert(
                         "nodePort".into(),
-                        json!(node_port(u32::from(p.host_port), &mut used)),
+                        json!(node_port(u32::from(p.host_port), &mut used)?),
                     );
                 }
                 m.insert("port".into(), json!(p.container_port));
                 m.insert("protocol".into(), json!(p.protocol));
                 m.insert("targetPort".into(), json!(p.container_port));
-                Value::Object(m)
+                Ok(Value::Object(m))
             })
-            .collect();
+            .collect::<Result<_, Error>>()?;
         let typ = if ports.iter().any(|p| p.get("nodePort").is_some()) {
             "NodePort"
         } else {
@@ -455,7 +461,7 @@ pub fn pod_documents(pod: &Pod, kind: Kind, replicas: u32, service: bool) -> Vec
             "spec": {"ports": ports, "selector": {"app": name}, "type": typ},
         }));
     }
-    docs
+    Ok(docs)
 }
 
 /// The legal range of a Service's nodePort.
@@ -463,9 +469,13 @@ const NODE_PORTS: std::ops::RangeInclusive<u32> = 30000..=32767;
 
 /// The nodePort for the published port `host`: the port itself when it is a
 /// legal one and free, else the next free one of the range from a place the
-/// port makes (the same YAML for the same pod).
-fn node_port(host: u32, used: &mut std::collections::BTreeSet<u32>) -> u32 {
+/// port makes (the same YAML for the same pod).  It is an error when every
+/// port of the range is taken.
+fn node_port(host: u32, used: &mut std::collections::BTreeSet<u32>) -> Result<u32, Error> {
     let size = NODE_PORTS.end() - NODE_PORTS.start() + 1;
+    if used.len() as u32 == size {
+        return Err(Error::new("every node port of the range is taken"));
+    }
     let first = if NODE_PORTS.contains(&host) {
         host
     } else {
@@ -475,7 +485,7 @@ fn node_port(host: u32, used: &mut std::collections::BTreeSet<u32>) -> u32 {
     while !used.insert(port) {
         port = NODE_PORTS.start() + (port - NODE_PORTS.start() + 1) % size;
     }
-    port
+    Ok(port)
 }
 
 /// The claim of a named volume.
@@ -585,7 +595,7 @@ mod tests {
 
     #[test]
     fn a_pod() {
-        let docs = pod_documents(&web(), Kind::Pod, 1, false);
+        let docs = pod_documents(&web(), Kind::Pod, 1, false).unwrap();
         assert_eq!(docs.len(), 1);
         let d = &docs[0];
         assert_eq!(
@@ -659,7 +669,7 @@ mod tests {
 
     #[test]
     fn workloads_and_a_service() {
-        let docs = pod_documents(&web(), Kind::Deployment, 3, true);
+        let docs = pod_documents(&web(), Kind::Deployment, 3, true).unwrap();
         assert_eq!(docs.len(), 2);
         let d = &docs[0];
         assert_eq!(
@@ -682,14 +692,14 @@ mod tests {
         );
         assert_eq!(s["spec"]["selector"], json!({"app": "web-pod"}));
 
-        let job = &pod_documents(&web(), Kind::Job, 1, false)[0];
+        let job = &pod_documents(&web(), Kind::Job, 1, false).unwrap()[0];
         assert_eq!(
             (job["apiVersion"].as_str(), job["kind"].as_str()),
             (Some("batch/v1"), Some("Job"))
         );
         assert_eq!(job["spec"]["template"]["spec"]["restartPolicy"], "Never");
         assert!(job["spec"].get("selector").is_none());
-        let ds = &pod_documents(&web(), Kind::DaemonSet, 1, false)[0];
+        let ds = &pod_documents(&web(), Kind::DaemonSet, 1, false).unwrap()[0];
         assert_eq!(ds["kind"], "DaemonSet");
         assert!(ds["spec"].get("replicas").is_none());
         assert_eq!("job".parse::<Kind>(), Ok(Kind::Job));
@@ -699,13 +709,23 @@ mod tests {
     #[test]
     fn node_ports_are_in_the_range_of_a_service() {
         let mut used = std::collections::BTreeSet::new();
-        assert_eq!(node_port(31000, &mut used), 31000);
+        assert_eq!(node_port(31000, &mut used).unwrap(), 31000);
         // a taken one, and a port outside the range, give the next free
-        assert_eq!(node_port(31000, &mut used), 31001);
-        assert_eq!(node_port(8181, &mut used), 32645);
-        assert_eq!(node_port(65535, &mut used), 30000 + 65535 % 2768);
+        assert_eq!(node_port(31000, &mut used).unwrap(), 31001);
+        assert_eq!(node_port(8181, &mut used).unwrap(), 32645);
+        assert_eq!(node_port(65535, &mut used).unwrap(), 30000 + 65535 % 2768);
         let mut used: std::collections::BTreeSet<u32> = (30000..=32766).collect();
-        assert_eq!(node_port(1, &mut used), 32767);
+        assert_eq!(node_port(1, &mut used).unwrap(), 32767);
+        assert!(node_port(1, &mut used).is_err());
+    }
+
+    #[test]
+    fn the_last_node_port_is_given_and_the_next_one_is_an_error() {
+        let mut used = std::collections::BTreeSet::new();
+        for n in 0..2768 {
+            node_port(n, &mut used).unwrap();
+        }
+        assert!(node_port(0, &mut used).is_err());
     }
 
     #[test]

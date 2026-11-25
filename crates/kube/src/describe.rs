@@ -290,7 +290,7 @@ pub async fn generate(engine: &Engine, names: &[String], opts: &GenerateOptions)
                 kind,
                 replicas,
                 service,
-            ));
+            )?);
         } else if let Some(c) = engine.container(name).await? {
             containers.push(c);
         } else if let Some(v) = engine.volume(name).await? {
@@ -318,7 +318,7 @@ pub async fn generate(engine: &Engine, names: &[String], opts: &GenerateOptions)
             kind,
             replicas,
             service,
-        ));
+        )?);
     }
     Ok(gen::to_yaml(&docs))
 }
