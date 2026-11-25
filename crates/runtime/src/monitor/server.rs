@@ -338,7 +338,7 @@ pub struct Monitor {
     /// A zombie that is not ours to reap was in the way: look again.
     reap_pending: bool,
     /// The restarts made by the restart policy.
-    restart_count: u32,
+    restarts: super::restart::Restarts,
     /// The exit of a run that is followed by a restart.
     restart: Option<PendingRestart>,
     /// The run was started by the restart policy.
@@ -758,7 +758,7 @@ fn run(dir_path: &Path, launch: Launch<'_>) -> io::Result<i32> {
 
     let logger = open_logger(&cfg)?;
     let cfg_stall_ms = cfg.client_stall_ms;
-    let restart_count = cfg.restart.count;
+    let restarts = super::restart::Restarts::after(cfg.restart.count);
 
     // (`--rm` removes its anonymous volumes)
     let plan = proto::ExitPlan {
@@ -825,7 +825,7 @@ fn run(dir_path: &Path, launch: Launch<'_>) -> io::Result<i32> {
         run_deadline: None,
         timed_out: false,
         reap_pending: false,
-        restart_count,
+        restarts,
         restart: None,
         restarted: false,
         pinned: Default::default(),
@@ -1415,7 +1415,7 @@ impl Monitor {
             exit: self.exit.clone(),
             oom: self.oom,
             health: self.tracker.as_ref().map(|t| t.health.clone()),
-            restart_count: self.restart_count,
+            restart_count: self.restarts.total,
             restarting: self.restart.as_ref().map(|r| r.exit.clone()),
             settled: self.settled_told.clone(),
         }
@@ -1934,7 +1934,7 @@ impl Monitor {
         self.broadcast_event(&Event::Started {
             pid,
             started_ns,
-            restart_count: self.restart_count,
+            restart_count: self.restarts.total,
             restarted,
         });
     }
@@ -2900,13 +2900,10 @@ impl Monitor {
     /// its restart policy says so.
     fn schedule_restart(&mut self) -> bool {
         let info = self.exit_info();
-        if self
-            .started_at
-            .is_some_and(|t| t.elapsed() >= super::restart::RESET_AFTER)
-        {
-            self.restart_count = 0;
+        if let Some(t) = self.started_at {
+            self.restarts.ended(t.elapsed());
         }
-        if !super::restart::should_restart(&self.cfg.restart, &info, self.restart_count) {
+        if !super::restart::should_restart(&self.cfg.restart, &info, self.restarts.total) {
             return false;
         }
         if let Err(e) = self.logger.finish() {
@@ -2924,11 +2921,10 @@ impl Monitor {
         self.out_r = None;
         self.err_r = None;
         self.pty = None;
-        let delay = super::restart::delay(self.restart_count);
-        self.restart_count += 1;
+        let delay = self.restarts.count();
         diag(&format!(
             "the container exited with {}: restart {} in {delay:?}",
-            info.code, self.restart_count
+            info.code, self.restarts.total
         ));
         self.restart = Some(PendingRestart {
             exit: info.clone(),
@@ -2937,7 +2933,7 @@ impl Monitor {
         self.state = RunState::Exited;
         self.broadcast_event(&Event::Restarting {
             exit: info.clone(),
-            restart_count: self.restart_count,
+            restart_count: self.restarts.total,
         });
         // The clients attached to this run are told it is over, as when the
         // monitor ends.

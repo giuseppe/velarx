@@ -15,9 +15,46 @@ use std::time::Duration;
 use velarx_wire::monitor::proto::ExitInfo;
 use velarx_wire::monitor::proto::{RestartPolicy, RestartSettings};
 
-/// How long a run has to last to count as a success: the number of restarts
-/// starts again from zero.
+/// How long a run has to last to count as a success: the wait before the
+/// next restart starts again from the shortest.  The restarts made still
+/// count against the limit of the policy.
 pub const RESET_AFTER: Duration = Duration::from_secs(10);
+
+/// The restarts made by the restart policy.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Restarts {
+    /// All of them: what `on-failure:N` limits and what is reported.
+    pub total: u32,
+    /// Those since the last run that lasted `RESET_AFTER`: what the wait
+    /// before the next restart grows with.
+    since_success: u32,
+}
+
+impl Restarts {
+    /// The restarts of a monitor that starts after `total` of them (all of
+    /// them since a success, as nothing says otherwise).
+    pub fn after(total: u32) -> Self {
+        Restarts {
+            total,
+            since_success: total,
+        }
+    }
+
+    /// The run that ended lasted `ran`.
+    pub fn ended(&mut self, ran: Duration) {
+        if ran >= RESET_AFTER {
+            self.since_success = 0;
+        }
+    }
+
+    /// Count a restart and return the wait before it.
+    pub fn count(&mut self) -> Duration {
+        let wait = delay(self.since_success);
+        self.since_success += 1;
+        self.total += 1;
+        wait
+    }
+}
 
 /// What the monitor does when the container exits.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -42,7 +79,7 @@ impl RestartConfig {
 }
 
 /// Whether the restart policy starts the container again after this exit,
-/// `restarts` restarts after the last run that counted as a success.
+/// `restarts` restarts made so far.
 pub fn should_restart(cfg: &RestartConfig, info: &ExitInfo, restarts: u32) -> bool {
     if info.stop_requested {
         return false;
@@ -209,6 +246,29 @@ mod tests {
         assert!(should_restart(&on_failure, &exit(2), 2));
         assert!(!should_restart(&on_failure, &exit(2), 3));
         assert!(should_restart(&policy("on-failure", 0), &exit(2), 100));
+    }
+
+    #[test]
+    fn a_long_run_shortens_the_wait_but_not_the_limit() {
+        let cfg = policy("on-failure", 2);
+        let mut restarts = Restarts::after(0);
+        let mut waits = Vec::new();
+        for _ in 0..5 {
+            restarts.ended(RESET_AFTER + Duration::from_secs(1));
+            if !should_restart(&cfg, &exit(1), restarts.total) {
+                break;
+            }
+            waits.push(restarts.count());
+        }
+        assert_eq!(restarts.total, 2);
+        assert_eq!(waits, [delay(0), delay(0)]);
+        // short runs make the wait grow
+        restarts.ended(Duration::from_secs(1));
+        assert_eq!(restarts.count(), delay(0));
+        restarts.ended(Duration::from_secs(1));
+        assert_eq!(restarts.count(), delay(1));
+        // a new monitor goes on from the restarts made
+        assert_eq!(Restarts::after(3).count(), delay(3));
     }
 
     #[test]

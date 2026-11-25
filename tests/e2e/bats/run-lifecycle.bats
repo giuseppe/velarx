@@ -841,11 +841,16 @@ EOT
 
 }
 
-# A container that runs for a while starts counting again.
-@test "a container that runs for a while starts counting again" {
+# A container that runs for a while waits less before its restart, but
+# its restarts still count against the limit.
+@test "a container that runs for a while is still bound by the limit" {
     sh_ container run -d --name rp6 --restart on-failure:1 --network none "$IMAGE" sh -c 'sleep 12; exit 1' > /dev/null
     wait_restarts rp6 1 40
     check "a long run is restarted" 0 $?
+    # (a window: the second run ends after 12 s, no third may follow)
+    wait_restarts rp6 2 20
+    check "but only up to the limit" 1 $?
+    check "the restarts are counted" 1 "$(field restart_count rp6)"
     sh_ container rm -t 0 -f rp6 > /dev/null
 }
 
