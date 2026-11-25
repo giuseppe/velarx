@@ -1263,7 +1263,6 @@ impl StagedFetch {
         let mut given = vec![false; batch.len()];
         let mut failure: Option<ImageError> = None;
         let mut fatal: Option<ImageError> = None;
-        let last = self.fetchers.len().saturating_sub(1);
         for (at, fetcher) in self
             .fetchers
             .iter()
@@ -1481,7 +1480,8 @@ impl StagedFetch {
                         }
                         // (the next fetcher is asked for them)
                         EventKind::Failed => {
-                            let (err, step) = failed_event(&fetcher.name, at == last, &event);
+                            let (err, step) =
+                                failed_event(&fetcher.name, Some(at) == self.origin, &event);
                             match step {
                                 Step::Next => failure = Some(err),
                                 // (the call is read to its end: the fetcher
@@ -1533,7 +1533,9 @@ impl StagedFetch {
                         format!("it staged {why}"),
                     ))
                 }
-                Err(e) if refused(&e) && at == last => return Err(fetcher_error(&fetcher.name, e)),
+                Err(e) if refused(&e) && Some(at) == self.origin => {
+                    return Err(fetcher_error(&fetcher.name, e))
+                }
                 Err(e) => {
                     self.untell(layer, at, &e);
                     breaker.trip(at, fetcher, &e);
@@ -2596,6 +2598,138 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// A fetcher whose fetch ends with a `failed` event of its class, or,
+    /// with none, is refused as a request.
+    struct Fails(Option<FailureClass>);
+
+    #[async_trait]
+    impl StagingFetcher for Fails {
+        fn described(&self) -> Described {
+            described_for_tests()
+        }
+
+        async fn fetch(
+            &self,
+            _scope: &Scope,
+            _layer: &crate::serve_fetch::LayerScope,
+            call: crate::serve_fetch::FetchCall,
+            out: &Out<Event>,
+        ) -> Result<(), FetcherError> {
+            let Some(class) = self.0 else {
+                return Err(FetcherError::Refused {
+                    reason: "no such request".into(),
+                });
+            };
+            let failure = Failure {
+                class,
+                reason: "it broke".into(),
+            };
+            out.send(Event::failed(
+                (0..call.objects.len() as u32).collect(),
+                failure,
+            ))
+            .await
+            .map_err(|_| FetcherError::failed("gone"))
+        }
+    }
+
+    /// The error of staging one file of a layer from the fetchers `before`
+    /// the registry, the registry `end` and the ones `after` it.
+    async fn failed_walk(
+        before: Vec<(&str, Arc<dyn StagingFetcher>)>,
+        end: Option<Arc<dyn StagingFetcher>>,
+        after: Vec<(&str, Arc<dyn StagingFetcher>)>,
+    ) -> Option<String> {
+        let root = tempfile::tempdir().unwrap();
+        let mut keep = Vec::new();
+        let mut links = |of: Vec<(&str, Arc<dyn StagingFetcher>)>| {
+            of.into_iter()
+                .map(|(name, api)| {
+                    let f = LocalFetcher::start(api, Limits::default()).unwrap();
+                    let link = Link {
+                        name: name.into(),
+                        conn: FetchConn::new(f.connect().unwrap()).unwrap(),
+                        idle: REGISTRY_IDLE,
+                    };
+                    keep.push(f);
+                    link
+                })
+                .collect::<Vec<_>>()
+        };
+        let (before, after) = (links(before), links(after));
+        let registry = end.map(|api| {
+            let f = LocalFetcher::start(api, Limits::default()).unwrap();
+            let conn = FetchConn::new(f.connect().unwrap()).unwrap();
+            keep.push(f);
+            conn
+        });
+        let staged = StagedFetch::open(
+            (before, registry, after),
+            root.path(),
+            false,
+            ("localhost/a", true),
+            Some(b"{}"),
+            &manifest(),
+        )
+        .await
+        .unwrap();
+        let (desc, toc) = layer_and_toc();
+        staged
+            .stage_files(
+                "stem",
+                &desc,
+                (&toc, &toc_z(&toc)),
+                vec![key_of(1)],
+                (Urgency::OnDemand, &|_| {}),
+            )
+            .await
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    /// The registry fetcher is the origin wherever it is in the list: its
+    /// failure fails the pull, the sources after it are not asked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_failure_of_the_registry_fails_the_pull_before_a_source() {
+        let failed = failed_walk(
+            Vec::new(),
+            Some(Arc::new(Fails(Some(FailureClass::Failed)))),
+            vec![("after", Arc::new(Stages))],
+        )
+        .await;
+        assert!(failed.unwrap().contains("it broke"));
+    }
+
+    /// A request the registry fetcher refuses is wrong for every fetcher:
+    /// the sources after it are not asked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_the_registry_refuses_fails_the_pull_before_a_source() {
+        let failed = failed_walk(
+            Vec::new(),
+            Some(Arc::new(Fails(None))),
+            vec![("after", Arc::new(Stages))],
+        )
+        .await;
+        assert!(failed.unwrap().contains("no such request"));
+    }
+
+    /// With no registry fetcher, the failure of the last source is the
+    /// failure of the pull, under its own name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_last_source_fails_the_pull_when_there_is_no_registry() {
+        let failed = failed_walk(
+            vec![("peers", Arc::new(Fails(Some(FailureClass::Failed))))],
+            None,
+            Vec::new(),
+        )
+        .await;
+        let failed = failed.unwrap();
+        assert!(
+            failed.contains("it broke") && failed.contains("peers"),
+            "{failed}"
+        );
     }
 
     /// A layer whose staging was removed (committed) and is fetched again is
