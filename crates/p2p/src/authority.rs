@@ -31,6 +31,8 @@
 //! Nothing falls back to the swarm key: a node with an authority admits
 //! certificates and nothing else.  Every refusal is a typed [`Error`].
 
+use crate::limits::MAX_LISTS_BYTES;
+use crate::protocol::{read_len, Budget};
 use libp2p::identity::{self, Keypair, PeerId};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -44,6 +46,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use tokio::sync::SemaphorePermit;
 use tracing::{debug, info, warn};
 use velarx_revoke_core::{Held, Part};
 
@@ -1210,7 +1213,7 @@ impl Authority {
         &self,
         who: Admitted,
         cert: CertificateDer<'static>,
-        lists: &[String],
+        lists: &[&str],
     ) -> Result<Admitted, Error> {
         self.adopt(&lists.join("\n"));
         let revoked = self
@@ -1363,11 +1366,16 @@ pub enum UpgradeError {
 #[derive(Clone)]
 pub struct Credentialed {
     noise: libp2p::noise::Config,
-    authority: Option<Arc<Authority>>,
+    /// The authority, and the budget of the node in which the lists of a
+    /// peer are read.
+    authority: Option<(Arc<Authority>, Budget)>,
 }
 
 impl Credentialed {
-    pub fn new(noise: libp2p::noise::Config, authority: Option<Arc<Authority>>) -> Self {
+    pub(crate) fn new(
+        noise: libp2p::noise::Config,
+        authority: Option<(Arc<Authority>, Budget)>,
+    ) -> Self {
         Self { noise, authority }
     }
 }
@@ -1417,12 +1425,47 @@ async fn read_part<S: futures::AsyncRead + Unpin>(io: &mut S, max: usize) -> io:
     Ok(data)
 }
 
+/// The lists of a peer: the length of the part (at most
+/// [`MAX_LISTS_BYTES`]), then its bytes, read in the budget of the node
+/// (the permit is held while the lists are used).
+async fn read_lists<'a, S>(
+    io: &mut S,
+    budget: &'a Budget,
+) -> io::Result<(Vec<u8>, SemaphorePermit<'a>)>
+where
+    S: futures::AsyncRead + Unpin + Send,
+{
+    let len = read_len(io, MAX_LISTS_BYTES, "revocation lists").await?;
+    budget.read(io, len).await
+}
+
+/// The texts of a part of lists (each with its length), as they lie in it.
+fn list_texts(mut rest: &[u8]) -> Vec<&str> {
+    let mut texts = Vec::new();
+    while rest.len() >= 4 {
+        let n = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        let Some(text) = rest.get(4..4 + n) else {
+            break;
+        };
+        if let Ok(text) = std::str::from_utf8(text) {
+            texts.push(text);
+        }
+        rest = &rest[4 + n..];
+    }
+    texts
+}
+
 /// Two steps: the certificates, each judged by the other end; then, between
 /// two admitted peers only, the revocation lists (no list is sent to
 /// or read from a peer that was not admitted).
-async fn exchange<S>(authority: &Authority, peer: PeerId, io: &mut S) -> Result<(), UpgradeError>
+async fn exchange<S>(
+    authority: &Authority,
+    budget: &Budget,
+    peer: PeerId,
+    io: &mut S,
+) -> Result<(), UpgradeError>
 where
-    S: futures::AsyncRead + futures::AsyncWrite + Unpin,
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin + Send,
 {
     let deadline = tokio::time::Instant::now() + EXCHANGE;
     let own = authority.own_key();
@@ -1448,12 +1491,17 @@ where
     let cert = CertificateDer::from(cert);
     let who = authority.admit_control(peer, &cert)?;
     let ours = lists_part(authority);
+    // (both ends write before they read: a list larger than the buffers of
+    // the socket is read while it is written)
+    let (mut from, mut to) = futures::AsyncReadExt::split(&mut *io);
     let theirs = async {
-        write_part(io, &ours).await?;
-        read_part(io, crate::limits::MAX_LISTS_BYTES).await
+        let ((), lists) =
+            futures::future::try_join(write_part(&mut to, &ours), read_lists(&mut from, budget))
+                .await?;
+        Ok::<_, io::Error>(lists)
     };
     // (an end that refused this node closes here)
-    let lists = match tokio::time::timeout_at(deadline, theirs).await {
+    let (lists, _held) = match tokio::time::timeout_at(deadline, theirs).await {
         Ok(result) => result?,
         Err(_) => {
             return Err(io::Error::new(
@@ -1463,18 +1511,7 @@ where
             .into())
         }
     };
-    let mut texts = Vec::new();
-    let mut rest = lists.as_slice();
-    while rest.len() >= 4 {
-        let n = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-        let Some(text) = rest.get(4..4 + n) else {
-            break;
-        };
-        if let Ok(text) = std::str::from_utf8(text) {
-            texts.push(text.to_string());
-        }
-        rest = &rest[4 + n..];
-    }
+    let texts = list_texts(&lists);
     authority.admit_lists(who, cert, &texts)?;
     Ok(())
 }
@@ -1493,8 +1530,8 @@ macro_rules! upgrade {
                 Box::pin(async move {
                     let (peer, mut io) =
                         libp2p::core::upgrade::$trait::$method(self.noise, socket, info).await?;
-                    if let Some(authority) = &self.authority {
-                        exchange(authority, peer, &mut io).await?;
+                    if let Some((authority, budget)) = &self.authority {
+                        exchange(authority, budget, peer, &mut io).await?;
                     }
                     Ok((peer, io))
                 })
@@ -1510,6 +1547,7 @@ upgrade!(OutboundConnectionUpgrade, upgrade_outbound);
 pub(crate) mod tests {
     use super::*;
     use crate::ca;
+    use crate::protocol::streams::announcing;
 
     /// An authority in `dir/ca` and a node certified by it.
     pub(crate) struct Swarm {
@@ -1910,6 +1948,97 @@ pub(crate) mod tests {
         assert!(part.len() > list.text().len());
     }
 
+    /// The part of lists of a handshake, as the other end writes it.
+    fn part_of(lists: &[&str]) -> Vec<u8> {
+        let mut part = Vec::new();
+        for text in lists {
+            part.extend_from_slice(&(text.len() as u32).to_be_bytes());
+            part.extend_from_slice(text.as_bytes());
+        }
+        part
+    }
+
+    /// A part that announces more than the lists may be is refused with
+    /// only its length read (the stream panics on a further read).
+    #[tokio::test]
+    async fn a_part_of_lists_larger_than_the_most_is_refused_unread() {
+        let budget = Budget::new(MAX_LISTS_BYTES);
+        let mut io = announcing(MAX_LISTS_BYTES as u32 + 1);
+        let err = read_lists(&mut io, &budget).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(budget.free(), MAX_LISTS_BYTES);
+        // the most is accepted: its first piece is taken and the rest awaited
+        let mut io = announcing(MAX_LISTS_BYTES as u32);
+        io.stalls = true;
+        let mut reading = Box::pin(read_lists(&mut io, &budget));
+        assert!(futures::poll!(reading.as_mut()).is_pending());
+        drop(reading);
+        assert_eq!(budget.free(), MAX_LISTS_BYTES);
+    }
+
+    /// The lists of a handshake are read in the budget of the node: while
+    /// it is held, a part waits and gives up, and the budget is whole again
+    /// after.
+    #[tokio::test(start_paused = true)]
+    async fn the_lists_of_a_handshake_wait_for_room_in_the_budget() {
+        let budget = Budget::new(100);
+        let (_, held) = budget
+            .read(&mut futures::io::Cursor::new([0; 60]), 60)
+            .await
+            .unwrap();
+        let part = part_of(&["x".repeat(50).as_str()]);
+        let mut wire = (part.len() as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(&part);
+        let err = read_lists(&mut futures::io::Cursor::new(wire.clone()), &budget)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(budget.free(), 40);
+        drop(held);
+        let (lists, permit) = read_lists(&mut futures::io::Cursor::new(wire), &budget)
+            .await
+            .unwrap();
+        assert_eq!(lists, part);
+        assert_eq!(budget.free(), 100 - part.len());
+        drop(permit);
+        assert_eq!(budget.free(), 100);
+    }
+
+    /// Two genuine lists of two authorities are read and both are adopted;
+    /// the bytes read are held while they are used, and given back after.
+    #[tokio::test]
+    async fn two_lists_of_two_authorities_are_read_and_adopted() {
+        let first = Swarm::new();
+        let second = Swarm::new();
+        let a = first.node("a", None, Role::Both);
+        let b = first.node("b", None, Role::Both);
+        let bundle = format!(
+            "{}{}",
+            std::fs::read_to_string(first.ca().join("ca.crt")).unwrap(),
+            std::fs::read_to_string(second.ca().join("ca.crt")).unwrap()
+        );
+        std::fs::write(&a.config.ca_path, bundle).unwrap();
+        let authority = a.authority();
+        let b_id = b.key.public().to_peer_id();
+        let who = authority.admit_control(b_id, &b.der()).unwrap();
+        let one = ca::revoke(&first.ca(), &[PeerId::random()]).unwrap();
+        let two = ca::revoke(&second.ca(), &[PeerId::random(), PeerId::random()]).unwrap();
+        let part = part_of(&[one.text(), two.text()]);
+        let mut wire = (part.len() as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(&part);
+        let budget = Budget::new(MAX_LISTS_BYTES);
+        let (lists, held) = read_lists(&mut futures::io::Cursor::new(wire), &budget)
+            .await
+            .unwrap();
+        assert_eq!(budget.free(), MAX_LISTS_BYTES - part.len());
+        let texts = list_texts(&lists);
+        assert_eq!(texts, [one.text(), two.text()]);
+        authority.admit_lists(who, b.der(), &texts).unwrap();
+        assert_eq!(authority.revoked_count(), 3);
+        drop(held);
+        assert_eq!(budget.free(), MAX_LISTS_BYTES);
+    }
+
     #[test]
     fn a_list_must_be_signed_by_an_authority_of_the_node() {
         let ours = Swarm::new();
@@ -2134,7 +2263,7 @@ pub(crate) mod tests {
         let list = ca::revoke(&swarm.ca(), &[b_id]).unwrap();
         assert_eq!(
             authority
-                .admit_lists(who, b.der(), &[list.text().to_string()])
+                .admit_lists(who, b.der(), &[list.text()])
                 .unwrap_err(),
             Error::Revoked(b_id)
         );

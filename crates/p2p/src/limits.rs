@@ -15,10 +15,20 @@ const _: () = assert!(MAX_ITEM_BYTES <= MAX_RESPONSE_PAYLOAD);
 /// The largest message of the gossip on the wire, and of an answer to one.
 pub const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
+/// The most one gossip message may be for a node with no authority, which
+/// never takes a list: the base64 text of a whole filter (`MAX_FILTER_BYTES`
+/// of the receiving node, counted as `full_text_ok` does: 5,592,408 bytes),
+/// and a frame ([`MAX_REQUEST_BYTES`]) for what is around it; every message
+/// without lists fits in the frame alone.  7,689,560 bytes.
+pub const MAX_GOSSIP_BYTES: usize =
+    velarx_recv_core::MAX_FILTER_BYTES / 3 * 4 + 4 + MAX_REQUEST_BYTES;
+const _: () = assert!(MAX_GOSSIP_BYTES < MAX_LISTS_BYTES);
+
 /// The largest revocation lists on the wire, in a handshake or in a gossip
 /// message: the lists go whole, so that a revoked peer is never let in by a
 /// node that was not told.  The bound only keeps a length field from asking
-/// for more; the bytes are read as they come.
+/// for more; the bytes are read as they come, in pieces taken from the
+/// budget of the node (of this size) that the handshake and the gossip share.
 pub const MAX_LISTS_BYTES: usize = 1 << 30;
 
 /// Whether `s` is a digest this node can name: the hash of content (sha256

@@ -516,6 +516,16 @@ impl P2PNode {
     pub async fn with_config(config: P2PConfig) -> P2PResult<Self> {
         let (psk, quic_auth) = Self::swarm_key(&config)?;
         let authority = config.authority.clone();
+        // (the bytes of the bodies read from peers: the gossip and the lists of
+        // a handshake)
+        let budget = protocol::Budget::new(limits::MAX_LISTS_BYTES);
+        // (a node with no authority never takes a list: no message of lists)
+        let most = if authority.is_some() {
+            limits::MAX_LISTS_BYTES
+        } else {
+            limits::MAX_GOSSIP_BYTES
+        };
+        let gossip_budget = budget.clone();
         let listen = multiaddrs("listen address", &config.listen_addrs)?;
         let bootstrap = multiaddrs("bootstrap peer", &config.bootstrap_peers)?;
         let idle_timeout = config.idle_timeout;
@@ -573,8 +583,10 @@ impl P2PNode {
             .with_tokio()
             .with_other_transport(
                 move |key| -> Result<_, Box<dyn std::error::Error + Send + Sync>> {
-                    let noise_config =
-                        authority::Credentialed::new(noise::Config::new(key)?, authority.clone());
+                    let noise_config = authority::Credentialed::new(
+                        noise::Config::new(key)?,
+                        authority.clone().map(|a| (a, budget)),
+                    );
                     let base_transport = dial_filter::Filtered::new(
                         tcp::tokio::Transport::new(tcp::Config::default().nodelay(true)),
                         dial_for_transport,
@@ -630,7 +642,8 @@ impl P2PNode {
                             .with_timeout(PING_TIMEOUT),
                     );
 
-                    let gossip = request_response::Behaviour::new(
+                    let gossip = request_response::Behaviour::with_codec(
+                        GossipCodec::new(gossip_budget, most),
                         [(GOSSIP_PROTOCOL, ProtocolSupport::Full)],
                         request_response::Config::default().with_request_timeout(GOSSIP_TIMEOUT),
                     );

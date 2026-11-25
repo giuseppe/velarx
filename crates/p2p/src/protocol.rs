@@ -448,6 +448,62 @@ mod tests {
         .is_err());
     }
 
+    /// The bound of a node with no authority: a message that announces more
+    /// is refused with only its length read, a larger one is not written,
+    /// and the largest messages a node makes fit.
+    #[tokio::test]
+    async fn test_a_node_with_no_authority_bounds_a_message_by_what_it_makes() {
+        use crate::filter::{FilterDelta, FilterFull, MAX_DELTA_KEYS};
+        use crate::limits::MAX_GOSSIP_BYTES;
+        use base64::Engine;
+        let mut codec = GossipCodec::new(Budget::new(MAX_LISTS_BYTES), MAX_GOSSIP_BYTES);
+        let refused = codec
+            .read_request(
+                &GOSSIP_PROTOCOL,
+                &mut announcing(MAX_GOSSIP_BYTES as u32 + 1),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
+        let lists = GossipMessage::Revocations {
+            lists: vec!["x".repeat(MAX_GOSSIP_BYTES)],
+        };
+        let mut wire = Vec::new();
+        let refused = codec
+            .write_request(&GOSSIP_PROTOCOL, &mut wire, lists)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
+        assert!(wire.is_empty());
+        // the largest filter, every field at its largest, and the largest delta
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let filter = GossipMessage::LayerFilter(FilterFull {
+            epoch: u64::MAX,
+            version: u64::MAX,
+            salt: u64::MAX,
+            hashes: velarx_recv_core::MAX_HASHES,
+            keys: u32::MAX,
+            bits: b64.encode(vec![0xffu8; velarx_recv_core::MAX_FILTER_BYTES]),
+        });
+        let delta = GossipMessage::LayerFilterDelta(FilterDelta {
+            epoch: u64::MAX,
+            from: u64::MAX - 1,
+            to: u64::MAX,
+            added: b64.encode(vec![0xffu8; MAX_DELTA_KEYS * 8]),
+        });
+        for message in [filter, delta] {
+            let mut wire = Vec::new();
+            codec
+                .write_request(&GOSSIP_PROTOCOL, &mut wire, message)
+                .await
+                .unwrap();
+            codec
+                .read_request(&GOSSIP_PROTOCOL, &mut futures::io::Cursor::new(wire))
+                .await
+                .unwrap();
+        }
+    }
+
     /// A peer that announces the most and sends nothing holds one piece,
     /// not the budget: the message of another peer is read meanwhile, and
     /// the piece is given back when the reading is dropped.

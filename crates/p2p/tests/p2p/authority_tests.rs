@@ -6,10 +6,11 @@
 
 use super::support::{address, connected_within, digest_of, fetch, key, Chunks};
 use libp2p::identity::Keypair;
+use libp2p::PeerId;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use velarx_p2p::authority::{Authority, Config, Role};
+use velarx_p2p::authority::{Authority, Config, RevocationList, Role};
 use velarx_p2p::{ca, P2PConfig, P2PNode};
 
 /// The authority of a swarm, in a directory.
@@ -278,6 +279,28 @@ async fn a_revocation_list_of_tens_of_thousands_of_peers_is_handed_over() {
         .expect("the revoked node was not refused")
         .unwrap();
     assert!(!connected_within(&d, &c, Duration::from_millis(200)).await);
+}
+
+/// Two nodes that each hold a list larger than the buffers of a socket (about
+/// 24 MiB) both write it before they read the other's: they still connect.
+#[tokio::test]
+async fn two_nodes_with_a_long_list_each_connect() {
+    let swarm = Swarm::new();
+    let revoked = swarm.dir.path().join("revoked");
+    let peers: Vec<_> = (0..400_000).map(|_| PeerId::random()).collect();
+    // (signed here: `ca::revoke` checks each peer against those before it)
+    let key = Keypair::from_protobuf_encoding(&std::fs::read(swarm.ca().join("ca.key")).unwrap())
+        .unwrap()
+        .try_into_ed25519()
+        .unwrap();
+    let list = RevocationList::sign(&key, 1, 1, &peers);
+    assert!(list.text().len() > 20 << 20);
+    std::fs::write(&revoked, list.text()).unwrap();
+    let ma = swarm.member("a", Role::Both, Some(&revoked));
+    let mb = swarm.member("b", Role::Both, Some(&revoked));
+    let (a, b) = (node(&ma, None).await, node(&mb, None).await);
+    b.dial(address(&a).await).await.unwrap();
+    assert!(connected_within(&b, &a, Duration::from_secs(15)).await);
 }
 
 #[tokio::test]
