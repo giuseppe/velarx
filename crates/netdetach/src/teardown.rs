@@ -481,7 +481,7 @@ struct ProviderNames {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub fn detach(dir: &Path) -> Detach {

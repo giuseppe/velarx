@@ -116,11 +116,15 @@ impl Detach {
 
     /// Tear down the slot whose metadata was renamed to CLAIM.
     pub fn pool_drain_slot(&self, a: &impl Access, slot: &str, claim: &Path) {
-        let meta: Option<Meta> = fs::read(claim)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok());
         let path = self.slot_path(slot);
         if path.exists() {
+            let meta = fs::read(claim)
+                .map_err(|e| e.to_string())
+                .and_then(|b| serde_json::from_slice::<Meta>(&b).map_err(|e| e.to_string()))
+                .map_err(|e| {
+                    warn!("tear down the pooled namespace {slot}: claim unusable, skipped: {e}");
+                })
+                .ok();
             let opts = self.opts_if_any().unwrap_or_else(|e| {
                 warn!("tear down the pooled namespace {slot}: {e}");
                 None
@@ -134,20 +138,34 @@ impl Detach {
             bridge::unpin_netns(&path);
         }
         let owned = slot.to_string();
-        let _ = a.call(move |c| velarx_db::network_ext::netns_pool_remove(c, &owned));
-        let _ = fs::remove_file(claim);
+        if let Err(e) = a.call(move |c| velarx_db::network_ext::netns_pool_remove(c, &owned)) {
+            warn!("forget the addresses of the pooled namespace {slot}: {e}");
+        }
+        match fs::remove_file(claim) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                warn!("remove {}: {e}", claim.display());
+            }
+            _ => {}
+        }
     }
 
     /// Forget the pooled addresses of the slots that are gone: the run root is
     /// cleared at boot, and a pin ends with the mount namespace of the
     /// command that made it (a rootless pool lasts while one lives).
     pub fn pool_gc(&self, a: &impl Access) {
-        let Ok(slots) = a.call(|c| velarx_db::network_ext::netns_pool_slots(c, None)) else {
-            return;
+        let slots = match a.call(|c| velarx_db::network_ext::netns_pool_slots(c, None)) {
+            Ok(slots) => slots,
+            Err(e) => {
+                warn!("list the pooled namespaces: {e}");
+                return;
+            }
         };
         for s in slots {
             if !bridge::is_nsfs(&self.slot_path(&s)) {
-                let _ = a.call(move |c| velarx_db::network_ext::netns_pool_remove(c, &s));
+                let slot = s.clone();
+                if let Err(e) = a.call(move |c| velarx_db::network_ext::netns_pool_remove(c, &s)) {
+                    warn!("forget the addresses of the pooled namespace {slot}: {e}");
+                }
             }
         }
     }
@@ -270,5 +288,48 @@ mod tests {
             assert_eq!(entry_slot(bad, None), None, "{bad}");
         }
         assert_eq!(random_slot().unwrap().len(), ID_LEN);
+    }
+
+    /// A claim that cannot be read skips the teardown in the namespace, not
+    /// the rest: the pin, the addresses and the claim go.
+    #[test]
+    fn a_slot_with_a_bad_claim_is_still_drained() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = crate::teardown::tests::detach(dir.path());
+        let db = dir.path().join("db.sqlite");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                velarx_db::Database::open(&db)
+                    .await
+                    .unwrap()
+                    .close()
+                    .await
+                    .unwrap();
+            });
+        let store = velarx_db::sync::Store::open(&db).unwrap();
+        let slot = "fedcba9876543210";
+        store
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO netns_pool (slot, network_id, idx, ip) VALUES (?1, 'n', 0, '10.0.0.2')",
+                    [slot],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        fs::create_dir_all(&d.pool_dir).unwrap();
+        fs::write(d.slot_path(slot), "").unwrap();
+        let claim = d.claim_path(slot);
+        fs::write(&claim, "{not json").unwrap();
+        d.pool_drain_slot(&store, slot, &claim);
+        assert!(!d.slot_path(slot).exists());
+        assert!(!claim.exists());
+        let left = store
+            .call(|c| velarx_db::network_ext::netns_pool_slots(c, None))
+            .unwrap();
+        assert!(left.is_empty(), "{left:?}");
     }
 }
