@@ -450,7 +450,7 @@ PY
     wait $events_pid 2> /dev/null
     out=$(grep evc "$WORKDIR/events" | tr '\n' ',')
     # the remove event has the last exit code, as podman's
-    check "events stream" "container create evc 0,container start evc 0,container died evc 3,container remove evc 3," "$out"
+    check "events stream" "container create evc 0,container init evc 0,container start evc 0,container died evc 3,container remove evc 3," "$out"
     out=$(pm events --stream=false --since 1m --filter event=died --filter container=evc --format '{{.Name}}')
     check "events history with filters" "evc" "$out"
     # every --rm run has its died event, once, before its removal
@@ -541,8 +541,8 @@ PY
     wait "$cevp" 2> /dev/null
     out=$(pm events --stream=false --since "$since" --format '{{.Type}} {{.Status}} {{.Name}}' |
         grep -E 'cev(img|vol|net|pod)?( |:|$)' | tr '\n' ',')
-    for want in "container create cev" "container start cev" "container kill cev" "container stop cev" \
-        "container died cev" "container remove cev" "image tag" "image untag" "volume create cevvol" \
+    for want in "container create cev" "container init cev" "container start cev" "container kill cev" \
+        "container died cev" "container cleanup cev" "container remove cev" "image tag" "image untag" "volume create cevvol" \
         "volume remove cevvol" "network create cevnet" "network remove cevnet" "pod create cevpod" \
         "pod remove cevpod"; do
         check_match "the CLI's event: $want" "$want" "$out"
