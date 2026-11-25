@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-addr-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Which network addresses are local: this machine, a private network or a cloud metadata service"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on the bytes of an address: no dependency, no I/O.  The
+# shell that parses the URLs and the literals, resolves the names and keeps
+# the policy of a registry is the registry client (`velarx-registry`,
+# netpolicy.rs).
+
+[lib]
+name = "velarx_addr_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

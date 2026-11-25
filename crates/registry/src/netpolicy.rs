@@ -6,10 +6,10 @@
 //! is made, on the addresses that are connected to, so that a name that
 //! changes its answer cannot get round the check.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
-/// Whether `host` names this machine or a private network (loopback,
-/// RFC 1918, shared address space, link-local, unique local, `localhost`).
+/// Whether `host` names this machine or a private network (an address of
+/// the table of `velarx_addr_core`, or `localhost`).
 pub(crate) fn local_host(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     match bare.parse::<IpAddr>() {
@@ -21,29 +21,12 @@ pub(crate) fn local_host(host: &str) -> bool {
     }
 }
 
-/// Whether `ip` is of this machine or of a private network, which includes
-/// the addresses of the metadata services of the clouds (link-local,
-/// shared address space, unique local).
+/// Whether `ip` is local (see `velarx_addr_core`): of this machine, of a
+/// private network or of a metadata service of a cloud.
 pub(crate) fn local_ip(ip: IpAddr) -> bool {
-    let v4 = |a: Ipv4Addr| {
-        a.is_loopback()
-            || a.is_private()
-            || a.is_link_local()
-            || a.is_unspecified()
-            || a.is_broadcast()
-            || a.octets()[0] == 0
-            || (a.octets()[0] == 100 && a.octets()[1] & 0xc0 == 0x40)
-    };
     match ip {
-        IpAddr::V4(a) => v4(a),
-        IpAddr::V6(a) => {
-            let first = a.segments()[0];
-            a.is_loopback()
-                || a.is_unspecified()
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80
-                || a.to_ipv4_mapped().is_some_and(v4)
-        }
+        IpAddr::V4(a) => velarx_addr_core::local_v4(a.octets()),
+        IpAddr::V6(a) => velarx_addr_core::local_v6(a.octets()),
     }
 }
 
@@ -208,5 +191,78 @@ mod tests {
         }
         assert!(local_host("localhost") && local_host("[::1]") && local_host("a.localhost."));
         assert!(!local_host("quay.io"));
+    }
+
+    /// What `local_ip` answers for addresses that are not plainly public or
+    /// private: the ones that lead to a local IPv4 address, or are not
+    /// public unicast addresses, are local too.
+    #[test]
+    fn the_odd_addresses_are_told_apart() {
+        let rows = [
+            // (address, answered local)
+            ("::ffff:169.254.169.254", true),
+            ("::ffff:8.8.8.8", false),
+            // the translated form
+            ("::ffff:0:a9fe:a9fe", true),
+            ("::ffff:0:808:808", false),
+            // NAT64 of the metadata address
+            ("64:ff9b::a9fe:a9fe", true),
+            // NAT64 of the loopback
+            ("64:ff9b::7f00:1", true),
+            ("64:ff9b::808:808", false),
+            // 6to4 of the metadata address
+            ("2002:a9fe:a9fe::1", true),
+            // 6to4 of a private address
+            ("2002:0a00:0001::1", true),
+            ("2002:0808:0808::1", false),
+            // IPv4-compatible metadata address
+            ("::169.254.169.254", true),
+            // IPv4-compatible private address
+            ("::10.0.0.1", true),
+            ("::8.8.8.8", false),
+            // site-local
+            ("fec0::1", true),
+            // multicast, v6
+            ("ff02::1", true),
+            // multicast, v4
+            ("224.0.0.1", true),
+            // reserved, v4
+            ("240.0.0.1", true),
+            ("255.255.255.255", true),
+            ("0.0.0.0", true),
+            ("::", true),
+            // special-purpose block
+            ("192.0.0.8", true),
+            // benchmarking
+            ("198.18.0.1", true),
+            // Teredo
+            ("2001:0:4136:e378:8000:63bf:3fff:fdd2", true),
+            // NAT64 local-use prefix
+            ("64:ff9b:1::1", true),
+            ("100.64.0.1", true),
+            ("100.127.255.255", true),
+            ("100.128.0.0", false),
+            ("172.32.0.1", false),
+            ("fd00::1", true),
+            ("fe80::1", true),
+            ("2606:4700::1111", false),
+            ("192.0.1.1", false),
+            ("192.0.2.1", true),
+            ("198.51.100.7", true),
+            ("203.0.113.9", true),
+            ("168.63.129.16", true),
+            ("168.63.129.17", false),
+            ("100::1", true),
+            ("2001:2::1", true),
+            ("2001:db8::1", true),
+            ("2001:3::1", false),
+            ("198.20.0.1", false),
+            ("223.255.255.255", false),
+            ("2001:4860::8888", false),
+            ("fbff::1", false),
+        ];
+        for (a, answered) in rows {
+            assert_eq!(local_ip(a.parse().unwrap()), answered, "{a}");
+        }
     }
 }
