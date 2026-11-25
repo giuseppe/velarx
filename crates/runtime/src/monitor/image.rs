@@ -871,22 +871,17 @@ mod imp {
                 );
                 // nodev, as a composefs root, and no peer of the mount of the
                 // directory: what is mounted in one is not in the other
-                let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
-                let line = |p: &Path| {
-                    info.lines()
-                        .rfind(|l| l.split(' ').nth(4) == Some(p.to_str().unwrap()))
-                        .unwrap_or_else(|| panic!("{} is not mounted: {info}", p.display()))
-                        .to_string()
+                let table = velarx_sys::statmount::table().unwrap();
+                let mount = |p: &Path| {
+                    table
+                        .iter()
+                        .rfind(|m| m.point.as_deref() == Some(p))
+                        .unwrap_or_else(|| panic!("{} is not mounted", p.display()))
                 };
-                let (src, dst) = (line(d.path()), line(&target));
-                assert!(dst.split(' ').nth(5).unwrap().contains("nodev"), "{dst}");
-                let peer = |l: &str| {
-                    l.split(' ')
-                        .find(|f| f.starts_with("shared:"))
-                        .map(str::to_string)
-                };
-                assert!(peer(&src).is_some(), "{src}");
-                assert_ne!(peer(&src), peer(&dst), "{src}\n{dst}");
+                let (src, dst) = (mount(d.path()), mount(&target));
+                assert!(dst.attr & libc::MOUNT_ATTR_NODEV != 0, "{dst:?}");
+                assert_ne!(src.peer_group, 0, "{src:?}");
+                assert_ne!(src.peer_group, dst.peer_group, "{src:?}\n{dst:?}");
                 std::fs::create_dir_all(target.join("mnt")).unwrap();
                 rustix::mount::mount(
                     "tmpfs",

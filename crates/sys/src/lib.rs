@@ -34,6 +34,7 @@ pub mod selftest;
 pub mod signal;
 pub mod spawn;
 pub mod spawner;
+pub mod statmount;
 pub mod system;
 pub mod time;
 pub mod tty;

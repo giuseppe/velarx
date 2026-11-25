@@ -2317,14 +2317,28 @@ impl StorageDriver for ComposefsDriver {
         Ok(StoppedView::overlay(upper, image))
     }
 
-    /// The mount table of the process says it (`root_is_overlay_of`).
+    /// The root of the process is the root of an overlay that has the
+    /// upper directory of the container among its options (the kernel
+    /// tells the mount of the process's root, as `proc_dir/root` opens it).
     fn is_root_of(&self, w: &Writable, proc_dir: &Path) -> DriverResult<bool> {
-        let mountinfo = std::fs::read_to_string(proc_dir.join("mountinfo"))
-            .map_err(|e| DriverError::io(NAME, e))?;
-        Ok(root_is_overlay_of(
-            &mountinfo,
-            &self.writable_paths(w).upper,
-        ))
+        use rustix::fs::{open, Mode, OFlags};
+        use std::os::fd::AsFd;
+        let io = |e: std::io::Error| DriverError::io(NAME, e);
+        let root = open(
+            proc_dir.join("root"),
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| io(e.into()))?;
+        // (a process that is chrooted below the root of a mount is not
+        // the root of it)
+        if !velarx_sys::statmount::is_mount_root(root.as_fd()).map_err(io)? {
+            return Ok(false);
+        }
+        let mount = velarx_sys::statmount::of_fd(root.as_fd()).map_err(io)?;
+        let mut upper = std::ffi::OsString::from("upperdir=");
+        upper.push(self.writable_paths(w).upper);
+        Ok(mount.fs_type == "overlay" && mount.options.contains(&upper))
     }
 
     fn usage(&self) -> DriverResult<Usage> {
@@ -2401,24 +2415,6 @@ fn set_root(
         },
     )
     .map_err(|e| context("time", e))
-}
-
-/// Whether the root of the process whose mount table is `mountinfo` is the
-/// overlay with the upper directory `upper`: the last mount of `/` is an
-/// overlay with `upperdir=` that directory among its options (the kernel
-/// writes the path escaped, as every mount table does; an option is
-/// compared whole).
-fn root_is_overlay_of(mountinfo: &str, upper: &Path) -> bool {
-    let want = format!("upperdir={}", upper.display());
-    velarx_base::mountinfo::parse(mountinfo)
-        .into_iter()
-        .rfind(|m| m.point == Path::new("/"))
-        .is_some_and(|m| {
-            m.fs_type == "overlay"
-                && m.super_options
-                    .split(',')
-                    .any(|o| velarx_base::mountinfo::unescape(o) == want)
-        })
 }
 
 /// The temporary files of the composefs directory that are old enough to be
@@ -3350,116 +3346,108 @@ mod tests {
         assert!(d.writable_paths(&other).upper.is_dir());
     }
 
-    /// The root of a process is the container's when the last mount of `/`
-    /// is an overlay with the container's upper directory, as the kernel
-    /// writes the table: escaped, whatever is in the path, and no other
-    /// mount, container or path that only looks like it matches.
-    #[tokio::test]
-    async fn the_root_of_a_container_is_found_in_the_mount_table() {
-        let tmp = tempfile::tempdir().unwrap();
-        let d: Arc<dyn StorageDriver> = Arc::new(driver(tmp.path()).await);
-        let table = |upper: &str| {
-            format!(
-                "22 1 0:21 / /proc rw,nosuid - proc proc rw\n\
-                 23 1 0:57 / / rw,relatime - overlay overlay \
-                 rw,lowerdir+=/x/layers/1,lowerdir+=/x/layers/2,upperdir={upper},\
-                 workdir=/x/work,userxattr\n\
-                 24 23 0:58 / /dev rw - tmpfs tmpfs rw,size=64k\n"
-            )
-        };
-        let on = |bundle: &str, mountinfo: &str| {
-            root_is_overlay_of(
-                mountinfo,
-                &d.writable_paths(&Writable::new("c", bundle)).upper,
-            )
-        };
-        let plain = "/var/lib/velarx/bundles/aa11";
-        assert!(on(plain, &table(&format!("{plain}/overlay/upper"))));
-        // a line as the kernel writes it (a quoted SELinux context with a
-        // comma in it, the layers added one by one, a data directory)
-        let real = format!(
-            "7379 7294 0:136 / / rw,relatime - overlay none \
-             rw,context=\"system_u:object_r:container_file_t:s0:c433,c487\",\
-             lowerdir+=/run/velarx/mon/b90a/fs/image-mapped-7a78/layer1,\
-             datadir+=/data/velarx/objects,upperdir={plain}/overlay/upper,\
-             workdir={plain}/overlay/work,redirect_dir=nofollow,uuid=on,userxattr\n"
-        );
-        assert!(on(plain, &real));
-        // a root that is another container's, or a prefix or an extension
-        // of the path, or the work directory: not the container's
-        for other in [
-            "/var/lib/velarx/bundles/bb22/overlay/upper",
-            "/var/lib/velarx/bundles/aa11/overlay/upper2",
-            "/var/lib/velarx/bundles/aa11/overlay/uppe",
-            "/var/lib/velarx/bundles/aa11x/overlay/upper",
-            "/var/lib/velarx/bundles/aa1/overlay/upper",
-            "/var/lib/velarx/bundles/aa11/overlay/work",
-            "/var/lib/velarx/bundles/aa11/overlay/upper/sub",
-            "/var/lib/velarx/bundles/aa11//overlay/uppers",
-        ] {
-            assert!(!on(plain, &table(other)), "{other}");
-        }
-        // the options are matched whole: a lower directory that names the
-        // upper one is not the upper one
-        let tricky = format!(
-            "23 1 0:57 / / rw - overlay overlay rw,lowerdir=/not/upperdir={plain}/overlay/upper,\
-             upperdir=/else/upper\n"
-        );
-        assert!(!on(plain, &tricky));
-        // spaces, tabs, newlines and backslashes are escaped by the kernel,
-        // and in the options of a mount commas and equal signs too
-        // (`seq_show_option`): an escaped comma does not split the option
-        let odd = "/var/lib/x y/bun\tdles/a\\b/c,upperdir=/d\ne";
-        let escaped = "/var/lib/x\\040y/bun\\011dles/a\\134b/c\\054upperdir\\075/d\\012e";
-        assert!(on(odd, &table(&format!("{escaped}/overlay/upper"))));
-        assert!(!on("/d\ne", &table(&format!("{escaped}/overlay/upper"))));
-        // an unescaped look-alike (a space is the field separator of the
-        // table, and what is written is the octal)
-        assert!(!on(odd, &table(&format!("{odd}/overlay/upperx"))));
-        assert!(!on(odd, &table("/var/lib/x/overlay/upper")));
-        // the last mount of `/` decides, and it must be an overlay
-        let stacked = format!(
-            "1 0 0:1 / / rw - overlay o rw,upperdir={plain}/overlay/upper\n\
-             2 1 0:2 / / rw - tmpfs t rw,upperdir={plain}/overlay/upper\n"
-        );
-        assert!(!on(plain, &stacked));
-        let stacked = format!(
-            "1 0 0:1 / / rw - tmpfs t rw\n\
-             2 1 0:2 / / rw - overlay o rw,upperdir={plain}/overlay/upper\n"
-        );
-        assert!(on(plain, &stacked));
-        // an overlay that is not at `/` is not the root
-        let elsewhere = format!(
-            "1 0 0:1 / / rw - tmpfs t rw\n\
-             2 1 0:2 / /mnt rw - overlay o rw,upperdir={plain}/overlay/upper\n"
-        );
-        assert!(!on(plain, &elsewhere));
-        assert!(!on(plain, ""));
-    }
-
-    /// The driver reads the mount table in the directory of the process in
-    /// `/proc`: this process is not a container's, and a process that is
-    /// gone is an error (its pid was not checked).
+    /// The driver asks the kernel for the root of the process in its
+    /// directory of `/proc`: this process is not a container's, and a
+    /// process that is gone is an error (its pid was not checked).
     #[tokio::test]
     async fn the_root_of_a_process_is_read_in_its_proc_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let d: Arc<dyn StorageDriver> = Arc::new(driver(tmp.path()).await);
         let w = Writable::new("c", tmp.path().join("bundles/c"));
         assert!(!d.is_root_of(&w, Path::new("/proc/self")).unwrap());
-        let proc_dir = tmp.path().join("proc");
-        let err = d.is_root_of(&w, &proc_dir).unwrap_err().into_io();
+        let err = d
+            .is_root_of(&w, &tmp.path().join("proc"))
+            .unwrap_err()
+            .into_io();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        std::fs::create_dir(&proc_dir).unwrap();
-        let upper = d.writable_paths(&w).upper;
-        std::fs::write(
-            proc_dir.join("mountinfo"),
-            format!(
-                "1 0 0:1 / / rw - overlay overlay rw,upperdir={},workdir=/w\n",
-                upper.display()
-            ),
+    }
+
+    /// The root of this process becomes a real overlay (as the kernel
+    /// shows it, with the upper directory among its options) of the
+    /// container whose bundle directory is named `name` (bytes the table
+    /// writes as escapes, or that are not UTF-8): the driver says it is the
+    /// root of that container, and not of another one.  In a process of its
+    /// own, which `in_child` makes.
+    fn the_root_is_the_overlay_of(name: &[u8]) {
+        use rustix::mount::{
+            fsconfig_create, fsconfig_set_fd, fsconfig_set_flag, fsconfig_set_string, fsmount,
+            fsopen, move_mount, FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags,
+        };
+        use std::os::unix::ffi::OsStrExt;
+        if !velarx_base::testing::private_namespace() {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = rt.block_on(driver(tmp.path()));
+        let (lower, root) = (tmp.path().join("lower"), tmp.path().join("root"));
+        for dir in [&lower, &root] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let make = |n: &[u8]| {
+            let w = Writable::new("c", tmp.path().join(std::ffi::OsStr::from_bytes(n)));
+            d.writable_create(&w, None, &WritableOptions::default(), None)
+                .unwrap();
+            w
+        };
+        let mine = make(name);
+        // (another container, and one whose directory starts like it)
+        let others = [make(b"other"), make(&[name, b"2"].concat())];
+        let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+        let fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC).unwrap();
+        let paths = d.writable_paths(&mine);
+        fsconfig_set_string(&fs, c"lowerdir", c(&lower)).unwrap();
+        // (a string would be unescaped by the kernel: a descriptor is the
+        // directory)
+        let dir = |p: &Path| {
+            rustix::fs::open(
+                p,
+                rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap()
+        };
+        fsconfig_set_fd(&fs, c"upperdir", dir(&paths.upper)).unwrap();
+        fsconfig_set_fd(&fs, c"workdir", dir(paths.work.as_ref().unwrap())).unwrap();
+        fsconfig_set_flag(&fs, c"userxattr").unwrap();
+        fsconfig_create(&fs).unwrap();
+        let m = fsmount(&fs, FsMountFlags::FSMOUNT_CLOEXEC, MountAttrFlags::empty()).unwrap();
+        move_mount(
+            &m,
+            "",
+            rustix::fs::CWD,
+            &root,
+            MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
         )
         .unwrap();
-        assert!(d.is_root_of(&w, &proc_dir).unwrap());
+        // (what the process needs of `/proc` stays reachable)
+        std::fs::create_dir(root.join("proc")).unwrap();
+        rustix::mount::mount_bind_recursive("/proc", root.join("proc")).unwrap();
+        rustix::process::chroot(&root).unwrap();
+        std::env::set_current_dir("/").unwrap(); // child-only
+        let proc_dir = Path::new("/proc/self");
+        assert!(d.is_root_of(&mine, proc_dir).unwrap());
+        for other in &others {
+            assert!(!d.is_root_of(other, proc_dir).unwrap());
+        }
+    }
+
+    #[test]
+    fn the_root_of_a_process_is_the_overlay_of_its_container() {
+        velarx_base::testing::in_child(|| the_root_is_the_overlay_of(b"plain"));
+    }
+
+    #[test]
+    fn a_bundle_path_the_table_escapes_is_the_root_all_the_same() {
+        velarx_base::testing::in_child(|| the_root_is_the_overlay_of(b"a b\tc\nd\\e,x=y"));
+    }
+
+    #[test]
+    fn a_bundle_path_that_is_not_utf8_is_the_root_too() {
+        velarx_base::testing::in_child(|| the_root_is_the_overlay_of(b"n\xffn"));
     }
 
     fn set_xattr(path: &Path, name: &str, value: &[u8]) -> bool {

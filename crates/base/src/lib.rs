@@ -15,7 +15,6 @@ pub mod host;
 pub mod idmap;
 pub mod ids;
 pub mod ipc;
-pub mod mountinfo;
 pub mod push_path;
 pub mod random;
 pub mod reference;

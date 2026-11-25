@@ -1186,16 +1186,32 @@ pub fn unmount_or_detach(path: &Path) {
     }
 }
 
-/// Detach every mount stacked on `path` (none is fine).
+/// Detach every mount stacked on `path` of this process's mount namespace
+/// (none is fine), the topmost first.
 pub fn detach_stale(path: &Path) -> io::Result<()> {
-    let n = velarx_base::mountinfo::detach_stacked(path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("cannot detach the stale mount on {}: {e}", path.display()),
-        )
-    })?;
-    if n > 0 {
-        debug!("Detached {n} stale mounts on {}", path.display());
+    use rustix::io::Errno;
+    use rustix::mount::{unmount, UnmountFlags};
+    let path = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut detached = 0;
+    while velarx_sys::statmount::is_mount_point(&path)? {
+        match unmount(&path, UnmountFlags::DETACH) {
+            Ok(()) => detached += 1,
+            // (gone with another process's unmount meanwhile)
+            Err(Errno::INVAL) | Err(Errno::NOENT) => break,
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::Error::from(e).kind(),
+                    format!("cannot detach the stale mount on {}: {e}", path.display()),
+                ))
+            }
+        }
+    }
+    if detached > 0 {
+        debug!("Detached {detached} stale mounts on {}", path.display());
     }
     Ok(())
 }
@@ -1204,6 +1220,47 @@ pub fn detach_stale(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use velarx_storage::{Toc, TocEntryType};
+
+    /// The mounts stacked on a path with the bytes the mount table writes
+    /// as escapes or that are not UTF-8 are all detached, and only those.
+    #[test]
+    fn stacked_mounts_of_odd_names_are_detached() {
+        velarx_base::testing::in_child(|| {
+            use rustix::mount::{mount, MountFlags};
+            if !velarx_base::testing::private_namespace() {
+                return;
+            }
+            let d = tempfile::tempdir().unwrap();
+            let tmpfs = |at: &Path| mount("t", at, "tmpfs", MountFlags::empty(), None).unwrap();
+            for name in [&b"a b"[..], b"a\tb\n\\c", b"x\xffy"] {
+                let at = d.path().join(OsStr::from_bytes(name));
+                let next = d.path().join(OsStr::from_bytes(&[name, b"2"].concat()));
+                std::fs::create_dir(&at).unwrap();
+                std::fs::create_dir(&next).unwrap();
+                tmpfs(&at);
+                tmpfs(&at);
+                tmpfs(&at);
+                tmpfs(&next);
+                let mounted = |p: &Path| {
+                    rustix::fs::statx(
+                        rustix::fs::CWD,
+                        p,
+                        rustix::fs::AtFlags::empty(),
+                        rustix::fs::StatxFlags::empty(),
+                    )
+                    .unwrap()
+                    .stx_attributes
+                    .contains(rustix::fs::StatxAttributes::MOUNT_ROOT)
+                };
+                assert!(mounted(&at) && mounted(&next));
+                detach_stale(&at).unwrap();
+                assert!(!mounted(&at), "{at:?}");
+                assert!(mounted(&next), "{next:?}");
+                // (none: fine)
+                detach_stale(&at).unwrap();
+            }
+        });
+    }
 
     #[test]
     fn a_time_before_the_epoch_is_given_as_the_kernel_adds_it() {
@@ -1986,11 +2043,13 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("cannot confine"), "{e}");
-        let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
         let left = tmp.path().join("mnt2");
         assert!(
-            !mounts.contains(left.to_str().unwrap()),
-            "a mount was left: {mounts}"
+            !velarx_sys::statmount::table()
+                .unwrap()
+                .iter()
+                .any(|m| m.point.as_deref().is_some_and(|p| p.starts_with(&left))),
+            "a mount was left"
         );
     }
 

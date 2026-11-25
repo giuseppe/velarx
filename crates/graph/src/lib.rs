@@ -1844,7 +1844,7 @@ pub trait StorageDriver: Send + Sync + 'static {
     /// `w`: how the engine tells that a pid is the container's (security
     /// relevant: a process of another container, or one that took a reused
     /// pid, must not match).  The driver reads what tells it there: an
-    /// overlay its `mountinfo`, a plain directory the inode of its `root`.
+    /// overlay the mount of its `root`, a plain directory the inode of it.
     /// The caller has pinned the process (a pidfd) before, and checks that
     /// it still runs after.
     ///

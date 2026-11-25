@@ -37,6 +37,7 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::sync::Mutex;
+use velarx_sys::statmount;
 
 fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
@@ -111,13 +112,6 @@ fn is_mount_root(st: &rustix::fs::Statx) -> bool {
             .contains(rustix::fs::StatxAttributes::MOUNT_ROOT)
 }
 
-/// The mount table of the namespace of this thread: the one the attach is
-/// made in (`/proc/self` is the main thread's, which can be another).
-fn mount_table() -> io::Result<String> {
-    std::fs::read_to_string("/proc/thread-self/mountinfo")
-        .map_err(|e| io_err(format!("/proc/thread-self/mountinfo: {e}")))
-}
-
 /// The descriptor is a directory that is the root of a detached mount, and
 /// not the host's `/` itself: the mount that `open_tree(OPEN_TREE_CLONE)`
 /// or `fsmount` made, not a directory of this namespace.  Whatever passes
@@ -126,35 +120,36 @@ fn mount_table() -> io::Result<String> {
 /// attached mount from being moved or cloned.
 fn check_detached(fd: &OwnedFd) -> io::Result<()> {
     use rustix::fs::{AtFlags, FileType, StatxFlags};
-    let st = rustix::fs::statx(
-        fd,
-        c"",
-        AtFlags::EMPTY_PATH,
-        StatxFlags::TYPE | StatxFlags::MNT_ID,
-    )
-    .map_err(|e| io_err(format!("statx: {e}")))?;
+    let st = rustix::fs::statx(fd, c"", AtFlags::EMPTY_PATH, StatxFlags::TYPE)
+        .map_err(|e| io_err(format!("statx: {e}")))?;
     if FileType::from_raw_mode(st.stx_mode.into()) != FileType::Directory {
         return Err(io_err(
             "it is not a directory: the root file system is the root of a mount",
         ));
     }
-    if st.stx_mask & StatxFlags::MNT_ID.bits() == 0 || !is_mount_root(&st) {
+    if !is_mount_root(&st) {
         return Err(io_err(
             "it is not the root of a mount (a directory of a file system, as a descriptor of `open` gives): \
              the driver hands over a mount made with open_tree(OPEN_TREE_CLONE) or fsmount",
         ));
     }
-    let table = mount_table()?;
-    let id = u32::try_from(st.stx_mnt_id).map_err(|_| io_err("its mount id is too big"))?;
-    if let Some(m) = velarx_base::mountinfo::parse(&table)
-        .iter()
-        .find(|m| m.id == id)
-    {
-        return Err(io_err(format!(
-            "it is the mount at {} of this mount namespace, not a detached one: \
-             attaching it would take that mount from where it is",
-            m.point.display()
-        )));
+    // (a detached mount is in no table: its id is found only for a mount of
+    // the namespace of this thread)
+    let id = statmount::id_of_fd(fd.as_fd()).map_err(|e| io_err(format!("statmount: {e}")))?;
+    match statmount::of_id(id) {
+        Ok(m) => {
+            // (a mount of the namespace out of reach of the root of this
+            // process has no point to name: it is refused as well)
+            let at = m
+                .point
+                .map_or("a place out of reach".into(), |p| p.display().to_string());
+            return Err(io_err(format!(
+                "it is the mount at {at} of this mount namespace, not a detached one: \
+                 attaching it would take that mount from where it is"
+            )));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_err(format!("statmount: {e}"))),
     }
     // the host's `/` itself, whatever the way it was reached
     let me = rustix::fs::fstat(fd).map_err(|e| io_err(format!("fstat: {e}")))?;
@@ -441,36 +436,25 @@ fn own_mount(target: &Path) -> io::Result<()> {
 /// super block), as the engine was told the driver made it: the monitor
 /// looks at the mount it attached, not at what the driver says of it.
 fn overlay_requires_verity(target: &Path) -> io::Result<()> {
-    use rustix::fs::{AtFlags, StatxFlags};
-    let st = rustix::fs::statx(
-        rustix::fs::CWD,
-        target,
-        AtFlags::empty(),
-        StatxFlags::MNT_ID,
-    )
-    .map_err(|e| io_err(format!("statx {}: {e}", target.display())))?;
-    let id = u32::try_from(st.stx_mnt_id).map_err(|_| io_err("its mount id is too big"))?;
-    let table = mount_table()?;
-    let mounts = velarx_base::mountinfo::parse(&table);
-    let mount = mounts
-        .iter()
-        .find(|m| m.id == id)
-        .ok_or_else(|| io_err(format!("{} is not in the mount table", target.display())))?;
+    let mount = statmount::id_of_path(target)
+        .and_then(statmount::of_id)
+        .map_err(|e| io_err(format!("statmount {}: {e}", target.display())))?;
     if mount.fs_type != "overlay" {
         return Err(io_err(format!(
             "the digests are enforced and the mount is a {}, not an overlay with verity=require",
             mount.fs_type
         )));
     }
-    match mount
-        .super_options
-        .split(',')
-        .any(|o| o == "verity=require")
-    {
+    match mount.options.iter().any(|o| o == "verity=require") {
         true => Ok(()),
         false => Err(io_err(format!(
             "the digests are enforced and the overlay is not mounted with verity=require ({})",
-            mount.super_options
+            mount
+                .options
+                .iter()
+                .map(|o| o.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(",")
         ))),
     }
 }
@@ -538,20 +522,13 @@ fn fs_name(fd: std::os::fd::BorrowedFd<'_>) -> String {
 /// instead of having the part of it the kernel carries (the top mount, or all
 /// of it) decided for it.
 fn no_submounts(target: &Path) -> io::Result<()> {
-    use rustix::fs::{AtFlags, StatxFlags};
-    let st = rustix::fs::statx(
-        rustix::fs::CWD,
-        target,
-        AtFlags::empty(),
-        StatxFlags::MNT_ID,
-    )
-    .map_err(|e| io_err(format!("statx {}: {e}", target.display())))?;
-    let id = u32::try_from(st.stx_mnt_id).map_err(|_| io_err("its mount id is too big"))?;
-    let table = mount_table()?;
-    let below: Vec<String> = velarx_base::mountinfo::parse(&table)
+    let id = statmount::id_of_path(target)
+        .map_err(|e| io_err(format!("statmount {}: {e}", target.display())))?;
+    let below: Vec<String> = statmount::table()
+        .map_err(|e| io_err(format!("statmount: {e}")))?
         .into_iter()
         .filter(|m| m.parent == id && m.id != id)
-        .map(|m| m.point.display().to_string())
+        .map(|m| m.point.unwrap_or_default().display().to_string())
         .collect();
     if below.is_empty() {
         return Ok(());
@@ -607,12 +584,21 @@ mod tests {
         m
     }
 
-    fn mountinfo_line(p: &Path) -> Option<String> {
-        std::fs::read_to_string("/proc/self/mountinfo")
+    /// The mount of this namespace at `p`, the last one when stacked.
+    fn mount_at(p: &Path) -> Option<statmount::Mount> {
+        statmount::table()
             .unwrap()
-            .lines()
-            .rfind(|l| l.split(' ').nth(4) == Some(p.to_str().unwrap()))
-            .map(str::to_string)
+            .into_iter()
+            .rfind(|m| m.point.as_deref() == Some(p))
+    }
+
+    fn has(m: &statmount::Mount, attr: u64) -> bool {
+        m.attr & attr != 0
+    }
+
+    /// The mount is neither shared nor a slave: private.
+    fn is_private(m: &statmount::Mount) -> bool {
+        m.peer_group == 0 && m.master == 0
     }
 
     fn held(fds: Vec<Option<OwnedFd>>) -> Held {
@@ -630,7 +616,7 @@ mod tests {
             .to_string();
         assert!(e.contains(why), "{e} (wanted {why:?})");
         assert!(e.contains("root file system"), "{e}");
-        assert!(mountinfo_line(&target).is_none(), "{e}: mounted");
+        assert!(mount_at(&target).is_none(), "{e}: mounted");
         assert!(!target.exists(), "{e}: {} was made", target.display());
     }
 
@@ -648,15 +634,11 @@ mod tests {
             let h = held(vec![Some(fd)]);
             attach_held(&h, 0, &target, &ROOT).unwrap();
             assert_eq!(std::fs::read(target.join("marker")).unwrap(), b"driver");
-            let line = mountinfo_line(&target).expect("mounted");
-            let opts = line.split(' ').nth(5).unwrap();
-            assert!(opts.contains("nodev"), "{line}");
+            let line = mount_at(&target).expect("mounted");
+            assert!(has(&line, libc::MOUNT_ATTR_NODEV), "{line:?}");
             // the suid bit works in a container root: only `nodev`
-            assert!(!opts.contains("nosuid"), "{line}");
-            assert!(
-                !line.contains(" shared:") && !line.contains(" master:"),
-                "private: {line}"
-            );
+            assert!(!has(&line, libc::MOUNT_ATTR_NOSUID), "{line:?}");
+            assert!(is_private(&line), "private: {line:?}");
             // what is written in the root is the driver's file system
             std::fs::write(target.join("new"), "x").unwrap();
             // the descriptor is used once
@@ -712,11 +694,45 @@ mod tests {
                     .unwrap_err()
                     .to_string();
                 assert!(e.contains(why), "{e}");
-                assert!(mountinfo_line(&target).is_none(), "{e}: still mounted");
+                assert!(mount_at(&target).is_none(), "{e}: still mounted");
             }
             let target = d.path().join("plain");
             attach_held(&held(vec![Some(detached_tmpfs())]), 0, &target, &ROOT).unwrap();
-            assert!(mountinfo_line(&target).is_some());
+            assert!(mount_at(&target).is_some());
+        });
+    }
+
+    /// `verity=require` inside the path of a lower directory (a comma the
+    /// file system shows escaped, with a backslash) is not the option: an
+    /// overlay without it, whose lower directories are named `x,verity=require`
+    /// and `a\\b,verity=require`, is refused.
+    #[test]
+    fn verity_in_a_path_is_not_the_option() {
+        velarx_base::testing::in_child(|| {
+            if !private_namespace() {
+                return;
+            }
+            let d = tempfile::tempdir().unwrap();
+            let enforced = Way {
+                kernel_verity: true,
+                ..ROOT
+            };
+            let lowers = [
+                d.path().join("x,verity=require"),
+                d.path().join("a\\b,verity=require"),
+            ];
+            lowers.iter().for_each(|l| std::fs::create_dir(l).unwrap());
+            let target = d.path().join("rootfs");
+            let e = attach_held(
+                &held(vec![Some(detached_overlay([&lowers[0], &lowers[1]]))]),
+                0,
+                &target,
+                &enforced,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains("not mounted with verity=require"), "{e}");
+            assert!(mount_at(&target).is_none(), "{e}: still mounted");
         });
     }
 
@@ -753,15 +769,9 @@ mod tests {
             let target = d.path().join("rootfs");
             let h = held(vec![Some(peer)]);
             attach_held(&h, 0, &target, &ROOT).unwrap();
-            let group = |p: &Path| {
-                mountinfo_line(p)
-                    .unwrap()
-                    .split(' ')
-                    .find(|f| f.starts_with("shared:"))
-                    .map(str::to_string)
-            };
+            let group = |p: &Path| Some(mount_at(p).unwrap().peer_group).filter(|g| *g != 0);
             assert!(group(&src).is_some());
-            assert_eq!(group(&target), None, "{:?}", mountinfo_line(&target));
+            assert_eq!(group(&target), None, "{:?}", mount_at(&target));
         });
     }
 
@@ -789,8 +799,8 @@ mod tests {
                 rustix::mount::MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
             )
             .unwrap();
-            let line = mountinfo_line(&own).expect("mounted");
-            assert!(!line.split(' ').nth(5).unwrap().contains("nodev"), "{line}");
+            let line = mount_at(&own).expect("mounted");
+            assert!(!has(&line, libc::MOUNT_ATTR_NODEV), "{line:?}");
         });
     }
 
@@ -855,7 +865,7 @@ mod tests {
             refused(&h, 6, d.path(), "is not open in the monitor");
             refused(&h, 7, d.path(), "not a detached one");
             // the mount point is where it was
-            assert!(mountinfo_line(&point).is_some());
+            assert!(mount_at(&point).is_some());
             // an index that is not there, and the message names the remedy
             let e = attach_held(&h, 9, &d.path().join("x"), &ROOT)
                 .unwrap_err()
@@ -868,7 +878,7 @@ mod tests {
             // the descriptor that is a detached mount is attached after the
             // refusals of the others
             attach_held(&h, 8, &d.path().join("ok"), &ROOT).unwrap();
-            assert!(mountinfo_line(&d.path().join("ok")).is_some());
+            assert!(mount_at(&d.path().join("ok")).is_some());
             let none = Held::new();
             let e = attach_held(&none, 0, &d.path().join("y"), &ROOT)
                 .unwrap_err()
@@ -911,7 +921,7 @@ mod tests {
             let target = d.path().join("rootfs");
             let e = attach_held(&h, 0, &target, &ROOT).unwrap_err().to_string();
             assert!(e.contains("open_tree failed"), "{e}");
-            assert!(mountinfo_line(&target).is_none());
+            assert!(mount_at(&target).is_none());
         });
     }
 
@@ -955,15 +965,12 @@ mod tests {
             let e = attach_held(&h, 0, &target, &ROOT).unwrap_err().to_string();
             assert!(e.contains("has mounts below it"), "{e}");
             assert!(e.contains("sub"), "{e}");
-            assert!(mountinfo_line(&target).is_none(), "still mounted: {e}");
+            assert!(mount_at(&target).is_none(), "still mounted: {e}");
             assert!(
-                !std::fs::read_to_string("/proc/self/mountinfo")
-                    .unwrap()
-                    .lines()
-                    .any(|l| l.contains(" /rootfs ")
-                        || l.split(' ')
-                            .nth(4)
-                            .is_some_and(|p| p.starts_with(target.to_str().unwrap()))),
+                !statmount::table().unwrap().iter().any(|m| {
+                    m.root == Path::new("/rootfs")
+                        || m.point.as_deref().is_some_and(|p| p.starts_with(&target))
+                }),
                 "a mount of the refused tree is left"
             );
             // the same top mount alone is attached
@@ -1016,10 +1023,11 @@ mod tests {
             attach_held(&h, 1, &target, &ROOT).unwrap();
             assert!(!target.join("left").exists());
             assert_eq!(
-                velarx_base::mountinfo::stacked_at(
-                    &std::fs::read_to_string("/proc/self/mountinfo").unwrap(),
-                    &target
-                ),
+                statmount::table()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m.point.as_deref() == Some(target.as_path()))
+                    .count(),
                 1
             );
         });
@@ -1079,8 +1087,8 @@ mod tests {
             let h = held(vec![Some(fd)]);
             attach_held(&h, 0, &target, &ROOT).unwrap();
             assert_eq!(std::fs::read(target.join("marker")).unwrap(), b"driver");
-            let line = mountinfo_line(&target).expect("mounted");
-            assert!(line.split(' ').nth(5).unwrap().contains("nodev"), "{line}");
+            let line = mount_at(&target).expect("mounted");
+            assert!(has(&line, libc::MOUNT_ATTR_NODEV), "{line:?}");
         });
     }
 
@@ -1112,21 +1120,7 @@ mod tests {
                     | rustix::mount::OpenTreeFlags::AT_EMPTY_PATH,
             )
             .unwrap();
-            let mnt_id = |fd: &dyn AsFd, path: &str| {
-                rustix::fs::statx(
-                    fd,
-                    path,
-                    if path.is_empty() {
-                        rustix::fs::AtFlags::EMPTY_PATH
-                    } else {
-                        rustix::fs::AtFlags::empty()
-                    },
-                    rustix::fs::StatxFlags::MNT_ID,
-                )
-                .unwrap()
-                .stx_mnt_id
-            };
-            let drivers = mnt_id(&fd, "");
+            let drivers = statmount::id_of_fd(fd.as_fd()).unwrap();
             // the driver keeps its descriptor, as a driver that does not close it
             let kept = rustix::io::fcntl_dupfd_cloexec(&fd, 100).unwrap();
             // the monitor's own mount namespace
@@ -1143,20 +1137,16 @@ mod tests {
             let target = d.path().join("img");
             attach_held(&held(vec![Some(fd)]), 0, &target, &way).unwrap();
             assert_eq!(std::fs::read(target.join("marker")).unwrap(), b"driver");
-            let line = mountinfo_line(&target).expect("mounted");
-            let options = line.split(' ').nth(5).unwrap();
+            let line = mount_at(&target).expect("mounted");
             assert!(
-                options.contains("nodev") && options.starts_with("ro"),
-                "{line}"
+                has(&line, libc::MOUNT_ATTR_NODEV) && has(&line, libc::MOUNT_ATTR_RDONLY),
+                "{line:?}"
             );
             // the container's mount is not the object the driver made, which
             // is no mount of this namespace and still has its own attributes
-            let attached = mnt_id(&rustix::fs::CWD, target.to_str().unwrap());
+            let attached = statmount::id_of_path(&target).unwrap();
             assert_ne!(attached, drivers);
-            let table = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
-            assert!(!velarx_base::mountinfo::parse(&table)
-                .iter()
-                .any(|m| u64::from(m.id) == drivers));
+            assert!(!statmount::table().unwrap().iter().any(|m| m.id == drivers));
             drop(kept);
             assert_eq!(
                 std::fs::write(target.join("new"), b"x")
@@ -1297,9 +1287,9 @@ mod tests {
             let target = d.path().join("rootfs");
             attach_held(&held(vec![Some(fd)]), 0, &target, &ROOT).unwrap();
             assert_eq!(std::fs::read(target.join("marker")).unwrap(), b"driver");
-            let line = mountinfo_line(&target).expect("mounted");
-            assert!(line.split(' ').nth(5).unwrap().contains("nodev"), "{line}");
-            assert!(!line.contains(" shared:"), "{line}");
+            let line = mount_at(&target).expect("mounted");
+            assert!(has(&line, libc::MOUNT_ATTR_NODEV), "{line:?}");
+            assert!(line.peer_group == 0, "{line:?}");
         });
     }
 
@@ -1350,16 +1340,12 @@ mod tests {
             let h = held(vec![Some(fd)]);
             attach_held(&h, 0, &target, &VOLUME).unwrap();
             assert_eq!(std::fs::read(target.join("marker")).unwrap(), b"driver");
-            let line = mountinfo_line(&target).unwrap();
-            let opts = line.split(' ').nth(5).unwrap();
+            let line = mount_at(&target).unwrap();
             assert!(
-                opts.split(',').any(|o| o == "ro") && opts.contains("nodev"),
-                "{line}"
+                has(&line, libc::MOUNT_ATTR_RDONLY) && has(&line, libc::MOUNT_ATTR_NODEV),
+                "{line:?}"
             );
-            assert!(
-                !line.contains(" shared:") && !line.contains(" master:"),
-                "{line}"
-            );
+            assert!(is_private(&line), "{line:?}");
             let e = std::fs::write(target.join("new"), "x").unwrap_err();
             assert_eq!(e.raw_os_error(), Some(libc::EROFS), "{e}");
             // the driver's own mount is writable still
@@ -1449,7 +1435,7 @@ mod tests {
             assert!(e.contains("tmpfs") && e.contains("idmapped already"), "{e}");
             assert!(e.contains("image mount /data"), "{e}");
             assert!(e.contains("storage driver must deliver"), "{e}");
-            assert!(mountinfo_line(&target).is_none() && !target.exists(), "{e}");
+            assert!(mount_at(&target).is_none() && !target.exists(), "{e}");
         });
     }
 
@@ -1498,7 +1484,7 @@ mod tests {
                 e.contains("overlay") && e.contains("does not take idmapped mounts"),
                 "{e}"
             );
-            assert!(mountinfo_line(&target).is_none(), "{e}");
+            assert!(mount_at(&target).is_none(), "{e}");
         });
     }
 
@@ -1526,7 +1512,7 @@ mod tests {
                 e.contains("tmpfs") && e.contains("rootless") && e.contains("`applied`"),
                 "{e}"
             );
-            assert!(mountinfo_line(&target).is_none() && !target.exists(), "{e}");
+            assert!(mount_at(&target).is_none() && !target.exists(), "{e}");
         });
     }
 
@@ -1567,15 +1553,8 @@ mod tests {
             .unwrap();
             assert_eq!(std::fs::read(target.join("inner")).unwrap(), b"inside");
             assert!(!target.join("marker").exists());
-            let line = mountinfo_line(&target).unwrap();
-            assert!(
-                line.split(' ')
-                    .nth(5)
-                    .unwrap()
-                    .split(',')
-                    .any(|o| o == "ro"),
-                "{line}"
-            );
+            let line = mount_at(&target).unwrap();
+            assert!(has(&line, libc::MOUNT_ATTR_RDONLY), "{line:?}");
             let e = std::fs::write(target.join("new"), "x").unwrap_err();
             assert_eq!(e.raw_os_error(), Some(libc::EROFS));
             // a directory the mount lacks is an error that names it

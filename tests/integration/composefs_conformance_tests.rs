@@ -48,6 +48,45 @@ fn server(dir: &Path) -> ImageServer {
     )
 }
 
+/// An overlay at `at` with the upper and work directories of `paths`.  They
+/// are given by descriptor, which the kernel does not unescape.
+fn mount_overlay(at: &Path, paths: &velarx_graph::WritablePaths) {
+    use rustix::mount::{
+        fsconfig_create, fsconfig_set_fd, fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen,
+        move_mount, FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags,
+    };
+    let dir = |p: &Path| {
+        rustix::fs::open(
+            p,
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap()
+    };
+    let lower = at.join("lower");
+    std::fs::create_dir_all(&lower).unwrap();
+    let fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC).unwrap();
+    fsconfig_set_string(
+        &fs,
+        c"lowerdir",
+        std::ffi::CString::new(lower.to_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    fsconfig_set_fd(&fs, c"upperdir", dir(&paths.upper)).unwrap();
+    fsconfig_set_fd(&fs, c"workdir", dir(paths.work.as_ref().unwrap())).unwrap();
+    fsconfig_set_flag(&fs, c"userxattr").unwrap();
+    fsconfig_create(&fs).unwrap();
+    let m = fsmount(&fs, FsMountFlags::FSMOUNT_CLOEXEC, MountAttrFlags::empty()).unwrap();
+    move_mount(
+        &m,
+        "",
+        rustix::fs::CWD,
+        at,
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )
+    .unwrap();
+}
+
 fn factory() -> Factory {
     Box::new(|dir| {
         Box::pin(async move {
@@ -84,20 +123,22 @@ fn factory() -> Factory {
                     std::fs::remove_file(cfs::layer_image_path(for_damage.root(), &key.file_stem()))
                         .is_ok()
                 }),
+                // the root of a process is a mount of its directory of
+                // /proc: the overlay of the layer, or a tmpfs
                 proc_root: Box::new(|dir, paths| {
-                    let table = match paths {
-                        Some(p) => format!(
-                            "22 1 0:21 / /proc rw,nosuid - proc proc rw\n\
-                             23 1 0:57 / / rw,relatime - overlay overlay \
-                             rw,lowerdir+=/x/layers/1,upperdir={},workdir={},userxattr\n",
-                            p.upper.display(),
-                            p.work.as_ref().unwrap().display()
-                        ),
-                        None => "22 1 0:21 / /proc rw,nosuid - proc proc rw\n\
-                                 23 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
-                            .to_string(),
-                    };
-                    std::fs::write(dir.join("mountinfo"), table).unwrap();
+                    let root = dir.join("root");
+                    std::fs::create_dir_all(&root).unwrap();
+                    match paths {
+                        Some(p) => mount_overlay(&root, p),
+                        None => rustix::mount::mount(
+                            "t",
+                            &root,
+                            "tmpfs",
+                            rustix::mount::MountFlags::empty(),
+                            None,
+                        )
+                        .unwrap(),
+                    }
                 }),
                 // the startup profile the image server records for a
                 // container of the image

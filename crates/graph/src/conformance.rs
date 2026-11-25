@@ -64,7 +64,7 @@
 //!   in progress use (`Keep::containers`, `Keep::pulls`);
 //! - a kernel mount (the status says `kernel mount: yes`) is only for root;
 //! - the root of a container is found by what `Subject::proc_root` makes of
-//!   a `/proc/PID` directory: a mount table, or the link `root`;
+//!   a `/proc/PID` directory: its `root`, a mount or a link;
 //! - the objects of the `FileStore` the pull writes are the engine's to
 //!   scan (`objects::objects`); `leftovers` names only the driver's own
 //!   temporary files and `Usage::artifacts` what the driver made, with the
@@ -136,7 +136,7 @@ pub struct Subject {
     /// it; false when there is nothing to damage.
     pub damage: Box<dyn Fn(&LayerKey) -> bool + Send + Sync>,
     /// What a process of the container's root looks like in its `/proc`
-    /// directory (an overlay's mount table, the root of a directory driver).
+    /// directory (an overlay's mount, the root of a directory driver).
     pub proc_root: ProcRoot,
     /// Make the state the driver keeps of an image while its containers run
     /// (composefs: the startup profile its FUSE server records), which
@@ -5527,7 +5527,7 @@ pub async fn the_root_of_a_container_is_found(f: &Factory) {
     let proc_dir = s.dir.join("proc");
     std::fs::create_dir_all(&proc_dir).unwrap();
     // a process whose root cannot be told is an error, not "no"
-    let e = expect_err(d.is_root_of(&w, &proc_dir), "no mountinfo");
+    let e = expect_err(d.is_root_of(&w, &proc_dir), "no root");
     of_driver(&s, &e);
     assert!(matches!(e.kind, DriverErrorKind::Io(_)), "{e:?}");
     // a process of another root

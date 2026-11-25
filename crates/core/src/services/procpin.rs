@@ -17,7 +17,7 @@ pub enum ContainerRoot<'a> {
     /// the monitor of `mon_dir` attached when it recorded one (a descriptor
     /// or a directory of the driver, which may be a new mount at every
     /// start), else the driver tells whether a process has it as its root
-    /// (an overlay reads the mount table).
+    /// (an overlay tells the mount of the root).
     Writable(&'a dyn StorageDriver, &'a Writable, &'a Path),
     /// A bind of this directory (`--rootfs`): the root of the process is
     /// that directory.
@@ -183,7 +183,7 @@ mod tests {
                 Err(velarx_graph::DriverError::of(
                     "test",
                     velarx_graph::DriverErrorKind::Unsupported,
-                    "no mount table to read",
+                    "no mount to ask",
                 ))
             }
         }

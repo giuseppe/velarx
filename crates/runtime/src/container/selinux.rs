@@ -18,6 +18,7 @@
 use serde::{Deserialize, Serialize};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use velarx_sys::statmount::{self, Mount};
 
 const XATTR: &str = "security.selinux";
 const MAX_DEPTH: usize = 256;
@@ -560,18 +561,8 @@ fn set_label_at(
 
 /// The mount the file open as `fd` is on, and its device.
 fn mount_of(fd: BorrowedFd<'_>) -> std::io::Result<(u64, u64)> {
-    use rustix::fs::{statx, AtFlags, StatxFlags};
-    let x =
-        statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID).map_err(|e| io_err("stat", e))?;
-    if x.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
-        return Err(std::io::Error::other(
-            "the kernel does not say the mount of a file",
-        ));
-    }
-    Ok((
-        x.stx_mnt_id,
-        rustix::fs::makedev(x.stx_dev_major, x.stx_dev_minor),
-    ))
+    let f = statmount::file_mount(fd, std::ffi::OsStr::new(""), libc::AT_EMPTY_PATH)?;
+    Ok((f.mount, rustix::fs::makedev(f.device.0, f.device.1)))
 }
 
 /// The walk of what is below a volume: a mount is the state of a directory
@@ -580,6 +571,9 @@ fn mount_of(fd: BorrowedFd<'_>) -> std::io::Result<(u64, u64)> {
 struct Relabel<'a> {
     label: &'a [u8],
     engine_dirs: &'a [PathBuf],
+    /// The mount table, read at the first mount below the volume and once
+    /// for the whole walk.
+    table: Option<Vec<Mount>>,
 }
 
 impl velarx_base::walk::Visit for Relabel<'_> {
@@ -608,32 +602,32 @@ impl velarx_base::walk::Visit for Relabel<'_> {
         _: usize,
         parent: &mut Self::Dir,
     ) -> std::io::Result<Option<Self::Dir>> {
-        use rustix::fs::{statx, AtFlags, FileType, StatxFlags};
+        use rustix::fs::FileType;
         use rustix::io::Errno;
         let Some(mnt) = *parent else {
             return Ok(None);
         };
-        let x = match statx(
+        let x = match statmount::file_mount(
             dir,
             name,
-            AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
-            StatxFlags::TYPE | StatxFlags::MNT_ID,
+            libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
         ) {
             Ok(x) => x,
-            Err(Errno::NOENT) => return Ok(None),
-            Err(e) => return Err(io_err("stat", e)),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(e) => return Err(e),
         };
-        let is_dir = FileType::from_raw_mode(x.stx_mode.into()) == FileType::Directory;
+        let is_dir = FileType::from_raw_mode(x.mode) == FileType::Directory;
         // what is mounted below the volume is part of what the container sees
         // (a recursive bind mount): a whole file system is relabeled too
-        // (`mount_relabeled`), a bind mount of a directory or a file is not
-        let here = (
-            x.stx_mnt_id,
-            rustix::fs::makedev(x.stx_dev_major, x.stx_dev_minor),
-        );
-        if x.stx_mask & StatxFlags::MNT_ID.bits() == 0 || here != mnt {
+        // (`whole_file_system`), a bind mount of a directory or a file is not
+        let here = (x.mount, rustix::fs::makedev(x.device.0, x.device.1));
+        if here != mnt {
             if is_dir {
-                return relabel_mount(dir, name, self.label, self.engine_dirs);
+                if self.table.is_none() {
+                    self.table = Some(statmount::table()?);
+                }
+                let table = self.table.as_deref().unwrap_or_default();
+                return relabel_mount(dir, name, self.label, self.engine_dirs, table);
             }
             return Ok(None);
         }
@@ -649,7 +643,7 @@ impl velarx_base::walk::Visit for Relabel<'_> {
 /// Relabel what is below the directory `dir`, on the mount `mnt` (see
 /// `mount_of`).  A mount below it is found by its mount, not its device (a
 /// bind mount of a directory of the same file system has the same): it is
-/// relabeled only when `mount_relabeled` says so.
+/// relabeled only when `whole_file_system` says so.
 fn relabel_children(
     dir: OwnedFd,
     label: &[u8],
@@ -662,7 +656,15 @@ fn relabel_children(
         skip_gone: true,
         lenient: false,
     }
-    .run(dir, Some(mnt), &mut Relabel { label, engine_dirs })
+    .run(
+        dir,
+        Some(mnt),
+        &mut Relabel {
+            label,
+            engine_dirs,
+            table: None,
+        },
+    )
     .map(|_| ())
 }
 
@@ -690,31 +692,32 @@ const STATE_FS: [&str; 19] = [
     "autofs",
 ];
 
-/// Whether the mount `id` of the mount table `table`, found below a volume,
-/// is relabeled with it.  Only a whole file system is (a tmpfs, a disk, a
-/// network share: its root is the root of the file system): a bind mount of
-/// a directory may show any directory of the host (`/etc` bound below the
+/// Whether the mount `m`, found below a volume, is a whole file system (a
+/// tmpfs, a disk, a network share: its root is the root of the file system),
+/// and not the file system of the kernel's state: a bind mount of a
+/// directory may show any directory of the host (`/etc` bound below the
 /// volume is still `/etc`), so it is left alone, as are the file systems of
-/// the kernel's state and a file system that is also mounted on a directory
-/// that is never relabeled (`/` or `/home` mounted again below the volume).
-fn mount_relabeled(table: &str, id: u64, engine_dirs: &[PathBuf]) -> bool {
-    let mounts = velarx_base::mountinfo::parse(table);
-    let Some(m) = mounts.iter().find(|m| u64::from(m.id) == id) else {
-        return false;
-    };
-    if m.root != Path::new("/") || STATE_FS.contains(&m.fs_type.as_str()) {
-        return false;
-    }
-    !mounts.iter().any(|o| {
+/// the kernel's state.
+fn whole_file_system(m: &Mount) -> bool {
+    m.root == Path::new("/") && !STATE_FS.contains(&m.fs_type.as_str())
+}
+
+/// Whether the file system of `m` is also mounted, in `table`, on a
+/// directory that is never relabeled (`/` or `/home` mounted again below
+/// the volume): the mount is then left alone.  A mount of the table has a
+/// point; one that is not a string counts as forbidden.
+fn is_also_on_forbidden_dir(m: &Mount, table: &[Mount], engine_dirs: &[PathBuf]) -> bool {
+    table.iter().any(|o| {
         o.device == m.device
             && o.point
-                .to_str()
+                .as_deref()
+                .and_then(Path::to_str)
                 .is_none_or(|p| path_forbidden(p, engine_dirs))
     })
 }
 
 /// The directory `name` of `dir`, the root of a mount below the volume: when
-/// the mount is one that is relabeled (`mount_relabeled`), its root is
+/// the mount is one that is relabeled (`whole_file_system`), its root is
 /// labeled and the mount is what its entries are walked on.  The mount is the
 /// one the descriptor is on, not what the name was.
 fn relabel_mount(
@@ -722,6 +725,7 @@ fn relabel_mount(
     name: &std::ffi::OsStr,
     label: &[u8],
     engine_dirs: &[PathBuf],
+    table: &[Mount],
 ) -> std::io::Result<Option<Option<(u64, u64)>>> {
     use rustix::fs::{openat, Mode, OFlags};
     use rustix::io::Errno;
@@ -739,8 +743,10 @@ fn relabel_mount(
     let Ok(mnt) = mount_of(sub.as_fd()) else {
         return Ok(None);
     };
-    let table = std::fs::read_to_string("/proc/self/mountinfo")?;
-    if !mount_relabeled(&table, mnt.0, engine_dirs) {
+    let Ok(mount) = statmount::of_fd(sub.as_fd()) else {
+        return Ok(None);
+    };
+    if !whole_file_system(&mount) || is_also_on_forbidden_dir(&mount, table, engine_dirs) {
         return Ok(None);
     }
     let target = std::fs::read_link(velarx_sys::fd::proc_path(&sub))?;
@@ -1212,32 +1218,59 @@ mod tests {
         assert!(!is_home("/", ""));
     }
 
-    /// A mount table as the kernel writes it: `/` and `/home` of one disk,
-    /// the tmpfs of `/tmp` and `/dev/shm`, and below the volume
-    /// `/srv/vol`: a tmpfs of its own, `/etc` and `/home/u` bound, the whole
-    /// disk mounted again, the tmpfs of `/tmp` bound, `/proc`, a network
-    /// share, a disk the engine has, the `/dev/shm` tmpfs bound, a
-    /// directory of the disk of `/srv/data` bound.
-    const TABLE: &str = "\
-22 1 253:0 / / rw,relatime shared:1 - xfs /dev/mapper/root rw
-23 22 253:0 /home /home rw,relatime shared:2 - xfs /dev/mapper/root rw
-24 22 0:30 / /tmp rw,nosuid shared:3 - tmpfs tmpfs rw
-25 22 0:5 / /dev rw,nosuid shared:4 - devtmpfs devtmpfs rw
-26 25 0:31 / /dev/shm rw,nosuid shared:5 - tmpfs tmpfs rw
-27 22 8:16 / /var/lib/velarx rw shared:6 - ext4 /dev/sdb rw
-28 22 8:32 / /srv/data rw shared:8 - ext4 /dev/sdc rw
-40 22 0:50 / /srv/vol/tmpfs rw shared:7 - tmpfs none rw
-41 22 253:0 /etc /srv/vol/etc rw shared:1 - xfs /dev/mapper/root rw
-42 22 253:0 /home/u /srv/vol/home rw shared:2 - xfs /dev/mapper/root rw
-43 22 253:0 / /srv/vol/root rw shared:1 - xfs /dev/mapper/root rw
-44 22 0:30 / /srv/vol/tmp rw shared:3 - tmpfs tmpfs rw
-45 22 0:22 / /srv/vol/proc rw - proc proc rw
-46 22 0:60 / /srv/vol/nfs rw - nfs4 srv:/export rw
-47 22 8:16 / /srv/vol/engine rw - ext4 /dev/sdb rw
-48 22 0:31 / /srv/vol/shm rw - tmpfs tmpfs rw
-49 22 0:61 / /srv/vol/with\\040space rw - tmpfs none rw
-50 22 8:32 /alice /srv/vol/alice rw shared:8 - ext4 /dev/sdc rw
-";
+    /// A mount table: `/` and `/home` of one disk, the tmpfs of `/tmp` and
+    /// `/dev/shm`, and below the volume `/srv/vol`: a tmpfs of its own,
+    /// `/etc` and `/home/u` bound, the whole disk mounted again, the tmpfs
+    /// of `/tmp` bound, `/proc`, a network share, a disk the engine has, the
+    /// `/dev/shm` tmpfs bound, a directory of the disk of `/srv/data` bound.
+    /// (id, device, root, point, file system)
+    const TABLE: [Row; 18] = [
+        (22, (253, 0), "/", "/", "xfs"),
+        (23, (253, 0), "/home", "/home", "xfs"),
+        (24, (0, 30), "/", "/tmp", "tmpfs"),
+        (25, (0, 5), "/", "/dev", "devtmpfs"),
+        (26, (0, 31), "/", "/dev/shm", "tmpfs"),
+        (27, (8, 16), "/", "/var/lib/velarx", "ext4"),
+        (28, (8, 32), "/", "/srv/data", "ext4"),
+        (40, (0, 50), "/", "/srv/vol/tmpfs", "tmpfs"),
+        (41, (253, 0), "/etc", "/srv/vol/etc", "xfs"),
+        (42, (253, 0), "/home/u", "/srv/vol/home", "xfs"),
+        (43, (253, 0), "/", "/srv/vol/root", "xfs"),
+        (44, (0, 30), "/", "/srv/vol/tmp", "tmpfs"),
+        (45, (0, 22), "/", "/srv/vol/proc", "proc"),
+        (46, (0, 60), "/", "/srv/vol/nfs", "nfs4"),
+        (47, (8, 16), "/", "/srv/vol/engine", "ext4"),
+        (48, (0, 31), "/", "/srv/vol/shm", "tmpfs"),
+        (49, (0, 61), "/", "/srv/vol/with space", "tmpfs"),
+        (50, (8, 32), "/alice", "/srv/vol/alice", "ext4"),
+    ];
+
+    type Row = (u64, (u32, u32), &'static str, &'static str, &'static str);
+
+    fn table() -> Vec<Mount> {
+        TABLE
+            .iter()
+            .map(|&(id, device, root, point, fs_type)| Mount {
+                id,
+                parent: 22,
+                device,
+                root: root.into(),
+                point: Some(point.into()),
+                fs_type: fs_type.into(),
+                options: vec![],
+                attr: 0,
+                propagation: 0,
+                peer_group: 0,
+                master: 0,
+            })
+            .collect()
+    }
+
+    fn mount_relabeled(id: u64, engine_dirs: &[PathBuf]) -> bool {
+        let table = table();
+        let m = table.iter().find(|m| m.id == id).unwrap();
+        whole_file_system(m) && !is_also_on_forbidden_dir(m, &table, engine_dirs)
+    }
 
     #[test]
     fn mounts_below_a_volume_that_are_relabeled() {
@@ -1245,17 +1278,16 @@ mod tests {
         // whole file systems of their own
         // (`/dev/shm` is not a path podman refuses: its tmpfs is one too)
         for id in [40, 46, 48, 49] {
-            assert!(mount_relabeled(TABLE, id, &engine), "{id}");
+            assert!(mount_relabeled(id, &engine), "{id}");
         }
         // bind mounts of directories, the disk of `/` again, the tmpfs of
-        // `/tmp`, the kernel's state, the engine's disk, a mount that is not
-        // in the table
-        for id in [41, 42, 43, 44, 45, 47, 50, 99] {
-            assert!(!mount_relabeled(TABLE, id, &engine), "{id}");
+        // `/tmp`, the kernel's state, the engine's disk
+        for id in [41, 42, 43, 44, 45, 47, 50] {
+            assert!(!mount_relabeled(id, &engine), "{id}");
         }
         // the engine's disk is relabeled when its directory is not forbidden
         // (a named volume)
-        assert!(mount_relabeled(TABLE, 47, &[]));
+        assert!(mount_relabeled(47, &[]));
     }
 
     /// Relabel a directory with the label it has (a change of label needs

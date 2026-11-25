@@ -1162,10 +1162,14 @@ pub fn local_volume_mount(options: &HashMap<String, String>) -> VolumeResult<Opt
     }))
 }
 
-/// Whether `path` is a mount point of this process.
-pub fn is_mount_point(path: &Path) -> bool {
-    fs::read_to_string("/proc/self/mountinfo")
-        .is_ok_and(|info| velarx_base::mountinfo::is_mount_point(&info, path))
+/// Whether `path` is a mount point of this process.  A path that is not
+/// there is not one; any other failure of the lookup is an error, for the
+/// caller to refuse what it was about to do (never "not mounted").
+pub fn is_mount_point(path: &Path) -> io::Result<bool> {
+    match velarx_sys::statmount::is_mount_point(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        r => r,
+    }
 }
 
 /// Volume service for managing named volumes
@@ -1390,11 +1394,20 @@ impl VolumeService {
 
         // The data of a volume that is a mount is not ours to delete.
         self.unmount_path(&volume.mountpoint)?;
-        if is_mount_point(&volume.mountpoint) {
-            return Err(VolumeError::InUse(format!(
-                "{name}: still mounted at {}",
-                volume.mountpoint.display()
-            )));
+        match is_mount_point(&volume.mountpoint) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(VolumeError::InUse(format!(
+                    "{name}: still mounted at {}",
+                    volume.mountpoint.display()
+                )))
+            }
+            Err(e) => {
+                return Err(VolumeError::InUse(format!(
+                    "{name}: cannot tell whether it is mounted at {}: {e}",
+                    volume.mountpoint.display()
+                )))
+            }
         }
 
         // Remove the volume directory (the one of `_data` too), its data
@@ -1443,7 +1456,7 @@ impl VolumeService {
                 users.join(", ")
             )));
         }
-        if is_mount_point(&volume.mountpoint) {
+        if is_mount_point(&volume.mountpoint)? {
             return Err(VolumeError::InUse(format!(
                 "{name}: volume is currently mounted"
             )));
@@ -1616,7 +1629,7 @@ impl VolumeService {
     pub async fn mount(&self, name: &str) -> VolumeResult<PathBuf> {
         let volume = self.get(name).await?;
         if let Some(m) = local_volume_mount(&volume.options)? {
-            if !is_mount_point(&volume.mountpoint) {
+            if !is_mount_point(&volume.mountpoint)? {
                 mount_volume(&m, &volume.mountpoint)?;
             }
         }
@@ -1635,12 +1648,10 @@ impl VolumeService {
     /// Unmount what is mounted at `path` (a volume mounted more than once
     /// has them all taken, the last on top first); busy is an error.
     fn unmount_path(&self, path: &Path) -> VolumeResult<()> {
-        let info = fs::read_to_string("/proc/self/mountinfo")?;
-        for m in velarx_base::mountinfo::at_or_below(&info, path)
-            .iter()
-            .filter(|m| m.point == path)
-        {
-            rustix::mount::unmount(&m.point, rustix::mount::UnmountFlags::empty())
+        // (`is_mount_point` does not follow a link at the end: neither
+        // does the unmount)
+        while is_mount_point(path)? {
+            rustix::mount::unmount(path, rustix::mount::UnmountFlags::NOFOLLOW)
                 .map_err(io::Error::from)?;
         }
         Ok(())
@@ -2222,9 +2233,93 @@ mod tests {
     }
 
     #[test]
-    fn a_mount_point_is_one_of_the_table() {
-        assert!(is_mount_point(Path::new("/proc")));
-        assert!(!is_mount_point(Path::new("/proc/self/cwd/definitely-not")));
+    fn a_mount_point_is_the_root_of_a_mount() {
+        assert!(is_mount_point(Path::new("/proc")).unwrap());
+        assert!(!is_mount_point(Path::new("/proc/self/cwd/definitely-not")).unwrap());
+    }
+
+    /// A directory with each of the bytes the kernel's mount table writes
+    /// as an octal escape (space, tab, newline, backslash) or that are not
+    /// UTF-8: every mount stacked on it is found and unmounted, the top one
+    /// first, and a directory next to it is not taken.
+    #[test]
+    fn mounts_at_a_path_of_any_bytes_are_found_and_taken() {
+        velarx_base::testing::in_child(|| {
+            use rustix::mount::{mount, MountFlags};
+            use std::os::unix::ffi::OsStrExt;
+            if !velarx_base::testing::private_namespace() {
+                return;
+            }
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (svc, dir) = rt.block_on(service());
+            let tmpfs = |at: &Path| mount("t", at, "tmpfs", MountFlags::empty(), None).unwrap();
+            for name in [&b"a b"[..], b"a\tb\n\\c", b"x\xffy"] {
+                let at = dir.path().join(std::ffi::OsStr::from_bytes(name));
+                let next = dir
+                    .path()
+                    .join(std::ffi::OsStr::from_bytes(&[name, b"2"].concat()));
+                fs::create_dir(&at).unwrap();
+                fs::create_dir(&next).unwrap();
+                assert!(!is_mount_point(&at).unwrap());
+                tmpfs(&at);
+                tmpfs(&at);
+                tmpfs(&next);
+                assert!(is_mount_point(&at).unwrap(), "{at:?}");
+                fs::write(at.join("top"), b"").unwrap();
+                svc.unmount_path(&at).unwrap();
+                assert!(!is_mount_point(&at).unwrap(), "{at:?}");
+                assert!(!at.join("top").exists());
+                assert!(is_mount_point(&next).unwrap(), "{next:?}");
+            }
+        });
+    }
+
+    /// A mount point that cannot be looked up (a loop of links above it) is
+    /// not "not mounted": the removal is refused and the data stays.
+    #[tokio::test]
+    async fn a_failing_lookup_does_not_remove_the_data() {
+        let (svc, _dir) = service().await;
+        let v = svc
+            .create("v", VolumeDriver::Local, HashMap::new(), HashMap::new())
+            .await
+            .unwrap();
+        fs::write(v.mountpoint.join("keep"), b"x").unwrap();
+        let dir = svc.volume_path("v");
+        let real = svc.volume_path("real");
+        fs::rename(&dir, &real).unwrap();
+        std::os::unix::fs::symlink("v", &dir).unwrap();
+        assert!(is_mount_point(&v.mountpoint).is_err());
+        assert!(svc.remove("v", true).await.is_err());
+        assert!(svc.get("v").await.is_ok());
+        assert_eq!(fs::read(real.join("_data/keep")).unwrap(), b"x");
+    }
+
+    /// A link at the end of the path of a volume is not followed by the
+    /// unmount, as `is_mount_point` does not: the mount it points to stays.
+    #[test]
+    fn a_link_at_the_end_does_not_unmount_what_it_points_to() {
+        velarx_base::testing::in_child(|| {
+            use rustix::mount::{mount, MountFlags};
+            if !velarx_base::testing::private_namespace() {
+                return;
+            }
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (svc, dir) = rt.block_on(service());
+            let other = dir.path().join("other");
+            let link = dir.path().join("link");
+            fs::create_dir(&other).unwrap();
+            mount("t", &other, "tmpfs", MountFlags::empty(), None).unwrap();
+            std::os::unix::fs::symlink(&other, &link).unwrap();
+            assert!(!is_mount_point(&link).unwrap());
+            svc.unmount_path(&link).unwrap();
+            assert!(is_mount_point(&other).unwrap());
+        });
     }
 
     async fn service() -> (VolumeService, tempfile::TempDir) {
