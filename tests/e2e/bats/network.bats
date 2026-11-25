@@ -517,6 +517,25 @@ from-hot1" "$out"
     sh_ container rm -t 0 -f again > /dev/null
 }
 
+# The namespace of a container that another one joined outlives it: its
+# interface is taken down with its end, so that its start does not put the
+# same address on a second port of the bridge.
+@test "a container that another joined stopped and started again has one port" {
+    ports () { ip -o link show master shbr0 | wc -l; }
+    n=$(ports)
+    sh_ container run -d --name jna "$IMG" sleep 1000 > /dev/null
+    sh_ container run -d --name jnb --network container:jna "$IMG" sleep 1000 > /dev/null
+    check "the two share a port" $((n + 1)) "$(ports)"
+    sh_ container stop -t 0 jna > /dev/null
+    check "no port stays" "$n" "$(ports)"
+    check "the namespace that is left has no interface" "" \
+        "$(sh_ container exec jnb sh -c 'ls /sys/class/net | grep -v "^lo$"')"
+    sh_ container start jna > /dev/null
+    check "the start of the container makes one port" $((n + 1)) "$(ports)"
+    sh_ container rm -t 0 -f jnb > /dev/null
+    sh_ container rm -t 0 -f jna > /dev/null
+}
+
 @test "network rm of a used network" {
     need_brnet
     sh_ network rm brnet > /dev/null 2>&1

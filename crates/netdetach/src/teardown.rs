@@ -22,6 +22,7 @@ use velarx_netkernel::bridge::{self, BridgeOptions, NetnsFate};
 use velarx_netkernel::cni::CniConfig;
 use velarx_netkernel::error::{NetworkError, NetworkResult};
 use velarx_netkernel::netns::{Netns, Records};
+use velarx_wire::request::NetworkMode;
 
 /// The interface of a container on a CNI network.
 pub const CNI_IFNAME: &str = "eth0";
@@ -333,8 +334,9 @@ impl Detach {
         }
         if (ns.is_some() || self.records().exists(&id)) && mode == Mode::Bridge {
             // (the namespace of a shareable one may be held by the
-            // containers that joined it)
-            let fate = if shareable {
+            // containers that joined it, as that of any container by one
+            // that runs with `--network container:ID`)
+            let fate = if shareable || self.joined_by_live(a, &id) {
                 NetnsFate::Stays
             } else {
                 NetnsFate::Released
@@ -395,6 +397,28 @@ impl Detach {
         result.map(|()| false)
     }
 
+    /// Whether a container that is alive joins the network namespace of the
+    /// container `id` (`--network container:ID`): the namespace outlives
+    /// it, so its interfaces are deleted, not left to the kernel.  A store
+    /// that cannot be read says yes: the interfaces are deleted then too.
+    fn joined_by_live(&self, a: &impl Access, id: &str) -> bool {
+        let owned = id.to_string();
+        a.call(move |c| {
+            let this = velarx_db::get_container(c, &owned)?;
+            let name = this.name.unwrap_or_default();
+            for dependent in velarx_db::container_dependents(c, &this.id, &name)? {
+                let dependent = velarx_db::get_container(c, &dependent)?;
+                let joins = serde_json::from_str::<JoinedNetwork>(&dependent.config)
+                    .is_ok_and(|j| matches!(j.network_mode, NetworkMode::Container(_)));
+                if joins && dependent.state.is_alive() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .unwrap_or(true)
+    }
+
     /// `Stop` of each provider the container's networks name; a failure is
     /// logged, never fatal.
     fn stop_providers(&self, a: &impl Access, id: &str) -> Vec<String> {
@@ -439,11 +463,19 @@ impl Detach {
     }
 }
 
+/// The part of a container's stored configuration that says whether it
+/// joins the network of another container.
+#[derive(Deserialize)]
+struct JoinedNetwork {
+    #[serde(default)]
+    network_mode: NetworkMode,
+}
+
 /// The part of a container's stored configuration that names its providers.
 #[derive(Deserialize)]
 struct ProviderNames {
     #[serde(default)]
-    network_mode: velarx_wire::request::NetworkMode,
+    network_mode: NetworkMode,
     #[serde(default)]
     networks: Vec<String>,
 }
@@ -515,6 +547,52 @@ mod tests {
         let done = d.release(&store, "c1", None, &|| {}).unwrap();
         assert!(!done.pooled);
         assert!(done.providers_failed.is_empty());
+    }
+
+    /// The interfaces of a container are deleted, not left to the kernel,
+    /// when a container that is alive has its network namespace.
+    #[test]
+    fn a_live_container_that_joins_the_network_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = detach(dir.path());
+        let db = dir.path().join("db.sqlite");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            velarx_db::Database::open(&db)
+                .await
+                .unwrap()
+                .close()
+                .await
+                .unwrap();
+        });
+        let store = velarx_db::sync::Store::open(&db).unwrap();
+        store
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO images (id, manifest_digest, config_digest, manifest, config, created_at) VALUES ('i','m','c','{}','{}','now');
+                     INSERT INTO containers (id, name, image_id, config, state, created_at) VALUES
+                       ('a', 'an', 'i', '{}', 'exited', 'now'),
+                       ('b', 'bn', 'i', '{\"network_mode\":\"container:an\"}', 'running', 'now'),
+                       ('c', 'cn', 'i', '{\"options\":{\"pid_ns\":\"container:a\"}}', 'running', 'now'),
+                       ('e', 'en', 'i', '{\"network_mode\":\"container:a\"}', 'exited', 'now');
+                     INSERT INTO container_deps (container_id, target) VALUES ('b','an'), ('c','a'), ('e','a');",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(d.joined_by_live(&store, "a"));
+        // (only a container that has ended joins it, or only its pid
+        // namespace)
+        store
+            .call(|c| {
+                c.execute_batch("UPDATE containers SET state = 'exited' WHERE id = 'b'")?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!d.joined_by_live(&store, "a"));
     }
 
     #[test]
