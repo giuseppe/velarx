@@ -36,13 +36,17 @@ use velarx_sys::confine::{self as sys, Ruleset};
 const SYS_FCHMODAT2: i64 = 452;
 /// The calls that came after the libc crate's lists, the same number on
 /// every architecture: `quotactl_fd`, the `*xattrat` twins of `setxattr`
-/// and `removexattr`, `open_tree_attr` (the new mount API) and
-/// `file_setattr` (the flags of a file: immutable, append only).
+/// and `removexattr`, `open_tree_attr` (the new mount API),
+/// `file_setattr` (the flags of a file: immutable, append only),
+/// `lsm_set_self_attr` (the security attributes of the caller) and
+/// `fchroot` (`chroot` by a descriptor).
 const SYS_QUOTACTL_FD: i64 = 443;
+const SYS_LSM_SET_SELF_ATTR: i64 = 460;
 const SYS_SETXATTRAT: i64 = 463;
 const SYS_REMOVEXATTRAT: i64 = 466;
 const SYS_OPEN_TREE_ATTR: i64 = 467;
 const SYS_FILE_SETATTR: i64 = 469;
+const SYS_FCHROOT: i64 = 472;
 
 /// The system calls a confined thread never makes; `EPERM`.
 const DENIED: &[i64] = &[
@@ -59,11 +63,13 @@ const DENIED: &[i64] = &[
     libc::SYS_umount2,
     libc::SYS_pivot_root,
     libc::SYS_chroot,
+    SYS_FCHROOT,
     libc::SYS_ptrace,
     libc::SYS_process_vm_readv,
     libc::SYS_process_vm_writev,
     libc::SYS_bpf,
     libc::SYS_keyctl,
+    SYS_LSM_SET_SELF_ATTR,
     libc::SYS_add_key,
     libc::SYS_request_key,
     libc::SYS_kexec_load,
@@ -550,6 +556,8 @@ mod tests {
             SYS_SETXATTRAT,
             SYS_REMOVEXATTRAT,
             SYS_FILE_SETATTR,
+            SYS_FCHROOT,
+            SYS_LSM_SET_SELF_ATTR,
             libc::SYS_open_tree,
             SYS_OPEN_TREE_ATTR,
             SYS_QUOTACTL_FD,
@@ -560,6 +568,11 @@ mod tests {
                 "{nr}"
             );
         }
+        // (and a call that is not listed goes through)
+        assert_eq!(
+            sys::seccomp_answer(&program, libc::SYS_getpid as u32, sys::ARCH, [0; 6]),
+            libc::SECCOMP_RET_ALLOW
+        );
     }
 
     /// The length and the FNV-1a hash of the instructions of a program.
@@ -582,18 +595,18 @@ mod tests {
     #[test]
     fn the_programs_of_the_filters_are_pinned() {
         for (name, program, want) in [
-            ("fuse", filter(), (200, 1670101401834716846)),
-            ("record", record_filter(), (201, 16209927425034214830)),
-            ("exit", exit_filter(), (199, 13994333819956319298)),
+            ("fuse", filter(), (204, 18413975421747261794)),
+            ("record", record_filter(), (205, 11720819298011521642)),
+            ("exit", exit_filter(), (203, 9208526778207930462)),
             (
                 "remove (root)",
                 remove_filter(true),
-                (201, 16209927425034214830),
+                (205, 11720819298011521642),
             ),
             (
                 "remove (user)",
                 remove_filter(false),
-                (193, 16003295455940468575),
+                (197, 15526162464081854443),
             ),
         ] {
             assert_eq!(fingerprint(program), want, "{name}");
