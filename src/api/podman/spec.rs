@@ -1913,22 +1913,18 @@ pub async fn from_docker(
         ("UTSMode", &mut req.uts_mode),
         ("CgroupnsMode", &mut req.cgroupns_mode),
     ] {
-        match s(host, key) {
-            "" => {}
-            // (private is not the default IPC mode: shareable is)
-            "private" if key == "IpcMode" => *field = NsMode::Private,
-            "none" if key == "IpcMode" => *field = NsMode::Off,
-            "private" => {}
-            "host" => *field = NsMode::Host,
-            "shareable" => *field = NsMode::Shareable,
-            m if m.starts_with("container:") => {
-                *field = NsMode::parse(m).map_err(|e| ApiError::bad_request(e.to_string()))?
-            }
-            m => {
+        let mode = NsMode::parse(s(host, key)).map_err(|e| ApiError::bad_request(e.to_string()))?;
+        match mode {
+            NsMode::Default => {}
+            // (`none` is the IPC mode of no /dev/shm)
+            NsMode::Off if key != "IpcMode" => {
                 return Err(ApiError::not_implemented(format!(
-                    "{key} `{m}` is not supported"
+                    "{key} `none` is not supported"
                 )))
             }
+            // (private is not the default IPC mode: shareable is)
+            NsMode::Private if key != "IpcMode" => {}
+            m => *field = m,
         }
     }
     // (the CDI ones are devices above; podman ignores the others, which

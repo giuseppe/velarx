@@ -69,3 +69,14 @@ setup () { api_setup; }
         "$(pm start -a "$id" 2>&1 | awk 'NR==2 {print $1, $2}')"
     pm rm -f -t 0 "$id" > /dev/null 2>&1
 }
+
+@test "compat create: ns:PATH for the pid, ipc, uts and cgroup namespaces" {
+    for key in PidMode IpcMode UTSMode CgroupnsMode; do
+        code=$(api -o "$WORKDIR/compat.out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+            -d '{"Image":"'"$IMG"'","Cmd":["true"],"HostConfig":{"'"$key"'":"ns:/proc/1/ns/x"}}' \
+            "http://d/v1.41/containers/create?name=cn-$key")
+        check "compat create with $key ns:PATH" "201 ns:/proc/1/ns/x" \
+            "$code $(api "http://d/v1.41/containers/cn-$key/json" | jq -r ".HostConfig.$key")"
+        pm rm -f -t 0 "cn-$key" > /dev/null 2>&1
+    done
+}
