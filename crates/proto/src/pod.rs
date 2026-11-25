@@ -10,6 +10,10 @@
 pub use crate::modes::{CgroupMode, CgroupsMode, UsernsChoice};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use velarx_limit_core::{
+    cpu_max, cpuset_mask, limit_of, shares_ok, swap_max, CpuMax, Limit, Swap, MASK_BYTES,
+    MAX_PERIOD, MIN_PERIOD,
+};
 
 /// Restart policy
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -402,34 +406,32 @@ impl PodResources {
     /// The values are ones a cgroup can have; `0` and `-1` are no limit.
     pub fn check(&self) -> Result<(), String> {
         let bad = |what: &str| Err(format!("invalid pod resources: {what}"));
-        if self.memory.is_some_and(|m| m < -1) {
+        let (memory, swap) = (self.memory.unwrap_or(0), self.memory_swap.unwrap_or(0));
+        if limit_of(memory) == Limit::Invalid {
             return bad("a negative memory limit");
         }
-        if self.memory_swap.is_some_and(|m| m < -1) {
+        if limit_of(swap) == Limit::Invalid {
             return bad("a negative memory and swap limit");
         }
-        if let (Some(m), Some(s)) = (self.memory.filter(|m| *m > 0), self.memory_swap) {
-            if s > 0 && s < m {
-                return bad("the memory and swap limit is below the memory limit");
-            }
+        if swap_max(memory, swap) == Swap::Invalid {
+            return bad(if memory > 0 {
+                "the memory and swap limit is below the memory limit"
+            } else {
+                "a swap limit needs a memory limit"
+            });
         }
-        if self.memory.is_none_or(|m| m <= 0) && self.memory_swap.is_some_and(|s| s > 0) {
-            return bad("a swap limit needs a memory limit");
-        }
-        if self
-            .cpu_shares
-            .is_some_and(|s| s != 0 && !(2..=262_144).contains(&s))
-        {
+        if !self.cpu_shares.is_none_or(shares_ok) {
             return bad("CPU shares are from 2 to 262144");
         }
-        if self.cpu_quota.is_some_and(|q| q < -1) {
-            return bad("a negative CPU quota");
-        }
-        if self
-            .cpu_period
-            .is_some_and(|p| p != 0 && !(1_000..=1_000_000).contains(&p))
-        {
-            return bad("a CPU period is from 1000 to 1000000 microseconds");
+        let (quota, period) = (self.cpu_quota.unwrap_or(0), self.cpu_period.unwrap_or(0));
+        if cpu_max(quota, period) == CpuMax::Invalid {
+            return bad(if quota < -1 {
+                "a negative CPU quota"
+            } else if period != 0 && !(MIN_PERIOD..=MAX_PERIOD).contains(&period) {
+                "a CPU period is from 1000 to 1000000 microseconds"
+            } else {
+                "a CPU quota is from 1000 to 17592186044415 microseconds"
+            });
         }
         for (name, list) in [
             ("weight", &self.blkio_weight_device),
@@ -451,10 +453,7 @@ impl PodResources {
             return bad("the block IO weight is from 10 to 1000");
         }
         for set in [&self.cpuset_cpus, &self.cpuset_mems].into_iter().flatten() {
-            if !set
-                .bytes()
-                .all(|b| b.is_ascii_digit() || b == b',' || b == b'-')
-            {
+            if cpuset_mask(set.as_bytes(), &mut [0; MASK_BYTES]).is_none() {
                 return bad("a cpuset is a list of numbers and ranges");
             }
         }
@@ -891,6 +890,11 @@ mod tests {
             br#"{"resources":{"cpu_shares":1}}"#,
             br#"{"resources":{"cpu_period":5}}"#,
             br#"{"resources":{"cpuset_cpus":"0;rm"}}"#,
+            br#"{"resources":{"cpuset_cpus":"3-1"}}"#,
+            br#"{"resources":{"cpuset_mems":"+1"}}"#,
+            br#"{"resources":{"cpu_quota":999}}"#,
+            br#"{"resources":{"cpu_quota":17592186044416}}"#,
+            br#"{"resources":{"cpu_quota":9223372036854775807}}"#,
             br#"{"resources":{"memory_swap":50}}"#,
             br#"{"resources":{"pids":3}}"#,
         ] {

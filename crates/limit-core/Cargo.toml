@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-limit-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The arithmetic of resource limits: what a size, a count of CPU shares, a quota, a swap limit or a score of a request becomes in a cgroup v2 file, or is refused"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on bytes and numbers: no dependency, no I/O.  The requests
+# (the CRI, the REST API, the pod specs), the writing of the cgroup files
+# and of the properties of the systemd slice, and the words of an error
+# stay in the crates that call these.
+
+[lib]
+name = "velarx_limit_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

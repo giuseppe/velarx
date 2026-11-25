@@ -12,14 +12,15 @@
 
 use std::io;
 use std::path::PathBuf;
+use velarx_limit_core::{
+    cpu_max, cpuset_mask, limit_of, quota_per_sec, swap_max, weight_of_shares, CpuMax, Limit, Swap,
+    MASK_BYTES,
+};
 use velarx_proto::pod::PodResources;
 use velarx_wire::sdbus::{self, Property};
 
 /// A property that is not set: the manager's `UINT64_MAX`.
 const UNSET: u64 = u64::MAX;
-
-/// The most CPUs (and memory nodes) of a mask.
-const MAX_CPUS: usize = 8192;
 
 /// The name of the slice of the pod `pod` below the slice `parent`
 /// (`NAME.slice`): `NAME-velarx_pod_<id>.slice`, which the manager puts in
@@ -83,26 +84,11 @@ pub fn populated(name: &str) -> Result<bool, velarx_base::ids::IdsError> {
 /// The mask of a list of CPUs (or memory nodes), `0-3,5`: bit `n` of byte
 /// `n / 8`.
 pub fn cpu_mask(list: &str) -> Result<Vec<u8>, String> {
-    let bad = || format!("invalid cpuset `{list}`");
-    let mut mask: Vec<u8> = Vec::new();
-    for part in list.split(',').filter(|p| !p.is_empty()) {
-        let (a, b) = match part.split_once('-') {
-            Some((a, b)) => (a, b),
-            None => (part, part),
-        };
-        let a: usize = a.parse().map_err(|_| bad())?;
-        let b: usize = b.parse().map_err(|_| bad())?;
-        if a > b || b >= MAX_CPUS {
-            return Err(bad());
-        }
-        if mask.len() <= b / 8 {
-            mask.resize(b / 8 + 1, 0);
-        }
-        for n in a..=b {
-            mask[n / 8] |= 1 << (n % 8);
-        }
+    let mut mask = [0; MASK_BYTES];
+    match cpuset_mask(list.as_bytes(), &mut mask) {
+        Some(n) => Ok(mask[..n].to_vec()),
+        None => Err(format!("invalid cpuset `{list}`")),
     }
-    Ok(mask)
 }
 
 /// The properties of a slice with `limits`: those that are set, and with
@@ -115,29 +101,41 @@ pub fn properties(limits: &PodResources, all: bool) -> Result<Vec<Property>, Str
             props.push(Property::U64(name, v));
         }
     };
-    let memory = limits.memory.filter(|m| *m > 0).map(|m| m as u64);
-    put("MemoryMax", memory);
-    // (the limit counts memory and swap together, the property the swap)
-    let swap = match (memory, limits.memory_swap) {
-        (Some(m), Some(s)) if s > 0 => Some((s as u64).saturating_sub(m)),
-        _ => None,
+    let (memory, swap) = (limits.memory.unwrap_or(0), limits.memory_swap.unwrap_or(0));
+    let invalid =
+        |what: &str, value: i64| format!("the {what} limit {value} of the pod is not one");
+    let memory_max = match limit_of(memory) {
+        Limit::Bytes(m) => Some(m),
+        Limit::Unset | Limit::Unlimited => None,
+        Limit::Invalid => return Err(invalid("memory", memory)),
     };
-    put("MemorySwapMax", swap);
+    put("MemoryMax", memory_max);
+    // (the limit counts memory and swap together, the property the swap)
+    let swap_max = match swap_max(memory, swap) {
+        Swap::Max(s) => Some(s),
+        Swap::Unlimited => None,
+        Swap::Invalid => return Err(invalid("memory and swap", swap)),
+    };
+    put("MemorySwapMax", swap_max);
     // (CPU shares are 2 to 262144, the weight 1 to 10000)
     put(
         "CPUWeight",
-        limits
-            .cpu_shares
-            .filter(|s| *s > 0)
-            .map(|s| 1 + s.saturating_sub(2) * 9999 / 262_142),
+        Some(weight_of_shares(limits.cpu_shares.unwrap_or(0))).filter(|w| *w > 0),
     );
-    let period = limits.cpu_period.filter(|p| *p > 0);
-    let quota = limits
-        .cpu_quota
-        .filter(|q| *q > 0)
-        .map(|q| q as u64 * 1_000_000 / period.unwrap_or(100_000));
-    put("CPUQuotaPerSecUSec", quota);
-    put("CPUQuotaPeriodUSec", period.filter(|_| quota.is_some()));
+    let quota = limits.cpu_quota.unwrap_or(0);
+    let per_sec = match cpu_max(quota, limits.cpu_period.unwrap_or(0)) {
+        CpuMax::Quota { quota, period } => Some(quota_per_sec(quota, period)),
+        CpuMax::Unlimited => None,
+        CpuMax::Invalid => return Err(invalid("CPU quota", quota)),
+    };
+    put("CPUQuotaPerSecUSec", per_sec);
+    put(
+        "CPUQuotaPeriodUSec",
+        limits
+            .cpu_period
+            .filter(|p| *p > 0)
+            .filter(|_| per_sec.is_some()),
+    );
     // (podman gives the weight to IOWeight as it is)
     put(
         "IOWeight",
@@ -313,9 +311,52 @@ mod tests {
         assert_eq!(cpu_mask("0-3,5").unwrap(), [0b0010_1111]);
         assert_eq!(cpu_mask("9").unwrap(), [0, 0b10]);
         assert_eq!(cpu_mask("").unwrap(), Vec::<u8>::new());
-        for bad in ["a", "3-1", "1-", "99999", "0;1"] {
+        for bad in ["a", "3-1", "1-", "99999", "0;1", "+1"] {
             assert!(cpu_mask(bad).is_err(), "{bad}");
         }
+    }
+
+    /// A quota is a quota of a second without wrapping, and a limit that no
+    /// cgroup takes is an error, not a smaller or no limit.
+    #[test]
+    fn a_quota_does_not_wrap_in_the_quota_of_a_second() {
+        let quota = |q: i64, period: u64| {
+            properties(
+                &PodResources {
+                    cpu_quota: Some(q),
+                    cpu_period: Some(period),
+                    ..Default::default()
+                },
+                false,
+            )
+        };
+        let max = (1i64 << 44) - 1;
+        assert_eq!(
+            quota(max, 1_000).unwrap()[0],
+            Property::U64("CPUQuotaPerSecUSec", max as u64 * 1_000)
+        );
+        // (2^63 / 10^6 of them: the product wrapped)
+        for q in [max + 1, 18_446_744_073_710, i64::MAX, 999, -2] {
+            assert!(quota(q, 0).is_err(), "{q}");
+        }
+        assert!(quota(1_000, 999).is_err());
+        let swap = |memory, swap| {
+            properties(
+                &PodResources {
+                    memory,
+                    memory_swap: swap,
+                    ..Default::default()
+                },
+                false,
+            )
+        };
+        assert!(swap(Some(100), Some(99)).is_err());
+        assert!(swap(None, Some(99)).is_err());
+        assert!(swap(Some(-5), None).is_err());
+        assert_eq!(
+            swap(Some(100), Some(100)).unwrap()[1],
+            Property::U64("MemorySwapMax", 0)
+        );
     }
 
     #[test]
@@ -342,7 +383,7 @@ mod tests {
             [
                 Property::U64("MemoryMax", 100),
                 Property::U64("MemorySwapMax", 50),
-                Property::U64("CPUWeight", 39),
+                Property::U64("CPUWeight", 100),
                 Property::U64("CPUQuotaPerSecUSec", 250_000),
                 Property::U64("CPUQuotaPeriodUSec", 200_000),
                 Property::U64("IOWeight", 50),

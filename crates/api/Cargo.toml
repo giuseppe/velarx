@@ -20,6 +20,7 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
+velarx-limit-core = { path = "../limit-core" }
 velarx-proto = { path = "../proto" }
 # the words of the refusals of Docker's formats
 velarx-base = { path = "../base" }

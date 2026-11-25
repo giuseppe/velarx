@@ -95,8 +95,16 @@ pub fn hugepages_of(r: &mut Resources, hugetlb: bool) -> Result<()> {
     Ok(())
 }
 
-/// The most CPU shares of a cgroup.
-const MAX_SHARES: i64 = 262_144;
+/// The score of a CRI's `oom_score_adj`: 0 is not set, else -1000 to 1000;
+/// another number is refused, and is never cut to its low bits.
+fn oom_score_of(v: i64) -> Result<Option<i32>> {
+    if v == 0 {
+        return Ok(None);
+    }
+    velarx_limit_core::oom_score_adj(v)
+        .map(Some)
+        .ok_or_else(|| Status::invalid_argument("oom_score_adj is out of range"))
+}
 
 /// The resources of a sandbox (or its overhead): its `unified` settings are
 /// refused but `memory.oom.group`, which the kubelet sends for every sandbox
@@ -152,26 +160,26 @@ pub fn resources_of(r: &cri::LinuxContainerResources) -> Result<Resources> {
 /// limit of a kind has none of it for the pod.  Both are the CRI's fields,
 /// zero when not set.
 pub fn sandbox_limits(resources: &Resources, overhead: &Resources) -> Resources {
-    let sum = |r: i64, o: i64| if r > 0 { r.saturating_add(o.max(0)) } else { r };
-    // (the swap limit counts the memory too: the memory of the overhead is in it)
-    let swap_overhead = overhead.memory_swap.max(overhead.memory_limit);
-    // (the overhead's quota is of its own period)
-    let quota = match (resources.cpu_quota, overhead.cpu_quota) {
-        (r, o) if r > 0 && o > 0 && overhead.cpu_period > 0 && resources.cpu_period > 0 => {
-            r.saturating_add(o.saturating_mul(resources.cpu_period) / overhead.cpu_period)
-        }
-        (r, o) => sum(r, o),
+    use velarx_limit_core::{
+        sandbox_period, sandbox_quota, sandbox_shares, sandbox_swap, with_overhead,
     };
     Resources {
-        memory_limit: sum(resources.memory_limit, overhead.memory_limit),
-        memory_swap: sum(resources.memory_swap, swap_overhead),
-        cpu_shares: sum(resources.cpu_shares, overhead.cpu_shares).min(MAX_SHARES),
-        cpu_quota: quota,
-        cpu_period: if resources.cpu_period > 0 {
-            resources.cpu_period
-        } else {
-            overhead.cpu_period
-        },
+        memory_limit: with_overhead(resources.memory_limit, overhead.memory_limit),
+        // (the swap limit counts the memory too: the memory of the overhead is in it)
+        memory_swap: sandbox_swap(
+            resources.memory_swap,
+            overhead.memory_swap,
+            overhead.memory_limit,
+        ),
+        cpu_shares: sandbox_shares(resources.cpu_shares, overhead.cpu_shares),
+        // (the overhead's quota is of its own period)
+        cpu_quota: sandbox_quota(
+            resources.cpu_quota,
+            resources.cpu_period,
+            overhead.cpu_quota,
+            overhead.cpu_period,
+        ),
+        cpu_period: sandbox_period(resources.cpu_period, overhead.cpu_period),
         cpuset_cpus: resources.cpuset_cpus.clone(),
         cpuset_mems: resources.cpuset_mems.clone(),
         ..Default::default()
@@ -381,13 +389,10 @@ fn infra_security_of(
     sc: Option<&cri::LinuxSandboxSecurityContext>,
     oom_score_adj: i64,
 ) -> Result<InfraSecurity> {
-    let mut i = InfraSecurity::default();
-    if oom_score_adj != 0 {
-        i.oom_score_adj = Some(
-            i32::try_from(oom_score_adj)
-                .map_err(|_| Status::invalid_argument("oom_score_adj is out of range"))?,
-        );
-    }
+    let mut i = InfraSecurity {
+        oom_score_adj: oom_score_of(oom_score_adj)?,
+        ..Default::default()
+    };
     let Some(sc) = sc else {
         return Ok(i);
     };
@@ -702,8 +707,8 @@ pub fn container_create_of(
         if let Some(r) = &l.resources {
             let mut r = resources_of(r)?;
             hugepages_of(&mut r, hugetlb)?;
-            c.oom_score_adj = (r.oom_score_adj != 0).then_some(r.oom_score_adj as i32);
-            c.resources = limits_of(&r);
+            c.oom_score_adj = oom_score_of(r.oom_score_adj)?;
+            c.resources = limits_of(&r)?;
         }
         if let Some(sc) = &l.security_context {
             c.privileged = sc.privileged;
@@ -784,11 +789,15 @@ pub fn container_create_of(
 }
 
 /// The limits of the engine's request of the CRI's resources: those set.
-fn limits_of(r: &Resources) -> Option<ResourceLimits> {
+fn limits_of(r: &Resources) -> Result<Option<ResourceLimits>> {
     let set = |v: i64| (v > 0).then_some(v);
+    let bytes = |what: &str, v: i64| {
+        crate::engine::varlink::byte_limit(what, v)
+            .map_err(|e| Status::invalid_argument(e.to_string()))
+    };
     let l = ResourceLimits {
-        memory: set(r.memory_limit),
-        memory_swap: set(r.memory_swap),
+        memory: bytes("memory", r.memory_limit)?,
+        memory_swap: bytes("memory and swap", r.memory_swap)?,
         cpu_quota: (r.cpu_quota != 0).then_some(r.cpu_quota),
         cpu_period: set(r.cpu_period).map(|v| v as u64),
         cpu_shares: set(r.cpu_shares).map(|v| v as u64),
@@ -814,7 +823,7 @@ fn limits_of(r: &Resources) -> Option<ResourceLimits> {
         || l.cpuset_mems.is_some()
         || !l.hugepage_limits.is_empty()
         || l.cgroup_conf.is_some();
-    any.then_some(l)
+    Ok(any.then_some(l))
 }
 
 /// The engine's `idmap` option of an ID-mapped mount: the mappings of its
@@ -1885,6 +1894,61 @@ mod tests {
         assert!(meta(true, true));
         assert!(!meta(true, false));
         assert!(!meta(false, true), "no input to close");
+    }
+
+    /// A score that is not one is refused, not cut to its low 32 bits (which
+    /// of 2^32 is no score at all).
+    #[test]
+    fn an_oom_score_out_of_range_is_refused() {
+        let with = |adj: i64| {
+            container(|c| {
+                c.linux = Some(cri::LinuxContainerConfig {
+                    resources: Some(cri::LinuxContainerResources {
+                        oom_score_adj: adj,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            })
+            .map(|r| r.oom_score_adj)
+        };
+        assert_eq!(with(0).unwrap(), None);
+        assert_eq!(with(-998).unwrap(), Some(-998));
+        assert_eq!(with(1000).unwrap(), Some(1000));
+        for adj in [1001, -1001, 1 << 32, (1 << 32) + 5, i64::MIN, i64::MAX] {
+            assert!(with(adj).is_err(), "{adj}");
+        }
+        assert!(infra_security_of(None, 1 << 32).is_err());
+        assert!(infra_security_of(None, 5000).is_err());
+        assert_eq!(
+            infra_security_of(None, -998).unwrap().oom_score_adj,
+            Some(-998)
+        );
+    }
+
+    /// A memory below -1 is refused, not made "no limit"; 0 and -1 stay none.
+    #[test]
+    fn a_negative_memory_is_refused() {
+        let with = |memory_limit: i64, memory_swap: i64| {
+            container(|c| {
+                c.linux = Some(cri::LinuxContainerConfig {
+                    resources: Some(cri::LinuxContainerResources {
+                        memory_limit_in_bytes: memory_limit,
+                        memory_swap_limit_in_bytes: memory_swap,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            })
+            .map(|r| r.resources.map(|l| (l.memory, l.memory_swap)))
+        };
+        assert_eq!(with(0, 0).unwrap(), None);
+        assert_eq!(with(-1, -1).unwrap(), None);
+        assert_eq!(with(100, 150).unwrap(), Some((Some(100), Some(150))));
+        for v in [-2, i64::MIN] {
+            assert!(with(v, 0).is_err(), "memory {v}");
+            assert!(with(0, v).is_err(), "swap {v}");
+        }
     }
 
     #[test]

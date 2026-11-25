@@ -7,6 +7,7 @@ use super::call::refuse_field;
 use super::error::{ApiError, ApiResult};
 use serde::Deserialize;
 use serde_json::Value;
+use velarx_limit_core::{limit_of, nano_cpus_max, CpuMax, Limit, MAX_QUOTA, MIN_QUOTA};
 use velarx_proto::engine::{PodmanHealthUpdate, UpdateBlockIo, UpdateDevice, UpdateSpec};
 use velarx_proto::pod::RestartPolicy;
 use velarx_proto::request::{parse_device_rule, DeviceRule, Ulimit};
@@ -307,9 +308,21 @@ pub(super) fn libpod(body: Option<Value>, restart: Option<RestartPolicy>) -> Api
         .write_iops
         .extend(path_devices(l.write_iops, false));
     Ok(UpdateSpec {
-        memory: l.memory.limit,
-        memory_reservation: l.memory.reservation,
-        memory_swap: l.memory.swap,
+        memory: l
+            .memory
+            .limit
+            .map(|v| byte_limit("Memory", v))
+            .transpose()?,
+        memory_reservation: l
+            .memory
+            .reservation
+            .map(|v| byte_limit("MemoryReservation", v))
+            .transpose()?,
+        memory_swap: l
+            .memory
+            .swap
+            .map(|v| byte_limit("MemorySwap", v))
+            .transpose()?,
         cpu_quota: l.cpu.quota,
         cpu_period: l.cpu.period,
         cpu_shares: l.cpu.shares,
@@ -341,6 +354,17 @@ pub(super) fn libpod(body: Option<Value>, restart: Option<RestartPolicy>) -> Api
 /// Docker's limit: a negative one is none.
 fn limit(n: i64) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// A byte limit of an update: 0 is none, -1 is no limit (both go on to the
+/// engine), another number below 1 is refused.
+fn byte_limit(name: &str, v: i64) -> ApiResult<i64> {
+    match limit_of(v) {
+        Limit::Invalid => Err(ApiError::bad_request(format!(
+            "invalid {name} {v}: bytes, 0 or -1"
+        ))),
+        _ => Ok(v),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -478,7 +502,15 @@ pub(super) fn docker(body: Option<Value>) -> ApiResult<UpdateSpec> {
     }
     let given = |v: i64| (v != 0).then_some(v);
     let (cpu_quota, cpu_period) = if d.nano_cpus > 0 {
-        (Some(d.nano_cpus / 10_000), Some(100_000))
+        match nano_cpus_max(d.nano_cpus) {
+            CpuMax::Quota { quota, period } => (Some(quota as i64), Some(period)),
+            _ => {
+                return Err(ApiError::bad_request(format!(
+                "invalid NanoCpus {}: a quota of {MIN_QUOTA} to {MAX_QUOTA} microseconds of 100000",
+                d.nano_cpus
+            )))
+            }
+        }
     } else if d.cpu_quota > 0 {
         (
             Some(d.cpu_quota),
@@ -493,12 +525,23 @@ pub(super) fn docker(body: Option<Value>) -> ApiResult<UpdateSpec> {
         .map(|r| parse_device_rule(r).map_err(ApiError::bad_request))
         .collect::<ApiResult<Vec<_>>>()?;
     Ok(UpdateSpec {
-        memory: given(d.memory),
-        memory_reservation: given(d.memory_reservation),
-        memory_swap: given(d.memory_swap),
+        memory: given(d.memory)
+            .map(|v| byte_limit("Memory", v))
+            .transpose()?,
+        memory_reservation: given(d.memory_reservation)
+            .map(|v| byte_limit("MemoryReservation", v))
+            .transpose()?,
+        memory_swap: given(d.memory_swap)
+            .map(|v| byte_limit("MemorySwap", v))
+            .transpose()?,
         cpu_quota,
         cpu_period,
-        cpu_shares: given(d.cpu_shares).map(|v| v as u64),
+        cpu_shares: given(d.cpu_shares)
+            .map(|v| {
+                u64::try_from(v)
+                    .map_err(|_| ApiError::bad_request(format!("CpuShares {v} is negative")))
+            })
+            .transpose()?,
         cpuset_cpus: Some(d.cpuset_cpus).filter(|s| !s.is_empty()),
         cpuset_mems: Some(d.cpuset_mems).filter(|s| !s.is_empty()),
         pids_limit: d.pids_limit.filter(|v| *v != 0),
@@ -642,6 +685,46 @@ mod tests {
             json!({"Ulimits": null, "RestartPolicy": null, "BlkioWeightDevice": null}),
         ))
         .unwrap();
+    }
+
+    /// A count of CPUs that rounds to a quota of 0 would be no limit, and
+    /// a negative count of shares would be a huge one.
+    #[test]
+    fn a_cpu_limit_is_never_turned_into_no_limit() {
+        let quota = |nano: i64| docker(Some(json!({"NanoCpus": nano}))).map(|s| s.cpu_quota);
+        assert_eq!(quota(1_500_000_000).unwrap(), Some(150_000));
+        assert_eq!(quota(10_000_000).unwrap(), Some(1_000));
+        for nano in [1, 9_999, 9_999_999, i64::MAX] {
+            let e = quota(nano).unwrap_err();
+            assert!(e.message.contains("NanoCpus"), "{nano}: {}", e.message);
+        }
+        assert_eq!(quota(0).unwrap(), None);
+        assert_eq!(
+            docker(Some(json!({"CpuShares": 512}))).unwrap().cpu_shares,
+            Some(512)
+        );
+        let e = docker(Some(json!({"CpuShares": -1}))).unwrap_err();
+        assert!(e.message.contains("negative"), "{}", e.message);
+    }
+
+    /// A memory below -1 is refused, not sent on to the runtime.
+    #[test]
+    fn a_negative_memory_is_refused() {
+        for (docker_key, libpod_key) in [
+            ("Memory", "limit"),
+            ("MemorySwap", "swap"),
+            ("MemoryReservation", "reservation"),
+        ] {
+            for v in [-2, i64::MIN] {
+                let e = docker(Some(json!({ docker_key: v }))).unwrap_err();
+                assert!(e.message.contains(docker_key), "{}", e.message);
+                libpod(Some(json!({"memory": { libpod_key: v }})), None).unwrap_err();
+            }
+            for v in [-1, 100] {
+                docker(Some(json!({ docker_key: v }))).unwrap();
+                libpod(Some(json!({"memory": { libpod_key: v }})), None).unwrap();
+            }
+        }
     }
 
     #[test]

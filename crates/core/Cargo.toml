@@ -36,6 +36,7 @@ velarx-netdetach = { path = "../netdetach" }
 velarx-base = { path = "../base" }
 velarx-types = { path = "../types" }
 velarx-wire = { path = "../wire" }
+velarx-limit-core = { path = "../limit-core" }
 velarx-proto = { path = "../proto", features = ["service"] }
 velarx-registry = { path = "../registry", features = ["engine"] }
 velarx-config = { path = "../config", features = ["engine"] }

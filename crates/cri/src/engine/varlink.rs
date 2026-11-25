@@ -15,6 +15,7 @@
 use super::*;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use velarx_limit_core::{limit_of, Limit};
 use velarx_proto::connect::{self, ConnectError};
 use velarx_proto::engine::{self as wire, AttachOptions, EngineProxy, MAX_FILTERS};
 use velarx_proto::modes::{CgroupsMode, UsernsChoice};
@@ -360,22 +361,34 @@ impl Varlink {
     }
 }
 
+/// A byte limit of the CRI's resources: 0 and -1 are no limit, another
+/// number below 1 is refused.
+pub fn byte_limit(what: &str, v: i64) -> Result<Option<i64>> {
+    match limit_of(v) {
+        Limit::Unset | Limit::Unlimited => Ok(None),
+        Limit::Bytes(b) => Ok(Some(b as i64)),
+        Limit::Invalid => Err(EngineError::Invalid(format!(
+            "the {what} limit {v} is not a number of bytes, 0 or -1"
+        ))),
+    }
+}
+
 /// The resources of a pod from the CRI's: what is not set is no limit.
-pub fn pod_resources(r: &Resources) -> PodResources {
-    PodResources {
-        memory: (r.memory_limit > 0).then_some(r.memory_limit),
-        memory_swap: (r.memory_swap > 0).then_some(r.memory_swap),
+pub fn pod_resources(r: &Resources) -> Result<PodResources> {
+    Ok(PodResources {
+        memory: byte_limit("memory", r.memory_limit)?,
+        memory_swap: byte_limit("memory and swap", r.memory_swap)?,
         cpu_shares: u64::try_from(r.cpu_shares).ok().filter(|s| *s > 0),
         cpu_quota: (r.cpu_quota != 0).then_some(r.cpu_quota),
         cpu_period: u64::try_from(r.cpu_period).ok().filter(|p| *p > 0),
         cpuset_cpus: Some(r.cpuset_cpus.clone()).filter(|c| !c.is_empty()),
         cpuset_mems: Some(r.cpuset_mems.clone()).filter(|m| !m.is_empty()),
         ..Default::default()
-    }
+    })
 }
 
 /// The spec of a pod the engine creates.
-pub fn pod_spec(s: &PodCreate) -> PodSpec {
+pub fn pod_spec(s: &PodCreate) -> Result<PodSpec> {
     let id_map = |m: &[IdRange]| -> Vec<IdMapping> {
         m.iter()
             .map(|r| IdMapping {
@@ -461,9 +474,9 @@ pub fn pod_spec(s: &PodCreate) -> PodSpec {
     spec.security_context.run_as_user = s.infra.run_as_user;
     spec.security_context.run_as_group = s.infra.run_as_group;
     spec.security_context.supplemental_groups = s.infra.supplemental_groups.clone();
-    let limits = pod_resources(&s.resources);
+    let limits = pod_resources(&s.resources)?;
     spec.resources = (!limits.is_empty()).then_some(limits);
-    spec
+    Ok(spec)
 }
 
 /// The most of the standard output, and of the standard error, of an
@@ -528,13 +541,13 @@ impl Engine for Varlink {
     }
 
     async fn pod_create(&self, s: &PodCreate) -> Result<String> {
-        let (_, spec) = json_pipe(&pod_spec(s))?;
+        let (_, spec) = json_pipe(&pod_spec(s)?)?;
         // (the document is the one descriptor, read to its end)
         Ok(raw_call!(self.pod_create(0, vec![spec]))?.id)
     }
 
     async fn pod_update(&self, id: &str, r: &Resources) -> Result<()> {
-        call!(self.pod_update(id, pod_resources(r))).map(|_| ())
+        call!(self.pod_update(id, pod_resources(r)?)).map(|_| ())
     }
 
     async fn pod_start(&self, id: &str) -> Result<()> {
@@ -1040,7 +1053,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let spec = pod_spec(&create);
+        let spec = pod_spec(&create).unwrap();
         assert_eq!(spec.hostname.as_deref(), Some("h"));
         assert_eq!(spec.networks, ["host"]);
         assert!(spec.host_ipc && !spec.share_ipc);
@@ -1056,18 +1069,31 @@ mod tests {
         let limits = spec.resources.expect("limits");
         assert_eq!(limits.memory, Some(1 << 20));
         assert_eq!(limits.cpu_period, Some(100_000));
+        // a memory below -1 is refused, not made no limit; 0 and -1 are none
+        for (v, ok) in [(-2, false), (i64::MIN, false), (-1, true), (0, true)] {
+            let r = Resources {
+                memory_limit: v,
+                ..Default::default()
+            };
+            assert_eq!(pod_resources(&r).is_ok(), ok, "memory {v}");
+            let r = Resources {
+                memory_swap: v,
+                ..Default::default()
+            };
+            assert_eq!(pod_resources(&r).is_ok(), ok, "swap {v}");
+        }
         // (not the configuration's mode: the engine's default without a parent)
         assert_eq!(spec.cgroups, CgroupsMode::Enabled);
         // the systemd driver's slice: scopes below it
         create.cgroup_parent = "kubepods-burstable-pod1.slice".into();
-        assert_eq!(pod_spec(&create).cgroups, CgroupsMode::Scope);
+        assert_eq!(pod_spec(&create).unwrap().cgroups, CgroupsMode::Scope);
         // the cgroupfs driver's path is the parent of the cgroups made there
         create.cgroup_parent = "/kubepods/pod1".into();
-        assert_eq!(pod_spec(&create).cgroups, CgroupsMode::Enabled);
+        assert_eq!(pod_spec(&create).unwrap().cgroups, CgroupsMode::Enabled);
         create.cgroup_parent = String::new();
-        assert_eq!(pod_spec(&create).cgroups, CgroupsMode::Enabled);
+        assert_eq!(pod_spec(&create).unwrap().cgroups, CgroupsMode::Enabled);
         // the engine takes it
-        let bytes = serde_json::to_vec(&pod_spec(&create)).unwrap();
+        let bytes = serde_json::to_vec(&pod_spec(&create).unwrap()).unwrap();
         PodSpec::from_document(&bytes).unwrap();
     }
 }

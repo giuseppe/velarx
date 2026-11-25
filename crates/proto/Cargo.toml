@@ -37,6 +37,7 @@ service = ["proxy", "session", "dep:zlink", "dep:flate2", "dep:tokio", "dep:rust
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+velarx-limit-core = { path = "../limit-core" }
 thiserror.workspace = true
 # (the key and passphrase of a signing push are wiped when dropped)
 zeroize.workspace = true

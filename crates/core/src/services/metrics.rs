@@ -11,6 +11,7 @@
 use super::cgroup::CgroupStats;
 use std::fs;
 use std::path::Path;
+use velarx_limit_core::shares_of_weight;
 use velarx_wire::wire::{Descriptor, Sample};
 
 /// The labels of every metric of a container.
@@ -205,12 +206,6 @@ fn processes(dir: &Path) -> (u64, u64, u64) {
     (procs, fds, sockets)
 }
 
-/// The shares the weight of `cpu.weight` stands for (the inverse of what
-/// the runtime writes for `cpu.shares`).
-fn shares_of(weight: u64) -> u64 {
-    2 + weight.saturating_sub(1) * 262_142 / 9_999
-}
-
 /// What the samples of a running container are made from.
 pub struct Reading<'a> {
     pub who: Identity<'a>,
@@ -289,7 +284,7 @@ pub fn container_samples(r: &Reading) -> Vec<Sample> {
         w.sample(
             "container_spec_cpu_shares",
             &[],
-            shares_of(s.cpu_weight.unwrap_or(100)) as f64,
+            shares_of_weight(s.cpu_weight.unwrap_or(100)) as f64,
         ),
         w.sample(
             "container_spec_memory_limit_bytes",
@@ -541,8 +536,8 @@ mod tests {
 
     #[test]
     fn shares_follow_the_weight() {
-        assert_eq!(shares_of(1), 2);
-        assert_eq!(shares_of(10_000), 262_144);
-        assert_eq!(shares_of(39), 998);
+        assert_eq!(shares_of_weight(1), 2);
+        assert_eq!(shares_of_weight(10_000), 262_115);
+        assert_eq!(shares_of_weight(100), 1012);
     }
 }

@@ -422,7 +422,9 @@ JSON
     fi
     check "memory.max of the cgroup of the pod" 134217728 "$(cat "$pcg/memory.max")"
     check "cpu.max of the cgroup of the pod" "50000 100000" "$(cat "$pcg/cpu.max")"
-    check "cpu.weight of the cgroup of the pod" 20 "$(cat "$pcg/cpu.weight")"
+    # (the engine writes the weight of the pod: 512 shares are 59 in the quadratic conversion
+    # of limit-core's weight_of_shares, crun's convert_shares_to_weight, where 1024 is 100)
+    check "cpu.weight of the cgroup of the pod" 59 "$(cat "$pcg/cpu.weight")"
     check "the infra container and the container are below the cgroup of the pod" 2 "$(find "$pcg" -mindepth 2 -maxdepth 2 -name container | grep -c .)"
     # (the directory of a member is <id> in the engine's tree, velarx-<id>.scope in the slice)
     check "the infra container has no limit of its own" max \

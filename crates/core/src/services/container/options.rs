@@ -509,7 +509,7 @@ impl ContainerService {
                 .push(o::rlimit(&u.name, u.soft, u.hard).map_err(inv)?);
         }
         if let Some(adj) = req.oom_score_adj {
-            if !(-1000..=1000).contains(&adj) {
+            if velarx_limit_core::oom_score_adj(i64::from(adj)).is_none() {
                 return Err(inv(format!("invalid oom score adjustment {adj}")));
             }
         }

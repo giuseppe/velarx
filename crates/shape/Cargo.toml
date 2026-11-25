@@ -20,6 +20,7 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
+velarx-limit-core = { path = "../limit-core" }
 velarx-proto = { path = "../proto", default-features = false }
 serde.workspace = true
 serde_json.workspace = true

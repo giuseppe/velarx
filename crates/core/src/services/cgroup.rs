@@ -8,6 +8,9 @@ use std::sync::Mutex;
 use thiserror::Error;
 use tracing::{debug, info};
 use velarx_base::spawn::DAEMON_CGROUP;
+use velarx_limit_core::{
+    cpu_max, io_weight_of_blkio, limit_of, swap_max, weight_of_shares, CpuMax, Limit, Swap,
+};
 use velarx_proto::pod::PodResources;
 
 #[derive(Error, Debug)]
@@ -103,12 +106,6 @@ fn managed_cgroup(raw: &str) -> &str {
     }
 }
 
-/// The weight of `cpu.weight` (1 to 10000) of CPU shares (2 to 262144), as
-/// the OCI runtimes convert them.
-fn weight_of(shares: u64) -> u64 {
-    1 + shares.saturating_sub(2) * 9999 / 262_142
-}
-
 /// Write `value` to the file `name` of the cgroup `dir`.  A file the cgroup
 /// does not have (its controller is not enabled) is an error unless the
 /// value is the default `reset` it has anyway.
@@ -134,28 +131,43 @@ fn write_limit(dir: &Path, name: &str, value: &str, reset: &str) -> io::Result<(
     }
 }
 
+/// The error of a limit that is no limit (a pod's are checked when it is
+/// made, so a record that has one is damaged).
+fn invalid_limit(what: &str, value: i64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("the {what} limit {value} of the pod is not one"),
+    )
+}
+
 /// Write the limits of a pod to its cgroup `dir`; what is not set is the
 /// default of the cgroup (no limit).
 fn write_pod_limits(dir: &Path, l: &PodResources) -> io::Result<()> {
-    let memory = l.memory.filter(|m| *m > 0);
-    let swap = match (memory, l.memory_swap) {
-        // (the OCI limit counts memory and swap together, cgroup v2's
-        // only the swap)
-        (Some(m), Some(s)) if s > 0 => (s - m).max(0).to_string(),
-        _ => "max".to_string(),
+    let (memory, swap) = (l.memory.unwrap_or(0), l.memory_swap.unwrap_or(0));
+    let memory_max = match limit_of(memory) {
+        Limit::Bytes(m) => m.to_string(),
+        Limit::Unset | Limit::Unlimited => "max".to_string(),
+        Limit::Invalid => return Err(invalid_limit("memory", memory)),
     };
-    write_limit(
-        dir,
-        "memory.max",
-        &memory.map_or("max".into(), |m| m.to_string()),
-        "max",
-    )?;
-    write_limit(dir, "memory.swap.max", &swap, "max")?;
-    let weight = l.cpu_shares.filter(|s| *s > 0).map_or(100, weight_of);
+    // (the OCI limit counts memory and swap together, cgroup v2's only the
+    // swap)
+    let swap_max = match swap_max(memory, swap) {
+        Swap::Unlimited => "max".to_string(),
+        Swap::Max(s) => s.to_string(),
+        Swap::Invalid => return Err(invalid_limit("memory and swap", swap)),
+    };
+    write_limit(dir, "memory.max", &memory_max, "max")?;
+    write_limit(dir, "memory.swap.max", &swap_max, "max")?;
+    let weight = match weight_of_shares(l.cpu_shares.unwrap_or(0)) {
+        0 => 100,
+        w => w,
+    };
     write_limit(dir, "cpu.weight", &weight.to_string(), "100")?;
-    let max = match l.cpu_quota.filter(|q| *q > 0) {
-        Some(q) => format!("{q} {}", l.cpu_period.filter(|p| *p > 0).unwrap_or(100_000)),
-        None => "max 100000".to_string(),
+    let quota = l.cpu_quota.unwrap_or(0);
+    let max = match cpu_max(quota, l.cpu_period.unwrap_or(0)) {
+        CpuMax::Quota { quota, period } => format!("{quota} {period}"),
+        CpuMax::Unlimited => "max 100000".to_string(),
+        CpuMax::Invalid => return Err(invalid_limit("CPU quota", quota)),
     };
     write_limit(dir, "cpu.max", &max, "max 100000")?;
     write_limit(
@@ -198,7 +210,12 @@ fn write_io_limits(dir: &Path, l: &PodResources) -> io::Result<()> {
     let weight = l.blkio_weight.filter(|w| *w > 0);
     // (the default weight of the file that is not used is back at 100)
     for (file, w) in [
-        ("io.weight", weight.filter(|_| !bfq).map(blkio_weight_of)),
+        (
+            "io.weight",
+            weight
+                .filter(|_| !bfq)
+                .map(|w| io_weight_of_blkio(u64::from(w))),
+        ),
         ("io.bfq.weight", weight.filter(|_| bfq).map(u64::from)),
     ] {
         let w = w.unwrap_or(100);
@@ -208,7 +225,7 @@ fn write_io_limits(dir: &Path, l: &PodResources) -> io::Result<()> {
         let (file, w) = if bfq {
             ("io.bfq.weight", d.value)
         } else {
-            ("io.weight", blkio_weight_of(d.value as u16))
+            ("io.weight", io_weight_of_blkio(d.value))
         };
         write_limit(dir, file, &format!("{}:{} {w}", d.major, d.minor), "").map_err(|e| {
             if e.kind() == io::ErrorKind::Unsupported {
@@ -228,12 +245,6 @@ fn write_io_limits(dir: &Path, l: &PodResources) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-/// The weight of `io.weight` (1 to 10000) of a block IO weight (10 to 1000),
-/// as the OCI runtimes convert it.
-fn blkio_weight_of(w: u16) -> u64 {
-    1 + u64::from(w).saturating_sub(10) * 9999 / 990
 }
 
 impl CgroupManager {
@@ -1175,7 +1186,7 @@ mod tests {
             read(dir.path(), "memory.swap.max"),
             (50u64 << 20).to_string()
         );
-        assert_eq!(read(dir.path(), "cpu.weight"), "39");
+        assert_eq!(read(dir.path(), "cpu.weight"), "100");
         assert_eq!(read(dir.path(), "cpu.max"), "50000 200000");
         assert_eq!(read(dir.path(), "cpuset.cpus"), "0-1");
         assert_eq!(read(dir.path(), "cpuset.mems"), "0");
@@ -1186,8 +1197,6 @@ mod tests {
         assert_eq!(read(dir.path(), "cpu.weight"), "100");
         assert_eq!(read(dir.path(), "cpu.max"), "max 100000");
         assert_eq!(read(dir.path(), "cpuset.cpus"), "");
-        assert_eq!(weight_of(2), 1);
-        assert_eq!(weight_of(262_144), 10_000);
     }
 
     /// The block IO files: the weight (converted for `io.weight`, as is for
@@ -1233,8 +1242,6 @@ mod tests {
             "7:0 rbps=max wbps=max riops=max wiops=max"
         );
         assert_eq!(read(dir.path(), "io.weight"), "default 100");
-        assert_eq!(blkio_weight_of(10), 1);
-        assert_eq!(blkio_weight_of(1000), 10_000);
         // a cgroup without the controller cannot have them
         let none = tempfile::tempdir().unwrap();
         let e = write_pod_limits(none.path(), &l).unwrap_err();

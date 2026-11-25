@@ -446,16 +446,8 @@ pub fn human_size(bytes: u64) -> String {
 fn host_config(c: &ContainerRecord) -> Value {
     let h = &c.host;
     let r = &c.resources;
-    let period = if r.cpu_period > 0 {
-        r.cpu_period
-    } else {
-        100_000
-    };
-    let cpus = if r.cpu_quota > 0 {
-        (r.cpu_quota as f64 / period as f64 * 1e9) as i64
-    } else {
-        0
-    };
+    let cpus =
+        velarx_limit_core::nano_cpus_of(r.cpu_quota, u64::try_from(r.cpu_period).unwrap_or(0));
     let binds: Vec<String> = c
         .mounts
         .iter()

@@ -4750,6 +4750,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "velarx-base",
+ "velarx-limit-core",
  "velarx-proto",
  "velarx-registry",
  "velarx-shape",
@@ -4924,6 +4925,7 @@ dependencies = [
  "velarx-fuse",
  "velarx-graph",
  "velarx-lazy-core",
+ "velarx-limit-core",
  "velarx-netdetach",
  "velarx-netkernel",
  "velarx-nsid",
@@ -4971,6 +4973,7 @@ dependencies = [
  "tracing",
  "velarx-base",
  "velarx-confine-core",
+ "velarx-limit-core",
  "velarx-proto",
  "velarx-registry",
  "velarx-sys",
@@ -5155,6 +5158,10 @@ name = "velarx-lazy-core"
 version = "0.1.0"
 
 [[package]]
+name = "velarx-limit-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-mcs-core"
 version = "0.1.0"
 
@@ -5333,6 +5340,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "velarx-limit-core",
  "velarx-sys",
  "zeroize",
  "zlink",
@@ -5465,6 +5473,7 @@ dependencies = [
  "velarx-db",
  "velarx-fuse",
  "velarx-graph",
+ "velarx-limit-core",
  "velarx-mcs-core",
  "velarx-netdetach",
  "velarx-netkernel",
@@ -5505,6 +5514,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "velarx-limit-core",
  "velarx-proto",
 ]
 
