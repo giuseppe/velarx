@@ -85,6 +85,9 @@ pub struct RemovalPlan {
     pub api_record: Option<PathBuf>,
     /// The directory of the volumes the volume service made
     pub volumes_dir: PathBuf,
+    /// The lock of the volumes (`<root>/volumes.lock`): held shared while
+    /// its anonymous volumes are removed
+    pub volumes_lock: PathBuf,
     /// The lock files of the container that go with it (`<state>/mon`)
     pub lock_files: Vec<PathBuf>,
     /// How its writable layer goes when the driver keeps it elsewhere than

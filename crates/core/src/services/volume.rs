@@ -1217,6 +1217,11 @@ pub fn is_mount_point(path: &Path) -> io::Result<bool> {
 pub struct VolumeService {
     db: Database,
     volumes_dir: PathBuf,
+    /// `<root>/volumes.lock`: held shared by whoever changes a volume
+    /// directory or a row and by a container create while it names
+    /// volumes, exclusive by `rename` and by the check, after the lock of
+    /// the store when both are taken
+    lock: PathBuf,
 }
 
 /// What to create.
@@ -1275,7 +1280,28 @@ impl VolumeService {
             )
         })?;
 
-        Ok(Self { db, volumes_dir })
+        let lock = volumes_dir
+            .parent()
+            .unwrap_or(&volumes_dir)
+            .join("volumes.lock");
+        Ok(Self {
+            db,
+            volumes_dir,
+            lock,
+        })
+    }
+
+    /// The lock file of the volumes.
+    pub fn lock_path(&self) -> &Path {
+        &self.lock
+    }
+
+    /// Hold the lock shared: a change of a volume is not seen half done.
+    /// (`remove` and `prune` hold it shared too, so a create may still name
+    /// a volume that is being removed: the user asked for the removal, and
+    /// an exclusive hold would stall every create while a tree is deleted)
+    pub(crate) async fn changing(&self) -> VolumeResult<velarx_storage::StorageLock> {
+        Ok(velarx_storage::StorageLock::shared(&self.lock).await?)
     }
 
     /// Create a new named volume
@@ -1309,6 +1335,7 @@ impl VolumeService {
         if !valid_volume_name(&name) {
             return Err(VolumeError::InvalidName(name));
         }
+        let _lock = self.changing().await?;
         if let Some(m) = local_volume_mount(&c.options)? {
             // podman checks that what a bind volume binds is there
             if m.fstype == "bind" {
@@ -1421,6 +1448,7 @@ impl VolumeService {
 
     /// Remove a volume
     pub async fn remove(&self, name: &str, force: bool) -> VolumeResult<()> {
+        let _lock = self.changing().await?;
         let volume = self.get(name).await?;
 
         if !force {
@@ -1478,6 +1506,9 @@ impl VolumeService {
         if !valid_volume_name(new_name) {
             return Err(VolumeError::InvalidName(new_name.to_string()));
         }
+        // (a create holds the lock shared from its mounts to its row: no
+        // container starts to use the volume between the users and the move)
+        let _lock = velarx_storage::StorageLock::exclusive(&self.lock).await?;
         let mut volume = self.get(name).await?;
         if volume.name == new_name {
             return Ok(volume);
@@ -1627,6 +1658,7 @@ impl VolumeService {
 
     /// Replace the state of a volume: its file, then its row.
     pub async fn set_state(&self, name: &str, state: &VolumeState) -> VolumeResult<()> {
+        let _lock = self.changing().await?;
         let dir = self.volumes_dir.join(name);
         let mut meta = VolumeMeta::read(&dir)?;
         meta.state = state.clone();
@@ -2661,6 +2693,81 @@ mod tests {
         svc.remove("data", false).await.unwrap();
         assert!(svc.get("data").await.is_err());
         assert!(!svc.volume_path("data").exists());
+    }
+
+    /// A change of a volume waits for the holder of the lock, exclusive,
+    /// with nothing done: a check never sees one half done.  Changes share
+    /// it.
+    #[tokio::test]
+    async fn a_change_waits_while_the_volumes_are_locked_exclusive() {
+        let (svc, _dir) = service().await;
+        let svc = std::sync::Arc::new(svc);
+        svc.create("a", VolumeDriver::Local, HashMap::new(), HashMap::new())
+            .await
+            .unwrap();
+        let lock = svc.lock_path().to_path_buf();
+        for change in ["create", "set_state", "rename", "remove"] {
+            let held = velarx_storage::StorageLock::exclusive(&lock).await.unwrap();
+            let before = entries(&svc);
+            let task = tokio::spawn({
+                let svc = svc.clone();
+                async move {
+                    let none = HashMap::new;
+                    match change {
+                        "create" => svc
+                            .create("b", VolumeDriver::Local, none(), none())
+                            .await
+                            .map(drop),
+                        "set_state" => svc.set_state("a", &VolumeState::default()).await,
+                        "rename" => svc.rename("a", "c").await.map(drop),
+                        _ => svc.remove("c", true).await,
+                    }
+                }
+            });
+            // (asleep in the lock, and so not ended while it is held)
+            let waiter = lock.clone();
+            let waits = tokio::task::spawn_blocking(move || {
+                velarx_base::testing::wait_lock_waiter(&waiter, std::time::Duration::from_secs(20))
+            });
+            assert!(waits.await.unwrap(), "{change} does not take the lock");
+            assert!(!task.is_finished());
+            assert_eq!(entries(&svc), before, "{change}");
+            drop(held);
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(entries(&svc), ["b"]);
+        let first = svc.changing().await.unwrap();
+        svc.set_state("b", &VolumeState::default()).await.unwrap();
+        drop(first);
+    }
+
+    /// A rename waits for every holder of the lock, shared as well, and a
+    /// change that asks for it again meanwhile is not held back by the
+    /// rename that waits: a create holds it shared and calls the changes.
+    #[tokio::test]
+    async fn a_rename_waits_for_a_shared_holder() {
+        let (svc, _dir) = service().await;
+        let svc = std::sync::Arc::new(svc);
+        svc.create("a", VolumeDriver::Local, HashMap::new(), HashMap::new())
+            .await
+            .unwrap();
+        let held = svc.changing().await.unwrap();
+        let task = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.rename("a", "c").await.map(drop) }
+        });
+        let lock = svc.lock_path().to_path_buf();
+        let waits = tokio::task::spawn_blocking(move || {
+            velarx_base::testing::wait_lock_waiter(&lock, std::time::Duration::from_secs(20))
+        });
+        assert!(waits.await.unwrap(), "rename does not take the lock");
+        assert!(!task.is_finished());
+        assert_eq!(entries(&svc), ["a"]);
+        // (the shared lock is granted while an exclusive one waits)
+        svc.set_state("a", &VolumeState::default()).await.unwrap();
+        drop(held);
+        task.await.unwrap().unwrap();
+        assert_eq!(entries(&svc), ["c"]);
     }
 
     /// What is in the volumes directory, by name.

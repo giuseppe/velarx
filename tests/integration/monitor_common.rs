@@ -651,6 +651,7 @@ impl Fixture {
                 named_files: Vec::new(),
                 api_record: None,
                 volumes_dir: self.dir.path().join("volumes"),
+                volumes_lock: self.dir.path().join("volumes.lock"),
                 lock_files: Vec::new(),
                 writable: velarx_graph::WritableRelease::InBundle { pin: None },
             },

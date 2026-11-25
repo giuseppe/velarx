@@ -44,6 +44,8 @@ pub struct Prepared {
     /// The lock of the store, shared until the removal is done: a
     /// collection of the store waits for the removal of a container's root
     _storage: velarx_storage::StorageLock,
+    /// The lock of the volumes, shared, when volumes go with the container
+    _volumes: Option<velarx_storage::StorageLock>,
 }
 
 impl Prepared {
@@ -100,8 +102,9 @@ fn used_by_others(a: &impl Access, me: &str, name: &str, mountpoint: &str) -> Db
 /// What a confined thread may not do: decide which volumes go and unmount
 /// what the container left mounted (the bundle, the root file system, a
 /// volume with options).  The caller holds the lock of the container's
-/// start; the lock of the store is taken here, shared, and held by
-/// [`Prepared`] until [`finish`].
+/// start; the lock of the store is taken here, shared, then the one of the
+/// volumes when some go, and both are held by [`Prepared`] until
+/// [`finish`].
 pub fn prepare(a: &impl Access, plan: &SettlePlan, with_volumes: bool) -> SettleResult<Prepare> {
     let Some(container) = row(a, &plan.id)? else {
         return Ok(Prepare::Gone);
@@ -122,6 +125,13 @@ pub fn prepare(a: &impl Access, plan: &SettlePlan, with_volumes: bool) -> Settle
     };
     let storage = velarx_storage::StorageLock::shared_blocking(&plan.storage_lock)?;
     let r = &plan.removal;
+    let volumes_lock = if volumes.is_empty() {
+        None
+    } else {
+        Some(velarx_storage::StorageLock::shared_blocking(
+            &r.volumes_lock,
+        )?)
+    };
     if let Some(public) = r.public_rootfs.as_deref().filter(|p| p.exists()) {
         mounts::detach_mounts_below(public);
     }
@@ -134,6 +144,7 @@ pub fn prepare(a: &impl Access, plan: &SettlePlan, with_volumes: bool) -> Settle
         container,
         volumes,
         _storage: storage,
+        _volumes: volumes_lock,
     })))
 }
 
@@ -248,6 +259,7 @@ pub fn finish(
         container,
         volumes,
         _storage,
+        _volumes,
     } = prepared;
     if let Err(e) = files(&plan.id, &plan.removal, &volumes) {
         tracing::warn!("Cannot remove the files of container {}: {e}", plan.id);
@@ -479,6 +491,7 @@ mod tests {
                 named_files: Vec::new(),
                 api_record: None,
                 volumes_dir: dir.path().join("volumes"),
+                volumes_lock: dir.path().join("volumes.lock"),
                 lock_files: Vec::new(),
                 writable: velarx_graph::WritableRelease::InBundle { pin: None },
             },
@@ -615,5 +628,46 @@ mod tests {
             0
         );
         assert!(f.plan.removal.bundle.exists());
+    }
+
+    /// The volumes that go with the container are removed under the lock of
+    /// the volumes, shared: a check of them waits for the removal.
+    #[test]
+    fn the_volumes_lock_is_held_while_anonymous_volumes_go() {
+        let f = fixture(false);
+        let config = ContainerConfig {
+            id: "c1".into(),
+            mounts: vec![crate::container::MountConfig {
+                source: "/v/anon/_data".into(),
+                target: "/d".into(),
+                volume: Some("anon".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        f.store
+            .call(move |c| {
+                c.execute(
+                    "UPDATE containers SET config = ?1",
+                    [serde_json::to_string(&config).unwrap()],
+                )?;
+                c.execute_batch(
+                    r#"INSERT INTO volumes (name, driver, mountpoint, labels, options, created_at, scope, state)
+                         VALUES ('anon', '"local"', '/v/anon/_data', '{}', '{}', 't', 'local', '{"anonymous":true}');"#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let lock = &f.plan.removal.volumes_lock;
+        let prepared = go(&f);
+        assert_eq!(prepared.volumes().len(), 1);
+        assert!(velarx_storage::StorageLock::try_exclusive(lock)
+            .unwrap()
+            .is_none());
+        assert!(finish(&f.store, &f.plan, prepared, None).removed);
+        assert!(velarx_storage::StorageLock::try_exclusive(lock)
+            .unwrap()
+            .is_some());
+        assert_eq!(rows(&f, "SELECT count(*) FROM volumes"), 0);
     }
 }

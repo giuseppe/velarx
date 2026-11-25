@@ -80,6 +80,7 @@ impl ContainerService {
                     .join(format!("{id}.json"))
             }),
             volumes_dir: self.volume_service.volumes_dir().to_path_buf(),
+            volumes_lock: self.volume_service.lock_path().to_path_buf(),
             lock_files: vec![
                 self.start_lock_file(id),
                 self.pause_lock_file(id),
