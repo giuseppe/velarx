@@ -111,7 +111,7 @@ pub fn open_in_root(
 
 /// Open the path `path` of `root` that has no link but maybe its last
 /// component, which is not followed.
-fn open_resolved(root: BorrowedFd<'_>, path: &str, flags: OFlags) -> io::Result<OwnedFd> {
+pub fn open_resolved(root: BorrowedFd<'_>, path: &str, flags: OFlags) -> io::Result<OwnedFd> {
     let rel = path.trim_start_matches('/');
     let rel = if rel.is_empty() { "." } else { rel };
     let flags = flags | OFlags::CLOEXEC | OFlags::NOFOLLOW;

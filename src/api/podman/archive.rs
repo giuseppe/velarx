@@ -287,41 +287,21 @@ fn base_name(path: &str) -> String {
     }
 }
 
-/// Resolve the path of a cp in the root of a process: links are followed
-/// (a link is reported with the path it resolves to, its target is what
-/// is copied).
-fn stat_path(root: BorrowedFd<'_>, path: &str) -> io::Result<(EntryStat, String)> {
-    let real = cp::open_in_root(root, path, OFlags::PATH, true)?;
-    let st = fstat(&real)?;
-    Ok((
-        EntryStat {
-            mode: st.st_mode,
-            size: st.st_size,
-            mtime: st.st_mtime,
-            mtime_nsec: st.st_mtime_nsec as i64,
-            is_dir: FileType::from_raw_mode(st.st_mode) == FileType::Directory,
-        },
-        cp::resolve_in_root(root, path)?,
-    ))
-}
-
-fn path_stat(root: &Root<'_>, path: &str) -> io::Result<PathStat> {
-    let (st, link_target) = match root {
-        Root::Process(fd) => stat_path(fd.as_fd(), path)?,
-        Root::Stopped(v) => v.stat(path)?,
-    };
+/// What a stat of `path`, resolved to `at`, says: a link is reported with
+/// the path it resolves to (its target is what is copied).
+fn path_stat(at: Resolved<'_>, path: &str) -> PathStat {
     // the client copies the contents of a directory asked as DIR/.
-    let link_target = preserve_base_path(path, &link_target);
+    let link_target = preserve_base_path(path, &at.path);
     // Docker names the path asked (a link by its name)
     let name = match base_name(path).as_str() {
         "." if !path.ends_with("/.") => "/".to_string(),
         n => n.to_string(),
     };
-    Ok(PathStat {
+    PathStat {
         name,
-        st,
+        st: at.st,
         link_target,
-    })
+    }
 }
 
 /// podman's PreserveBasePath: the resolved path keeps a final `/.` and a
@@ -361,26 +341,84 @@ fn archive_error(e: io::Error, path: &str) -> ApiError {
     }
 }
 
-/// Write the tar of `path` of the container (its contents with `contents`).
+/// A path of the root of a container, resolved once: the path it resolves
+/// to (links followed), its stat and, for a process, the descriptor opened
+/// from that path (a link swapped in meanwhile is not followed).  What a
+/// stat says, what is left out and what is archived are all taken from it.
+struct Resolved<'r> {
+    path: String,
+    st: EntryStat,
+    node: Node<'r>,
+}
+
+/// Where what a path resolved to is read from.
+enum Node<'r> {
+    Process(OwnedFd),
+    Stopped(&'r StoppedView<'r>),
+}
+
+impl<'r> Resolved<'r> {
+    fn of(root: &'r Root<'r>, inside: &str) -> io::Result<Resolved<'r>> {
+        match root {
+            Root::Process(fd) => {
+                let path = cp::resolve_in_root(fd.as_fd(), inside)?;
+                let node = cp::open_resolved(fd.as_fd(), &path, OFlags::PATH)?;
+                let st = fstat(&node)?;
+                Ok(Resolved {
+                    path,
+                    st: EntryStat {
+                        mode: st.st_mode,
+                        size: st.st_size,
+                        mtime: st.st_mtime,
+                        mtime_nsec: st.st_mtime_nsec as i64,
+                        is_dir: FileType::from_raw_mode(st.st_mode) == FileType::Directory,
+                    },
+                    node: Node::Process(node),
+                })
+            }
+            Root::Stopped(v) => {
+                let (st, path) = v.stat(inside)?;
+                Ok(Resolved {
+                    path,
+                    st,
+                    node: Node::Stopped(v),
+                })
+            }
+        }
+    }
+
+    /// What a copy of it leaves out, if it is in the root of the container
+    /// (podman leaves out nothing of a volume or a bind mount of a running
+    /// container): from the path it resolves to (a link to `/dev` is
+    /// `/dev`).
+    fn excluded(&self) -> Excluded {
+        let mut comps = self.path.split('/').filter(|c| !matches!(*c, "" | "."));
+        match comps.next() {
+            None => Excluded::Top,
+            Some(first) if cp::ROOT_EXCLUDES.contains(&first) => Excluded::All {
+                dir: self.st.is_dir,
+            },
+            Some(_) => Excluded::None,
+        }
+    }
+}
+
+/// Write the tar of what `at` resolved to (its contents with `contents`).
 fn write_archive<W: Write>(
-    root: &Root<'_>,
     b: &mut tar::Builder<W>,
-    path: &str,
+    at: Resolved<'_>,
     name: &Path,
     contents: bool,
     ids: &IdMaps,
     exclude: &[&str],
 ) -> io::Result<()> {
-    match root {
-        Root::Process(fd) => {
-            let real = cp::open_in_root(fd.as_fd(), path, OFlags::PATH, true)?;
-            TreeWriter {
-                builder: b,
-                ids: Some(ids),
-            }
-            .add_tree_excluding(real, name, contents, exclude)
+    match at.node {
+        Node::Process(real) => TreeWriter {
+            builder: b,
+            ids: Some(ids),
         }
-        Root::Stopped(v) => v.archive_excluding(b, path, name, contents, ids, exclude),
+        .add_tree_excluding(real, name, contents, exclude),
+        Node::Stopped(v) => v.archive_excluding(b, &at.path, name, contents, ids, exclude),
     }
 }
 
@@ -431,11 +469,12 @@ async fn stat_of(
     let (t2, p2) = (target.clone(), path.clone());
     let stat = tokio::task::spawn_blocking(move || {
         let (root, inside, mount) = t2.open_at(&p2)?;
-        let mut stat = path_stat(&root, &inside)?;
+        let at = Resolved::of(&root, &inside)?;
         let excluded = match mount {
             Some(_) => Excluded::None,
-            None => excluded(&root, &inside)?,
+            None => at.excluded(),
         };
+        let mut stat = path_stat(at, &inside);
         // (what a link resolves to is a path of the container)
         if let Some(dest) = mount.filter(|d| *d != "/") {
             stat.link_target = format!("{dest}{}", stat.link_target);
@@ -481,23 +520,6 @@ enum Excluded {
     All { dir: bool },
 }
 
-/// What is left out of the copy of `inside` of the root of the container
-/// `root` (not of a mount: podman leaves out nothing of a volume or a bind
-/// mount of a running container), from the path it resolves to (a link to
-/// `/dev` is `/dev`).
-fn excluded(root: &Root<'_>, inside: &str) -> io::Result<Excluded> {
-    let (st, resolved) = match root {
-        Root::Process(fd) => stat_path(fd.as_fd(), inside)?,
-        Root::Stopped(v) => v.stat(inside)?,
-    };
-    let mut comps = resolved.split('/').filter(|c| !matches!(*c, "" | "."));
-    Ok(match comps.next() {
-        None => Excluded::Top,
-        Some(first) if cp::ROOT_EXCLUDES.contains(&first) => Excluded::All { dir: st.is_dir },
-        Some(_) => Excluded::None,
-    })
-}
-
 /// The tar of `path` of a container, written as it is read.
 fn tar_of(target: Arc<Target>, path: String) -> ByteStream {
     let (body, tx) = body_channel();
@@ -515,9 +537,10 @@ fn tar_of(target: Arc<Target>, path: String) -> ByteStream {
             let name = base_name(&path);
             // (as podman, without the devices and the kernel's files of the
             // root of the container)
+            let at = Resolved::of(&root, &inside)?;
             let excluded = match mount {
                 Some(_) => Excluded::None,
-                None => excluded(&root, &inside)?,
+                None => at.excluded(),
             };
             let exclude: &[&str] = match excluded {
                 Excluded::None => &[],
@@ -532,15 +555,7 @@ fn tar_of(target: Arc<Target>, path: String) -> ByteStream {
                     ))
                 }
             };
-            write_archive(
-                &root,
-                &mut b,
-                &inside,
-                Path::new(&name),
-                contents,
-                &target.ids,
-                exclude,
-            )?;
+            write_archive(&mut b, at, Path::new(&name), contents, &target.ids, exclude)?;
             b.into_inner()?.flush()
         })();
         if let Err(e) = result {
@@ -744,7 +759,8 @@ pub(crate) async fn export_of(state: &Arc<AppState>, name: &str) -> ApiResult<By
                 buf: Vec::new(),
             });
             b.mode(tar::HeaderMode::Complete);
-            write_archive(&root, &mut b, "/", Path::new(""), true, &target.ids, &[])?;
+            let top = Resolved::of(&root, "/")?;
+            write_archive(&mut b, top, Path::new(""), true, &target.ids, &[])?;
             b.into_inner()?.flush()
         })();
         if let Err(e) = result {
@@ -1041,16 +1057,17 @@ mod tests {
         std::fs::write(d.path().join("etc/f"), "x").unwrap();
         std::os::unix::fs::symlink("/etc", d.path().join("l")).unwrap();
         let root = Root::Process(open_dir(d.path()).unwrap());
-        let ps = path_stat(&root, "/l").unwrap();
+        let path_stat = |p: &str| Resolved::of(&root, p).map(|at| path_stat(at, p));
+        let ps = path_stat("/l").unwrap();
         assert!(ps.st.is_dir);
         assert_eq!((ps.name.as_str(), ps.link_target.as_str()), ("l", "/etc"));
-        let ps = path_stat(&root, "/l/f").unwrap();
+        let ps = path_stat("/l/f").unwrap();
         assert_eq!(
             (ps.name.as_str(), ps.link_target.as_str(), ps.st.is_dir),
             ("f", "/etc/f", false)
         );
-        assert_eq!(path_stat(&root, "/").unwrap().name, "/");
-        let e = path_stat(&root, "/nope").err().unwrap();
+        assert_eq!(path_stat("/").unwrap().name, "/");
+        let e = path_stat("/nope").err().unwrap();
         assert_eq!(e.raw_os_error(), Some(libc::ENOENT));
     }
 
@@ -1065,7 +1082,8 @@ mod tests {
         std::fs::write(d.path().join("dev/null"), "").unwrap();
         std::os::unix::fs::symlink("/dev", d.path().join("mydev")).unwrap();
         let root = Root::Process(open_dir(d.path()).unwrap());
-        let at = |p: &str| excluded(&root, p).unwrap();
+        let excluded = |p: &str| Resolved::of(&root, p).map(|at| at.excluded());
+        let at = |p: &str| excluded(p).unwrap();
         for p in ["/", "/.", "//", "/lib/.."] {
             assert_eq!(at(p), Excluded::Top, "{p}");
         }
@@ -1084,7 +1102,33 @@ mod tests {
         for p in ["/usr/dev", "/usr", "/lib"] {
             assert_eq!(at(p), Excluded::None, "{p}");
         }
-        assert!(excluded(&root, "/nope").is_err());
+        assert!(excluded("/nope").is_err());
+    }
+
+    /// What a copy leaves out and what it archives come from the one
+    /// resolution: a link that is swapped after it does not change either.
+    #[test]
+    fn a_link_swapped_after_the_resolution_changes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        for dir in ["proc", "usr"] {
+            std::fs::create_dir_all(d.path().join(dir)).unwrap();
+        }
+        std::fs::write(d.path().join("proc/seen"), "").unwrap();
+        std::fs::write(d.path().join("usr/other"), "").unwrap();
+        std::os::unix::fs::symlink("/proc", d.path().join("l")).unwrap();
+        let root = Root::Process(open_dir(d.path()).unwrap());
+        let at = Resolved::of(&root, "/l").unwrap();
+        std::fs::remove_file(d.path().join("l")).unwrap();
+        std::os::unix::fs::symlink("/usr", d.path().join("l")).unwrap();
+        assert_eq!(at.excluded(), Excluded::All { dir: true });
+        let mut b = tar::Builder::new(Vec::new());
+        write_archive(&mut b, at, Path::new("l"), true, &IdMaps::default(), &[]).unwrap();
+        let names: Vec<_> = tar::Archive::new(&b.into_inner().unwrap()[..])
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["seen"]);
     }
 
     #[tokio::test]
