@@ -724,3 +724,16 @@ async fn a_removal_that_waited_for_another_finds_no_image() {
         other => panic!("not NotFound: {other:?}"),
     }
 }
+
+/// What a publish of a lazy pull that died left, a `.new-` directory in
+/// `staging/pulls`, is removed by the collection (not only at a reboot).
+#[tokio::test]
+async fn the_leftover_of_a_publish_that_died_is_collected() {
+    let e = env().await;
+    let pulls = e.staging.join("pulls");
+    let dead = pulls.join(".new-dead");
+    std::fs::create_dir_all(dead.join("sub")).unwrap();
+    let report = gc(&e).collect(GcOptions::default()).await.unwrap();
+    assert!(!dead.exists());
+    assert_eq!(report.staging_removed, 1);
+}

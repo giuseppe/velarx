@@ -668,7 +668,9 @@ impl GcService {
             }
         }
         // what a publish of a pull that died left
-        if let Ok(entries) = std::fs::read_dir(area.root().join("images")) {
+        if let Ok(entries) =
+            std::fs::read_dir(area.root().join(velarx_content::pull::staged::PULLS))
+        {
             for e in entries.flatten() {
                 if e.file_name().to_string_lossy().starts_with(".new-") {
                     let path = e.path();
