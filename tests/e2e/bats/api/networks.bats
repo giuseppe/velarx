@@ -94,15 +94,14 @@ setup () { api_setup; }
     pm rm -f -t0 apic1 > /dev/null 2>&1
 }
 
-@test "libpod list refuses external by name, takes sync" {
-    out=$(api -o /dev/null -w '%{http_code}' "http://d/v5.0.0/libpod/containers/json?external=true")
-    check "libpod list ?external=true is refused" 501 "$out"
-    check_match "and names it" "the parameter \`external\` is not supported" "$(api "http://d/v5.0.0/libpod/containers/json?external=true")"
-    check "?external=false is fine" 200 "$(api -o /dev/null -w '%{http_code}' "http://d/v5.0.0/libpod/containers/json?external=false")"
-    # (podman's remote client sends it for the containers it acts on)
+@test "libpod list takes external and sync" {
+    # (the store has no containers of other tools: the list is the same)
+    check "libpod list ?external=true is taken" 200 "$(api -o /dev/null -w '%{http_code}' "http://d/v5.0.0/libpod/containers/json?external=true")"
+    check "?external=false is taken" 200 "$(api -o /dev/null -w '%{http_code}' "http://d/v5.0.0/libpod/containers/json?external=false")"
+    # (podman's remote client sends sync for the containers it acts on)
     check "?sync=true is taken" 200 "$(api -o /dev/null -w '%{http_code}' "http://d/v5.0.0/libpod/containers/json?all=true&sync=true")"
     pm ps --external > /dev/null 2>&1
-    check "podman --remote ps --external is refused" 125 $?
+    check "podman --remote ps --external is taken" 0 $?
 }
 
 @test "connect to a host network is refused by name" {
