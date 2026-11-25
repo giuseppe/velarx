@@ -656,8 +656,9 @@ pub fn add_devices(
 pub use velarx_base::cdi::split_cdi_device;
 
 /// Write the options into the spec (its JSON); `rootless` is a daemon in a
-/// user namespace, which cannot mount /proc for the PID namespace of the
-/// host or own the IPC one.
+/// user namespace, which cannot own the IPC namespace of the host.  A
+/// daemon in one, or a container with a user namespace of its own, cannot
+/// mount /proc for the PID namespace of the host.
 pub fn apply(
     spec: &mut Value,
     o: &CreateOptions,
@@ -725,7 +726,10 @@ pub fn apply(
     if !o.pid_ns.is_empty() {
         set_namespace(spec, "pid", &o.pid_ns);
         // procfs is mounted only by the owner of the PID namespace
-        if o.pid_ns == "host" && rootless {
+        let own_userns = spec["linux"]["namespaces"]
+            .as_array()
+            .is_some_and(|ns| ns.iter().any(|n| n["type"] == "user"));
+        if o.pid_ns == "host" && (rootless || own_userns) {
             remove_mounts(spec, &["/proc"]);
             push_mount(
                 spec,
@@ -1120,6 +1124,38 @@ mod tests {
                 ]}
             }
         })
+    }
+
+    #[test]
+    fn the_host_pid_namespace_binds_proc_where_the_container_does_not_own_it() {
+        let o = CreateOptions {
+            pid_ns: "host".into(),
+            ..Default::default()
+        };
+        let proc_type = |rootless: bool, userns: bool| {
+            let mut s = base();
+            if userns {
+                s["linux"]["namespaces"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type": "user"}));
+            }
+            apply(&mut s, &o, rootless).unwrap();
+            let proc = s["mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["destination"] == "/proc")
+                .unwrap()
+                .clone();
+            proc["type"].as_str().unwrap().to_string()
+        };
+        // a root daemon, a container with no user namespace of its own
+        assert_eq!(proc_type(false, false), "proc");
+        // its own user namespace, rootless or not: it does not own the PID one
+        assert_eq!(proc_type(false, true), "bind");
+        assert_eq!(proc_type(true, false), "bind");
+        assert_eq!(proc_type(true, true), "bind");
     }
 
     #[test]

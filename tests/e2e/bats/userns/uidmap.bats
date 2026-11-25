@@ -149,6 +149,13 @@ $((ME + 1)) $((ME + 1)) $((1499 - ME))" "$out"
     fi
 }
 
+@test "the pid namespace of the host with a user namespace of its own" {
+    # procfs is mounted only by the owner of the pid namespace: /proc is
+    # the host's, also for a root daemon
+    out=$(runo "--userns auto --pid host" sh -c 'test -d /proc/1 && [ "$(cat /proc/1/comm)" != sh ] && echo yes')
+    check "userns auto, pid host" "yes" "$out"
+}
+
 @test "container:ID shares the namespace" {
     a=$(bg "--userns auto" sleep 60)
     e2e_wait_condition "$a" running 30 || e2e_die "$a is not running"
