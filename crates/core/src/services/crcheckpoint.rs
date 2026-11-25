@@ -767,9 +767,8 @@ impl ContainerService {
         })
         .await
         .map_err(|e| ContainerError::Io(std::io::Error::other(e)))??;
-        let mut opts = opts.clone();
-        opts.import = Some(staging.path().join(CHECKPOINT_IMAGE_ARCHIVE));
-        self.restore_import(&opts, Some(pods)).await
+        let archive = open_staged_archive(staging.path())?;
+        self.restore_archive(archive, opts, Some(pods)).await
     }
 
     /// Extract an archive of a checkpoint into a directory of its own, and
@@ -900,6 +899,16 @@ impl ContainerService {
         }
         let file = std::fs::File::open(&path)
             .map_err(|e| invalid(format!("the archive: {}: {e}", path.display())))?;
+        self.restore_archive(file, opts, pods).await
+    }
+
+    /// [`Self::restore_import`] of the archive `file`, opened by the caller.
+    async fn restore_archive(
+        self: &Arc<Self>,
+        file: std::fs::File,
+        opts: &RestoreOptions,
+        pods: Option<&super::pod::PodService>,
+    ) -> ContainerResult<CheckpointRecord> {
         let (staging, dump) = self.extract_archive(file).await?;
         let previous = match &opts.import_previous {
             Some(path) => {
@@ -1381,10 +1390,36 @@ pub(crate) fn import_request(
             .collect::<Result<Vec<_>, _>>()?
             .concat();
     }
+    // (a directory for the health check's log is a host path, as the log
+    // path of the container)
+    if let Some(h) = r.healthcheck.as_mut().filter(|h| h.log_dir().is_some()) {
+        h.log_destination.clear();
+    }
     // (not: id, name, replace, pidfile, conmon_pidfile, cidfile, pod,
     // no_monitor, lazy, annotations, init_path, cgroup_parent, sysctls,
     // the log path, timezone, systemd...)
     Ok(r)
+}
+
+/// The archive of a checkpoint image staged in `staging`: a regular file of
+/// the directory, not a link, a device or a FIFO that the image may hold.
+fn open_staged_archive(staging: &std::path::Path) -> ContainerResult<std::fs::File> {
+    use velarx_sys::fs::{open_beneath, Beneath, BeneathError};
+    let dir = std::fs::File::open(staging)?;
+    match open_beneath(
+        dir.as_fd(),
+        std::path::Path::new(CHECKPOINT_IMAGE_ARCHIVE),
+        Beneath::File,
+    ) {
+        Ok(fd) => Ok(fd.into()),
+        Err(BeneathError::NotRegular) => Err(invalid(format!(
+            "the checkpoint image has no regular file {CHECKPOINT_IMAGE_ARCHIVE}"
+        ))),
+        Err(e) => Err(invalid(format!(
+            "the checkpoint image: {CHECKPOINT_IMAGE_ARCHIVE}: {}",
+            std::io::Error::from(e)
+        ))),
+    }
 }
 
 /// Remove the directory of checkpoint images `dir` (and what is in it, off
@@ -1651,6 +1686,44 @@ mod tests {
         )
         .unwrap();
         assert!(r.ip_address.is_none() && r.mac_address.is_none());
+    }
+
+    #[test]
+    fn an_imported_health_check_has_no_log_directory() {
+        let imported = |to: &str| {
+            let r = import_request(
+                dumped(|r| {
+                    r.healthcheck = Some(velarx_proto::health::Healthcheck {
+                        log_destination: to.into(),
+                        ..Default::default()
+                    })
+                }),
+                &RestoreOptions::default(),
+            )
+            .unwrap();
+            r.healthcheck.unwrap().log_destination
+        };
+        assert_eq!(imported("/var/log/h"), "");
+        assert_eq!(imported("events_logger"), "events_logger");
+    }
+
+    #[test]
+    fn a_staged_archive_must_be_a_regular_file_of_the_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("image");
+        std::fs::create_dir(&staging).unwrap();
+        let archive = staging.join(CHECKPOINT_IMAGE_ARCHIVE);
+        let host = tmp.path().join("host");
+        std::fs::write(&host, b"host").unwrap();
+        std::os::unix::fs::symlink(&host, &archive).unwrap();
+        assert!(open_staged_archive(&staging).is_err());
+        std::fs::remove_file(&archive).unwrap();
+        // (no waiting for a writer)
+        rustix::fs::mkfifoat(rustix::fs::CWD, &archive, rustix::fs::Mode::RUSR).unwrap();
+        assert!(open_staged_archive(&staging).is_err());
+        std::fs::remove_file(&archive).unwrap();
+        std::fs::write(&archive, b"tar").unwrap();
+        assert!(open_staged_archive(&staging).is_ok());
     }
 
     #[test]
