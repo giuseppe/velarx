@@ -359,11 +359,17 @@ impl ContainerService {
         };
         for m in &mut mounts {
             if let Some(i) = m.image.as_mut() {
-                let (image, tags) = self
-                    .image_service
-                    .get_with_tags(&i.image)
-                    .await
-                    .map_err(|_| ContainerError::ImageNotFound(i.image.clone()))?;
+                // (a lazy pull in progress is finished first: the image
+                // mounted is the whole image, served with the digests of
+                // the store)
+                let (image, tags) = match self.image_service.get_with_tags(&i.image).await {
+                    Err(velarx_types::ImageError::Pulling(_)) => {
+                        self.image_service.complete_image(&i.image).await?;
+                        self.image_service.get_with_tags(&i.image).await
+                    }
+                    found => found,
+                }
+                .map_err(|_| ContainerError::ImageNotFound(i.image.clone()))?;
                 // an image mounted is judged as the image of the container
                 self.image_service
                     .verify_stored(&i.image, &image, &tags, judging)
