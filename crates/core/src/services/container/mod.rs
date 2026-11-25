@@ -122,9 +122,7 @@ const ENGINE_MOUNTS: &[&str] = &[
 
 /// The names podman accepts for a container.
 fn valid_container_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    velarx_base::names::is_object_name(name)
 }
 
 impl ContainerError {
@@ -726,6 +724,12 @@ impl ContainerService {
 
     /// Rename a container
     pub async fn rename(&self, id: &str, new_name: &str) -> ContainerResult<()> {
+        let new_name = new_name.strip_prefix('/').unwrap_or(new_name);
+        if !valid_container_name(new_name) {
+            return Err(ContainerError::InvalidArgument(
+                "names must match [a-zA-Z0-9][a-zA-Z0-9_.-]*: invalid argument".into(),
+            ));
+        }
         let container = self.db.get_container(id).await?;
 
         self.db.rename_container(&container.id, new_name).await?;

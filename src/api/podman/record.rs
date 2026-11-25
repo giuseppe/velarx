@@ -42,8 +42,7 @@ fn file(state: &AppState, id: &str) -> Option<PathBuf> {
 
 fn file_in(config: &velarx_config::Config, id: &str) -> Option<PathBuf> {
     // ids are hex: never a path
-    id.bytes()
-        .all(|b| b.is_ascii_hexdigit())
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| dir_in(config).join(format!("{id}.json")))
 }
 
@@ -101,4 +100,18 @@ pub async fn forget_removed(state: &AppState) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_hex_id_names_a_file() {
+        let config = velarx_config::Config::default();
+        assert!(file_in(&config, "0aF9").is_some());
+        for bad in ["", "..", "a/b", "xyz"] {
+            assert!(file_in(&config, bad).is_none(), "{bad}");
+        }
+    }
 }

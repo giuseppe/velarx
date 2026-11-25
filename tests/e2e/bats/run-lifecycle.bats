@@ -913,6 +913,19 @@ EOT
     sh_ container rm -t 0 -f rp6 > /dev/null
 }
 
+# A rename applies the name rule of create.
+@test "a container is renamed only to a valid name" {
+    sh_ container create --name rn1 --network none "$IMAGE" true > /dev/null
+    for bad in . .. -x _x .x a/b; do
+        out=$(sh_ container rename rn1 -- "$bad" 2>&1)
+        check_match "rename to $bad is refused" "names must match" "$out"
+        check "rn1 keeps its name" rn1 "$(inspect_of rn1 name)"
+    done
+    sh_ container rename rn1 rn2 > /dev/null
+    check "a valid name is accepted" 0 $?
+    sh_ container rm rn2 > /dev/null
+}
+
 # The processes are named by what they do.
 @test "the server process is named velarx-server" {
     n=0

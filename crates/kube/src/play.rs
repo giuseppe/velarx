@@ -353,13 +353,9 @@ pub fn file_volume_names(docs: &[Value]) -> Vec<String> {
     out
 }
 
-/// A name of an object: DNS-1123 subdomain characters only.
+/// A name of an object: the rule of every object a user names.
 fn check_name(what: &str, n: &str) -> Result<(), String> {
-    let ok = !n.is_empty()
-        && n.len() <= 253
-        && n.bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_'));
-    if ok {
+    if n.len() <= 253 && velarx_base::names::is_object_name(n) {
         Ok(())
     } else {
         Err(format!("invalid {what} name `{n}`"))
@@ -1940,6 +1936,14 @@ pub fn plan(docs: &[Value], opts: &Options, store: &dyn Sources) -> Result<Plan,
 mod tests {
     use super::*;
     use crate::yaml::parse_documents;
+
+    #[test]
+    fn a_name_of_an_object_follows_the_rule_of_the_other_objects() {
+        assert!(check_name("object", "web-1.a_b").is_ok());
+        for bad in ["", ".", "..", "-web", ".web", "a/b"] {
+            assert!(check_name("object", bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn the_images_of_the_containers_a_play_runs() {

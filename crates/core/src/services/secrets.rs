@@ -54,11 +54,7 @@ pub struct SecretStore {
 }
 
 fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 253
-        && name
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+    name.len() <= 253 && velarx_base::names::is_object_name(name)
 }
 
 fn row_info(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretInfo> {
@@ -649,6 +645,16 @@ mod tests {
                 .unwrap(),
             d,
         )
+    }
+
+    #[test]
+    fn a_secret_name_follows_the_rule_of_the_other_objects() {
+        for ok in ["s", "db-pass_1", "a.b"] {
+            assert!(valid_name(ok), "{ok}");
+        }
+        for bad in ["", ".", "..", "-s", ".hidden", "a/b", &"a".repeat(254)] {
+            assert!(!valid_name(bad), "{bad}");
+        }
     }
 
     #[tokio::test]

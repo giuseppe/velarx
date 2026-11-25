@@ -281,10 +281,7 @@ pub enum MountType {
 
 /// A volume name: what podman allows (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`).
 pub fn valid_volume_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && name.len() <= 255
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    name.len() <= 255 && velarx_base::names::is_object_name(name)
 }
 
 /// The destination of a mount: absolute, cleaned, not the root.
