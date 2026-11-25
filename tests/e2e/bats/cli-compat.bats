@@ -937,7 +937,7 @@ from stdin" "$out"
     check "network inspect" "Error: network nosuchnet: unable to find network with name or ID nosuchnet: network not found" "$(sh_ network inspect nosuchnet 2>&1 | tail -1)"
 }
 
-@test "pull takes several images, and restore --tcp-close is refused by name" {
+@test "pull takes several images, and restore --tcp-close is an option of restore" {
     sh_ tag "$IMAGE" localhost/pull-two:1
     out=$(sh_ pull -q "$IMAGE" "$IMAGE" 2>&1)
     check "pull of two images" 0 $?
@@ -950,8 +950,12 @@ from stdin" "$out"
     check "the second is pulled" 1 "$(printf '%s\n' "$out" | grep -c '^[0-9a-f]\{64\}$')"
     check_match "the first is said" "^Error: .*localhost:1" "$out"
     out=$(sh_ container restore --tcp-close nosuch 2>&1)
-    check "restore --tcp-close" 125 $?
-    check_match "refused by name, not unknown" "--tcp-close is not supported" "$out"
+    check "restore --tcp-close of a container that is not there" 125 $?
+    # (it is an option of restore: the answer is about the lack of root, or
+    # about the container, not about the option)
+    want="checkpoint and restore need root"
+    [ "$(id -u)" != 0 ] || want=nosuch
+    check_match "the answer is not about the option" "^Error: .*$want" "$out"
 }
 
 @test "tools/parity-report/cli.py counts an option velarx does not know as unknown" {
