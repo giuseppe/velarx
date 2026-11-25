@@ -179,7 +179,10 @@ lengths before allocating and verifies every digest.
   image together is not caught); with `--security-opt verity=enforce` or
   `[storage] composefs_digests = "require"` an image without those digests
   is refused, so the image, its record and the bundle cannot be changed
-  together and believed.
+  together and believed.  The writable layer of a container is outside
+  the chain in every mode and the engine never mounts it as a lower
+  layer: a writer of the store can change what a container sees there,
+  and `run --rm` by digest starts from the image alone.
 * **A client of the API** that can connect is an administrator of the
   engine: there are no per-user permissions. The REST and CRI frontends are
   separate confined processes that decode requests and call the engine over

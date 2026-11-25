@@ -391,6 +391,36 @@ pub fn wait_gone(path: &Path, limit: Duration) -> bool {
     true
 }
 
+/// A mount namespace of the test's child (and a user namespace for an
+/// unprivileged user), with a private `/`: false where the kernel does
+/// not let this user have one.
+pub fn private_namespace() -> bool {
+    use rustix::thread::UnshareFlags;
+    let uid = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
+    let root = rustix::process::geteuid().is_root();
+    let flags = if root {
+        UnshareFlags::NEWNS
+    } else {
+        UnshareFlags::NEWNS | UnshareFlags::NEWUSER
+    };
+    if velarx_sys::ns::unshare(flags).is_err() {
+        eprintln!("SKIPPED: no mount namespace for this user");
+        return false;
+    }
+    if !root {
+        std::fs::write("/proc/self/setgroups", "deny").unwrap();
+        std::fs::write("/proc/self/uid_map", format!("0 {uid} 1")).unwrap();
+        std::fs::write("/proc/self/gid_map", format!("0 {gid} 1")).unwrap();
+    }
+    rustix::mount::mount_change(
+        "/",
+        rustix::mount::MountPropagationFlags::PRIVATE | rustix::mount::MountPropagationFlags::REC,
+    )
+    .unwrap();
+    true
+}
+
 /// The nft binary: in $PATH, else the system directories.  The code never
 /// runs it; the tests use it as another view of the ruleset than ours.
 pub fn find_nft() -> Option<PathBuf> {

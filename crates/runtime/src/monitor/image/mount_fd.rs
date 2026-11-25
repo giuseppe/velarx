@@ -567,6 +567,7 @@ mod tests {
     use super::*;
     use rustix::mount::{FsMountFlags, FsOpenFlags, MountAttrFlags};
     use std::path::PathBuf;
+    use velarx_base::testing::private_namespace;
 
     const ROOT: Way = Way {
         what: "root file system",
@@ -604,37 +605,6 @@ mod tests {
         .unwrap();
         rustix::io::write(&f, b"driver").unwrap();
         m
-    }
-
-    /// A mount namespace of the test's child (and a user namespace for an
-    /// unprivileged user), with a private `/`: false where the kernel does
-    /// not let this user have one.
-    fn private_namespace() -> bool {
-        use rustix::thread::UnshareFlags;
-        let uid = rustix::process::getuid().as_raw();
-        let gid = rustix::process::getgid().as_raw();
-        let root = rustix::process::geteuid().is_root();
-        let flags = if root {
-            UnshareFlags::NEWNS
-        } else {
-            UnshareFlags::NEWNS | UnshareFlags::NEWUSER
-        };
-        if velarx_sys::ns::unshare(flags).is_err() {
-            eprintln!("SKIPPED: no mount namespace for this user");
-            return false;
-        }
-        if !root {
-            std::fs::write("/proc/self/setgroups", "deny").unwrap();
-            std::fs::write("/proc/self/uid_map", format!("0 {uid} 1")).unwrap();
-            std::fs::write("/proc/self/gid_map", format!("0 {gid} 1")).unwrap();
-        }
-        rustix::mount::mount_change(
-            "/",
-            rustix::mount::MountPropagationFlags::PRIVATE
-                | rustix::mount::MountPropagationFlags::REC,
-        )
-        .unwrap();
-        true
     }
 
     fn mountinfo_line(p: &Path) -> Option<String> {

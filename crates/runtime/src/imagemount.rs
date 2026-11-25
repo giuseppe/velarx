@@ -411,6 +411,49 @@ pub fn writable_overlay(o: &RootOverlay<'_>) -> io::Result<OwnedFd> {
 mod tests {
     use super::*;
 
+    /// The upper layer of a container is never a lower layer: the kernel
+    /// refuses the overlay of a root file system whose lower or data-only
+    /// layer is its upper or work directory, lies under one, or reaches it
+    /// by a link, so no check of the engine stands in front of it.
+    #[test]
+    fn the_upper_layer_is_never_a_lower_layer() {
+        velarx_base::testing::in_child(|| {
+            if !velarx_base::testing::private_namespace() {
+                return;
+            }
+            let d = tempfile::tempdir().unwrap();
+            let p = |n: &str| d.path().join(n).to_string_lossy().into_owned();
+            for n in ["image", "data", "upper/usr", "work"] {
+                std::fs::create_dir_all(p(n)).unwrap();
+            }
+            std::os::unix::fs::symlink(p("upper"), p("link")).unwrap();
+            let (upper, work) = (p("upper"), p("work"));
+            let mount = |lowers: &[String], datas: &[String]| {
+                writable_overlay(&RootOverlay {
+                    lowers,
+                    datas,
+                    upper: Path::new(&upper),
+                    work: Path::new(&work),
+                    verity: None,
+                    userxattr: true,
+                    volatile: false,
+                    stubs: Stubs::Every,
+                    label: None,
+                })
+            };
+            let image = [p("image")];
+            mount(&image, &[]).unwrap();
+            mount(&image, &[p("data")]).unwrap();
+            let refused = rustix::io::Errno::LOOP.to_string();
+            for bad in ["upper", "upper/usr", "link", "work", "work/work"] {
+                let e = mount(&[p(bad)], &[]).unwrap_err().to_string();
+                assert!(e.contains(&refused), "lower {bad}: {e}");
+                let e = mount(&image, &[p(bad)]).unwrap_err().to_string();
+                assert!(e.contains(&refused), "data {bad}: {e}");
+            }
+        });
+    }
+
     /// No descriptor left (`EMFILE`) is told apart from the system having
     /// none (`ENFILE`) and from what is wrong with an image, also when the
     /// opening of an image fails with it.
