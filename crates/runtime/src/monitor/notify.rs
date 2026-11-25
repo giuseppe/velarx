@@ -93,8 +93,24 @@ pub fn bind(path: &Path, label: Option<&str>) -> io::Result<OwnedFd> {
     };
     net::bind(&sock, &SocketAddrUnix::new(path)?)?;
     // The container may be another user.
-    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o666))?;
+    open_to_all(path)?;
     Ok(sock)
+}
+
+/// Make the file at `path` writable by everyone, through a descriptor of
+/// the name itself: a link the container put there is not followed (the
+/// mode of a link cannot change), and the umask of the monitor, which
+/// cuts the mode an `fchmod` of the socket before the bind would give,
+/// does not matter.
+fn open_to_all(path: &Path) -> io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
+    let file = rustix::fs::open(
+        path,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    rustix::fs::chmod(velarx_sys::fd::proc_path(&file), Mode::from_raw_mode(0o666))?;
+    Ok(())
 }
 
 fn new_socket() -> io::Result<OwnedFd> {
@@ -144,6 +160,33 @@ mod tests {
         assert!(!valid_target("relative/path"));
         assert!(!valid_target("@"));
         assert!(!valid_target(&format!("/{}", "x".repeat(200))));
+    }
+
+    #[test]
+    fn the_socket_is_open_to_all() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify.sock");
+        let _sock = bind(&path, None).unwrap();
+        let mode = std::fs::symlink_metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o666);
+    }
+
+    #[test]
+    fn a_link_put_at_the_name_is_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let path = dir.path().join("notify.sock");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(open_to_all(&path).is_err());
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o600);
     }
 
     #[test]
