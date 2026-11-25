@@ -158,10 +158,19 @@ fn try_push_confinement(
     };
     // (an archive's file is written to: the descriptor is open; nothing is
     // opened by a name)
+    const PROBE: &str = "/var/tmp/.velarx-push-probe";
+    let made = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(PROBE);
     results.push((
         "creates no file by a name".into(),
-        std::fs::File::create("/var/tmp/.velarx-push-probe").is_err(),
+        made.as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
     ));
+    if made.is_ok() {
+        let _ = std::fs::remove_file(PROBE);
+    }
     if !mode.is_directory() {
         let mut file = std::fs::File::from(dest);
         results.push((
