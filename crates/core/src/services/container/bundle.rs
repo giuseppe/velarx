@@ -559,6 +559,14 @@ impl RootAsk {
     }
 }
 
+/// What the donor container has in its resolv.conf, which it writes through
+/// its bind mount: nothing when the file is not a regular file or is larger
+/// than a resolv.conf can be.
+fn donor_resolv(dir: &Path) -> Option<String> {
+    const MAX_RESOLV: u64 = 1 << 20;
+    velarx_base::conf::read_config_file(&dir.join(ETC_RESOLV), MAX_RESOLV).ok()
+}
+
 impl ContainerService {
     /// How the owners of an image become ids of the daemon's namespace: those
     /// of the container's own user namespace, else the ids the daemon has.
@@ -764,7 +772,7 @@ impl ContainerService {
                 .is_ok_and(|m| m.is_file() && m.uid() == rustix::process::geteuid().as_raw())
         };
         Ok(Some(InheritedEtc {
-            resolv_text: fs::read_to_string(dir.join(ETC_RESOLV)).ok(),
+            resolv_text: donor_resolv(&dir),
             share_resolv: !mapped && ours(ETC_RESOLV),
             share_hosts: !mapped && ours(ETC_HOSTS),
             dir,
@@ -1053,6 +1061,19 @@ impl ContainerService {
 #[cfg(test)]
 mod label_tests {
     use super::*;
+
+    #[test]
+    fn a_donor_resolv_conf_is_read_up_to_a_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(ETC_RESOLV);
+        std::fs::write(&file, "nameserver 10.0.0.1\n").unwrap();
+        assert_eq!(
+            donor_resolv(dir.path()).as_deref(),
+            Some("nameserver 10.0.0.1\n")
+        );
+        std::fs::write(&file, vec![b'#'; (1 << 20) + 1]).unwrap();
+        assert_eq!(donor_resolv(dir.path()), None);
+    }
 
     #[test]
     fn an_image_cannot_name_the_unit_of_its_container() {
