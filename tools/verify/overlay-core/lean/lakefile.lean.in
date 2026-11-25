@@ -1,0 +1,19 @@
+-- SPDX-License-Identifier: Apache-2.0
+import Lake
+open Lake DSL
+
+-- (AENEAS of ../pins)
+require aeneas from git
+  "https://github.com/AeneasVerif/aeneas" @ "@AENEAS@" / "backends/lean"
+
+package «overlay-core»
+
+-- What Aeneas made of crates/overlay-core (../../run puts it there)
+lean_lib Extracted where
+  globs := #[.submodules `Extracted]
+
+-- `#proved` (../../Proved.lean)
+@[default_target] lean_lib Proved
+
+@[default_target] lean_lib OverlayCore where
+  globs := #[.submodules `OverlayCore]
