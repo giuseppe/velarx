@@ -136,3 +136,22 @@ setup () { api_setup; }
         pm volume rm ftvol > /dev/null 2>&1
     fi
 }
+
+@test "a volume directory holds volume.json, which moves with a rename" {
+    pm volume create --label k=v dirvol > /dev/null
+    mp=$(pm volume inspect dirvol --format '{{.Mountpoint}}')
+    dir=$(dirname "$mp")
+    check "volume.json has the labels" v "$(jq -r .labels.k "$dir/volume.json")"
+    check "volume.json is private" 600 "$(stat -c %a "$dir/volume.json")"
+    echo x > "$mp/f"
+    out=$(api -o /dev/null -w '%{http_code}' -X POST "http://d/v5.0.0/libpod/volumes/dirvol/rename?newName=dirvol2")
+    check "volume rename" 204 "$out"
+    new=$(pm volume inspect dirvol2 --format '{{.Mountpoint}}')
+    check "the data moved with the volume" x "$(cat "$new/f")"
+    check "the file moved with the volume" v "$(jq -r .labels.k "$(dirname "$new")/volume.json")"
+    check "the old directory is gone" no "$([ -e "$dir" ] && echo yes || echo no)"
+    check "no volume is left half built" 0 "$(ls -A "$(dirname "$dir")" | grep -c '^\.new-')"
+    check "the volume is listed under its new name" dirvol2 "$(pm volume ls --filter label=k=v --format '{{.Name}}')"
+    pm volume rm dirvol2 > /dev/null
+    check "the directory goes with the volume" no "$([ -e "$(dirname "$new")" ] && echo yes || echo no)"
+}
