@@ -191,10 +191,6 @@ pub struct Pool {
     names: std::sync::OnceLock<Arc<dyn Resolver>>,
 }
 
-/// The port of DNS: the resolver of the C library asks again over TCP when
-/// the answer did not fit in a datagram.
-const DNS_PORT: u16 = 53;
-
 /// The TCP ports of HTTPS and HTTP: a registry named without a port, the
 /// hosts it sends the client to (its token service, the CDN of its blobs).
 const WEB_PORTS: [u16; 2] = [443, 80];
@@ -251,14 +247,13 @@ fn endpoint_ports(endpoints: &[EndpointSpec]) -> impl Iterator<Item = u16> + '_ 
 
 /// The TCP ports a worker for `endpoints` may connect to (its Landlock
 /// rules): 443 and 80, the ports the endpoints and their hints name, those
-/// of the proxies and DNS.  A registry that sends the client to a host on
+/// of the proxies.  A registry that sends the client to a host on
 /// another port (a token service, a CDN) the hints do not know is not
 /// reached.
 pub fn connect_ports(endpoints: &[EndpointSpec]) -> Vec<u16> {
     let mut ports: Vec<u16> = WEB_PORTS.to_vec();
     ports.extend(endpoint_ports(endpoints));
     ports.extend(proxy_ports());
-    ports.push(DNS_PORT);
     ports.sort_unstable();
     ports.dedup();
     ports
@@ -361,7 +356,7 @@ impl Pool {
     /// A pool of one worker for the requests to `authority` (`host[:port]`
     /// of a URL or of a registry to log in to), which may connect to its
     /// port only (`default_port` when it names none), besides those of the
-    /// proxies and the resolver ([`connect_ports`]).
+    /// proxies ([`connect_ports`]).
     pub fn for_authority(
         spawner: Arc<Spawner>,
         authority: &str,
@@ -372,7 +367,6 @@ impl Pool {
             None => default_ports.to_vec(),
         };
         ports.extend(proxy_ports());
-        ports.push(DNS_PORT);
         ports.sort_unstable();
         ports.dedup();
         Self::with_ports(spawner, Vec::new(), 1, ports)

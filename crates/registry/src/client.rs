@@ -2372,12 +2372,9 @@ fn go_cause(host: &str, e: &(dyn std::error::Error + 'static)) -> String {
     while let Some(s) = source {
         if let Some(io) = s.downcast_ref::<std::io::Error>() {
             if io.kind() == std::io::ErrorKind::ConnectionRefused {
-                // (Go names the address it dialed, the first of the name)
-                let addr = std::net::ToSocketAddrs::to_socket_addrs(host)
-                    .ok()
-                    .and_then(|mut a| a.next())
-                    .map_or_else(|| host.to_string(), |a| a.to_string());
-                return format!("dial tcp {addr}: connect: connection refused");
+                // (Go names the address it dialed; the host is named here: a
+                // worker resolves no name itself)
+                return format!("dial tcp {host}: connect: connection refused");
             }
             // (the io error holds the error of the resolver, which its own
             // source skips)

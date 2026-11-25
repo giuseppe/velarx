@@ -120,8 +120,8 @@ fn landlock(paths: &Paths, staging: Option<std::os::fd::BorrowedFd<'_>>) -> Resu
     rules.restrict_fully("the service").map(drop)
 }
 
-/// What the service makes: the runtime and the files and IPv4 and IPv6
-/// sockets of a pull worker, the sockets it listens on and serves (UNIX,
+/// What the service makes: the runtime and the files of a pull worker, IPv4
+/// and IPv6 sockets of every type, the sockets it listens on and serves (UNIX,
 /// the daemon's and its own) and netlink (the interfaces mDNS watches), UDP
 /// in batches (QUIC), and beneath the staging of the store what Landlock
 /// lets it write: the files of the layers it fetches.  No process, no
@@ -141,7 +141,14 @@ fn allowed(pid: u32, role: Role) -> Result<Allow, String> {
         families.push(libc::AF_UNIX as u64);
     }
     let allow = net_client(Allow::runtime(pid)?)
-        .calls(&[libc::SYS_listen, libc::SYS_bind, libc::SYS_accept4])
+        .calls(&[
+            libc::SYS_listen,
+            libc::SYS_bind,
+            libc::SYS_accept4,
+            // (QUIC sends and receives its datagrams in batches)
+            libc::SYS_sendmmsg,
+            libc::SYS_recvmmsg,
+        ])
         .when(libc::SYS_socket, one_of(0, &families));
     if role == Role::Overlay {
         return Ok(allow);

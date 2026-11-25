@@ -622,7 +622,16 @@ mod tests {
             (libc::SYS_accept4, [0; 6], EPERM),
             (libc::SYS_listen, [0; 6], EPERM),
             (libc::SYS_bind, [0; 6], EPERM),
-            (libc::SYS_socket, af(libc::AF_INET), ALLOW),
+            (
+                libc::SYS_socket,
+                [2, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+                ALLOW,
+            ),
+            (
+                libc::SYS_socket,
+                [2, libc::SOCK_DGRAM as u64, 0, 0, 0, 0],
+                EPERM,
+            ),
             (libc::SYS_socket, af(libc::AF_UNIX), EPERM),
             (libc::SYS_socket, af(libc::AF_NETLINK), EPERM),
             (libc::SYS_socket, af(libc::AF_PACKET), EPERM),
@@ -917,7 +926,7 @@ mod tests {
                 "an IPv4 socket",
                 rustix::net::socket(
                     rustix::net::AddressFamily::INET,
-                    rustix::net::SocketType::DGRAM,
+                    rustix::net::SocketType::STREAM,
                     None,
                 )
                 .is_ok(),

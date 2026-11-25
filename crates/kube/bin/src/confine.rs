@@ -40,7 +40,12 @@ impl Needs {
         if self.api_port.is_some() {
             // (the libraries the resolver loads, the certificates, the
             // configuration of the resolver)
-            read.extend(velarx_sandbox::READABLE.iter().map(PathBuf::from));
+            read.extend(
+                velarx_sandbox::READABLE
+                    .iter()
+                    .chain(velarx_sandbox::RESOLVER_FILES)
+                    .map(PathBuf::from),
+            );
             for var in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
                 read.extend(std::env::var_os(var).map(PathBuf::from));
             }

@@ -10,19 +10,21 @@
 //!   host's root (else as the daemon's user), with its IPC, host name and
 //!   mounts;
 //! * a session of its own, `/dev/null` for the standard streams, no core
-//!   dump, not dumpable, no file descriptor but the one to the daemon;
+//!   dump, not dumpable, no file descriptor but the one to the daemon and
+//!   the channel on which it asks for names (it resolves none itself);
 //! * `no_new_privs` and no capability;
-//! * Landlock (ABI 9, every right a must: a kernel that cannot
-//!   enforce all of it does not run a worker): no path is writable, a few
-//!   are readable (the libraries, the certificate stores, the files of the
-//!   resolver); no TCP bind; TCP connections only to the ports the front
-//!   named at the start (`--connect-port`: those of the registry or the
-//!   URL the worker is for, `velarx_registry_lib::net::pool::connect_ports`); abstract
-//!   UNIX sockets and signals outside the sandbox are denied;
+//! * Landlock (ABI 9, every right a must: a kernel that cannot enforce all
+//!   of it does not run a worker): no path is writable, a few are readable
+//!   (the libraries, the certificate stores); no TCP bind; TCP connections
+//!   only to the ports the front named at the start (`--connect-port`:
+//!   those of the registry or the URL the worker is for,
+//!   `velarx_registry_lib::net::pool::connect_ports`); abstract UNIX
+//!   sockets and signals outside the sandbox are denied;
 //! * seccomp: mounts, ptrace, bpf, keyctl, module loading, `mknod`, the
 //!   `set*id` family, the Landlock calls, `fork`, `execve` and the creation
 //!   of namespaces are refused, `clone` is for threads only and sockets are
-//!   for IPv4 and IPv6 only.
+//!   TCP sockets of IPv4 and IPv6 only (no datagram, no other protocol of
+//!   the stream type: Landlock restricts the ports of TCP alone).
 //!
 //! Nothing is optional: a worker that cannot confine itself exits with an
 //! error, and the pull fails.
@@ -59,11 +61,6 @@ pub const READABLE: &[&str] = &[
     "/etc/ssl",
     "/etc/ca-certificates",
     "/etc/ld.so.cache",
-    "/etc/resolv.conf",
-    "/etc/hosts",
-    "/etc/nsswitch.conf",
-    "/etc/host.conf",
-    "/etc/gai.conf",
     "/etc/services",
     "/etc/protocols",
     "/etc/localtime",
@@ -74,6 +71,16 @@ pub const READABLE: &[&str] = &[
     "/dev/urandom",
     "/dev/random",
     "/dev/null",
+];
+
+/// The files the resolver of the C library reads, for a confined process
+/// that resolves names itself (a pull worker does not: it asks its front).
+pub const RESOLVER_FILES: &[&str] = &[
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+    "/etc/host.conf",
+    "/etc/gai.conf",
 ];
 
 pub fn rule(conditions: Vec<SeccompCondition>) -> Result<SeccompRule, String> {
@@ -90,10 +97,36 @@ pub fn condition(
 }
 
 /// What a pull worker makes on top of [`Allow::runtime`]: the files it
-/// reads (the libraries the resolver loads, the certificates, its
-/// configuration), TCP and UDP sockets of IPv4 and IPv6 to the registry and
-/// the resolver, and a pair of UNIX sockets of its own for the runtime.
+/// reads (the libraries, the certificates), TCP sockets of IPv4 and IPv6 to
+/// the registries, and a pair of UNIX sockets of its own for the runtime.  It
+/// resolves no name itself: it asks on a channel it was given
+/// (`velarx_registry_lib::net::resolve`), so it has no datagram socket and no
+/// file of the resolver.
 pub fn net_client(allow: Allow) -> Allow {
+    let tcp = |family: i32, protocol: i32| {
+        rule(vec![
+            condition(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, family as u64)
+                .expect("a condition"),
+            // (the type, without the flags `SOCK_NONBLOCK` and `SOCK_CLOEXEC`)
+            condition(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(0xf),
+                libc::SOCK_STREAM as u64,
+            )
+            .expect("a condition"),
+            // (TCP by default or by name: not MPTCP nor SCTP, whose
+            // connections Landlock does not restrict)
+            condition(
+                2,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                protocol as u64,
+            )
+            .expect("a condition"),
+        ])
+        .expect("a rule")
+    };
     let allow = allow
         .calls(&[
             libc::SYS_openat,
@@ -102,20 +135,15 @@ pub fn net_client(allow: Allow) -> Allow {
             libc::SYS_faccessat2,
             libc::SYS_getdents64,
             libc::SYS_connect,
-            // the resolver sends its queries in batches and asks the
-            // version of the kernel
-            libc::SYS_sendmmsg,
-            libc::SYS_recvmmsg,
+            // (the C library asks the version of the kernel)
             libc::SYS_uname,
         ])
-        // (the C library's resolver also tries a netlink socket, to sort the
-        // addresses, and the UNIX socket of systemd-resolved; refused, it
-        // goes on to the next source of the hosts line of nsswitch.conf: the
-        // sockets of a worker are the connections to the registries and the
-        // DNS servers)
         .when(
             libc::SYS_socket,
-            allow::one_of(0, &[libc::AF_INET as u64, libc::AF_INET6 as u64]),
+            [libc::AF_INET, libc::AF_INET6]
+                .into_iter()
+                .flat_map(|family| [tcp(family, 0), tcp(family, libc::IPPROTO_TCP)])
+                .collect(),
         )
         .when(
             libc::SYS_socketpair,
@@ -395,7 +423,8 @@ fn landlock(ports: &[u16]) -> Result<(), String> {
     rules.restrict_fully("a worker").map(drop)
 }
 
-/// Confine the process and return the descriptor of the daemon's socket.
+/// Confine the process and return its descriptors: the daemon's socket and
+/// the channel of the names.
 /// Call it before any thread is started: the filters apply to the threads
 /// that are created afterwards.
 pub fn enter(
@@ -459,9 +488,14 @@ pub fn probes(ports: &[u16]) -> Vec<(&'static str, bool)> {
         "read /etc/shadow",
         open_with("/etc/shadow", OFlags::RDONLY).is_err(),
     ));
+    // (the files of the resolver: the names are resolved for it)
     out.push((
         "read /etc/hosts",
-        open_with("/etc/hosts", OFlags::RDONLY).map_or_else(|e| e == Errno::NOENT, |_| true),
+        open_with("/etc/hosts", OFlags::RDONLY).is_err(),
+    ));
+    out.push((
+        "read /etc/resolv.conf",
+        open_with("/etc/resolv.conf", OFlags::RDONLY).is_err(),
     ));
     out.push((
         "write /dev/null",
@@ -482,6 +516,17 @@ pub fn probes(ports: &[u16]) -> Vec<(&'static str, bool)> {
         socket(AddressFamily::UNIX).err() == Some(Errno::PERM),
     ));
     out.push(("an IPv4 socket", socket(AddressFamily::INET).is_ok()));
+    // (a stream that is not TCP: Landlock leaves its ports alone)
+    out.push((
+        "an MPTCP socket",
+        rustix::net::socket(
+            AddressFamily::INET,
+            SocketType::STREAM,
+            Some(rustix::net::ipproto::MPTCP),
+        )
+        .err()
+            == Some(Errno::PERM),
+    ));
     // TCP: the ports named at the start only (Landlock refuses the others
     // with EACCES before any packet; a port allowed is refused by the peer,
     // or not at all, but never by Landlock)
@@ -525,14 +570,17 @@ pub fn probes(ports: &[u16]) -> Vec<(&'static str, bool)> {
         )
         .is_err(),
     ));
-    // The resolver of the C library opens a netlink socket (to sort the
-    // addresses) and, for a name the hosts file lacks, the UNIX socket of
-    // systemd-resolved: the filter refuses both and the library goes on to
-    // the next source of the hosts line of nsswitch.conf.
+    // It sends no datagram and reads no file of the resolver, so the
+    // resolver of the C library finds no name: the ones it needs come from
+    // the channel it was given.
     out.push((
-        "resolves a name",
-        std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 80))
-            .is_ok_and(|mut a| a.any(|a| a.ip().is_loopback())),
+        "a datagram socket",
+        rustix::net::socket(AddressFamily::INET, SocketType::DGRAM, None).err()
+            == Some(Errno::PERM),
+    ));
+    out.push((
+        "resolves no name itself",
+        std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 80)).is_err(),
     ));
     out.push(("ptrace", velarx_sys::probe::ptrace_traceme().is_err()));
     out.push((
@@ -644,12 +692,68 @@ mod tests {
     #[test]
     fn the_filters_allow_a_client_and_refuse_the_rest() {
         let af = |d: i32| [d as u64, 0, 0, 0, 0, 0];
+        let tcp = |d: i32| [d as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0];
+        let udp = |d: i32| [d as u64, libc::SOCK_DGRAM as u64, 0, 0, 0, 0];
         velarx_sys::allow::testing::check_runtime(&verdict);
         let table: &[Expect] = &[
             (libc::SYS_openat, [0; 6], ALLOW),
             (libc::SYS_connect, [0; 6], ALLOW),
-            (libc::SYS_socket, af(libc::AF_INET), ALLOW),
-            (libc::SYS_socket, af(libc::AF_INET6), ALLOW),
+            (libc::SYS_socket, tcp(libc::AF_INET), ALLOW),
+            (libc::SYS_socket, tcp(libc::AF_INET6), ALLOW),
+            // (the flags of the type are no matter)
+            (
+                libc::SYS_socket,
+                [
+                    libc::AF_INET as u64,
+                    (libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                ALLOW,
+            ),
+            (libc::SYS_socket, udp(libc::AF_INET), EPERM),
+            (libc::SYS_socket, udp(libc::AF_INET6), EPERM),
+            // (TCP by name; not MPTCP nor SCTP, out of the reach of Landlock)
+            (
+                libc::SYS_socket,
+                [
+                    2,
+                    libc::SOCK_STREAM as u64,
+                    libc::IPPROTO_TCP as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                ALLOW,
+            ),
+            (
+                libc::SYS_socket,
+                [
+                    2,
+                    libc::SOCK_STREAM as u64,
+                    libc::IPPROTO_MPTCP as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                EPERM,
+            ),
+            (
+                libc::SYS_socket,
+                [
+                    10,
+                    libc::SOCK_STREAM as u64,
+                    libc::IPPROTO_SCTP as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                EPERM,
+            ),
+            (libc::SYS_sendmmsg, [0; 6], EPERM),
+            (libc::SYS_recvmmsg, [0; 6], EPERM),
             (libc::SYS_socket, af(libc::AF_UNIX), EPERM),
             (libc::SYS_socket, af(libc::AF_NETLINK), EPERM),
             (libc::SYS_socket, af(libc::AF_PACKET), EPERM),

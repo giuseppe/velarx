@@ -72,6 +72,18 @@ lengths before allocating and verifies every digest.
   `security.capability`, is kept: it grants nothing past the bounding set
   of the container); decompression is cut at `max_inflate_ratio` times the
   compressed size and at `max_layer_gib`.
+  The worker resolves no name: it asks the fetcher's front on a channel
+  (a host name of at most 253 bytes, 16 questions at a time, at most 32
+  addresses in an answer), and the front asks a runner it forked before
+  it confined itself.  The runner reads files and opens sockets, as the
+  name service of the host needs, and writes, executes and mounts nothing
+  (`nobody` with no capability for a root engine).  A compromised worker
+  can have it resolve any host name (a channel of bytes to a name server,
+  as the ports it may connect to are) and keep 16 of its 64 places busy;
+  the check of the addresses it gets (`allow-private-addresses`) is the
+  worker's own.
+  A front whose runner dies ends (it cannot fork another once it is
+  confined), and the engine starts a new fetcher for its next need.
 * **A malicious or compromised registry or content source** is verified:
   the manifest by policy, the configuration and layers by digest and diff id,
   chunks by their hash, files by fs-verity digest.  A layer with a table of

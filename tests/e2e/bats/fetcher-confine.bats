@@ -150,7 +150,9 @@ descends () { # pid
         "binds no TCP port" "connects to no TCP port" "connects to no UNIX socket by name" \
         "worker: connect to a TCP port it was not given" \
         "worker: connect to a TCP port it was given" "worker: signal the daemon" \
-        "worker: execve" "worker: create a file"; do
+        "worker: execve" "worker: create a file" \
+        "worker: a datagram socket" "worker: an MPTCP socket" \
+        "worker: resolves no name itself"; do
         check "probe: $want" yes "$(printf '%s' "$out" | python3 -I -c 'import json,sys; print("yes" if sys.argv[1] in [w for w, _ in json.load(sys.stdin)] else "no")' "$want")"
     done
 }
@@ -235,6 +237,29 @@ descends () { # pid
         "$("$BIN/velarx" --config "$WORKDIR/sh.toml" --socket "$SOCKDIR/sh.sock" container exec held cat /etc/alpine-release 2>&1)"
 }
 
+# A host whose only source of names is systemd-resolved, on its UNIX socket
+# (`hosts: resolve` without `dns`), which a worker may not open: the runner
+# of the front resolves for it.  resolved answers a name under `localhost`
+# with this machine.
+
+@test "a pull of a registry named by a source the worker cannot use" {
+    as_root && skip "root: unshare -r would map the host's root"
+    [ -S /run/systemd/resolve/io.systemd.Resolve ] || skip "no systemd-resolved"
+    local name=registry.nss-less.localhost port=${E2E_REGISTRY##*:} rc
+    printf 'hosts: resolve\n' > "$WORKDIR/nss-switch"
+    printf '[[registry]]\nlocation = "%s:%s"\ninsecure = true\nallow-private-addresses = true\n' \
+        "$name" "$port" > "$WORKDIR/nss-registries.conf"
+    sed -e "s#$WORKDIR/\(state\|root\|store\)\"#$WORKDIR/nss-\1\"#" \
+        -e "s#/sh.sock\"#/nss.sock\"#" "$WORKDIR/sh.toml" > "$WORKDIR/nss.toml"
+    unshare -rm sh -c '
+        mount --bind "$1/nss-switch" /etc/nsswitch.conf &&
+        exec env VELARX_REGISTRIES_CONF="$1/nss-registries.conf" "$2/velarx" --config "$1/nss.toml" \
+            image pull --tls-verify=false "$3"' sh "$WORKDIR" "$BIN" "$name:$port/${IMAGE#*/}" > "$WORKDIR/nss.log" 2>&1
+    rc=$?
+    [ $rc = 0 ] || sed "s/^/# /" "$WORKDIR/nss.log"
+    check "a pull by a name only the runner resolves" 0 $rc
+}
+
 @test "the front is confined and the credential helper runs in an unconfined runner" {
     as_root || skip "not root"
     local FRONT= RUNNER d pid
@@ -268,6 +293,22 @@ descends () { # pid
     check "the front process is root" 0 "$(awk '/^Uid:/ {print $2}' /proc/$FRONT/status)"
     check "it has a mount namespace of its own" different \
         "$([ "$(readlink /proc/$FRONT/ns/mnt)" != "$(readlink /proc/$DAEMON_PID/ns/mnt)" ] && echo different || echo same)"
+}
+
+@test "the resolver runner of a root front is nobody, with no capability" {
+    local d resolver=
+    as_root || skip "not root"
+    [ -n "${FRONT:-}" ] || { echo "no front of the earlier test (it failed or did not run)" >&2; exit 1; }
+    # (the children of the front: the credential helper runner and the
+    # spawner are root, the workers are the spawner's)
+    for d in /proc/[0-9]*; do
+        [ "$(awk '/^PPid:/ {print $2}' "$d/status" 2> /dev/null)" = "$FRONT" ] || continue
+        [ "$(awk '/^Uid:/ {print $2}' "$d/status" 2> /dev/null)" = 65534 ] && resolver=${d#/proc/}
+    done
+    check "a child of the front is nobody" yes "$([ -n "$resolver" ] && echo yes || echo no)"
+    check "it has no capability" 0000000000000000 "$(awk '/^CapPrm:/ {print $2}' /proc/${resolver:-0}/status 2> /dev/null)"
+    check "it can gain none" 0000000000000000 "$(awk '/^CapBnd:/ {print $2}' /proc/${resolver:-0}/status 2> /dev/null)"
+    check "it is under seccomp" 2 "$(awk '/^Seccomp:/ {print $2}' /proc/${resolver:-0}/status 2> /dev/null)"
 }
 
 @test "the kernel's files are read-only in its mount namespace" {
@@ -345,4 +386,38 @@ EOT
     rc=$?
     [ $rc = 0 ] || sed "s/^/# /" "$WORKDIR/pull-cli.log"
     check "a pull as root with the binary and HOME in a private directory" 0 $rc
+}
+
+# The front cannot fork a new resolver runner once it is confined: when its
+# runner dies it ends, and the engine starts a new fetcher for its next need.
+# (the last test, as it ends the front the tests before look at; it starts
+# a front of its own, as a root test before it ends theirs)
+
+@test "a fetcher whose resolver runner died ends and the next pull starts a new one" {
+    local front= runner= d pid rc
+    # (a lazy pull: the daemon keeps the connection to the fetcher of the
+    # layers it staged, `lazy_completers = 0`)
+    "$BIN/velarx" --config "$WORKDIR/sh.toml" --socket "$SOCKDIR/sh.sock" image pull --lazy --tls-verify=false "$IMAGE" > "$WORKDIR/renew.log" 2>&1
+    rc=$?
+    [ $rc = 0 ] || sed "s/^/# /" "$WORKDIR/renew.log"
+    check "a lazy pull through the fetcher" 0 $rc
+    for d in /proc/[0-9]*; do
+        pid=${d#/proc/}
+        tr '\0' ' ' 2> /dev/null < "$d/cmdline" | grep -q 'velarx-registry --listen-fd' || continue
+        descends "$pid" && { front=$pid; break; }
+    done
+    [ -n "$front" ] || { echo "FAIL no fetcher of this daemon is running" >&2; exit 1; }
+    for d in /proc/[0-9]*; do
+        [ "$(awk '/^PPid:/ {print $2}' "$d/status" 2> /dev/null)" = "$front" ] || continue
+        [ "$(cat "$d/comm" 2> /dev/null)" = resolver-runner ] && runner=${d#/proc/}
+    done
+    [ -n "$runner" ] || { echo "FAIL the fetcher has no resolver runner" >&2; exit 1; }
+    kill -KILL "$runner"
+    e2e_wait_exit "$front"
+    check "the fetcher ended with its runner" gone "$(e2e_alive "$front")"
+    # (the rest of the layers the lazy pull staged: fetched by a new one)
+    "$BIN/velarx" --config "$WORKDIR/sh.toml" --socket "$SOCKDIR/sh.sock" image pull --tls-verify=false "$IMAGE" > "$WORKDIR/renewed.log" 2>&1
+    rc=$?
+    [ $rc = 0 ] || sed "s/^/# /" "$WORKDIR/renewed.log"
+    check "the next pull is served by a new fetcher" 0 $rc
 }

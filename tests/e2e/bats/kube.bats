@@ -762,7 +762,7 @@ after" "$(sc container exec ksw-c cat /mounted 2>&1)"
 
 @test "kube apply: a file, and the YAML of what exists" {
     # the documents go to the API server of the kubeconfig's cluster (a fake
-    # one here, over HTTP)
+    # one here, over HTTP, named: the confined process resolves it)
     cat > "$WORKDIR/fake-k8s.py" << 'EOT'
 import http.server, sys
 log = open(sys.argv[1], "a")
@@ -785,7 +785,7 @@ EOT
     python3 -I "$WORKDIR/fake-k8s.py" "$WORKDIR/k8s.log" > "$WORKDIR/k8s.port" 3>&- &
     k8s_pid=$!
     e2e_wait_line "$WORKDIR/k8s.port" . 10
-    printf 'apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: http://127.0.0.1:%s\nusers:\n- name: u\n  user:\n    token: secret-token\n' \
+    printf 'apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: http://localhost:%s\nusers:\n- name: u\n  user:\n    token: secret-token\n' \
         "$(cat "$WORKDIR/k8s.port")" > "$WORKDIR/kubeconfig"
     printf 'apiVersion: v1\nkind: Pod\nmetadata:\n  name: kp\nspec:\n  replicas: 3\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: ks\n' > "$WORKDIR/apply.yaml"
     out=$(kc apply --kubeconfig "$WORKDIR/kubeconfig" --ns ns1 -f "$WORKDIR/apply.yaml")
