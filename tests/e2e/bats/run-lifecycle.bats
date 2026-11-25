@@ -841,6 +841,39 @@ EOT
 
 }
 
+# The containers whose namespaces a container joins are what it needs, as
+# those it requires: the one that is stopped is started first.
+@test "a container that joins the namespaces of a stopped container starts it" {
+    sh_ container run -d --name jn1 --network none "$IMAGE" sleep 300 > /dev/null
+    for mode in "--network container:jn1" "--pid container:jn1" "--ipc container:jn1" \
+        "--uts container:jn1" "--cgroupns container:jn1"; do
+        sh_ container stop -t 0 jn1 > /dev/null
+        check "jn1 is stopped" exited "$(state_of jn1)"
+        out=$(sh_ container run --rm $mode --name jn2 "$IMAGE" true 2>&1)
+        check "run $mode" 0 $?
+        check "$mode: the target runs" running "$(state_of jn1)"
+    done
+    # the target is the container named at the create, whatever its name is
+    # now and whichever container has its old name
+    sh_ container create --name jn3 --network container:jn1 "$IMAGE" sleep 300 > /dev/null
+    sh_ container stop -t 0 jn1 > /dev/null
+    sh_ container rename jn1 jn1-old
+    sh_ container create --name jn1 --pid container:jn3 "$IMAGE" sleep 300 > /dev/null
+    sh_ container start jn3 > /dev/null
+    check "a renamed target is started" running "$(state_of jn1-old)"
+    check "not the container of its old name" created "$(state_of jn1)"
+    for c in jn1 jn3 jn1-old; do sh_ container rm -t 0 -f $c > /dev/null; done
+    # a target that cannot start: the container does not start either
+    sh_ container create --name jn4 "$IMAGE" /nonexistent > /dev/null
+    sh_ container create --name jn5 --network container:jn4 "$IMAGE" true > /dev/null
+    out=$(sh_ container start jn5 2>&1)
+    check "the target cannot start: the start fails" 125 $?
+    check_match "and says which" "cannot start $(inspect_of jn4 id), which the container needs: .*/nonexistent" "$out"
+    check "the container is not started" created "$(state_of jn5)"
+    sh_ container rm -t 0 -f jn5 > /dev/null
+    sh_ container rm -t 0 -f jn4 > /dev/null
+}
+
 # A container that runs for a while waits less before its restart, but
 # its restarts still count against the limit.
 @test "a container that runs for a while is still bound by the limit" {

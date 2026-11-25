@@ -142,7 +142,7 @@ impl ContainerService {
 
     pub(super) async fn create_inner(
         self: &Arc<Self>,
-        req: CreateContainerRequest,
+        mut req: CreateContainerRequest,
         undo: &mut CreateUndo,
     ) -> ContainerResult<String> {
         // The id names the bundle and is the runtime's last argument: only
@@ -166,6 +166,7 @@ impl ContainerService {
                 "conflicting options: dns and the network mode: {mode}"
             )));
         }
+        self.resolve_joined_network(&mut req).await?;
         let network_mode = req.network_mode.clone();
 
         let mut rootfs_dir = req
@@ -278,10 +279,10 @@ impl ContainerService {
         let userns_mode = match &userns.spec {
             UsernsSpec::Host => UsernsMode::Host,
             UsernsSpec::Container(target) => {
-                let (path, uid, gid) = self.userns_of_container(target).await?;
+                let (id, path, uid, gid) = self.userns_of_container(target).await?;
                 (userns.uid_mappings, userns.gid_mappings) = (uid, gid);
                 userns_path = Some(path);
-                UsernsMode::Container(target.clone())
+                UsernsMode::Container(id)
             }
             UsernsSpec::Ns(path) => {
                 let (uid, gid) = crate::userns::maps_of_namespace(path)?;

@@ -502,25 +502,32 @@ impl ContainerService {
         Ok(())
     }
 
-    /// Start what the container needs (`--requires`) that does not run,
-    /// and what that needs: the dependencies existed when the container was
-    /// made, so they form no cycle.
+    /// Start what the container needs that does not run: the containers it
+    /// requires (`--requires`) and those whose namespaces it joins
+    /// (`--network container:ID` and the like), and what those need: the
+    /// dependencies are named by their ids and existed when the container
+    /// was made, so they form no cycle.
     pub(super) fn start_dependencies<'a>(
         self: &'a Arc<Self>,
         config: &'a ContainerConfig,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ContainerResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            for dep in &config.requires {
+            for dep in config.dependencies() {
                 let rec = self.db.get_container(dep).await.map_err(|_| {
-                    ContainerError::NotFound(format!("{dep}, which the container requires"))
+                    ContainerError::NotFound(format!("{dep}, which the container needs"))
                 })?;
                 if rec.state == RecordState::Running {
                     continue;
                 }
-                info!("Starting {}, which {} requires", rec.id, config.id);
+                info!("Starting {}, which {} needs", rec.id, config.id);
                 match self.start_with(&rec.id, false).await {
                     Ok(_) | Err(ContainerError::AlreadyRunning(_)) => {}
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        return Err(ContainerError::Dependency {
+                            id: rec.id,
+                            source: Box::new(e),
+                        })
+                    }
                 }
             }
             Ok(())

@@ -53,6 +53,13 @@ pub enum ContainerError {
     MonitorVersion { id: String, reason: String },
     #[error("container already running: {0}")]
     AlreadyRunning(String),
+    /// A container it needs (`--requires`, a namespace it joins) did not
+    /// start.
+    #[error("cannot start {id}, which the container needs: {source}")]
+    Dependency {
+        id: String,
+        source: Box<ContainerError>,
+    },
     #[error("image not found: {0}")]
     ImageNotFound(String),
     #[error("{0}")]

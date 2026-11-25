@@ -449,6 +449,31 @@ impl ContainerService {
         }
     }
 
+    /// The network a request joins (`container:ID`), in its mode and its
+    /// list of networks, named by the id of the container, as the other
+    /// namespaces are: a rename or a new container of the same name does
+    /// not change what it joins and starts first.  A target that does not
+    /// exist is left to the create.
+    pub(super) async fn resolve_joined_network(
+        &self,
+        req: &mut CreateContainerRequest,
+    ) -> ContainerResult<()> {
+        let NetworkMode::Container(target) = &req.network_mode else {
+            return Ok(());
+        };
+        let Ok(rec) = self.db.get_container(target).await else {
+            return Ok(());
+        };
+        let joined = NetworkMode::Container(rec.id);
+        for n in &mut req.networks {
+            if NetworkMode::parse(n) == req.network_mode {
+                *n = joined.to_string();
+            }
+        }
+        req.network_mode = joined;
+        Ok(())
+    }
+
     /// The IPC namespace of `--ipc` as [`Self::ns_mode`] has it, and as
     /// podman: `none` is a namespace of its own (without /dev/shm), and the
     /// IPC namespace of a container that is `private` cannot be joined.
@@ -642,11 +667,12 @@ impl ContainerService {
         Ok(out)
     }
 
-    /// The user namespace of a running container to join and its mappings.
+    /// The user namespace of a running container to join: the id of the
+    /// container, the path of the namespace and its mappings.
     pub(super) async fn userns_of_container(
         &self,
         target: &str,
-    ) -> ContainerResult<(String, Vec<IdMapping>, Vec<IdMapping>)> {
+    ) -> ContainerResult<(String, String, Vec<IdMapping>, Vec<IdMapping>)> {
         let record =
             self.db.get_container(target).await.map_err(|_| {
                 ContainerError::NotFound(format!("container {target} for --userns"))
@@ -671,7 +697,7 @@ impl ContainerService {
                 )))
             }
         };
-        Ok((path, config.uid_mappings, config.gid_mappings))
+        Ok((record.id, path, config.uid_mappings, config.gid_mappings))
     }
 }
 

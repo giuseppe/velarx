@@ -275,6 +275,31 @@ impl ContainerConfig {
     pub fn throw_away(&self) -> bool {
         self.auto_remove || self.volatile
     }
+
+    /// The containers this one needs to run before it starts: those it
+    /// requires (`--requires`) and those whose pid, ipc, uts, cgroup,
+    /// network or user namespace it joins (`container:ID`), as named.
+    pub fn dependencies(&self) -> Vec<&str> {
+        let o = &self.options;
+        let userns = match &self.userns_mode {
+            UsernsMode::Container(target) => Some(target.as_str()),
+            _ => None,
+        };
+        let network = match &self.network_mode {
+            NetworkMode::Container(target) => Some(target.as_str()),
+            _ => None,
+        };
+        let namespaces = [&o.pid_ns, &o.ipc_ns, &o.uts_ns, &o.cgroup_ns]
+            .into_iter()
+            .filter_map(|ns| ns.strip_prefix("container:"));
+        self.requires
+            .iter()
+            .map(String::as_str)
+            .chain(namespaces)
+            .chain(userns)
+            .chain(network)
+            .collect()
+    }
 }
 
 /// The image of a container named by a digest: the digest as the user typed
@@ -1758,6 +1783,24 @@ mod tests {
     }
 
     use super::*;
+
+    /// A container needs those it requires and those whose namespaces it
+    /// joins, not those whose it only shares by path or host.
+    #[test]
+    fn a_container_depends_on_the_containers_whose_namespaces_it_joins() {
+        let mut config = ContainerConfig {
+            requires: vec!["r".into()],
+            ..Default::default()
+        };
+        assert_eq!(config.dependencies(), ["r"]);
+        config.options.pid_ns = "container:p".into();
+        config.options.ipc_ns = "host".into();
+        config.options.uts_ns = "container:u".into();
+        config.options.cgroup_ns = "/proc/1/ns/cgroup".into();
+        config.userns_mode = UsernsMode::Container("x".into());
+        config.network_mode = NetworkMode::Container("n".into());
+        assert_eq!(config.dependencies(), ["r", "p", "u", "x", "n"]);
+    }
 
     /// A container the runtime keeps has its directory in the state
     /// directory of the runtime until its delete.

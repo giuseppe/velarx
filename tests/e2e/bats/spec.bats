@@ -303,12 +303,11 @@ tmpfs" --read-only -- sh -c 'for d in /tmp /var/tmp /run; do grep " $d " /proc/s
     sc container stop -t 1 nsb > /dev/null; sc container start nsb > /dev/null
     check_match "a restarted target: the joiner follows it" "sleep 301" "$(sc container exec nsb ps -o args)"
     sc container stop -t 1 nsb > /dev/null; sc container stop -t 1 nsa > /dev/null
-    out=$(sc container start nsb 2>&1)
-    check "the target does not run: the start fails" 1 $(( $? != 0 ))
-    check_match "the target does not run: message" "nsa|joins" "$out"
+    sc container start nsb > /dev/null
+    check "the target does not run: the start starts it" running "$(sc container inspect --format '{{.State.Status}}' nsa)"
+    check "the target does not run: and the container" running "$(sc container inspect --format '{{.State.Status}}' nsb)"
     # A restart policy with a joined namespace is allowed: the monitor keeps
     # the joined namespaces open for its restarts.
-    sc container start nsa > /dev/null
     sc container run -d --name nsr --restart always --pid container:nsa "$IMAGE" sleep 302 > /dev/null
     check "a restart policy with a joined namespace" running "$(sc container inspect --format '{{.State.Status}}' nsr)"
     sc container rm -t 0 -f nsr > /dev/null
