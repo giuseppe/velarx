@@ -655,12 +655,18 @@ fn open_dir_beneath(dir: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
     )?)
 }
 
+/// What `extract_with` calls for a directory it made on the way to an
+/// entry: its path below the base and the directory.
+pub type CopyUp<'a> = &'a dyn Fn(&Path, BorrowedFd<'_>) -> io::Result<()>;
+
 /// The directory below `base` that holds the entry `rel`, its missing
-/// directories created; returns it and the last component.
+/// directories created (`made` is told of each); returns it and the last
+/// component.
 fn parent_dir(
     base: BorrowedFd<'_>,
     rel: &Path,
     owner: Option<(u32, u32)>,
+    made: CopyUp<'_>,
 ) -> io::Result<(OwnedFd, OsString)> {
     let name = rel
         .file_name()
@@ -668,16 +674,19 @@ fn parent_dir(
         .to_owned();
     let mut cur = rustix::io::fcntl_dupfd_cloexec(base, 0)?;
     if let Some(parent) = rel.parent() {
+        let mut at = PathBuf::new();
         for c in parent.components() {
             let Component::Normal(c) = c else {
                 return Err(invalid(format!("invalid path `{}`", rel.display())));
             };
+            at.push(c);
             cur = match open_dir_beneath(&cur, c) {
                 Ok(fd) => fd,
                 Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
                     mkdirat(&cur, c, Mode::from_raw_mode(0o755))?;
                     let fd = open_dir_beneath(&cur, c)?;
                     chown_fd(fd.as_fd(), owner)?;
+                    made(&at, fd.as_fd())?;
                     fd
                 }
                 Err(e) => return Err(e),
@@ -759,18 +768,21 @@ fn set_link_times(dir: &OwnedFd, name: &OsStr, stamp: &Timestamps) -> io::Result
 /// the archive at the end, when nothing more is made in them (as podman's
 /// and Docker's extraction).
 pub fn extract<R: Read>(r: R, base: BorrowedFd<'_>, opts: &ExtractOptions) -> io::Result<()> {
-    for (rel, kind) in extract_with(r, base, opts)? {
+    for (rel, kind) in extract_with(r, base, opts, &|_, _| Ok(()))? {
         tracing::warn!("cp: entry {} of type {kind:?} skipped", rel.display());
     }
     Ok(())
 }
 
 /// `extract`, the entries it skips returned (their path below the base and
-/// their type) instead of warned of.
+/// their type) instead of warned of, and `made` is told of each directory
+/// made on the way to an entry that the archive has no entry for (a caller
+/// makes it like one that exists elsewhere).
 pub fn extract_with<R: Read>(
     r: R,
     base: BorrowedFd<'_>,
     opts: &ExtractOptions,
+    made: CopyUp<'_>,
 ) -> io::Result<Vec<(PathBuf, tar::EntryType)>> {
     let mut skipped = Vec::new();
     let mut ar = crate::sparse::archive(r);
@@ -799,7 +811,7 @@ pub fn extract_with<R: Read>(
             }
             continue;
         }
-        let (dir, name) = parent_dir(base, &rel, opts.owner)?;
+        let (dir, name) = parent_dir(base, &rel, opts.owner, made)?;
         let mtime = entry.header().mtime().unwrap_or(0).min(i64::MAX as u64) as i64;
         let stamp = Timestamps {
             last_access: Timespec {
@@ -852,7 +864,7 @@ pub fn extract_with<R: Read>(
                     })?
                     .into_owned();
                 let target = entry_path(&target, &opts.rename)?;
-                let (tdir, tname) = parent_dir(base, &target, opts.owner)?;
+                let (tdir, tname) = parent_dir(base, &target, opts.owner, made)?;
                 make_room(&dir, &name, &rel, "a hard link", opts.overwrite_dir_non_dir)?;
                 // (no flag: a link at the target is linked, not followed)
                 rustix::fs::linkat(&tdir, &tname, &dir, &name, AtFlags::empty())?;
@@ -1058,7 +1070,7 @@ pub fn extract_with<R: Read>(
     }
     // (a directory a later entry replaced is not one any more)
     for (rel, mtime) in dir_times.iter().rev() {
-        let (dir, name) = parent_dir(base, rel, opts.owner)?;
+        let (dir, name) = parent_dir(base, rel, opts.owner, made)?;
         let Ok(fd) = open_dir_beneath(&dir, &name) else {
             continue;
         };

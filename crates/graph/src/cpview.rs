@@ -672,27 +672,58 @@ impl<'a> StoppedView<'a> {
                         .ok_or_else(enoent)?;
                     mkdirat(&cur, c.as_str(), Mode::from_raw_mode(0o700))?;
                     let fd = open(&cur, c)?;
-                    let (uid, gid) = (
-                        self.image.translate.uid_of(n.entry.uid),
-                        self.image.translate.gid_of(n.entry.gid),
-                    );
-                    if uid != IdTranslate::NOBODY && gid != IdTranslate::NOBODY {
-                        rustix::fs::chownat(
-                            &fd,
-                            "",
-                            Some(rustix::fs::Uid::from_raw_unchecked(uid)),
-                            Some(rustix::fs::Gid::from_raw_unchecked(gid)),
-                            rustix::fs::AtFlags::EMPTY_PATH,
-                        )?;
-                    }
-                    let p = velarx_sys::fd::proc_str(&fd);
-                    rustix::fs::chmod(p.as_str(), Mode::from_raw_mode(n.entry.mode & 0o7777))?;
+                    self.copy_up_attrs(fd.as_fd(), &n)?;
                     fd
                 }
                 Err(e) => return Err(e.into()),
             };
         }
         Ok(cur)
+    }
+
+    /// What makes a directory that a copy to `path` (a directory, as for
+    /// `upper_dir_for`) creates below it like the image's, if the view has
+    /// the image's there (not below an opaque directory): for
+    /// `cp::extract_with`, given the directory's path below `path` and the
+    /// directory.
+    pub fn copy_up_below(
+        &self,
+        path: &str,
+    ) -> io::Result<impl Fn(&Path, BorrowedFd<'_>) -> io::Result<()> + '_> {
+        let (comps, _) = self.resolve(path, true)?;
+        Ok(move |rel: &Path, fd: BorrowedFd<'_>| {
+            let mut at = comps.clone();
+            at.extend(
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned()),
+            );
+            let lower = self.locate(&at)?.and_then(|e| e.lower);
+            match lower.and_then(|l| self.image.tree.node(l)) {
+                Some(n) if n.entry.entry_type == TocEntryType::Dir => self.copy_up_attrs(fd, &n),
+                _ => Ok(()),
+            }
+        })
+    }
+
+    /// Give the directory `fd`, made in the upper directory, the owner and
+    /// the mode of the image's directory `n`.
+    fn copy_up_attrs(&self, fd: BorrowedFd<'_>, n: &velarx_fuse::view::ViewNode) -> io::Result<()> {
+        let (uid, gid) = (
+            self.image.translate.uid_of(n.entry.uid),
+            self.image.translate.gid_of(n.entry.gid),
+        );
+        if uid != IdTranslate::NOBODY && gid != IdTranslate::NOBODY {
+            rustix::fs::chownat(
+                fd,
+                "",
+                Some(rustix::fs::Uid::from_raw_unchecked(uid)),
+                Some(rustix::fs::Gid::from_raw_unchecked(gid)),
+                rustix::fs::AtFlags::EMPTY_PATH,
+            )?;
+        }
+        let p = velarx_sys::fd::proc_str(&fd);
+        rustix::fs::chmod(p.as_str(), Mode::from_raw_mode(n.entry.mode & 0o7777))?;
+        Ok(())
     }
 }
 
@@ -761,6 +792,7 @@ mod tests {
                 file("d/b", &fd, 10),
                 entry("o", TocEntryType::Dir),
                 file("o/hidden", &fd, 10),
+                entry("o/sub", TocEntryType::Dir),
                 entry("dev2", TocEntryType::Dir),
                 device("dev2/c", TocEntryType::Char, 5, 1),
                 device("dev2/b", TocEntryType::Block, 7, 0),
@@ -1271,5 +1303,72 @@ mod tests {
         cp::extract(&t[..], dir.as_fd(), &Default::default()).unwrap();
         assert!(f.upper.join("etc/new").exists());
         assert!(v.upper_dir_for("/etc/passwd").is_err());
+    }
+
+    /// A directory that is only in the image and that a copy makes on the
+    /// way to its entry gets the image's mode and owner, as when the copy
+    /// goes into it; one the image has below an opaque directory is not
+    /// there for the copy.  As root the image's root is another user than
+    /// the copier; without root they are the same, and the owner is not
+    /// checked.
+    #[test]
+    fn a_parent_only_in_the_image_is_copied_up_as_it_is() {
+        use std::os::unix::fs::MetadataExt;
+        let mut b = tar::Builder::new(Vec::new());
+        for path in ["etc/sub/new", "o/sub/new"] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(3);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            b.append_data(&mut h, path, &b"abc"[..]).unwrap();
+        }
+        let t = b.into_inner().unwrap();
+        let root_user = rustix::process::geteuid().is_root();
+        let fixture = || {
+            let mut f = fx();
+            if root_user {
+                let other = vec![IdMapping {
+                    container_id: 0,
+                    host_id: 4321,
+                    size: 1,
+                }];
+                f.translate.uid = other.clone();
+                f.translate.gid = other;
+            }
+            f
+        };
+
+        let f = fixture();
+        let v = view(&f);
+        let root = v.upper_dir_for("/").unwrap();
+        let up = v.copy_up_below("/").unwrap();
+        let copier = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
+        let opts = cp::ExtractOptions {
+            owner: Some(copier),
+            ..Default::default()
+        };
+        cp::extract_with(&t[..], root.as_fd(), &opts, &up).unwrap();
+        let made = std::fs::metadata(f.upper.join("etc")).unwrap();
+        assert_eq!(std::fs::read(f.upper.join("etc/sub/new")).unwrap(), b"abc");
+
+        let g = fixture();
+        view(&g).upper_dir_for("/etc").unwrap();
+        let want = std::fs::metadata(g.upper.join("etc")).unwrap();
+        assert_eq!(made.mode() & 0o7777, want.mode() & 0o7777);
+        assert_eq!(made.mode() & 0o7777, 0o750);
+        assert_eq!((made.uid(), made.gid()), (want.uid(), want.gid()));
+        if root_user {
+            assert_eq!((made.uid(), made.gid()), (4321, 4321));
+        }
+        // a directory that is not in the image is the copier's, and so is
+        // one of the image hidden by an opaque directory
+        for dir in ["etc/sub", "o/sub"] {
+            let st = std::fs::metadata(f.upper.join(dir)).unwrap();
+            assert_eq!(st.mode() & 0o7777, 0o755, "{dir}");
+            assert_eq!((st.uid(), st.gid()), copier, "{dir}");
+        }
     }
 }

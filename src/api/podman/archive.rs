@@ -645,14 +645,24 @@ pub(crate) async fn archive_put_of(
             overwrite_dir_non_dir: opts.overwrite_dir_non_dir,
             mask_setid: false,
         };
-        cp::extract(
+        // (a directory that is only in the image keeps its mode and owner)
+        let copy_up = match &root {
+            Root::Stopped(v) => Some(v.copy_up_below(&inside)?),
+            Root::Process(_) => None,
+        };
+        let skipped = cp::extract_with(
             decompressed(ChanReader {
                 rx,
                 cur: Bytes::new(),
             })?,
             dest.as_fd(),
             &extract,
-        )
+            &|rel, fd| copy_up.as_ref().map_or(Ok(()), |up| up(rel, fd)),
+        )?;
+        for (rel, kind) in skipped {
+            tracing::warn!("cp: entry {} of type {kind:?} skipped", rel.display());
+        }
+        Ok(())
     });
     use futures::StreamExt;
     // (what is not a tar archive is refused at its first block, by the

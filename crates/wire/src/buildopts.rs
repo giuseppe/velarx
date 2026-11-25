@@ -349,8 +349,8 @@ impl Output {
                     mask_setid: true,
                     ..Default::default()
                 };
-                let skipped =
-                    extract_with(reader, base.as_fd(), &opts).map_err(|e| named(dir, e))?;
+                let skipped = extract_with(reader, base.as_fd(), &opts, &|_, _| Ok(()))
+                    .map_err(|e| named(dir, e))?;
                 for (rel, kind) in skipped {
                     let what = match kind {
                         // (an unprivileged user makes no device node, nor
