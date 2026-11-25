@@ -687,3 +687,34 @@ async fn rows_that_name_no_object_keep_their_files() {
     let e2 = e.db.all_file_objects().await.unwrap_err().to_string();
     assert!(e2.contains("a store of another velarx"), "{e2}");
 }
+
+/// A build in progress keeps an image it uses from a prune and from the
+/// removal of the unused build images, as long as it lives; once it is gone
+/// (it ended, or was killed) the image can be pruned.
+#[tokio::test]
+async fn an_image_a_build_uses_is_not_pruned_until_the_build_is_gone() {
+    let e = env().await;
+    let l = layer("etc/b", &[6u8; 20_000]);
+    e.publish(&[&l], &[ZSTD]);
+    let id = e.pull().await.unwrap().id;
+    e.service
+        .build_cache_put(velarx_db::BUILD_SCRATCH, "step", &id)
+        .await
+        .unwrap();
+
+    let build = e.service.take_lease("build-0000b017").await.unwrap();
+    let got = e
+        .service
+        .build_cache_get(velarx_db::BUILD_SCRATCH, "step", build.id())
+        .await
+        .unwrap();
+    assert_eq!(got.as_deref(), Some(id.as_str()));
+    assert!(e.service.prune(true, &[]).await.unwrap().is_empty());
+    assert!(e.service.prune_build_cache().await.unwrap().0.is_empty());
+    assert!(e.db.get_image(&id).await.is_ok());
+
+    drop(build);
+    let pruned = e.service.prune(true, &[]).await.unwrap();
+    assert_eq!(pruned.len(), 1);
+    assert_eq!(pruned[0].0, id);
+}
