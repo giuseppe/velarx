@@ -41,6 +41,8 @@ root_dir = "$WORKDIR/root"
 shutdown_timeout_secs = 5
 [storage]
 root = "$WORKDIR/storage"
+[containers]
+log_driver = "k8s-file"
 EOT
     cat > "$XDG_CONFIG_HOME/velarx/registries.conf" <<EOT
 [[registry]]
