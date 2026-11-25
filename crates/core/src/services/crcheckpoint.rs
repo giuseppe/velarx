@@ -936,7 +936,9 @@ impl ContainerService {
         // the level of the archive if it is of the allocator's form and no
         // container's level overlaps it (create checks, in its lock), else
         // one of its own: the restore gives the processes the new label
-        req.preferred_selinux_level = dump.selinux_level.filter(|l| level_with_categories(l));
+        req.preferred_selinux_level = dump
+            .selinux_level
+            .filter(|l| crate::container::selinux::is_allocated_form(l));
         // (the pod's namespaces are the container's; the container is one of
         // its members from its creation until it is removed)
         let pod = match (pods, &opts.pod) {
@@ -1098,14 +1100,6 @@ struct ConfigDump {
     /// other container has it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     selinux_level: Option<String>,
-}
-
-/// A level of the allocator's form: `s0:cA,cB`, two distinct categories
-/// in order, below 1024.
-fn level_with_categories(level: &str) -> bool {
-    crate::container::selinux::level_categories(level).is_some_and(|c| {
-        c.len() == 2 && c[0] < c[1] && level == crate::container::selinux::make_level(c[0], c[1])
-    })
 }
 
 /// A `-v` (or, `mount`, a `--mount`) of the archive, made again: a named
@@ -1660,8 +1654,8 @@ mod tests {
 
     #[test]
     fn only_levels_with_categories_are_taken() {
-        assert!(level_with_categories("s0:c1,c2"));
-        assert!(level_with_categories("s0:c0,c1023"));
+        assert!(crate::container::selinux::is_allocated_form("s0:c1,c2"));
+        assert!(crate::container::selinux::is_allocated_form("s0:c0,c1023"));
         for bad in [
             "s0",
             "s0-s0:c0.c1023",
@@ -1671,7 +1665,7 @@ mod tests {
             "s0:c1.c3",
             "s0:c1,d2",
         ] {
-            assert!(!level_with_categories(bad), "{bad}");
+            assert!(!crate::container::selinux::is_allocated_form(bad), "{bad}");
         }
         for bad in [
             "s0:c2,c1",
@@ -1680,7 +1674,7 @@ mod tests {
             "s0:c1,c1024",
             "s0:c1023",
         ] {
-            assert!(!level_with_categories(bad), "{bad}");
+            assert!(!crate::container::selinux::is_allocated_form(bad), "{bad}");
         }
     }
 

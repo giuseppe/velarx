@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-mcs-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The SELinux MCS levels of containers: what a level may be, which two containers reach each other's files, and the fresh pair of categories"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on bytes and numbers: no dependency, no I/O.  The source of
+# randomness, the levels the containers have (the database), the policy files
+# and the labels of files stay in `velarx-runtime` (container/selinux.rs) and
+# `velarx-core`.
+
+[lib]
+name = "velarx_mcs_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

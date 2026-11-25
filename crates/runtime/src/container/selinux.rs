@@ -16,13 +16,10 @@
 //! are refused.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 const XATTR: &str = "security.selinux";
-/// The categories of the levels drawn (`c0` to `c1023`).
-pub const CATEGORIES: u16 = 1024;
 const MAX_DEPTH: usize = 256;
 
 /// SELinux is enabled on the host.
@@ -66,7 +63,7 @@ pub fn valid_name(v: &str) -> bool {
 /// `s0`, `s0:c1,c2`, `s0-s15:c0.c1023`: a sensitivity (or a range of them)
 /// and, after a colon, categories.  `s0,c1,c2` is none.
 pub fn valid_level(v: &str) -> bool {
-    level_categories(v).is_some()
+    velarx_mcs_core::strict(v.as_bytes())
 }
 
 impl SelinuxConfig {
@@ -252,10 +249,18 @@ fn config_value(text: &str, key: &str) -> Option<String> {
 
 /// `user:role:type:level`
 fn split_context(c: &str) -> Option<(String, String, String, String)> {
-    let mut it = c.splitn(4, ':');
-    let (u, r, t, l) = (it.next()?, it.next()?, it.next()?, it.next()?);
-    (valid_name(u) && valid_name(r) && valid_name(t) && valid_level(l))
-        .then(|| (u.into(), r.into(), t.into(), l.into()))
+    let at = velarx_mcs_core::context_colons(c.as_bytes())?;
+    let (u, r, t, l) = (
+        &c[..at[0]],
+        &c[at[0] + 1..at[1]],
+        &c[at[1] + 1..at[2]],
+        &c[at[2] + 1..],
+    );
+    (valid_name(u)
+        && valid_name(r)
+        && valid_name(t)
+        && velarx_mcs_core::parse(l.as_bytes()).is_some())
+    .then(|| (u.into(), r.into(), t.into(), l.into()))
 }
 
 impl Contexts {
@@ -351,90 +356,48 @@ pub fn labels(
 
 /// The label with the level `s0`, shared by every container (`:z`).
 pub fn shared_label(label: &str) -> Option<String> {
-    let mut parts = label.splitn(4, ':');
-    let (u, r, t) = (parts.next()?, parts.next()?, parts.next()?);
-    parts.next()?;
-    Some(format!("{u}:{r}:{t}:s0"))
-}
-
-/// `s0:cA,cB` with A < B.
-/// The categories of a level (`s0:c1,c2`, `s0-s0:c0.c1023`: those of its
-/// high part), in order, without repeats; `None` when it is not one.
-pub fn level_categories(level: &str) -> Option<Vec<u16>> {
-    let cat = |c: &str| -> Option<u16> {
-        c.strip_prefix('c')
-            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))?
-            .parse()
-            .ok()
-            .filter(|n| *n < CATEGORIES)
-    };
-    let sens_ok = |s: &str| {
-        s.strip_prefix('s')
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-    };
-    let (sens, cats) = match level.split_once(':') {
-        Some((s, c)) => (s, Some(c)),
-        None => (level, None),
-    };
-    if !sens.split('-').all(sens_ok) {
-        return None;
-    }
-    let mut out = Vec::new();
-    if let Some(cats) = cats {
-        for item in cats.split(',') {
-            match item.split_once('.') {
-                Some((lo, hi)) => {
-                    let (lo, hi) = (cat(lo)?, cat(hi)?);
-                    if lo > hi {
-                        return None;
-                    }
-                    out.extend(lo..=hi);
-                }
-                None => out.push(cat(item)?),
-            }
-        }
-    }
-    out.sort_unstable();
-    out.dedup();
-    Some(out)
+    let at = velarx_mcs_core::context_colons(label.as_bytes())?;
+    Some(format!("{}:s0", &label[..at[2]]))
 }
 
 /// Whether a container at `a` and one at `b` may reach each other's
 /// files: one's categories include the other's (an empty set, `s0`, is
-/// left out: no container of the allocator has one).
+/// left out: no container of the allocator has one).  A level that is none
+/// counts as reaching.
 pub fn levels_overlap(a: &str, b: &str) -> bool {
-    match (level_categories(a), level_categories(b)) {
-        (Some(x), Some(y)) if !x.is_empty() && !y.is_empty() => {
-            x.iter().all(|c| y.contains(c)) || y.iter().all(|c| x.contains(c))
-        }
-        // a level that does not parse: as if it overlapped
-        (None, _) | (_, None) => true,
-        _ => false,
-    }
+    velarx_mcs_core::overlap(a.as_bytes(), b.as_bytes())
 }
 
-pub fn make_level(c1: u16, c2: u16) -> String {
-    let (a, b) = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
-    format!("s0:c{a},c{b}")
+/// `level` is of the form the allocator gives, `s0:cA,cB` with A < B.
+pub fn is_allocated_form(level: &str) -> bool {
+    velarx_mcs_core::read_pair(level.as_bytes()).is_some()
 }
 
-/// A level of two random categories that is not in `used`.
-pub fn allocate_level(used: &HashSet<String>) -> Result<String, String> {
-    for _ in 0..1000 {
-        let mut r = [0u8; 4];
-        rustix::rand::getrandom(&mut r, rustix::rand::GetRandomFlags::empty())
-            .map_err(|e| format!("getrandom: {e}"))?;
-        let c1 = u16::from_ne_bytes([r[0], r[1]]) % CATEGORIES;
-        let c2 = u16::from_ne_bytes([r[2], r[3]]) % CATEGORIES;
-        if c1 == c2 {
-            continue;
-        }
-        let level = make_level(c1, c2);
-        if !used.contains(&level) {
-            return Ok(level);
+/// How many pairs of categories are tried for a level before giving up.
+const ATTEMPTS: usize = 1000;
+
+/// A level of two random categories that reaches none of `used`; when every
+/// pair does because a level in use is wide on purpose (`s0:c0.c1023`), one
+/// that is not equal to or a superset of a level in use.
+pub fn allocate_level(used: &[String]) -> Result<String, String> {
+    let mut bytes = [0u8; 8 * ATTEMPTS];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match rustix::rand::getrandom(&mut bytes[filled..], rustix::rand::GetRandomFlags::empty()) {
+            Ok(n) => filled += n,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(format!("getrandom: {e}")),
         }
     }
-    Err("no free SELinux level".into())
+    let mut rand = [0u32; 2 * ATTEMPTS];
+    for (r, b) in rand.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        *r = u32::from_ne_bytes(*b);
+    }
+    let used: Vec<Vec<u8>> = used.iter().map(|u| u.as_bytes().to_vec()).collect();
+    match velarx_mcs_core::pick(&rand, &used) {
+        Some(label) => Ok(String::from_utf8_lossy(label.as_bytes()).into_owned()),
+        None => Err("no free SELinux level".into()),
+    }
 }
 
 fn at_or_below(path: &str, dir: &str) -> bool {
@@ -972,7 +935,6 @@ mod tests {
             ..Default::default()
         };
         assert!(s.validate().is_err());
-        assert_eq!(make_level(9, 3), "s0:c3,c9");
     }
 
     #[test]
@@ -1084,11 +1046,12 @@ mod tests {
 
     #[test]
     fn levels_are_unique() {
-        let mut used = HashSet::new();
+        let mut used = Vec::new();
         for _ in 0..200 {
             let l = allocate_level(&used).unwrap();
             assert!(valid_level(&l));
-            assert!(used.insert(l));
+            assert!(!used.contains(&l));
+            used.push(l);
         }
     }
 
@@ -1310,12 +1273,153 @@ mod tests {
         assert_eq!(fd_label(f.as_fd()).as_deref(), Some(label.as_str()));
     }
 
+    /// What a level given by a user or by the CRI may be, edge by edge.
+    #[test]
+    fn levels_that_are_taken_and_refused() {
+        for l in [
+            "s0",
+            "s15",
+            "s0-s15",
+            "s0:c0",
+            "s0:c1023",
+            "s0:c1,c1",
+            "s0:c3.c3",
+            "s0:c0.c1023",
+            "s0:c1,c5.c9,c2",
+            "s0-s0:c1,c2",
+            "s99999999999999999999:c1",
+            "s10:c10.c100",
+        ] {
+            assert!(valid_level(l), "{l}");
+        }
+        for l in [
+            "",
+            ":",
+            ":c1",
+            "s",
+            "s0:",
+            "s0::c1",
+            "s0:c1:c2",
+            "S0",
+            "s0:C1",
+            "s0:c",
+            "s0:c1.",
+            "s0:.c1",
+            "s0:c1..c2",
+            "s0:c1.c2.c3",
+            "s0:c5.c3",
+            "s0:c1023.c1024",
+            "s0:c1024",
+            "s0:c99999999999",
+            "s0:c+1",
+            "s0:c-1",
+            "s0:c 1",
+            "s0: c1",
+            "s0:c1 ",
+            "s0:c1\n",
+            "s0:c1,,c2",
+            "s0:,c1",
+            "s0,c1",
+            "s0:c1\"",
+            "s0:c1,c2\",context=x",
+            "s0-",
+            "-s0",
+            "s0--s1",
+            "s0-s1:",
+            "s0\0",
+            "s0:c١",
+            "s٠",
+            "s0:c1;c2",
+            "s0-s1-s2",
+            "s00",
+            "s0:c01",
+            "s0:c1.c01",
+            "s0:c0000000000000000000001",
+        ] {
+            assert!(!valid_level(l), "{l:?}");
+        }
+        // what reaches `context=` of a mount is validated first
+        let s = SelinuxConfig {
+            level: Some("s0:c1,c2\",context=x".into()),
+            ..Default::default()
+        };
+        assert!(s.validate().is_err());
+    }
+
+    /// Two levels reach each other's files when the categories of one are
+    /// all in the other; a level that is not one counts as reaching.
+    #[test]
+    fn levels_that_overlap() {
+        assert!(levels_overlap("s0:c1,c2", "s0:c1,c2"));
+        assert!(levels_overlap("s0:c1,c2", "s0:c2,c1"));
+        assert!(levels_overlap("s0:c1,c2", "s0:c1.c2"));
+        assert!(levels_overlap("s0:c1,c2", "s0:c1,c2,c3"));
+        assert!(levels_overlap("s0:c1,c2,c3", "s0:c1,c2"));
+        assert!(levels_overlap("s0:c7", "s0:c0.c1023"));
+        assert!(levels_overlap("s0:c1,c1", "s0:c1,c9"));
+        assert!(!levels_overlap("s0:c1,c2", "s0:c2,c3"));
+        assert!(!levels_overlap("s0:c1,c2,c3", "s0:c3,c4,c5"));
+        assert!(!levels_overlap("s0", "s0"));
+        assert!(!levels_overlap("s0:c1", "s0-s5"));
+        assert!(levels_overlap("s0:c1,c2", "junk"));
+        assert!(levels_overlap("junk", "s0"));
+        assert!(levels_overlap("", ""));
+    }
+
+    /// The level of a fresh container is `s0:cA,cB` with A < B, and reaches
+    /// no level in use, however the level in use is spelled.
+    #[test]
+    fn pairs_of_categories() {
+        let mut used = Vec::new();
+        for _ in 0..50 {
+            let l = allocate_level(&used).unwrap();
+            assert!(is_allocated_form(&l), "{l}");
+            assert!(used.iter().all(|u| !levels_overlap(&l, u)));
+            used.push(l);
+        }
+        assert!(!is_allocated_form("s0:c2,c1") && !is_allocated_form("s0:c1,c2,c3"));
+        // a level that is wide on purpose does not stop the allocation
+        for wide in ["s0:c0.c1023", "s0-s0:c0.c1023", "s0:c0.c1000"] {
+            let l = allocate_level(&[wide.to_string()]).unwrap();
+            assert!(is_allocated_form(&l), "{wide} {l}");
+        }
+        // a pair never is the set of a level in use, or has one inside
+        for _ in 0..200 {
+            let l = allocate_level(&["s0:c1".to_string(), "s0:c7,c8".to_string()]).unwrap();
+            let (a, b) = velarx_mcs_core::read_pair(l.as_bytes()).unwrap();
+            assert!(![a, b].contains(&1) && !(a == 7 && b == 8), "{l}");
+        }
+        // many levels in use, none of them wide, and a wide one: still a pair
+        let mut many: Vec<String> = (0..300)
+            .map(|i| format!("s0:c{},c{}", 2 * i, 2 * i + 1))
+            .collect();
+        many.push("s0:c0.c1023".into());
+        assert!(allocate_level(&many).is_ok());
+    }
+
+    /// The level field of a context has colons of its own.
+    #[test]
+    fn the_level_of_a_context_is_replaced() {
+        let f = |c| shared_label(c).as_deref().map(str::to_owned);
+        assert_eq!(f("u:r:t:s0:c1,c2").as_deref(), Some("u:r:t:s0"));
+        assert_eq!(f("u:r:t:s0-s0:c0.c1023").as_deref(), Some("u:r:t:s0"));
+        assert_eq!(f("u:r:t:s0").as_deref(), Some("u:r:t:s0"));
+        assert_eq!(f("u:r:t:").as_deref(), Some("u:r:t:s0"));
+        assert_eq!(f("u:r:t:x:y:z").as_deref(), Some("u:r:t:s0"));
+        assert_eq!(f("u:r:t"), None);
+        assert_eq!(f(""), None);
+        assert_eq!(
+            split_context("u:r:t:s0:c1,c2"),
+            Some(("u".into(), "r".into(), "t".into(), "s0:c1,c2".into()))
+        );
+        assert_eq!(split_context("u:r:t:s0:c1024"), None);
+        assert_eq!(split_context("u:r:t"), None);
+        assert_eq!(split_context("u:r:t:"), None);
+        assert_eq!(split_context("u:r:t x:s0"), None);
+    }
+
     #[test]
     fn levels_are_compared_as_sets_of_categories() {
-        assert_eq!(level_categories("s0:c2,c1"), Some(vec![1, 2]));
-        assert_eq!(level_categories("s0-s0:c0.c3"), Some(vec![0, 1, 2, 3]));
-        assert_eq!(level_categories("s0"), Some(vec![]));
-        assert!(level_categories("s0:c1024").is_none() && level_categories("x:c1").is_none());
         assert!(levels_overlap("s0:c1,c2", "s0:c2,c1"));
         assert!(levels_overlap("s0:c1,c2", "s0:c0.c1023"));
         assert!(!levels_overlap("s0:c1,c2", "s0:c1,c3"));

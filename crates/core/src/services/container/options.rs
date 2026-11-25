@@ -386,12 +386,7 @@ impl ContainerService {
         // privileged one that asks for them labelled
         let needs_level = s.level.is_none() && (!privileged || s.files);
         if needs_level {
-            let used: std::collections::HashSet<String> = self
-                .db
-                .container_selinux_levels()
-                .await?
-                .into_iter()
-                .collect();
+            let used = self.db.container_selinux_levels().await?;
             // (in the lock of the store: no create in between)
             let level = match preferred {
                 Some(p) if !used.iter().any(|u| selinux::levels_overlap(p, u)) => p.to_string(),

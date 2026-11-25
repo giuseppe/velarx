@@ -5151,6 +5151,10 @@ name = "velarx-lazy-core"
 version = "0.1.0"
 
 [[package]]
+name = "velarx-mcs-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-monitor-bin"
 version = "0.1.0"
 dependencies = [
@@ -5451,6 +5455,7 @@ dependencies = [
  "velarx-db",
  "velarx-fuse",
  "velarx-graph",
+ "velarx-mcs-core",
  "velarx-netdetach",
  "velarx-netkernel",
  "velarx-nsid",
