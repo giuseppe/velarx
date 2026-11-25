@@ -492,7 +492,16 @@ pub fn resolve_free_ports(ports: &mut [PortSpec]) -> std::io::Result<()> {
     for p in ports.iter_mut().filter(|p| p.host_port == 0) {
         let mut found = false;
         for _ in 0..64 {
-            let (fd, first) = bind_port(p.host_ip, p.proto, 0)?;
+            let (fd, first) = bind_port(p.host_ip, p.proto, 0).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot find a free host port for the container port {}/{}: {e}",
+                        p.container_port,
+                        p.proto.as_str()
+                    ),
+                )
+            })?;
             let mut group = vec![fd];
             for k in 1..p.range {
                 let Some(port) = first.checked_add(k) else {
@@ -877,6 +886,20 @@ mod tests {
             resolve_free_ports(&mut ports).unwrap();
             assert_eq!(hold_ports(&ports).unwrap().len(), 300);
         });
+    }
+
+    /// `-P` of an image that exposes more ports than the host has free
+    /// ones ends with an error that names the port, not with the bare one
+    /// of the socket.
+    #[test]
+    fn a_port_with_no_free_host_port_is_named() {
+        // (an address of no host: no port of it can be bound)
+        let mut ports = vec![PortSpec::parse("192.0.2.1::8080/udp").unwrap()];
+        let e = resolve_free_ports(&mut ports).unwrap_err().to_string();
+        assert!(
+            e.starts_with("cannot find a free host port for the container port 8080/udp: "),
+            "{e}"
+        );
     }
 
     #[test]
