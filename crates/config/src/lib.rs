@@ -1538,14 +1538,15 @@ impl Config {
     }
 
     /// Load config from path, returning default if file doesn't exist.
-    /// Returns error if file exists but can't be read or parsed.
+    /// Returns error if file exists but can't be read or parsed, or if
+    /// whether it exists can't be told.
     /// What podman's global options say (`--root`, `--runroot`,
     /// `--cgroup-manager`, `--runtime-flag`, `--hooks-dir`,
     /// `--events-backend`, which the command line gives its processes in
     /// the environment) takes the place of the file's.
     pub fn load_or_default<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let mut config = if path.exists() {
+        let mut config = if path.try_exists()? {
             Self::load(path)?
         } else {
             Self::default()
@@ -1918,6 +1919,17 @@ impl Config {
 mod tests {
     use std::collections::HashMap;
     use velarx_types::digest::Algorithm;
+
+    #[test]
+    fn a_config_that_cannot_be_looked_up_is_an_error_not_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Config::load_or_default(dir.path().join("none.toml")).is_ok());
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        // (a regular file is no directory: the lookup fails, root or not)
+        let e = Config::load_or_default(file.join("velarx.toml")).unwrap_err();
+        assert!(matches!(e, ConfigError::ReadError(_)), "{e}");
+    }
 
     fn dirs(rootful: bool, env: &[(&str, &str)]) -> DefaultDirs {
         let env: HashMap<_, _> = env.iter().copied().collect();
