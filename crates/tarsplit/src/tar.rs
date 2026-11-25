@@ -95,8 +95,16 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-/// An octal or base-256 number field.
+/// An octal or base-256 number field.  NULs and spaces in front of octal
+/// digits are skipped, as Go's `archive/tar` does (`strconv.go`
+/// `parseOctal`): a field that starts with a NUL is not 0 then.
 fn number(field: &[u8], what: &str) -> io::Result<u64> {
+    let blank = field.iter().take_while(|&&b| b == 0 || b == b' ').count();
+    let field = if field.get(blank).is_some_and(u8::is_ascii_digit) {
+        &field[blank..]
+    } else {
+        field
+    };
     header::number(field).map_err(|e| num_error(e, what))
 }
 
@@ -125,6 +133,10 @@ struct Overrides {
     xattr_bytes: usize,
 }
 
+fn nonempty(s: String) -> Option<String> {
+    (!s.is_empty()).then_some(s)
+}
+
 /// Parse `len key=value\n` records.
 fn parse_pax(data: &[u8], out: &mut Overrides) -> io::Result<()> {
     let mut rest = data;
@@ -138,8 +150,9 @@ fn parse_pax(data: &[u8], out: &mut Overrides) -> io::Result<()> {
         let value = &rest[record.value];
         rest = &rest[record.len..];
         match key {
-            "path" => out.path = Some(utf8(value, "PAX path")?),
-            "linkpath" => out.link = Some(utf8(value, "PAX linkpath")?),
+            // (an empty name keeps that of the header, as for Go)
+            "path" => out.path = nonempty(utf8(value, "PAX path")?),
+            "linkpath" => out.link = nonempty(utf8(value, "PAX linkpath")?),
             "size" => out.size = Some(decimal(value).map_err(|_| invalid("invalid PAX size"))?),
             "uid" | "gid" => {
                 let v = decimal(value).map_err(|_| invalid("invalid PAX id"))?;
@@ -356,22 +369,29 @@ impl<R: Read, S: Sink> TarReader<R, S> {
             let size = number(&block[124..136], "size")?;
             match block[156] {
                 b'x' => {
+                    // (the records of a second one replace those of the
+                    // first, as for Go)
                     let data = self.read_extension(size)?;
+                    ov = Overrides::default();
                     parse_pax(&data, &mut ov)?;
                     continue;
                 }
                 b'g' => {
-                    // Global extended headers are not applied.
+                    // Global extended headers are not applied.  Go returns
+                    // one as an entry: what came before it is dropped.
                     self.read_extension(size)?;
+                    ov = Overrides::default();
+                    gnu_path = None;
+                    gnu_link = None;
                     continue;
                 }
                 b'L' | b'K' => {
                     let data = self.read_extension(size)?;
-                    let name = utf8(cstr(&data), "GNU long name")?;
+                    let name = nonempty(utf8(cstr(&data), "GNU long name")?);
                     if block[156] == b'L' {
-                        gnu_path = Some(name);
+                        gnu_path = name;
                     } else {
-                        gnu_link = Some(name);
+                        gnu_link = name;
                     }
                     continue;
                 }
@@ -409,11 +429,22 @@ impl<R: Read, S: Sink> TarReader<R, S> {
         };
 
         let posix = &block[257..263] == b"ustar\0";
-        let path = if let Some(p) = ov.path.or(gnu_path) {
+        // (star has a shorter prefix, then its times)
+        let prefix_end = if posix && &block[508..512] == b"tar\0" {
+            476
+        } else {
+            500
+        };
+        // A GNU long name wins over a PAX one, as for Go.
+        let path = if let Some(p) = gnu_path.or(ov.path) {
             p
         } else {
             let name = cstr(&block[0..100]);
-            let prefix = if posix { cstr(&block[345..500]) } else { &[] };
+            let prefix = if posix {
+                cstr(&block[345..prefix_end])
+            } else {
+                &[]
+            };
             if prefix.is_empty() {
                 utf8(name, "path")?
             } else {
@@ -424,7 +455,7 @@ impl<R: Read, S: Sink> TarReader<R, S> {
         if block[156] == 0 && path.ends_with('/') {
             kind = Kind::Directory;
         }
-        let link = match ov.link.or(gnu_link) {
+        let link = match gnu_link.or(ov.link) {
             Some(l) => Some(l),
             None => {
                 let l = cstr(&block[157..257]);
@@ -467,7 +498,9 @@ impl<R: Read, S: Sink> TarReader<R, S> {
         let uid = u32::try_from(uid).map_err(|_| invalid("uid is too large"))?;
         let gid = u32::try_from(gid).map_err(|_| invalid("gid is too large"))?;
         let mode = (number(&block[100..108], "mode")? & 0o7777) as u32;
-        let (dev_major, dev_minor) = if matches!(kind, Kind::Char | Kind::Block) {
+        // (an old header, with no magic, has no device numbers)
+        let v7 = !posix && &block[257..265] != b"ustar  \0";
+        let (dev_major, dev_minor) = if matches!(kind, Kind::Char | Kind::Block) && !v7 {
             (
                 u32::try_from(number(&block[329..337], "device major")?)
                     .map_err(|_| invalid("device major is too large"))?,
@@ -845,6 +878,115 @@ mod tests {
             .read_to_end(&mut out)
             .unwrap();
         assert_eq!(out, stream);
+    }
+
+    /// An extension header of `typeflag` with `data`, padded.
+    fn extension(typeflag: u8, data: &[u8]) -> Vec<u8> {
+        let mut out = raw("ext", typeflag, data.len() as u64);
+        out.extend(data);
+        out.resize(out.len().next_multiple_of(BLOCK), 0);
+        out
+    }
+
+    /// `block` with its bytes at `at` replaced and its checksum set again.
+    fn patched(block: Vec<u8>, at: usize, bytes: &[u8]) -> Vec<u8> {
+        let mut h = tar::Header::new_old();
+        h.as_mut_bytes().copy_from_slice(&block);
+        h.as_mut_bytes()[at..at + bytes.len()].copy_from_slice(bytes);
+        h.set_cksum();
+        h.as_bytes().to_vec()
+    }
+
+    fn paths(stream: Vec<u8>) -> Vec<String> {
+        let entries = read_all(finished(stream)).unwrap();
+        entries.into_iter().map(|(h, _)| h.path).collect()
+    }
+
+    #[test]
+    fn test_nuls_in_front_of_a_number() {
+        let mut stream = patched(raw("f", b'0', 0), 124, b"\0\x00000000012\0");
+        stream.extend(vec![b'D'; 10]);
+        stream.resize(BLOCK * 2, 0);
+        stream.extend(patched(raw("m", b'0', 0), 100, b"\0 04755\0"));
+        let entries = read_all(finished(stream)).unwrap();
+        assert_eq!(entries[0].0.size, 10);
+        assert_eq!(entries[0].1, vec![b'D'; 10]);
+        assert_eq!(entries[1].0.mode, 0o4755);
+    }
+
+    #[test]
+    fn test_a_gnu_long_name_wins_over_a_pax_one() {
+        let mut stream = extension(b'x', &record_of("path=pax"));
+        stream.extend(extension(b'L', b"gnu\0"));
+        stream.extend(raw("header", b'0', 0));
+        stream.extend(extension(b'K', b"gnulink\0"));
+        stream.extend(extension(b'x', &record_of("linkpath=paxlink")));
+        stream.extend(raw("l", b'2', 0));
+        let entries = read_all(finished(stream)).unwrap();
+        assert_eq!(entries[0].0.path, "gnu");
+        assert_eq!(entries[1].0.link.as_deref(), Some("gnulink"));
+    }
+
+    #[test]
+    fn test_a_second_pax_header_replaces_the_first() {
+        let mut first = record_of("path=first");
+        first.extend(record_of("uid=7"));
+        let mut stream = extension(b'x', &first);
+        stream.extend(extension(b'x', &record_of("gid=9")));
+        stream.extend(raw("header", b'0', 0));
+        let entries = read_all(finished(stream)).unwrap();
+        assert_eq!(entries[0].0.path, "header");
+        assert_eq!(entries[0].0.uid, 0);
+        assert_eq!(entries[0].0.gid, 9);
+    }
+
+    #[test]
+    fn test_a_global_header_drops_what_came_before() {
+        let mut stream = extension(b'x', &record_of("path=fromx"));
+        stream.extend(extension(b'L', b"froml\0"));
+        stream.extend(extension(b'g', &record_of("comment=c")));
+        stream.extend(raw("header", b'0', 0));
+        assert_eq!(paths(stream), ["header"]);
+    }
+
+    #[test]
+    fn test_an_empty_long_name_keeps_the_header_one() {
+        let mut stream = extension(b'x', &record_of("path="));
+        stream.extend(raw("one", b'0', 0));
+        stream.extend(extension(b'L', b"\0"));
+        stream.extend(raw("two", b'0', 0));
+        stream.extend(extension(b'x', &record_of("linkpath=")));
+        stream.extend(raw("l", b'2', 0));
+        let entries = read_all(finished(stream)).unwrap();
+        assert_eq!(entries[0].0.path, "one");
+        assert_eq!(entries[1].0.path, "two");
+        assert_eq!(entries[2].0.link.as_deref(), Some("t"));
+    }
+
+    /// The prefix of a star header is 131 bytes: its times follow.
+    #[test]
+    fn test_the_prefix_of_a_star_header() {
+        let mut prefix = vec![b'p'; 131];
+        prefix.extend(b"00000000000");
+        let block = patched(raw("n", b'0', 0), 345, &prefix);
+        let block = patched(block, 508, b"tar\0");
+        assert_eq!(paths(block), [format!("{}/n", "p".repeat(131))]);
+    }
+
+    /// A header without magic has no device numbers.
+    #[test]
+    fn test_an_old_header_has_no_device_numbers() {
+        let mut h = tar::Header::new_ustar();
+        h.set_path("c").unwrap();
+        h.set_entry_type(tar::EntryType::Char);
+        h.set_device_major(5).unwrap();
+        h.set_device_minor(7).unwrap();
+        h.set_cksum();
+        let old = patched(h.as_bytes().to_vec(), 257, &[0; 8]);
+        let entries = read_all(finished(old)).unwrap();
+        assert_eq!((entries[0].0.dev_major, entries[0].0.dev_minor), (0, 0));
+        let entries = read_all(finished(h.as_bytes().to_vec())).unwrap();
+        assert_eq!((entries[0].0.dev_major, entries[0].0.dev_minor), (5, 7));
     }
 
     #[test]
