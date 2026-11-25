@@ -43,7 +43,7 @@ refusal='velarx needs cgroup v2 and /sys/fs/cgroup is not a cgroup2 mount'
 }
 
 @test "the monitor refuses to start without cgroup v2" {
-    out=$(without_cgroup2 "$BIN/velarx-monitor" "$WORKDIR" 2>&1)
+    out=$(without_cgroup2 "$BIN/velarx-monitor" --varlink-fd 3 "$WORKDIR" 2>&1)
     check "exit status" 1 $?
     check_match "the error" "monitor failed: $refusal" "$out"
 }
@@ -52,7 +52,7 @@ refusal='velarx needs cgroup v2 and /sys/fs/cgroup is not a cgroup2 mount'
     unshare -rmC true 2> /dev/null || skip "no cgroup namespaces"
     # (the monitor checks first, then fails on the run directory that is not one)
     out=$(unshare -rmC sh -c 'mount -t cgroup2 none /sys/fs/cgroup && exec "$@"' sh \
-        "$BIN/velarx-monitor" "$WORKDIR/no-such-run-dir" 2>&1)
+        "$BIN/velarx-monitor" --varlink-fd 3 "$WORKDIR/no-such-run-dir" 2>&1)
     check "the monitor fails, not on the cgroups" 1 $?
     case "$out" in
         *"needs cgroup v2"*) echo "FAIL a cgroup2 mount of a cgroup namespace is refused: $out" >&2; return 1 ;;
