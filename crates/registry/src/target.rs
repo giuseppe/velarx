@@ -793,12 +793,12 @@ where
     };
     let (mut body, mut digest) = fetch(reference).await?;
     check_size(&body)?;
-    velarx_types::docker::refuse_manifest(&body)?;
     if let Some(pinned) = &image_ref.digest {
         // fetched by a tag, the bytes are the digest's own algorithm to check
         verify_digest(pinned, &body)?;
         digest = *pinned;
     }
+    velarx_types::docker::refuse_manifest(&body)?;
     // An index: pick the instance for this platform (an index may list
     // indexes, two levels of them).
     for level in 0.. {
@@ -830,13 +830,17 @@ where
         indexes.push((digest, body.clone()));
         body = match kept {
             Some(body) => body,
-            None => fetch(wanted.to_string()).await?.0,
+            None => {
+                let body = fetch(wanted.to_string()).await?.0;
+                check_size(&body)?;
+                // whoever fetched it (a confined worker too), the instance
+                // is the one the index names: its bytes are hashed here,
+                // before they are read
+                verify_digest(&wanted, &body)?;
+                body
+            }
         };
-        check_size(&body)?;
         velarx_types::docker::refuse_manifest(&body)?;
-        // whoever fetched it (a confined worker too), the instance is the
-        // one the index names: its bytes are hashed here
-        verify_digest(&wanted, &body)?;
         digest = wanted;
     }
     let manifest: OciManifest = serde_json::from_slice(&body)?;

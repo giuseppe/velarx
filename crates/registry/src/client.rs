@@ -2942,12 +2942,11 @@ mod tests {
         assert!(resolve_manifest(&r, None, alone).await.is_ok());
     }
 
-    /// Pins a problem: the bytes are parsed (and refused as a Docker
-    /// schema 1 manifest) before they are hashed; a body of another
-    /// digest than the one that named it is a DigestMismatch whatever
-    /// it holds.  Expect DigestMismatch in both cases.
+    /// Bytes are hashed before they are read: a body of another digest
+    /// than the one that named it is a DigestMismatch whatever it holds
+    /// (a Docker schema 1 manifest, say).
     #[tokio::test]
-    async fn test_bytes_are_parsed_before_they_are_hashed_pinned() {
+    async fn test_bytes_are_hashed_before_they_are_read() {
         let schema1 = br#"{"schemaVersion":1,"name":"a","tag":"latest","fsLayers":[]}"#.to_vec();
         let named = sha256_of(b"the manifest that was asked for");
         // by a digest reference
@@ -2958,7 +2957,7 @@ mod tests {
             async move { Ok::<_, ImageError>((Bytes::from(body.clone()), sha256_of(&body))) }
         };
         let err = resolve_manifest(&by_digest, None, fetch).await.unwrap_err();
-        assert!(matches!(err, ImageError::DockerFormat(_)), "{err}");
+        assert!(matches!(err, ImageError::DigestMismatch { .. }), "{err}");
         // by the digest an index names
         let index = format!(
             r#"{{"manifests":[{{"digest":"{named}","platform":{{"os":"linux","architecture":"{}"}}}}]}}"#,
@@ -2977,7 +2976,7 @@ mod tests {
             }
         };
         let err = resolve_manifest(&tag, None, fetch).await.unwrap_err();
-        assert!(matches!(err, ImageError::DockerFormat(_)), "{err}");
+        assert!(matches!(err, ImageError::DigestMismatch { .. }), "{err}");
     }
 
     #[test]
