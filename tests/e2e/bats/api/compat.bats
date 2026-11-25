@@ -83,6 +83,9 @@ print(sorted(set(out)))' "$WORKDIR/logs.bin")
     out=$(api -X POST -H 'Content-Type: application/json' -d '{"Cmd":["echo","hi"],"AttachStdout":true}' \
           "http://d/v1.41/containers/$id/exec")
     check_match "compat exec on a stopped container" "container state improper" "$out"
+    code=$(api -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"Cmd":["id"],"User":1000}' \
+          "http://d/v1.41/containers/$id/exec")
+    check "compat exec with a user that is no string" 400 "$code"
     code=$(api -o /dev/null -w '%{http_code}' -X DELETE "http://d/v1.41/containers/$id")
     check "compat remove" 204 "$code"
     code=$(api -o /dev/null -w '%{http_code}' -X DELETE "http://d/v1.41/containers/$id")

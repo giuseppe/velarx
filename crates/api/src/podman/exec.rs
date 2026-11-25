@@ -35,30 +35,61 @@ fn field<'a>(v: &'a Value, k: &str) -> Option<&'a Value> {
     })
 }
 
-fn text<'a>(v: &'a Value, k: &str) -> &'a str {
-    field(v, k).and_then(Value::as_str).unwrap_or("")
+/// The member `k` of a body when it is there and not null (as Go's
+/// decoder, which leaves the zero value for a null).
+fn member<'a>(v: &'a Value, k: &str) -> Option<&'a Value> {
+    field(v, k).filter(|x| !x.is_null())
 }
 
-fn flag(v: &Value, k: &str) -> bool {
-    field(v, k).and_then(Value::as_bool).unwrap_or(false)
+/// The 400 for a member that is not of its type.
+fn wrong_type(k: &str, want: &str, got: &Value) -> ApiError {
+    let got = match got {
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        _ => "object",
+    };
+    ApiError::bad_request(format!(
+        "json: cannot unmarshal {got} into Go struct field {k} of type {want}"
+    ))
 }
 
-fn strings(v: &Value, k: &str) -> Vec<String> {
-    field(v, k)
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+fn text<'a>(v: &'a Value, k: &str) -> ApiResult<&'a str> {
+    match member(v, k) {
+        None => Ok(""),
+        Some(Value::String(s)) => Ok(s),
+        Some(x) => Err(wrong_type(k, "string", x)),
+    }
+}
+
+fn flag(v: &Value, k: &str) -> ApiResult<bool> {
+    match member(v, k) {
+        None => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(x) => Err(wrong_type(k, "bool", x)),
+    }
+}
+
+fn strings(v: &Value, k: &str) -> ApiResult<Vec<String>> {
+    match member(v, k) {
+        None => Ok(Vec::new()),
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|x| match x {
+                Value::String(s) => Ok(s.clone()),
+                x => Err(wrong_type(k, "string", x)),
+            })
+            .collect(),
+        Some(x) => Err(wrong_type(k, "[]string", x)),
+    }
 }
 
 /// The session podman's body asks for; podman's 400 for a variable of the
 /// environment without a value.
 fn spec_of(body: &Value) -> ApiResult<ExecSpec> {
     let mut env = std::collections::BTreeMap::new();
-    for e in strings(body, "Env") {
+    for e in strings(body, "Env")? {
         let Some((k, v)) = e.split_once('=') else {
             return Err(ApiError::bad_request(format!(
                 "environment variable {e:?} badly formed, must be key=value"
@@ -67,16 +98,16 @@ fn spec_of(body: &Value) -> ApiResult<ExecSpec> {
         env.insert(k.to_string(), v.to_string());
     }
     Ok(ExecSpec {
-        command: strings(body, "Cmd"),
+        command: strings(body, "Cmd")?,
         env,
-        work_dir: text(body, "WorkingDir").to_string(),
-        user: text(body, "User").to_string(),
-        tty: flag(body, "Tty"),
-        stdin: flag(body, "AttachStdin"),
-        stdout: flag(body, "AttachStdout"),
-        stderr: flag(body, "AttachStderr"),
-        privileged: flag(body, "Privileged"),
-        detach_keys: text(body, "DetachKeys").to_string(),
+        work_dir: text(body, "WorkingDir")?.to_string(),
+        user: text(body, "User")?.to_string(),
+        tty: flag(body, "Tty")?,
+        stdin: flag(body, "AttachStdin")?,
+        stdout: flag(body, "AttachStdout")?,
+        stderr: flag(body, "AttachStderr")?,
+        privileged: flag(body, "Privileged")?,
+        detach_keys: text(body, "DetachKeys")?.to_string(),
         timeout_ms: None,
         errors_apart: false,
     })
@@ -153,7 +184,7 @@ async fn start(mut call: Call) -> ApiResult {
     let upgraded = hijack::upgraded(&call);
     let id = call.param(0).to_string();
     let int = |k| field(&b, k).and_then(Value::as_i64).unwrap_or(0);
-    let (detach, h, w) = (flag(&b, "Detach"), int("h"), int("w"));
+    let (detach, h, w) = (flag(&b, "Detach")?, int("h"), int("w"));
     // (in a task of its own: a client that hangs up before the answer, which
     // drops this request, still has its command started, and it goes on, as
     // podman's)
@@ -178,7 +209,7 @@ async fn resize(call: Call) -> ApiResult {
 /// `POST /exec/{id}/remove`
 async fn remove(mut call: Call) -> ApiResult {
     let b = body(&mut call).await?;
-    let force = flag(&b, "Force");
+    let force = flag(&b, "Force")?;
     engine_call!(call.engine, exec_remove(call.param(0), force))?;
     Ok(reply::empty(200))
 }
@@ -200,3 +231,43 @@ pub(super) static ROUTES: &[Route] = &[
     route!("POST", "/exec/{}/resize", BOTH, Exec, resize),
     route!("POST", "/exec/{}/remove", LIBPOD, Exec, remove),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_member_of_another_type_is_a_400_not_its_default() {
+        for (member, body) in [
+            ("User", json!({"User": 1000})),
+            ("Cmd", json!({"Cmd": "ls"})),
+            ("Cmd", json!({"Cmd": ["ls", 5]})),
+            ("Env", json!({"Env": "A=1"})),
+            ("Env", json!({"Env": [true]})),
+            ("Tty", json!({"Tty": "yes"})),
+            ("WorkingDir", json!({"WorkingDir": ["/"]})),
+            ("AttachStdout", json!({"AttachStdout": 1})),
+            ("Privileged", json!({"Privileged": "false"})),
+            // (the name in any case, as the members are found)
+            ("Tty", json!({"tty": "yes"})),
+        ] {
+            let e = spec_of(&body).unwrap_err();
+            assert_eq!(e.status.as_u16(), 400, "{body}");
+            assert!(e.message.contains(member), "{}", e.message);
+        }
+        assert!(flag(&json!({"Detach": "yes"}), "Detach").is_err());
+    }
+
+    #[test]
+    fn an_absent_or_null_member_is_its_default() {
+        let spec = spec_of(&json!({"Env": null, "User": null, "Tty": null})).unwrap();
+        assert!(spec.env.is_empty() && spec.user.is_empty() && !spec.tty);
+        assert!(spec_of(&Value::Null).unwrap().command.is_empty());
+        let spec = spec_of(&json!({"Cmd": ["ls", "-l"], "User": "1000", "Tty": true})).unwrap();
+        assert_eq!(
+            (spec.command, spec.user, spec.tty),
+            (vec!["ls".into(), "-l".into()], "1000".into(), true)
+        );
+    }
+}
