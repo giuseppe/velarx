@@ -14,9 +14,12 @@ trust of an image named by its digest.
   registry_images.py digest REGISTRY REPOSITORY TAG
       the digest of the manifest REPOSITORY:TAG.
   registry_images.py copy REGISTRY REPOSITORY TAG NEW-REPOSITORY NEW-TAG
-      the manifest REPOSITORY:TAG, with its blobs, as it is, in
-      NEW-REPOSITORY (an image of another writer, in a repository of the
-      test).  Prints its manifest digest.
+      the manifest REPOSITORY:TAG, with its blobs, in NEW-REPOSITORY (an
+      image of another writer, in a repository of the test): the digests of
+      EROFS images that its writer stated (a layer's
+      io.containers.composefs.digest, the composefs.merged.* of the manifest)
+      are taken off, as another writer states none.  Prints its manifest
+      digest.
   registry_images.py annotate REGISTRY REPOSITORY TAG NEW-TAG N [VALUE]
       a copy of the image REPOSITORY:TAG whose layer N (from 1) states VALUE
       as the digests of its EROFS image (io.containers.composefs.digest), or
@@ -69,8 +72,16 @@ def main(argv):
         for blob in [manifest["config"]] + manifest["layers"]:
             _, _, data = call("GET", f"{base}/v2/{repo}/blobs/{blob['digest']}")
             put_blob(base, dest, data)
-        put_manifest(base, dest, new_tag, body, media_type)
-        print(sha(body))
+        for layer in manifest["layers"]:
+            layer.get("annotations", {}).pop("io.containers.composefs.digest", None)
+            if not layer.get("annotations", True):
+                del layer["annotations"]
+        annotations = manifest.get("annotations", {})
+        for key in [k for k in annotations if k.startswith("composefs.merged.")]:
+            del annotations[key]
+        out = json.dumps(manifest, separators=(",", ":")).encode()
+        put_manifest(base, dest, new_tag, out, media_type)
+        print(sha(out))
         return
     if what == "annotate":
         new_tag, n = argv[4], int(argv[5])

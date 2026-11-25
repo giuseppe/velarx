@@ -86,7 +86,7 @@ EOT
     export X; X=$(reg index "$REG" "$NAME" zstd index) || e2e_die "index"
     # an index that lists the variant first, then the image, for one platform
     export X2; X2=$(reg index "$REG" "$NAME" variant index2 zstd) || e2e_die "index2"
-    # an image of another writer, copied as it is: no layer states a digest;
+    # an image of another writer, copied without the digests it states: no layer states one;
     # an index of it, and an index that lists it before the image above
     export U; U=$(reg copy "$REG" alpine chunked "$NAME" plain) || e2e_die "copy"
     export UX; UX=$(reg index "$REG" "$NAME" plain plainindex) || e2e_die "plain index"
