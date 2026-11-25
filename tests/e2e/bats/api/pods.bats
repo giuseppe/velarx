@@ -201,6 +201,15 @@ mkpod () {
     pm pod rm -t 0 -f unspod > /dev/null
 }
 
+@test "a member of a keep-id pod runs as the user of the host" {
+    if test "$(id -u)" = 0; then skip "keep-id is for rootless daemons"; fi
+    mkpod --name kidpod --userns keep-id > /dev/null
+    check "a member has the user of the host" "$(id -u):$(id -g)" \
+        "$(pm run --rm --pod kidpod "$IMG" sh -c 'echo $(id -u):$(id -g)')"
+    check "unless it names one" 0 "$(pm run --rm --pod kidpod --user 0 "$IMG" id -u)"
+    pm pod rm -t 0 -f kidpod > /dev/null
+}
+
 @test "velarx pod create with options" {
     sc () { timeout 60 "$CLI" --socket "$ESOCK" "$@"; }
     sc pod create --share +pid --sysctl net.ipv4.ip_unprivileged_port_start=82 \

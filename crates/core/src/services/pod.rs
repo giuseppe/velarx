@@ -73,6 +73,13 @@ impl InitKind {
     }
 }
 
+/// Whether a member of a pod with the user namespace `pod_userns` takes the
+/// user of the infra container: `keep-id` gives the infra the user of the
+/// host, and a member that names no user runs as it, not as the image's.
+fn keep_id_member_wants_user(pod_userns: &Option<UsernsChoice>, requested: &str) -> bool {
+    matches!(pod_userns, Some(UsernsChoice::KeepId(_))) && requested.is_empty()
+}
+
 /// Whether the container of `rec` is an init container of its pod, and what
 /// kind.
 pub fn init_kind(rec: &velarx_db::ContainerRecord) -> Option<InitKind> {
@@ -1387,6 +1394,16 @@ impl PodService {
                 ));
             }
             req.userns_mode = join;
+            if keep_id_member_wants_user(&pod.spec.userns, &req.user) {
+                let record = self
+                    .container_service
+                    .inspect(infra)
+                    .await
+                    .map_err(|e| PodError::Container(e.to_string()))?;
+                req.user = super::container::stored_config(&record)
+                    .map_err(|e| PodError::Container(e.to_string()))?
+                    .user;
+            }
         }
         if pod.spec.share_uts {
             // /etc/hostname says what the shared namespace has
@@ -1959,6 +1976,18 @@ mod tests {
             exit_code: None,
             removing: false,
         }
+    }
+
+    #[test]
+    fn a_member_of_a_keep_id_pod_takes_the_user_of_the_infra_unless_it_names_one() {
+        use super::keep_id_member_wants_user as wants;
+        use crate::services::UsernsChoice;
+        let keep = Some(UsernsChoice::KeepId(Some("uid=5".into())));
+        assert!(wants(&keep, ""));
+        assert!(wants(&Some(UsernsChoice::KeepId(None)), ""));
+        assert!(!wants(&keep, "0"));
+        assert!(!wants(&Some(UsernsChoice::Auto(None)), ""));
+        assert!(!wants(&None, ""));
     }
 
     #[test]
