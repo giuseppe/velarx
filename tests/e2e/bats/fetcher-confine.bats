@@ -227,8 +227,8 @@ descends () { # pid
     # the layers of a pull that is not completed in the background
     # (`lazy_completers = 0`) stay staged, and the service keeps the list of
     # fetchers they are fetched with, which the next tests look at; the first
-    # read of the container has the front ask the helper again)
-    : > "$WORKDIR/helper.log"
+    # read of the container is served by this front or a later one: the
+    # last line of helper.log is the runner of the front that is alive)
     "$BIN/velarx" --config "$WORKDIR/sh.toml" --socket "$SOCKDIR/sh.sock" container run -d --lazy --network none --name held "$sealed:zstd" sleep 600 > "$WORKDIR/run.log" 2>&1
     rc=$?
     [ $rc = 0 ] || sed "s/^/# /" "$WORKDIR/run.log"
@@ -272,8 +272,9 @@ descends () { # pid
     # the helper ran for the pull of the front, in a child of the front that no
     # seccomp filter and no Landlock domain confines
     check "the helper was asked for the registry" "$E2E_REGISTRY" "$(awk '{print $2}' "$WORKDIR/helper.log" 2> /dev/null | sort -u)"
-    # (the last one: the front the container's reads went to; an earlier
-    # one served the start and left with its connections)
+    # (the last one: the front the container's reads went to; an answer of
+    # the helper is kept for a few seconds, so a front that served the pull
+    # may not ask again for the reads)
     RUNNER=$(awk 'END {print $1}' "$WORKDIR/helper.log" 2> /dev/null)
     echo "FRONT=$FRONT" >> "$WORKDIR/vars"
     echo "RUNNER=$RUNNER" >> "$WORKDIR/vars"
