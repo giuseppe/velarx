@@ -1001,6 +1001,7 @@ impl ImageService {
             repository,
             *tls_verify,
             &given,
+            true,
         )?;
         let walker = self
             .staged_fetch((repository, None), *tls_verify, Some(&access), manifest)

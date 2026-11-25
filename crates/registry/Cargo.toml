@@ -31,6 +31,7 @@ net = ["engine", "velarx-types/http", "dep:velarx-addr-core", "dep:velarx-send-c
 
 [dependencies]
 velarx-addr-core = { path = "../addr-core", optional = true }
+velarx-auth-core = { path = "../auth-core" }
 velarx-base = { path = "../base" }
 velarx-endpoint-core = { path = "../endpoint-core" }
 velarx-platform-core = { path = "../platform-core", optional = true }

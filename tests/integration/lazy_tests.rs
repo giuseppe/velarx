@@ -1119,15 +1119,27 @@ fn test_the_stored_credentials_go_with_a_request_without_tls_verification() {
     .unwrap();
     let stored = velarx_registry::AuthConfig::load_file(&auth);
     let none = RegistryAccess::default();
-    // the stored credentials of the registry are added, and only its own
-    let access = with_stored(&stored, "strict.example/a/b", &none).unwrap();
+    let plain = velarx_registry::target::Resolver::with_config(
+        velarx_registry::target::TransportConfig {
+            registries: Default::default(),
+            certs_dirs: vec![],
+            tls_verify: true,
+        },
+        velarx_registry::AuthConfig::default(),
+    );
+    // the stored credentials of the registry are added, for the repository
+    // that is asked, and only its own
+    let access = with_stored(&stored, &plain, "strict.example/a/b", &none, true).unwrap();
     assert_eq!(
-        access.auths.get("strict.example"),
+        access.auths.get("strict.example/a/b"),
         Some(&Credentials::basic("u", "stored"))
     );
-    assert!(with_stored(&stored, "other.example/a/b", &none)
-        .unwrap()
-        .is_empty());
+    assert_eq!(access.auths.len(), 1);
+    assert!(
+        with_stored(&stored, &plain, "other.example/a/b", &none, true)
+            .unwrap()
+            .is_empty()
+    );
     // what the command brought for the registry comes first
     let brought = RegistryAccess {
         auths: [(
@@ -1137,11 +1149,13 @@ fn test_the_stored_credentials_go_with_a_request_without_tls_verification() {
         .into(),
         ..Default::default()
     };
-    let access = with_stored(&stored, "strict.example/a/b", &brought).unwrap();
-    assert_eq!(
-        access.auths.get("strict.example"),
-        Some(&Credentials::basic("me", "mine"))
-    );
+    let access = with_stored(&stored, &plain, "strict.example/a/b", &brought, true).unwrap();
+    for key in ["strict.example", "strict.example/a/b"] {
+        assert_eq!(
+            access.auths.get(key),
+            Some(&Credentials::basic("me", "mine"))
+        );
+    }
     // the other cases add nothing: verified, insecure, `--creds`
     let client = velarx_registry::target::Resolver::with_config(
         velarx_registry::target::TransportConfig {
@@ -1154,20 +1168,69 @@ fn test_the_stored_credentials_go_with_a_request_without_tls_verification() {
         },
         velarx_registry::AuthConfig::load_file(&auth),
     );
-    assert!(access_for(&client, "strict.example/a/b", true, &none)
+    assert!(access_for(&client, "strict.example/a/b", true, &none, true)
         .unwrap()
         .is_empty());
-    assert!(access_for(&client, "loose.example/a/b", false, &none)
+    assert!(access_for(&client, "loose.example/a/b", false, &none, true)
         .unwrap()
         .is_empty());
     let creds = RegistryAccess {
         creds: Some(Credentials::basic("me", "mine")),
         ..Default::default()
     };
-    assert!(access_for(&client, "strict.example/a/b", false, &creds)
-        .unwrap()
-        .auths
-        .is_empty());
+    assert!(
+        access_for(&client, "strict.example/a/b", false, &creds, true)
+            .unwrap()
+            .auths
+            .is_empty()
+    );
+}
+
+/// A credential stored for a namespace goes with the request for the
+/// repository that is asked, after the rewrite of registries.conf, and is
+/// not offered for another repository of the host in the same access (the
+/// repository a push mounts a blob from).
+#[test]
+fn test_a_stored_namespace_credential_goes_for_the_asked_repository_only() {
+    use velarx_content::pull::access::with_stored;
+    use velarx_registry::auth::RegistryAccess;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = dir.path().join("auth.json");
+    std::fs::write(
+        &auth,
+        r#"{"auths": {"real.example/ns": {"username": "u", "password": "ns"}}}"#,
+    )
+    .unwrap();
+    let stored = velarx_registry::AuthConfig::load_file(&auth);
+    let client = velarx_registry::target::Resolver::with_config(
+        velarx_registry::target::TransportConfig {
+            registries: velarx_registry::config::RegistriesConfig::parse(
+                "[[registry]]\nprefix = \"alias.example/x\"\nlocation = \"real.example/ns\"\n",
+            )
+            .unwrap(),
+            certs_dirs: vec![],
+            tls_verify: true,
+        },
+        velarx_registry::AuthConfig::default(),
+    );
+    for (name, asked) in [
+        ("real.example/ns/a", "real.example/ns/a"),
+        ("alias.example/x/a", "real.example/ns/a"),
+    ] {
+        let access = with_stored(&stored, &client, name, &RegistryAccess::default(), true).unwrap();
+        let offered = velarx_registry::AuthConfig::default().with_access(&access);
+        let (host, repository) = asked.split_once('/').unwrap();
+        assert!(
+            offered.lookup(host, repository).unwrap().is_some(),
+            "{name}"
+        );
+        for other in ["ns/b", "ns", "other", ""] {
+            assert!(
+                offered.lookup(host, other).unwrap().is_none(),
+                "{name} {other}"
+            );
+        }
+    }
 }
 
 /// A miss of a file that a fetch of a lower urgency (the completion's

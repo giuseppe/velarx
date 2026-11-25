@@ -320,6 +320,7 @@ impl ImageService {
                     &repository,
                     tls_verify,
                     access,
+                    false,
                 )?;
                 let access = (!access.is_empty())
                     .then(|| serde_json::to_vec(&access))

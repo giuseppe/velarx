@@ -211,8 +211,9 @@ impl Entry {
     }
 }
 
-/// An auth file as it is read.
-#[derive(Debug, Default, Deserialize)]
+/// An auth file as it is read.  Its `auths` are the secrets of the user:
+/// it is never printed.
+#[derive(Default, Deserialize)]
 struct FileContent {
     #[serde(default)]
     auths: std::collections::BTreeMap<String, serde_json::Value>,
@@ -222,11 +223,19 @@ struct FileContent {
     cred_helpers: std::collections::BTreeMap<String, String>,
 }
 
+/// A credential under its key: normalized, and as it was written.
+#[derive(Debug, Clone)]
+struct Keyed {
+    key: String,
+    written: String,
+    credentials: Credentials,
+}
+
 /// A parsed auth file: keys normalized.
 #[derive(Debug, Clone, Default)]
 struct AuthFile {
     path: PathBuf,
-    auths: Vec<(String, Credentials)>,
+    auths: Vec<Keyed>,
     /// (normalized registry, key as written, helper)
     helpers: Vec<(String, String, String)>,
     store: Option<String>,
@@ -252,7 +261,7 @@ pub struct AuthConfig {
     /// Credentials of the command line (`--creds`), for the endpoints on
     /// the host that was named.
     any: Option<Credentials>,
-    explicit: Vec<(String, Credentials)>,
+    explicit: Vec<Keyed>,
     files: Vec<AuthFile>,
     /// Why the files could not be loaded: every lookup fails with it.
     error: Option<String>,
@@ -265,50 +274,21 @@ pub struct AuthConfig {
 
 /// "index.docker.io", "registry-1.docker.io" -> "docker.io".
 fn normalize_registry(r: &str) -> &str {
-    match r {
-        "index.docker.io" | "registry-1.docker.io" => "docker.io",
-        r => r,
+    if velarx_auth_core::hub_alias(r.as_bytes()) {
+        "docker.io"
+    } else {
+        r
     }
 }
 
 /// A key of `auths`: no scheme and no trailing slash; a key with a scheme
 /// is in the legacy Docker form and its path is dropped
-/// (`https://index.docker.io/v1/` is `docker.io`).
+/// (`https://index.docker.io/v1/` is `docker.io`).  A key of another
+/// scheme, `s3://bucket`, is the key of a destination of a push transport:
+/// no registry name, its scheme and authority in lower case as
+/// `ImageLocation::credential_key` gives them, the rest as written.
 pub fn normalize_auth_key(key: &str) -> String {
-    // (a key of another scheme, `s3://bucket`, is the key of a destination
-    // of a push transport: no registry name, its scheme and authority in
-    // lower case as `ImageLocation::credential_key` gives them, the rest as
-    // written)
-    if let Some((scheme, rest)) = key.split_once("://") {
-        if !matches!(scheme, "https" | "http") {
-            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-            let (authority, tail) = rest.split_at(end);
-            return format!(
-                "{}://{}{tail}",
-                scheme.to_ascii_lowercase(),
-                authority.to_ascii_lowercase()
-            )
-            .trim_end_matches('/')
-            .to_string();
-        }
-    }
-    let (rest, had_scheme) = match key
-        .strip_prefix("https://")
-        .or_else(|| key.strip_prefix("http://"))
-    {
-        Some(r) => (r, true),
-        None => (key, false),
-    };
-    let rest = rest.trim_end_matches('/');
-    let rest = if had_scheme {
-        rest.split('/').next().unwrap_or(rest)
-    } else {
-        rest
-    };
-    match rest.split_once('/') {
-        Some((host, path)) => format!("{}/{path}", normalize_registry(host)),
-        None => normalize_registry(rest).to_string(),
-    }
+    String::from_utf8_lossy(&velarx_auth_core::normalize(key.as_bytes())).into_owned()
 }
 
 /// The value of an environment variable, if set and not empty.
@@ -401,7 +381,11 @@ impl AuthFile {
                 .credentials()
                 .map_err(|e| bad(format!("entry `{key}`: {e}")))?
             {
-                file.auths.push((normalize_auth_key(&key), c));
+                file.auths.push(Keyed {
+                    key: normalize_auth_key(&key),
+                    written: key,
+                    credentials: c,
+                });
             }
         }
         for (key, helper) in raw.cred_helpers {
@@ -410,11 +394,22 @@ impl AuthFile {
         Ok(file)
     }
 
+    /// The place of the `credHelpers` entry of `registry`.
+    fn helper_place(&self, registry: &str) -> Option<usize> {
+        let keys: Vec<Vec<u8>> = self
+            .helpers
+            .iter()
+            .map(|(r, _, _)| r.as_bytes().to_vec())
+            .collect();
+        velarx_auth_core::exact(&keys, registry.as_bytes())
+    }
+
     /// The helper that holds the credentials of `registry` (normalized)
     /// and the server name it is asked for: the `credHelpers` entry for it,
     /// else `credsStore`.
     pub(crate) fn helper_for(&self, registry: &str) -> Option<(String, String)> {
-        if let Some((_, key, helper)) = self.helpers.iter().find(|(r, _, _)| r == registry) {
+        if let Some(i) = self.helper_place(registry) {
+            let (_, key, helper) = &self.helpers[i];
             return Some((helper.clone(), key.clone()));
         }
         self.store.as_deref().map(|store| {
@@ -442,7 +437,7 @@ impl AuthFile {
                 None => run_credential_helper(&name, &server),
             })
         };
-        if self.helpers.iter().any(|(r, _, _)| r == registry) {
+        if self.helper_place(registry).is_some() {
             if let Some(h) = self.helper_for(registry) {
                 return ask(h).map(Some);
             }
@@ -485,24 +480,19 @@ pub(crate) fn helper_credentials(
 /// The credentials of the longest key that is `registry` or a namespace or
 /// repository of `registry/repository`.
 fn best_match<'a>(
-    entries: &'a [(String, Credentials)],
+    entries: &'a [Keyed],
     registry: &str,
     repository: &str,
 ) -> Option<&'a Credentials> {
-    let full = if repository.is_empty() {
-        registry.to_string()
-    } else {
-        format!("{registry}/{repository}")
-    };
-    entries
+    let keys: Vec<velarx_auth_core::Key> = entries
         .iter()
-        .filter(|(k, _)| {
-            full.strip_prefix(k.as_str())
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-                && (k == registry || k.starts_with(&format!("{registry}/")))
+        .map(|e| velarx_auth_core::Key {
+            kept: e.key.as_bytes().to_vec(),
+            written: e.written.as_bytes().to_vec(),
         })
-        .max_by_key(|(k, _)| k.len())
-        .map(|(_, c)| c)
+        .collect();
+    velarx_auth_core::pick(&keys, registry.as_bytes(), repository.as_bytes())
+        .map(|i| &entries[i].credentials)
 }
 
 /// What the auth files of the user are now (the inode, the time of the last
@@ -585,8 +575,12 @@ impl AuthConfig {
     /// prefix) before anything of the files.
     pub fn with_credentials(mut self, key: &str, c: Credentials) -> Self {
         let key = normalize_auth_key(key);
-        self.explicit.retain(|(k, _)| *k != key);
-        self.explicit.push((key, c));
+        self.explicit.retain(|e| e.key != key);
+        self.explicit.push(Keyed {
+            written: key.clone(),
+            key,
+            credentials: c,
+        });
         self
     }
 
@@ -680,8 +674,12 @@ impl AuthConfig {
         }
         let mut out = std::collections::BTreeMap::new();
         for f in self.files.iter().rev() {
-            for (k, c) in &f.auths {
-                out.insert(k.clone(), c.clone());
+            // of the keys that are one, the one written as it is kept goes
+            // last: it is the one a lookup takes
+            let mut entries: Vec<&Keyed> = f.auths.iter().collect();
+            entries.sort_by_key(|e| e.key == e.written);
+            for e in entries {
+                out.insert(e.key.clone(), e.credentials.clone());
             }
         }
         Ok(out)
@@ -1241,6 +1239,112 @@ mod tests {
         assert!(c.lookup("ghcr.io", "x").unwrap().is_none());
     }
 
+    /// What the keys of a file are for: the host of the key, nothing
+    /// that only looks like it, and the forms Docker and podman write.
+    #[test]
+    fn the_keys_of_a_file_are_for_the_host_they_name() {
+        let entry = |u: &str| format!(r#"{{"auth": "{}"}}"#, BASE64.encode(format!("{u}:x")));
+        let json = format!(
+            r#"{{"auths": {{
+                "r.test/": {},
+                "https://p.test:5000/v2/": {},
+                "http://q.test/": {},
+                "https://good@e.test/": {},
+                "r.test/ns/": {},
+                "docker.io": {},
+                "https://index.docker.io/v1/": {}
+            }}}}"#,
+            entry("a"),
+            entry("b"),
+            entry("c"),
+            entry("d"),
+            entry("e"),
+            entry("f"),
+            entry("g"),
+        );
+        let c = file(&json);
+        let who = |h: &str, r: &str| user(c.lookup(h, r).unwrap());
+        // a trailing slash and a scheme are not part of the key; the path
+        // after the host of a key with a scheme is dropped
+        assert_eq!(who("r.test", "x"), "a:x");
+        assert_eq!(who("p.test:5000", "x"), "b:x");
+        assert_eq!(who("p.test", "x"), "");
+        assert_eq!(who("q.test", "x"), "c:x");
+        // user information is part of the host the key names
+        assert_eq!(who("e.test", "x"), "");
+        assert_eq!(who("good", "x"), "");
+        assert_eq!(who("good@e.test", "x"), "d:x");
+        assert_eq!(who("r.test", "ns/x"), "e:x");
+        assert_eq!(who("r.test", "nsx/x"), "a:x");
+        assert_eq!(who("r.test.evil.org", "ns/x"), "");
+        // two keys of one name: the one written as it is kept
+        assert_eq!(who("docker.io", "library/a"), "f:x");
+        assert_eq!(who("index.docker.io", "library/a"), "f:x");
+    }
+
+    /// The `auth` value is split at its first colon; a password may have
+    /// more, a user none; what is not the base64 of UTF-8 refuses the file.
+    #[test]
+    fn the_auth_value_is_split_at_the_first_colon() {
+        let one = |decoded: &[u8]| {
+            AuthFile::parse(
+                Path::new("t"),
+                &format!(
+                    r#"{{"auths": {{"r.io": {{"auth": "{}"}}}}}}"#,
+                    BASE64.encode(decoded)
+                ),
+            )
+        };
+        let c = |f: AuthFile| AuthConfig {
+            files: vec![f],
+            ..Default::default()
+        };
+        assert_eq!(
+            user(c(one(b"u:p:q:").unwrap()).lookup("r.io", "x").unwrap()),
+            "u:p:q:"
+        );
+        assert_eq!(
+            user(c(one(b"u:").unwrap()).lookup("r.io", "x").unwrap()),
+            "u:"
+        );
+        // no user and no token: no credentials, not an empty user
+        assert!(c(one(b":pw").unwrap())
+            .lookup("r.io", "x")
+            .unwrap()
+            .is_none());
+        assert!(one(b"u\xff:p").is_err());
+        assert!(one(b"nocolon").is_err());
+        // a NUL or a line end in the password is bytes of the base64 of the
+        // `Basic` value, never a line of the request
+        let got = c(one(b"u:p\r\nX: y\0").unwrap())
+            .lookup("r.io", "x")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.password, "p\r\nX: y\0");
+        let b64 = BASE64.encode(format!("{}:{}", got.username, got.password));
+        assert!(b64
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')));
+    }
+
+    /// A `credHelpers` key is a host: the Hub under its names, nothing with
+    /// a path and no other host.
+    #[test]
+    fn a_helper_is_the_one_of_the_host_only() {
+        let f = AuthFile::parse(
+            Path::new("t"),
+            r#"{"credHelpers": {"r.test": "a", "https://index.docker.io/v1/": "h", "s.test/ns": "n", "t.test:5000": "t"}}"#,
+        )
+        .unwrap();
+        let named = |r: &str| f.helper_for(r).map(|(h, _)| h);
+        assert_eq!(named("r.test").as_deref(), Some("a"));
+        assert_eq!(named("docker.io").as_deref(), Some("h"));
+        assert_eq!(named("s.test"), None);
+        assert_eq!(named("r.test.evil.org"), None);
+        assert_eq!(named("t.test"), None);
+        assert_eq!(named("t.test:5000").as_deref(), Some("t"));
+    }
+
     #[test]
     fn test_tokens() {
         let c = file(
@@ -1319,6 +1423,38 @@ mod tests {
             normalize_auth_key("registry-1.docker.io/library"),
             "docker.io/library"
         );
+        // the scheme is a scheme in any case, and a key is normalized once
+        assert_eq!(normalize_auth_key("HTTPS://Host/v1/"), "Host");
+        assert_eq!(normalize_auth_key("Host"), "Host");
+    }
+
+    #[test]
+    fn of_the_names_of_the_hub_the_one_written_as_it_is_kept_wins() {
+        // sorted, `docker.io` is first and `index.docker.io` last
+        let c = file(&format!(
+            r#"{{"auths": {{
+                "docker.io": {{"auth": "{}"}},
+                "https://index.docker.io/v1/": {{"auth": "{}"}},
+                "index.docker.io": {{"auth": "{}"}}
+            }}}}"#,
+            BASE64.encode("exact:1"),
+            BASE64.encode("url:2"),
+            BASE64.encode("alias:3"),
+        ));
+        for host in ["docker.io", "index.docker.io", "registry-1.docker.io"] {
+            assert_eq!(user(c.lookup(host, "library/x").unwrap()), "exact:1");
+        }
+        assert_eq!(c.export().unwrap()["docker.io"].username, "exact");
+        // without it, the later of them
+        let c = file(&format!(
+            r#"{{"auths": {{
+                "https://index.docker.io/v1/": {{"auth": "{}"}},
+                "index.docker.io": {{"auth": "{}"}}
+            }}}}"#,
+            BASE64.encode("url:2"),
+            BASE64.encode("alias:3"),
+        ));
+        assert_eq!(user(c.lookup("docker.io", "x").unwrap()), "alias:3");
     }
 
     #[test]

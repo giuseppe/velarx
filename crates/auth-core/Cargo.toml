@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-auth-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Which key of an auth file is the credential of a registry request: the key, the host, the repository, as bytes"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on bytes and numbers: no dependency, no I/O.  The files
+# are read, the credentials decoded and the helpers run by the registry
+# package (`velarx-registry`, auth.rs).
+
+[lib]
+name = "velarx_auth_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

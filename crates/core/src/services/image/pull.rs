@@ -941,7 +941,7 @@ impl ImageService {
     ) -> ImageResult<velarx_content::pull::net::origin::OriginRemote> {
         let origin = self.origin()?;
         let access =
-            velarx_content::pull::access::access_for(client, repository, tls_verify, access)?;
+            velarx_content::pull::access::access_for(client, repository, tls_verify, access, true)?;
         velarx_content::pull::net::origin::OriginRemote::new(
             origin.clone(),
             repository,
@@ -963,7 +963,8 @@ impl ImageService {
     ) -> ImageResult<Net> {
         let origin = self.origin()?;
         let name = image_ref.full_name();
-        let access = velarx_content::pull::access::access_for(client, &name, tls_verify, access)?;
+        let access =
+            velarx_content::pull::access::access_for(client, &name, tls_verify, access, true)?;
         let access =
             velarx_content::fetcher::fetch_client::Access::new(&access).map_err(ImageError::Io)?;
         Ok(Net::Origin(
@@ -1318,6 +1319,7 @@ impl ImageService {
                 &image_ref.full_name(),
                 reach.tls_verify,
                 &access,
+                true,
             )?),
             recorded: Vec::new(),
         };
