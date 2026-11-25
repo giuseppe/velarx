@@ -107,6 +107,9 @@ async fn finish_create(
         .filter(|_| !secrets.is_empty())
         .map(|id| spec::secrets_dir(state, id));
     let asked = req.with_secrets_by_name(secrets_dir.as_deref());
+    if let Some(why) = req.namespace_conflict() {
+        return Err(ApiError::bad_request(why));
+    }
     let pod = state.pod_service.prepare_member(&mut req).await?;
     let mut warnings = Vec::new();
     if let Some(netns) = req

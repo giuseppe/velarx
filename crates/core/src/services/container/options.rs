@@ -126,12 +126,7 @@ pub(super) fn dns_conflict(req: &CreateContainerRequest) -> Option<&'static str>
         None
     } else if req.has_network_mode(&NetworkMode::Off) {
         Some("none")
-    } else if matches!(req.network_mode, NetworkMode::Container(_))
-        || req
-            .networks
-            .iter()
-            .any(|n| matches!(NetworkMode::parse(n), NetworkMode::Container(_)))
-    {
+    } else if req.joins_network_of_container() {
         Some("container")
     } else {
         None

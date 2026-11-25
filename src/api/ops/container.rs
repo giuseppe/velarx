@@ -118,6 +118,9 @@ pub(crate) async fn create(state: &AppState, mut req: CreateContainerRequest) ->
         .filter(|_| !used.is_empty())
         .map(|id| state.container_service.secrets_dir_of(id));
     let asked = req.with_secrets_by_name(secrets_dir.as_deref());
+    if let Some(why) = req.namespace_conflict() {
+        return Err(Error::bad_request(why));
+    }
     let pod = state
         .pod_service
         .prepare_member(&mut req)

@@ -44,6 +44,45 @@ impl CreateContainerRequest {
         NetworkMode::has(&self.networks, &self.network_mode, wanted)
     }
 
+    /// Whether the container is to share the network namespace of another
+    /// (`container:ID`; the members of a pod are made so).
+    pub fn joins_network_of_container(&self) -> bool {
+        matches!(self.network_mode, NetworkMode::Container(_))
+            || self
+                .networks
+                .iter()
+                .any(|n| matches!(NetworkMode::parse(n), NetworkMode::Container(_)))
+    }
+
+    /// What a container that is in no pod asks for and its namespaces do
+    /// not allow (the namespaces of a member of a pod are those of its infra
+    /// container, which the pod checks), to be asked of a request as it was
+    /// typed: extra hosts for the network namespace of another container, a
+    /// hostname in a UTS namespace that is not its own, a size of /dev/shm
+    /// for an IPC namespace that has none of its own.
+    pub fn namespace_conflict(&self) -> Option<String> {
+        if self.pod.as_deref().is_some_and(|p| !p.is_empty()) {
+            return None;
+        }
+        let invalid = |what: &str| format!("{what}: invalid configuration");
+        if !self.add_hosts.is_empty() && self.joins_network_of_container() {
+            Some(invalid(
+                "cannot set extra host entries when the container is joined to another containers network namespace",
+            ))
+        } else if !self.hostname.is_empty() && self.uts_mode.is_joined() {
+            Some(invalid(
+                "cannot set hostname when running in the host UTS namespace",
+            ))
+        } else if self.shm_size.is_some() && matches!(self.ipc_mode, NsMode::Host | NsMode::Off) {
+            Some(format!(
+                "cannot set shmsize when running in the {} IPC Namespace",
+                self.ipc_mode
+            ))
+        } else {
+            None
+        }
+    }
+
     /// The digests the command that made the request typed: those of its
     /// image and of the images mounted in it.  They are what an enforced
     /// start holds the images to.
@@ -1471,5 +1510,74 @@ mod volumes_from_tests {
             .unwrap_err()
             .contains(":z more than once"));
         assert!(args(&info, "ro,z").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    #[test]
+    fn options_need_the_namespace_they_act_in() {
+        let conflict = |f: &dyn Fn(&mut CreateContainerRequest)| {
+            let mut req = CreateContainerRequest::default();
+            f(&mut req);
+            req.namespace_conflict()
+        };
+        let uts = |mode: &str| {
+            conflict(&|r| {
+                r.hostname = "h".into();
+                r.uts_mode = NsMode::parse(mode).unwrap();
+            })
+        };
+        for mode in ["host", "container:x", "ns:/proc/1/ns/uts"] {
+            assert_eq!(
+                uts(mode).as_deref(),
+                Some("cannot set hostname when running in the host UTS namespace: invalid configuration"),
+                "{mode}"
+            );
+        }
+        assert_eq!(uts("private"), None);
+        assert_eq!(conflict(&|r| r.uts_mode = NsMode::Host), None);
+        for (mode, word) in [("host", "host"), ("none", "none")] {
+            let shm = conflict(&|r| {
+                r.shm_size = Some(1 << 20);
+                r.ipc_mode = NsMode::parse(mode).unwrap();
+            });
+            assert_eq!(
+                shm,
+                Some(format!(
+                    "cannot set shmsize when running in the {word} IPC Namespace"
+                ))
+            );
+        }
+        assert_eq!(conflict(&|r| r.shm_size = Some(1 << 20)), None);
+        let hosts = |mode: &str| {
+            conflict(&|r| {
+                r.add_hosts = vec!["a:1.2.3.4".into()];
+                r.network_mode = NetworkMode::parse(mode);
+            })
+        };
+        assert_eq!(
+            hosts("container:x").as_deref(),
+            Some("cannot set extra host entries when the container is joined to another containers network namespace: invalid configuration")
+        );
+        assert_eq!(hosts("host"), None);
+        // (no pod is named by an empty name)
+        assert!(conflict(&|r| {
+            r.pod = Some(String::new());
+            r.hostname = "h".into();
+            r.uts_mode = NsMode::Host;
+        })
+        .is_some());
+        // (a member of a pod: the pod checks)
+        assert_eq!(
+            conflict(&|r| {
+                r.pod = Some("p".into());
+                r.hostname = "h".into();
+                r.uts_mode = NsMode::Host;
+            }),
+            None
+        );
     }
 }

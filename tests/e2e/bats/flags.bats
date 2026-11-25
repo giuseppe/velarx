@@ -396,6 +396,24 @@ options ndots:3" "$(sc run --rm --pod pdns $IMG cat /etc/resolv.conf 2>&1)"
     sc volume remove ev2 ev3 > /dev/null
 }
 
+@test "a hostname, a shm size and extra hosts need the namespace they act in" {
+    sc run -d --name nsbase $IMG /bin/sleep 300 > /dev/null
+    out=$(sc create --hostname h --uts host $IMG true 2>&1)
+    check "--hostname with --uts host: exit code" 125 $?
+    check_match "--hostname with --uts host" "cannot set hostname when running in the host UTS namespace: invalid configuration" "$out"
+    out=$(sc create --hostname h --uts container:nsbase $IMG true 2>&1)
+    check_match "--hostname with --uts container:" "cannot set hostname when running in the host UTS namespace" "$out"
+    out=$(sc create --shm-size 10m --ipc host $IMG true 2>&1)
+    check_match "--shm-size with --ipc host" "cannot set shmsize when running in the host IPC Namespace" "$out"
+    out=$(sc create --shm-size 10m --ipc none $IMG true 2>&1)
+    check_match "--shm-size with --ipc none" "cannot set shmsize when running in the none IPC Namespace" "$out"
+    out=$(sc create --add-host a:1.2.3.4 --network container:nsbase $IMG true 2>&1)
+    check_match "--add-host with --network container:" "cannot set extra host entries when the container is joined to another containers network namespace" "$out"
+    sc create --name nsok --hostname h --shm-size 10m --add-host a:1.2.3.4 $IMG true > /dev/null
+    check "the same options in the namespaces of their own" 0 $?
+    sc container rm -t 0 -f nsbase nsok > /dev/null
+}
+
 @test "network create options" {
     sc network create -d host --label a=b --opt k=v --ipam-driver host-local en2 > /dev/null
     check "network create with --label --opt --ipam-driver" 0 $?
