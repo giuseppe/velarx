@@ -1190,6 +1190,17 @@ pub struct CreateVolume {
     pub container: Option<String>,
 }
 
+/// Move the directory `from` to `to`, which must not be there.
+fn move_into_place(from: &Path, to: &Path, name: &str) -> VolumeResult<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(|e| match e {
+        rustix::io::Errno::EXIST | rustix::io::Errno::NOTEMPTY => {
+            VolumeError::AlreadyExists(name.to_string())
+        }
+        e => io::Error::from(e).into(),
+    })
+}
+
 fn random_name() -> String {
     format!(
         "{}{}",
@@ -1461,46 +1472,33 @@ impl VolumeService {
                 "{name}: volume is currently mounted"
             )));
         }
-        match self.get(new_name).await {
-            Ok(_) => return Err(VolumeError::AlreadyExists(new_name.to_string())),
-            Err(VolumeError::NotFound(_)) => {}
-            Err(e) => return Err(e),
-        }
-        // the directory of the volume moves, with its `_data`
-        let old_dir = self.own_dir(&volume);
+        // The directory first: once it moved the volume is `new_name`,
+        // whatever the rows say, and one transaction replaces its row.  A
+        // crash before it leaves a volume directory no row names and a row
+        // no directory has, which the check completes.
+        let old_dir = self.volumes_dir.join(name);
         let new_dir = self.volumes_dir.join(new_name);
-        if let Some(old) = &old_dir {
-            if new_dir.exists() {
-                return Err(VolumeError::AlreadyExists(new_name.to_string()));
-            }
-            fs::rename(old, &new_dir)?;
-            volume.mountpoint = new_dir.join(VOLUME_DATA);
+        if new_dir.exists() {
+            return Err(VolumeError::AlreadyExists(new_name.to_string()));
         }
+        move_into_place(&old_dir, &new_dir, new_name)?;
         volume.name = new_name.to_string();
+        volume.mountpoint = new_dir.join(VOLUME_DATA);
         volume.state.anonymous = false;
-        let (from, to, path, state) = (
+        let (from, row) = (
             name.to_string(),
-            volume.name.clone(),
-            volume.mountpoint.to_string_lossy().to_string(),
-            serde_json::to_string(&volume.state).map_err(std::io::Error::from)?,
+            velarx_db::volumes::VolumeRow::from(&volume),
         );
-        let updated = self
+        let stored = self
             .db
             .conn()
-            .call(move |conn| {
-                conn.execute(
-                    "UPDATE volumes SET name = ?2, mountpoint = ?3, state = ?4 WHERE name = ?1",
-                    [&from, &to, &path, &state],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|e| VolumeError::Database(e.to_string()));
-        if let Err(e) = updated {
-            if let Some(old) = &old_dir {
-                let _ = fs::rename(&new_dir, old);
+            .call(move |conn| velarx_db::volumes::rename(conn, &from, &row))
+            .await;
+        if let Err(e) = stored {
+            if let Err(u) = move_into_place(&new_dir, &old_dir, name) {
+                warn!("rename volume {name}: move its directory back: {u}");
             }
-            return Err(e);
+            return Err(VolumeError::Database(e.to_string()));
         }
         info!("Renamed volume {} to {}", name, volume.name);
         Ok(volume)
@@ -1572,35 +1570,10 @@ impl VolumeService {
 
     /// Store a volume in the database
     async fn store_volume(&self, volume: &Volume) -> VolumeResult<()> {
-        let name = volume.name.clone();
-        let driver = serde_json::to_string(&volume.driver).unwrap_or_default();
-        let mountpoint = volume.mountpoint.to_string_lossy().to_string();
-        let labels = serde_json::to_string(&volume.labels).unwrap_or_default();
-        let options = serde_json::to_string(&volume.options).unwrap_or_default();
-        let created_at = volume.created_at.clone();
-        let scope = volume.scope.clone();
-        let state = serde_json::to_string(&volume.state).unwrap_or_default();
-
+        let row = velarx_db::volumes::VolumeRow::from(volume);
         self.db
             .conn()
-            .call(move |conn| {
-                conn.execute(
-                    "INSERT OR REPLACE INTO volumes
-                     (name, driver, mountpoint, labels, options, created_at, scope, state)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    [
-                        &name,
-                        &driver,
-                        &mountpoint,
-                        &labels,
-                        &options,
-                        &created_at,
-                        &scope,
-                        &state,
-                    ],
-                )?;
-                Ok(())
-            })
+            .call(move |conn| velarx_db::volumes::upsert(conn, &row))
             .await
             .map_err(|e| VolumeError::Database(e.to_string()))
     }
@@ -1756,6 +1729,24 @@ impl From<velarx_db::volumes::VolumeRow> for Volume {
                 .state
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default(),
+        }
+    }
+}
+
+impl From<&Volume> for velarx_db::volumes::VolumeRow {
+    fn from(volume: &Volume) -> Self {
+        fn json(v: &impl Serialize) -> String {
+            serde_json::to_string(v).unwrap_or_default()
+        }
+        Self {
+            name: volume.name.clone(),
+            driver: json(&volume.driver),
+            mountpoint: volume.mountpoint.to_string_lossy().to_string(),
+            labels: json(&volume.labels),
+            options: json(&volume.options),
+            created_at: volume.created_at.clone(),
+            scope: volume.scope.clone(),
+            state: Some(json(&volume.state)),
         }
     }
 }
@@ -2389,6 +2380,105 @@ mod tests {
         assert!(!svc.volume_path("c").exists());
     }
 
+    /// A rename that dies after the directory moved and before its row:
+    /// the directory has the new name, the row the old one, and the
+    /// directory is the volume.
+    #[tokio::test]
+    async fn a_rename_killed_before_its_row_leaves_the_new_directory() {
+        let (svc, _dir) = service().await;
+        let v = svc
+            .create("a", VolumeDriver::Local, HashMap::new(), HashMap::new())
+            .await
+            .unwrap();
+        fs::write(v.mountpoint.join("f"), "x").unwrap();
+        ignore(&svc, "DELETE").await;
+        ignore(&svc, "INSERT").await;
+        svc.rename("a", "c").await.unwrap();
+        assert_eq!(entries(&svc), ["c"]);
+        assert_eq!(
+            fs::read_to_string(svc.volume_path("c").join("_data/f")).unwrap(),
+            "x"
+        );
+        assert_eq!(svc.get("a").await.unwrap().mountpoint, v.mountpoint);
+        assert!(matches!(svc.get("c").await, Err(VolumeError::NotFound(_))));
+    }
+
+    /// A database that refuses the row gets the directory back.
+    #[tokio::test]
+    async fn a_rename_the_database_refuses_moves_the_directory_back() {
+        let (svc, _dir) = service().await;
+        let v = svc
+            .create("a", VolumeDriver::Local, HashMap::new(), HashMap::new())
+            .await
+            .unwrap();
+        fs::write(v.mountpoint.join("f"), "x").unwrap();
+        svc.db
+            .conn()
+            .call(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER refused BEFORE INSERT ON volumes \
+                     BEGIN SELECT RAISE(FAIL, 'refused'); END",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            svc.rename("a", "c").await,
+            Err(VolumeError::Database(_))
+        ));
+        assert_eq!(entries(&svc), ["a"]);
+        assert_eq!(fs::read_to_string(v.mountpoint.join("f")).unwrap(), "x");
+        assert_eq!(svc.get("a").await.unwrap().mountpoint, v.mountpoint);
+    }
+
+    /// A move that fails changes nothing: the row was not touched.
+    #[tokio::test]
+    async fn a_rename_whose_directory_is_gone_changes_nothing() {
+        let (svc, _dir) = service().await;
+        let v = svc
+            .create("a", VolumeDriver::Local, HashMap::new(), HashMap::new())
+            .await
+            .unwrap();
+        fs::remove_dir_all(svc.volume_path("a")).unwrap();
+        assert!(matches!(
+            svc.rename("a", "c").await,
+            Err(VolumeError::Io(_))
+        ));
+        assert_eq!(svc.get("a").await.unwrap().mountpoint, v.mountpoint);
+        assert!(matches!(svc.get("c").await, Err(VolumeError::NotFound(_))));
+        assert!(entries(&svc).is_empty());
+    }
+
+    /// A name a directory has is refused before anything moves, whether or
+    /// not a row names it.
+    #[tokio::test]
+    async fn a_rename_to_an_existing_directory_moves_nothing() {
+        let (svc, _dir) = service().await;
+        svc.create_with(CreateVolume {
+            name: Some("a".into()),
+            anonymous: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        fs::create_dir(svc.volume_path("c")).unwrap();
+        assert!(matches!(
+            svc.rename("a", "c").await,
+            Err(VolumeError::AlreadyExists(_))
+        ));
+        assert_eq!(entries(&svc), ["a", "c"]);
+        assert!(svc.get("a").await.unwrap().state.anonymous);
+        // a link is a name taken too, found by the move itself
+        std::os::unix::fs::symlink("nowhere", svc.volume_path("d")).unwrap();
+        assert!(matches!(
+            svc.rename("a", "d").await,
+            Err(VolumeError::AlreadyExists(_))
+        ));
+        assert_eq!(entries(&svc), ["a", "c", "d"]);
+        assert!(svc.get("a").await.unwrap().state.anonymous);
+    }
+
     #[tokio::test]
     async fn test_create_state_and_options() {
         let (svc, _dir) = service().await;
@@ -2479,6 +2569,31 @@ mod tests {
         svc.remove("data", false).await.unwrap();
         assert!(svc.get("data").await.is_err());
         assert!(!svc.volume_path("data").exists());
+    }
+
+    /// What is in the volumes directory, by name.
+    fn entries(svc: &VolumeService) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(svc.volumes_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Make the statements of `kind` (`INSERT`, `DELETE`) on the rows of
+    /// the volumes do nothing and say nothing: the process that dies
+    /// between the directory and the row, with no error to clean up.
+    async fn ignore(svc: &VolumeService, kind: &str) {
+        let sql = format!(
+            "CREATE TRIGGER ignored_{kind} BEFORE {kind} ON volumes \
+             BEGIN SELECT RAISE(IGNORE); END"
+        );
+        svc.db
+            .conn()
+            .call(move |conn| Ok(conn.execute_batch(&sql)?))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -71,3 +71,36 @@ pub fn delete(conn: &mut rusqlite::Connection, name: &str) -> Result<(), tokio_r
     conn.execute("DELETE FROM volumes WHERE name = ?1", [name])?;
     Ok(())
 }
+
+/// Write the row of a volume, replacing the one of its name.
+pub fn upsert(conn: &rusqlite::Connection, row: &VolumeRow) -> Result<(), tokio_rusqlite::Error> {
+    conn.execute(
+        &format!(
+            "INSERT OR REPLACE INTO volumes ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        ),
+        rusqlite::params![
+            row.name,
+            row.driver,
+            row.mountpoint,
+            row.labels,
+            row.options,
+            row.created_at,
+            row.scope,
+            row.state
+        ],
+    )?;
+    Ok(())
+}
+
+/// The volume `from` is now the volume `row`: one transaction, so a reader
+/// never sees both names or neither.
+pub fn rename(
+    conn: &mut rusqlite::Connection,
+    from: &str,
+    row: &VolumeRow,
+) -> Result<(), tokio_rusqlite::Error> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM volumes WHERE name = ?1", [from])?;
+    upsert(&tx, row)?;
+    Ok(tx.commit()?)
+}
