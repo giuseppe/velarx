@@ -626,6 +626,18 @@ struct Walk<'a> {
     path: Vec<OsString>,
 }
 
+/// Refuse a name that is not one component of a path: a layer may not have
+/// it, and nothing is made by it.
+pub(crate) fn check_name(name: &str) -> io::Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("`{name}` is not a name a layer may have"),
+        ));
+    }
+    Ok(())
+}
+
 impl Walk<'_> {
     fn shown(&self, name: &str) -> String {
         let mut p = String::from("/");
@@ -643,12 +655,7 @@ impl Walk<'_> {
             return Ok(Vec::new());
         };
         for name in n.children.keys() {
-            if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("`{name}` is not a name a layer may have"),
-                ));
-            }
+            check_name(name)?;
         }
         Ok(n.children.iter().map(|(k, &v)| (k.clone(), v)).collect())
     }

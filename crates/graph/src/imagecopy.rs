@@ -6,6 +6,7 @@
 //! The owners are what the file system of the container shows: the owner of
 //! the image translated by the user namespace.
 
+use crate::directory::check_name;
 use base64::Engine;
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, Timespec, Timestamps};
 use std::collections::HashMap;
@@ -413,6 +414,7 @@ impl Walk<'_> {
                 }
                 continue;
             };
+            check_name(&name)?;
             let Some(c) = self.src.tree.node(child) else {
                 continue;
             };
@@ -790,6 +792,59 @@ mod tests {
                 Ok(got) => assert!(right && got.unwrap() == data),
                 Err(e) => assert!(!right, "{e}"),
             }
+        }
+    }
+
+    /// A child that is not one path component is refused before anything is
+    /// made by its name.
+    #[test]
+    fn a_child_name_that_is_not_a_component_is_refused() {
+        use velarx_storage::TocEntryType::Dir;
+        struct Bad(&'static str);
+        impl ImageTree for Bad {
+            fn lookup(&self, _: usize, _: &str) -> Option<usize> {
+                None
+            }
+            fn children(&self, dir: usize) -> io::Result<Vec<(String, usize)>> {
+                Ok(if dir == 0 {
+                    vec![(self.0.into(), 1)]
+                } else {
+                    Vec::new()
+                })
+            }
+            fn node(&self, id: usize) -> Option<ViewNode> {
+                (id < 2).then(|| ViewNode {
+                    entry: TocEntry::new("./".to_string(), Dir),
+                    layer: 0,
+                    nlink: 1,
+                    key: (0, id as u64),
+                })
+            }
+            fn has_verity(&self) -> bool {
+                false
+            }
+        }
+        struct NoObjects;
+        impl ObjectOpener for NoObjects {
+            fn object_file(&self, _: &str, _: u64) -> io::Result<File> {
+                Err(io::ErrorKind::NotFound.into())
+            }
+        }
+        let translate = IdTranslate::default();
+        for name in ["..", ".", "", "a/b"] {
+            let tree = Bad(name);
+            let source = TreeSource {
+                tree: &tree,
+                layers: &[],
+                objects: &NoObjects,
+                verity: VerityMode::Off,
+                fetcher: None,
+                translate: &translate,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let dst = OwnedFd::from(File::open(dir.path()).unwrap());
+            let e = source.copy_into("/", &dst, None).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{name}: {e}");
         }
     }
 
