@@ -30,6 +30,7 @@ mod fetcher_tests;
 mod fuse_bench;
 mod fuzz_corpus;
 mod gc_tests;
+mod hold_tests;
 mod image_server_tests;
 mod integration_tests;
 mod lazy_tests;

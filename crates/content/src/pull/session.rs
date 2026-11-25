@@ -1728,6 +1728,32 @@ mod tests {
         assert!(p.exists());
     }
 
+    /// The directory of a session is never there before it is held: a look
+    /// at the staging directory (a check, a collection) while sessions are
+    /// made never finds one nobody holds.
+    #[test]
+    fn a_session_is_held_from_the_moment_it_is_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let store = Arc::new(FileStore::new(tmp.path().join("files")).unwrap());
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let looking = scope.spawn(|| {
+                let mut seen = Vec::new();
+                while !done.load(Ordering::Relaxed) {
+                    seen.extend(holds::stale(&staging).unwrap());
+                }
+                seen
+            });
+            for _ in 0..1000 {
+                drop(Session::create(&staging, store.clone()).unwrap());
+            }
+            done.store(true, Ordering::Relaxed);
+            assert_eq!(looking.join().unwrap(), Vec::<PathBuf>::new());
+        });
+    }
+
     /// A session is a hold: live while it is, and its name is the hold's.
     #[test]
     fn a_session_is_a_live_hold() {

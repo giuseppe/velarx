@@ -737,3 +737,60 @@ async fn the_leftover_of_a_publish_that_died_is_collected() {
     assert!(!dead.exists());
     assert_eq!(report.staging_removed, 1);
 }
+
+/// What the live holds pin is read or the collection stops: a `pins` that
+/// cannot be read, or a staging directory that cannot, removes nothing and
+/// the error is the collection's.
+#[tokio::test]
+async fn a_collection_that_cannot_read_what_is_pinned_removes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let e = env().await;
+    let l = layer("etc/p", &[2u8; 20_000]);
+    e.publish(&[&l], &[ZSTD]);
+    let pulled = e.pull().await.unwrap();
+    let file = vid(&[2u8; 20_000]);
+    // (stored, and no image uses it)
+    e.db.delete_image(&pulled.id).await.unwrap();
+    let hold = holds::Hold::create(&e.staging, "pull-00bb").unwrap();
+    hold.pin(holds::LAYER, [l.key()]).unwrap();
+
+    let pins = hold.path().join(holds::PINS);
+    std::fs::set_permissions(&pins, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(gc(&e).collect(GcOptions::default()).await.is_err());
+    assert!(e.db.get_layer(&l.key()).await.is_ok() && e.store.contains(&file));
+    std::fs::set_permissions(&pins, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    std::fs::set_permissions(&e.staging, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let report = gc(&e).collect(GcOptions::default()).await;
+    std::fs::set_permissions(&e.staging, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(report.is_err());
+    assert!(e.db.get_layer(&l.key()).await.is_ok() && e.store.contains(&file));
+
+    // (read again, it is pinned: and once the hold is gone, collected)
+    let report = gc(&e).collect(GcOptions::default()).await.unwrap();
+    assert_eq!(report.layers_removed, 0);
+    drop(hold);
+    let report = gc(&e).collect(GcOptions::default()).await.unwrap();
+    assert_eq!(report.layers_removed, 1);
+}
+
+/// A prune asks the holds again where it removes the image: a build that
+/// pinned it after the pass looked is respected.
+#[tokio::test]
+async fn a_prune_asks_the_holds_again_before_it_removes_an_image() {
+    let e = env().await;
+    let l = layer("etc/r", &[3u8; 20_000]);
+    e.publish(&[&l], &[ZSTD]);
+    let id = e.pull().await.unwrap().id;
+    let build = e.service.hold_build().unwrap();
+    // (nothing pinned when the pass looked; the build pins it now)
+    holds::pin(build.path(), holds::IMAGE, [&id]).unwrap();
+    assert!(e.service.remove_unless_pinned(&id).await.unwrap().is_none());
+    assert!(e.db.get_image(&id).await.is_ok());
+    drop(build);
+    assert!(e.service.remove_unless_pinned(&id).await.unwrap().is_some());
+    assert!(e.db.get_image(&id).await.is_err());
+}

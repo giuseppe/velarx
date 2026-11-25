@@ -2139,3 +2139,39 @@ pub fn build_canonical(items: &[Item]) -> Built {
         annotations: w.annotations.into_iter().collect(),
     }
 }
+
+/// A service on the store under `root` whose database is the file `db`: what
+/// another command of the same store makes (its own connection, its own
+/// fetcher), pulling from the registry at `host`; with that connection and
+/// the store.
+pub async fn service_on(
+    root: &std::path::Path,
+    db: &std::path::Path,
+    host: &str,
+) -> (ImageService, Database, Arc<FileStore>) {
+    let pull = PullConfig {
+        worker_path: Some(registry_bin().into()),
+        ..Default::default()
+    };
+    let db = Database::open(db).await.unwrap().with_layer_files(Arc::new(
+        velarx_db::layer_files::Directory(root.to_path_buf()),
+    ));
+    let store = Arc::new(FileStore::new(root.join("objects")).unwrap());
+    let origin = origin_with(
+        root,
+        &conf_for(&[host]),
+        (&pull, &velarx_config::PushConfig::default()),
+    );
+    let service = ImageService::new(
+        db.clone(),
+        store.clone(),
+        root.join("staging"),
+        velarx_storage::VerityMode::Off,
+    )
+    .unwrap()
+    .with_pull_config(pull)
+    .unwrap()
+    .with_resolver(client_for(&[host]))
+    .with_origin(origin);
+    (service, db, store)
+}
