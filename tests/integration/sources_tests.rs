@@ -268,10 +268,11 @@ async fn test_completing_a_lazy_image_from_a_source_leaves_the_objects_in_the_st
     let ranged = e.reg.ranged.load(Ordering::SeqCst);
     let stats = e.service.complete_image(&result.id).await.unwrap();
     assert!(stats.from("source0").0 > 0, "{stats:?}");
+    // (a source gives no tar-split: the registry is asked for that alone)
     assert_eq!(
         e.reg.ranged.load(Ordering::SeqCst),
-        ranged,
-        "the registry was not asked"
+        ranged + 1,
+        "the registry was asked only for the tar-split"
     );
     // Another process (a fetcher of its own) finds the objects without any fetch.
     let requests = e.reg.requests.load(Ordering::SeqCst);

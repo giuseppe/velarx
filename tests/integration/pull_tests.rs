@@ -833,26 +833,30 @@ async fn test_answers_that_bring_nothing_end_the_pull() {
     assert!(asked < 10, "{asked} range requests");
 }
 
-/// The TOC of a layer stored lazily is not fetched again by a pull.
+/// The TOC of a layer stored lazily is not fetched again by a pull (the
+/// tar-split, which the lazy pull did without, is).
 #[tokio::test]
 async fn test_the_metadata_of_a_lazy_layer_is_not_fetched_again() {
     let e = env().await;
     let layer = build_chunked(&sample());
     e.publish(&[&layer], &[ZSTD]);
     e.pull_lazy().await.unwrap();
-    let toc_at: usize = layer.annotations["io.github.containers.zstd-chunked.manifest-position"]
+    let position: Vec<usize> = layer.annotations
+        ["io.github.containers.zstd-chunked.manifest-position"]
         .split(':')
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
+        .map(|n| n.parse().unwrap())
+        .collect();
+    let toc = position[0]..position[0] + position[1];
     e.reg.range_log.lock().unwrap().clear();
     e.pull().await.unwrap();
     let rec = e.db.get_layer(&layer.key()).await.unwrap();
     assert_eq!(rec.status, "ready");
     for r in e.reg.range_log.lock().unwrap().iter() {
-        for (_, b) in parse_ranges(r, usize::MAX).unwrap() {
-            assert!(b < toc_at, "{r} reaches the TOC at {toc_at}");
+        for (a, b) in parse_ranges(r, usize::MAX).unwrap() {
+            assert!(
+                b < toc.start || a >= toc.end,
+                "{r} reaches the TOC at {toc:?}"
+            );
         }
     }
 }

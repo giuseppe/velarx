@@ -61,7 +61,8 @@ async fn test_lazy_pull_stages_metadata_and_fetches_files_on_demand() {
     let record = staged(&e, &layer_digest).record();
     assert_eq!(record.status, "lazy");
     assert_eq!(record.diff_id, None);
-    assert!(!staged(&e, &layer_digest).tarsplit().unwrap().is_empty());
+    // (the tar-split is the completion's)
+    assert!(staged(&e, &layer_digest).tarsplit().unwrap().is_empty());
     assert!(!e.store.contains(&vid(b"hello\n")));
 
     let toc = staged_toc(&staged(&e, &layer_digest));
@@ -495,7 +496,8 @@ async fn test_a_completion_that_is_interrupted_is_resumed_from_the_pool() {
     assert_eq!(linked(&e), ALL);
 }
 
-/// A complete pool commits without a request to the registry.
+/// A complete pool commits without a request for a file: the only request
+/// is for the tar-split, which the completion fetches.
 #[tokio::test]
 async fn test_a_complete_pool_is_committed_as_it_is() {
     let (e, layer_digest, _) = lazy_env().await;
@@ -504,7 +506,7 @@ async fn test_a_complete_pool_is_committed_as_it_is() {
     let before = lazy_requests(&e);
     let image_ref = format!("{}/test:latest", e.host);
     e.service.complete_image(&image_ref).await.unwrap();
-    assert_eq!(lazy_requests(&e), before, "nothing was fetched");
+    assert_eq!(lazy_requests(&e), before + 1, "only the tar-split");
     assert!(e.service.get(&result.id).await.is_ok());
     assert_eq!(e.db.get_layer(&layer_digest).await.unwrap().status, "ready");
     assert_eq!(linked(&e), ALL);
@@ -578,7 +580,7 @@ async fn test_a_pooled_file_the_link_refuses_leaves_the_image_pulling() {
             .contains("not the fs-verity digest it is known by"),
         "{err}"
     );
-    assert_eq!(lazy_requests(&e), before, "nothing was fetched");
+    assert_eq!(lazy_requests(&e), before + 1, "only the tar-split");
     assert!(e.service.get(&result.id).await.is_err());
     assert!(e.db.get_layer(&layer_digest).await.is_err());
     assert!(!e.store.contains(&vid(&data_of("usr/big"))));
