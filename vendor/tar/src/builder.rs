@@ -805,14 +805,32 @@ fn append_file(
         append_extended_sparse_headers(dst, &sparse_entries)?;
         for entry in sparse_entries.entries {
             file.seek(io::SeekFrom::Start(entry.offset))?;
-            io::copy(&mut file.take(entry.num_bytes), dst)?;
+            copy_exactly(file, entry.num_bytes, dst, path)?;
         }
         pad_zeroes(dst, sparse_entries.on_disk_size)?;
     } else {
-        let len = io::copy(file, dst)?;
-        pad_zeroes(dst, len)?;
+        copy_exactly(file, stat.len(), dst, path)?;
+        pad_zeroes(dst, stat.len())?;
     }
 
+    Ok(())
+}
+
+/// Copy `size` bytes of `file`, the size its header says: a file that
+/// grew since is cut there, one that shrank is an error, so the next
+/// header always follows the data.
+fn copy_exactly(
+    file: &mut fs::File,
+    size: u64,
+    dst: &mut dyn Write,
+    path: &Path,
+) -> io::Result<()> {
+    if io::copy(&mut file.take(size), dst)? != size {
+        return Err(io::Error::other(format!(
+            "`{}` changed while it was read",
+            path.display()
+        )));
+    }
     Ok(())
 }
 

@@ -891,6 +891,112 @@ mod tests {
         assert_eq!(error_status(&e.context("in context")), 2);
     }
 
+    /// A writer that changes `file` when the first header has been
+    /// written, so the file changes after its size was taken.
+    struct ChangesFile {
+        out: Vec<u8>,
+        file: std::path::PathBuf,
+        change: Option<fn(&std::path::Path)>,
+    }
+
+    impl std::io::Write for ChangesFile {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.out.extend_from_slice(buf);
+            if let Some(change) = self.change.take() {
+                change(&self.file);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn context_tar_of_changing_file(change: fn(&std::path::Path)) -> (anyhow::Result<()>, Vec<u8>) {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("f"), "abc").unwrap();
+        std::fs::write(d.path().join("g"), "next").unwrap();
+        let mut out = ChangesFile {
+            out: Vec::new(),
+            file: d.path().join("f"),
+            change: Some(change),
+        };
+        let r = context_tar(d.path(), None, Vec::new(), &[], &[], &mut out);
+        (r, out.out)
+    }
+
+    #[test]
+    fn test_context_tar_cuts_a_file_that_grew_at_its_size() {
+        let (r, out) = context_tar_of_changing_file(|f| {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(f).unwrap();
+            f.write_all(&[b'x'; 600]).unwrap();
+        });
+        r.unwrap();
+        let mut files = std::collections::BTreeMap::new();
+        for e in tar::Archive::new(&out[..]).entries().unwrap() {
+            let mut e = e.unwrap();
+            let mut data = String::new();
+            std::io::Read::read_to_string(&mut e, &mut data).unwrap();
+            files.insert(e.path().unwrap().to_string_lossy().into_owned(), data);
+        }
+        assert_eq!(files["f"], "abc");
+        assert_eq!(files["g"], "next");
+    }
+
+    #[test]
+    fn test_context_tar_refuses_a_file_that_shrank() {
+        let (r, _) = context_tar_of_changing_file(|f| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_len(1)
+                .unwrap();
+        });
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("changed while it was read"), "{e}");
+    }
+
+    /// The pieces of a file with holes are copied as long as its map
+    /// says too: one that shrank is the same error.
+    #[test]
+    fn test_context_tar_refuses_a_file_with_holes_that_shrank() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("f");
+        {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::File::create(&f).unwrap();
+            file.write_all_at(b"abc", 0).unwrap();
+            file.write_all_at(b"end", 1 << 20).unwrap();
+        }
+        let mut out = Vec::new();
+        context_tar(d.path(), None, Vec::new(), &[], &[], &mut out).unwrap();
+        let mut entries = tar::Archive::new(&out[..]);
+        let e = entries.entries().unwrap().next().unwrap().unwrap();
+        if e.header().entry_type() != tar::EntryType::GNUSparse {
+            eprintln!("no holes in this file system: skipped");
+            return;
+        }
+        let mut out = ChangesFile {
+            out: Vec::new(),
+            file: f,
+            change: Some(|f| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(f)
+                    .unwrap()
+                    .set_len(1 << 19)
+                    .unwrap();
+            }),
+        };
+        let e = context_tar(d.path(), None, Vec::new(), &[], &[], &mut out)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`f` changed while it was read"), "{e}");
+    }
+
     #[test]
     fn test_context_tar_leaves_out_what_is_ignored() {
         let d = tempfile::tempdir().unwrap();
