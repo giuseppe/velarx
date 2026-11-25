@@ -63,6 +63,7 @@ zstd = { workspace = true, optional = true }
 # without the feature)
 futures.workspace = true
 velarx-registry = { path = "../registry" }
+velarx-registry-lib = { path = "../registry-lib" }
 zstd.workspace = true
 
 [lints]
