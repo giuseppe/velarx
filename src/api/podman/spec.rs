@@ -1905,21 +1905,8 @@ pub async fn from_docker(
         req.resources = Some(limits);
     }
 
-    let userns = s(host, "UsernsMode");
-    match userns {
-        "" | "host" => {}
-        "auto" => req.userns_mode = UsernsChoice::Auto(None),
-        "private" => req.userns_mode = UsernsChoice::Private,
-        u if u.starts_with("container:") => {
-            req.userns_mode =
-                UsernsChoice::parse(u).map_err(|e| ApiError::bad_request(e.to_string()))?
-        }
-        u => {
-            return Err(ApiError::not_implemented(format!(
-                "the user namespace mode `{u}` is not supported"
-            )))
-        }
-    }
+    req.userns_mode = UsernsChoice::parse(s(host, "UsernsMode"))
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
     for (key, field) in [
         ("IpcMode", &mut req.ipc_mode),
         ("PidMode", &mut req.pid_mode),

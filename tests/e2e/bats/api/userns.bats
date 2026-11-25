@@ -44,3 +44,28 @@ setup () { api_setup; }
         "$(pm inspect unspath --format '{{.HostConfig.UsernsMode}}' 2>&1)"
     pm rm -f -t 0 unspath > /dev/null 2>&1
 }
+
+@test "compat create: HostConfig.UsernsMode takes the forms of --userns" {
+    if [ "$(id -u)" = 0 ]; then
+        skip "keep-id and nomap are for rootless containers"
+    fi
+    for mode in keep-id keep-id:uid=2000,gid=2000 nomap auto:size=2000 ns:/proc/$$/ns/user; do
+        name=cu-${mode//[^a-z0-9]/}
+        code=$(api -o "$WORKDIR/compat.out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+            -d '{"Image":"'"$IMG"'","Cmd":["true"],"HostConfig":{"UsernsMode":"'"$mode"'"}}' \
+            "http://d/v1.41/containers/create?name=$name")
+        check "compat create with UsernsMode $mode" "201 $mode" \
+            "$code $(pm inspect "$name" --format '{{.HostConfig.UsernsMode}}' 2>&1)"
+        pm rm -f -t 0 "$name" > /dev/null 2>&1
+    done
+    code=$(api -o "$WORKDIR/compat.out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+        -d '{"Image":"'"$IMG"'","Cmd":["true"],"HostConfig":{"UsernsMode":"bogus"}}' \
+        http://d/v1.41/containers/create)
+    check "an invalid UsernsMode is a bad request" 400 "$code"
+    id=$(api -X POST -H 'Content-Type: application/json' \
+        -d '{"Image":"'"$IMG"'","Cmd":["cat","/proc/self/uid_map"],"HostConfig":{"UsernsMode":"keep-id"}}' \
+        http://d/v1.41/containers/create | jq -r .Id)
+    check "keep-id maps the user of the daemon" "$(id -u) 0" \
+        "$(pm start -a "$id" 2>&1 | awk 'NR==2 {print $1, $2}')"
+    pm rm -f -t 0 "$id" > /dev/null 2>&1
+}
