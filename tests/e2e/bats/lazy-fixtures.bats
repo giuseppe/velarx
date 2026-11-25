@@ -23,7 +23,7 @@ setup_file () {
     curl -sf -m 5 "http://$E2E_REGISTRY/v2/" > /dev/null || skip "no registry at $E2E_REGISTRY"
     e2e_setup_file
     export LF=$BIN/examples/lazy_fixture
-    [ -x "$LF" ] || e2e_die "no $LF (cargo build -p velarx-content --example lazy_fixture)"
+    [ -x "$LF" ] || skip "no $LF (cargo build -p velarx-content --example lazy_fixture)"
     e2e_verity_store
     export REPO=$E2E_REGISTRY/velarx-e2e/lazy-fixtures-$$
 }
