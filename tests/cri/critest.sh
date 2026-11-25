@@ -105,6 +105,8 @@ TOML
 # conmon's, which runs at the level s0): the pipes of the output of a container
 # are the monitor's, and a container (`container_t` of its own categories) may
 # open them again (`/dev/stderr`, as nginx does) only when they are of the level s0.
+# The helpers the engine starts next to itself (`velarx-registry`, `velarx-dir`) come
+# along, so that no installed copy is picked up from the PATH.
 serve () {
     local bin=$1 w=$2
     mkdir -p "$w/run" "$w/data" "$w/etc"
@@ -112,9 +114,11 @@ serve () {
     if command -v selinuxenabled > /dev/null && selinuxenabled; then
         BIN=$w/bin
         mkdir -p "$BIN"
-        cp "$bin/velarx" "$bin/velarx-monitor" "$bin/velarx-cri" "$BIN/"
+        cp "$bin/velarx" "$bin/velarx-monitor" "$bin/velarx-cri" \
+            "$bin/velarx-registry" "$bin/velarx-dir" "$BIN/" || return 1
         chcon -t container_runtime_exec_t "$BIN/velarx" "$BIN/velarx-cri" &&
-            chcon -t conmon_exec_t "$BIN/velarx-monitor" || return 1
+            chcon -t conmon_exec_t "$BIN/velarx-monitor" &&
+            chcon -t bin_t "$BIN/velarx-registry" "$BIN/velarx-dir" || return 1
     fi
     cat > "$w/etc/config.toml" <<TOML
 storage.root = "$w/data"
