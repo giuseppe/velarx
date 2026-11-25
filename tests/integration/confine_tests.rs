@@ -368,6 +368,10 @@ fn run_self_test(
     use std::os::fd::OwnedFd;
     let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     let theirs: OwnedFd = theirs.into();
+    // (the channel on which it would ask for names, which it does not use)
+    let (names, theirs_names) = std::os::unix::net::UnixStream::pair().unwrap();
+    let theirs_names: OwnedFd = theirs_names.into();
+    velarx_sys::spawn::pass_as_fd3(&mut cmd, std::os::fd::AsRawFd::as_raw_fd(&theirs_names));
     let mut child = cmd
         .env_clear()
         .envs(env.iter().copied())
@@ -378,9 +382,11 @@ fn run_self_test(
         .unwrap();
     // (the socket of the worker is held by the command until it is dropped)
     drop(cmd);
+    drop(theirs_names);
     let mut reply = Vec::new();
     (&mine).read_to_end(&mut reply).unwrap();
     let ok = child.wait().unwrap().success();
+    drop(names);
     let text = String::from_utf8_lossy(reply.get(24..).unwrap_or_default()).into_owned();
     // A reply frame: kind, three zero bytes, the lengths, the JSON.
     let results = if reply.first() == Some(&3) {
@@ -446,12 +452,12 @@ fn test_a_worker_without_a_user_namespace() {
 }
 
 /// A worker that cannot confine itself tells the daemon why on its socket,
-/// whichever descriptors it was started with (here one on descriptor 3,
+/// whichever descriptors it was started with (here one on descriptor 4,
 /// which the socket cannot take then).
 #[test]
-fn test_a_worker_that_cannot_confine_itself_says_why_with_a_descriptor_on_3() {
+fn test_a_worker_that_cannot_confine_itself_says_why_with_a_descriptor_on_4() {
     let cmd = where_no_user_namespace_is_left(
-        "exec \"$0\" pull-worker --self-test --require-userns 3</dev/null",
+        "exec \"$0\" pull-worker --self-test --require-userns 4</dev/null",
     );
     let (ok, _, text) = run_self_test(cmd, &[]);
     assert!(!ok);
@@ -535,6 +541,56 @@ async fn test_urls_through_a_confined_worker() {
         .await
         .unwrap_err();
     assert!(e.to_string().contains("scheme"), "{e}");
+}
+
+/// Resolves one name, to this machine, as a host with a source of names the
+/// worker cannot use would.
+struct OneName(&'static str);
+
+impl velarx_registry::netpolicy::Resolver for OneName {
+    fn lookup<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> futures::future::BoxFuture<'a, std::io::Result<Vec<std::net::SocketAddr>>> {
+        Box::pin(async move {
+            if host == self.0 {
+                Ok(vec![std::net::SocketAddr::new([127, 0, 0, 1].into(), port)])
+            } else {
+                Err(std::io::Error::other("no such host"))
+            }
+        })
+    }
+}
+
+/// A worker that has no source of names of its own gets the addresses it
+/// asks for from whoever started it: a name only the resolver it was
+/// given knows is connected to, and one it does not know is not.
+#[tokio::test]
+async fn test_a_worker_gets_its_names_from_the_resolver_of_its_front() {
+    use velarx_registry_lib::net::url::Fetcher;
+    let ok = http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello");
+    let f = Fetcher::new(spawner(), &Default::default())
+        .with_names(std::sync::Arc::new(OneName("only-the-front-knows.example")));
+    let mut got = Vec::new();
+    f.fetch(
+        &format!("http://only-the-front-knows.example:{ok}/f"),
+        100,
+        &mut |b| {
+            got.extend_from_slice(b);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, b"hello");
+    let e = f
+        .fetch(&format!("http://nobody.example:{ok}/f"), 100, &mut |_| {
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("nobody.example"), "{e}");
 }
 
 /// The URLs of the engine (an import, an ADD, a remote context) are read by
@@ -835,7 +891,10 @@ fn test_a_kernel_that_refuses_user_namespaces() {
     );
     let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     let theirs: OwnedFd = theirs.into();
-    let Ok(mut child) = std::process::Command::new("unshare")
+    let (_names, theirs_names) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut cmd = std::process::Command::new("unshare");
+    velarx_sys::spawn::pass_as_fd3(&mut cmd, std::os::fd::AsRawFd::as_raw_fd(&theirs_names));
+    let Ok(mut child) = cmd
         .args(["-r", "sh", "-c", &script])
         .stdin(std::process::Stdio::from(theirs))
         .stdout(std::process::Stdio::null())
@@ -845,6 +904,8 @@ fn test_a_kernel_that_refuses_user_namespaces() {
         eprintln!("skipped: no unshare");
         return;
     };
+    // (the socket of the worker is held by the command until it is dropped)
+    drop(cmd);
     let mut reply = Vec::new();
     (&mine).read_to_end(&mut reply).unwrap();
     if !child.wait().unwrap().success() && reply.is_empty() {

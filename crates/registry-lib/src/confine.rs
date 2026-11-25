@@ -111,6 +111,7 @@ pub fn reach(
 fn worker_self_test(spawner: &std::sync::Arc<Spawner>) -> Result<Vec<(String, bool)>, String> {
     use std::io::Read;
     let (mut mine, theirs) = std::os::unix::net::UnixStream::pair().map_err(|e| e.to_string())?;
+    let (_names, names) = std::os::unix::net::UnixStream::pair().map_err(|e| e.to_string())?;
     let args = ["pull-worker", "--self-test", "--connect-port", "443"]
         .map(String::from)
         .to_vec();
@@ -124,6 +125,7 @@ fn worker_self_test(spawner: &std::sync::Arc<Spawner>) -> Result<Vec<(String, bo
             args,
             Vec::new(),
             theirs.into(),
+            names.into(),
         ))
         .map_err(|e| format!("cannot start a worker: {e}"))?;
     let mut reply = Vec::new();

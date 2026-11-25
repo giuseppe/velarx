@@ -131,12 +131,26 @@ fn seccomp_programs(pid: u32) -> Result<Vec<BpfProgram>, String> {
     net_client(Allow::runtime(pid)?).programs()
 }
 
-/// Move the socket of the daemon (the standard input) to descriptor 3,
-/// point the standard streams to `/dev/null` and close everything else.  A
-/// failure leaves the socket as the standard input, where the daemon is
-/// told why.
-pub(crate) fn descriptors(startup: &velarx_sys::fd::Startup) -> Result<OwnedFd, String> {
-    let ipc = rustix::io::fcntl_dupfd_cloexec(rustix::stdio::stdin(), 3)
+/// The descriptor of the channel on which the worker asks for names (the
+/// third the daemon passes, after the standard streams).
+pub const NAMES_FD: i32 = 3;
+
+/// The descriptors of a worker: the socket of the daemon and the channel of
+/// the names.
+pub struct Sockets {
+    pub daemon: OwnedFd,
+    pub names: OwnedFd,
+}
+
+/// Move the socket of the daemon (the standard input) to descriptor 4 or
+/// above, keep the channel of the names on [`NAMES_FD`], point the standard
+/// streams to `/dev/null` and close everything else.  A failure leaves the
+/// socket as the standard input, where the daemon is told why.
+pub(crate) fn descriptors(startup: &velarx_sys::fd::Startup) -> Result<Sockets, String> {
+    let names = startup
+        .adopt(NAMES_FD)
+        .ok_or("the channel of the names (descriptor 3) is not open")?;
+    let ipc = rustix::io::fcntl_dupfd_cloexec(rustix::stdio::stdin(), NAMES_FD + 1)
         .map_err(|e| format!("duplicate the socket: {e}"))?;
     let null = rustix::fs::open(
         "/dev/null",
@@ -155,13 +169,13 @@ pub(crate) fn descriptors(startup: &velarx_sys::fd::Startup) -> Result<OwnedFd, 
         return Err(format!("redirect the standard streams: {e}"));
     }
     drop(null);
-    // Everything above the socket, and the temporary descriptors.
+    // Everything above the sockets, and the temporary descriptors.
     let keep = ipc.as_raw_fd();
-    if keep > 3 {
-        startup.close_range(3, keep as u32 - 1);
+    if keep > NAMES_FD + 1 {
+        startup.close_range(NAMES_FD as u32 + 1, keep as u32 - 1);
     }
     startup.close_from(keep as u32 + 1);
-    Ok(ipc)
+    Ok(Sockets { daemon: ipc, names })
 }
 
 /// The calls the kernel needs the process to make on itself.
@@ -388,12 +402,13 @@ pub fn enter(
     startup: &velarx_sys::fd::Startup,
     require_userns: bool,
     ports: &[u16],
-) -> Result<OwnedFd, String> {
-    let ipc = descriptors(startup)?;
+) -> Result<Sockets, String> {
+    let sockets = descriptors(startup)?;
+    let ipc = sockets.daemon.as_fd();
     let confined = || -> Result<(), String> {
         user_namespace(require_userns, true)?;
         process_limits()?;
-        ensure_daemon_present(ipc.as_fd())?;
+        ensure_daemon_present(ipc)?;
         drop_privileges()?;
         // (the user namespace is the worker's: what it says of the ids
         // stays)
@@ -404,16 +419,16 @@ pub fn enter(
     };
     if let Err(e) = confined() {
         // The socket stays open for the daemon to be told why, as the
-        // standard input again (it is not on descriptor 3 when a
+        // standard input again (it is not on descriptor 3 or 4 when a
         // descriptor of the parent that is not close-on-exec was there:
         // the standard input is /dev/null now, and the message would be
         // written to it).
-        let _ = rustix::stdio::dup2_stdin(&ipc);
-        std::mem::forget(ipc);
+        let _ = rustix::stdio::dup2_stdin(ipc);
+        std::mem::forget(sockets);
         return Err(e);
     }
-    debug_assert!(ipc.as_raw_fd() >= 3);
-    Ok(ipc)
+    debug_assert!(sockets.daemon.as_raw_fd() > NAMES_FD);
+    Ok(sockets)
 }
 
 /// Try what the sandbox forbids, and what it allows: `(what, as it should

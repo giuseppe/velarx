@@ -23,6 +23,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 use velarx_content::pull::net::origin::{UrlError, UrlTrailer};
 use velarx_content::pull::ranges::{Piece, RangesError};
+use velarx_registry::netpolicy::Resolver;
 use velarx_registry::target::EndpointSpec;
 use velarx_sys::spawner::Spawner;
 use velarx_types::digest::{Algorithm, Digest};
@@ -107,12 +108,14 @@ impl Worker {
 }
 
 /// Start a worker with `args` and the variables `env`, its standard input
-/// `stdin`, its standard output and error one pipe the front reads.
+/// `stdin`, its standard output and error one pipe the front reads, and
+/// `names`, the channel on which it asks for names, as the descriptor 3.
 pub async fn start_worker(
     spawner: &Arc<Spawner>,
     args: Vec<String>,
     env: Vec<(String, String)>,
     stdin: std::os::fd::OwnedFd,
+    names: std::os::fd::OwnedFd,
 ) -> std::io::Result<Worker> {
     let spawner = spawner.clone();
     let (pipe_read, pipe_write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
@@ -122,7 +125,12 @@ pub async fn start_worker(
             0,
             &args,
             &env,
-            &[stdin.as_fd(), pipe_write.as_fd(), pipe_write.as_fd()],
+            &[
+                stdin.as_fd(),
+                pipe_write.as_fd(),
+                pipe_write.as_fd(),
+                names.as_fd(),
+            ],
         )
     })
     .await
@@ -178,6 +186,9 @@ pub struct Pool {
     /// Whether the workers must have a user namespace (`[pull]
     /// require_userns`)
     require_userns: std::sync::atomic::AtomicBool,
+    /// What resolves the names the workers ask for (this process' own
+    /// resolver if none was given)
+    names: std::sync::OnceLock<Arc<dyn Resolver>>,
 }
 
 /// The port of DNS: the resolver of the C library asks again over TCP when
@@ -390,7 +401,18 @@ impl Pool {
             cdn_told: Mutex::default(),
             schemes: Mutex::default(),
             require_userns: std::sync::atomic::AtomicBool::new(false),
+            names: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Resolve the names the workers of this pool, and of the pools that hold
+    /// the credentials for it, ask for with `names` (a process that cannot
+    /// resolve them itself has another do it).
+    pub fn use_names(&self, names: Arc<dyn Resolver>) {
+        let _ = self.names.set(names.clone());
+        for pool in self.auth.iter().flatten() {
+            pool.use_names(names.clone());
+        }
     }
 
     /// Keep what the workers find out about the registries in `store`.
@@ -448,6 +470,22 @@ impl Pool {
         let (mine, theirs) = std::os::unix::net::UnixStream::pair().map_err(lost)?;
         mine.set_nonblocking(true).map_err(lost)?;
         let theirs: OwnedFd = theirs.into();
+        // (the names the worker asks for are resolved here, for as long as
+        // it holds its end)
+        let (names, names_theirs) = std::os::unix::net::UnixStream::pair().map_err(lost)?;
+        names.set_nonblocking(true).map_err(lost)?;
+        let names = UnixStream::from_std(names).map_err(lost)?;
+        let resolver = self
+            .names
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(super::runner::System));
+        tokio::spawn(async move {
+            let served = super::resolve::serve(names, resolver, super::resolve::MAX_IN_FLIGHT);
+            if let Err(e) = served.await {
+                debug!("The names of a pull worker are no longer resolved: {e}");
+            }
+        });
         if let Some(c) = self.confinement.get() {
             c.check().await.map_err(worker_failed)?;
         }
@@ -470,7 +508,7 @@ impl Pool {
                 Some(((*name).to_string(), value))
             })
             .collect();
-        let mut worker = start_worker(&self.spawner, args, env, theirs)
+        let mut worker = start_worker(&self.spawner, args, env, theirs, names_theirs.into())
             .await
             .map_err(|e| worker_failed(e.to_string()))?;
         let stderr_tail = Arc::new(Mutex::new(Vec::new()));
@@ -713,6 +751,7 @@ impl Pool {
             cdn_told: Mutex::default(),
             schemes: Mutex::default(),
             require_userns: std::sync::atomic::AtomicBool::new(false),
+            names: std::sync::OnceLock::new(),
         })
     }
 

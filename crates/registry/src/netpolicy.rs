@@ -76,6 +76,19 @@ pub(crate) async fn lookup(host: &str, port: u16) -> std::io::Result<Vec<SocketA
     })
 }
 
+/// The resolver of a client that has no policy to apply to the names it
+/// connects to (a download of a URL): [`lookup`], the process' own resolver.
+pub struct Names;
+
+impl reqwest::dns::Resolve for Names {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let addrs = lookup(name.as_str(), 0).await?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 /// The resolver could not give the addresses of `name`.  Typed, so
 /// that whoever reports a failed connection can tell it from the others.
 #[derive(Debug)]

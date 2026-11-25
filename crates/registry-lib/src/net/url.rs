@@ -43,6 +43,8 @@ pub(super) async fn get(url: &str) -> Result<(reqwest::Response, Option<String>)
         return Err(format!("unsupported URL scheme `{}`", parsed.scheme()).into());
     }
     let client = reqwest::Client::builder()
+        // (a worker resolves no name itself)
+        .dns_resolver(Arc::new(velarx_registry::netpolicy::Names))
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .redirect(reqwest::redirect::Policy::limited(10))
@@ -74,6 +76,8 @@ pub struct Fetcher {
     config: Arc<velarx_config::PullConfig>,
     /// The least a download must bring (`[pull] min_speed_kib`)
     min_speed: velarx_registry::speed::Speed,
+    /// What resolves the names its workers ask for, if not this process
+    names: Option<Arc<dyn velarx_registry::netpolicy::Resolver>>,
 }
 
 impl Fetcher {
@@ -88,6 +92,7 @@ impl Fetcher {
             spawner,
             config: Arc::new(config.clone()),
             min_speed: Default::default(),
+            names: None,
         }
     }
 
@@ -95,7 +100,17 @@ impl Fetcher {
     fn pool(&self, authority: &str, default_ports: &[u16]) -> Arc<Pool> {
         let pool = Pool::for_authority(self.spawner.clone(), authority, default_ports);
         pool.confine(&self.config);
+        if let Some(names) = &self.names {
+            pool.use_names(names.clone());
+        }
         pool
+    }
+
+    /// Have `names` resolve the names the workers ask for (this process
+    /// opens no socket itself).
+    pub fn with_names(mut self, names: Arc<dyn velarx_registry::netpolicy::Resolver>) -> Self {
+        self.names = Some(names);
+        self
     }
 
     /// Fail the downloads that bring less than `speed` (the default is

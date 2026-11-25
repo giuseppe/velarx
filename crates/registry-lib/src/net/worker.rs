@@ -946,8 +946,11 @@ pub fn main(startup: &velarx_sys::fd::Startup) -> anyhow::Result<()> {
             }
         }
     }
-    let socket = match sandbox::enter(startup, require_userns, &ports) {
-        Ok(fd) => fd,
+    let sandbox::Sockets {
+        daemon: socket,
+        names,
+    } = match sandbox::enter(startup, require_userns, &ports) {
+        Ok(sockets) => sockets,
         Err(e) => {
             // Tell the daemon why, on the socket it gave (still the
             // standard input at this point if the sandbox failed early).
@@ -966,13 +969,20 @@ pub fn main(startup: &velarx_sys::fd::Startup) -> anyhow::Result<()> {
         (&std_socket).write_all(&frame)?;
         return Ok(());
     }
+    let names = std::os::unix::net::UnixStream::from(names);
     std_socket.set_nonblocking(true)?;
+    names.set_nonblocking(true)?;
     // One thread for the network: a worker is one of several processes, the
     // decompression runs on the blocking threads.
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(async {
+            // (the names of this process are resolved by whoever is on the
+            // other end of the channel: the process cannot do it itself)
+            let resolver = super::resolve::Client::new(tokio::net::UnixStream::from_std(names)?);
+            velarx_registry::netpolicy::use_resolver(std::sync::Arc::new(resolver))
+                .map_err(io::Error::other)?;
             let socket = tokio::net::UnixStream::from_std(std_socket)?;
             serve(socket).await
         })?;

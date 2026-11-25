@@ -4065,22 +4065,10 @@ mod tests {
         assert_eq!(parse_upload_range("x"), None);
     }
 
-    /// The resolver of the clients, as far as the report of a failure goes.
-    struct Lookup;
-
-    impl reqwest::dns::Resolve for Lookup {
-        fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-            Box::pin(async move {
-                let addrs = crate::netpolicy::lookup(name.as_str(), 0).await?;
-                Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
-            })
-        }
-    }
-
     #[tokio::test]
     async fn a_name_that_does_not_resolve_is_told_as_go_does() {
         let client = reqwest::Client::builder()
-            .dns_resolver(Arc::new(Lookup))
+            .dns_resolver(Arc::new(crate::netpolicy::Names))
             .build()
             .unwrap();
         let e = client

@@ -31,6 +31,7 @@ use velarx_content::serve_registry::{RegistryCalls, RemoteCall};
 use velarx_registry::auth::RegistryAccess;
 use velarx_registry::client::RegistryClient;
 use velarx_registry::helper::HelperRunner;
+use velarx_registry::netpolicy::Resolver;
 use velarx_sys::spawner::Spawner;
 use velarx_types::digest::Digest;
 use velarx_types::{ImageError, ImageReference};
@@ -65,6 +66,10 @@ pub struct RegistryService {
     /// What the workers have for the person who pulls, sent with the next
     /// piece of a `Get`
     warnings: Arc<Mutex<Vec<String>>>,
+    /// What resolves the names its workers ask for, when this process
+    /// cannot (the confined front); else the workers' names are resolved
+    /// here
+    names: std::sync::OnceLock<Arc<dyn Resolver>>,
 }
 
 fn failed(e: impl std::fmt::Display) -> RegistryError {
@@ -154,6 +159,15 @@ fn read_piece(file: &std::fs::File, at: u64, len: usize) -> std::io::Result<byte
 }
 
 impl RegistryService {
+    /// Where the downloads are made, with the confinement of `pull`.
+    fn fetcher(&self, pull: &PullConfig) -> crate::net::url::Fetcher {
+        let fetcher = crate::net::url::Fetcher::new(self.spawner(), pull);
+        match self.names.get() {
+            Some(names) => fetcher.with_names(names.clone()),
+            None => fetcher,
+        }
+    }
+
     /// What starts the confined workers that make the requests.
     pub(crate) fn spawner(&self) -> Arc<Spawner> {
         self.spawner.clone()
@@ -161,12 +175,17 @@ impl RegistryService {
 }
 
 impl RegistryService {
+    /// The service of the confined front: `names` resolves the names its
+    /// workers ask for (it opens no socket itself).
     pub fn new(
         (pull, push): (PullConfig, PushConfig),
         helpers: Arc<HelperRunner>,
         spawner: Arc<Spawner>,
+        names: Arc<dyn Resolver>,
     ) -> Result<Arc<Self>, velarx_base::ids::IdsError> {
-        Self::with_helpers((pull, push), Some(helpers), spawner)
+        let service = Self::with_helpers((pull, push), Some(helpers), spawner)?;
+        let _ = service.names.set(names);
+        Ok(service)
     }
 
     /// The service of a process that runs the credential helpers itself
@@ -209,6 +228,7 @@ impl RegistryService {
             auth_files,
             pools: Mutex::new(Vec::new()),
             warnings: Arc::default(),
+            names: std::sync::OnceLock::new(),
         }))
     }
 
@@ -309,6 +329,9 @@ impl RegistryService {
             }
         };
         pool.confine(&self.pull);
+        if let Some(names) = self.names.get() {
+            pool.use_names(names.clone());
+        }
         pool.set_hints(client.hint_store().cloned());
         let warnings = self.warnings.clone();
         pool.on_warning(Arc::new(move |line| {
@@ -438,7 +461,7 @@ impl RegistryCalls for RegistryService {
         let tls_verify = tls_verify && !target.endpoint.insecure;
         // (a confined worker asks the registry, as for every request: this
         // process opens no connection)
-        let checker = crate::net::url::Fetcher::new(self.spawner(), &self.pull);
+        let checker = self.fetcher(&self.pull);
         // (a registry that did not take the credentials, in podman's words)
         tokio::select! {
             checked = checker.login(&target.endpoint.host, &access, tls_verify) => {
@@ -468,7 +491,8 @@ impl RegistryCalls for RegistryService {
             return Err(bad("a URL is http or https"));
         }
         let pull = &self.pull;
-        let fetcher = crate::net::url::Fetcher::new(self.spawner(), pull)
+        let fetcher = self
+            .fetcher(pull)
             .with_min_speed(velarx_content::pull::min_speed(pull));
         let mut writer = velarx_storage::SparseWriter::new(file);
         let mut sink = |chunk: &[u8]| writer.write_all(chunk);
@@ -688,6 +712,12 @@ pub fn main(
     let helpers = Arc::new(HelperRunner::start().map_err(|e| {
         anyhow::anyhow!("the fetcher cannot start its credential helper runner: {e}")
     })?);
+    // (and the runner that resolves the names of the workers: this process
+    // opens no socket once it is confined)
+    let names = Arc::new(
+        crate::net::runner::Runner::start()
+            .map_err(|e| anyhow::anyhow!("the fetcher cannot start its resolver: {e}"))?,
+    );
     // (the spawner of the workers, as the runner: forked before the
     // confinement and the limits, which are the front's, not the workers')
     let spawner = start_spawner(&worker)?;
@@ -765,8 +795,21 @@ pub fn main(
         .thread_name("registry-fetcher")
         .enable_all()
         .build()?;
-    let service =
-        RegistryService::new((config.pull.clone(), config.push.clone()), helpers, spawner)?;
+    // (a confined front cannot fork another runner, and without one no
+    // worker resolves a name: it ends, its calls fail and the engine starts
+    // a new fetcher for its next need)
+    let resolving = names.clone();
+    runtime.spawn(async move {
+        resolving.gone().await;
+        eprintln!("the fetcher ends: its resolver runner is gone");
+        std::process::exit(1);
+    });
+    let service = RegistryService::new(
+        (config.pull.clone(), config.push.clone()),
+        helpers,
+        spawner,
+        names,
+    )?;
     let endpoint = {
         let _on = runtime.enter();
         velarx_content::serve_fetch::FetchEndpoint::new(crate::registry_fetch::RegistryFetch::new(
