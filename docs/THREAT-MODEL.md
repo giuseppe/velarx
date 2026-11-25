@@ -160,6 +160,12 @@ lengths before allocating and verifies every digest.
 * **The monitor's socket** (`org.velarx.Monitor`, mode 0700 directory) accepts
   only the monitor's user and root (`SO_PEERCRED`), with bounded calls,
   connections and idle time.
+  Landlock's signal scope (ABI 6, Linux 6.12) keeps the confined threads of
+  the monitor from signalling other processes; their filter denies `kill`
+  and `pidfd_send_signal` but not `tgkill`, `tkill`, `rt_sigqueueinfo` or
+  `rt_tgsigqueueinfo`. On a kernel before 6.12, older than the one Velarx
+  needs, a thread taken over first could signal any process the monitor
+  may.
 * **A local unprivileged user** cannot reach the sockets of a root engine
   (0660 root:root in a 0700 directory). `velarx-api` serves TCP only with
   `--listen tcp://` and does not start without a bearer token
