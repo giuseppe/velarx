@@ -112,7 +112,7 @@ pub(crate) type Tell = Arc<dyn Fn(u64) -> futures::future::BoxFuture<'static, ()
 /// Upload the blob `digest` of `size` bytes that `data` holds, in pieces of
 /// `chunk`, to the registry `pool` reaches; `tell` is told the bytes the
 /// registry has taken before each piece.  The registry checks the digest
-/// with the last piece.
+/// once the last piece is in.
 pub(crate) async fn upload_file(
     pool: &Arc<Pool>,
     digest: &Digest,

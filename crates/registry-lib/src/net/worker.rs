@@ -303,8 +303,8 @@ impl State {
         Ok(())
     }
 
-    /// Upload a blob the daemon sends, a PATCH per CHUNK bytes, the last
-    /// piece with the PUT that has the registry check the digest.
+    /// Upload a blob the daemon sends, a PATCH per CHUNK bytes and one for
+    /// the rest, then the PUT that has the registry check the digest.
     async fn upload(
         &self,
         reader: &mut OwnedReadHalf,

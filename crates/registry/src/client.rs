@@ -21,7 +21,8 @@ use base64::Engine;
 use bytes::Bytes;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE,
+    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    LOCATION, RANGE,
 };
 use reqwest::{Method, Response, StatusCode};
 use serde::Deserialize;
@@ -1937,8 +1938,10 @@ impl RegistryClient {
     }
 
     /// End an upload with the last bytes (maybe none), which start at
-    /// `offset`, and the digest the registry has to check; tried again as
-    /// the pieces are.
+    /// `offset`, and the digest the registry has to check.  The last
+    /// bytes are a piece like the others; the PUT that closes the upload
+    /// has no body, which every registry reads the same way.  The PUT is
+    /// tried again as the pieces are.
     pub async fn finish_upload(
         &self,
         t: &Target,
@@ -1947,10 +1950,13 @@ impl RegistryClient {
         digest: &Digest,
         last: Bytes,
     ) -> ImageResult<()> {
-        let (mut session, mut offset, mut last) = (session.clone(), offset, last);
+        let mut session = match last.is_empty() {
+            true => session.clone(),
+            false => self.upload_chunk(t, session, offset, last).await?,
+        };
         let mut failures = 0;
         loop {
-            match self.put_upload(t, &session, digest, last.clone()).await {
+            match self.put_upload(t, &session, digest).await {
                 Ok(None) => return Ok(()),
                 Ok(Some(e)) if failures < UPLOAD_RETRIES => {
                     failures += 1;
@@ -1960,18 +1966,13 @@ impl RegistryClient {
                     if self.blob_exists(t, digest).await? {
                         return Ok(());
                     }
-                    let (have, next) = self.upload_status(t, &session).await.map_err(|s| {
-                        ImageError::Registry(format!("{e}; the upload cannot go on: {s}"))
-                    })?;
-                    let end = offset + last.len() as u64;
-                    if have < offset || have > end {
-                        return Err(ImageError::Registry(format!(
-                            "{e}; the registry has {have} bytes of the upload, {offset} to {end} were sent"
-                        )));
-                    }
-                    last = last.slice((have - offset) as usize..);
-                    offset = have;
-                    session = next;
+                    session = self
+                        .upload_status(t, &session)
+                        .await
+                        .map_err(|s| {
+                            ImageError::Registry(format!("{e}; the upload cannot go on: {s}"))
+                        })?
+                        .1;
                 }
                 Ok(Some(e)) => return Err(e),
                 Err(e) => return Err(e),
@@ -1985,7 +1986,6 @@ impl RegistryClient {
         t: &Target,
         session: &reqwest::Url,
         digest: &Digest,
-        last: Bytes,
     ) -> ImageResult<Option<ImageError>> {
         let mut url = session.clone();
         url.query_pairs_mut()
@@ -1995,6 +1995,8 @@ impl RegistryClient {
             CONTENT_TYPE,
             HeaderValue::from_static("application/octet-stream"),
         );
+        // (a request with no body has no length otherwise)
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
         let resp = match self
             .send_url(
                 t,
@@ -2002,7 +2004,7 @@ impl RegistryClient {
                     method: Method::PUT,
                     url: url.as_str(),
                     headers: &headers,
-                    body: Some(last),
+                    body: None,
                     actions: "pull,push",
                     cache_key: None,
                 },
@@ -3636,12 +3638,18 @@ mod tests {
             axum::routing::any(move |m: axum::http::Method, h: AxHeaders| {
                 let log = log.clone();
                 async move {
+                    let patch = m == axum::http::Method::PATCH;
                     log.lock().unwrap().push((
                         m.to_string(),
                         h.get(header::AUTHORIZATION)
                             .map(|v| v.to_str().unwrap().to_string()),
                     ));
-                    AxStatus::CREATED
+                    match patch {
+                        true => {
+                            (AxStatus::ACCEPTED, [(header::LOCATION, "/upload/1")]).into_response()
+                        }
+                        false => AxStatus::CREATED.into_response(),
+                    }
                 }
             }),
         );
@@ -3881,7 +3889,13 @@ mod tests {
                         u.fail_puts.fetch_sub(1, Ordering::SeqCst);
                         return AxStatus::BAD_GATEWAY.into_response();
                     }
+                    // (a body with no Content-Range is read as the start
+                    // of the upload, as zot does: it fits only an upload
+                    // that has nothing yet)
                     let mut data = u.data.lock().unwrap();
+                    if !body.is_empty() && !data.is_empty() {
+                        return AxStatus::RANGE_NOT_SATISFIABLE.into_response();
+                    }
                     data.extend_from_slice(&body);
                     let digest = sha256_of(&data[..]).to_string();
                     let asked = q.unwrap_or_default().replace("digest=", "").replace("%3A", ":");
@@ -3943,6 +3957,35 @@ mod tests {
         .await;
         upload_all(&host).await.unwrap();
         assert_eq!(*u.data.lock().unwrap(), (0..35u8).collect::<Vec<_>>());
+        assert!(u.done.lock().unwrap().is_some());
+    }
+
+    /// A registry that places the body of the closing PUT at the start of
+    /// the upload (it has no `Content-Range` there) gets the last bytes as
+    /// a piece, and the PUT with no body.
+    #[tokio::test]
+    async fn the_last_bytes_of_an_upload_are_a_piece_and_the_closing_put_has_no_body() {
+        let (host, u) = start_upload_registry(Default::default()).await;
+        upload_all(&host).await.unwrap();
+        assert_eq!(*u.data.lock().unwrap(), (0..35u8).collect::<Vec<_>>());
+        assert_eq!(u.patches.load(Ordering::SeqCst), 4);
+        assert!(u.done.lock().unwrap().is_some());
+    }
+
+    /// An empty blob is a PUT with no body and no piece.
+    #[tokio::test]
+    async fn an_empty_blob_is_one_put() {
+        let (host, u) = start_upload_registry(Default::default()).await;
+        let client = client_for(&host, true, true);
+        let t = client.push_target(&reference(&host)).unwrap();
+        let UploadStart::Session(session) = client.start_upload(&t, None).await.unwrap() else {
+            panic!("mounted")
+        };
+        client
+            .finish_upload(&t, &session, 0, &sha256_of(b""), Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(u.patches.load(Ordering::SeqCst), 0);
         assert!(u.done.lock().unwrap().is_some());
     }
 
