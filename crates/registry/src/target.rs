@@ -710,15 +710,17 @@ pub fn parse_tags(body: &[u8]) -> serde_json::Result<Vec<String>> {
 
 /// The architecture name of the host, as OCI platforms spell it.
 pub fn host_arch() -> &'static str {
-    oci_arch(std::env::consts::ARCH)
+    oci_arch(std::env::consts::ARCH, cfg!(target_endian = "little"))
 }
 
-/// The OCI name of the architecture Rust names `arch`.
-pub(crate) fn oci_arch(arch: &str) -> &str {
+/// The OCI name of the architecture Rust names `arch` (`powerpc64` is
+/// both `ppc64le` and `ppc64`).
+pub(crate) fn oci_arch(arch: &str, little_endian: bool) -> &str {
     match arch {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
-        "powerpc64" => "ppc64le",
+        "powerpc64" if little_endian => "ppc64le",
+        "powerpc64" => "ppc64",
         other => other,
     }
 }

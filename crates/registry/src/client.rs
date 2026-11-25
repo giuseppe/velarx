@@ -2884,11 +2884,13 @@ mod tests {
         assert_eq!(select(index, "unknown/unknown"), None);
     }
 
-    /// Pins a problem: Rust's `powerpc64` is both endiannesses; the
-    /// big-endian one is `ppc64`, not `ppc64le`.
+    /// Rust's `powerpc64` is both endiannesses; the big-endian one is
+    /// `ppc64`.
     #[test]
-    fn test_powerpc64_is_little_endian_pinned() {
-        assert_eq!(oci_arch("powerpc64"), "ppc64le");
+    fn test_powerpc64_has_two_names() {
+        assert_eq!(oci_arch("powerpc64", true), "ppc64le");
+        assert_eq!(oci_arch("powerpc64", false), "ppc64");
+        assert_eq!(oci_arch("x86_64", false), "amd64");
     }
 
     fn manifest_of_size(size: usize) -> Vec<u8> {
