@@ -109,17 +109,6 @@ impl Starts {
     }
 }
 
-/// What a completion ended with, for the command that waits for it.
-#[derive(Clone, Default)]
-struct Over {
-    /// What the try moved
-    moved: TransferStats,
-    /// Why the pull stopped when a layer was refused for its table of
-    /// contents ([`ImageError::Contradicted`]): the one failure a command
-    /// tells from the others, since trying again gives the same
-    contradicted: Option<String>,
-}
-
 /// A pull the task holds.
 struct Held {
     id: String,
@@ -130,14 +119,12 @@ struct Held {
     plan: Option<Arc<Plan>>,
     /// What the try moved
     stats: TransferStats,
-    /// Why a layer was refused, if it was ([`Over::contradicted`])
-    contradicted: Option<String>,
     started: Instant,
     /// `progress.json` as last told, and when it was last written
     progress: Progress,
     written: Option<Instant>,
-    /// Set to how the try ended when the pull is over
-    done: watch::Sender<Option<Over>>,
+    /// Set to what the try moved when the pull is over
+    done: watch::Sender<Option<TransferStats>>,
 }
 
 impl Held {
@@ -205,7 +192,7 @@ impl Completions {
         &self,
         id: &str,
         event: fn(PullId) -> Event,
-    ) -> Option<watch::Receiver<Option<Over>>> {
+    ) -> Option<watch::Receiver<Option<TransferStats>>> {
         let (reply, answer) = oneshot::channel();
         let id = id.to_string();
         let told = move |t: &mut Task| {
@@ -408,10 +395,7 @@ impl Task {
                 let held = self.pulls.remove(&pull)?;
                 // (the lease goes before a waiter looks)
                 drop(held.lease);
-                held.done.send_replace(Some(Over {
-                    moved: held.stats,
-                    contradicted: held.contradicted,
-                }));
+                held.done.send_replace(Some(held.stats));
             }
             // (one timer, the earliest: the tick asks for the next)
             Action::Wake(at) if self.wake.as_ref().is_some_and(|(t, _)| *t <= at) => {}
@@ -541,12 +525,17 @@ impl Task {
             State::NoSpace(_) => (PullState::WaitingForSpace, pid),
             State::NeedsCredentials => (PullState::NeedsCredentials, None),
             State::Failed => {
-                let reason = failure.map(reason_of).unwrap_or_default();
-                held.contradicted = match failure {
-                    Some(ImageError::Contradicted(why)) => Some(why.clone()),
-                    _ => None,
+                let (reason, contradicted) = match failure {
+                    Some(ImageError::Contradicted(why)) => (why.clone(), true),
+                    failure => (failure.map(reason_of).unwrap_or_default(), false),
                 };
-                (PullState::Failed { reason }, None)
+                (
+                    PullState::Failed {
+                        reason,
+                        contradicted,
+                    },
+                    None,
+                )
             }
         };
         // (an event that fails one pull may record another as running)
@@ -676,7 +665,6 @@ impl ImageService {
             access: access.clone(),
             plan: None,
             stats: TransferStats::default(),
-            contradicted: None,
             started: Instant::now(),
             written: None,
             done: watch::channel(None).0,
@@ -753,7 +741,7 @@ impl ImageService {
                 _ => {}
             }
             self.add_completion(&completions, id, &access);
-            let over = match completions.tell(id, Event::Hurry).await {
+            let moved = match completions.tell(id, Event::Hurry).await {
                 Some(mut done) => done
                     .wait_for(Option::is_some)
                     .await
@@ -768,23 +756,24 @@ impl ImageService {
                     tokio::task::spawn_blocking(move || wait.wait_for_completer(&waited))
                         .await
                         .map_err(|e| ImageError::Storage(e.to_string()))??;
-                    Over::default()
+                    TransferStats::default()
                 }
             };
             if self.image_stored(&pull.manifest_digest).await {
                 return Ok(TransferStats {
                     duration_ms: start.elapsed().as_millis() as u64,
-                    ..over.moved
+                    ..moved
                 });
             }
             match area.state(id)?.state {
-                PullState::Failed { reason } => {
-                    return Err(match over.contradicted {
-                        Some(why) => ImageError::Contradicted(why),
-                        None => {
-                            ImageError::Pulling(format!("the pull of image {id} failed: {reason}"))
-                        }
-                    })
+                PullState::Failed {
+                    reason,
+                    contradicted: true,
+                } => return Err(ImageError::Contradicted(reason)),
+                PullState::Failed { reason, .. } => {
+                    return Err(ImageError::Pulling(format!(
+                        "the pull of image {id} failed: {reason}"
+                    )))
                 }
                 // (what was refused says what it needs; a completion that ran
                 // without the credentials, started before, is followed by

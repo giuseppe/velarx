@@ -78,8 +78,11 @@ pub enum PullState {
     NeedsCredentials,
     /// The file system is full; retried
     WaitingForSpace,
-    /// An error that retrying cannot fix: the staging is kept
-    Failed { reason: String },
+    /// An error that retrying cannot fix: the staging is kept.
+    /// `contradicted`: a layer was refused for its table of contents
+    /// (`ImageError::Contradicted`, `reason` says why), which a command
+    /// that waits for the pull tells from the other failures
+    Failed { reason: String, contradicted: bool },
     /// Removed by the user: collected with the next garbage collection
     Cancelled,
 }
@@ -88,6 +91,19 @@ impl PullState {
     /// The engine service is to complete the pull.
     pub fn is_open(&self) -> bool {
         matches!(self, Self::Queued | Self::Running | Self::WaitingForSpace)
+    }
+
+    /// Why a failed pull stopped, as it is shown (a refused layer says
+    /// that it is refused); none for a pull that did not fail.
+    pub fn failure(&self) -> Option<String> {
+        match self {
+            Self::Failed {
+                reason,
+                contradicted: true,
+            } => Some(velarx_types::ImageError::Contradicted(reason.clone()).to_string()),
+            Self::Failed { reason, .. } => Some(reason.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -1330,8 +1346,15 @@ mod tests {
         assert_eq!(area.pulls().len(), 1);
         // a failed one starts over
         let id = joined.id;
-        area.set_state(&id, PullState::Failed { reason: "x".into() }, None)
-            .unwrap();
+        area.set_state(
+            &id,
+            PullState::Failed {
+                reason: "x".into(),
+                contradicted: false,
+            },
+            None,
+        )
+        .unwrap();
         area.publish_pull(&pull(1, "latest")).unwrap();
         assert_eq!(area.state(&id).unwrap().state, PullState::Queued);
     }
@@ -1348,8 +1371,15 @@ mod tests {
             assert!(!area.remove_failed_pull(&p.id).unwrap());
             assert!(area.pull(&p.id).unwrap().is_some());
         }
-        area.set_state(&p.id, PullState::Failed { reason: "x".into() }, None)
-            .unwrap();
+        area.set_state(
+            &p.id,
+            PullState::Failed {
+                reason: "x".into(),
+                contradicted: false,
+            },
+            None,
+        )
+        .unwrap();
         assert!(area.remove_failed_pull(&p.id).unwrap());
         assert!(area.pull(&p.id).unwrap().is_none());
     }

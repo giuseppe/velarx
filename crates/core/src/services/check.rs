@@ -759,11 +759,12 @@ impl CheckService {
                 continue;
             }
             match &entry.state.state {
-                PullState::Failed { reason } => add(
+                failed @ PullState::Failed { .. } => add(
                     "failed_pull",
                     format!(
-                        "the pull of {} failed: {reason}: `velarx image complete {}` tries again",
+                        "the pull of {} failed: {}: `velarx image complete {}` tries again",
                         named.as_deref().unwrap_or(&short(id)),
+                        failed.failure().unwrap_or_default(),
                         short(id)
                     ),
                     Fix::Complete(id.clone()),

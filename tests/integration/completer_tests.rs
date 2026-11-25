@@ -240,6 +240,7 @@ async fn pulls_nobody_completes_are_resumed() {
     for state in [
         PullState::Failed {
             reason: "the layer is not what its table says".into(),
+            contradicted: true,
         },
         PullState::NeedsCredentials,
         PullState::Cancelled,
@@ -258,6 +259,7 @@ async fn pulls_nobody_completes_are_resumed() {
         &pulled.id,
         PullState::Failed {
             reason: "blob gone".into(),
+            contradicted: false,
         },
         None,
     )
@@ -321,6 +323,51 @@ async fn a_command_that_waits_is_told_why_the_completion_stopped() {
     assert_eq!(listed[0].state.word(), "failed");
     assert!(listed[0].error.is_some());
     assert!(service.get(&pulled.id).await.is_err());
+}
+
+/// Another process completes the pull and stops on a refused layer: the
+/// command that waits for it is told the class of the failure, not only
+/// its text.
+#[tokio::test]
+async fn a_command_that_waits_for_another_process_is_told_a_refused_layer() {
+    let e = lazy_env_published().await;
+    let caller = std::mem::ManuallyDrop::new(service_of(&e, Default::default()));
+    let pulled = pull_lazily(&caller, &e).await;
+    let area = e.area();
+    let failed = |contradicted| PullState::Failed {
+        reason: "the table differs".into(),
+        contradicted,
+    };
+    for contradicted in [true, false] {
+        // (stopped: the waiter queues it again and waits for the other
+        // process, which records the failure and lets the lease go)
+        area.set_state(&pulled.id, failed(contradicted), None)
+            .unwrap();
+        let held = LeaseHolder::hold(&area.image_dir(&pulled.id).join("lease"));
+        let mut waiter =
+            std::pin::pin!(caller.complete_waiting(&pulled.id, RegistryAccess::default()));
+        // (its first step queues the pull and finds the lease held)
+        assert!(futures::poll!(&mut waiter).is_pending());
+        assert_eq!(area.state(&pulled.id).unwrap().state, PullState::Queued);
+        area.set_state(&pulled.id, failed(contradicted), None)
+            .unwrap();
+        held.release();
+        let err = waiter.await.unwrap_err();
+        assert_eq!(
+            matches!(err, velarx_types::ImageError::Contradicted(_)),
+            contradicted,
+            "{err}"
+        );
+        let shown = match contradicted {
+            true => "the layer is refused: the table differs",
+            false => "the table differs",
+        };
+        if contradicted {
+            assert_eq!(err.to_string(), shown);
+        }
+        let listed = caller.pulls().await.unwrap();
+        assert_eq!(listed[0].error.as_deref(), Some(shown));
+    }
 }
 
 /// Cancelling a pull the service completes stops its task: the lease is

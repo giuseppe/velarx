@@ -84,7 +84,7 @@ impl ImageService {
         );
         use velarx_proto::workload::PullState as Shown;
         let (state, error) = match &entry.state.state {
-            PullState::Failed { reason } => (Shown::Failed, Some(reason.clone())),
+            failed @ PullState::Failed { .. } => (Shown::Failed, failed.failure()),
             PullState::Queued => (Shown::Queued, entry.progress.error.clone()),
             PullState::Running => (Shown::Running, entry.progress.error.clone()),
             PullState::NeedsCredentials => (Shown::NeedsCredentials, entry.progress.error.clone()),
@@ -126,9 +126,10 @@ impl ImageService {
         self.resume_pulls();
         match &entry.state.state {
             PullState::Cancelled => return Ok(None),
-            PullState::Failed { reason } => {
+            failed @ PullState::Failed { .. } => {
                 return Err(ImageError::Pulling(format!(
-                    "the pull of {reference} failed: {reason}: `velarx image complete {reference}` tries again"
+                    "the pull of {reference} failed: {}: `velarx image complete {reference}` tries again",
+                    failed.failure().unwrap_or_default()
                 )))
             }
             _ => {}
@@ -164,8 +165,9 @@ impl ImageService {
                     PullState::Cancelled => Err(ImageError::Pulling(format!(
                         "the pull of image {id} was cancelled"
                     ))),
-                    PullState::Failed { reason } => Err(ImageError::Pulling(format!(
-                        "the pull of image {id} failed: {reason}"
+                    failed @ PullState::Failed { .. } => Err(ImageError::Pulling(format!(
+                        "the pull of image {id} failed: {}",
+                        failed.failure().unwrap_or_default()
                     ))),
                     _ => {
                         let tags = entry
