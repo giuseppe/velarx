@@ -21,6 +21,27 @@ need_state () {
     fi
 }
 
+# pods_now: the pods of the frontend (a short timeout: it may be gone)
+pods_now () { crictl --timeout 10s -r "unix://$CRISOCK" -i "unix://$CRISOCK" pods -q 2> /dev/null; }
+
+# After a test that failed: the pods it made go, so that the next tests,
+# which check that no pod is left, do not fail for it.
+setup () {
+    set +e
+    PODS_BEFORE=" $(pods_now | tr '\n' ' ') "
+}
+teardown () {
+    [ -n "${BATS_TEST_COMPLETED:-}${BATS_TEST_SKIPPED:-}" ] && return 0
+    local p
+    for p in $(pods_now); do
+        case "$PODS_BEFORE" in
+        *" $p "*) ;;
+        *) cc stopp "$p" > /dev/null; cc rmp "$p" > /dev/null ;;
+        esac
+    done
+    return 0
+}
+
 setup_file () {
     # (the CRI is run and tested as root, as a kubelet runs it: docs/CRI.md)
     [ "$(id -u)" = 0 ] || skip "the CRI is tested as root"
