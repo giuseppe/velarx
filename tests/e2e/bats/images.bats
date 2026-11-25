@@ -422,18 +422,36 @@ PY
     out=$($SH container run --rm --tls-verify=false "docker://$IMG" echo via-docker-transport 2>&1)
     check "run docker://" "via-docker-transport" "$out"
 
-    $SH image push "$IMG" "oci-archive:$t/a.tar:v1" > /dev/null 2>&1
+    # a zstd:chunked layer is pulled by its table of contents or not at all,
+    # and an archive, a layout or a directory gives none: refused, and no
+    # image is named after it
+    names=$($SH image list --format '{{.Repository}}:{{.Tag}}' 2>&1)
+    $SH image push "$IMG" "oci-archive:$t/chunked.tar:chunked" > /dev/null 2>&1
+    check "push the chunked image to oci-archive:" 0 $?
+    $SH image push "$IMG" "oci:$t/chunked:chunked" > /dev/null 2>&1
+    check "push the chunked image to oci:" 0 $?
+    $SH image push "$IMG" "dir:$t/chunked-dir" > /dev/null 2>&1
+    check "push the chunked image to dir:" 0 $?
+    for ref in "oci-archive:$t/chunked.tar:chunked" "oci:$t/chunked:chunked" "dir:$t/chunked-dir"; do
+        out=$($SH image pull "$ref" 2>&1)
+        check "pull $ref of a zstd:chunked layer" 125 $?
+        check_match "...saying why" "layer sha256:[0-9a-f]{64}: it is zstd:chunked, which is pulled by its table of contents or not at all, and the source gives none" "$out"
+    done
+    check "no image is named after them" "$names" "$($SH image list --format '{{.Repository}}:{{.Tag}}' 2>&1)"
+
+    # the gzip layers of the same image are pulled from them
+    $SH image push --compression-format gzip "$IMG" "oci-archive:$t/a.tar:v1" > /dev/null 2>&1
     check "push to oci-archive:" 0 $?
-    $SH image push "$IMG" "oci:$t/layout:v1" > /dev/null 2>&1
+    $SH image push --compression-format gzip "$IMG" "oci:$t/layout:v1" > /dev/null 2>&1
     check "push to oci:" 0 $?
-    $SH image push "$IMG" "oci:$t/layout:v2" > /dev/null 2>&1
+    $SH image push --compression-format gzip "$IMG" "oci:$t/layout:v2" > /dev/null 2>&1
     check "push a second tag to the layout" 0 $?
-    $SH image push "$IMG" "dir:$t/dir" > /dev/null 2>&1
+    $SH image push --compress "$IMG" "dir:$t/dir" > /dev/null 2>&1
     check "push to dir:" 0 $?
     check_match "dir: has a manifest and a version" "manifest.json" "$(ls "$t/dir")"
     check "the layout has two entries" 2 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["manifests"]))' "$t/layout/index.json")"
 
-    $SH image push "$IMG" "oci:$t/layout:v1" > /dev/null 2>&1
+    $SH image push --compression-format gzip "$IMG" "oci:$t/layout:v1" > /dev/null 2>&1
     check "the same tag again replaces its entry" 2 "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["manifests"]))' "$t/layout/index.json")"
 
     for ref in "oci-archive:$t/a.tar:v1" "oci:$t/layout:v2" "dir:$t/dir"; do
@@ -445,7 +463,7 @@ PY
     names=$($SH image list --format '{{.Repository}}:{{.Tag}}' 2>&1)
     check_match "oci:PATH:TAG names the image after the tag, as podman" "library/v2:latest" "$names"
     check_match "oci-archive: names it after its ref.name, local like podman load" "localhost/v1:latest" "$names"
-    $SH image push "$IMG" "oci:$t/single:only" > /dev/null 2>&1
+    $SH image push --compression-format gzip "$IMG" "oci:$t/single:only" > /dev/null 2>&1
     check "oci:PATH: with an empty tag is the only image, as skopeo has it" "$id" "$($SH image pull "oci:$t/single:" 2>&1)"
     check "the tag of the layout is not a name of the image pulled without it" 0 "$($SH image list --format '{{.Repository}}:{{.Tag}}' 2>&1 | grep -c 'only')"
     out=$($SH image pull "oci:$t/layout" 2>&1)
@@ -476,9 +494,9 @@ PY
         check "skopeo reads our layout" 0 $?
         skopeo inspect --raw "dir:$t/dir" > /dev/null 2>&1
         check "skopeo reads our dir" 0 $?
-        skopeo copy --src-tls-verify=false "docker://$IMG" "dir:$t/skdir" > /dev/null 2>&1
-        skopeo copy --src-tls-verify=false "docker://$IMG" "oci:$t/sklayout:sk" > /dev/null 2>&1
-        skopeo copy --src-tls-verify=false "docker://$IMG" "oci-archive:$t/sk.tar:sk" > /dev/null 2>&1
+        skopeo copy --src-tls-verify=false --dest-compress --dest-compress-format gzip --dest-force-compress-format "docker://$IMG" "dir:$t/skdir" > /dev/null 2>&1
+        skopeo copy --src-tls-verify=false --dest-compress --dest-compress-format gzip --dest-force-compress-format "docker://$IMG" "oci:$t/sklayout:sk" > /dev/null 2>&1
+        skopeo copy --src-tls-verify=false --dest-compress --dest-compress-format gzip --dest-force-compress-format "docker://$IMG" "oci-archive:$t/sk.tar:sk" > /dev/null 2>&1
         check "pull a dir: of skopeo" "$id" "$($SH image pull "dir:$t/skdir" 2>&1)"
         check "pull an oci: of skopeo" "$id" "$($SH image pull "oci:$t/sklayout:sk" 2>&1)"
         check "pull an oci-archive: of skopeo" "$id" "$($SH image pull "oci-archive:$t/sk.tar:sk" 2>&1)"
@@ -547,6 +565,11 @@ PY
     check "...a reference no image has" 125 $?
     check_match "...says the names it has" "no image named .localhost/nope:1." "$out"
     $SH image remove localhost/e2e-da:v2 localhost/e2e-da:other > /dev/null 2>&1
+    # (the name of $IMG is the archive's image: the registry's again for the
+    # tests that follow)
+    $SH image remove "$IMG" > /dev/null 2>&1
+    $SH image pull --tls-verify=false "$IMG" > /dev/null 2>&1
+    check "the image of the registry is back" "$id" "$($SH image inspect --format '{{.Id}}' "$IMG")"
 }
 
 # podman's options of push: the digest file, the level of a compression, the
