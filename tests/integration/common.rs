@@ -15,13 +15,14 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use velarx_config::PullConfig;
+use velarx_content::layer::writer::{write_canonical_layer, Compression};
 use velarx_core::services::ImageService;
 use velarx_db::Database;
 use velarx_registry::config::RegistriesConfig;
 use velarx_registry::target::Resolver;
 use velarx_registry::target::TransportConfig;
 use velarx_registry::AuthConfig;
-use velarx_storage::FileStore;
+use velarx_storage::{canonical, FileStore, TocEntry, TocEntryType};
 pub use velarx_types::digest::{Algorithm, Digest};
 
 pub fn sha(data: &[u8]) -> Digest {
@@ -2095,4 +2096,73 @@ pub fn staged_toc(layer: &velarx_content::pull::staged::StagedLayer) -> velarx_s
 pub fn restage_toc(e: &Env, key: &velarx_db::LayerKey, toc: &velarx_storage::Toc) {
     let z = zstd::encode_all(&serde_json::to_vec(toc).unwrap()[..], 3).unwrap();
     std::fs::write(e.area().layer_dir(key).join("toc.zst"), z).unwrap();
+}
+
+pub fn entry(name: &str, kind: TocEntryType, size: u64) -> TocEntry {
+    TocEntry {
+        mode: if kind == TocEntryType::Dir {
+            0o755
+        } else {
+            0o644
+        },
+        size,
+        mod_time: Some("2023-11-14T22:13:20.5Z".to_string()),
+        ..TocEntry::new(name.to_string(), kind)
+    }
+}
+
+/// The canonical tar of the items, in the order of its paths.
+pub fn tar_of_items(items: &[Item]) -> Vec<u8> {
+    let mut entries = Vec::new();
+    let mut data: HashMap<String, Vec<u8>> = HashMap::new();
+    for item in items {
+        match item {
+            Item::Dir(n) => entries.push(entry(&format!("./{n}"), TocEntryType::Dir, 0)),
+            Item::File { name, data: d, .. } => {
+                entries.push(entry(
+                    &format!("./{name}"),
+                    TocEntryType::Reg,
+                    d.len() as u64,
+                ));
+                data.insert(format!("./{name}"), d.clone());
+            }
+            Item::Symlink(n, t) => {
+                let mut e = entry(&format!("./{n}"), TocEntryType::Symlink, 0);
+                e.link_name = Some(t.to_string());
+                entries.push(e);
+            }
+        }
+    }
+    let key = |e: &TocEntry| {
+        e.name
+            .trim_end_matches('/')
+            .split('/')
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    entries.sort_by_key(key);
+    let mut tar = Vec::new();
+    canonical::write(&entries, &mut tar, |e, out| out.write_all(&data[&e.name])).unwrap();
+    tar
+}
+
+/// A layer of version 2 as a producer that is not this engine writes it:
+/// the canonical tar of the items, as a blob.
+pub fn build_canonical(items: &[Item]) -> Built {
+    let tar = tar_of_items(items);
+    let mut blob = Vec::new();
+    let w = write_canonical_layer(
+        &tar[..],
+        velarx_types::digest::Algorithm::Sha256,
+        Compression::ZstdChunked,
+        None,
+        &mut blob,
+    )
+    .unwrap();
+    assert_eq!(w.diff_id, sha(&tar));
+    Built {
+        blob,
+        diff_id: w.diff_id,
+        annotations: w.annotations.into_iter().collect(),
+    }
 }

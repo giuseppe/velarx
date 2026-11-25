@@ -801,7 +801,9 @@ fn asked(range: &str) -> u64 {
 #[tokio::test]
 async fn test_a_cut_answer_is_resumed() {
     let e = env().await;
-    let layer = build_chunked(&sample());
+    // (a layer of version 2 has no tar-split, which the pull of a lazily
+    // pulled layer would fetch first, in an answer of its own)
+    let layer = build_canonical(&sample());
     e.publish(&[&layer], &[ZSTD]);
     // the metadata first, untouched; then the first answer for the files
     e.pull_lazy().await.unwrap();

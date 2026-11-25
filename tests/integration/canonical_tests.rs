@@ -7,79 +7,10 @@ use crate::common::*;
 use std::collections::HashMap;
 use std::io::Read;
 use velarx_content::layer::reproduce::StoredLayer;
-use velarx_content::layer::writer::{write_canonical_layer, Compression};
-use velarx_storage::{canonical, Toc, TocEntry, TocEntryType};
+use velarx_content::layer::writer::Compression;
+use velarx_storage::{canonical, Toc};
 
 const PREFIX: &str = "io.github.containers.zstd-chunked.";
-
-fn entry(name: &str, kind: TocEntryType, size: u64) -> TocEntry {
-    TocEntry {
-        mode: if kind == TocEntryType::Dir {
-            0o755
-        } else {
-            0o644
-        },
-        size,
-        mod_time: Some("2023-11-14T22:13:20.5Z".to_string()),
-        ..TocEntry::new(name.to_string(), kind)
-    }
-}
-
-/// The canonical tar of the items, in the order of its paths.
-fn tar_of_items(items: &[Item]) -> Vec<u8> {
-    let mut entries = Vec::new();
-    let mut data: HashMap<String, Vec<u8>> = HashMap::new();
-    for item in items {
-        match item {
-            Item::Dir(n) => entries.push(entry(&format!("./{n}"), TocEntryType::Dir, 0)),
-            Item::File { name, data: d, .. } => {
-                entries.push(entry(
-                    &format!("./{name}"),
-                    TocEntryType::Reg,
-                    d.len() as u64,
-                ));
-                data.insert(format!("./{name}"), d.clone());
-            }
-            Item::Symlink(n, t) => {
-                let mut e = entry(&format!("./{n}"), TocEntryType::Symlink, 0);
-                e.link_name = Some(t.to_string());
-                entries.push(e);
-            }
-        }
-    }
-    let key = |e: &TocEntry| {
-        e.name
-            .trim_end_matches('/')
-            .split('/')
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    };
-    entries.sort_by_key(key);
-    let mut tar = Vec::new();
-    canonical::write(&entries, &mut tar, |e, out| out.write_all(&data[&e.name])).unwrap();
-    tar
-}
-
-/// A layer of version 2 as a producer that is not this engine writes it:
-/// the canonical tar of the items, as a blob.
-fn build_canonical(items: &[Item]) -> Built {
-    let tar = tar_of_items(items);
-    let mut blob = Vec::new();
-    let w = write_canonical_layer(
-        &tar[..],
-        velarx_types::digest::Algorithm::Sha256,
-        Compression::ZstdChunked,
-        None,
-        &mut blob,
-    )
-    .unwrap();
-    assert_eq!(w.diff_id, sha(&tar));
-    Built {
-        blob,
-        diff_id: w.diff_id,
-        annotations: w.annotations.into_iter().collect(),
-    }
-}
 
 /// `layer` with the table of contents `edit` makes of its own: the blob
 /// ends with the table and the footer, which are written again, and the
