@@ -5276,6 +5276,7 @@ dependencies = [
  "velarx-netdetach",
  "velarx-netkernel",
  "velarx-proto",
+ "velarx-recv-core",
  "velarx-registry",
  "velarx-request-core",
  "velarx-revoke-core",
@@ -5340,6 +5341,10 @@ dependencies = [
 
 [[package]]
 name = "velarx-pull-core"
+version = "0.1.0"
+
+[[package]]
+name = "velarx-recv-core"
 version = "0.1.0"
 
 [[package]]

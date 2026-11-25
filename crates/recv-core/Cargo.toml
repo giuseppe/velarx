@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-recv-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "What a node takes from a peer of the peer-to-peer network: the answer to its requests and the filter the peer tells of its layers"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on numbers: no dependency, no I/O, no clock.  The
+# streams, the base64 and the Bloom filter itself, the clock and the
+# check of the bytes against their digest stay in the package of the
+# peers (its quic.rs, filter.rs and provider.rs).
+
+[lib]
+name = "velarx_recv_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

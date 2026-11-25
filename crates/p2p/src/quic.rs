@@ -96,6 +96,7 @@ use std::time::Duration;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 use velarx_content::fetcher::fetch::Urgency;
+use velarx_recv_core::{self as recv_core, Reading, Status, Turn, ABSENT, FAILED, HERE, NO_ROOM};
 use velarx_request_core as request_core;
 use velarx_storage::ChunkFile;
 use velarx_types::digest::{Algorithm, Digest, Kind};
@@ -110,11 +111,6 @@ pub const OP_SIGNATURES: u8 = 5;
 /// The longest reference (a name with its tag, or a digest) of a request
 /// for signatures.
 const MAX_REFERENCE: usize = 512;
-const ABSENT: u8 = 0;
-const HERE: u8 = 1;
-const NO_ROOM: u8 = 2;
-/// The server could not read its store: not the same as having no chunk.
-const FAILED: u8 = 3;
 
 /// What a peer answers when it could not read its store: the peer and the
 /// connection work, the chunk is neither absent nor here.  The asker asks
@@ -642,8 +638,7 @@ pub struct Reply {
     _send: quinn::SendStream,
     recv: quinn::RecvStream,
     asked: Vec<(String, Option<u64>)>,
-    next: usize,
-    payload: u64,
+    answer: Reading,
     later: Vec<(String, Option<u64>)>,
     /// Whether the peer could not read its store for one of the chunks
     failed: bool,
@@ -661,7 +656,7 @@ impl Reply {
         match self.answered().await {
             Err(e) if store_failed(&e) => {
                 self.failed = true;
-                self.next = self.asked.len();
+                self.answer.end();
                 Ok(None)
             }
             answered => answered,
@@ -669,32 +664,32 @@ impl Reply {
     }
 
     async fn answered(&mut self) -> io::Result<Option<(String, Vec<u8>)>> {
-        while self.next < self.asked.len() {
-            let (digest, size) = &self.asked[self.next];
-            self.next += 1;
+        // (the turn is claimed before the status byte is read: when that
+        // read fails, the digest is unanswered and is asked again)
+        while let Some(at) = self.answer.claim() {
+            let (digest, size) = &self.asked[at];
             let mut status = [0u8; 1];
             read(&mut self.recv, &mut status, self.idle).await?;
-            match status[0] {
-                ABSENT => continue,
-                NO_ROOM => {
+            match recv_core::turn(status[0]) {
+                Turn::Absent => continue,
+                Turn::NoRoom => {
                     self.later.push((digest.clone(), *size));
                     continue;
                 }
-                HERE => {}
+                Turn::Here => {}
                 // (that chunk is for another peer; the others still come)
-                FAILED => {
+                Turn::Failed => {
                     self.failed = true;
                     continue;
                 }
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "a bad answer")),
+                Turn::Bad => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "a bad answer"))
+                }
             }
             let mut len = [0u8; 8];
             read(&mut self.recv, &mut len, self.idle).await?;
             let len = u64::from_be_bytes(len);
-            if len > MAX_ITEM_BYTES as u64
-                || size.is_some_and(|s| s != len)
-                || (self.payload > 0 && self.payload + len > MAX_RESPONSE_PAYLOAD as u64)
-            {
+            if !self.answer.take(len, *size) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "a chunk of another size than the one asked, or too many bytes",
@@ -706,7 +701,6 @@ impl Reply {
                 self.received
                     .fetch_add(piece.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
-            self.payload += len;
             return Ok(Some((digest.clone(), data)));
         }
         Ok(None)
@@ -720,7 +714,7 @@ impl Reply {
     /// What did not come of an answer that failed: what the server had no
     /// room for, the chunk it was sending and the ones after it.
     fn unanswered(self) -> Vec<(String, Option<u64>)> {
-        let from = self.next.saturating_sub(1);
+        let from = self.answer.next().saturating_sub(1);
         let mut left = self.later;
         left.extend(self.asked.into_iter().skip(from));
         left
@@ -972,8 +966,11 @@ impl Quic {
             _send: send,
             recv,
             asked: digests.to_vec(),
-            next: 0,
-            payload: 0,
+            answer: Reading::new(
+                digests.len(),
+                MAX_ITEM_BYTES as u64,
+                MAX_RESPONSE_PAYLOAD as u64,
+            ),
             later: Vec::new(),
             failed: false,
             idle: self.idle,
@@ -1156,20 +1153,18 @@ impl Quic {
         let (_send, mut recv) = self.open(addr, head, &Via::Primary).await?;
         let mut status = [0u8; 1];
         read(&mut recv, &mut status, self.idle).await?;
-        if status[0] == ABSENT {
-            return Ok(None);
-        }
-        if status[0] == FAILED {
-            return Err(store_failure());
-        }
-        // (it may have one: nothing is known of it)
-        if status[0] == NO_ROOM {
-            return Err(io::Error::other(NoRoom));
+        match recv_core::status(status[0]) {
+            Status::Absent => return Ok(None),
+            Status::Failed => return Err(store_failure()),
+            // (it may have one: nothing is known of it)
+            Status::NoRoom => return Err(io::Error::other(NoRoom)),
+            Status::Bad => return Err(io::Error::new(io::ErrorKind::InvalidData, "a bad index")),
+            Status::Here => {}
         }
         let mut len = [0u8; 8];
         read(&mut recv, &mut len, self.idle).await?;
         let len = u64::from_be_bytes(len);
-        if status[0] != HERE || len == 0 || len > max {
+        if !recv_core::item(len, max) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "a bad index"));
         }
         let mut data = vec![0u8; len as usize];
@@ -1185,12 +1180,12 @@ impl Quic {
         let (_send, mut recv) = self.open(addr, &head, &Via::Primary).await?;
         let mut status = [0u8; 1];
         read(&mut recv, &mut status, self.idle).await?;
-        match status[0] {
-            HERE => Ok(Presence::Has),
-            ABSENT => Ok(Presence::Lacks),
-            NO_ROOM => Ok(Presence::Busy),
-            FAILED => Err(store_failure()),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "a bad answer")),
+        match recv_core::status(status[0]) {
+            Status::Here => Ok(Presence::Has),
+            Status::Absent => Ok(Presence::Lacks),
+            Status::NoRoom => Ok(Presence::Busy),
+            Status::Failed => Err(store_failure()),
+            Status::Bad => Err(io::Error::new(io::ErrorKind::InvalidData, "a bad answer")),
         }
     }
 
@@ -2220,7 +2215,7 @@ impl Server {
                     !full
                         && c.len > 0
                         && c.len <= piece
-                        && (payload == 0 || payload + c.len <= MAX_RESPONSE_PAYLOAD as u64)
+                        && recv_core::room(payload, c.len, MAX_RESPONSE_PAYLOAD as u64)
                 };
                 match file {
                     Ok(Some(c)) if joins(&c, payload) => {
@@ -2343,7 +2338,7 @@ impl Server {
     ) -> io::Result<Sent> {
         // too large is absent, no room is for another answer
         let mut fits = |len: u64| {
-            let room = *payload == 0 || *payload + len <= MAX_RESPONSE_PAYLOAD as u64;
+            let room = recv_core::room(*payload, len, MAX_RESPONSE_PAYLOAD as u64);
             *full |= !room;
             room && len <= MAX_ITEM_BYTES as u64
         };
@@ -3351,6 +3346,45 @@ mod tests {
         assert_eq!(found, vec![(digest_of(&good), bad)]);
         assert!(!crate::limits::names(&found[0].0, &found[0].1));
         assert_eq!(s.served(), 1);
+    }
+
+    /// An answer whose second status byte does not come in time is
+    /// unanswered from that digest on, not from the one before: the chunk
+    /// that was taken is not asked again.
+    #[tokio::test]
+    async fn a_status_byte_that_does_not_come_leaves_its_digest_unanswered() {
+        struct Slow(HashMap<String, Vec<u8>>);
+        impl ChunkProvider for Slow {
+            fn get_chunk(&self, digest: &str) -> std::io::Result<Option<Vec<u8>>> {
+                if digest == digest_of(b"bb") {
+                    std::thread::sleep(Duration::from_millis(1500));
+                }
+                Ok(self.0.get(digest).cloned())
+            }
+        }
+        let items: Vec<Vec<u8>> = vec![b"aa".to_vec(), b"bb".to_vec(), b"cc".to_vec()];
+        let slow = Slow(items.iter().map(|c| (digest_of(c), c.clone())).collect());
+        let (_server, addr) = bind_with(served(Arc::new(slow)), Limits::default());
+        let client = Quic::bind_with(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::default(),
+            KEY,
+            Limits {
+                idle: Duration::from_millis(300),
+                ..Limits::default()
+            },
+            Arc::default(),
+        )
+        .unwrap();
+        let asked: Vec<(String, Option<u64>)> =
+            items.iter().map(|c| (digest_of(c), None)).collect();
+        let mut reply = client.request(addr, &asked, Urgency::Wait).await.unwrap();
+        assert_eq!(reply.next().await.unwrap().unwrap().1, b"aa");
+        assert_eq!(
+            reply.next().await.unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(reply.unanswered(), asked[1..].to_vec());
     }
 
     #[tokio::test]

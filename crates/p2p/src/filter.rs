@@ -57,13 +57,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
+pub use velarx_recv_core::Said;
+use velarx_recv_core::{delta_ok, full_ok, full_text_ok, OnDelta, OnFull, Seen, MAX_FILTER_BYTES};
 
 /// The keys a filter is sized for at least.
 pub const MIN_CAPACITY: usize = 256;
 /// The hashes of a filter, at most.
-pub const MAX_HASHES: u8 = 16;
+pub const MAX_HASHES: u8 = velarx_recv_core::MAX_HASHES;
 /// The keys one delta carries, at most (more are sent as a whole filter).
-pub const MAX_DELTA_KEYS: usize = 8192;
+pub const MAX_DELTA_KEYS: usize = velarx_recv_core::MAX_DELTA_KEYS;
 /// How often a node sends each peer its whole filter, whatever changed (each
 /// time a random part of a fifth more or less: nodes that started together
 /// do not all send at once).
@@ -562,12 +564,9 @@ pub async fn run<F>(
 /// The filter of one peer, and what this node saw of it.
 pub struct Received {
     bloom: Option<Bloom>,
-    /// The run of the sender the filter held is of, and its version
-    epoch: u64,
-    version: u64,
-    /// The last version of that run heard of: when it is past `version`, a
-    /// message is missing and the filter does not say "no"
-    heard: u64,
+    /// The run and the version of the sender the filter held is of, and
+    /// what was heard of it
+    seen: Seen,
     at: Instant,
     /// What it said "maybe" to that it then served, and that it did not have
     pub hits: u64,
@@ -577,22 +576,11 @@ pub struct Received {
     pub last_refused: Option<Refused>,
 }
 
-/// What a filter says of a layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Said {
-    Maybe,
-    No,
-    /// No filter that is believed: the peer is asked as before filters
-    Unknown,
-}
-
 impl Received {
     pub fn new(now: Instant) -> Self {
         Self {
             bloom: None,
-            epoch: 0,
-            version: 0,
-            heard: 0,
+            seen: Seen::new(),
             at: now,
             hits: 0,
             false_positives: 0,
@@ -610,7 +598,7 @@ impl Received {
     }
 
     pub fn version(&self) -> u64 {
-        self.version
+        self.seen.version()
     }
 
     pub fn age(&self, now: Instant) -> Duration {
@@ -633,22 +621,14 @@ impl Received {
     /// was lost, comes later, or is of another run): its "no" is not
     /// believed then.
     pub fn behind(&self) -> bool {
-        self.heard > self.version
+        self.seen.behind()
     }
 
     /// What its filter says of `key`.
     pub fn says(&self, key: u64, now: Instant) -> Said {
         match &self.bloom {
-            Some(b) if self.believed(now) => {
-                if b.contains(key) {
-                    Said::Maybe
-                } else if self.behind() {
-                    Said::Unknown
-                } else {
-                    Said::No
-                }
-            }
-            _ => Said::Unknown,
+            Some(b) => self.seen.says(self.believed(now), b.contains(key)),
+            None => Said::Unknown,
         }
     }
 
@@ -661,21 +641,19 @@ impl Received {
 
     /// A whole filter of the peer.
     pub fn full(&mut self, f: &FilterFull, now: Instant) -> Result<(), Refused> {
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(&f.bits)
-            .map_err(|_| Refused::Malformed)
-            .and_then(|r| {
-                if r.is_empty() || r.len() % 8 != 0 {
-                    Err(Refused::Malformed)
-                } else {
-                    Ok(r)
-                }
-            });
-        let raw = raw.map_err(|e| self.refuse(e))?;
-        if f.hashes == 0 || f.hashes > MAX_HASHES {
-            return Err(self.refuse(Refused::Malformed));
-        }
-        if f.epoch == self.epoch && f.version < self.version && self.bloom.is_some() {
+        // (the size is judged before the text is decoded)
+        let decoded = if full_text_ok(f.bits.len(), MAX_FILTER_BYTES) {
+            base64::engine::general_purpose::STANDARD
+                .decode(&f.bits)
+                .ok()
+        } else {
+            None
+        };
+        let raw = match decoded {
+            Some(raw) if full_ok(raw.len(), f.hashes) => raw,
+            _ => return Err(self.refuse(Refused::Malformed)),
+        };
+        if self.seen.full(f.epoch, f.version, self.bloom.is_some()) == OnFull::Stale {
             // (an older filter that came after a newer one)
             return Ok(());
         }
@@ -693,51 +671,39 @@ impl Received {
             ones,
             keys: f.keys,
         };
-        if f.epoch != self.epoch {
-            // (a new run of the sender: what was heard of the run before
-            // does not count)
-            self.epoch = f.epoch;
-            self.heard = 0;
-        }
         self.bloom = Some(bloom);
-        self.version = f.version;
-        self.heard = self.heard.max(f.version);
         self.at = now;
         Ok(())
     }
 
     /// What the peer added to its filter.
     pub fn delta(&mut self, d: &FilterDelta, now: Instant) -> Result<(), Refused> {
-        if d.epoch != self.epoch {
-            // (a new run of the sender whose whole filter has not come: the
-            // one held may lack what that run holds, and says no "no" until
-            // it comes; its keys are added all the same)
-            self.epoch = d.epoch;
-            self.version = 0;
-            self.heard = d.to;
-        } else if d.to <= self.version {
-            // (what the filter held already has)
-            return Ok(());
+        // (a delta of a new run of the sender, whose whole filter has not
+        // come, is added all the same: the filter says no "no" until it
+        // comes; so is one that does not follow, a message is missing)
+        match self.seen.delta(d.epoch, d.to, self.bloom.is_some()) {
+            OnDelta::Stale | OnDelta::Skip => return Ok(()),
+            OnDelta::Add => {}
         }
-        // (a delta that does not follow is a message missing: the filter
-        // says no "no" until a whole one of the last version heard of)
-        self.heard = self.heard.max(d.to);
-        let Some(bloom) = self.bloom.as_mut() else {
-            // (the whole filter is on its way, or was refused)
-            return Ok(());
+        // (the size is judged before the text is decoded: a delta is at
+        // most `MAX_DELTA_KEYS` keys of 8 bytes, as base64)
+        let decoded = if full_text_ok(d.added.len(), MAX_DELTA_KEYS * 8) {
+            base64::engine::general_purpose::STANDARD
+                .decode(&d.added)
+                .ok()
+        } else {
+            None
         };
-        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&d.added) else {
-            return Err(self.refuse(Refused::Malformed));
+        let raw = match decoded {
+            Some(raw) if delta_ok(raw.len()) => raw,
+            _ => return Err(self.refuse(Refused::Malformed)),
         };
-        if raw.is_empty() || raw.len() % 8 != 0 {
-            return Err(self.refuse(Refused::Malformed));
+        if let Some(bloom) = self.bloom.as_mut() {
+            for key in raw.as_chunks::<8>().0 {
+                bloom.insert(u64::from_le_bytes(*key));
+            }
         }
-        for key in raw.as_chunks::<8>().0 {
-            bloom.insert(u64::from_le_bytes(*key));
-        }
-        if d.from == self.version {
-            self.version = d.to;
-        }
+        self.seen.added(d.from, d.to);
         self.at = now;
         Ok(())
     }
@@ -1061,6 +1027,116 @@ mod tests {
             assert_eq!(r.full(&bad, now), Err(Refused::Malformed), "{bad:?}");
             assert_eq!(r.says(key_of(&layer(1)), now), Said::Unknown);
         }
+    }
+
+    /// What a peer's messages do to the filter held, in the order they come:
+    /// the version it follows, whether a message is missing, what is said.
+    #[test]
+    fn the_messages_of_a_peer_move_the_filter_held_as_their_order_says() {
+        let now = Instant::now();
+        let enc = |keys: &[u64]| {
+            let raw: Vec<u8> = keys.iter().flat_map(|k| k.to_le_bytes()).collect();
+            base64::engine::general_purpose::STANDARD.encode(raw)
+        };
+        let whole = |epoch, version, keys: &[u64]| {
+            let mut b = Bloom::new(256, 0.01, 256 << 10, 3);
+            for k in keys {
+                b.insert(*k);
+            }
+            FilterFull {
+                epoch,
+                version,
+                salt: 3,
+                hashes: b.hashes(),
+                keys: keys.len() as u32,
+                bits: b.wire_bits(),
+            }
+        };
+        let delta = |epoch, from, to, keys: &[u64]| FilterDelta {
+            epoch,
+            from,
+            to,
+            added: enc(keys),
+        };
+        let (a, b, c, absent) = (11u64, 22u64, 33u64, 44u64);
+        let mut r = Received::new(now);
+        // a delta with no filter to add to is noted only
+        r.delta(&delta(1, 1, 2, &[b]), now).unwrap();
+        assert!(r.bloom().is_none() && r.behind());
+        assert_eq!(r.says(a, now), Said::Unknown);
+        // the whole filter of that run, older than the last heard of
+        r.full(&whole(1, 1, &[a]), now).unwrap();
+        assert_eq!((r.version(), r.behind()), (1, true));
+        assert_eq!(r.says(a, now), Said::Maybe);
+        assert_eq!(r.says(absent, now), Said::Unknown);
+        // the delta that follows it closes the gap
+        r.delta(&delta(1, 1, 2, &[b]), now).unwrap();
+        assert_eq!((r.version(), r.behind()), (2, false));
+        assert_eq!(r.says(b, now), Said::Maybe);
+        assert_eq!(r.says(absent, now), Said::No);
+        // an older whole filter, and a delta already held: nothing
+        r.full(&whole(1, 1, &[]), now).unwrap();
+        r.delta(&delta(1, 1, 2, &[absent]), now).unwrap();
+        assert_eq!((r.version(), r.behind()), (2, false));
+        assert_eq!(r.says(a, now), Said::Maybe);
+        assert_eq!(r.says(absent, now), Said::No);
+        // a delta of another run: added, and no "no" until its whole filter
+        r.delta(&delta(2, 1, 2, &[c]), now).unwrap();
+        assert_eq!((r.version(), r.behind()), (0, true));
+        assert_eq!(r.says(c, now), Said::Maybe);
+        assert_eq!(r.says(absent, now), Said::Unknown);
+        r.full(&whole(2, 2, &[c]), now).unwrap();
+        assert_eq!((r.version(), r.behind()), (2, false));
+        assert_eq!(r.says(a, now), Said::No);
+        // a delta that is not whole words drops the filter
+        let mut bad = delta(2, 2, 3, &[a]);
+        bad.added = base64::engine::general_purpose::STANDARD.encode([1u8; 5]);
+        assert_eq!(r.delta(&bad, now), Err(Refused::Malformed));
+        assert!(r.bloom().is_none());
+        assert_eq!((r.refused, r.says(c, now)), (1, Said::Unknown));
+    }
+
+    /// A peer cannot make a node hold or decode more than a node may send:
+    /// a filter above the largest one a node can be set to send, and a delta
+    /// of more keys than a node sends, are refused.
+    #[test]
+    fn what_is_bigger_than_a_node_sends_is_refused() {
+        let now = Instant::now();
+        let enc = |bytes: usize| base64::engine::general_purpose::STANDARD.encode(vec![0u8; bytes]);
+        let whole = |bytes: usize| FilterFull {
+            epoch: 1,
+            version: 1,
+            salt: 1,
+            hashes: 7,
+            keys: 0,
+            bits: enc(bytes),
+        };
+        let mut r = Received::new(now);
+        r.full(&whole(MAX_FILTER_BYTES), now).unwrap();
+        assert_eq!(r.bytes(), MAX_FILTER_BYTES);
+        assert_eq!(
+            r.full(&whole(MAX_FILTER_BYTES + 8), now),
+            Err(Refused::Malformed)
+        );
+        assert!(r.bloom().is_none());
+        // (not even decoded: the text alone is too long)
+        let mut long = whole(8);
+        long.bits = "A".repeat(MAX_FILTER_BYTES / 3 * 4 + 8);
+        assert_eq!(r.full(&long, now), Err(Refused::Malformed));
+        r.full(&whole(8), now).unwrap();
+        let delta = |keys: usize, to| FilterDelta {
+            epoch: 1,
+            from: to - 1,
+            to,
+            added: enc(keys * 8),
+        };
+        r.delta(&delta(MAX_DELTA_KEYS, 2), now).unwrap();
+        assert!(r.bloom().is_some());
+        assert_eq!(
+            r.delta(&delta(MAX_DELTA_KEYS + 1, 3), now),
+            Err(Refused::Malformed)
+        );
+        assert!(r.bloom().is_none());
     }
 
     /// A filter that says "maybe" and is wrong most of the time is not

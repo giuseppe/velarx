@@ -47,6 +47,7 @@ velarx-storage = { path = "../storage" }
 velarx-fuse = { path = "../fuse" }
 velarx-group-core = { path = "../group-core" }
 velarx-revoke-core = { path = "../revoke-core" }
+velarx-recv-core = { path = "../recv-core" }
 velarx-request-core = { path = "../request-core" }
 
 # chunk transfer between peers over QUIC (quic.rs)

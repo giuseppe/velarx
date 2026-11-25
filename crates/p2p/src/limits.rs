@@ -10,6 +10,7 @@ pub const MAX_ITEM_BYTES: usize = velarx_storage::MAX_SERVED_BYTES;
 /// Bytes of chunks in one response; the first chunk is served up to
 /// [`MAX_ITEM_BYTES`] whatever the rest weighs.
 pub const MAX_RESPONSE_PAYLOAD: usize = 16 * 1024 * 1024;
+const _: () = assert!(MAX_ITEM_BYTES <= MAX_RESPONSE_PAYLOAD);
 
 /// The largest message of the gossip on the wire, and of an answer to one.
 pub const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
