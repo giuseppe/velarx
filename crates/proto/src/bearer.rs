@@ -42,7 +42,9 @@ impl Token {
                 meta.uid()
             ));
         }
-        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut &file, &mut bytes)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         Self::new(&bytes).map_err(|e| format!("{}: {e}", path.display()))
     }
 
