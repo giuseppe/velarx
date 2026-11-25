@@ -216,6 +216,50 @@ YAML
     check "kube play: DirectoryOrCreate made the host path" 1 "$(test -d "$WORKDIR/hostdir/made" && echo 1)"
 }
 
+@test "kube play: a subPath of a hostPath is looked up inside it" {
+    h=$WORKDIR/hsub
+    rm -rf "$h"
+    mkdir -p "$h/dir"
+    echo indir > "$h/dir/f"
+    echo conf > "$h/app.conf"
+    ln -s / "$h/escape"
+    e2e_label_for_containers "$h"
+    cat > "$WORKDIR/hsub.yaml" <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: khsub
+spec:
+  containers:
+  - name: c
+    image: $IMAGE
+    command: [sleep, "1000"]
+    volumeMounts:
+    - {name: h, mountPath: /d, subPath: dir}
+    - {name: h, mountPath: /etc/app.conf, subPath: app.conf, readOnly: true}
+    - {name: h, mountPath: /e, subPath: escape}
+  volumes:
+  - name: h
+    hostPath: {path: $h}
+YAML
+    kc play --tls-verify=false "$WORKDIR/hsub.yaml" > /dev/null
+    check "kube play" 0 $?
+    check "a directory of the host path" indir "$(sc container exec khsub-c cat /d/f 2>&1)"
+    check "a file of the host path" conf "$(sc container exec khsub-c cat /etc/app.conf 2>&1)"
+    check "a link to / is the host path" "ok" \
+        "$(sc container exec khsub-c sh -c 'test -f /e/app.conf && test ! -e /e/usr && echo ok' 2>&1)"
+    # a link put in place of the directory after the play: the next start
+    # looks the sub path up inside the host path again
+    sc container stop -t 0 khsub-c > /dev/null
+    rm -rf "$h/dir"
+    ln -s /etc "$h/dir"
+    out=$(sc container start khsub-c 2>&1)
+    rc=$?
+    check "the start through a link that leads out fails" 1 "$(test $rc -ne 0 && echo 1)"
+    check_match "the start says why" "has no dir" "$out"
+    kc down "$WORKDIR/hsub.yaml" > /dev/null
+}
+
 @test "kube play of an existing pod fails, --replace and --start=false" {
     kc play --tls-verify=false "$WORKDIR/kube.yaml" > /dev/null 2>&1
     check "kube play of an existing pod fails" 125 $?

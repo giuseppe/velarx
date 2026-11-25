@@ -469,7 +469,7 @@ pub fn chown_path(path: &std::path::Path, uid: u32, gid: u32) -> io::Result<()> 
     fs::chownat(fs::CWD, path, Some(u), Some(g), AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)
 }
 
-pub use velarx_runtime::fsdir::{open_dir, open_dir_in_root};
+pub use velarx_runtime::fsdir::{open_dir, open_dir_in_root, open_path_in_root};
 
 /// Whether a directory has no entry.
 pub fn is_empty(dir: BorrowedFd<'_>) -> io::Result<bool> {

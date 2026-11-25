@@ -567,32 +567,23 @@ mod imp {
         out
     }
 
-    /// A directory of a volume: looked up inside the volume, and what was
-    /// looked up is what is mounted (a clone of the mount at that
-    /// descriptor), so another container of the volume that swaps a
-    /// directory for a link cannot lead the mount out of it.
+    /// A directory or a file of a volume (or of a host directory): looked
+    /// up inside the volume, and what was looked up is what is mounted (a
+    /// clone of the mount at that descriptor), so another container of the
+    /// volume that swaps it for a link cannot lead the mount out of it.
     fn mount_subpath_volume(v: &SubpathVolume) -> io::Result<()> {
-        use rustix::fs::{Mode, OFlags, ResolveFlags};
+        use rustix::fs::FileType;
         use rustix::mount::{move_mount, open_tree, MoveMountFlags, OpenTreeFlags};
         let fail = |what: &str, e: rustix::io::Errno| io_err(format!("{what} failed: {e}"));
-        let root = crate::fsdir::open_dir(&v.volume)?;
-        let rel = v.subpath.trim_start_matches('/');
-        let rel = if rel.is_empty() { "." } else { rel };
-        let dir = velarx_sys::fs::openat2_retry(
-            std::os::fd::AsFd::as_fd(&root),
-            rel,
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
-        )
-        .map_err(|e| match e {
-            rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR => {
-                io_err(format!("the volume has no directory {}", v.subpath))
-            }
-            e => fail("openat2", e),
-        })?;
+        let root = crate::fsdir::open_dir(&v.volume)
+            .map_err(|e| io_err(format!("{}: {e}", v.volume.display())))?;
+        let found =
+            crate::fsdir::open_path_in_root(std::os::fd::AsFd::as_fd(&root), &v.subpath)?
+                .ok_or_else(|| io_err(format!("{} has no {}", v.volume.display(), v.subpath)))?;
+        let is_dir = FileType::from_raw_mode(rustix::fs::fstat(&found).map_err(io_err)?.st_mode)
+            == FileType::Directory;
         let tree = open_tree(
-            &dir,
+            &found,
             "",
             OpenTreeFlags::OPEN_TREE_CLONE
                 | OpenTreeFlags::OPEN_TREE_CLOEXEC
@@ -601,7 +592,25 @@ mod imp {
         )
         .map_err(|e| fail("open_tree", e))?;
         velarx_fuse::detach_stale(&v.target)?;
-        std::fs::create_dir_all(&v.target)?;
+        // the mount point (in the bundle) is of the kind of what is mounted,
+        // which may not be the kind it had at the previous start
+        match std::fs::symlink_metadata(&v.target) {
+            Ok(m) if m.is_dir() && !is_dir => std::fs::remove_dir(&v.target)?,
+            Ok(m) if !m.is_dir() && is_dir => std::fs::remove_file(&v.target)?,
+            _ => {}
+        }
+        if is_dir {
+            std::fs::create_dir_all(&v.target)?;
+        } else {
+            if let Some(parent) = v.target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&v.target)?;
+        }
         move_mount(
             &tree,
             "",
@@ -1180,6 +1189,92 @@ mod imp {
                 e.contains("image mount /v0") && e.contains("type=image"),
                 "{e}"
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod subpath_volume_tests {
+        use super::*;
+
+        /// A directory or a file of a volume (or of a host directory) is
+        /// looked up inside it: a link that points at `/` or at a host path
+        /// shows the root of the volume, or nothing, never the host.
+        #[test]
+        fn a_link_in_the_volume_does_not_lead_out_of_it() {
+            velarx_base::testing::in_child(|| {
+                use rustix::thread::UnshareFlags;
+                let uid = rustix::process::getuid().as_raw();
+                let gid = rustix::process::getgid().as_raw();
+                let root = rustix::process::geteuid().is_root();
+                let flags = if root {
+                    UnshareFlags::NEWNS
+                } else {
+                    UnshareFlags::NEWNS | UnshareFlags::NEWUSER
+                };
+                // (no skip: the test fails where it cannot be run)
+                velarx_sys::ns::unshare(flags)
+                    .expect("a mount namespace (and a user namespace) for this test");
+                if !root {
+                    std::fs::write("/proc/self/setgroups", "deny").unwrap();
+                    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1")).unwrap();
+                    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1")).unwrap();
+                }
+                rustix::mount::mount_change(
+                    "/",
+                    rustix::mount::MountPropagationFlags::PRIVATE
+                        | rustix::mount::MountPropagationFlags::REC,
+                )
+                .unwrap();
+                let d = tempfile::tempdir().unwrap();
+                let volume = d.path().join("volume");
+                std::fs::create_dir_all(volume.join("a/b")).unwrap();
+                std::fs::write(volume.join("a/b/file"), "inside").unwrap();
+                std::fs::write(volume.join("marker"), "root of the volume").unwrap();
+                std::os::unix::fs::symlink("/", volume.join("to-root")).unwrap();
+                std::os::unix::fs::symlink("/usr", volume.join("to-usr")).unwrap();
+                std::os::unix::fs::symlink("a/b/file", volume.join("to-file")).unwrap();
+                std::os::unix::fs::symlink("/etc/passwd", volume.join("to-passwd")).unwrap();
+                let mount = |sub: &str, n: u32| {
+                    let target = d.path().join(format!("t{n}"));
+                    let v = SubpathVolume {
+                        volume: volume.clone(),
+                        subpath: sub.into(),
+                        target: target.clone(),
+                    };
+                    mount_subpath_volume(&v).map(|()| target)
+                };
+                // an ordinary sub path is that directory
+                let at = mount("a", 0).unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(at.join("b/file")).unwrap(),
+                    "inside"
+                );
+                // `/` is the root of the volume, not of the host
+                let at = mount("to-root", 1).unwrap();
+                assert!(at.join("marker").exists() && !at.join("etc").exists());
+                // a host path is looked up in the volume, where it is not
+                let e = mount("to-usr", 2).unwrap_err().to_string();
+                assert!(e.contains("has no to-usr"), "{e}");
+                // a file is mounted on a file, also through a link inside
+                let at = mount("a/b/file", 3).unwrap();
+                assert_eq!(std::fs::read_to_string(&at).unwrap(), "inside");
+                let at = mount("to-file", 4).unwrap();
+                assert_eq!(std::fs::read_to_string(&at).unwrap(), "inside");
+                // ... and a link to a host file is not the host's
+                assert!(mount("to-passwd", 5).is_err());
+                // the next start mounts what the sub path is now: a
+                // directory where a file was (the mount point follows)
+                let at = d.path().join("t3");
+                rustix::mount::unmount(&at, rustix::mount::UnmountFlags::DETACH).unwrap();
+                std::fs::remove_file(volume.join("a/b/file")).unwrap();
+                std::fs::create_dir(volume.join("a/b/file")).unwrap();
+                std::fs::write(volume.join("a/b/file/in"), "now a directory").unwrap();
+                let at = mount("a/b/file", 3).unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(at.join("in")).unwrap(),
+                    "now a directory"
+                );
+            });
         }
     }
 

@@ -23,12 +23,27 @@ pub fn open_dir(path: &std::path::Path) -> io::Result<OwnedFd> {
 /// the root of the file system: absolute links and `..` stay inside.  `None`
 /// when it does not exist or is not a directory.
 pub fn open_dir_in_root(root: BorrowedFd<'_>, path: &str) -> io::Result<Option<OwnedFd>> {
+    open_in_root(
+        root,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOCTTY,
+    )
+}
+
+/// Look up `path` inside `root` as `open_dir_in_root` does, whatever it is
+/// (a directory, a file, a socket): a descriptor that only names it
+/// (`O_PATH`).  `None` when it does not exist.
+pub fn open_path_in_root(root: BorrowedFd<'_>, path: &str) -> io::Result<Option<OwnedFd>> {
+    open_in_root(root, path, OFlags::PATH | OFlags::CLOEXEC)
+}
+
+fn open_in_root(root: BorrowedFd<'_>, path: &str, flags: OFlags) -> io::Result<Option<OwnedFd>> {
     let rel = path.trim_start_matches('/');
     let rel = if rel.is_empty() { "." } else { rel };
     match velarx_sys::fs::openat2_retry(
         root,
         rel,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOCTTY,
+        flags,
         Mode::empty(),
         fs::ResolveFlags::IN_ROOT | fs::ResolveFlags::NO_MAGICLINKS,
     ) {

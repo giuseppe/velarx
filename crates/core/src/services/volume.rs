@@ -326,6 +326,15 @@ impl MountSpec {
         Ok(spec)
     }
 
+    /// Only the directory or file `subpath` of the source of a bind mount
+    /// (a hostPath of kube play): the start looks it up inside the source
+    /// again, so a link cannot lead out of it.  Not an option of `--mount`.
+    pub fn in_subpath(mut self, subpath: &str) -> VolumeResult<Self> {
+        self.options.subpath = Some(subpath.to_string());
+        self.validate()?;
+        Ok(self)
+    }
+
     /// A mount of an image (or a directory of it) given as values.
     pub fn image(image: &str, target: &str, subpath: Option<&str>) -> VolumeResult<Self> {
         let spec = MountSpec {
@@ -562,6 +571,12 @@ impl MountSpec {
                     .into(),
             ));
         }
+        // (the sub path of a bind mount is kube play's, not an option)
+        if mount_type == MountType::Bind && options.subpath.is_some() {
+            return Err(VolumeError::Parse(
+                "subpath is for volumes and images".into(),
+            ));
+        }
         let target = clean_target(
             &target.ok_or_else(|| VolumeError::Parse("must set volume destination".to_string()))?,
         )?;
@@ -648,9 +663,19 @@ impl MountSpec {
                 "an overlay volume (`O`) takes no subpath".into(),
             ));
         }
-        if o.subpath.is_some() && !matches!(self.mount_type, MountType::Volume | MountType::Image) {
+        if o.subpath.is_some()
+            && !matches!(
+                self.mount_type,
+                MountType::Volume | MountType::Image | MountType::Bind
+            )
+        {
             return Err(VolumeError::Parse(
                 "subpath is for volumes and images".into(),
+            ));
+        }
+        if o.subpath.is_some() && o.chown && self.mount_type == MountType::Bind {
+            return Err(VolumeError::Parse(
+                "the `U` option is not supported with the subpath of a bind mount".into(),
             ));
         }
         if o.chown && o.idmap.is_some() {
@@ -2023,6 +2048,7 @@ mod tests {
             "type=bind,src=/s,dst=/d,bind-propagation=x",
             "type=bind,src=/s,dst=/d,ro=maybe",
             "type=bind,src=/s,dst=/d,subpath=x",
+            "type=tmpfs,dst=/t,subpath=x",
             "type=volume,src=v,dst=/d,subpath=../x",
             "type=volume,src=v,dst=/d,subpath=",
             "type=tmpfs,dst=/t,idmap",
@@ -2095,6 +2121,25 @@ mod tests {
             .to_mount_config(Path::new("/vols"))
             .unwrap();
         assert_eq!(c.subpath.as_deref(), Some("sub"));
+        let c = MountSpec::bind("/h", "/i", &[])
+            .unwrap()
+            .in_subpath("sub")
+            .unwrap()
+            .to_mount_config(Path::new("/vols"))
+            .unwrap();
+        assert_eq!(
+            (c.source.as_str(), c.subpath.as_deref(), c.volume.as_deref()),
+            ("/h", Some("sub"), None)
+        );
+        // the sub path of a bind mount is checked as that of a volume, and
+        // takes no `U` (nothing would give it to the user)
+        let bind = |o: &[&str]| {
+            let o: Vec<String> = o.iter().map(|s| s.to_string()).collect();
+            MountSpec::bind("/h", "/i", &o).unwrap()
+        };
+        assert!(bind(&[]).in_subpath("../x").is_err());
+        assert!(bind(&[]).in_subpath("").is_err());
+        assert!(bind(&["U"]).in_subpath("x").is_err());
         let o = volume("/s:/d:ro").to_oci_mount(Path::new("/v")).unwrap();
         assert_eq!(
             (

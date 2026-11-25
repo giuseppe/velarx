@@ -781,11 +781,17 @@ pub async fn from_spec(
                     return Err(ApiError::bad_request("a bind mount without source"));
                 }
                 check_bind_options(&opts)?;
-                let mut arg = format!("{src}:{dest}");
-                if !opts.is_empty() {
-                    arg = format!("{arg}:{}", opts.join(","));
+                let sub = s(m, "subpath");
+                if sub.is_empty() {
+                    let mut arg = format!("{src}:{dest}");
+                    if !opts.is_empty() {
+                        arg = format!("{arg}:{}", opts.join(","));
+                    }
+                    add_volume_arg(state, &mut req, &arg).await?;
+                } else {
+                    let spec = MountSpec::bind(src, dest, &opts)?.in_subpath(sub)?;
+                    req.mounts.push(mount_from_spec(state, spec).await?);
                 }
-                add_volume_arg(state, &mut req, &arg).await?;
             }
             "tmpfs" => add_tmpfs(&mut req, dest, &opts.join(","))?,
             t => {

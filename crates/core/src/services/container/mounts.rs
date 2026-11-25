@@ -472,7 +472,10 @@ impl ContainerService {
                     overlay_index += 1;
                     continue;
                 }
-                if m.subpath.is_some() && m.volume.is_none() {
+                if m.subpath.is_some()
+                    && m.volume.is_none()
+                    && m.mount_type.as_deref() != Some("bind")
+                {
                     return Err(io_err(format!(
                         "the mount at {} has a subpath but no volume",
                         m.target
@@ -656,12 +659,22 @@ impl ContainerService {
                         // monitor looks it up again when it mounts it)
                         let vol_fd = match &sub {
                             None => vol_fd,
-                            Some(sub) => volcopy::open_dir_in_root(vol_fd.as_fd(), sub)?
-                                .ok_or_else(|| {
-                                    std::io::Error::other(format!(
-                                        "the volume has no directory {sub}"
-                                    ))
-                                })?,
+                            Some(sub) => match volcopy::open_dir_in_root(vol_fd.as_fd(), sub)? {
+                                Some(dir) => dir,
+                                // a file: nothing to copy into it
+                                None => {
+                                    let other = |m: String| std::io::Error::other(m);
+                                    volcopy::open_path_in_root(vol_fd.as_fd(), sub)?
+                                        .ok_or_else(|| other(format!("the volume has no {sub}")))?;
+                                    if chown_u {
+                                        return Err(other(format!(
+                                            "the U option needs a directory: {sub} of the \
+                                             volume is not one"
+                                        )));
+                                    }
+                                    return Ok(state);
+                                }
+                            },
                         };
                         // U: the directory that is mounted, through the
                         // descriptor that was looked up inside the volume
@@ -708,14 +721,22 @@ impl ContainerService {
                         self.volume_service.set_state(&name, &new_state).await?;
                     }
                     if subpath.is_some() {
-                        // the monitor mounts the directory at
-                        // `bundle/subvol/N`, the source of the mount
                         m.subpath_root = Some(vol.mountpoint.to_string_lossy().into_owned());
-                        let at = bundle.join("subvol").join(subpath_index.to_string());
-                        fs::create_dir_all(&at)?;
-                        m.source = at.to_string_lossy().into_owned();
-                        subpath_index += 1;
                     }
+                } else if m.subpath.is_some() {
+                    // a host directory: its sub path is looked up inside it
+                    // as in a volume
+                    let root = fs::canonicalize(&m.source)
+                        .map_err(|e| io_err(format!("the source {}: {e}", m.source)))?;
+                    m.subpath_root = Some(root.to_string_lossy().into_owned());
+                }
+                if m.subpath_root.is_some() {
+                    // the monitor mounts the directory or file at
+                    // `bundle/subvol/N`, the source of the mount
+                    let at = bundle.join("subvol").join(subpath_index.to_string());
+                    fs::create_dir_all(&at)?;
+                    m.source = at.to_string_lossy().into_owned();
+                    subpath_index += 1;
                 }
 
                 // (a sub path of a volume was given its owner above)

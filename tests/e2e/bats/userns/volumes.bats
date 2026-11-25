@@ -267,6 +267,9 @@ orig" "$out"
     check "volume subpath: writes go to the directory" "w" \
         "$(runo "--mount $SP,subpath=a" sh -c 'echo w > /d/new' > /dev/null; runo "-v spv:/v" cat /v/a/new)"
     check "volume subpath through a link stays in the volume" "inner" "$(runo "--mount $SP,subpath=root/a/b" cat /d/f)"
+    check "volume subpath: a file" "inner" "$(runo "--mount type=volume,src=spv,dst=/f,subpath=a/b/f" cat /f)"
+    runo "--mount type=volume,src=spv,dst=/f,subpath=a/b/f,U" true > /dev/null 2>&1
+    checkfail "volume subpath: U needs a directory" $?
     runo "--mount $SP,subpath=nope" true > /dev/null 2>&1
     checkfail "volume subpath: a missing directory" $?
     runo "--mount $SP,subpath=hostetc" true > /dev/null 2>&1
@@ -288,7 +291,7 @@ orig" "$out"
     out=$(sh_ container start -a "$id" 2>&1)
     check "volume subpath: a link swapped in does not lead out of the volume" 1 \
         "$(test "$out" != "$(cat /etc/hostname)" && echo 1)"
-    check_match "volume subpath: the start says why" "no directory a/b" "$out"
+    check_match "volume subpath: the start says why" "has no a/b" "$out"
     sh_ container rm -t 0 -f "$id" > /dev/null 2>&1
     out=$(runo "$MAPOPTS --mount $SP,subpath=a/b.old" cat /d/f)
     check "volume subpath under a mapping" "inner" "$out"

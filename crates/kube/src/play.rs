@@ -1469,16 +1469,14 @@ fn container_plan(
                 volumes.push(json!({"Name": "", "Dest": dest, "IsAnonymous": true}));
             }
             Some(PodVolume::Host(h)) => {
-                let source = if sub.is_empty() {
-                    h.path.clone()
-                } else {
-                    format!("{}/{sub}", h.path.trim_end_matches('/'))
-                };
                 let mut o = vec![json!("rbind")];
                 ro_opt(&mut o);
-                mounts.push(
-                    json!({"type": "bind", "source": source, "destination": dest, "options": o}),
-                );
+                let mut m =
+                    json!({"type": "bind", "source": h.path, "destination": dest, "options": o});
+                if !sub.is_empty() {
+                    m["subpath"] = json!(sub);
+                }
+                mounts.push(m);
             }
             Some(PodVolume::Tmpfs(size)) => {
                 if rro {
@@ -2091,6 +2089,7 @@ spec:
         - {name: data, mountPath: /data}
         - {name: data, mountPath: /sub, subPath: a/b, readOnly: true}
         - {name: host, mountPath: /host}
+        - {name: host, mountPath: /hostsub, subPath: web/x, readOnly: true}
         - {name: scratch, mountPath: /scratch}
         - {name: disk, mountPath: /disk}
         - {name: conf, mountPath: /etc/app}
@@ -2219,6 +2218,9 @@ spec:
             .any(|v| v["Name"] == "kweb-pod-conf" && v["Options"] == json!(["ro"])));
         let mounts = s["mounts"].as_array().unwrap();
         assert!(mounts.contains(&json!({"type": "bind", "source": "/srv/web", "destination": "/host", "options": ["rbind"]})));
+        // a sub path of a host directory is looked up inside it at each
+        // start, so the source is the directory itself
+        assert!(mounts.contains(&json!({"type": "bind", "source": "/srv/web", "destination": "/hostsub", "options": ["rbind", "ro"], "subpath": "web/x"})));
         assert!(mounts.contains(&json!({"type": "tmpfs", "source": "tmpfs", "destination": "/scratch", "options": ["rw", "size=16777216"]})));
         assert_eq!(pod_names(&docs), ["kweb-pod"]);
         assert_eq!(volume_names(&docs), ["kubeplayvol"]);
