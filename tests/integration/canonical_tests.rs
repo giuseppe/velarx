@@ -83,11 +83,31 @@ fn build_canonical(items: &[Item]) -> Built {
 
 /// `layer` with the table of contents `edit` makes of its own: the blob
 /// ends with the table and the footer, which are written again, and the
-/// annotations say where and what they are.
+/// annotations say where and what they are.  The layer is the one of a
+/// writer that has no binary table, so the JSON is what a pull reads.
 fn edited(
     layer: &Built,
     edit: impl FnOnce(&mut Toc),
     annotate: impl FnOnce(&mut HashMap<String, String>),
+) -> Built {
+    rewritten(layer, edit, annotate, false)
+}
+
+/// [`edited`] with the binary table of the edited table of contents before
+/// it, which the annotations name and a pull reads instead of the JSON.
+fn with_table(
+    layer: &Built,
+    edit: impl FnOnce(&mut Toc),
+    annotate: impl FnOnce(&mut HashMap<String, String>),
+) -> Built {
+    rewritten(layer, edit, annotate, true)
+}
+
+fn rewritten(
+    layer: &Built,
+    edit: impl FnOnce(&mut Toc),
+    annotate: impl FnOnce(&mut HashMap<String, String>),
+    table: bool,
 ) -> Built {
     let a = |k: &str| layer.annotations[&format!("{PREFIX}{k}")].clone();
     let position: Vec<usize> = a("manifest-position")
@@ -99,9 +119,29 @@ fn edited(
     )
     .unwrap();
     edit(&mut toc);
+    // (the metadata starts with the table, when the layer has one)
+    let start = layer
+        .annotations
+        .get(&format!("{PREFIX}table-position"))
+        .map_or(position[0], |p| {
+            p.split(':').next().unwrap().parse().unwrap()
+        });
+    let mut blob = layer.blob[..start - 8].to_vec();
+    let mut annotations = layer.annotations.clone();
+    annotations.retain(|k, _| !k.starts_with(&format!("{PREFIX}table-")));
+    if table {
+        let table = velarx_storage::table::encode(&toc, Algorithm::Sha256).unwrap();
+        let z = zstd::encode_all(&table[..], 3).unwrap();
+        blob.extend(skippable(z.len()));
+        annotations.insert(
+            format!("{PREFIX}table-position"),
+            format!("{}:{}:{}", blob.len(), z.len(), table.len()),
+        );
+        annotations.insert(format!("{PREFIX}table-checksum"), sha(&z).to_string());
+        blob.extend(&z);
+    }
     let json = serde_json::to_vec(&toc).unwrap();
     let z = zstd::encode_all(&json[..], 3).unwrap();
-    let mut blob = layer.blob[..position[0] - 8].to_vec();
     blob.extend(skippable(z.len()));
     let toc_offset = blob.len() as u64;
     blob.extend(&z);
@@ -112,7 +152,6 @@ fn edited(
     footer.extend(b"GNUlInUx");
     blob.extend(skippable(footer.len()));
     blob.extend(footer);
-    let mut annotations = layer.annotations.clone();
     annotations.insert(
         format!("{PREFIX}manifest-position"),
         format!("{toc_offset}:{}:{}:1", z.len(), json.len()),
@@ -283,19 +322,23 @@ async fn test_a_table_of_version_2_that_is_not_canonical_is_refused() {
         |toc| toc.tar_split_digest = Some(sha(b"split").to_string()),
         |_| {},
     );
-    let says_so = edited(
-        &good,
-        |_| {},
-        |a| {
-            a.insert(format!("{PREFIX}tarsplit-position"), "10:20:30".into());
-        },
-    );
+    let tar_split = |a: &mut HashMap<String, String>| {
+        a.insert(format!("{PREFIX}tarsplit-position"), "10:20:30".into());
+    };
+    let says_so_json = edited(&good, |_| {}, tar_split);
+    // (the layer as the writer made it, read by its binary table: a table
+    // has its paths in order, each a path, each file with its fs-verity
+    // digest, and no tar-split when it is canonical; what it can be told
+    // otherwise is the annotation)
+    let mut says_so_table = good.clone();
+    tar_split(&mut says_so_table.annotations);
     for (name, layer) in [
         ("swapped", &swapped),
         ("unnamed", &unnamed),
         ("unproven", &unproven),
         ("with a tar-split digest", &with_split),
-        ("with a tar-split position", &says_so),
+        ("with a tar-split position", &says_so_json),
+        ("a binary table with a tar-split position", &says_so_table),
     ] {
         for lazy in [false, true] {
             let e = eager_env().await;
@@ -421,12 +464,34 @@ async fn test_a_table_whose_sizes_are_not_possible_is_refused_and_stores_nothing
         |_| {},
     );
     let too_big = edited(&good, |t| another(t, "./zz", "ab", 2 << 30), |_| {});
+    // the same, read by the binary table a writer gives them
+    let huge_table = with_table(&good, |t| another(t, "./zz", "ab", u64::MAX), |_| {});
+    let wraps_table = with_table(
+        &good,
+        |t| {
+            another(t, "./zz", "ab", 1 << 63);
+            another(t, "./zzz", "cd", 1 << 63);
+        },
+        |_| {},
+    );
+    let too_big_table = with_table(&good, |t| another(t, "./zz", "ab", 2 << 30), |_| {});
     let hello = vid(b"hello\n");
     for (name, layer, says) in [
         ("two sizes", &two_sizes, "two sizes"),
         ("2^64-1 bytes", &huge, "tar is larger"),
         ("2^64 bytes in two files", &wraps, "tar is larger"),
         ("more than a layer may be", &too_big, "tar is larger"),
+        ("table: 2^64-1 bytes", &huge_table, "tar is larger"),
+        (
+            "table: 2^64 bytes in two files",
+            &wraps_table,
+            "tar is larger",
+        ),
+        (
+            "table: more than a layer may be",
+            &too_big_table,
+            "tar is larger",
+        ),
     ] {
         for lazy in [false, true] {
             let e = env_with(velarx_config::PullConfig {

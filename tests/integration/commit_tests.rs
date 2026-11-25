@@ -1030,11 +1030,7 @@ async fn test_a_layer_built_here_is_a_version_2_layer_to_every_reader() {
                 .await
                 .unwrap();
         }
-        let key = velarx_db::LayerKey::Toc(
-            layer.annotations[&format!("{PREFIX}manifest-checksum")]
-                .parse()
-                .unwrap(),
-        );
+        let key = velarx_db::LayerKey::expected(layer);
         let record = other.db.get_layer(&key).await.unwrap();
         assert_eq!(record.status, "ready", "lazy: {lazy}");
         let stored = stored_toc(&other.db, &key).await;
@@ -1054,11 +1050,7 @@ async fn test_a_layer_built_here_is_a_version_2_layer_to_every_reader() {
             .read_to_end(&mut back)
             .unwrap();
         assert_eq!(back, tar, "lazy: {lazy}");
-        let below = velarx_db::LayerKey::Toc(
-            manifest.layers[1].annotations[&format!("{PREFIX}manifest-checksum")]
-                .parse()
-                .unwrap(),
-        );
+        let below = velarx_db::LayerKey::expected(&manifest.layers[1]);
         assert!(other
             .db
             .get_layer_tarsplit(&below)

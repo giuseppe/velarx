@@ -86,16 +86,15 @@ impl Built {
         names
     }
 
-    /// The layer of the store a pull through its TOC makes: the TOC its
-    /// annotations name, or the blob of a layer without them.
+    /// The layer of the store a pull of it as a zstd layer makes, as the
+    /// pull keys it: by the table its annotations name, or by its blob.
     pub fn key(&self) -> velarx_db::LayerKey {
-        match self
-            .annotations
-            .get("io.github.containers.zstd-chunked.manifest-checksum")
-        {
-            Some(toc) => velarx_db::LayerKey::Toc(toc.parse().unwrap()),
-            None => self.whole(),
-        }
+        velarx_db::LayerKey::expected(&velarx_types::OciDescriptor {
+            media_type: ZSTD.into(),
+            digest: sha(&self.blob),
+            size: self.blob.len() as i64,
+            annotations: self.annotations.clone(),
+        })
     }
 
     /// The layer of the store a pull of the whole blob makes.
