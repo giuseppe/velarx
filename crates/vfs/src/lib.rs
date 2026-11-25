@@ -206,6 +206,22 @@ fn keep_tocs<T: std::borrow::Borrow<Toc>>(
 /// The image below a copy, with the ranges of its user and group ids.
 type Base3 = (Arc<MergedView>, Vec<IdRange>, Vec<IdRange>);
 
+/// The bytes of the regular files among `paths`, names below `root`.  A name
+/// is looked up from the descriptor, no link on the way is followed (the
+/// container that writes there may swap one in), and what is not a file, or
+/// is gone, adds nothing.
+fn files_size<'a>(root: std::os::fd::BorrowedFd<'_>, paths: impl Iterator<Item = &'a str>) -> u64 {
+    use velarx_sys::fs::{open_beneath, Beneath};
+    paths
+        .filter_map(|p| open_beneath(root, Path::new(p), Beneath::Path).ok())
+        .filter_map(|fd| rustix::fs::fstat(fd).ok())
+        .filter(|st| {
+            rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile
+        })
+        .map(|st| st.st_size as u64)
+        .sum()
+}
+
 fn io_error(e: std::io::Error) -> DriverError {
     if velarx_graph::directory::is_label_refused(&e) {
         return DriverError::label_refused(NAME, e);
@@ -1211,15 +1227,12 @@ impl StorageDriver for VfsDriver {
             ..Default::default()
         };
         let list = dirtar::copydiff::changes(fd.as_fd(), &opts).map_err(io_error)?;
-        Ok(list
-            .iter()
-            .filter(|(_, c)| *c != Change::Deleted)
-            .filter_map(|(p, _)| {
-                std::fs::symlink_metadata(upper.join(p.trim_start_matches('/'))).ok()
-            })
-            .filter(|m| m.is_file())
-            .map(|m| m.len())
-            .sum())
+        Ok(files_size(
+            fd.as_fd(),
+            list.iter()
+                .filter(|(_, c)| *c != Change::Deleted)
+                .map(|(p, _)| p.trim_start_matches('/')),
+        ))
     }
 
     fn writable_remove(&self, w: &Writable) -> DriverResult<()> {
@@ -2397,6 +2410,25 @@ mod tests {
             d.writable_size(&w).unwrap() >= 3,
             "no record: a copy of nothing"
         );
+    }
+
+    /// A directory swapped for a link to a host directory after the walk of
+    /// the changes adds nothing of the host's files to the size.
+    #[test]
+    fn the_size_counts_no_file_beyond_a_link() {
+        let t = tempfile::tempdir().unwrap();
+        let upper = t.path().join("upper");
+        let host = t.path().join("host");
+        std::fs::create_dir_all(upper.join("own")).unwrap();
+        std::fs::create_dir(&host).unwrap();
+        std::fs::write(upper.join("own/f"), b"123").unwrap();
+        std::fs::write(host.join("f"), b"hostfile").unwrap();
+        std::os::unix::fs::symlink(&host, upper.join("swapped")).unwrap();
+        std::os::unix::fs::symlink(host.join("f"), upper.join("link")).unwrap();
+        let fd = std::fs::File::open(&upper).unwrap();
+        let size = |names: &[&str]| files_size(fd.as_fd(), names.iter().copied());
+        assert_eq!(size(&["own/f"]), 3);
+        assert_eq!(size(&["swapped/f", "link", "own", "gone"]), 0);
     }
 
     /// The size of the layer of a container is what the container wrote: the
