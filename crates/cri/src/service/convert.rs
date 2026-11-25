@@ -543,8 +543,18 @@ pub fn container_create_of(
     let log_path = if cfg.log_path.is_empty() {
         String::new()
     } else {
+        let relative = std::path::Path::new(&cfg.log_path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(Status::invalid_argument(
+                "the log path is not inside the log directory of the pod",
+            ));
+        }
         std::path::Path::new(log_directory)
-            .join(&cfg.log_path)
+            .join(relative)
             .to_string_lossy()
             .into_owned()
     };
@@ -1384,6 +1394,20 @@ mod tests {
     #[test]
     fn a_cri_container_has_no_default_pids_limit() {
         assert_eq!(container(|_| {}).unwrap().pids_limit, Some(-1));
+    }
+
+    /// The log of a container stays in the log directory of its pod.
+    #[test]
+    fn a_log_path_outside_the_log_directory_is_refused() {
+        let with = |path: &str| container(|c| c.log_path = path.into());
+        assert_eq!(
+            with("web/2.log").unwrap().log_config.unwrap().config["path"],
+            "/log/web/2.log"
+        );
+        for path in ["/etc/passwd", "../x.log", "web/../../x.log", "web/.."] {
+            let e = with(path).unwrap_err();
+            assert_eq!(e.code(), tonic::Code::InvalidArgument, "{path}");
+        }
     }
 
     /// Every field of a container's config the engine applies has its place
