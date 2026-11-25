@@ -1576,7 +1576,7 @@ fn secret_data(fds: Vec<OwnedFd>, at: u32) -> Result<zeroize::Zeroizing<Vec<u8>>
 
 /// The error of an operation of the podman shaping, by the name of its
 /// condition.
-fn api_error(mut e: ApiError, kind: ErrorKind) -> EngineError {
+pub(crate) fn api_error(mut e: ApiError, kind: ErrorKind) -> EngineError {
     let shown = e.kind_or(kind);
     let state = e.is_invalid_state();
     let condition = e.condition();

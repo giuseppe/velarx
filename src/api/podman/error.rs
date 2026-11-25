@@ -330,6 +330,10 @@ impl From<velarx_types::ImageError> for ApiError {
                 ..Self::bad_request(velarx_types::not_lazy_text(&image, &layers))
                     .with_condition(Condition::ImageNotLazy)
             },
+            // (why, as the cause: the command turns it back into the refusal)
+            E::Contradicted(ref why) => Self::internal(e.to_string())
+                .with_cause(why.clone())
+                .with_condition(Condition::Contradicted),
             // (an image this engine cannot mount, too many layers for the
             // overlay or for the open files the process may have: what the
             // client sent is refused, nothing failed inside)

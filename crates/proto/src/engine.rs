@@ -1256,6 +1256,9 @@ pub enum EngineError {
         image: String,
         layers: Vec<NotLazyLayer>,
     },
+    /// A layer is refused because its table of contents contradicts its
+    /// tar stream: trying again gives the same
+    Contradicted { cause: String, message: String },
     /// Anything else: the engine tried and failed
     Failed { cause: String, message: String },
 }
@@ -1292,12 +1295,13 @@ pub enum Condition {
     InvalidContent,
     SourceUnavailable,
     ImageNotLazy,
+    Contradicted,
     Failed,
 }
 
 impl Condition {
     /// Every condition, in the order of the interface.
-    pub const ALL: [Condition; 30] = [
+    pub const ALL: [Condition; 31] = [
         Self::NoSuchContainer,
         Self::NoSuchImage,
         Self::NoSuchPod,
@@ -1327,6 +1331,7 @@ impl Condition {
         Self::InvalidContent,
         Self::SourceUnavailable,
         Self::ImageNotLazy,
+        Self::Contradicted,
         Self::Failed,
     ];
 
@@ -1362,6 +1367,7 @@ impl Condition {
             Self::InvalidContent => "InvalidContent",
             Self::SourceUnavailable => "SourceUnavailable",
             Self::ImageNotLazy => "ImageNotLazy",
+            Self::Contradicted => "Contradicted",
             Self::Failed => "Failed",
         }
     }
@@ -1401,6 +1407,7 @@ impl Condition {
             | Self::NoPasta
             | Self::InvalidContent
             | Self::SourceUnavailable
+            | Self::Contradicted
             | Self::NeedsForce
             | Self::Failed => 500,
         }
@@ -1471,6 +1478,7 @@ impl EngineError {
             | Self::InvalidContent { cause, message, .. }
             | Self::SourceUnavailable { cause, message, .. }
             | Self::ImageNotLazy { cause, message, .. }
+            | Self::Contradicted { cause, message }
             | Self::Failed { cause, message } => (cause, message),
         }
     }
@@ -1507,6 +1515,7 @@ impl EngineError {
             Self::InvalidContent { .. } => Condition::InvalidContent,
             Self::SourceUnavailable { .. } => Condition::SourceUnavailable,
             Self::ImageNotLazy { .. } => Condition::ImageNotLazy,
+            Self::Contradicted { .. } => Condition::Contradicted,
             Self::Failed { .. } => Condition::Failed,
         }
     }
@@ -1576,6 +1585,7 @@ impl EngineError {
                 image: String::new(),
                 layers: Vec::new(),
             },
+            Condition::Contradicted => Self::Contradicted { cause, message },
             Condition::Failed => Self::Failed { cause, message },
         }
     }
@@ -2967,6 +2977,7 @@ mod status_tests {
                     | C::InvalidContent
                     | C::SourceUnavailable
                     | C::ImageNotLazy
+                    | C::Contradicted
             ) {
                 let back = E::from_status(e.status(), state, c, "c".into(), "m".into());
                 assert_eq!(back.condition(), c, "{}", c.name());
@@ -2977,7 +2988,7 @@ mod status_tests {
             statuses,
             [
                 404, 404, 404, 404, 404, 404, 404, 404, 409, 409, 409, 404, 500, 400, 400, 400,
-                413, 403, 401, 501, 507, 502, 503, 500, 500, 500, 500, 500, 400, 500
+                413, 403, 401, 501, 507, 502, 503, 500, 500, 500, 500, 500, 400, 500, 500
             ]
         );
     }

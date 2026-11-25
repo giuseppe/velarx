@@ -140,6 +140,7 @@ fn image_error(e: EngineError) -> ImageError {
                 })
                 .collect(),
         },
+        EngineError::Contradicted { cause, .. } => ImageError::Contradicted(cause),
         EngineError::NoSuchImage { .. } => ImageError::NotFound(message),
         EngineError::Unauthorized { .. } => ImageError::Unauthorized(message),
         EngineError::PermissionDenied { .. } => ImageError::Forbidden(message),
@@ -250,5 +251,41 @@ impl PullHandOff for PullService {
         self.connect()
             .map(drop)
             .map_err(|e| unreachable(&self.config, e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::podman::error::ApiError;
+    use crate::engine_service::api_error;
+
+    /// A refused layer goes over the interface as its own condition and
+    /// comes back as the same class, with the reason it was refused for.
+    #[test]
+    fn a_refused_layer_keeps_its_class_over_the_interface() {
+        let sent = api_error(
+            ApiError::from(ImageError::Contradicted("tar-split differs".into())),
+            crate::api::podman::error::Kind::Image,
+        );
+        assert!(matches!(sent, EngineError::Contradicted { .. }), "{sent:?}");
+        // (a client of the interface reads what the command would say)
+        assert_eq!(
+            sent.parts(),
+            (
+                "tar-split differs",
+                "the layer is refused: tar-split differs"
+            )
+        );
+        let back = image_error(sent);
+        assert!(matches!(back, ImageError::Contradicted(_)), "{back:?}");
+        assert_eq!(back.to_string(), "the layer is refused: tar-split differs");
+        assert!(matches!(
+            image_error(EngineError::Failed {
+                cause: String::new(),
+                message: "x".into()
+            }),
+            ImageError::Pulling(_)
+        ));
     }
 }

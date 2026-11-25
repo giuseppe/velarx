@@ -112,7 +112,9 @@ pub(super) fn refused(e: wire::EngineError) -> EngineError {
         E::Unreachable { message, .. }
         | E::Unavailable { message, .. }
         | E::SourceUnavailable { message, .. } => EngineError::Unavailable(message),
-        E::InvalidContent { message, .. } => EngineError::DataLoss(message),
+        E::InvalidContent { message, .. } | E::Contradicted { message, .. } => {
+            EngineError::DataLoss(message)
+        }
         E::NotStarted { message, .. }
         | E::NeedsForce { message, .. }
         | E::CommandNotFound { message, .. }
