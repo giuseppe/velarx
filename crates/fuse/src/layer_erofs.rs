@@ -1607,6 +1607,58 @@ pub(crate) mod tests {
         assert_eq!(tree.resolve(&path), Some(dir));
     }
 
+    /// A path below an entry of the same layer that is not a directory is
+    /// refused by the image and by the merged view, whichever comes first
+    /// in the layer, and it is no layer for any kind of entry; across
+    /// layers a file over a directory (and a directory over a file) is
+    /// what an overlay does.
+    #[test]
+    fn a_path_below_what_is_not_a_directory_is_an_error() {
+        let mut link = entry("a", TocEntryType::Hardlink);
+        link.link_name = Some("f".into());
+        let mut symlink = entry("a", TocEntryType::Symlink);
+        symlink.link_name = Some("..".into());
+        let parents = [
+            (vec![], file("a", 1, 1)),
+            (vec![], symlink),
+            (vec![], device("a", false, 1, 2)),
+            (vec![], entry("a", TocEntryType::Fifo)),
+            (vec![file("f", 1, 1)], link),
+        ];
+        for (before, parent) in parents {
+            for first in [true, false] {
+                for below in ["a/b", "a/b/c", "a/.wh.b", "a/.wh..wh..opq"] {
+                    let child = file(below, 2, 1);
+                    let mut entries = before.clone();
+                    entries.extend(if first {
+                        [parent.clone(), child]
+                    } else {
+                        [child, parent.clone()]
+                    });
+                    let what = format!("{:?} then {below}, first: {first}", parent.entry_type);
+                    let e = layer_image(&entries).err().unwrap_or_default();
+                    assert!(
+                        e.contains("not a directory") || e.contains("directory into"),
+                        "{what}: {e}"
+                    );
+                    assert!(
+                        crate::MergedTree::build_entries(&[&entries]).is_err(),
+                        "{what}"
+                    );
+                }
+            }
+        }
+        let below = [file("a/b", 1, 1)];
+        let over = [file("a", 2, 1)];
+        let tree = crate::MergedTree::build_entries(&[&below, &over]).unwrap();
+        let a = tree.lookup(crate::merged::ROOT, "a").unwrap();
+        assert_eq!(tree.lookup(a, "b"), None);
+        assert!(layer_image(&over).is_ok());
+        let tree = crate::MergedTree::build_entries(&[&over, &below]).unwrap();
+        let a = tree.lookup(crate::merged::ROOT, "a").unwrap();
+        assert!(tree.lookup(a, "b").is_some());
+    }
+
     #[test]
     fn what_cannot_be_a_layer_is_an_error() {
         let mut hard = entry("a", TocEntryType::Hardlink);

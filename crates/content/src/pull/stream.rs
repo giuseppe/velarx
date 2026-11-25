@@ -721,6 +721,28 @@ mod tests {
         );
     }
 
+    /// A plain tar keeps the order of its entries and has no rule of order
+    /// (the table of a layer fetched whole is the one of version 1): a file
+    /// and a path below it, in either order, is read, and it is the image
+    /// of the layer that refuses it, at the pull, naming the path.
+    #[tokio::test]
+    async fn test_a_path_below_a_file_of_a_tar_is_read_and_refused_by_its_image() {
+        for files in [
+            [("a", &b"x"[..]), ("a/b", &b"y"[..])],
+            [("a/b", &b"y"[..]), ("a", &b"x"[..])],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = ctx(dir.path()).await;
+            let (gz, layer, diff) = layer_with(&files);
+            let ingested = ingest_bytes(&ctx, gz, &layer, &diff).await.unwrap();
+            assert_eq!(ingested.toc.entries.len(), 2);
+            let e = velarx_fuse::layer_erofs::layer_image(&ingested.toc.entries)
+                .err()
+                .unwrap();
+            assert!(e.contains("`a`"), "{files:?}: {e}");
+        }
+    }
+
     /// A second pull of a layer read whole stages nothing the store has: the
     /// files are reused, keyed by their fs-verity digest, and the table of
     /// contents they make is settled with no file of the pull's.

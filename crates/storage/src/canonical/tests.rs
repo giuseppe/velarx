@@ -1733,6 +1733,12 @@ fn the_edges_of_every_field_agree_in_the_rules_the_bytes_and_the_headers() {
             }
         }
     }
+    // a path below an entry that is not a directory, and one that only
+    // sorts after it
+    for kind in kinds.into_iter().filter(|&k| k != DIR) {
+        w.table(&[plain(kind), file("./e/z", 0)]);
+        w.table(&[plain(kind), file("./e-z", 0)]);
+    }
     // the names of the link and of what it links to
     for n in edge_names(false) {
         w.linked(&file("./e", 1), &n);
@@ -1803,6 +1809,72 @@ fn a_size_of_a_directory_is_no_content_for_any_function() {
     assert_eq!(skeleton_size(&entries), out.len() as u64);
     assert_eq!(stream_size(&entries).unwrap(), out.len() as u64);
     assert!(validate_entries(&entries).is_err());
+}
+
+/// The entries before an entry of each kind that is not a directory, and
+/// the entry (named `./a`, `./.wh.a` for the whiteout).
+fn not_directories() -> Vec<(&'static str, Vec<TocEntry>)> {
+    let root = entry("./", DIR);
+    let mut link = entry("./a", TocEntryType::Hardlink);
+    link.link_name = Some("./0".into());
+    let mut symlink = entry("./a", TocEntryType::Symlink);
+    symlink.link_name = Some("..".into());
+    let mut dev = entry("./a", TocEntryType::Block);
+    (dev.dev_major, dev.dev_minor) = (Some(1), Some(2));
+    let whiteout = file("./.wh.a", 0);
+    vec![
+        ("a regular file", vec![root.clone(), file("./a", 0)]),
+        ("a symbolic link", vec![root.clone(), symlink]),
+        ("a device", vec![root.clone(), dev]),
+        (
+            "a fifo",
+            vec![root.clone(), entry("./a", TocEntryType::Fifo)],
+        ),
+        ("a hard link", vec![root.clone(), file("./0", 0), link]),
+        ("a whiteout", vec![root, whiteout]),
+    ]
+}
+
+#[test]
+fn a_path_below_an_entry_that_is_not_a_directory_is_refused() {
+    for (what, before) in not_directories() {
+        let parent = before.last().unwrap().name.clone();
+        for below in [format!("{parent}/b"), format!("{parent}/b/c")] {
+            let mut t = before.clone();
+            t.push(file(&below, 0));
+            let e = validate_entries(&t).unwrap_err().to_string();
+            assert!(e.contains(&parent) && e.contains(&below), "{what}: {e}");
+            assert!(validate_tar(&tar(&t)[..]).is_err(), "{what}: the tar");
+        }
+        // what sorts after the entry and is not below it is fine
+        let mut t = before.clone();
+        t.push(file(&format!("{parent}-c"), 0));
+        validate_entries(&t).unwrap_or_else(|e| panic!("{what}: {e}"));
+        canonical(&t);
+    }
+}
+
+#[test]
+fn a_path_below_a_directory_is_fine() {
+    let t = [
+        entry("./", DIR),
+        entry("./a/", DIR),
+        file("./a/b", 0),
+        entry("./c/", DIR),
+        file("./c/d/e", 0),
+    ];
+    validate_entries(&t).unwrap();
+    canonical(&t);
+    // a whiteout of a name is not an entry of that name: the layer removes
+    // what is below it and makes the directory again
+    let t = [
+        entry("./", DIR),
+        file("./.wh.a", 0),
+        entry("./a/", DIR),
+        file("./a/b", 0),
+    ];
+    validate_entries(&t).unwrap();
+    canonical(&t);
 }
 
 #[test]

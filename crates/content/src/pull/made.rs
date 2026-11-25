@@ -392,6 +392,48 @@ mod tests {
         assert_eq!(made.files.len(), 4);
     }
 
+    /// A walk that gives a path below a file or a symbolic link (a tree
+    /// that changed under a build, the merged tree of a squash with a bug)
+    /// makes no layer: the table is checked as the canonical tar it is.
+    #[test]
+    fn a_walk_with_a_path_below_what_is_not_a_directory_makes_no_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink: Arc<dyn Sink> = session(tmp.path(), "walk");
+        for kind in [tar::EntryType::Regular, tar::EntryType::Symlink] {
+            let made = from_walk(
+                &sink,
+                Algorithm::Sha256,
+                u64::MAX,
+                Box::new(|_| Ok(())),
+                |out| {
+                    let header = |kind| {
+                        let mut h = tar::Header::new_gnu();
+                        h.set_mode(0o644);
+                        h.set_uid(0);
+                        h.set_gid(0);
+                        h.set_mtime(0);
+                        h.set_entry_type(kind);
+                        h.set_size(0);
+                        h
+                    };
+                    match kind {
+                        tar::EntryType::Symlink => {
+                            out.link(&mut header(kind), "a", OsStr::new(".."))?
+                        }
+                        _ => out.entry(&mut header(kind), "a", Content::None)?,
+                    }
+                    let kind = tar::EntryType::Regular;
+                    out.entry(&mut header(kind), "a/passwd", Content::None)
+                },
+            );
+            let e = made.err().unwrap().to_string();
+            assert!(
+                e.contains("not a canonical tar") && e.contains("./a/passwd") && e.contains("./a`"),
+                "{kind:?}: {e}"
+            );
+        }
+    }
+
     /// A whiteout is where its own name sorts, not where the file it hides
     /// was, and has the mode, owner and time every whiteout has.
     #[test]

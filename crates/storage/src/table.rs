@@ -1325,6 +1325,50 @@ mod tests {
         }
     }
 
+    /// A path below an entry that is not a directory, in either order, has
+    /// no table (and the format has no record for it: only a directory has
+    /// children).
+    #[test]
+    fn test_a_path_below_what_is_not_a_directory_has_no_table() {
+        let alg = Algorithm::Sha256;
+        let mut link = e("./a", TocEntryType::Hardlink);
+        link.link_name = Some("./0".into());
+        let mut sym = e("./a", TocEntryType::Symlink);
+        sym.link_name = Some("..".into());
+        let mut dev = e("./a", TocEntryType::Block);
+        (dev.dev_major, dev.dev_minor) = (Some(1), Some(2));
+        // (what a hard link is to, before; the entry)
+        let target = file(alg, "./0", b"f", (100, 150));
+        let parents = [
+            (None, file(alg, "./a", b"f", (100, 150))),
+            (None, sym),
+            (None, dev),
+            (None, e("./a", TocEntryType::Fifo)),
+            (Some(target), link),
+            (None, e("./.wh.a", TocEntryType::Reg)),
+        ];
+        for (before, parent) in parents {
+            let below = format!("{}/b", parent.name);
+            let child = file(alg, &below, b"g", (150, 200));
+            for first in [true, false] {
+                let mut entries = vec![e("./", TocEntryType::Dir)];
+                entries.extend(before.clone());
+                if first {
+                    entries.extend([parent.clone(), child.clone()]);
+                } else {
+                    entries.extend([child.clone(), parent.clone()]);
+                }
+                let toc = Toc {
+                    version: 2,
+                    entries,
+                    tar_split_digest: None,
+                };
+                let err = encode(&toc, alg).unwrap_err();
+                assert!(err.contains("directory"), "{below} first: {first}: {err}");
+            }
+        }
+    }
+
     #[test]
     fn test_an_empty_layer_has_a_table() {
         for canonical in [true, false] {

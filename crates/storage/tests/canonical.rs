@@ -794,6 +794,22 @@ fn random_layer(rng: &mut StdRng) -> (Vec<TocEntry>, Contents) {
         w.mode = 0o644;
         paths.insert(parts, w);
     }
+    // (a path below a file, a link, a device, a fifo or a whiteout is no
+    // layer)
+    let below: Vec<_> = paths
+        .keys()
+        .filter(|p| {
+            (1..p.len()).any(|n| {
+                paths
+                    .get(&p[..n])
+                    .is_some_and(|a| a.entry_type != TocEntryType::Dir)
+            })
+        })
+        .cloned()
+        .collect();
+    for p in below {
+        paths.remove(&p);
+    }
     let mut entries: Vec<TocEntry> = paths.into_values().collect();
     entries.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
     // contents, and hard links to a file of an earlier path

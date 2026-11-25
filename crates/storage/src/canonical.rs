@@ -23,6 +23,10 @@
 //! * The entries are in the order of their paths as sequences of
 //!   components, each component compared as bytes (a directory before what
 //!   it holds, `./a/b` before `./a-c`).  A path is in the layer once.
+//! * A path below an entry of the layer is below a directory: no regular
+//!   file, link, device, fifo or whiteout has a path under it (`./a` a file
+//!   and then `./a/b` is refused, naming both).  What a layer below has at
+//!   the path is another matter: a layer may make a directory a file.
 //! * A regular file has the type `0`, and its content follows its header
 //!   padded with zeros to a block.
 //! * A hard link is to a regular file, a symbolic link, a device or a fifo
@@ -219,6 +223,9 @@ struct Seen {
 /// The rules of the entries one after the other.
 struct Checker {
     previous: Option<String>,
+    /// The path of the entry before, when it is not a directory: what may
+    /// not have a path below it, and which sorts right before all of them.
+    leaf: Option<String>,
     seen: HashMap<String, Seen>,
     names: usize,
     /// The bytes of the tar so far, and the most it may have.
@@ -230,6 +237,7 @@ impl Checker {
     fn new(max_tar: u64) -> Self {
         Checker {
             previous: None,
+            leaf: None,
             seen: HashMap::new(),
             names: 0,
             tar: END.len() as u64,
@@ -257,6 +265,16 @@ impl Checker {
                         "the path sorts before the one of the entry before it, `{previous}`"
                     ))
                 }
+            }
+        }
+        if let Some(leaf) = &self.leaf {
+            if key
+                .strip_prefix(leaf.as_str())
+                .is_some_and(|r| r.starts_with('/'))
+            {
+                return Err(format!(
+                    "the path is below `./{leaf}`, which is not a directory"
+                ));
             }
         }
         if f.mode > 0o7777 {
@@ -361,6 +379,7 @@ impl Checker {
                 mtime: f.mtime,
             },
         );
+        self.leaf = (f.kind != TocEntryType::Dir).then(|| key.to_string());
         self.previous = Some(key.to_string());
         Ok(())
     }

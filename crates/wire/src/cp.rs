@@ -1465,6 +1465,64 @@ mod tests {
         assert_eq!(std::fs::read(d.path().join("f")).unwrap(), b"new");
     }
 
+    /// An entry `a` that is not a directory (a file, a symlink to a
+    /// directory outside the destination, to `..` or to `/`, a fifo, a hard
+    /// link) and then `a/passwd`: the entry below is an error, nothing is
+    /// made outside the destination, and what `a` is stays what it is.
+    #[test]
+    fn nothing_is_made_below_an_entry_that_is_not_a_directory() {
+        let outside = tempfile::tempdir().unwrap();
+        let out = outside.path().to_str().unwrap();
+        let kinds: [(tar::EntryType, &str); 6] = [
+            (tar::EntryType::Regular, ""),
+            (tar::EntryType::Symlink, out),
+            (tar::EntryType::Symlink, ".."),
+            (tar::EntryType::Symlink, "/"),
+            (tar::EntryType::Fifo, ""),
+            (tar::EntryType::Link, "f"),
+        ];
+        for (kind, link) in kinds {
+            for opts in [
+                ExtractOptions::default(),
+                ExtractOptions {
+                    layer: true,
+                    overlay_upper: true,
+                    ..Default::default()
+                },
+            ] {
+                let mut b = tar::Builder::new(Vec::new());
+                let mut put = |name: &str, kind, link: &str| {
+                    let mut h = tar::Header::new_gnu();
+                    h.set_entry_type(kind);
+                    h.set_mode(0o644);
+                    let size = usize::from(kind == tar::EntryType::Regular && name != "a");
+                    h.set_size(size as u64);
+                    if !link.is_empty() {
+                        h.set_link_name(link).unwrap();
+                    }
+                    b.append_data(&mut h, name, &b"x"[..size]).unwrap();
+                };
+                put("f", tar::EntryType::Regular, "");
+                put("a", kind, link);
+                put("a/passwd", tar::EntryType::Regular, "");
+                let tar = b.into_inner().unwrap();
+                let d = tempfile::tempdir().unwrap();
+                let at = format!("{kind:?} to `{link}`, layer {}", opts.layer);
+                let e = extract(&tar[..], dir_fd(d.path()).as_fd(), &opts);
+                assert!(!outside.path().join("passwd").exists(), "{at}");
+                assert!(!d.path().join("passwd").exists(), "{at}");
+                // (a copy skips a fifo and a hard link: `a` is not made,
+                // and `a/passwd` makes it a directory)
+                if opts.layer || !matches!(kind, tar::EntryType::Fifo | tar::EntryType::Link) {
+                    assert!(e.is_err(), "{at}");
+                    let made = std::fs::symlink_metadata(d.path().join("a")).unwrap();
+                    assert!(!made.is_dir(), "{at}");
+                }
+            }
+        }
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn a_link_from_the_archive_is_not_followed_by_later_entries() {
         let d = tempfile::tempdir().unwrap();

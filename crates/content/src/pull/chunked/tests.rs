@@ -1560,6 +1560,40 @@ fn test_a_table_of_version_2_that_is_not_canonical_is_an_error_that_names_the_la
     refused(&toc, None);
 }
 
+/// A table of a layer has no path below a file: of version 2 (a canonical
+/// layer, which a peer or a registry gives with the same table) it is
+/// refused with both names.  Version 1 has the order of any tar, in which
+/// a file may replace what was below its name: the table is taken, and the
+/// image of the layer is what refuses it (`layer_erofs`).
+#[test]
+fn test_a_path_below_a_file_is_an_error_of_version_2_only() {
+    let layer = crate::sha256(b"layer");
+    let mut toc = canonical_layer();
+    let mut below = toc.entries[2].clone();
+    below.name = "./d/a/x".into();
+    toc.entries.insert(3, below);
+    let (z, info) = vouched(&toc, None);
+    let e = verify_metadata(&info, &z, Vec::new(), &layer, u64::MAX)
+        .err()
+        .unwrap();
+    assert!(refuses(&e), "{e}");
+    let text = e.to_string();
+    assert!(text.contains(&layer.to_string()), "{text}");
+    assert!(
+        text.contains("./d/a/x") && text.contains("./d/a`"),
+        "{text}"
+    );
+    let entries = toc.entries[2..4].to_vec();
+    let ts = tarsplit_of(&entries);
+    let toc = Toc {
+        version: 1,
+        entries,
+        tar_split_digest: Some(crate::sha256(&ts).to_string()),
+    };
+    let (z, info) = vouched(&toc, Some((0, ts.len() as u64, 0)));
+    verify_metadata(&info, &z, ts, &layer, u64::MAX).unwrap();
+}
+
 #[test]
 fn test_a_table_of_version_1_without_a_tar_split_is_an_error_that_names_the_layer() {
     let layer = crate::sha256(b"layer");
