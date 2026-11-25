@@ -31,28 +31,52 @@ pub(crate) fn local_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// The addresses of the name `host` (the system's resolver; tests name
-/// their own).
+/// Where a process that cannot resolve names itself gets them (a confined
+/// pull worker).
+pub trait Resolver: Send + Sync {
+    /// The addresses of the name `host`, each with `port`.
+    fn lookup<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> futures::future::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>>;
+}
+
+static RESOLVER: std::sync::OnceLock<std::sync::Arc<dyn Resolver>> = std::sync::OnceLock::new();
+
+/// Resolve the names of this process with `resolver` from now on, not with
+/// the system's (once: a second call is refused).
+pub fn use_resolver(resolver: std::sync::Arc<dyn Resolver>) -> Result<(), &'static str> {
+    RESOLVER
+        .set(resolver)
+        .map_err(|_| "the names of this process have a resolver already")
+}
+
+/// The addresses of the name `host` (the resolver of the process if it has
+/// one, else the system's; tests name their own).
 pub(crate) async fn lookup(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
     #[cfg(test)]
     if let Some(addrs) = crate::client::hint_tests::dns(host) {
         return Ok(addrs);
     }
-    tokio::net::lookup_host((host, port))
-        .await
-        .map(Iterator::collect)
-        .map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                LookupError {
-                    name: host.to_string(),
-                    source: e,
-                },
-            )
-        })
+    let found = match RESOLVER.get() {
+        Some(resolver) => resolver.lookup(host, port).await,
+        None => tokio::net::lookup_host((host, port))
+            .await
+            .map(Iterator::collect),
+    };
+    found.map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            LookupError {
+                name: host.to_string(),
+                source: e,
+            },
+        )
+    })
 }
 
-/// The system's resolver could not give the addresses of `name`.  Typed, so
+/// The resolver could not give the addresses of `name`.  Typed, so
 /// that whoever reports a failed connection can tell it from the others.
 #[derive(Debug)]
 pub(crate) struct LookupError {

@@ -16,7 +16,7 @@ pub mod helper;
 #[cfg(feature = "engine")]
 pub mod hints;
 #[cfg(feature = "net")]
-pub(crate) mod netpolicy;
+pub mod netpolicy;
 #[cfg(feature = "engine")]
 pub mod speed;
 #[cfg(feature = "engine")]
