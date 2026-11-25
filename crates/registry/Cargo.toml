@@ -24,7 +24,7 @@ default = []
 # The endpoints, credentials and certificates of the registries and the
 # manifests of images (`target`, `hints`): what the engine needs to describe
 # a registry to a fetcher, without an HTTP client.
-engine = ["dep:velarx-types", "dep:bytes", "dep:futures"]
+engine = ["dep:velarx-types", "dep:velarx-platform-core", "dep:bytes", "dep:futures"]
 # The HTTP client of the registries (`client`, `transport`): only the
 # fetchers, which make the requests.
 net = ["engine", "velarx-types/http", "dep:velarx-send-core", "dep:reqwest", "dep:tokio", "dep:percent-encoding", "dep:hyper"]
@@ -32,6 +32,7 @@ net = ["engine", "velarx-types/http", "dep:velarx-send-core", "dep:reqwest", "de
 [dependencies]
 velarx-base = { path = "../base" }
 velarx-endpoint-core = { path = "../endpoint-core" }
+velarx-platform-core = { path = "../platform-core", optional = true }
 velarx-ref-core = { path = "../ref-core" }
 velarx-send-core = { path = "../send-core", optional = true }
 velarx-types = { path = "../types", default-features = false, optional = true }

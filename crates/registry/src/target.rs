@@ -16,6 +16,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, warn};
+use velarx_platform_core as plat;
 use velarx_types::digest::Digest;
 use velarx_types::{ImageError, ImageReference, ImageResult, OciManifest};
 
@@ -709,13 +710,15 @@ pub fn parse_tags(body: &[u8]) -> serde_json::Result<Vec<String>> {
 
 /// The architecture name of the host, as OCI platforms spell it.
 pub fn host_arch() -> &'static str {
-    match std::env::consts::ARCH {
+    oci_arch(std::env::consts::ARCH)
+}
+
+/// The OCI name of the architecture Rust names `arch`.
+pub(crate) fn oci_arch(arch: &str) -> &str {
+    match arch {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
         "powerpc64" => "ppc64le",
-        "arm" => "arm",
-        "s390x" => "s390x",
-        "riscv64" => "riscv64",
         other => other,
     }
 }
@@ -919,10 +922,20 @@ impl Platform {
         })
     }
 
+    /// The platform of an image of `os`, `arch` and `variant` is one this
+    /// platform accepts (the variants as [`plat::wanted_variant`] lists them).
     pub fn matches(&self, os: &str, arch: &str, variant: Option<&str>) -> bool {
-        self.os == os
-            && self.arch == normalize_arch(arch)
-            && self.variant.as_deref().is_none_or(|v| Some(v) == variant)
+        let wanted = of(&self.os, &self.arch, self.variant.as_deref());
+        plat::rank(of(os, arch, variant), wanted).is_some()
+    }
+}
+
+/// The platform of the core, the architecture under its OCI name.
+fn of<'a>(os: &'a str, arch: &'a str, variant: Option<&'a str>) -> plat::Platform<'a> {
+    plat::Platform {
+        os: os.as_bytes(),
+        arch: normalize_arch(arch).as_bytes(),
+        variant: variant.unwrap_or("").as_bytes(),
     }
 }
 
@@ -936,21 +949,30 @@ impl std::fmt::Display for Platform {
     }
 }
 
-/// The digest of the instance of an index for `platform`.
+/// The digest of the instance of an index for `platform`: the entry
+/// [`plat::choose`] names.  An entry without an os or an architecture (for
+/// containers/image the least preferred candidate of an OCI index), and an
+/// attestation (`unknown/unknown`), is no image.  The architecture of an
+/// entry is compared by its OCI name (`x86_64` is `amd64`, which
+/// containers/image does not do); the variants are compared as written.
 pub fn select_platform(instances: &[serde_json::Value], platform: &Platform) -> Option<String> {
-    instances
+    let entries: Vec<plat::Entry> = instances
         .iter()
-        .find(|m| {
-            let p = m.get("platform");
-            let field = |k: &str| p.and_then(|p| p.get(k)).and_then(|v| v.as_str());
-            match (field("os"), field("architecture")) {
-                (Some(os), Some(arch)) => platform.matches(os, arch, field("variant")),
-                _ => false,
+        .map(|m| {
+            let field = |k: &str| m.get("platform")?.get(k)?.as_str();
+            let (os, arch) = (
+                field("os").unwrap_or(""),
+                field("architecture").unwrap_or(""),
+            );
+            plat::Entry {
+                platform: of(os, arch, field("variant")),
+                image: !os.is_empty() && !arch.is_empty() && (os, arch) != ("unknown", "unknown"),
             }
         })
-        .and_then(|m| m.get("digest"))
-        .and_then(|d| d.as_str())
-        .map(str::to_string)
+        .collect();
+    let wanted = of(&platform.os, &platform.arch, platform.variant.as_deref());
+    let chosen = plat::choose(&entries, wanted)?;
+    Some(instances[chosen].get("digest")?.as_str()?.to_string())
 }
 
 #[cfg(test)]

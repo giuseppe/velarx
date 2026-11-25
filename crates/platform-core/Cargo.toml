@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-platform-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Which image of an index runs: the wanted platforms in order of preference and the entry that matches the best"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on the platforms of the entries of an index, as bytes:
+# no dependency, no I/O.  The shell that reads the JSON of the index and
+# checks the digest of every document is the registry package
+# (`velarx-registry`, target.rs).
+
+[lib]
+name = "velarx_platform_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

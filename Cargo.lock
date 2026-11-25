@@ -5287,6 +5287,10 @@ name = "velarx-plan-core"
 version = "0.1.0"
 
 [[package]]
+name = "velarx-platform-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-policy-core"
 version = "0.1.0"
 
@@ -5342,6 +5346,7 @@ dependencies = [
  "tracing",
  "velarx-base",
  "velarx-endpoint-core",
+ "velarx-platform-core",
  "velarx-ref-core",
  "velarx-send-core",
  "velarx-sys",

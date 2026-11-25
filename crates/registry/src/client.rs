@@ -2791,7 +2791,8 @@ mod tests {
         assert_eq!(pick("linux/amd64").as_deref(), Some("sha256:a"));
         assert_eq!(pick("x86_64").as_deref(), Some("sha256:a"));
         assert_eq!(pick("linux/arm/v7").as_deref(), Some("sha256:c"));
-        assert_eq!(pick("linux/arm").as_deref(), Some("sha256:b"));
+        assert_eq!(pick("linux/arm").as_deref(), Some("sha256:c"));
+        assert_eq!(pick("linux/arm/v6").as_deref(), Some("sha256:b"));
         assert_eq!(pick("linux/arm64"), None);
         assert_eq!(pick("freebsd/amd64"), None);
     }
@@ -2843,6 +2844,129 @@ mod tests {
             Some("sha256:c")
         );
         assert_eq!(select_platform(&idx[..2], &Platform::host()), None);
+    }
+
+    fn select(index: &str, platform: &str) -> Option<String> {
+        let index: Vec<serde_json::Value> = serde_json::from_str(index).unwrap();
+        select_platform(&index, &Platform::parse(platform).unwrap())
+    }
+
+    /// arm64 with and without `v8` are one platform, as for
+    /// containers/image.
+    #[test]
+    fn test_arm64_with_and_without_v8() {
+        let bare = r#"[{"digest":"sha256:a","platform":{"os":"linux","architecture":"arm64"}}]"#;
+        assert_eq!(select(bare, "linux/arm64/v8").as_deref(), Some("sha256:a"));
+        let v8 = r#"[{"digest":"sha256:a","platform":{"os":"linux","architecture":"arm64","variant":"v8"}}]"#;
+        assert_eq!(select(v8, "linux/arm64").as_deref(), Some("sha256:a"));
+    }
+
+    /// A platform without a variant takes the best arm entry (no variant,
+    /// then v8, v7, v6, v5), not the first; a variant asked for takes it
+    /// or one below it.
+    #[test]
+    fn test_arm_takes_the_best_entry() {
+        let arm = r#"[
+            {"digest":"sha256:a","platform":{"os":"linux","architecture":"arm","variant":"v5"}},
+            {"digest":"sha256:b","platform":{"os":"linux","architecture":"arm","variant":"v7"}},
+            {"digest":"sha256:c","platform":{"os":"linux","architecture":"arm","variant":"v8"}}]"#;
+        assert_eq!(select(arm, "linux/arm").as_deref(), Some("sha256:c"));
+        assert_eq!(select(arm, "linux/arm/v7").as_deref(), Some("sha256:b"));
+        assert_eq!(select(arm, "linux/arm/v6").as_deref(), Some("sha256:a"));
+        assert_eq!(select(arm, "linux/arm/v8").as_deref(), Some("sha256:c"));
+    }
+
+    /// An attestation is no image, not even for a request for it.
+    #[test]
+    fn test_an_attestation_is_not_chosen() {
+        let index =
+            r#"[{"digest":"sha256:a","platform":{"os":"unknown","architecture":"unknown"}}]"#;
+        assert_eq!(select(index, "unknown/unknown"), None);
+    }
+
+    /// Pins a problem: Rust's `powerpc64` is both endiannesses; the
+    /// big-endian one is `ppc64`, not `ppc64le`.
+    #[test]
+    fn test_powerpc64_is_little_endian_pinned() {
+        assert_eq!(oci_arch("powerpc64"), "ppc64le");
+    }
+
+    fn manifest_of_size(size: usize) -> Vec<u8> {
+        let mut body = br#"{"schemaVersion":2,"config":{"mediaType":"x","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":1},"layers":[]}"#.to_vec();
+        body.resize(size, b' ');
+        body
+    }
+
+    /// Pins a problem: a manifest larger than MAX_MANIFEST_SIZE is used
+    /// (parsed, hashed) and taken; expect an error, for the manifest of a
+    /// tag and for the instance of an index alike.
+    #[tokio::test]
+    async fn test_an_oversized_manifest_is_taken_pinned() {
+        let r = ImageReference::parse("example.com/a:latest").unwrap();
+        let big = manifest_of_size(MAX_MANIFEST_SIZE as usize + 1);
+        let alone = |_: String| {
+            let body = big.clone();
+            async move {
+                let d = sha256_of(&body);
+                Ok::<_, ImageError>((Bytes::from(body), d))
+            }
+        };
+        assert!(resolve_manifest(&r, None, alone).await.is_ok());
+        let index = format!(
+            r#"{{"manifests":[{{"digest":"{}","platform":{{"os":"linux","architecture":"{}"}}}}]}}"#,
+            sha256_of(&big),
+            host_arch()
+        );
+        let nested = |reference: String| {
+            let body = if reference == "latest" {
+                index.clone().into_bytes()
+            } else {
+                big.clone()
+            };
+            async move {
+                let d = sha256_of(&body);
+                Ok::<_, ImageError>((Bytes::from(body), d))
+            }
+        };
+        assert!(resolve_manifest(&r, None, nested).await.is_ok());
+    }
+
+    /// Pins a problem: the bytes are parsed (and refused as a Docker
+    /// schema 1 manifest) before they are hashed; a body of another
+    /// digest than the one that named it is a DigestMismatch whatever
+    /// it holds.  Expect DigestMismatch in both cases.
+    #[tokio::test]
+    async fn test_bytes_are_parsed_before_they_are_hashed_pinned() {
+        let schema1 = br#"{"schemaVersion":1,"name":"a","tag":"latest","fsLayers":[]}"#.to_vec();
+        let named = sha256_of(b"the manifest that was asked for");
+        // by a digest reference
+        let by_digest = ImageReference::parse(&format!("example.com/a@{named}")).unwrap();
+        let answer = schema1.clone();
+        let fetch = |_: String| {
+            let body = answer.clone();
+            async move { Ok::<_, ImageError>((Bytes::from(body.clone()), sha256_of(&body))) }
+        };
+        let err = resolve_manifest(&by_digest, None, fetch).await.unwrap_err();
+        assert!(matches!(err, ImageError::DockerFormat(_)), "{err}");
+        // by the digest an index names
+        let index = format!(
+            r#"{{"manifests":[{{"digest":"{named}","platform":{{"os":"linux","architecture":"{}"}}}}]}}"#,
+            host_arch()
+        );
+        let tag = ImageReference::parse("example.com/a:latest").unwrap();
+        let fetch = |reference: String| {
+            let body = if reference == "latest" {
+                index.clone().into_bytes()
+            } else {
+                schema1.clone()
+            };
+            async move {
+                let d = sha256_of(&body);
+                Ok::<_, ImageError>((Bytes::from(body), d))
+            }
+        };
+        let err = resolve_manifest(&tag, None, fetch).await.unwrap_err();
+        assert!(matches!(err, ImageError::DockerFormat(_)), "{err}");
     }
 
     #[test]
