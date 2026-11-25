@@ -1254,7 +1254,7 @@ async fn test_the_annotations_and_the_os_of_the_built_image() {
         let ctx = BuildContext::new(&context, Some(std::path::Path::new(file))).unwrap();
         let svc = &svc;
         async move {
-            svc.build(&ctx, &opts, None, Default::default())
+            Box::pin(svc.build(&ctx, &opts, None, Default::default()))
                 .await
                 .unwrap()
         }
