@@ -50,7 +50,7 @@ type EngineCall = connect::Held;
 
 /// Where this frontend's socket goes by default: next to the sockets of the
 /// engine, `/run/velarx/cri.sock` or `$XDG_RUNTIME_DIR/velarx/cri.sock`.
-pub fn default_cri_socket() -> std::result::Result<PathBuf, velarx_base::ids::IdsError> {
+pub fn default_cri_socket() -> std::result::Result<PathBuf, velarx_base::dirs::DirsError> {
     Ok(velarx_base::dirs::DefaultDirs::current()?
         .run
         .join("cri.sock"))
@@ -58,7 +58,7 @@ pub fn default_cri_socket() -> std::result::Result<PathBuf, velarx_base::ids::Id
 
 /// The socket of the engine as the command line has it: the rootful
 /// `/run/velarx/engine/engine.sock`, or `$XDG_RUNTIME_DIR/velarx/engine/engine.sock`.
-pub fn default_engine_socket() -> std::result::Result<PathBuf, velarx_base::ids::IdsError> {
+pub fn default_engine_socket() -> std::result::Result<PathBuf, velarx_base::dirs::DirsError> {
     Ok(velarx_base::dirs::DefaultDirs::current()?
         .run
         .join("engine/engine.sock"))

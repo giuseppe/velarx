@@ -28,5 +28,7 @@ setup () { api_setup; }
     out=$(pm exec "$id" sh -c 'echo in > /tmp/f; cat /tmp/f')
     check "exec in a --userns=auto container" "in" "$out"
     pm rm -t 0 -f "$id" > /dev/null
-    check "the public root is gone with the container" 0 "$(ls /tmp/velarx-rootfs-"$(id -u)" 2>/dev/null | grep -c "^$id")"
+    base=/tmp/velarx-rootfs-$(id -u)
+    [ "$(id -u)" = 0 ] && base=/run/velarx-rootfs-0
+    check "the public root is gone with the container" 0 "$(ls "$base" 2>/dev/null | grep -c "^$id")"
 }

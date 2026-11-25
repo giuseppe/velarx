@@ -640,14 +640,14 @@ impl ContainerService {
         }
         velarx_base::trace::point("remove runtime deleted");
         // where a monitor that was killed left the root file system bound
-        let public = crate::userns::rootless::public_rootfs_base()?.join(id);
+        let public = crate::userns::rootless::own_public_rootfs(id);
         let (bundle_path, mon_dir) = (self.bundle_dir(id), self.mon_dir(id));
         // (the unmounts and the removes of the bundle, which holds what the
         // container wrote, in one turn of the blocking pool)
         let mon = mon_dir.clone();
         let (driver, writable) = (self.storage().clone(), self.writable(id));
         let removed_layer = crate::off_thread(move || {
-            if public.exists() {
+            if let Some(public) = public.filter(|p| p.exists()) {
                 velarx_runtime::settle::mounts::detach_mounts_below(&public);
                 let _ = std::fs::remove_dir(&public);
             }

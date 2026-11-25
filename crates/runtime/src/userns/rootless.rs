@@ -81,12 +81,39 @@ fn traversable_by_others(dir: &std::path::Path) -> bool {
         .all(|d| std::fs::metadata(d).is_ok_and(|m| m.permissions().mode() & 0o001 != 0))
 }
 
-/// `/tmp/velarx-rootfs-UID`, made 0711 and the user's.
+/// `/tmp/velarx-rootfs-UID`, made 0711 and the user's; root's is
+/// `/run/velarx-rootfs-0`, where no other user can make a directory.
 pub fn public_rootfs_base() -> Result<std::path::PathBuf, velarx_base::ids::IdsError> {
+    let uid = host_uid()?;
+    let parent = if uid == 0 { "/run" } else { "/tmp" };
     Ok(std::path::PathBuf::from(format!(
-        "/tmp/velarx-rootfs-{}",
-        host_uid()?
+        "{parent}/velarx-rootfs-{uid}"
     )))
+}
+
+/// Whether `base` is a directory (not a link) of the user `uid`, as the
+/// base of the public roots is when this user made it; if not, an error
+/// that names it.
+pub fn check_public_base(base: &std::path::Path, uid: u32) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let st = std::fs::symlink_metadata(base)
+        .map_err(|e| io::Error::new(e.kind(), format!("`{}`: {e}", base.display())))?;
+    if !st.is_dir() || st.uid() != uid {
+        return Err(io::Error::other(format!(
+            "`{}` is not a directory of user {uid}",
+            base.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Where the public root of the container `id` is, if the base of the
+/// public roots is the user's: a directory of another user is none of
+/// this engine's to look into or remove from.
+pub fn own_public_rootfs(id: &str) -> Option<std::path::PathBuf> {
+    let base = public_rootfs_base().ok()?;
+    check_public_base(&base, rustix::process::geteuid().as_raw()).ok()?;
+    Some(base.join(id))
 }
 
 pub fn user_name(uid: u32) -> Option<String> {
@@ -306,10 +333,37 @@ mod tests {
         );
         // a namespace that maps the daemon reaches its directories
         assert_eq!(public_rootfs(&bundle, "c", &maps(euid)).unwrap(), None);
-        assert!(public_rootfs_base()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("/tmp/velarx-rootfs-"));
+        // (root's is under /run, where nobody else can make a directory)
+        let base = public_rootfs_base().unwrap();
+        let parent = if euid == 0 { "/run" } else { "/tmp" };
+        assert_eq!(
+            base.to_string_lossy(),
+            format!("{parent}/velarx-rootfs-{}", host_uid().unwrap())
+        );
+    }
+
+    #[test]
+    fn the_base_of_the_public_roots_must_be_the_users_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let base = d.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        check_public_base(&base, uid).unwrap();
+        // another user's is refused, and named
+        let e = check_public_base(&base, uid + 1).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            format!(
+                "`{}` is not a directory of user {}",
+                base.display(),
+                uid + 1
+            )
+        );
+        // a link to one of the user's is not one
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert!(check_public_base(&link, uid).is_err());
+        assert!(check_public_base(&d.path().join("none"), uid).is_err());
     }
 
     #[test]

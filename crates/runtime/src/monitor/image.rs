@@ -1483,13 +1483,8 @@ impl PublicRoot {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
+        crate::userns::rootless::check_public_base(base, rustix::process::geteuid().as_raw())?;
         let st = std::fs::symlink_metadata(base)?;
-        if !st.is_dir() || st.uid() != rustix::process::geteuid().as_raw() {
-            return Err(io::Error::other(format!(
-                "`{}` is not a directory of the user",
-                base.display()
-            )));
-        }
         if st.mode() & 0o7777 != 0o711 {
             std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o711))?;
         }

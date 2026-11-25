@@ -270,6 +270,12 @@ impl From<velarx_base::ids::IdsError> for ApiError {
     }
 }
 
+impl From<velarx_base::dirs::DirsError> for ApiError {
+    fn from(e: velarx_base::dirs::DirsError) -> Self {
+        Self::internal(e.to_string())
+    }
+}
+
 impl From<serde_json::Error> for ApiError {
     fn from(e: serde_json::Error) -> Self {
         Self::bad_request(format!("decode request: {e}"))

@@ -68,9 +68,7 @@ impl ContainerService {
             mon_dir: self.mon_dir(id),
             log_dir: self.log_dir(id),
             secrets_dir: self.secrets_dir_of(id),
-            public_rootfs: crate::userns::rootless::public_rootfs_base()
-                .ok()
-                .map(|p| p.join(id)),
+            public_rootfs: crate::userns::rootless::own_public_rootfs(id),
             named_files: [&config.pid_file, &config.conmon_pid_file, &config.cid_file]
                 .into_iter()
                 .flatten()
