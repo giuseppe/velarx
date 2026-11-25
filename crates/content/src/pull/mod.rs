@@ -16,6 +16,7 @@
 
 pub mod access;
 pub mod chunked;
+pub mod holds;
 pub mod index;
 pub mod lazy;
 pub mod made;
