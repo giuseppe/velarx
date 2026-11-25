@@ -773,9 +773,9 @@ impl ImageService {
     /// The lazy layers of the pull of `manifest` (those the store lacks, as
     /// `stored` says), as the fetchers of `staged` found them (`Probe`)
     /// and the engine verified them; `ImageNotLazy` with every layer that
-    /// cannot be lazy, before anything of the pull exists.  Each layer is
-    /// sent to `accepted` (its descriptor and its table as the layer has it)
-    /// as soon as it is verified.
+    /// cannot be lazy, before anything of the pull exists.  Once every layer
+    /// is accepted, each is sent to `accepted` (its descriptor and its table
+    /// as the layer has it).
     async fn accept_lazy(
         staged: &velarx_content::pull::staged_fetch::StagedFetch,
         manifest: &OciManifest,
@@ -806,6 +806,7 @@ impl ImageService {
         velarx_base::trace::point("pull probed");
         let mut accepted = Accepted::default();
         let mut refused = Vec::new();
+        let mut told = Vec::new();
         // (the layers are checked at once, and what the pull needs of each
         // is made as soon as its table is: the last does not wait for the
         // others)
@@ -823,11 +824,7 @@ impl ImageService {
                     None => Err(velarx_proto::transfer::NotLazy::NoToc),
                 };
                 let made = match &answer {
-                    Ok((_, lazy)) => {
-                        // (nobody may listen: the pull tells nobody then)
-                        let _ = accepted_tx.unbounded_send((layer.clone(), lazy.toc_z.clone()));
-                        Some(Self::made_of_table(layer, &lazy.toc, db).await?)
-                    }
+                    Ok((_, lazy)) => Some(Self::made_of_table(layer, &lazy.toc, db).await?),
                     Err(_) => None,
                 };
                 Ok::<_, ImageError>((at, layer, answer, made))
@@ -858,6 +855,7 @@ impl ImageService {
             }
             match answer {
                 Ok(f) => {
+                    told.push((layer.clone(), f.1.toc_z.clone()));
                     accepted.found.insert(layer.digest.to_string(), f);
                 }
                 Err(reason) => refused.push(velarx_types::NotLazyLayer {
@@ -874,6 +872,12 @@ impl ImageService {
                 image: image.to_string(),
                 layers: refused,
             });
+        }
+        // (the fetchers hear of the layers of a pull that is accepted:
+        // nothing of one that is refused exists; nobody may listen, and
+        // the pull tells nobody then)
+        for layer in told {
+            let _ = accepted_tx.unbounded_send(layer);
         }
         Ok(accepted)
     }
