@@ -5,7 +5,7 @@ use crate::mock::Mock;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use velarx_cri::engine::{Engine, ExecSpec};
+use velarx_cri::engine::{Engine, ExecSpec, ExecStream};
 use velarx_cri::stream::{encode_frame, parse_frame, run_exec, Channels};
 
 fn masked(payload: &[u8]) -> Vec<u8> {
@@ -78,6 +78,7 @@ async fn exec_echo_and_status() {
             stdin: true,
             stdout: true,
             stderr: false,
+            input_ends: false,
         },
         true,
     ));
@@ -146,6 +147,7 @@ async fn a_resize_that_fails_is_logged_and_the_session_goes_on() {
             stdin: true,
             stdout: true,
             stderr: false,
+            input_ends: false,
         },
         true,
     ));
@@ -198,6 +200,7 @@ async fn a_large_input_and_its_output_go_together() {
         stdin: true,
         stdout: true,
         stderr: false,
+        input_ends: false,
     };
     let task = tokio::spawn(run_exec(mock.clone(), server, es, channels, true));
     // (a counter, so that a stream gone wrong shows where)
@@ -247,6 +250,7 @@ async fn an_exec_is_killed_when_its_client_goes_away() {
         stdin: true,
         stdout: true,
         stderr: false,
+        input_ends: false,
     };
     let spec = ExecSpec {
         cmd: vec!["cat".into()],
@@ -609,4 +613,46 @@ async fn the_streaming_server_holds_a_limited_number_of_connections() {
     let c3 = third.await.unwrap();
     drop((c2, c3));
     task.abort();
+}
+
+/// An attach without a terminal and without `stdin_once` ends with the
+/// input of its client: what the client sent is passed on, the attach
+/// stream of the engine gets the end of the input (the engine keeps the
+/// input of the container open), and the session ends although the
+/// container goes on.
+#[tokio::test]
+async fn an_attach_ends_with_the_input_of_its_client() {
+    let (mock, cri) = Mock::cri();
+    drop(cri);
+    let (ours, mut container) = tokio::io::duplex(4096);
+    let es = ExecStream {
+        id: String::new(),
+        framed: false,
+        io: Box::new(ours),
+    };
+    let (server, mut client) = tokio::io::duplex(8192);
+    let task = tokio::spawn(run_exec(
+        mock,
+        server,
+        es,
+        Channels {
+            stdin: true,
+            stdout: true,
+            stderr: false,
+            input_ends: true,
+        },
+        false,
+    ));
+    client.write_all(&masked(b"\x00hello")).await.unwrap();
+    client.write_all(&masked(b"\xff\x00")).await.unwrap();
+    let mut input = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), container.read_to_end(&mut input))
+        .await
+        .expect("the attach stream gets the end of the input")
+        .unwrap();
+    assert_eq!(input, b"hello");
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the attach ends with the input of its client")
+        .unwrap();
 }

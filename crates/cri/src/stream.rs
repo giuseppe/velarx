@@ -468,6 +468,7 @@ impl<E: Engine> StreamServer<E> {
                             stdin: spec.stdin,
                             stdout: spec.stdout,
                             stderr: spec.stderr,
+                            input_ends: false,
                         },
                         true,
                     )
@@ -479,6 +480,7 @@ impl<E: Engine> StreamServer<E> {
                         stdin,
                         stdout,
                         stderr,
+                        stdin_once,
                         tty,
                         ..
                     },
@@ -491,6 +493,7 @@ impl<E: Engine> StreamServer<E> {
                             stdin,
                             stdout,
                             stderr: stderr && !tty,
+                            input_ends: !stdin_once && !tty,
                         },
                         false,
                     )
@@ -581,6 +584,10 @@ pub struct Channels {
     pub stdin: bool,
     pub stdout: bool,
     pub stderr: bool,
+    /// The session ends when the client's input ends, once what it sent is
+    /// passed on (an attach without a terminal and without `stdin_once`:
+    /// the container keeps its input open).
+    pub input_ends: bool,
 }
 
 /// The new size of the terminal of an exec session, as the client sends it
@@ -699,8 +706,12 @@ pub async fn run_exec<E: Engine, T>(
     let mut pending: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; 16 * 1024];
     let mut client_gone = false;
+    let mut input_done = false;
     let mut held = VecDeque::new();
     loop {
+        if input_done && held.is_empty() {
+            break;
+        }
         tokio::select! {
             r = pass_input(&stdin_tx, &mut held), if !held.is_empty() => r,
             msg = in_rx.recv(), if held.is_empty() => match msg {
@@ -713,7 +724,10 @@ pub async fn run_exec<E: Engine, T>(
                     match ch {
                         0 if stdin => held.push_back(Some(data.to_vec())),
                         4 if !id.is_empty() => resize(&*engine, &id, data).await,
-                        255 if data.first() == Some(&0) => held.push_back(None),
+                        255 if data.first() == Some(&0) => {
+                            held.push_back(None);
+                            input_done = channels.input_ends;
+                        }
                         _ => {}
                     }
                 }
@@ -869,6 +883,7 @@ impl<E: Engine> StreamServer<E> {
                         stdin: spec.stdin,
                         stdout: spec.stdout,
                         stderr: spec.stderr && !spec.tty,
+                        input_ends: false,
                     };
                     run_exec_spdy(engine, io, es, ch, spec.tty, true).await
                 }
@@ -878,6 +893,7 @@ impl<E: Engine> StreamServer<E> {
                         stdin,
                         stdout,
                         stderr,
+                        stdin_once,
                         tty,
                         ..
                     },
@@ -886,6 +902,7 @@ impl<E: Engine> StreamServer<E> {
                         stdin,
                         stdout,
                         stderr: stderr && !tty,
+                        input_ends: !stdin_once && !tty,
                     };
                     run_exec_spdy(engine, io, es, ch, tty, false).await
                 }
@@ -983,8 +1000,12 @@ async fn run_exec_spdy<E: Engine, T>(
     let mut pending: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; 16 * 1024];
     let mut client_gone = false;
+    let mut input_done = false;
     let mut held = VecDeque::new();
     loop {
+        if input_done && held.is_empty() {
+            break;
+        }
         tokio::select! {
             r = pass_input(&stdin_tx, &mut held), if !held.is_empty() => r,
             e = ev.recv(), if held.is_empty() => match e {
@@ -999,6 +1020,7 @@ async fn run_exec_spdy<E: Engine, T>(
                         }
                         if fin {
                             held.push_back(None);
+                            input_done = channels.input_ends;
                         }
                     } else if Some(sid) == resize_id && !id.is_empty() {
                         resize(&*engine, &id, &data).await;
@@ -1006,6 +1028,7 @@ async fn run_exec_spdy<E: Engine, T>(
                 }
                 Some(crate::spdy::Event::Reset { id: sid }) if Some(sid) == stdin_id => {
                     held.push_back(None);
+                    input_done = channels.input_ends;
                 }
                 Some(_) => {}
             },

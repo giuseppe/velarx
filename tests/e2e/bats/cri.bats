@@ -671,7 +671,8 @@ JSON
     for once in true false; do
         c=$(cc create "$pod" "$WORKDIR/octr-$once.json" "$WORKDIR/opod.json")
         cc start "$c" > /dev/null
-        echo hello | timeout -s KILL 5 crictl -r "unix://$CRISOCK" -i "unix://$CRISOCK" attach -i "$c" > /dev/null 2>&1
+        echo hello | timeout -s KILL 5 crictl -r "unix://$CRISOCK" -i "unix://$CRISOCK" attach -i "$c" \
+            > "$WORKDIR/attach-$once.out" 2>&1
         eval "rc_$once=$?"
         eval "c_$once=$c"
     done
@@ -681,6 +682,9 @@ JSON
     st=$(cc inspect "$c_true" | jq_of 'd["status"]["state"]')
     check "with stdin_once the container read the end of its input" CONTAINER_EXITED "$st"
     check_match "and what was sent" "hello" "$(cat "$WORKDIR/logs/once-true.log")"
+    check "the attach ended with the container" 0 "$rc_true"
+    check_match "and passed what it wrote after the end of its input" "input closed" \
+        "$(cat "$WORKDIR/attach-true.out")"
     check "without, its input stays open" CONTAINER_RUNNING "$(cc inspect "$c_false" | jq_of 'd["status"]["state"]')"
     # (as CRI-O's: the attach without a terminal ends with the input of its client)
     check "and the attach ended with the input of its client" 0 "$rc_false"
