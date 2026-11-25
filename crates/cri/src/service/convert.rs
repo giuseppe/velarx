@@ -4,6 +4,8 @@
 use crate::api as cri;
 use crate::engine::{IdRange, InfraSecurity, NsMode, PodCreate, Port};
 use std::fmt::Write as _;
+use velarx_confine_core::cri::{from_cri, Context, Profile};
+use velarx_confine_core::Seccomp;
 use velarx_proto::modes::{self, CgroupsMode, UsernsChoice};
 use velarx_proto::pod::{Pressure, Psi, PsiData};
 use velarx_proto::request::{
@@ -319,41 +321,26 @@ fn hostname_of(name: &str) -> String {
     h.trim_matches('-').to_string()
 }
 
-/// The seccomp profile of a container.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SeccompKind {
-    /// The engine's default profile
-    RuntimeDefault,
-    /// None
-    Unconfined,
-    /// A file of the host
-    Localhost,
-}
-
-/// The seccomp profile a security context asks for, `None` when it names
-/// none: the `seccomp` message, else the deprecated path.
-fn seccomp_of(
-    profile: Option<&cri::SecurityProfile>,
-    deprecated_path: &str,
-) -> Option<(SeccompKind, String)> {
+/// The seccomp profile a security context asks for (`Absent` when it names
+/// none) and the file of a `Localhost` one: the `seccomp` message, else the
+/// deprecated path.
+fn seccomp_of(profile: Option<&cri::SecurityProfile>, deprecated_path: &str) -> (Profile, String) {
     use cri::security_profile::ProfileType;
     if let Some(p) = profile {
-        return Some(
-            match ProfileType::try_from(p.profile_type).unwrap_or_default() {
-                ProfileType::RuntimeDefault => (SeccompKind::RuntimeDefault, String::new()),
-                ProfileType::Unconfined => (SeccompKind::Unconfined, String::new()),
-                ProfileType::Localhost => (SeccompKind::Localhost, p.localhost_ref.clone()),
-            },
-        );
+        return match ProfileType::try_from(p.profile_type).unwrap_or_default() {
+            ProfileType::RuntimeDefault => (Profile::RuntimeDefault, String::new()),
+            ProfileType::Unconfined => (Profile::Unconfined, String::new()),
+            ProfileType::Localhost => (Profile::Localhost, p.localhost_ref.clone()),
+        };
     }
     match deprecated_path {
-        "" => None,
-        "unconfined" => Some((SeccompKind::Unconfined, String::new())),
-        "runtime/default" | "docker/default" => Some((SeccompKind::RuntimeDefault, String::new())),
-        p => Some((
-            SeccompKind::Localhost,
+        "" => (Profile::Absent, String::new()),
+        "unconfined" => (Profile::Unconfined, String::new()),
+        "runtime/default" | "docker/default" => (Profile::RuntimeDefault, String::new()),
+        p => (
+            Profile::Localhost,
             p.trim_start_matches("localhost/").to_string(),
-        )),
+        ),
     }
 }
 
@@ -432,9 +419,9 @@ fn infra_security_of(
     }
     match seccomp_of(sc.seccomp.as_ref(), &sc.seccomp_profile_path) {
         _ if sc.privileged => i.security_opts.push("seccomp=unconfined".into()),
-        Some((SeccompKind::Unconfined, _)) => i.security_opts.push("seccomp=unconfined".into()),
-        Some((SeccompKind::Localhost, path)) => i.security_opts.push(format!("seccomp={path}")),
-        Some((SeccompKind::RuntimeDefault, _)) | None => {}
+        (Profile::Unconfined, _) => i.security_opts.push("seccomp=unconfined".into()),
+        (Profile::Localhost, path) => i.security_opts.push(format!("seccomp={path}")),
+        (Profile::RuntimeDefault | Profile::Absent, _) => {}
     }
     match apparmor_of(sc.apparmor.as_ref(), "")?.as_str() {
         "" => {}
@@ -698,9 +685,13 @@ pub fn container_create_of(
             },
         });
     }
-    // a container with no security context: the engine's defaults, no
-    // seccomp profile, masks and limits (as containerd and CRI-O)
-    let mut privileged = false;
+    // a container with no security context: the engine's defaults
+    let mut context = Context {
+        present: false,
+        privileged: false,
+        seccomp: Profile::Absent,
+    };
+    let mut localhost = String::new();
     let mut masked = Vec::new();
     let mut readonly = Vec::new();
     if let Some(l) = &cfg.linux {
@@ -711,16 +702,13 @@ pub fn container_create_of(
             c.resources = limits_of(&r);
         }
         if let Some(sc) = &l.security_context {
-            privileged = sc.privileged;
             c.privileged = sc.privileged;
             c.read_only_rootfs = sc.readonly_rootfs;
             c.security_opt.no_new_privileges = sc.no_new_privs;
             // exactly the lists given, empty ones too (as containerd and
-            // CRI-O); a privileged container has none
-            if !sc.privileged {
-                masked = sc.masked_paths.clone();
-                readonly = sc.readonly_paths.clone();
-            }
+            // CRI-O)
+            masked = sc.masked_paths.clone();
+            readonly = sc.readonly_paths.clone();
             if let Some(cap) = &sc.capabilities {
                 c.cap_ambient = cap.add_ambient_capabilities.clone();
                 c.cap_add = cap.add_capabilities.clone();
@@ -751,15 +739,13 @@ pub fn container_create_of(
                 selinux.push("files".into());
             }
             c.security_opts = selinux.iter().map(|o| format!("label={o}")).collect();
-            // a security context with no profile asks for none
-            match seccomp_of(sc.seccomp.as_ref(), &sc.seccomp_profile_path) {
-                _ if sc.privileged => c.security_opt.seccomp_unconfined = true,
-                None | Some((SeccompKind::Unconfined, _)) => {
-                    c.security_opt.seccomp_unconfined = true
-                }
-                Some((SeccompKind::Localhost, path)) => c.security_opt.seccomp_profile = Some(path),
-                Some((SeccompKind::RuntimeDefault, _)) => {}
-            }
+            let (seccomp, path) = seccomp_of(sc.seccomp.as_ref(), &sc.seccomp_profile_path);
+            context = Context {
+                present: true,
+                privileged: sc.privileged,
+                seccomp,
+            };
+            localhost = path;
             match apparmor_of(sc.apparmor.as_ref(), &sc.apparmor_profile)?.as_str() {
                 "" => {}
                 "unconfined" => c.security_opt.apparmor_unconfined = true,
@@ -777,10 +763,15 @@ pub fn container_create_of(
             }
         }
     }
+    let ask = from_cri(&context);
+    match ask.seccomp {
+        Seccomp::Unconfined => c.security_opt.seccomp_unconfined = true,
+        Seccomp::Custom => c.security_opt.seccomp_profile = Some(localhost),
+        Seccomp::Default => {}
+    }
     // the CRI's lists go to the OCI spec as they are, empty ones too (an
-    // unmasked /proc): they replace the defaults of the engine; a privileged
-    // container has none
-    if !privileged {
+    // unmasked /proc): they replace the defaults of the engine
+    if ask.own_paths {
         c.security_opt.unmask_paths = vec!["ALL".into()];
         c.security_opt.mask_paths = masked;
         c.security_opt.readonly_paths = readonly;
@@ -1654,6 +1645,117 @@ mod tests {
         assert!(
             c.mask_paths.is_empty() && c.readonly_paths.is_empty() && c.unmask_paths.is_empty()
         );
+    }
+
+    /// What the security context of the kubelet becomes for the engine:
+    /// privileged x seccomp profile x lists of paths, no context, and the
+    /// infra container of a sandbox.
+    #[test]
+    #[allow(deprecated)]
+    fn the_confinement_of_every_security_context() {
+        use cri::security_profile::ProfileType;
+        let typed = |t: ProfileType, r: &str| {
+            Some(cri::SecurityProfile {
+                profile_type: t as i32,
+                localhost_ref: r.into(),
+            })
+        };
+        // (typed profile, deprecated path, what the engine gets: unconfined
+        // or the profile file, none for the default profile)
+        let profiles = [
+            // nothing asked is unconfined, as the API says of the empty
+            // deprecated path (a sandbox gets the default profile instead)
+            (None, "", (true, None)),
+            (typed(ProfileType::RuntimeDefault, ""), "", (false, None)),
+            (typed(ProfileType::Unconfined, ""), "", (true, None)),
+            (typed(ProfileType::Localhost, "/p"), "", (false, Some("/p"))),
+            (None, "runtime/default", (false, None)),
+            (None, "docker/default", (false, None)),
+            (None, "unconfined", (true, None)),
+            (None, "localhost/p", (false, Some("p"))),
+            // the typed one wins over the deprecated one
+            (
+                typed(ProfileType::RuntimeDefault, ""),
+                "unconfined",
+                (false, None),
+            ),
+            (
+                typed(ProfileType::Unconfined, ""),
+                "runtime/default",
+                (true, None),
+            ),
+            (
+                typed(ProfileType::Localhost, "/p"),
+                "unconfined",
+                (false, Some("/p")),
+            ),
+        ];
+        for privileged in [false, true] {
+            for (seccomp, path, (unconfined, file)) in &profiles {
+                for (masked, readonly) in
+                    [(vec![], vec![]), (vec!["/proc/kcore"], vec!["/proc/sys"])]
+                {
+                    let c = container(|c| {
+                        c.linux = Some(cri::LinuxContainerConfig {
+                            security_context: Some(cri::LinuxContainerSecurityContext {
+                                privileged,
+                                seccomp: seccomp.clone(),
+                                seccomp_profile_path: path.to_string(),
+                                masked_paths: masked.iter().map(|s| s.to_string()).collect(),
+                                readonly_paths: readonly.iter().map(|s| s.to_string()).collect(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        })
+                    })
+                    .unwrap();
+                    let so = &c.security_opt;
+                    let what = format!("{seccomp:?} {path:?} privileged {privileged} {masked:?}");
+                    // a privileged container has no profile (the one asked
+                    // for does not apply either), and no paths
+                    assert_eq!(so.seccomp_unconfined, *unconfined || privileged, "{what}");
+                    assert_eq!(
+                        so.seccomp_profile.as_deref(),
+                        file.filter(|_| !privileged),
+                        "{what}"
+                    );
+                    let paths = |v: &[&str]| -> Vec<String> {
+                        v.iter()
+                            .filter(|_| !privileged)
+                            .map(|s| s.to_string())
+                            .collect()
+                    };
+                    assert_eq!(so.mask_paths, paths(&masked), "{what}");
+                    assert_eq!(so.readonly_paths, paths(&readonly), "{what}");
+                    assert_eq!(
+                        so.unmask_paths,
+                        if privileged {
+                            vec![]
+                        } else {
+                            vec!["ALL".to_string()]
+                        }
+                    );
+                }
+            }
+        }
+        // No security context at all: the engine's defaults, its default
+        // seccomp profile and its paths.
+        let so = container(|_| {}).unwrap().security_opt;
+        assert!(!so.seccomp_unconfined && so.seccomp_profile.is_none());
+        assert!(so.unmask_paths.is_empty());
+        assert!(so.mask_paths.is_empty() && so.readonly_paths.is_empty());
+        // A sandbox that names no profile, with a context or without one,
+        // keeps the default profile for its infra container.
+        let infra = |sc: Option<cri::LinuxSandboxSecurityContext>| {
+            infra_security_of(sc.as_ref(), 0).unwrap().security_opts
+        };
+        assert!(infra(None).is_empty());
+        assert!(infra(Some(Default::default())).is_empty());
+        let unconfined = cri::LinuxSandboxSecurityContext {
+            seccomp: typed(ProfileType::Unconfined, ""),
+            ..Default::default()
+        };
+        assert_eq!(infra(Some(unconfined)), ["seccomp=unconfined"]);
     }
 
     #[test]

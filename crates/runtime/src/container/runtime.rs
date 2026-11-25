@@ -10,6 +10,7 @@ use std::fs::{self};
 use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use velarx_confine_core as confine_core;
 use velarx_proto::health::Healthcheck;
 use velarx_wire::monitor::proto::RestartSettings;
 use velarx_wire::request::{CgroupsMode, NetworkMode};
@@ -839,6 +840,9 @@ impl OciRuntime {
             user.uid == 0,
         )
         .map_err(RuntimeError::Runtime)?;
+        let seccomp = super::seccomp::SeccompMode::from_security_opt(&config.security_opt.seccomp)
+            .map_err(|e| RuntimeError::Runtime(e.to_string()))?;
+        let confine = confinement(config, &seccomp);
         let mut annotations = HashMap::new();
         if let Some(bpf) = &config.security_opt.seccomp_bpf {
             annotations.insert("run.oci.seccomp_bpf_data".to_string(), bpf.clone());
@@ -862,7 +866,7 @@ impl OciRuntime {
             .env(env)
             .cwd(cwd.to_string())
             .capabilities(capabilities.clone())
-            .no_new_privileges(config.security_opt.no_new_privileges)
+            .no_new_privileges(confine.no_new_privileges)
             .build()
             .oci()?;
 
@@ -890,7 +894,7 @@ impl OciRuntime {
                                 "nosuid",
                                 "noexec",
                                 "nodev",
-                                if config.privileged { "rw" } else { "ro" },
+                                if confine.sys_readonly { "ro" } else { "rw" },
                                 "rbind",
                             ]
                             .map(String::from)
@@ -900,7 +904,7 @@ impl OciRuntime {
                         .oci()?;
                 }
                 // a privileged container can write to /sys
-                Some("/sys") if config.privileged => {
+                Some("/sys") if !confine.sys_readonly => {
                     let opts = m.options().clone().unwrap_or_default();
                     m.set_options(Some(opts.into_iter().filter(|o| o != "ro").collect()));
                 }
@@ -1093,7 +1097,7 @@ impl OciRuntime {
         // program, and a container with CAP_MKNOD could make and open the
         // block devices of the host.  Podman's defaults; a privileged
         // container has every device.
-        if !config.privileged {
+        if confine.deny_all_devices {
             let mut resources = resources_out.take().unwrap_or_default();
             resources.set_devices(Some(default_device_cgroup()?));
             resources_out = Some(resources);
@@ -1102,11 +1106,7 @@ impl OciRuntime {
             linux_builder = linux_builder.resources(resources);
         }
 
-        // The default profile is for unprivileged containers; an explicit one
-        // applies to all.
-        let seccomp = super::seccomp::SeccompMode::from_security_opt(&config.security_opt.seccomp)
-            .map_err(|e| RuntimeError::Runtime(e.to_string()))?;
-        if !(config.privileged && seccomp == super::seccomp::SeccompMode::Default) {
+        if !matches!(confine.seccomp, confine_core::Filter::None) {
             let bounding: std::collections::HashSet<String> = capabilities
                 .bounding()
                 .iter()
@@ -1121,7 +1121,7 @@ impl OciRuntime {
             }
         }
 
-        let (masked, readonly) = masked_and_readonly_paths(config);
+        let (masked, readonly) = masked_and_readonly_paths(config, &confine);
         linux_builder = linux_builder.masked_paths(masked).readonly_paths(readonly);
 
         let mut sysctls = config.sysctls.clone();
@@ -1654,48 +1654,64 @@ fn sysfs_is_a_host_bind(config: &ContainerConfig) -> bool {
     host_net && own_userns
 }
 
-/// The masked and read-only paths of a container: the defaults (none when
-/// privileged), `mask=` and the read-only paths asked for added, `unmask=`
-/// taken out of both (`ALL`: only those asked for are left).
-fn masked_and_readonly_paths(config: &ContainerConfig) -> (Vec<String>, Vec<String>) {
+/// What `--privileged`, an unconfined seccomp profile, `unmask=` and a host
+/// `/sys` turn off (`velarx-confine-core`).
+fn confinement(
+    config: &ContainerConfig,
+    seccomp: &super::seccomp::SeccompMode,
+) -> confine_core::Decision {
+    use super::seccomp::SeccompMode;
     let so = &config.security_opt;
-    let mut masked = if config.privileged {
-        Vec::new()
-    } else {
-        default_masked_paths()
+    confine_core::decide(&confine_core::Request {
+        privileged: config.privileged,
+        seccomp: match seccomp {
+            SeccompMode::Default => confine_core::Seccomp::Default,
+            SeccompMode::Unconfined => confine_core::Seccomp::Unconfined,
+            SeccompMode::Custom(_) => confine_core::Seccomp::Custom,
+        },
+        unmask_all: so.unmask_paths.iter().any(|p| p == "ALL"),
+        unmask_some: so.unmask_paths.iter().any(|p| p != "ALL"),
+        host_sysfs: sysfs_is_a_host_bind(config),
+        no_new_privileges: so.no_new_privileges,
+    })
+}
+
+/// The masked and read-only paths of a container: the defaults the decision
+/// keeps (podman's: a list given does not replace them, /proc/sys would be
+/// writable) and `mask=` and the read-only paths asked for, which `unmask=`
+/// does not take out.
+fn masked_and_readonly_paths(
+    config: &ContainerConfig,
+    confine: &confine_core::Decision,
+) -> (Vec<String>, Vec<String>) {
+    use confine_core::Paths;
+    let so = &config.security_opt;
+    let defaults = |paths: Paths, all: Vec<String>| match paths {
+        Paths::Default => all,
+        Paths::Without => all
+            .into_iter()
+            .filter(|p| !so.unmask_paths.contains(p))
+            .collect(),
+        Paths::None => Vec::new(),
     };
-    // The /sys of a container in the network namespace of the host that
-    // has a user namespace is a bind of the host's, whose /sys/kernel is the
+    let mut masked = defaults(confine.masked, default_masked_paths());
+    // The /sys of a container in the network namespace of the host that has
+    // a user namespace is a bind of the host's, whose /sys/kernel is the
     // host's debugfs, tracing and security files; podman masks it as it
-    // makes the bind (`canMountSys`)
-    if !config.privileged && sysfs_is_a_host_bind(config) {
+    // makes the bind (`canMountSys`).
+    if confine.mask_sys_kernel {
         masked.push("/sys/kernel".to_string());
     }
-    for p in &so.mask_paths {
-        if !masked.contains(p) {
-            masked.push(p.clone());
+    let mut readonly = defaults(confine.readonly, default_readonly_paths());
+    for (list, asked) in [
+        (&mut masked, &so.mask_paths),
+        (&mut readonly, &so.readonly_paths),
+    ] {
+        for p in asked {
+            if !list.contains(p) {
+                list.push(p.clone());
+            }
         }
-    }
-    // the defaults and those asked for, as podman's: a list given does not
-    // replace the defaults (/proc/sys would be writable)
-    let mut readonly = if config.privileged {
-        Vec::new()
-    } else {
-        default_readonly_paths()
-    };
-    for p in &so.readonly_paths {
-        if !readonly.contains(p) {
-            readonly.push(p.clone());
-        }
-    }
-    if so.unmask_paths.iter().any(|p| p == "ALL") {
-        // what the user masked or made read-only stays so: with `unmask=ALL`
-        // the lists are exactly those asked for
-        masked.retain(|p| so.mask_paths.contains(p));
-        readonly.retain(|p| so.readonly_paths.contains(p));
-    } else {
-        masked.retain(|p| !so.unmask_paths.contains(p) || so.mask_paths.contains(p));
-        readonly.retain(|p| !so.unmask_paths.contains(p) || so.readonly_paths.contains(p));
     }
     (masked, readonly)
 }
@@ -2585,7 +2601,11 @@ mod tests {
                 // (a user namespace of its own: the sysfs is a bind of the host's)
                 config.userns_mode = UsernsMode::Private;
                 f(&mut config);
-                masked_and_readonly_paths(&config).0
+                masked_and_readonly_paths(
+                    &config,
+                    &confinement(&config, &crate::container::seccomp::SeccompMode::Default),
+                )
+                .0
             };
             let sys_kernel = |m: &[String]| m.iter().any(|p| p == "/sys/kernel");
             assert!(sys_kernel(&masked(&|c| c.network_mode = NetworkMode::Host)));
@@ -2601,7 +2621,13 @@ mod tests {
                 c.network_mode = NetworkMode::Host;
                 c.security_opt.unmask_paths = vec!["/sys/kernel".into()];
             });
-            assert!(!sys_kernel(&unmasked));
+            // no unmask opens it, as in podman: it is not a default path
+            assert!(sys_kernel(&unmasked));
+            let all = masked(&|c| {
+                c.network_mode = NetworkMode::Host;
+                c.security_opt.unmask_paths = vec!["ALL".into()];
+            });
+            assert_eq!(all, ["/sys/kernel"]);
         }
 
         #[test]
@@ -2871,6 +2897,151 @@ mod tests {
                 Some(-1),
                 "Memory swap -1 should mean unlimited"
             );
+        }
+
+        /// The confinement of every combination of the options that decide
+        /// it, as the spec of the engine has it today.
+        #[test]
+        fn the_confinement_of_every_combination_of_options() {
+            use crate::container::seccomp::SeccompMode;
+            let (runtime, tmp) = create_test_runtime();
+            let profile = r#"{"defaultAction":"SCMP_ACT_ERRNO"}"#;
+            let default_masked = default_masked_paths();
+            let default_readonly = default_readonly_paths();
+            let sorted = |mut v: Vec<String>| {
+                v.sort();
+                v
+            };
+            for flags in 0..2u32.pow(5) {
+                let (privileged, host_sysfs, nnp, read_only, root) = (
+                    flags & 1 != 0,
+                    flags & 2 != 0,
+                    flags & 4 != 0,
+                    flags & 8 != 0,
+                    flags & 16 != 0,
+                );
+                for seccomp in ["", "unconfined", profile] {
+                    // unmask=, mask=, the read-only paths asked for
+                    let lists: [(&[&str], &[&str], &[&str]); 6] = [
+                        (&[], &[], &[]),
+                        (&["/proc/kcore", "/proc/sys"], &[], &[]),
+                        // what is asked for stays, whatever is unmasked
+                        (
+                            &["/proc/kcore", "/proc/sys"],
+                            &["/proc/kcore"],
+                            &["/proc/sys"],
+                        ),
+                        (&["ALL"], &[], &[]),
+                        (&["ALL"], &["/x"], &["/y"]),
+                        (&["/sys/kernel"], &[], &[]),
+                    ];
+                    for (unmask, mask, ro) in lists {
+                        let mut config = create_test_config();
+                        config.privileged = privileged;
+                        config.read_only_rootfs = read_only;
+                        config.user = if root { "0" } else { "1000" }.into();
+                        config.userns_mode = UsernsMode::Private;
+                        if host_sysfs {
+                            config.network_mode = NetworkMode::Host;
+                        }
+                        config.security_opt.no_new_privileges = nnp;
+                        config.security_opt.seccomp = seccomp.into();
+                        let owned = |v: &[&str]| v.iter().map(|p| p.to_string()).collect();
+                        config.security_opt.unmask_paths = owned(unmask);
+                        config.security_opt.mask_paths = owned(mask);
+                        config.security_opt.readonly_paths = owned(ro);
+                        let what = format!(
+                            "privileged {privileged} seccomp {seccomp:?} unmask {unmask:?} mask {mask:?} \
+                             host sysfs {host_sysfs} nnp {nnp} read-only {read_only} root {root}"
+                        );
+                        let spec = runtime.generate_spec(&config, tmp.path()).unwrap();
+                        let linux = spec.linux().as_ref().unwrap();
+
+                        // the device cgroup: all denied first, but for a
+                        // privileged container
+                        let devices = linux.resources().as_ref().and_then(|r| r.devices().clone());
+                        match (privileged, devices) {
+                            (false, Some(d)) => assert!(
+                                !d[0].allow() && d[0].typ().is_none(),
+                                "deny all first: {what}"
+                            ),
+                            (true, d) => assert!(d.is_none_or(|d| d.is_empty()), "{what}"),
+                            (false, None) => panic!("no device rules: {what}"),
+                        }
+
+                        // seccomp: the default profile is not for a
+                        // privileged container, an explicit one is for all
+                        let mode = SeccompMode::from_security_opt(seccomp).unwrap();
+                        let filtered = match mode {
+                            SeccompMode::Unconfined => false,
+                            SeccompMode::Default => !privileged,
+                            SeccompMode::Custom(_) => true,
+                        };
+                        assert_eq!(linux.seccomp().is_some(), filtered, "seccomp: {what}");
+
+                        // the paths: none for a privileged container, the
+                        // defaults less those unmasked, none for ALL
+                        // and what was asked for, unmasked or not
+                        let kept = |defaults: &[String], asked: &[&str]| -> Vec<String> {
+                            let mut v: Vec<String> = if privileged || unmask == ["ALL"] {
+                                Vec::new()
+                            } else {
+                                defaults
+                                    .iter()
+                                    .filter(|p| !unmask.contains(&p.as_str()))
+                                    .cloned()
+                                    .collect()
+                            };
+                            for p in asked {
+                                if !v.iter().any(|q| q == p) {
+                                    v.push(p.to_string());
+                                }
+                            }
+                            v
+                        };
+                        let mut masked = kept(&default_masked, mask);
+                        // (whatever is unmasked, `ALL` and the path itself
+                        // too: the mask is not one of the defaults, as in
+                        // podman)
+                        if !privileged && host_sysfs {
+                            masked.push("/sys/kernel".into());
+                        }
+                        assert_eq!(
+                            sorted(linux.masked_paths().clone().unwrap_or_default()),
+                            sorted(masked),
+                            "masked: {what}"
+                        );
+                        assert_eq!(
+                            sorted(linux.readonly_paths().clone().unwrap_or_default()),
+                            sorted(kept(&default_readonly, ro)),
+                            "read-only: {what}"
+                        );
+
+                        // the rest is what was asked
+                        let process = spec.process().as_ref().unwrap();
+                        assert_eq!(process.no_new_privileges(), Some(nnp), "{what}");
+                        assert_eq!(spec.root().as_ref().unwrap().readonly(), Some(read_only));
+                        let sys = spec
+                            .mounts()
+                            .iter()
+                            .flatten()
+                            .find(|m| m.destination() == Path::new("/sys"))
+                            .unwrap();
+                        let opts = sys.options().clone().unwrap();
+                        assert_eq!(
+                            sys.typ().as_deref(),
+                            Some(if host_sysfs { "bind" } else { "sysfs" }),
+                            "{what}"
+                        );
+                        assert_eq!(
+                            opts.contains(&"ro".to_string()),
+                            !privileged,
+                            "/sys: {what}"
+                        );
+                        assert_eq!(opts.contains(&"rw".to_string()), privileged && host_sysfs);
+                    }
+                }
+            }
         }
     }
 }

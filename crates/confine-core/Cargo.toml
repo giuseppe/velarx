@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-confine-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Which confinement a container gets: what privileged, unconfined and unmask turn off, and what stays"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# One function on the flags of a request: no dependency, no I/O.  The shells
+# that read the flags and build the OCI spec are `velarx-runtime`
+# (container/runtime.rs) and, for the kubelet's security context,
+# `velarx-cri` (service/convert.rs).
+
+[lib]
+name = "velarx_confine_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

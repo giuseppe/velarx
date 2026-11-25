@@ -4828,6 +4828,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "velarx-confine-core"
+version = "0.1.0"
+
+[[package]]
 name = "velarx-content"
 version = "0.1.0"
 dependencies = [
@@ -4957,6 +4961,7 @@ dependencies = [
  "tonic-build",
  "tracing",
  "velarx-base",
+ "velarx-confine-core",
  "velarx-proto",
  "velarx-registry",
  "velarx-sys",
@@ -5430,6 +5435,7 @@ dependencies = [
  "velarx-bpf-core",
  "velarx-caps-core",
  "velarx-config",
+ "velarx-confine-core",
  "velarx-content",
  "velarx-db",
  "velarx-fuse",

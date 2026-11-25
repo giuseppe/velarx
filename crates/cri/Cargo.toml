@@ -40,6 +40,7 @@ sha1 = "0.10"
 sha2.workspace = true
 rustix = { workspace = true, features = ["process", "fs", "rand", "event", "net"] }
 zlink = { workspace = true, features = ["tokio", "proxy", "service", "tracing"] }
+velarx-confine-core = { path = "../confine-core" }
 velarx-proto = { path = "../proto" }
 velarx-sys = { path = "../sys" }
 # the credentials of a pull are a `RegistryAccess`
