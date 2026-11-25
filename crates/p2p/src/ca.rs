@@ -247,9 +247,7 @@ pub fn revoke(dir: &Path, peers: &[PeerId]) -> io::Result<RevocationList> {
         }
     }
     let list = RevocationList::sign(&ed, number + 1, now() as u64, &all);
-    let tmp = dir.join(format!(".{LISTS}.new"));
-    std::fs::write(&tmp, list.text())?;
-    std::fs::rename(&tmp, &path)?;
+    velarx_base::atomic_file::write(&path, list.text().as_bytes(), 0o644)?;
     Ok(list)
 }
 
@@ -299,4 +297,27 @@ pub fn show(path: &Path) -> io::Result<String> {
         ));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A link planted where the list used to be written first is not
+    /// followed.
+    #[test]
+    fn revoke_does_not_write_through_a_planted_link() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path(), 30).unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "kept").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join(format!(".{LISTS}.new"))).unwrap();
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let list = revoke(dir.path(), &[peer]).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "kept");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(LISTS)).unwrap(),
+            list.text()
+        );
+    }
 }
