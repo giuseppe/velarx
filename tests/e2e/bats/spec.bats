@@ -337,6 +337,14 @@ tmpfs" --read-only -- sh -c 'for d in /tmp /var/tmp /run; do grep " $d " /proc/s
     sc container rm -t 0 -f hnsa > /dev/null 2>&1
 }
 
+@test "a container that joins one with the host's network has it too" {
+    sc container run -d --name hnsn --network host "$IMAGE" sleep 305 > /dev/null
+    check "the target runs" running "$(sc container inspect --format '{{.State.Status}}' hnsn)"
+    out=$(sc container run --rm --network container:hnsn "$IMAGE" readlink /proc/self/ns/net 2>&1)
+    check "--network container: is the host's" "$(readlink /proc/self/ns/net)" "$out"
+    sc container rm -t 0 -f hnsn > /dev/null 2>&1
+}
+
 # The spec carries the destinations of the bind mounts as given: the runtime
 # resolves them in the root at every start, so a container that replaces the
 # link /etc -> /var/etc of its image by a directory gets /etc/hosts there

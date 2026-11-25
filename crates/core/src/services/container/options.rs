@@ -452,8 +452,10 @@ impl ContainerService {
     /// The network a request joins (`container:ID`), in its mode and its
     /// list of networks, named by the id of the container, as the other
     /// namespaces are: a rename or a new container of the same name does
-    /// not change what it joins and starts first.  A target that does not
-    /// exist is left to the create.
+    /// not change what it joins and starts first.  That of a container that
+    /// has the host's network is the host's for a rootless engine, which
+    /// cannot join the host's namespace.  A target that does not exist is
+    /// left to the create.
     pub(super) async fn resolve_joined_network(
         &self,
         req: &mut CreateContainerRequest,
@@ -464,7 +466,14 @@ impl ContainerService {
         let Ok(rec) = self.db.get_container(target).await else {
             return Ok(());
         };
-        let joined = NetworkMode::Container(rec.id);
+        let theirs = serde_json::from_str::<ContainerConfig>(&rec.config).unwrap_or_default();
+        let joined = if crate::userns::rootless::in_user_namespace()?
+            && config_has_network_mode(&theirs, &NetworkMode::Host)
+        {
+            NetworkMode::Host
+        } else {
+            NetworkMode::Container(rec.id)
+        };
         for n in &mut req.networks {
             if NetworkMode::parse(n) == req.network_mode {
                 *n = joined.to_string();
