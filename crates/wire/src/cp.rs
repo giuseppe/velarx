@@ -319,7 +319,7 @@ impl<W: Write> TreeWriter<'_, W> {
     /// a directory (its header is added when `header`, its entries are the
     /// walk's).  A fifo and a device are archived (never opened), as the
     /// copy out of a stopped container does it; sockets are skipped.
-    fn add_node(&mut self, fd: OwnedFd, tar_path: &Path, header: bool) -> io::Result<bool> {
+    pub fn add_node(&mut self, fd: OwnedFd, tar_path: &Path, header: bool) -> io::Result<bool> {
         let st = fstat(&fd)?;
         match FileType::from_raw_mode(st.st_mode) {
             FileType::Directory => {

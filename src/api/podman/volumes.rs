@@ -362,17 +362,18 @@ impl Write for ChannelWriter {
 }
 
 /// The content of the volume as a tar: nothing is followed, directories
-/// have a trailing slash as in the archives of the container engines.
+/// have a trailing slash as in the archives of the container engines, and
+/// an entry removed while the volume is walked is left out.
 pub(crate) fn write_volume_tar(dir: &Path, w: impl Write) -> io::Result<()> {
+    use rustix::fs::{openat, FileType, Mode, OFlags};
     use std::os::fd::BorrowedFd;
     use velarx_base::walk::{Visit, Walk};
+    use velarx_wire::cp::TreeWriter;
     /// The walk of the volume: the state of a directory is its name in the
-    /// archive.  The entries are read through the descriptor of their
-    /// directory (`/proc/self/fd`), so a name replaced by a link is not
-    /// followed.
-    struct Tar<'a, W: Write> {
-        b: &'a mut tar::Builder<W>,
-    }
+    /// archive.  Each entry is a node opened with `O_PATH | O_NOFOLLOW`
+    /// and archived from that descriptor, so a name replaced by a link is
+    /// not followed.
+    struct Tar<'a, W: Write>(TreeWriter<'a, W>);
     impl<W: Write> Visit for Tar<'_, W> {
         type Dir = std::path::PathBuf;
 
@@ -384,51 +385,42 @@ pub(crate) fn write_volume_tar(dir: &Path, w: impl Write) -> io::Result<()> {
             _: usize,
             prefix: &mut std::path::PathBuf,
         ) -> io::Result<Option<std::path::PathBuf>> {
-            use rustix::fs::FileType;
-            let mut path = velarx_sys::fd::proc_path(&dir);
-            path.push(name);
-            let leaf = name;
+            let fd = match openat(
+                dir,
+                name,
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                // removed since the directory was read
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
             let name = prefix.join(name);
-            match FileType::from_raw_mode(st.st_mode) {
-                FileType::Directory => {
-                    let mut with_slash = name.clone().into_os_string();
-                    with_slash.push("/");
-                    self.b.append_dir(Path::new(&with_slash), &path)?;
-                    return Ok(Some(name));
-                }
-                FileType::RegularFile => {
-                    // (a file with holes is a sparse entry)
-                    let file = std::fs::File::from(rustix::fs::openat(
-                        dir,
-                        leaf,
-                        rustix::fs::OFlags::RDONLY
-                            | rustix::fs::OFlags::NOFOLLOW
-                            | rustix::fs::OFlags::NONBLOCK
-                            | rustix::fs::OFlags::CLOEXEC,
-                        rustix::fs::Mode::empty(),
-                    )?);
-                    let meta = file.metadata()?;
-                    let mut h = tar::Header::new_gnu();
-                    h.set_metadata_in_mode(&meta, tar::HeaderMode::Complete);
-                    velarx_wire::sparse::append_file(self.b, &mut h, &name, &file, meta.len())?;
-                }
-                _ => self.b.append_path_with_name(&path, &name)?,
+            if FileType::from_raw_mode(st.st_mode) != FileType::Directory {
+                self.0.add_node(fd, &name, true)?;
+                return Ok(None);
             }
-            Ok(None)
+            let mut with_slash = name.clone().into_os_string();
+            with_slash.push("/");
+            self.0.add_node(fd, Path::new(&with_slash), true)?;
+            Ok(Some(name))
         }
     }
     let mut b = tar::Builder::new(w);
-    b.follow_symlinks(false);
     Walk {
         max_depth: velarx_base::tree::MAX_DEPTH,
         sorted: true,
-        skip_gone: false,
+        skip_gone: true,
         lenient: false,
     }
     .run(
         velarx_base::tree::open_root(dir)?,
         std::path::PathBuf::new(),
-        &mut Tar { b: &mut b },
+        &mut Tar(TreeWriter {
+            builder: &mut b,
+            ids: None,
+        }),
     )?;
     b.into_inner()?.flush()
 }
@@ -809,5 +801,76 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["link", "sub/", "sub/f"]);
+    }
+
+    /// The entries of a tar, as `kind path mode uid gid link content`.
+    fn listing(tar: &[u8]) -> Vec<String> {
+        let mut ar = tar::Archive::new(tar);
+        ar.entries()
+            .unwrap()
+            .map(|e| {
+                let mut e = e.unwrap();
+                let h = e.header().clone();
+                let mut content = Vec::new();
+                e.read_to_end(&mut content).unwrap();
+                format!(
+                    "{:?} {} {:o} {} {} {:?} {:?}",
+                    h.entry_type(),
+                    String::from_utf8_lossy(&e.path_bytes()),
+                    h.mode().unwrap(),
+                    h.uid().unwrap(),
+                    h.gid().unwrap(),
+                    e.link_name_bytes()
+                        .map(|l| String::from_utf8_lossy(&l).into_owned()),
+                    String::from_utf8_lossy(&content),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn export_of_every_kind_of_entry() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let d = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "host").unwrap();
+        let p = |n: &str| d.path().join(n);
+        std::fs::create_dir(p("dir")).unwrap();
+        std::fs::set_permissions(p("dir"), std::fs::Permissions::from_mode(0o750)).unwrap();
+        std::fs::write(p("dir/file"), "data").unwrap();
+        std::fs::set_permissions(p("dir/file"), std::fs::Permissions::from_mode(0o4755)).unwrap();
+        std::fs::hard_link(p("dir/file"), p("hard")).unwrap();
+        symlink("dir/file", p("rel")).unwrap();
+        symlink(outside.path().join("secret"), p("abs")).unwrap();
+        symlink("dir", p("todir")).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            p("fifo"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o640),
+            0,
+        )
+        .unwrap();
+        let _sock = std::os::unix::net::UnixListener::bind(p("sock")).unwrap();
+        let mut out = Vec::new();
+        write_volume_tar(d.path(), &mut out).unwrap();
+        // (a socket is left out)
+        let (uid, gid) = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
+        let host = outside.path().join("secret");
+        let host = host.display();
+        let want = [
+            format!("Symlink abs 777 {uid} {gid} Some(\"{host}\") \"\""),
+            format!("Directory dir/ 750 {uid} {gid} None \"\""),
+            format!("Regular dir/file 4755 {uid} {gid} None \"data\""),
+            format!("Fifo fifo 640 {uid} {gid} None \"\""),
+            format!("Regular hard 4755 {uid} {gid} None \"data\""),
+            format!("Symlink rel 777 {uid} {gid} Some(\"dir/file\") \"\""),
+            format!("Symlink todir 777 {uid} {gid} Some(\"dir\") \"\""),
+        ];
+        // the content of the host file is nowhere: a link is a link
+        assert_eq!(listing(&out), want);
     }
 }
