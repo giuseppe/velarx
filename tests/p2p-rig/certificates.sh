@@ -14,6 +14,15 @@ img=$REG/certs:latest
 fail=0
 check () { if eval "$1"; then log "ok: $2"; else log "FAILED: $2"; fail=1; fi; }
 faketime=$(ls /usr/lib*/libfaketime.so.1 /usr/lib/*/faketime/libfaketime.so.1 2> /dev/null | head -1)
+# the offset is in seconds, without a unit: a suffix such as "s" is refused
+# by libfaketime and the program is then not started
+back=$((30 * 86400 - EXP))
+if [ -z "$faketime" ]; then
+    log "SKIPPED: no libfaketime, the expiry of node 4's certificate is not checked"
+elif [ "$(LD_PRELOAD="$faketime" FAKETIME="-$back" date +%s 2> /dev/null)" -gt $(($(date +%s) - back + 60)) ] 2> /dev/null; then
+    log "SKIPPED: libfaketime does not move the clock, the expiry of node 4's certificate is not checked"
+    faketime=
+fi
 
 image certs 4 > "$OUT/build.log" 2>&1 || { echo "the image is not built, see $OUT/build.log" >&2; exit 1; }
 as_user "$P" ca init "$W/ca" > /dev/null
@@ -27,8 +36,8 @@ for i in 0 1 2 3; do
 done
 # node 4: valid from now-30d+EXP s for 30 days
 if [ -n "$faketime" ]; then
-    as_user env LD_PRELOAD="$faketime" FAKETIME="-$((30 * 86400 - EXP))s" \
-        "$P" ca sign --ca "$W/ca" --name node4 --days 30 -o "$W/nodes/n4/node.crt" "$W/nodes/n4/request" > /dev/null
+    as_user env LD_PRELOAD="$faketime" FAKETIME="-$back" \
+        "$P" ca sign --ca "$W/ca" --name node4 --days 30 -o "$W/nodes/n4/node.crt" "$W/nodes/n4/request" > /dev/null || exit 1
 else
     as_user "$P" ca sign --ca "$W/ca" --name node4 --days 30 -o "$W/nodes/n4/node.crt" "$W/nodes/n4/request" > /dev/null
 fi
