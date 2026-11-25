@@ -770,6 +770,10 @@ mod tests {
                 p(Some("img"), CheckAction::ImageRemoved),
                 p(Some("img"), CheckAction::ImageRemoved),
                 p(None, CheckAction::None),
+                CheckProblem {
+                    volume: Some("vol".into()),
+                    ..p(None, CheckAction::Repaired)
+                },
             ],
             removed_containers: vec![CheckRemovedContainer {
                 id: "ctr".into(),
@@ -782,6 +786,8 @@ mod tests {
             "Damaged layer k:\n1 error occurred:\n\t* k: m\n\n\
              Damaged image img:\n2 errors occurred:\n\t* k: m\n\t* k: m\n\n\
              Deleted damaged image: img\n\
+             Damaged volume vol:\n1 error occurred:\n\t* k: m\n\n\
+             Repaired volume: vol\n\
              Deleted damaged container: ctr\n"
         );
     }

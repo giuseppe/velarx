@@ -110,6 +110,7 @@ impl Finding {
         CheckProblem {
             image: self.image,
             name: self.name,
+            volume: None,
             kind: self.kind.to_string(),
             message: self.message,
             path: self.path.map(|p| p.display().to_string()),

@@ -2254,12 +2254,15 @@ type CheckAction (
 	image_in_use
 )
 
-# A problem of the store, of an image if it has one.
+# A problem of the store, of an image or a volume if it has one.
 type CheckProblem (
 	# The id of the image the problem is of (none: of the store).
 	image: ?string,
 	# A name of that image.
 	name: ?string,
+	# The volume the problem is of: the name of its row or of its entry
+	# in the volumes directory.
+	volume: ?string,
 	kind: string,
 	message: string,
 	path: ?string,
@@ -2277,6 +2280,8 @@ type CheckReport (
 	images_unchecked: int,
 	files_checked: int,
 	bytes_read: int,
+	# The entries of the volumes directory that were looked at.
+	volumes_checked: int,
 	elapsed_ms: int,
 	problems: []CheckProblem,
 	# The containers `repair_lossy` removed, with their images.

@@ -453,6 +453,13 @@ pub(super) fn check_text(report: &velarx_proto::system::CheckReport) -> String {
     {
         out.push_str(&format!("Deleted damaged image: {id}\n"));
     }
+    damaged(&mut out, "Volumes", "Damaged volume");
+    for name in shape["RepairedVolumes"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "Repaired volume: {}\n",
+            name.as_str().unwrap_or_default()
+        ));
+    }
     damaged(&mut out, "Containers", "Damaged container");
     for id in shape["RemovedContainers"]
         .as_object()

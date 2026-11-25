@@ -417,7 +417,7 @@ pub enum CheckAction {
     ImageInUse,
 }
 
-/// A problem of the store, of an image if it has one.
+/// A problem of the store, of an image or a volume if it has one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "proxy", derive(zlink::introspect::CustomType))]
 #[serde(default)]
@@ -426,6 +426,9 @@ pub struct CheckProblem {
     pub image: Option<String>,
     /// A name of that image.
     pub name: Option<String>,
+    /// The volume the problem is of: the name of its row or of its entry
+    /// in the volumes directory.
+    pub volume: Option<String>,
     pub kind: String,
     pub message: String,
     pub path: Option<String>,
@@ -476,6 +479,8 @@ pub struct CheckReport {
     pub images_unchecked: u64,
     pub files_checked: u64,
     pub bytes_read: u64,
+    /// The entries of the volumes directory that were looked at.
+    pub volumes_checked: u64,
     pub elapsed_ms: u64,
     pub problems: Vec<CheckProblem>,
     /// The containers `repair_lossy` removed, with their images.

@@ -552,11 +552,20 @@ pub fn check(r: &CheckReport) -> Value {
     let mut images: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut removed_images: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut removed_layers = Vec::new();
+    let mut volumes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut repaired_volumes: Vec<String> = Vec::new();
     for p in &r.problems {
         // (what was detected, also when it was removed)
         let mut message = format!("{}: {}", p.kind, p.message);
-        if let (Some(_), Some(path)) = (&p.image, &p.path) {
+        if let (true, Some(path)) = (p.image.is_some() || p.volume.is_some(), &p.path) {
             message.push_str(&format!(" ({path})"));
+        }
+        if let Some(volume) = &p.volume {
+            if p.action == CheckAction::Repaired && !repaired_volumes.contains(volume) {
+                repaired_volumes.push(volume.clone());
+            }
+            volumes.entry(volume.clone()).or_default().push(message);
+            continue;
         }
         let key = p.path.clone().unwrap_or_else(|| p.kind.clone());
         match &p.image {
@@ -601,6 +610,8 @@ pub fn check(r: &CheckReport) -> Value {
         "RemovedImages": lists(removed_images),
         "Containers": null,
         "RemovedContainers": map(removed_containers),
+        "Volumes": lists(volumes),
+        "RepairedVolumes": if repaired_volumes.is_empty() { Value::Null } else { json!(repaired_volumes) },
     })
 }
 
@@ -621,6 +632,7 @@ mod tests {
             message: "bad".into(),
             path: Some("/store/o".into()),
             action,
+            ..Default::default()
         }
     }
 
@@ -637,9 +649,37 @@ mod tests {
             "RemovedImages",
             "Containers",
             "RemovedContainers",
+            "Volumes",
+            "RepairedVolumes",
         ] {
             assert!(v[k].is_null(), "{k}");
         }
+    }
+
+    #[test]
+    fn a_volume_is_under_its_own_keys() {
+        let volume = |name: &str, action| CheckProblem {
+            volume: Some(name.into()),
+            kind: "orphan_volume".into(),
+            message: "no row".into(),
+            path: Some(format!("/v/{name}")),
+            action,
+            ..Default::default()
+        };
+        let report = CheckReport {
+            problems: vec![
+                volume("a", CheckAction::Repaired),
+                volume("b", CheckAction::None),
+            ],
+            ..Default::default()
+        };
+        let v = check(&report);
+        assert_eq!(v["Errors"], true);
+        assert_eq!(v["Volumes"]["a"], json!(["orphan_volume: no row (/v/a)"]));
+        assert_eq!(v["Volumes"]["b"], json!(["orphan_volume: no row (/v/b)"]));
+        assert_eq!(v["RepairedVolumes"], json!(["a"]));
+        // (not a layer: nothing says a volume was deleted)
+        assert!(v["Layers"].is_null() && v["RemovedLayers"].is_null());
     }
 
     #[test]
