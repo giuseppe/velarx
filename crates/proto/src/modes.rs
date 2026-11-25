@@ -224,15 +224,31 @@ impl UsernsChoice {
             // (podman ignores the value of these)
             "" | "default" | "host" => Self::Host,
             "private" if value.is_empty() => Self::Private,
-            "nomap" if value.is_empty() => Self::NoMap,
-            "auto" | "keep-id" | "container" | "ns" if value.is_empty() => {
+            "no-map" if value.is_empty() => Self::NoMap,
+            "path" => return Some(Self::parse(&format!("ns:{value}"))),
+            "auto" | "keep-id" | "container" if value.is_empty() => {
                 return Some(Self::parse(nsmode))
             }
-            "auto" | "keep-id" | "container" | "ns" => {
+            "auto" | "keep-id" | "container" => {
                 return Some(Self::parse(&format!("{nsmode}:{value}")))
             }
             _ => return None,
         }))
+    }
+
+    /// The `nsmode` and `value` of the SpecGenerator that
+    /// [`Self::from_spec`] reads as this choice.
+    pub fn to_spec(&self) -> (&'static str, String) {
+        let opts = |o: &Option<String>| o.clone().unwrap_or_default();
+        match self {
+            Self::Host => ("host", String::new()),
+            Self::Private => ("private", String::new()),
+            Self::NoMap => ("no-map", String::new()),
+            Self::Auto(o) => ("auto", opts(o)),
+            Self::KeepId(o) => ("keep-id", opts(o)),
+            Self::Ns(path) => ("path", path.clone()),
+            Self::Container(id) => ("container", id.clone()),
+        }
     }
 }
 

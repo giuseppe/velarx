@@ -319,7 +319,7 @@ pub fn spec_of(g: Generator) -> Result<PodSpec, SpecError> {
         spec.networks = g.cni_networks;
     }
     if let Some(u) = g.userns {
-        // (`ns` and `container` are not for pods, a value of theirs or not)
+        // (`path` and `container` are not for pods, a value of theirs or not)
         match UsernsChoice::from_spec(&u.nsmode, &u.value) {
             Some(Ok(UsernsChoice::Host)) => {}
             Some(Ok(

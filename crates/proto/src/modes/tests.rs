@@ -278,27 +278,36 @@ fn the_userns_of_a_spec_generator_is_one_choice() {
         // (podman ignores the value of the host's)
         ("host", "x", Host),
         ("private", "", Private),
-        ("nomap", "", NoMap),
+        ("no-map", "", NoMap),
         ("auto", "", Auto(None)),
         ("auto", "size=5", Auto(Some(s("size=5")))),
         ("keep-id", "", KeepId(None)),
         ("keep-id", "uid=1", KeepId(Some(s("uid=1")))),
         ("container", "c", Container(s("c"))),
-        ("ns", "/p", Ns(s("/p"))),
+        ("path", "/p", Ns(s("/p"))),
     ] {
         assert_eq!(
             UsernsChoice::from_spec(mode, value),
-            Some(Ok(want)),
+            Some(Ok(want.clone())),
             "{mode} {value}"
         );
+        // and the choice is written back as a spec that reads as it
+        let (mode, value) = want.to_spec();
+        assert_eq!(UsernsChoice::from_spec(mode, &value), Some(Ok(want)));
     }
     // a mode that is none here, or that takes no value
-    for (mode, value) in [("private", "x"), ("nomap", "x"), ("slirp", "")] {
+    for (mode, value) in [
+        ("private", "x"),
+        ("no-map", "x"),
+        ("nomap", ""),
+        ("ns", "/p"),
+        ("slirp", ""),
+    ] {
         assert_eq!(UsernsChoice::from_spec(mode, value), None, "{mode} {value}");
     }
     // a value the mode does not take is the error of `--userns`: a choice
     // that is made shows as a text that reads back (the wire)
-    for (mode, value) in [("container", ""), ("ns", ""), ("ns", "relative")] {
+    for (mode, value) in [("container", ""), ("path", ""), ("path", "relative")] {
         let e = UsernsChoice::from_spec(mode, value).unwrap().unwrap_err();
         assert!(e.to_string().contains("invalid user namespace mode"), "{e}");
     }

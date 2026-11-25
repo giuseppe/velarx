@@ -1813,7 +1813,9 @@ fn pod_plan(
         .or_else(|| annotations.get("io.podman.annotations.userns").cloned())
         .or_else(|| (!host_users).then(|| "auto".to_string()));
     if let Some(u) = &userns {
-        let (mode, value) = u.split_once(':').unwrap_or((u.as_str(), ""));
+        let (mode, value) = velarx_proto::modes::UsernsChoice::parse(u)
+            .map_err(|e| e.to_string())?
+            .to_spec();
         p.insert("userns".into(), json!({"nsmode": mode, "value": value}));
     }
     let sysctls: Map<String, Value> = list(&spec["securityContext"], "sysctls")
@@ -2544,6 +2546,21 @@ spec:
             p.pods[0].spec["userns"],
             json!({"nsmode": "auto", "value": ""})
         );
+        // (the words of --userns are written as the API names them)
+        for (userns, spec) in [
+            ("nomap", json!({"nsmode": "no-map", "value": ""})),
+            (
+                "keep-id:uid=1",
+                json!({"nsmode": "keep-id", "value": "uid=1"}),
+            ),
+        ] {
+            let opts = Options {
+                userns: Some(userns.into()),
+                ..Default::default()
+            };
+            let p = plan(&docs, &opts, &NoStore).unwrap();
+            assert_eq!(p.pods[0].spec["userns"], spec, "{userns}");
+        }
         let c = &p.pods[0].containers[0].spec;
         assert_eq!(c["pidns"], json!({"nsmode": "host"}));
         assert_eq!(c["log_configuration"], json!({"driver": "k8s-file"}));

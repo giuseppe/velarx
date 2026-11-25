@@ -32,3 +32,15 @@ setup () { api_setup; }
     [ "$(id -u)" = 0 ] && base=/run/velarx-rootfs-0
     check "the public root is gone with the container" 0 "$(ls "$base" 2>/dev/null | grep -c "^$id")"
 }
+
+@test "libpod create: --userns nomap and ns:PATH from a podman remote client" {
+    if [ "$(id -u)" = 0 ]; then
+        skip "nomap is for rootless containers"
+    fi
+    out=$(pm run --rm --userns=nomap "$IMG" awk 'NR==1 {print $1, $2}' /proc/self/uid_map 2>&1)
+    check "podman run --userns=nomap" "0 1" "$out"
+    pm create --name unspath --userns=ns:/proc/$$/ns/user "$IMG" true > /dev/null 2>&1
+    check "podman create --userns=ns:PATH" "ns:/proc/$$/ns/user" \
+        "$(pm inspect unspath --format '{{.HostConfig.UsernsMode}}' 2>&1)"
+    pm rm -f -t 0 unspath > /dev/null 2>&1
+}
