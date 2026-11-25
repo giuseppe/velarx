@@ -529,19 +529,7 @@ fn collect_store(
         .map(|l| l.key.to_string())
         .filter(|k| !kept.contains(k))
         .collect();
-    store
-        .rt
-        .block_on(store.db.conn().call({
-            let gone = gone.clone();
-            move |conn| {
-                for k in &gone {
-                    conn.execute("DELETE FROM file_refs WHERE layer_id = ?1", [k])?;
-                    conn.execute("DELETE FROM layers WHERE id = ?1", [k])?;
-                }
-                Ok(())
-            }
-        }))
-        .map_err(failed)?;
+    forget_layers(store, gone)?;
     // (the files of the layers the rows of which are gone, those of a pull
     // that was not committed, and what a writer that died left; a layer of
     // a live pull is kept.  The engine asks for a collection holding the
@@ -589,6 +577,23 @@ fn collect_store(
     Ok((freed + rest.bytes_freed, errors))
 }
 
+/// Delete the rows of `gone` layers, and with them (the schema cascades)
+/// their file references, in one transaction: a failure leaves every layer
+/// with its references.
+fn forget_layers(store: &Store, gone: Vec<String>) -> DriverResult<()> {
+    store
+        .rt
+        .block_on(store.db.conn().call(move |conn| {
+            let tx = conn.transaction()?;
+            for k in &gone {
+                tx.execute("DELETE FROM layers WHERE id = ?1", [k])?;
+            }
+            tx.commit()?;
+            Ok(())
+        }))
+        .map_err(failed)
+}
+
 /// The copies of images the server reads for `MountImage` that have a layer
 /// the collection no longer keeps.
 fn forget_image_copies(store: &Arc<Store>, kept: &HashSet<String>) {
@@ -606,5 +611,49 @@ fn forget_image_copies(store: &Arc<Store>, kept: &HashSet<String>) {
         let _ = store.vfs.writable_remove(&w);
         let _ = velarx_base::tree::remove_dir_all_confined(&c.bundle);
         let _ = store.forget_container(&id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Stores;
+
+    /// A failure while a layer is forgotten leaves the layer and its file
+    /// references, not the layer without them.
+    #[test]
+    fn a_failed_forget_leaves_the_layer_with_its_references() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stores = Stores::new(root.path(), rt.handle().clone());
+        let store = stores
+            .get(1000, "0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let count = |table: &'static str| -> i64 {
+            rt.block_on(store.db.conn().call(move |conn| {
+                Ok(conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?)
+            }))
+            .unwrap()
+        };
+        rt.block_on(store.db.conn().call(|conn| {
+            conn.execute_batch(
+                "INSERT INTO layers (id, blob, size, stream_size, created_at) VALUES ('l', 'b', 1, 1, 't');
+                 INSERT INTO files (digest, size, created_at) VALUES ('f', 1, 't');
+                 INSERT INTO file_refs (layer_id, file_digest) VALUES ('l', 'f');
+                 CREATE TRIGGER injected BEFORE DELETE ON layers
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )?;
+            Ok(())
+        }))
+        .unwrap();
+        assert!(forget_layers(&store, vec!["l".into()]).is_err());
+        assert_eq!((count("layers"), count("file_refs")), (1, 1));
+        rt.block_on(store.db.conn().call(|conn| {
+            conn.execute_batch("DROP TRIGGER injected")?;
+            Ok(())
+        }))
+        .unwrap();
+        forget_layers(&store, vec!["l".into()]).unwrap();
+        assert_eq!((count("layers"), count("file_refs")), (0, 0));
     }
 }
