@@ -135,6 +135,17 @@ fn brief(text: &str) -> String {
         .collect()
 }
 
+/// The body a registry answered, for a message: a body the read cut in
+/// the middle of a character ends before it, and its line end is not part
+/// of the text.
+fn body_text(body: &[u8]) -> String {
+    let end = match std::str::from_utf8(body) {
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        _ => body.len(),
+    };
+    String::from_utf8_lossy(&body[..end]).trim_end().to_string()
+}
+
 /// The scheme, host and port of `url`, for a message.
 fn url_origin(url: &str) -> String {
     reqwest::Url::parse(url)
@@ -928,9 +939,8 @@ impl RegistryClient {
                         let why = match &e {
                             ImageError::Http(_) => "network error".to_string(),
                             e => {
-                                let text = e.to_string();
-                                let text = text.trim_start_matches("registry error: ");
-                                text.split(" - ").next().unwrap_or(text).to_string()
+                                let text = e.reason();
+                                text.split(" - ").next().unwrap_or(&text).to_string()
                             }
                         };
                         if self.drop_hint(&t.endpoint.host, &format!("token endpoint: {why}")) {
@@ -1680,11 +1690,7 @@ impl RegistryClient {
             let text = read_limited(resp, 4096).await.unwrap_or_default();
             let e = answered(
                 status,
-                format!(
-                    "Failed to get manifest: {} - {}",
-                    status,
-                    String::from_utf8_lossy(&text)
-                ),
+                format!("Failed to get manifest: {} - {}", status, body_text(&text)),
             );
             // a manifest that is not there is the caller's to judge
             if status == reqwest::StatusCode::NOT_FOUND {
@@ -1767,7 +1773,7 @@ impl RegistryClient {
                 s,
                 format!(
                     "Failed to initiate blob upload: {s} - {}",
-                    String::from_utf8_lossy(&read_limited(resp, 4096).await.unwrap_or_default())
+                    body_text(&read_limited(resp, 4096).await.unwrap_or_default())
                 ),
             )),
         }
@@ -1884,10 +1890,7 @@ impl RegistryClient {
         let text = read_limited(resp, 4096).await.unwrap_or_default();
         let e = answered(
             status,
-            format!(
-                "Failed to upload a chunk: {status} - {}",
-                String::from_utf8_lossy(&text)
-            ),
+            format!("Failed to upload a chunk: {status} - {}", body_text(&text)),
         );
         Ok(match status {
             StatusCode::RANGE_NOT_SATISFIABLE | StatusCode::BAD_REQUEST if offset.is_some() => {
@@ -2024,7 +2027,7 @@ impl RegistryClient {
             status,
             format!(
                 "Failed to upload blob {digest}: {status} - {}",
-                String::from_utf8_lossy(&text)
+                body_text(&text)
             ),
         );
         if status.is_server_error()
@@ -2087,8 +2090,7 @@ impl RegistryClient {
                 status,
                 format!(
                     "Failed to push manifest: {status} - {}{hint}",
-                    // (without the line end of the body before the hint)
-                    String::from_utf8_lossy(&text).trim_end()
+                    body_text(&text)
                 ),
             ));
         }
@@ -3135,6 +3137,37 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         addr.to_string()
+    }
+
+    /// The body of a refusal ends with a line end, and a long one is cut
+    /// in the middle of a character: neither is a character of the text.
+    #[test]
+    fn test_the_body_of_an_answer_is_text_without_its_end() {
+        assert_eq!(body_text(b"{\"errors\":[]}\n"), "{\"errors\":[]}");
+        assert_eq!(body_text("été".as_bytes()), "été");
+        assert_eq!(body_text(&"été".as_bytes()[..3]), "ét");
+        // (a byte that is no UTF-8 at all is shown, in the place it is)
+        assert_eq!(body_text(b"a\xffb\n"), "a\u{fffd}b");
+    }
+
+    #[tokio::test]
+    async fn test_an_error_body_is_shown_without_its_line_end() {
+        let app = Router::new().route(
+            "/v2/r/manifests/:reference",
+            get(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    "{\"errors\":[{\"code\":\"MANIFEST_UNKNOWN\"}]}\n",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = client_for(&host, true, true);
+        let t = client.target(&reference(&host)).unwrap();
+        let err = client.fetch_manifest(&t, "latest").await.unwrap_err();
+        assert!(err.to_string().ends_with('}'), "{err}");
     }
 
     #[tokio::test]

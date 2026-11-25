@@ -99,7 +99,7 @@ pub fn registry_failure(e: &ImageError) -> Failure {
     };
     Failure {
         class,
-        reason: e.to_string(),
+        reason: e.reason(),
     }
 }
 
@@ -1364,6 +1364,14 @@ impl StagingFetcher for RegistryFetch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The failure is told under the name of the registry: its reason does
+    /// not say `registry error` again.
+    #[test]
+    fn the_reason_of_a_failure_is_the_words_of_the_registry() {
+        let e = ImageError::Registry("Failed to get manifest: 500".into());
+        assert_eq!(registry_failure(&e).reason, "Failed to get manifest: 500");
+    }
 
     /// A registry that does not answer the connection in time is not tried
     /// again by the same call: the failure is `unavailable`, not

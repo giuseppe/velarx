@@ -281,6 +281,20 @@ impl ImageError {
         }
     }
 
+    /// The words of the error for a message that names the party that
+    /// failed: what the registry's own variants say, without their
+    /// `registry error:`.
+    pub fn reason(&self) -> String {
+        match self {
+            ImageError::Registry(t)
+            | ImageError::Unauthorized(t)
+            | ImageError::Forbidden(t)
+            | ImageError::Unreachable(t)
+            | ImageError::RegistryNotFound(t) => printable(t),
+            e => e.to_string(),
+        }
+    }
+
     /// The class of the failure of a party, when this is one.
     pub fn class(&self) -> Option<FailureClass> {
         match self {
@@ -473,6 +487,15 @@ mod status_tests {
         assert_eq!(ImageError::Registry(words.into()).registry_status(), 500);
         assert!(ImageError::Forbidden(String::new()).is_refusal());
         assert!(!ImageError::RegistryNotFound(String::new()).is_refusal());
+    }
+
+    #[test]
+    fn the_reason_of_a_registry_failure_does_not_say_registry_error() {
+        let e = ImageError::Unauthorized("denied\n".into());
+        assert_eq!(e.to_string(), "registry error: denied\u{fffd}");
+        assert_eq!(e.reason(), "denied\u{fffd}");
+        let e = ImageError::Layer("short".into());
+        assert_eq!(e.reason(), e.to_string());
     }
 
     /// A transfer is tried again after what the registry or the network

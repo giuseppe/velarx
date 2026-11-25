@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn registry_errors_as_errcode_writes_them() {
-        let m = "registry error: Failed to get manifest: 401 Unauthorized - {\"errors\":[{\"code\":\"UNAUTHORIZED\",\"detail\":{},\"message\":\"access to the requested resource is not authorized\"}]}\u{fffd}";
+        let m = "registry error: Failed to get manifest: 401 Unauthorized - {\"errors\":[{\"code\":\"UNAUTHORIZED\",\"detail\":{},\"message\":\"access to the requested resource is not authorized\"}]}";
         assert_eq!(
             registry_error_text(m).as_deref(),
             Some("unauthorized: access to the requested resource is not authorized")
