@@ -372,16 +372,15 @@ impl RootfsDir {
     }
 
     /// The passwd and group files of the directory, looked up in it.
-    pub fn users(&self) -> std::io::Result<(String, String)> {
+    pub fn users(&self) -> Result<(Vec<u8>, Vec<u8>), super::userspec::UserError> {
         Ok((self.file("etc/passwd")?, self.file("etc/group")?))
     }
 
-    /// A text file of the directory, looked up in it ("" when it has none).
-    pub fn file(&self, rel: &str) -> std::io::Result<String> {
-        const MAX: u64 = 16 << 20;
-        let root = crate::fsdir::open_dir(&self.path)?;
-        let text = velarx_sys::fs::read_in_root(std::os::fd::AsFd::as_fd(&root), rel, MAX)?;
-        Ok(String::from_utf8_lossy(&text.unwrap_or_default()).into_owned())
+    /// A file of the directory, looked up in it, as the files of a user are
+    /// read: empty when it is missing, an error when it is no regular file,
+    /// larger than 16 MiB or cannot be read.
+    pub fn file(&self, rel: &str) -> Result<Vec<u8>, super::userspec::UserError> {
+        super::userspec::read_in_root(&self.path, rel)
     }
 }
 
@@ -420,8 +419,31 @@ mod rootfs_dir_tests {
         std::os::unix::fs::symlink("/etc/passwd", dir.path().join("etc/group")).unwrap();
         let d = RootfsDir::parse(dir.path().to_str().unwrap()).unwrap();
         let (passwd, group) = d.users().unwrap();
-        assert!(passwd.starts_with("root:"));
+        assert!(passwd.starts_with(b"root:"));
         assert_eq!(group, passwd);
+    }
+
+    /// The files of a directory are read as those of a container are: a
+    /// missing one is empty, one that is no regular file or is larger than
+    /// 16 MiB is an error, and no byte is cut or changed.
+    #[test]
+    fn files_of_the_directory_are_read_whole_or_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let etc = dir.path().join("etc");
+        std::fs::create_dir(&etc).unwrap();
+        let latin1 = b"a:x:1:1:caf\xe9:/:/bin/sh\n";
+        std::fs::write(etc.join("passwd"), latin1).unwrap();
+        std::fs::File::create(etc.join("group"))
+            .unwrap()
+            .set_len((16 << 20) + 1)
+            .unwrap();
+        rustix::fs::mkfifoat(rustix::fs::CWD, etc.join("hosts"), rustix::fs::Mode::RUSR).unwrap();
+        let d = RootfsDir::parse(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(d.file("etc/passwd").unwrap(), latin1);
+        assert!(d.file("etc/none").unwrap().is_empty());
+        assert!(d.file("etc/group").is_err());
+        assert!(d.file("etc/hosts").is_err());
+        assert!(d.users().is_err());
     }
 }
 

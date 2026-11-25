@@ -446,9 +446,13 @@ pub fn selinux_opts(s: &cri::SeLinuxOption) -> Vec<String> {
 }
 
 /// An id of the kubelet: it must be one of the engine's, never a number that
-/// the engine would look up as a name (`-1`).
+/// the engine would look up as a name (`-1`), nor the "no change" id of
+/// setuid (4294967295).
 fn id_of(v: i64, what: &str) -> Result<u32> {
-    u32::try_from(v).map_err(|_| Status::invalid_argument(format!("invalid {what}")))
+    u32::try_from(v)
+        .ok()
+        .filter(|v| *v != u32::MAX)
+        .ok_or_else(|| Status::invalid_argument(format!("invalid {what}")))
 }
 
 /// The user a container runs as, from its security context: `UID[:GID]`, a
@@ -1356,6 +1360,9 @@ mod tests {
         };
         assert!(with(|sc| sc.run_as_user = int(-1)).is_err());
         assert!(with(|sc| sc.run_as_user = int(1 << 32)).is_err());
+        assert!(with(|sc| sc.run_as_user = int(i64::from(u32::MAX))).is_err());
+        assert!(with(|sc| sc.run_as_user = int(i64::from(u32::MAX) - 1)).is_ok());
+        assert!(with(|sc| sc.supplemental_groups = vec![i64::from(u32::MAX)]).is_err());
         assert!(with(|sc| {
             sc.run_as_user = int(1);
             sc.run_as_group = int(-1);

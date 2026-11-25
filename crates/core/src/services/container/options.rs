@@ -284,21 +284,21 @@ impl ContainerService {
         &self,
         layers: &[LayerRecord],
         config: &ContainerConfig,
-    ) -> ContainerResult<(String, String)> {
+    ) -> ContainerResult<(Vec<u8>, Vec<u8>)> {
         let translate = self.translation(&config.uid_mappings, &config.gid_mappings);
         let mut files = self.image_files(layers, &translate, &["etc/passwd", "etc/group"])?;
         let group = files.pop().unwrap_or_default();
         Ok((files.pop().unwrap_or_default(), group))
     }
 
-    /// Text files of the image of a container ("" for one it lacks), read
+    /// Files of the image of a container (empty for one it lacks), read
     /// as `image_users` reads its files.
     pub(super) fn image_files(
         &self,
         layers: &[LayerRecord],
         translate: &velarx_fuse::IdTranslate,
         paths: &[&str],
-    ) -> ContainerResult<Vec<String>> {
+    ) -> ContainerResult<Vec<Vec<u8>>> {
         let tree = self.image_view(layers)?;
         let layer_digests: Vec<String> = layers.iter().map(|l| l.key.to_string()).collect();
         let objects = self.image_service.objects();
@@ -329,8 +329,14 @@ impl ContainerService {
             .image_files(layers, &Default::default(), &["etc/passwd", "etc/group"])
             .unwrap_or_default();
         let from_users = velarx_base::idmap::max_id_of_passwd_group(
-            files.first().map_or("", String::as_str),
-            files.get(1).map_or("", String::as_str),
+            &files
+                .first()
+                .map(|f| String::from_utf8_lossy(f))
+                .unwrap_or_default(),
+            &files
+                .get(1)
+                .map(|f| String::from_utf8_lossy(f))
+                .unwrap_or_default(),
         );
         Ok(from_files.max(from_users))
     }
@@ -659,13 +665,13 @@ impl ContainerService {
     }
 }
 
-/// The text files `paths` of the image `source` reads ("" for one it lacks
-/// or that is no regular file), each read up to one byte more than 16 MiB:
-/// a larger one is an error that names it.
+/// The files `paths` of the image `source` reads (empty for one it lacks),
+/// each read up to one byte more than 16 MiB: a larger one, and one that
+/// is no regular file, is an error that names it.
 fn text_files(
     source: &crate::services::imagecopy::TreeSource<'_>,
     paths: &[&str],
-) -> ContainerResult<Vec<String>> {
+) -> ContainerResult<Vec<Vec<u8>>> {
     const MAX: u64 = 16 << 20;
     paths
         .iter()
@@ -673,8 +679,8 @@ fn text_files(
             Some(b) if b.len() as u64 > MAX => Err(ContainerError::InvalidArgument(format!(
                 "/{path} of the image is larger than 16 MiB"
             ))),
-            Some(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
-            None => Ok(String::new()),
+            Some(b) => Ok(b),
+            None => Ok(Vec::new()),
         })
         .collect()
 }
@@ -685,7 +691,8 @@ mod text_file_tests {
 
     /// The files a create reads of an image read from a mount: a
     /// `/etc/passwd` of 64 MiB is refused naming it (one byte past the limit
-    /// is read, not the file), one of 16 MiB is read, a FIFO is nothing.
+    /// is read, not the file), one of 16 MiB is read, a FIFO is refused naming
+    /// it, a missing file is nothing.
     #[test]
     fn a_text_file_of_a_mounted_image_is_read_up_to_16_mib() {
         struct NoObjects;
@@ -728,8 +735,14 @@ mod text_file_tests {
                 .contains("/etc/passwd of the image is larger than 16 MiB"),
             "{err}"
         );
-        let files = text_files(&source, &["etc/group", "etc/shadow", "etc/none"]).unwrap();
+        let files = text_files(&source, &["etc/group", "etc/none"]).unwrap();
         assert_eq!(files[0].len(), 16 << 20);
-        assert_eq!(files[1..], ["", ""]);
+        assert!(files[1].is_empty());
+        let err = text_files(&source, &["etc/shadow"]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("/etc/shadow of the image is not a regular file"),
+            "{err}"
+        );
     }
 }

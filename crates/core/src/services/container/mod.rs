@@ -1316,8 +1316,8 @@ mod tests {
     #[test]
     fn user_entries_are_mounted_from_the_bundle() {
         let bundle = tempfile::tempdir().unwrap();
-        let passwd = "root:x:0:0:root:/root:/bin/sh\n";
-        let group = "root:x:0:\n";
+        let passwd = b"root:x:0:0:root:/root:/bin/sh\n";
+        let group = b"root:x:0:\n";
         let mut config = ContainerConfig {
             user: "4242:4243".into(),
             working_dir: "/srv".into(),
@@ -1371,7 +1371,7 @@ mod tests {
             resolve_container_user(passwd, group, &config, &req, Some(("me", "us"))).unwrap();
         assert_eq!(
             user.passwd.as_deref(),
-            Some("root:x:0:0:root:/root:/bin/sh\nme:*:4242:0::/:/bin/sh\n")
+            Some(&b"root:x:0:0:root:/root:/bin/sh\nme:*:4242:0::/:/bin/sh\n"[..])
         );
         // an unknown name fails
         let config = ContainerConfig {
@@ -1408,7 +1408,7 @@ mod tests {
 
     #[test]
     fn only_a_user_the_image_lacks_is_made_later() {
-        let (passwd, group) = ("root:x:0:0::/root:/bin/sh\n", "root:x:0:\n");
+        let (passwd, group) = (b"root:x:0:0::/root:/bin/sh\n", b"root:x:0:\n");
         let req = CreateContainerRequest::default();
         let asks = |user: &str| ContainerConfig {
             user: user.into(),

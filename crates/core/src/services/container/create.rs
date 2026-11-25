@@ -1025,7 +1025,7 @@ impl ContainerService {
         let with_hosts = if req.host_users.is_empty() {
             passwd.clone()
         } else {
-            let host = fs::read_to_string("/etc/passwd")?;
+            let host = fs::read("/etc/passwd")?;
             let mounts = &config.mounts;
             crate::container::userspec::with_host_users(
                 &passwd,
@@ -1289,7 +1289,7 @@ impl ContainerService {
             .await?;
 
         if req.hosts_file.as_deref() == Some("image") && !req.no_hosts {
-            req.hosts_image = Some(match &rootfs_dir {
+            let hosts = match &rootfs_dir {
                 Some(dir) => dir.file("etc/hosts")?,
                 None => self
                     .image_files(
@@ -1299,7 +1299,8 @@ impl ContainerService {
                     )?
                     .pop()
                     .unwrap_or_default(),
-            });
+            };
+            req.hosts_image = Some(String::from_utf8_lossy(&hosts).into_owned());
         }
         let inherited = self.inherited_etc(&req, !uid_mappings.is_empty()).await?;
         let etc_mounts = self.setup_etc_files(

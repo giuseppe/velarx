@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "velarx-user-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The user a container runs as: a user string and the passwd and group files of the image, to a uid, a gid, a home and the supplementary groups"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain functions on bytes and numbers: no dependency, no I/O.  The files
+# are read below the root of the container, and the words of an error and
+# the entries added for an unknown user are made, by `velarx-runtime`
+# (container/userspec.rs).
+
+[lib]
+name = "velarx_user_core"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

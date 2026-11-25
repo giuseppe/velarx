@@ -132,14 +132,8 @@ fn exec_user(
     spec: &str,
     cfg: &MonitorConfig,
 ) -> io::Result<(u32, u32, Vec<u32>, String)> {
-    // (a file the image lacks names nobody)
-    let (passwd, group) = (
-        read_in_root(rootfs, "etc/passwd").unwrap_or_default(),
-        read_in_root(rootfs, "etc/group").unwrap_or_default(),
-    );
-    let user = crate::container::userspec::resolve_user_groups(
-        &passwd,
-        &group,
+    let user = crate::container::userspec::resolve_user_in_root(
+        rootfs,
         spec,
         &cfg.group_add,
         cfg.groups_strict,
@@ -151,17 +145,6 @@ fn exec_user(
         user.additional_gids,
         user.home.unwrap_or_default(),
     ))
-}
-
-/// A small file of the root file system, a symbolic link kept inside it.
-fn read_in_root(rootfs: &Path, path: &str) -> io::Result<String> {
-    let root = rustix::fs::open(
-        rootfs,
-        rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )?;
-    let text = velarx_sys::fs::read_in_root(root.as_fd(), path, 1 << 20)?.unwrap_or_default();
-    Ok(String::from_utf8_lossy(&text).into_owned())
 }
 
 /// The process of an exec (`crun exec --process`, as podman's: `--user`

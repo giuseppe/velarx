@@ -108,7 +108,9 @@ impl TreeSource<'_> {
         Some(cur)
     }
 
-    /// The content of the file `path` of the image, at most `limit` bytes.
+    /// The content of the file `path` of the image, at most `limit` bytes:
+    /// `None` when there is no such file, an error when it is not a
+    /// regular file (a FIFO, a directory, a device).
     pub fn read_file(&self, path: &str, limit: u64) -> io::Result<Option<Vec<u8>>> {
         use std::io::Read;
         let Some(node) = self.resolve(path).and_then(|n| self.tree.node(n)) else {
@@ -118,7 +120,13 @@ impl TreeSource<'_> {
             node.entry.entry_type,
             TocEntryType::Reg | TocEntryType::Chunk | TocEntryType::Hardlink
         ) {
-            return Ok(None);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "/{} of the image is not a regular file",
+                    path.trim_matches('/')
+                ),
+            ));
         }
         if node.entry.size == 0 {
             return Ok(Some(Vec::new()));
@@ -609,8 +617,11 @@ mod tests {
         // a link to a path of the host, or of /proc, is nothing
         assert!(source.read_file("etc/group", 1 << 20).unwrap().is_none());
         assert!(source.read_file("etc/hosts", 1 << 20).unwrap().is_none());
-        // a FIFO is not read (and does not hang)
-        assert!(source.read_file("etc/shadow", 1 << 20).unwrap().is_none());
+        // a FIFO is not read (and does not hang): it is an error
+        let err = source.read_file("etc/shadow", 1 << 20).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("/etc/shadow of the image is not a regular file"));
         // a big file is read up to the limit asked
         assert_eq!(
             source.read_file("etc/big", 4097).unwrap().unwrap().len(),

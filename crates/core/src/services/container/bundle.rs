@@ -110,15 +110,15 @@ pub(super) fn open_beneath(
 /// its image, and the entries the image lacks for it (`None`: no change).
 pub(super) struct ContainerUser {
     pub(super) user: crate::container::userspec::ResolvedUser,
-    pub(super) passwd: Option<String>,
-    pub(super) group: Option<String>,
+    pub(super) passwd: Option<Vec<u8>>,
+    pub(super) group: Option<Vec<u8>>,
 }
 
 /// `identity` is the name and home of the passwd entry for a user the
 /// image lacks (`--userns=keep-id` gives those of the user on the host).
 pub(super) fn resolve_container_user(
-    passwd: &str,
-    group: &str,
+    passwd: &[u8],
+    group: &[u8],
     config: &ContainerConfig,
     req: &CreateContainerRequest,
     identity: Option<(&str, &str)>,
@@ -156,8 +156,8 @@ pub(super) fn resolve_container_user(
 /// create is a large future already.)
 #[inline(never)]
 pub(super) fn resolve_container_user_later(
-    passwd: &str,
-    group: &str,
+    passwd: &[u8],
+    group: &[u8],
     config: &ContainerConfig,
     req: &CreateContainerRequest,
     identity: Option<(&str, &str)>,
@@ -239,7 +239,7 @@ fn owner_of(root: &WritableRoot<'_>, e: &velarx_storage::TocEntry) -> (Option<u3
 /// when the image has a regular file there (its mode and owner stay): false
 /// when it has not, or `/etc` is not a directory (a link, ...), and the
 /// file is bind mounted.
-fn write_in_upper(root: &WritableRoot<'_>, name: &str, content: &str) -> ContainerResult<bool> {
+fn write_in_upper(root: &WritableRoot<'_>, name: &str, content: &[u8]) -> ContainerResult<bool> {
     use rustix::fs::{Mode, OFlags, RawMode, ResolveFlags};
     use velarx_storage::TocEntryType;
     let entry = |path: &str, kind: TocEntryType| {
@@ -279,7 +279,7 @@ fn write_in_upper(root: &WritableRoot<'_>, name: &str, content: &str) -> Contain
         .into());
     }
     let mut f = fs::File::from(fd);
-    std::io::Write::write_all(&mut f, content.as_bytes())?;
+    std::io::Write::write_all(&mut f, content)?;
     let (u, g) = owner_of(root, &file);
     rustix::fs::fchown(
         &f,
@@ -310,13 +310,7 @@ pub(super) fn add_user_files(
                 }
             }
             let dest = format!("/etc/{name}");
-            mounts.push(bundle_file_mount(
-                bundle_path,
-                name,
-                c.as_bytes(),
-                &dest,
-                false,
-            )?);
+            mounts.push(bundle_file_mount(bundle_path, name, &c, &dest, false)?);
         }
     }
     if let Some((zone, data)) = localtime {
@@ -1211,7 +1205,7 @@ mod root_fd_tests {
                 translate: &tr,
                 root: std::os::fd::AsFd::as_fd(&fd),
             };
-            assert!(write_in_upper(&root, name, text).unwrap());
+            assert!(write_in_upper(&root, name, text.as_bytes()).unwrap());
             assert_eq!(snapshot(path_dir.path()), snapshot(by_fd.path()), "{name}");
             // (and it is what the image's file says)
             let m = fs::metadata(by_fd.path().join("etc").join(name)).unwrap();
@@ -1242,7 +1236,7 @@ mod root_fd_tests {
             translate: &tr,
             root: std::os::fd::AsFd::as_fd(&fd),
         };
-        assert!(write_in_upper(&root, "passwd", "new\n").unwrap());
+        assert!(write_in_upper(&root, "passwd", "new\n".as_bytes()).unwrap());
         assert_eq!(
             fs::read_to_string(dir.path().join("etc/passwd")).unwrap(),
             "new\n"
@@ -1264,7 +1258,7 @@ mod root_fd_tests {
             translate: &tr,
             root: std::os::fd::AsFd::as_fd(&fd),
         };
-        assert!(!write_in_upper(&root, "passwd", "x").unwrap());
+        assert!(!write_in_upper(&root, "passwd", "x".as_bytes()).unwrap());
         assert!(!link_localtime_in_upper(&root, "Europe/Berlin").unwrap());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
@@ -1282,7 +1276,7 @@ mod root_fd_tests {
             translate: &tr,
             root: std::os::fd::AsFd::as_fd(&fd),
         };
-        assert!(write_in_upper(&root, "passwd", "x").is_err());
+        assert!(write_in_upper(&root, "passwd", "x".as_bytes()).is_err());
         assert!(link_localtime_in_upper(&root, "Europe/Berlin").is_err());
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
         // the file is a link to a file outside the root
@@ -1297,12 +1291,12 @@ mod root_fd_tests {
             translate: &tr,
             root: std::os::fd::AsFd::as_fd(&fd),
         };
-        assert!(write_in_upper(&root, "passwd", "x").is_err());
+        assert!(write_in_upper(&root, "passwd", "x".as_bytes()).is_err());
         assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
         // (the root as a path is renamed away: the descriptor still names it)
         let moved = dir.path().with_extension("moved");
         fs::rename(dir.path(), &moved).unwrap();
-        assert!(write_in_upper(&root, "group", "g\n").unwrap());
+        assert!(write_in_upper(&root, "group", "g\n".as_bytes()).unwrap());
         assert_eq!(fs::read_to_string(moved.join("etc/group")).unwrap(), "g\n");
         assert!(!dir.path().exists());
         fs::remove_dir_all(&moved).unwrap();
@@ -1326,7 +1320,7 @@ mod root_fd_tests {
             translate: &tr,
             root: std::os::fd::AsFd::as_fd(&fd),
         };
-        assert!(write_in_upper(&root, "passwd", "x").is_err());
+        assert!(write_in_upper(&root, "passwd", "x".as_bytes()).is_err());
         assert!(link_localtime_in_upper(&root, "Europe/Berlin").is_err());
         assert_eq!(fs::read_dir(dir.path().join("usr")).unwrap().count(), 0);
         let dir = tempfile::tempdir().unwrap();
@@ -1341,8 +1335,8 @@ mod root_fd_tests {
             translate: &tr,
             root: std::os::fd::AsFd::as_fd(&fd),
         };
-        assert!(write_in_upper(&root, "passwd", "x").is_err());
-        assert!(write_in_upper(&root, "group", "x").is_err());
+        assert!(write_in_upper(&root, "passwd", "x".as_bytes()).is_err());
+        assert!(write_in_upper(&root, "group", "x".as_bytes()).is_err());
         for f in ["victim", "etc/shadow"] {
             assert_eq!(
                 fs::read_to_string(dir.path().join(f)).unwrap(),
@@ -1374,8 +1368,8 @@ mod root_fd_tests {
             translate: &tr,
             root: std::os::fd::AsFd::as_fd(&fd),
         };
-        assert!(write_in_upper(&root, "passwd", "x").is_err());
-        assert!(write_in_upper(&root, "group", "x").is_err());
+        assert!(write_in_upper(&root, "passwd", "x".as_bytes()).is_err());
+        assert!(write_in_upper(&root, "group", "x".as_bytes()).is_err());
         // (a device, as root: opened, then refused before it is written; on
         // a file system of the host that allows devices, /tmp has `nodev`)
         if rustix::process::geteuid().is_root() {
@@ -1399,7 +1393,7 @@ mod root_fd_tests {
                 translate: &tr,
                 root: std::os::fd::AsFd::as_fd(&fd),
             };
-            let e = write_in_upper(&root, "passwd", "x")
+            let e = write_in_upper(&root, "passwd", "x".as_bytes())
                 .unwrap_err()
                 .to_string();
             assert!(nodev || e.contains("not a regular file"), "{e}");
@@ -1442,7 +1436,7 @@ mod root_fd_tests {
             translate: &tr,
             root: std::os::fd::AsFd::as_fd(&fd),
         };
-        assert!(write_in_upper(&root, "passwd", "root:x:0:0::/:/bin/sh\n").unwrap());
+        assert!(write_in_upper(&root, "passwd", "root:x:0:0::/:/bin/sh\n".as_bytes()).unwrap());
         assert!(link_localtime_in_upper(&root, "Europe/Berlin").unwrap());
         for p in ["etc", "etc/passwd"] {
             let m = fs::metadata(by_fd.path().join(p)).unwrap();
@@ -1517,13 +1511,13 @@ mod root_fd_tests {
             root: std::os::fd::AsFd::as_fd(&fd),
         };
         // a regular file of the image is written over, in the layer
-        assert!(write_in_upper(&root, "group", "root:x:0:\nme:x:5:\n").unwrap());
+        assert!(write_in_upper(&root, "group", "root:x:0:\nme:x:5:\n".as_bytes()).unwrap());
         assert_eq!(
             fs::read_to_string(upper.path().join("etc/group")).unwrap(),
             "root:x:0:\nme:x:5:\n"
         );
         // a link is not a regular file: the entries are mounted instead
-        assert!(!write_in_upper(&root, "passwd", "me:x:5:5::/:/bin/sh\n").unwrap());
+        assert!(!write_in_upper(&root, "passwd", "me:x:5:5::/:/bin/sh\n".as_bytes()).unwrap());
         assert!(!upper.path().join("etc/passwd").exists());
         assert_eq!(
             fs::read_to_string(outside.path().join("secret")).unwrap(),

@@ -5464,6 +5464,7 @@ dependencies = [
  "velarx-storage-client",
  "velarx-sys",
  "velarx-types",
+ "velarx-user-core",
  "velarx-wire",
  "yaml-rust2",
  "zlink",
@@ -5658,6 +5659,10 @@ dependencies = [
  "velarx-proto",
  "velarx-ref-core",
 ]
+
+[[package]]
+name = "velarx-user-core"
+version = "0.1.0"
 
 [[package]]
 name = "velarx-vfs"
