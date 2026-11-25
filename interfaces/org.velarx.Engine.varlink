@@ -2024,6 +2024,12 @@ type CpuUtilization (user_percent: float, system_percent: float, idle_percent: f
 # The host the engine runs on, and what it runs the containers with.
 type HostRecord (
 	hostname: string,
+	# The `ID` of the os-release file of the host (`fedora`)
+	distribution: string,
+	# Its `VERSION_ID`
+	distribution_version: string,
+	# Its `PRETTY_NAME`
+	distribution_name: string,
 	cpus: int,
 	mem_total: int,
 	mem_free: int,

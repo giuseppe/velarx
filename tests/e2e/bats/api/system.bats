@@ -29,6 +29,11 @@ setup () { api_setup; }
     check_match "info" "^linux " "$out"
     out=$(api http://d/v1.41/info | jq -r .OSType)
     check "compat info" linux "$out"
+    expected=$(. /etc/os-release; echo "$ID $VERSION_ID")
+    out=$(pm info --format '{{.Host.Distribution.Distribution}} {{.Host.Distribution.Version}}')
+    check "info distribution" "$expected" "$out"
+    out=$(api http://d/v1.41/info | jq -r '.OSVersion + " " + .OperatingSystem')
+    check "compat info OSVersion and OperatingSystem" "$(. /etc/os-release; echo "$VERSION_ID $PRETTY_NAME")" "$out"
 }
 
 @test "system check" {

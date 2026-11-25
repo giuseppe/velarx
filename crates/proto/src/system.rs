@@ -127,6 +127,12 @@ pub struct CpuUtilization {
 #[serde(default)]
 pub struct HostRecord {
     pub hostname: String,
+    /// The `ID` of the os-release file of the host (`fedora`)
+    pub distribution: String,
+    /// Its `VERSION_ID`
+    pub distribution_version: String,
+    /// Its `PRETTY_NAME`
+    pub distribution_name: String,
     pub cpus: u64,
     pub mem_total: u64,
     pub mem_free: u64,

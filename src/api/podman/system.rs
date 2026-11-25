@@ -133,6 +133,32 @@ fn cpu_utilization_of(stat: &str) -> CpuUtilization {
     }
 }
 
+/// What `/etc/os-release` (else `/usr/lib/os-release`) says of the host:
+/// its `ID`, `VERSION_ID` and `PRETTY_NAME`, empty when the file or the key
+/// is not there.
+async fn os_release() -> (String, String, String) {
+    let files = proc_strings(&["/etc/os-release", "/usr/lib/os-release"]).await;
+    let text = files
+        .into_iter()
+        .find(|t| !t.is_empty())
+        .unwrap_or_default();
+    (
+        os_release_value(&text, "ID"),
+        os_release_value(&text, "VERSION_ID"),
+        os_release_value(&text, "PRETTY_NAME"),
+    )
+}
+
+/// The value of `key` in the text of an os-release file: the last
+/// assignment, with the quotes of the shell taken off.
+fn os_release_value(text: &str, key: &str) -> String {
+    text.lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))
+        .map(|v| v.trim_matches(['"', '\'']).to_string())
+        .unwrap_or_default()
+}
+
 fn meminfo_of(text: &str, key: &str) -> u64 {
     text.lines()
         .find_map(|l| {
@@ -427,6 +453,7 @@ fn inodes_of(path: &std::path::Path) -> (Option<u64>, Option<u64>) {
 pub(crate) async fn system_record(state: &AppState) -> ApiResult<SystemRecord> {
     let cfg = &state.config;
     let proc = Proc::read().await;
+    let (distribution, distribution_version, distribution_name) = os_release().await;
     let driver = state.image_service.storage();
     let mut store = StoreRecord {
         storage_driver: cfg.storage.driver_kind().name().to_string(),
@@ -474,6 +501,9 @@ pub(crate) async fn system_record(state: &AppState) -> ApiResult<SystemRecord> {
     let server = state.server_service.info().await?;
     let host = HostRecord {
         hostname: proc.hostname.clone(),
+        distribution,
+        distribution_version,
+        distribution_name,
         cpus: cpus() as u64,
         mem_total: proc.meminfo("MemTotal"),
         mem_free: proc.meminfo("MemFree"),
@@ -1179,6 +1209,16 @@ pub(crate) async fn login_of(
 #[cfg(test)]
 mod df_tests {
     use super::*;
+
+    #[test]
+    fn the_distribution_is_read_from_an_os_release_text() {
+        let text = "# a comment\nNAME=\"Fedora Linux\"\nID=fedora\nID_LIKE=\"rhel\"\nVERSION_ID=\"46\"\nVERSION_ID='47'\n";
+        assert_eq!(os_release_value(text, "ID"), "fedora");
+        // (the last assignment wins, as in the shell that sources the file)
+        assert_eq!(os_release_value(text, "VERSION_ID"), "47");
+        assert_eq!(os_release_value(text, "VARIANT_ID"), "");
+        assert_eq!(os_release_value("", "ID"), "");
+    }
 
     #[test]
     fn the_size_of_a_directory_counts_its_files_and_entries_not_beyond_a_depth() {

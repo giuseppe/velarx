@@ -164,7 +164,7 @@ pub fn libpod_info(s: &SystemRecord, socket: Option<(&str, bool)>) -> Value {
             "idMappings": id_mappings(h),
             "cpus": h.cpus,
             "databaseBackend": "sqlite",
-            "distribution": {"distribution": "", "version": ""},
+            "distribution": {"distribution": h.distribution, "version": h.distribution_version},
             "eventLogger": h.event_logger,
             "hostname": h.hostname,
             "kernel": v.kernel,
@@ -300,8 +300,12 @@ pub fn docker_info(s: &SystemRecord, version: Option<(u32, u32)>, now_ns: i64) -
         "CgroupDriver": "cgroupfs",
         "CgroupVersion": h.cgroup_version.to_string(),
         "KernelVersion": v.kernel,
-        "OperatingSystem": v.os,
-        "OSVersion": "",
+        // (Docker's: the pretty name, "Linux" when there is none)
+        "OperatingSystem": match h.distribution_name.as_str() {
+            "" => "Linux",
+            name => name,
+        },
+        "OSVersion": h.distribution_version,
         "OSType": v.os,
         "Architecture": v.arch,
         "NCPU": h.cpus,
@@ -678,6 +682,9 @@ mod tests {
             },
             host: HostRecord {
                 hostname: "h".into(),
+                distribution: "fedora".into(),
+                distribution_version: "46".into(),
+                distribution_name: "Fedora Linux 46".into(),
                 cpus: 4,
                 cgroup_version: 2,
                 uptime_ns: 7_384_500_000_000,
@@ -731,6 +738,10 @@ mod tests {
             "2h 3m 4.00s (Approximately 0.08 days)"
         );
         assert_eq!(info["host"]["cgroupVersion"], "v2");
+        assert_eq!(
+            info["host"]["distribution"],
+            json!({"distribution": "fedora", "version": "46"})
+        );
         assert_eq!(info["host"]["ociRuntimes"], json!(["runc"]));
         assert_eq!(
             info["host"]["remoteSocket"],
@@ -758,6 +769,8 @@ mod tests {
         assert_eq!(info["version"]["BuiltTime"], "Fri Jan  2 03:04:05 2026");
         assert_eq!(info["version"]["OsArch"], "linux/amd64");
         let docker = docker_info(&system(), Some((1, 43)), 0);
+        assert_eq!(docker["OSVersion"], "46");
+        assert_eq!(docker["OperatingSystem"], "Fedora Linux 46");
         assert_eq!(
             (docker["Containers"].clone(), docker["Images"].clone()),
             (json!(2), json!(5))
