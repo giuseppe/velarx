@@ -339,7 +339,7 @@ impl UserNamespaceManager {
                 .subtract(&IdSet::from_intervals(&[(0, 1)]));
             if pool.is_empty() {
                 return Err(UsernsError::NoAvailableRanges(
-                    "the daemon has only the id of its user: add the user to /etc/subuid and /etc/subgid and install newuidmap and newgidmap".into(),
+                    "the daemon has only the id of its user: the sub ids are read from /etc/subuid and /etc/subgid only, add the user to them and install newuidmap and newgidmap".into(),
                 ));
             }
             return Ok(pool);

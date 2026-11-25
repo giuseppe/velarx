@@ -309,7 +309,17 @@ async fn keep_id_without_sub_ids_maps_the_user_only() {
     let r = f.manager.resolve(&req("keep-id")).await.unwrap();
     assert_eq!(r.uid_mappings, [m(1000, 0, 1)]);
     assert!(f.manager.resolve(&req("nomap")).await.is_err());
-    assert!(f.manager.resolve(&req("auto")).await.is_err());
+    let e = f
+        .manager
+        .resolve(&req("auto"))
+        .await
+        .unwrap_err()
+        .to_string();
+    // a host that keeps the sub ids elsewhere (nsswitch) learns what is read
+    assert!(
+        e.contains("read from /etc/subuid and /etc/subgid only"),
+        "{e}"
+    );
 }
 
 #[tokio::test]
