@@ -559,6 +559,23 @@ async fn test_concurrent_pulls_of_the_same_layer_commit_it_once() {
     assert!(e.area().layer_keys().is_empty());
 }
 
+/// A file two layers of an image share is staged once, in the staging of
+/// the layer it was read from: the second here, not the first, which the
+/// completion fetches it into.  The completion commits it from there.
+#[tokio::test]
+async fn test_a_shared_file_staged_in_the_second_layer_is_committed() {
+    let (e, [_, second], [first, _]) = two_images(&[0, 1], &[1]).await;
+    e.service
+        .fetch_lazy_file(&vid(b"hello\n"), &second)
+        .await
+        .unwrap();
+    e.service
+        .complete_image(&format!("{}/test:first", e.host))
+        .await
+        .unwrap();
+    assert!(e.service.get(&first.id).await.is_ok());
+}
+
 /// A pooled file that is not what its name says is not linked, and the
 /// proof does not fetch it behind the link: the commit fails and the image
 /// is still being pulled.

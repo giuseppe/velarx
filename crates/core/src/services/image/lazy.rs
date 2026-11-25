@@ -878,10 +878,9 @@ impl ImageService {
     }
 
     /// Give the staged files `digests` their names in the store, from the
-    /// staging directories of `layers` (a content is staged once, in the
-    /// first layer that has it), after the staging is written to the disk
-    /// when `[storage] sync` says (the files are complete and sealed: one
-    /// `syncfs`), each by a link of the same inode.  Returns the objects the
+    /// staging directories of `layers` (each from the staging that has it),
+    /// after the staging is written to the disk when `[storage] sync` says
+    /// (the files are complete and sealed: one `syncfs`), each by a link of the same inode.  Returns the objects the
     /// kernel measured.  With `image`, the layer's staged EROFS image is
     /// renamed into the store in the same commit (the same bytes: the
     /// containers that run on the staged one keep their mounts), after it
@@ -911,7 +910,7 @@ impl ImageService {
         let area = self.staging_area();
         let dirs: Vec<PathBuf> = layers.iter().map(|l| area.layer_files(&l.key)).collect();
         let objects = area.objects_stand_in();
-        let wanted = wanted_by_staging(layers, digests);
+        let owners: Vec<_> = layers.iter().map(|l| l.toc.files()).collect();
         let images: Vec<StagedImageOf> = images
             .into_iter()
             .filter_map(|l| {
@@ -925,6 +924,7 @@ impl ImageService {
             })
             .collect();
         tokio::task::spawn_blocking(move || {
+            let wanted = wanted_by_staging(&owners, &dirs, digests);
             let verified = verify_staged(&dirs, &wanted, &store, fsverity, &images, &objects)?;
             Ok::<_, ImageError>(StagedFiles {
                 dirs,
@@ -1028,18 +1028,33 @@ async fn blocking_holding<H: Send + 'static, R: Send + 'static>(
         .map_err(|e| ImageError::Storage(e.to_string()))
 }
 
-/// The files `digests` split by the staging that holds each: a content is
-/// staged once, in the first layer of `layers` that has it, and is asked of
-/// that staging only (not of every one: no `openat2` of a file in a staging
-/// that cannot have it, and no name removed from a staging of another layer).
-fn wanted_by_staging(layers: &[LazyLayer], digests: Vec<String>) -> Vec<Vec<String>> {
-    let owners: Vec<std::collections::HashSet<String>> = layers
-        .iter()
-        .map(|l| l.toc.files().into_iter().collect())
-        .collect();
-    let mut wanted: Vec<Vec<String>> = vec![Vec::new(); layers.len()];
+/// The files `digests` split by the staging each is asked of: of the layers
+/// whose files are `owners` (their staging directories `dirs`) that list a
+/// content, the first whose staging has it, else the first.  A content is
+/// staged once, and not always in the first layer that lists it: a read
+/// stages it in the layer it was read from, and the completion of another
+/// image that shares the layers in another order in the first of its own.
+/// It is asked of that staging only (no `openat2` of a file in a staging
+/// that cannot have it).
+fn wanted_by_staging(
+    owners: &[Vec<String>],
+    dirs: &[PathBuf],
+    digests: Vec<String>,
+) -> Vec<Vec<String>> {
+    let owners: Vec<std::collections::HashSet<&String>> =
+        owners.iter().map(|o| o.iter().collect()).collect();
+    let mut wanted: Vec<Vec<String>> = vec![Vec::new(); owners.len()];
     for digest in digests {
-        if let Some(at) = owners.iter().position(|o| o.contains(&digest)) {
+        let rel = Digest::parse_fsverity(&digest)
+            .ok()
+            .map(|d| velarx_content::pull::commit::rel_of(&d));
+        let listing: Vec<usize> = (0..owners.len())
+            .filter(|&at| owners[at].contains(&digest))
+            .collect();
+        let staged = listing
+            .iter()
+            .find(|&&at| rel.as_ref().is_some_and(|rel| dirs[at].join(rel).exists()));
+        if let Some(&at) = staged.or(listing.first()) {
             wanted[at].push(digest);
         }
     }
@@ -1365,31 +1380,42 @@ mod tests {
         }
     }
 
-    /// A file two layers have is asked of the staging of the first, and the
-    /// files only the second has of the second's.
+    /// A file two layers have is asked of the staging of the first, unless
+    /// only the second's has it, and the files only the second has of the
+    /// second's.
     #[test]
     fn a_file_is_wanted_from_the_staging_of_the_first_layer_that_has_it() {
         let a = layer_of(&[("a", b"one"), ("shared", b"both")]);
-        let mut b = layer_of(&[("shared", b"both"), ("c", b"three")]);
-        b.key = LayerKey::Toc(format!("sha256:{}", "3".repeat(64)).parse().unwrap());
-        let layers = [a, b];
+        let b = layer_of(&[("shared", b"both"), ("c", b"three")]);
+        let owners = [a.toc.files(), b.toc.files()];
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = [tmp.path().join("a"), tmp.path().join("b")];
         let id = |d: &[u8]| velarx_storage::fsverity_digest_of(Algorithm::Sha256, d);
         let mut seen = std::collections::HashSet::new();
-        let all: Vec<String> = layers
+        let all: Vec<String> = owners
             .iter()
-            .flat_map(|l| l.toc.files())
-            .filter(|d| seen.insert(d.clone()))
+            .flatten()
+            .filter(|d| seen.insert(d.to_string()))
+            .cloned()
             .collect();
-        let wanted = wanted_by_staging(&layers, all);
-        let at =
-            |i: usize| -> std::collections::HashSet<String> { wanted[i].iter().cloned().collect() };
+        let set =
+            |l: &[String]| -> std::collections::HashSet<String> { l.iter().cloned().collect() };
+        let wanted = wanted_by_staging(&owners, &dirs, all.clone());
         assert_eq!(
-            at(0),
-            [id(b"one"), id(b"both")].into_iter().collect(),
+            set(&wanted[0]),
+            set(&[id(b"one"), id(b"both")]),
             "{wanted:?}"
         );
-        assert_eq!(at(1), [id(b"three")].into_iter().collect());
-        assert_eq!(wanted[0].len() + wanted[1].len(), 3);
+        assert_eq!(set(&wanted[1]), set(&[id(b"three")]));
+        // (the second's staging has the shared file: a read of the second
+        // staged it there)
+        let shared = Digest::parse_fsverity(&id(b"both")).unwrap();
+        let path = dirs[1].join(velarx_content::pull::commit::rel_of(&shared));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"both").unwrap();
+        let wanted = wanted_by_staging(&owners, &dirs, all);
+        assert_eq!(set(&wanted[0]), set(&[id(b"one")]), "{wanted:?}");
+        assert_eq!(set(&wanted[1]), set(&[id(b"both"), id(b"three")]));
     }
 
     fn stores() -> (tempfile::TempDir, Arc<FileStore>) {
