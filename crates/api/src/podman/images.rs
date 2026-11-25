@@ -191,9 +191,16 @@ async fn prune(call: Call) -> ApiResult {
 
 /// `GET /distribution/{name}/json`: what the registry has for a name.
 async fn distribution(call: Call) -> ApiResult {
-    let tls_verify = call.q_bool("tlsVerify", true)?;
+    let tls_verify = tls_verify(&call, call.param(0))?;
     let d = engine_call!(call.engine, image_remote_inspect(call.param(0), tls_verify))?;
     Ok(reply::json(200, &velarx_shape::image::distribution(&d)))
+}
+
+/// Whether the registry of `reference` is verified: the query's
+/// `tlsVerify`, and on Docker's routes (not libpod's) a registry on the
+/// loopback is insecure, as for the Docker daemon.
+fn tls_verify(call: &Call, reference: &str) -> ApiResult<bool> {
+    Ok(call.q_bool("tlsVerify", true)? && (call.libpod || !loopback_registry(reference)))
 }
 
 /// The registries on the loopback are insecure, as for the Docker daemon:
@@ -638,7 +645,7 @@ async fn do_pull(call: Call, reference: String, compat: bool) -> ApiResult {
     // transport is the command line's)
     velarx_types::transport::ImageLocation::registry(&reference, "the REST API")
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let tls_verify = call.q_bool("tlsVerify", true)? && !(compat && loopback_registry(&reference));
+    let tls_verify = tls_verify(&call, &reference)?;
     let quiet = call.q_bool("quiet", false)?;
     // libpod's per-layer report (podman 6)
     let pull_progress = !compat && call.q_bool("pullProgress", false)?;
@@ -812,11 +819,12 @@ async fn push(call: Call) -> ApiResult {
     };
     let image = call.param(0).to_string();
     let tag = call.q_set("tag");
+    let destination = call.q_set("destination");
     let quiet = call.q_bool("quiet", false)?;
     let spec = PushSpec {
         images: vec![image.clone()],
         tag: tag.clone(),
-        destination: call.q_set("destination"),
+        destination: destination.clone(),
         platform: PlatformSpec {
             platform: call.q_set("platform"),
             os: call.q_set("os"),
@@ -827,7 +835,7 @@ async fn push(call: Call) -> ApiResult {
         all_tags: false,
         artifact: false,
         add_compression: Vec::new(),
-        tls_verify: call.q_bool("tlsVerify", true)?,
+        tls_verify: tls_verify(&call, destination.as_deref().unwrap_or(&image))?,
         compression: match call.q_set("compressionFormat").as_deref() {
             None | Some("keep") => None,
             Some(c) => Some(
@@ -977,5 +985,32 @@ mod tests {
         ] {
             assert!(!loopback_registry(hub), "{hub}");
         }
+    }
+
+    #[test]
+    fn docker_routes_do_not_verify_the_loopback() {
+        use axum::{body::Body, http::HeaderMap, http::Method};
+        let call = |q: &str, libpod: bool| {
+            let mut c = Call::new(
+                crate::engine::Engine::new(std::path::Path::new("/nonexistent")),
+                Method::POST,
+                HeaderMap::new(),
+                Body::empty(),
+                None,
+                None,
+            );
+            c.libpod = libpod;
+            c.query = super::super::call::parse_query(q);
+            c
+        };
+        let (loop_ref, far) = ("127.0.0.1:5000/app", "registry.example/app");
+        // Docker's routes: the loopback is insecure, the others follow the query
+        assert!(!tls_verify(&call("", false), loop_ref).unwrap());
+        assert!(tls_verify(&call("", false), far).unwrap());
+        assert!(!tls_verify(&call("tlsVerify=false", false), far).unwrap());
+        // libpod's never are, whatever the other options say
+        assert!(tls_verify(&call("", true), loop_ref).unwrap());
+        assert!(tls_verify(&call("compatMode=true", true), loop_ref).unwrap());
+        assert!(!tls_verify(&call("tlsVerify=false", true), loop_ref).unwrap());
     }
 }

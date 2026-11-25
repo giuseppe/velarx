@@ -542,3 +542,29 @@ rc=125" "$out"
     out=$(api -X POST http://d/v1.41/build/prune | jq -r '(.CachesDeleted | length) > 0 and .SpaceReclaimed > 0')
     check "build prune" true "$out"
 }
+
+# Docker's daemon treats the registries of the loopback as insecure and
+# libpod's routes do not, whatever compatMode says.
+@test "the loopback registries are insecure on Docker's routes only" {
+    e2e_registry_up || skip "no registry on $E2E_REGISTRY"
+    case $E2E_REGISTRY in
+        localhost:*|127.0.0.1:*) ;;
+        *) skip "$E2E_REGISTRY is not on the loopback" ;;
+    esac
+    # (an address registries.conf does not mark insecure)
+    ref=127.0.0.1:${E2E_REGISTRY##*:}/alpine:chunked
+    out=$(api -o /dev/null -w '%{http_code}' -X POST "http://d/v5.0.0/libpod/images/pull?reference=$ref&compatMode=true")
+    check "libpod pull with compatMode verifies" 500 "$out"
+    out=$(api -X POST "http://d/v1.44/images/create?fromImage=${ref%:*}&tag=chunked" | jq -rs 'map(.error // empty) | length')
+    check "Docker's pull does not" 0 "$out"
+    # (pushed to a name of the test, not over the image the tests share)
+    dst=127.0.0.1:${E2E_REGISTRY##*:}/velarx-e2e/loopback-$$:1
+    pm tag "$ref" "$dst" > /dev/null
+    out=$(api -o /dev/null -w '%{http_code}' -X POST "http://d/v1.44/images/$dst/push")
+    check "Docker's push does not" 200 "$out"
+    out=$(api -X POST "http://d/v5.0.0/libpod/images/$dst/push" | jq -rs 'map(.error // empty) | length > 0')
+    check "libpod's push verifies" true "$out"
+    out=$(api "http://d/v1.44/distribution/$ref/json" | jq -r '.Descriptor.digest | startswith("sha256:")')
+    check "Docker's distribution does not" true "$out"
+    pm rmi -f "$ref" "$dst" > /dev/null 2>&1
+}
