@@ -42,6 +42,20 @@ its files and did not commit) and the temporary files of a writer that died,
 which the start of the daemon, the first start of a boot and the storage
 service at its start remove too, when no pull holds the store.
 
+What a pull, a commit or a build in progress uses is told by a hold: a
+directory `staging/pull-<id>` or `staging/build-<id>` that is live while a
+process has an `flock` on it (the owner takes it shared and keeps it, so the
+kernel lets it go when the process ends however it ends; whoever judges or
+removes a hold tries to take it exclusive without waiting, and a failed try
+counts as live). A hold is made under a temporary name, locked, and renamed,
+so no directory of that name is ever seen unlocked while its owner lives. The last user to let go does it under a gate (a lock on `staging` itself that a look takes shared): it renames the hold away and removes it after the gate is free, so a look never sees the instant between the unlock and the removal and never waits for a tree. The
+file `pins` in it lists the layers and images the owner uses (`layer KEY`,
+`image ID`); the pins of a hold nobody holds count for nothing. The
+collection and `system check` ask the directory, so several commands on one
+store with no service need nothing else, and a hold left by a process that
+died is reported by `system check` as `stale_staging` and removed by
+`--repair` and by the next collection.
+
 The EROFS image of a layer is made from its table of contents alone, so it
 is the same file in every image that has the layer, whatever is below it.
 The root of a layer is its `./` entry, or a plain directory (0755, owned by
