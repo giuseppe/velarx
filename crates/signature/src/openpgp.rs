@@ -604,6 +604,24 @@ fn verified(by: &Key, raw: &[u8], types: &[u8], data: &[u8]) -> Option<Signature
     by.verifies(&sig, data).ok()?.then_some(sig)
 }
 
+/// Keeps in `newest` the later of it and `sig`, `sig` on a tie.
+fn keep_newest(newest: &mut Option<Signature>, sig: Signature) {
+    if newest
+        .as_ref()
+        .is_none_or(|n| sig.sub.created >= n.sub.created)
+    {
+        *newest = Some(sig);
+    }
+}
+
+/// The later of two signatures, `b` on a tie.
+fn later<'a>(a: &'a Option<Signature>, b: &'a Option<Signature>) -> Option<&'a Signature> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if b.sub.created >= a.sub.created { b } else { a }),
+        (a, b) => a.as_ref().or(b.as_ref()),
+    }
+}
+
 /// The keys of a keyring's binary packets.  Every self-signature, binding
 /// and back-signature is verified, and only what they say counts: a key
 /// without a valid self-signature cannot sign, a subkey without a valid
@@ -628,19 +646,18 @@ fn parse_keys(data: &[u8], keys: &mut Vec<Key>) -> Result<(), Error> {
                 .chain(block.ids.iter().flat_map(|(_, _, s)| s.iter()))
         };
         primary.revoked = all_sigs().any(|raw| signature_type(raw) == Some(0x20));
-        // the newest valid self-signature says the expiry and the flags
-        let mut newest: Option<Signature> = None;
-        let mut keep = |sig: Signature| {
-            if newest
-                .as_ref()
-                .is_none_or(|n| sig.sub.created >= n.sub.created)
-            {
-                newest = Some(sig);
-            }
-        };
+        // the newest valid self-signature of all says when they were made;
+        // the expiry and the flags are the stricter of what the newest user
+        // ID self-signature (no expiry subpacket there: it does not expire)
+        // and the newest direct key signature say, so that neither can
+        // drop an expiry or add "may sign" that the other states.  A key
+        // extended by a newer signature of one kind only is thus still
+        // expired if the newest of the other kind says so.
+        let mut newest_direct: Option<Signature> = None;
+        let mut newest_id: Option<Signature> = None;
         for raw in &block.direct {
             if let Some(sig) = verified(&primary, raw, &[0x1f], &primary_framed) {
-                keep(sig);
+                keep_newest(&mut newest_direct, sig);
             }
         }
         for (tag, body, sigs) in &block.ids {
@@ -648,13 +665,17 @@ fn parse_keys(data: &[u8], keys: &mut Vec<Key>) -> Result<(), Error> {
             data.extend(framed_id(*tag, body)?);
             for raw in sigs {
                 if let Some(sig) = verified(&primary, raw, &[0x10, 0x11, 0x12, 0x13], &data) {
-                    keep(sig);
+                    keep_newest(&mut newest_id, sig);
                 }
             }
         }
-        if let Some(sig) = &newest {
-            primary.expires = sig.sub.key_expires;
-            primary.can_sign = sig.sub.key_flags.is_none_or(|f| f & 0x02 != 0);
+        let newest = later(&newest_direct, &newest_id);
+        if let Some(sig) = newest {
+            let says = || newest_id.iter().chain(&newest_direct);
+            primary.expires = says()
+                .filter_map(|s| s.sub.key_expires.filter(|e| *e != 0))
+                .min();
+            primary.can_sign = says().all(|s| s.sub.key_flags.is_none_or(|f| f & 0x02 != 0));
             primary.sigs_expire_at = expires_at(sig);
             primary.sigs_made_at = sig.sub.created.map(u64::from);
         }
@@ -1189,6 +1210,88 @@ mod tests {
         verify_message(&k, fixture!("msg-pexp.sig"), created + 60).unwrap();
         let e = verify_message(&k, fixture!("msg-pexp.sig"), created + 2 * 86400).unwrap_err();
         assert!(e.0.contains("primary key"), "{e}");
+    }
+
+    #[test]
+    fn a_direct_key_signature_does_not_change_the_expiry_or_the_flags() {
+        // made 1795621561: the user ID says the key expires a day later;
+        // a newer direct key signature states neither the expiry nor the
+        // flags
+        let created = 1_795_621_561;
+        let k = keys(fixture!("key-dkexp.gpg"));
+        verify_message(&k, fixture!("msg-dkexp.sig"), created + 3600).unwrap();
+        let e = verify_message(&k, fixture!("msg-dkexp.sig"), created + 2 * 86400).unwrap_err();
+        assert!(e.0.contains("is expired"), "{e}");
+        // a key that only certifies stays unable to sign
+        assert!(!keys(fixture!("key-dkcert.gpg"))[0].can_sign);
+    }
+
+    /// A keyring of one Ed25519 key with a direct key signature made 1000
+    /// seconds before `NOW` and a user ID self-signature made 500 seconds
+    /// before, each with these hashed subpackets after the creation time
+    /// (none: not there); with `other`, a newer certification of the user
+    /// ID by another key that states neither an expiry nor flags.
+    fn direct_and_id(direct: Option<&[u8]>, id: Option<&[u8]>, other: bool) -> Key {
+        let key = PKey::generate_ed25519().unwrap();
+        let mut public = vec![4];
+        public.extend_from_slice(&((NOW - 3000) as u32).to_be_bytes());
+        public.push(ALGO_ED25519);
+        public.extend(key.raw_public_key().unwrap());
+        let signed = |by: &PKey<openssl::pkey::Private>,
+                      sig_type: u8,
+                      data: &[u8],
+                      at: u64,
+                      extra: &[u8]| {
+            let mut hashed = sp(2, &((NOW - at) as u32).to_be_bytes());
+            hashed.extend_from_slice(extra);
+            packet(TAG_SIGNATURE, &ed_signature(by, sig_type, data, &hashed))
+        };
+        let mut ring = packet(TAG_PUBLIC_KEY, &public);
+        if let Some(extra) = direct {
+            ring.extend(signed(
+                &key,
+                0x1f,
+                &framed_key(&public).unwrap(),
+                1000,
+                extra,
+            ));
+        }
+        let uid = b"a <a@example.com>";
+        ring.extend(packet(TAG_USER_ID, uid));
+        let mut data = framed_key(&public).unwrap();
+        data.extend(framed_id(TAG_USER_ID, uid).unwrap());
+        if let Some(extra) = id {
+            ring.extend(signed(&key, 0x13, &data, 500, extra));
+        }
+        if other {
+            let stranger = PKey::generate_ed25519().unwrap();
+            ring.extend(signed(&stranger, 0x13, &data, 100, &[]));
+        }
+        parse_keyring(&ring).unwrap().remove(0)
+    }
+
+    #[test]
+    fn the_stricter_of_the_direct_key_and_user_id_signatures_counts() {
+        let expiry = |s: u32| sp(9, &s.to_be_bytes());
+        let certify = sp(27, &[0x01]);
+        // a direct key signature alone
+        let mut both = expiry(100);
+        both.extend_from_slice(&certify);
+        let k = direct_and_id(Some(&both), None, false);
+        assert_eq!((k.expires, k.can_sign), (Some(100), false));
+        // a user ID self-signature that states neither drops neither
+        let k = direct_and_id(Some(&both), Some(&[]), false);
+        assert_eq!((k.expires, k.can_sign), (Some(100), false));
+        // the earlier expiry, whichever states it
+        let k = direct_and_id(Some(&expiry(100)), Some(&expiry(5000)), false);
+        assert_eq!(k.expires, Some(100));
+        let k = direct_and_id(Some(&expiry(0)), Some(&expiry(100)), false);
+        assert_eq!(k.expires, Some(100));
+        // a newer certification by another key changes nothing
+        let k = direct_and_id(None, Some(&both), true);
+        assert_eq!((k.expires, k.can_sign), (Some(100), false));
+        let k = direct_and_id(None, None, true);
+        assert!(!k.can_sign);
     }
 
     #[test]
