@@ -792,6 +792,7 @@ where
         }
     };
     let (mut body, mut digest) = fetch(reference).await?;
+    check_size(&body)?;
     velarx_types::docker::refuse_manifest(&body)?;
     if let Some(pinned) = &image_ref.digest {
         // fetched by a tag, the bytes are the digest's own algorithm to check
@@ -831,17 +832,26 @@ where
             Some(body) => body,
             None => fetch(wanted.to_string()).await?.0,
         };
+        check_size(&body)?;
         velarx_types::docker::refuse_manifest(&body)?;
         // whoever fetched it (a confined worker too), the instance is the
         // one the index names: its bytes are hashed here
         verify_digest(&wanted, &body)?;
         digest = wanted;
-        if body.len() as u64 > MAX_MANIFEST_SIZE {
-            break;
-        }
     }
     let manifest: OciManifest = serde_json::from_slice(&body)?;
     Ok((manifest, digest, body, indexes))
+}
+
+/// A manifest or index of the registry is read only when it is no larger
+/// than [`MAX_MANIFEST_SIZE`], whoever fetched it.
+fn check_size(body: &[u8]) -> ImageResult<()> {
+    if body.len() as u64 > MAX_MANIFEST_SIZE {
+        return Err(ImageError::Manifest(format!(
+            "a manifest of more than {MAX_MANIFEST_SIZE} bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// The instances `value` lists when it is an index; none for an image

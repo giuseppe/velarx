@@ -2899,11 +2899,10 @@ mod tests {
         body
     }
 
-    /// Pins a problem: a manifest larger than MAX_MANIFEST_SIZE is used
-    /// (parsed, hashed) and taken; expect an error, for the manifest of a
-    /// tag and for the instance of an index alike.
+    /// A manifest larger than MAX_MANIFEST_SIZE is refused, whoever fetched
+    /// it: the manifest of a tag and the instance of an index alike.
     #[tokio::test]
-    async fn test_an_oversized_manifest_is_taken_pinned() {
+    async fn test_an_oversized_manifest_is_refused() {
         let r = ImageReference::parse("example.com/a:latest").unwrap();
         let big = manifest_of_size(MAX_MANIFEST_SIZE as usize + 1);
         let alone = |_: String| {
@@ -2913,7 +2912,7 @@ mod tests {
                 Ok::<_, ImageError>((Bytes::from(body), d))
             }
         };
-        assert!(resolve_manifest(&r, None, alone).await.is_ok());
+        assert!(resolve_manifest(&r, None, alone).await.is_err());
         let index = format!(
             r#"{{"manifests":[{{"digest":"{}","platform":{{"os":"linux","architecture":"{}"}}}}]}}"#,
             sha256_of(&big),
@@ -2930,7 +2929,17 @@ mod tests {
                 Ok::<_, ImageError>((Bytes::from(body), d))
             }
         };
-        assert!(resolve_manifest(&r, None, nested).await.is_ok());
+        assert!(resolve_manifest(&r, None, nested).await.is_err());
+        // (one of the bound itself is taken)
+        let fits = manifest_of_size(MAX_MANIFEST_SIZE as usize);
+        let alone = |_: String| {
+            let body = fits.clone();
+            async move {
+                let d = sha256_of(&body);
+                Ok::<_, ImageError>((Bytes::from(body), d))
+            }
+        };
+        assert!(resolve_manifest(&r, None, alone).await.is_ok());
     }
 
     /// Pins a problem: the bytes are parsed (and refused as a Docker
