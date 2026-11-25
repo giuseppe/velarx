@@ -404,10 +404,10 @@ tmpfs" --read-only -- sh -c 'for d in /tmp /var/tmp /run; do grep " $d " /proc/s
         check "block IO" 201 "$(api_update "$id" '{"blockIO": {"weight": 300}}')"
         check_match "its weight" "default (300|2930)" "$(sc container exec "$id" sh -c "cat /sys/fs/cgroup/io.bfq.weight 2>/dev/null || cat /sys/fs/cgroup/io.weight" 2>&1)"
     else
-        check "block IO without the io controller" 500 "$(api_update "$id" '{"blockIO": {"weight": 300}}')"
+        check "block IO without the io controller" 400 "$(api_update "$id" '{"blockIO": {"weight": 300}}')"
         # what the runtime refuses is not recorded: neither the memory limit
         # that came with it
-        check "a refused update" 500 \
+        check "a refused update" 400 \
             "$(api_update "$id" '{"memory": {"limit": 62914560}, "blockIO": {"weight": 300}}')"
         check "the record keeps the limit the cgroup has" "52428800 52428800" \
             "$(sc container inspect --format '{{.HostConfig.Memory}}' "$id") $(sc container exec "$id" cat /sys/fs/cgroup/memory.max)"
