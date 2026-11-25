@@ -326,6 +326,18 @@ tmpfs" --read-only -- sh -c 'for d in /tmp /var/tmp /run; do grep " $d " /proc/s
         --network container:nosuch --sysctl net.ipv4.ip_forward=1 -- true
 }
 
+@test "a container that joins one with the host's namespaces has those too" {
+    sc container run -d --name hnsa --pid host --uts host --cgroupns host "$IMAGE" sleep 304 > /dev/null
+    check "the target runs" running "$(sc container inspect --format '{{.State.Status}}' hnsa)"
+    for kind in pid uts cgroup; do
+        flag=--$kind
+        [ "$kind" != cgroup ] || flag=--cgroupns
+        out=$(sc container run --rm "$flag" container:hnsa "$IMAGE" readlink /proc/self/ns/$kind 2>&1)
+        check "$flag container: is the host's" "$(readlink /proc/self/ns/$kind)" "$out"
+    done
+    sc container rm -t 0 -f hnsa > /dev/null 2>&1
+}
+
 # The spec carries the destinations of the bind mounts as given: the runtime
 # resolves them in the root at every start, so a container that replaces the
 # link /etc -> /var/etc of its image by a directory gets /etc/hosts there

@@ -407,7 +407,14 @@ impl ContainerService {
 
     /// The namespace `kind` (`pid`, `ipc`...) of `--pid` and the like:
     /// private (empty), `host`, `container:ID` (its path) or `ns:PATH`.
-    pub(super) async fn ns_mode(&self, kind: &str, mode: &NsMode) -> ContainerResult<String> {
+    /// The namespace of a container that has the host's is the host's for a
+    /// rootless engine, which cannot join the host's namespace.
+    pub(super) async fn ns_mode(
+        &self,
+        kind: &str,
+        mode: &NsMode,
+        rootless: bool,
+    ) -> ContainerResult<String> {
         match mode {
             NsMode::Default | NsMode::Private | NsMode::Shareable => Ok(String::new()),
             NsMode::Host => Ok("host".into()),
@@ -419,6 +426,18 @@ impl ContainerService {
                     .get_container(target)
                     .await
                     .map_err(|_| ContainerError::NotFound(target.to_string()))?;
+                let o = serde_json::from_str::<ContainerConfig>(&rec.config)
+                    .unwrap_or_default()
+                    .options;
+                let theirs = match kind {
+                    "pid" => o.pid_ns,
+                    "ipc" => o.ipc_ns,
+                    "uts" => o.uts_ns,
+                    _ => o.cgroup_ns,
+                };
+                if rootless && theirs == "host" {
+                    return Ok("host".into());
+                }
                 Ok(format!("container:{}", rec.id))
             }
             // (`none` is for the IPC namespace only; `pod` is for a member
@@ -430,15 +449,13 @@ impl ContainerService {
     }
 
     /// The IPC namespace of `--ipc` as [`Self::ns_mode`] has it, and as
-    /// podman: `none` is a namespace of its own (without /dev/shm), the IPC
-    /// namespace of a container that is `private` cannot be joined, and that
-    /// of one that has the host's is the host's for a rootless engine (it
-    /// cannot join the host's namespace).
+    /// podman: `none` is a namespace of its own (without /dev/shm), and the
+    /// IPC namespace of a container that is `private` cannot be joined.
     async fn ipc_mode(&self, mode: &NsMode, rootless: bool) -> ContainerResult<String> {
         if *mode == NsMode::Off {
             return Ok(String::new());
         }
-        let ns = self.ns_mode("ipc", mode).await?;
+        let ns = self.ns_mode("ipc", mode, rootless).await?;
         let Some(target) = ns.strip_prefix("container:") else {
             return Ok(ns);
         };
@@ -451,9 +468,6 @@ impl ContainerService {
                  IpcMode:shareable for the donor container)",
                 rec.id
             )));
-        }
-        if rootless && o.ipc_ns == "host" {
-            return Ok("host".into());
         }
         Ok(ns)
     }
@@ -537,7 +551,7 @@ impl ContainerService {
         for r in &req.device_cgroup_rules {
             out.device_rules.push(o::parse_device_rule(r).map_err(inv)?);
         }
-        out.pid_ns = self.ns_mode("pid", &req.pid_mode).await?;
+        out.pid_ns = self.ns_mode("pid", &req.pid_mode, rootless).await?;
         out.ipc_ns = self.ipc_mode(&req.ipc_mode, rootless).await?;
         // (shareable is the default: any container's /dev/shm can be
         // joined with --ipc container:ID; `none` has no /dev/shm at all)
@@ -555,8 +569,8 @@ impl ContainerService {
                 }
             }
         }
-        out.uts_ns = self.ns_mode("uts", &req.uts_mode).await?;
-        out.cgroup_ns = self.ns_mode("cgroup", &req.cgroupns_mode).await?;
+        out.uts_ns = self.ns_mode("uts", &req.uts_mode, rootless).await?;
+        out.cgroup_ns = self.ns_mode("cgroup", &req.cgroupns_mode, rootless).await?;
         // The restarts the monitor makes join the namespaces the first run
         // joined (it keeps them open: monitor::restart).
         out.personality = req
