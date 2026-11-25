@@ -81,8 +81,12 @@ mkpod () {
 @test "a message queue of a member is seen by the others" {
     # a message queue of one is seen by the other: the mqueue file system
     # is that of the IPC namespace
-    pm exec nsm1 sh -c ': > /dev/mqueue/q1'
-    check "a message queue is seen by both" "q1" "$(pm exec nsm2 ls /dev/mqueue 2>&1)"
+    # (members without their SELinux label: a host's policy may give a
+    # labeled container no message queue, whatever engine starts it)
+    pm run --rm --pod nspod --security-opt label=disable "$IMG" sh -c ': > /dev/mqueue/q1'
+    check "a member makes a message queue" 0 $?
+    check "another one sees it" "q1" "$(pm run --rm --pod nspod --security-opt label=disable "$IMG" ls /dev/mqueue 2>&1)"
+    check "a container out of the pod does not" "" "$(pm run --rm --security-opt label=disable "$IMG" ls /dev/mqueue 2>&1)"
 }
 
 @test "the velarx CLI joins the pod too" {
