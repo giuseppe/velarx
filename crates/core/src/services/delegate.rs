@@ -221,7 +221,15 @@ fn sibling(rel: &str, pid: u32, limits: Limits) -> Result<String, String> {
     let name = format!("velarx-{pid}");
     let new_rel = parent.join(&name).to_string_lossy().into_owned();
     let dir = full(&new_rel);
-    std::fs::create_dir(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    // A daemon that had this pid before left its cgroup (nothing removes it
+    // once its daemon is gone): it goes, unless a process is still in it.
+    match std::fs::create_dir(&dir) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            remove_tree(&dir).and_then(|()| std::fs::create_dir(&dir))
+        }
+        r => r,
+    }
+    .map_err(|e| format!("create {}: {e}", dir.display()))?;
     let setup = || -> Result<(), String> {
         for (file, v) in [
             ("memory.max", limits.memory),
@@ -241,6 +249,19 @@ fn sibling(rel: &str, pid: u32, limits: Limits) -> Result<String, String> {
         return Err(e);
     }
     Ok(new_rel)
+}
+
+/// Remove the cgroup `dir` and the cgroups below it, the deepest first.
+/// The kernel refuses to remove a cgroup a process is in, so only a tree
+/// with no process goes.
+fn remove_tree(dir: &Path) -> io::Result<()> {
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        if e.file_type()?.is_dir() {
+            remove_tree(&e.path())?;
+        }
+    }
+    std::fs::remove_dir(dir)
 }
 
 /// Why the daemon does not own the cgroup `cg`.
@@ -445,5 +466,31 @@ mod tests {
         std::fs::write(daemon.join("cgroup.procs"), "7\n").unwrap();
         std::fs::write(d.path().join("cgroup.procs"), "").unwrap();
         assert!(usable(&daemon, 7));
+    }
+
+    #[test]
+    fn the_cgroup_an_earlier_daemon_of_the_pid_left_is_taken() {
+        // a child stands for the daemon, next to the cgroup of the test
+        let rel = velarx_base::cgroup::of_process(None).unwrap();
+        let parent = Path::new(&rel).parent().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // what a daemon that had this pid left: its cgroup, engine/ in it
+        let stale = full(&parent.join(format!("velarx-{pid}")).to_string_lossy());
+        let made = std::fs::create_dir_all(stale.join(DAEMON_CGROUP));
+        let got = made.is_ok().then(|| sibling(&rel, pid, Limits::default()));
+        let moved = velarx_base::cgroup::of_process(Some(pid as i32));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let Some(got) = got else {
+            return eprintln!("skipped: no cgroup can be made next to the test's: {made:?}");
+        };
+        remove_tree(&stale).unwrap();
+        let got = got.unwrap();
+        assert!(got.ends_with(&format!("/velarx-{pid}")), "{got}");
+        assert_eq!(moved.unwrap(), got);
     }
 }
