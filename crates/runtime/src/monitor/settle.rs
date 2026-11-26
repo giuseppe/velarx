@@ -427,6 +427,13 @@ impl Settler {
         }
     }
 
+    /// The exit job runs, or its result is not taken yet: it starts the
+    /// CNI plugins and waits for them, so the monitor must not reap them
+    /// as strays.  (The removal job starts no process.)
+    pub fn spawning(&self) -> bool {
+        self.started.is_some() && !self.exit_settled
+    }
+
     /// What the end of the container came to; the monitor tells its clients
     /// once this is true (or the deadline passed).
     pub fn exit_done(&self, now: Instant) -> bool {
@@ -796,4 +803,58 @@ fn remove_job(
     };
     *keep = Some(store);
     done
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settle::RemovalPlan;
+    use velarx_wire::events::log::EventLog;
+
+    fn plan(dir: &std::path::Path) -> SettlePlan {
+        SettlePlan {
+            id: "c1".into(),
+            db: dir.join("missing.db"),
+            start_lock: dir.join("c1.lock"),
+            storage_lock: dir.join("storage.lock"),
+            events: EventLog::File {
+                path: dir.join("events"),
+                max_size: 0,
+            },
+            network: None,
+            removal: RemovalPlan {
+                bundle: dir.join("bundle"),
+                mon_dir: dir.join("mon"),
+                log_dir: dir.join("log"),
+                secrets_dir: dir.join("secrets"),
+                public_rootfs: None,
+                named_files: Vec::new(),
+                api_record: None,
+                volumes_dir: dir.join("volumes"),
+                volumes_lock: dir.join("volumes.lock"),
+                lock_files: Vec::new(),
+                writable: velarx_graph::WritableRelease::InBundle { pin: None },
+            },
+            image: None,
+            pod: None,
+            cgroup: None,
+        }
+    }
+
+    #[test]
+    fn the_exit_job_spawns_until_its_result_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settler = Settler::new(Some(plan(dir.path()))).unwrap();
+        assert!(!settler.spawning());
+        // (the job waits for the lock of the start: it is running)
+        let lock = settle::lock::exclusive(&dir.path().join("c1.lock")).unwrap();
+        settler.start_exit(None, false, false);
+        assert!(settler.spawning());
+        drop(lock);
+        settler.wait_ended();
+        assert!(settler.spawning(), "the result is not taken yet");
+        settler.reap();
+        assert!(settler.exit_settled());
+        assert!(!settler.spawning());
+    }
 }

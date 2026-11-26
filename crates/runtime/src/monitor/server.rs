@@ -2394,7 +2394,8 @@ impl Monitor {
 
     /// Reap the orphans that became ours, but not the children that a
     /// pidfd is waiting for, nor any while a runtime is still starting a
-    /// command: that command may be one of them.
+    /// command: that command may be one of them.  Nor any while the exit
+    /// job runs: the plugins it starts are waited for by it.
     fn reap_strays(&mut self) {
         loop {
             let Some(pid) = sys::peek_zombie() else {
@@ -2403,7 +2404,8 @@ impl Monitor {
             };
             // A child somebody waits for through its pidfd is theirs.
             let known = self.init.as_ref().is_some_and(|i| i.pid == pid)
-                || self.execs.iter().any(|e| e.pid == pid || e.starting());
+                || self.execs.iter().any(|e| e.pid == pid || e.starting())
+                || self.settler.spawning();
             if known {
                 self.reap_pending = true;
                 return;
