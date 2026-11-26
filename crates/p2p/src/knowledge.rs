@@ -694,7 +694,18 @@ impl Inner {
         if l.peers.len() >= MAX_PEERS_PER_LAYER && !l.peers.contains_key(&peer) {
             l.peers.retain(|_, e| e.live(now));
             if l.peers.len() >= MAX_PEERS_PER_LAYER {
-                return;
+                // Misses must not crowd out a peer that serves the layer:
+                // the oldest of them makes room.
+                let Some(oldest) = l
+                    .peers
+                    .iter()
+                    .filter(|(_, e)| !e.served_live(now))
+                    .min_by_key(|(_, e)| e.missed)
+                    .map(|(p, _)| *p)
+                else {
+                    return;
+                };
+                l.peers.remove(&oldest);
             }
         }
         update(l.peers.entry(peer).or_insert(Entry {
@@ -985,5 +996,18 @@ mod tests {
         let inner = k.lock();
         assert!(inner.peers.len() <= MAX_PEERS);
         assert!(inner.layers[L].peers.len() <= MAX_PEERS_PER_LAYER);
+    }
+
+    #[test]
+    fn a_table_full_of_misses_takes_the_peer_that_serves() {
+        let k = Knowledge::default();
+        let t0 = Instant::now();
+        for i in 0..MAX_PEERS_PER_LAYER {
+            k.missed_at(Some(L), peer(), t0 + Duration::from_millis(i as u64));
+        }
+        let server = peer();
+        k.served_at(Some(L), server, Duration::from_millis(1), t0);
+        assert_eq!(k.providers_at(L, t0), vec![server]);
+        assert_eq!(k.lock().layers[L].peers.len(), MAX_PEERS_PER_LAYER);
     }
 }
