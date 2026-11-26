@@ -137,6 +137,19 @@ setup () { api_setup; }
     fi
 }
 
+@test "volume rename of a volume a container uses" {
+    id=$(pm create --pull never -v rnvol:/d "$IMG" true)
+    out=$(api -w '\n%{http_code}' -X POST "http://d/v5.0.0/libpod/volumes/rnvol/rename?newName=rnvol2")
+    check "rename of a volume in use" 409 "$(tail -n1 <<< "$out")"
+    check "the refusal names the container" 1 "$(grep -c "$id" <<< "$out")"
+    pm volume inspect rnvol > /dev/null
+    check "the volume is still there" 0 $?
+    pm rm -t 0 -f "$id" > /dev/null 2>&1
+    out=$(api -o /dev/null -w '%{http_code}' -X POST "http://d/v5.0.0/libpod/volumes/rnvol/rename?newName=rnvol2")
+    check "rename once the container is gone" 204 "$out"
+    pm volume rm rnvol2 > /dev/null
+}
+
 @test "a volume directory holds volume.json, which moves with a rename" {
     pm volume create --label k=v dirvol > /dev/null
     mp=$(pm volume inspect dirvol --format '{{.Mountpoint}}')

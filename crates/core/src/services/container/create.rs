@@ -377,6 +377,10 @@ impl ContainerService {
             None => None,
         };
 
+        // The volumes the mounts name stay as they are until the row is
+        // stored: a rename takes this lock exclusive, after it looks at the
+        // containers that use the volume.
+        let _volumes = self.volume_service.changing().await?;
         let gathered = self
             .gather_mounts(
                 &req,

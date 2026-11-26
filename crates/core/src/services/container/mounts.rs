@@ -209,6 +209,11 @@ impl ContainerService {
         image_volumes: &HashMap<String, serde_json::Value>,
         new_volumes: &mut Vec<String>,
     ) -> ContainerResult<Vec<MountConfig>> {
+        // (the API resolved these before the lock of the volumes was taken:
+        // a volume renamed or removed since is not found)
+        for name in req.mounts.iter().filter_map(|m| m.volume.as_ref()) {
+            self.volume_service.get(name).await?;
+        }
         let mut mounts = req.mounts.clone();
         let mut specs = Vec::new();
         for v in &req.volumes {

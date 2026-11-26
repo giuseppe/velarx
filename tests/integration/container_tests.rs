@@ -180,6 +180,7 @@ mod resource_conversion_tests {
 /// `img` is in the database.  The records `record` makes use that runtime.
 struct WithRuntime {
     containers: std::sync::Arc<velarx_core::services::ContainerService>,
+    volumes: std::sync::Arc<velarx_core::services::VolumeService>,
     asked: std::path::PathBuf,
     runtime: std::path::PathBuf,
 }
@@ -226,12 +227,13 @@ impl WithRuntime {
                 state_dir: tmp.join("state"),
                 cgroup_manager: None,
                 network_providers: Default::default(),
-                volume_service: volumes,
+                volume_service: volumes.clone(),
             })
             .unwrap(),
         );
         Self {
             containers,
+            volumes,
             asked,
             runtime,
         }
@@ -510,4 +512,108 @@ async fn test_the_alive_listing_has_the_running_and_the_paused() {
     assert_eq!(alive, ["paused", "running"]);
     // (the runtime is asked for those two only)
     assert_eq!(with.states_asked(), 2);
+}
+
+/// A request to create a container on the root file system `rootfs` that
+/// mounts `mount`, as the podman API makes it: the volume is resolved
+/// before the request.
+fn create_on_volume(
+    rootfs: &std::path::Path,
+    mount: velarx_core::services::MountConfig,
+) -> velarx_wire::request::CreateContainerRequest {
+    velarx_wire::request::CreateContainerRequest {
+        image: rootfs.display().to_string(),
+        rootfs: true,
+        mounts: vec![mount],
+        ..Default::default()
+    }
+}
+
+/// The volume `v` made, and the mount of it at `/x` that a request carries.
+async fn volume_mount(with: &WithRuntime) -> velarx_core::services::MountConfig {
+    volume_mount_as(with, "v:/x").await
+}
+
+/// The volume `v` made, and the mount `arg` of it that a request carries.
+async fn volume_mount_as(with: &WithRuntime, arg: &str) -> velarx_core::services::MountConfig {
+    use velarx_core::services::{MountSpec, VolumeDriver, VolumeState};
+    with.volumes
+        .create(
+            "v",
+            VolumeDriver::Local,
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    // (a volume that is used already: the create does not give it an owner,
+    // which a test that is not root of its user namespace could not do)
+    with.volumes
+        .set_state("v", &VolumeState::default())
+        .await
+        .unwrap();
+    with.volumes
+        .resolve_mount(MountSpec::parse_volume_arg(arg).unwrap())
+        .await
+        .unwrap()
+}
+
+/// A create holds the lock of the volumes, shared, until its row is
+/// stored: it waits for the holder of the lock, exclusive, and a rename
+/// that comes after it is refused.
+#[tokio::test]
+async fn test_a_create_holds_its_volumes_and_a_rename_is_refused() {
+    use velarx_core::services::VolumeError;
+
+    let e = super::common::env().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let with = WithRuntime::new(&e, tmp.path()).await;
+    let rootfs = tmp.path().join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    let mount = volume_mount(&with).await;
+    let lock = with.volumes.lock_path().to_path_buf();
+    let held = velarx_storage::StorageLock::exclusive(&lock).await.unwrap();
+    let creating = {
+        let containers = with.containers.clone();
+        let req = create_on_volume(&rootfs, mount);
+        tokio::spawn(async move { containers.create(req).await })
+    };
+    // (asleep in the lock, and so not ended while it is held)
+    super::common::wait_for_lock_waiter(&lock).await;
+    assert!(!creating.is_finished());
+    assert!(with.containers.list(true).await.unwrap().is_empty());
+    drop(held);
+    creating.await.unwrap().unwrap();
+    let err = with.volumes.rename("v", "w").await.unwrap_err();
+    assert!(matches!(err, VolumeError::InUse(_)), "{err:?}");
+}
+
+/// A request resolves its volumes before the create locks them, as the
+/// podman API does: a volume renamed in between is not found, and no
+/// container names it (an overlay volume as well, which is mounted from
+/// its directory and not looked up again by name).
+#[tokio::test]
+async fn test_a_volume_renamed_after_the_request_is_not_found() {
+    use velarx_core::services::{ContainerError, VolumeError};
+
+    let e = super::common::env().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let with = WithRuntime::new(&e, tmp.path()).await;
+    let rootfs = tmp.path().join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    for arg in ["v:/x", "v:/x:O"] {
+        let mount = volume_mount_as(&with, arg).await;
+        with.volumes.rename("v", "w").await.unwrap();
+        let err = with
+            .containers
+            .create(create_on_volume(&rootfs, mount))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ContainerError::Volume(VolumeError::NotFound(_))),
+            "{arg}: {err:?}"
+        );
+        assert!(with.containers.list(true).await.unwrap().is_empty());
+        with.volumes.remove("w", true).await.unwrap();
+    }
 }
