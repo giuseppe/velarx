@@ -1795,6 +1795,8 @@ pub struct NetworkMember {
     pub ipv4: String,
     /// Its IPv6 address, the same way
     pub ipv6: String,
+    /// The name of its interface on the network, empty as the MAC address
+    pub interface: String,
 }
 
 /// A network.
@@ -1970,7 +1972,7 @@ deserialize_members! {
         bundle, oci_config, resolv_conf, hostname, hosts, monitor_pid_file, pid_file, log,
         graph_driver, graph_data,
     }
-    NetworkMember { id, name, running, mac_address, ipv4, ipv6 }
+    NetworkMember { id, name, running, mac_address, ipv4, ipv6, interface }
     ManifestDescriptor { media_type, digest, size, artifact_type, annotations, data }
     ManifestInstance { media_type, digest, size, artifact_type, annotations, platform }
     ManifestListRecord {

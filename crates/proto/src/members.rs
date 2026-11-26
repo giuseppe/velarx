@@ -526,6 +526,7 @@ mod tests {
             mac_address: "m".into(),
             ipv4: "4".into(),
             ipv6: "6".into(),
+            interface: "e".into(),
         });
         // (a reply without the members that are empty)
         assert_eq!(

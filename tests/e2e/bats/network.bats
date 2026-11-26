@@ -298,6 +298,8 @@ nameserver 10.213.4.1" "$out"
     sh_ network connect optnet3 optc
     out=$(sh_ container exec optc sh -c 'for i in eth0 eth1 eth2; do ip -o -4 addr show $i; done' | awk '{print $2, $4}' | cut -d. -f1-3)
     check "the interfaces of the networks" "$(printf 'eth0 10.213.61\neth1 10.213.60\neth2 10.213.62')" "$out"
+    out=$(sh_ network inspect --format '{{range .Containers}}{{range $k, $v := .Interfaces}}{{$k}}{{end}}{{end}}' optnet1)
+    check "network inspect names the interface" "eth1" "$out"
     sh_ container rm -t 0 -f optc > /dev/null
     # one address of the command line cannot be on two networks
     out=$(run_ctr --network optnet1 --network optnet2 --ip 10.213.60.21 "$IMG" true)

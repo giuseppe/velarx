@@ -70,6 +70,8 @@ setup () { api_setup; }
     out=$(pm exec apiopt sh -c 'cat /sys/class/net/foo0/address; ip -o -4 addr show foo0; ip -o -4 addr show eth0' | awk 'NF == 1 {print; next} {print $2, $3, $4}')
     check "libpod: an address, a MAC address and an interface name for each network" \
         "$(printf '02:42:ac:11:00:98\nfoo0 inet 10.153.1.20/24\neth0 inet 10.153.2.30/24')" "$out"
+    out=$(api http://d/v5.0.0/libpod/networks/apinetopt1/json | jq -r '.containers[].interfaces | keys[]')
+    check "libpod network inspect: the interface of the container" foo0 "$out"
     pm rm -t 0 -f apiopt > /dev/null
     # Docker: the addresses of each endpoint
     code=$(api -o /dev/null -w '%{http_code}' -X POST -d '{"Image":"'"$IMG"'","Cmd":["top"],

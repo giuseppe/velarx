@@ -93,10 +93,9 @@ pub fn libpod_inspect(n: &NetworkRecord) -> Value {
                 }
             }
             let iface = json!({"subnets": subnets, "mac_address": m.mac_address});
-            (
-                m.id.clone(),
-                json!({"name": m.name, "interfaces": {"eth0": iface}}),
-            )
+            let mut ifaces = Map::new();
+            ifaces.insert(m.interface.clone(), iface);
+            (m.id.clone(), json!({"name": m.name, "interfaces": ifaces}))
         })
         .collect();
     o["containers"] = Value::Object(containers);
@@ -260,6 +259,7 @@ mod tests {
                 mac_address: "0a:01:73:78:43:18".into(),
                 ipv4: "10.151.0.2/24".into(),
                 ipv6: String::new(),
+                interface: "foo0".into(),
             },
             NetworkMember {
                 id: "off".into(),
@@ -270,9 +270,9 @@ mod tests {
         let j = libpod_inspect(&n);
         let c = &j["containers"]["cid"];
         assert_eq!(c["name"], "web");
-        assert_eq!(c["interfaces"]["eth0"]["mac_address"], "0a:01:73:78:43:18");
+        assert_eq!(c["interfaces"]["foo0"]["mac_address"], "0a:01:73:78:43:18");
         assert_eq!(
-            c["interfaces"]["eth0"]["subnets"],
+            c["interfaces"]["foo0"]["subnets"],
             json!([{"ipnet": "10.151.0.2/24", "gateway": "10.151.0.1"}])
         );
         assert!(j["containers"].get("off").is_none());
@@ -293,6 +293,7 @@ mod tests {
             mac_address: "0a:01:73:78:43:18".into(),
             ipv4: "10.151.0.2/24".into(),
             ipv6: String::new(),
+            interface: "eth0".into(),
         }];
         let j = docker(&n, None);
         assert_eq!(j["Containers"]["cid"]["IPv4Address"], "10.151.0.2/24");

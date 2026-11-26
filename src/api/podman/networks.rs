@@ -331,6 +331,7 @@ async fn members(state: &AppState, net: &Net) -> ApiResult<Vec<NetworkMember>> {
         let ifaces = state.network_service.engine().interfaces(&m.id).await?;
         if let Some(i) = ifaces.iter().find(|i| i.network_id == net.id) {
             m.mac_address = i.mac.clone();
+            m.interface = i.ifname.clone();
             m.ipv4 =
                 i.ip.map(|ip| format!("{ip}/{}", i.prefix))
                     .unwrap_or_default();

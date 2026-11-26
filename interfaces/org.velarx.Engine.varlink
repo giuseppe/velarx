@@ -121,7 +121,9 @@ type NetworkMember (
 	# Its IPv4 address, `ADDRESS/PREFIX`, empty when it has none
 	ipv4: string,
 	# Its IPv6 address, the same way
-	ipv6: string
+	ipv6: string,
+	# The name of its interface on the network, empty as the MAC address
+	interface: string
 )
 
 # A network.
