@@ -47,6 +47,10 @@ const EXEMPT: &[(&str, &str)] = &[
         "the command line, not this frontend, calls it",
     ),
     (
+        "ImagePulling",
+        "the command line, not this frontend, calls it",
+    ),
+    (
         "ImageComplete",
         "the command line, not this frontend, calls it",
     ),

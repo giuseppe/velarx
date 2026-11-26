@@ -156,6 +156,17 @@ lease_held () {
     check "inspect finds no image" yes "$([ $? != 0 ] && echo yes)"
     check_match "another command says it is being pulled" "is being pulled" "$(sh_ image push "$IMAGE" localhost:1/x:1 2>&1)"
     check_match "and so does tag" "is being pulled" "$(sh_ image tag "$IMAGE" localhost/x:1 2>&1)"
+    # --pull=never takes the pull by its tag, its short id and the digest
+    # of its manifest
+    local repo=${IMAGE%:*} digest name made
+    digest=$(curl -sfI -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+        "http://$E2E_REGISTRY/v2/${repo#*/}/manifests/${IMAGE##*:}" |
+        tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: //p')
+    for name in "$IMAGE" "$(sh_ image pulls -q)" "$repo@$digest"; do
+        made=$(sh_ container create --lazy --pull=never "$name" true 2>&1 | tail -1)
+        check_match "--pull=never takes the pull by $name" "^[0-9a-f]{64}$" "$made"
+        sh_ container rm "$made" > /dev/null 2>&1
+    done
     check "the staging has the layer, not the store" yes "$([ "$(staged_layers)" -gt 0 ] && echo yes)"
     check "the engine service holds the pull" held "$(lease_held)"
     check "the state names the service" "\"pid\":$DAEMON_PID" \

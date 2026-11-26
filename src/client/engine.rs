@@ -1521,6 +1521,12 @@ impl EngineClient {
         Ok(listed.pulls)
     }
 
+    /// Whether a pull in progress has the name or the id `image`.
+    pub fn image_pulling(&self, image: &str) -> ClientResult<bool> {
+        let answer = self.typed("ImagePulling", |conn| ask(conn.image_pulling(image)))?;
+        Ok(answer.pulling)
+    }
+
     /// Fetch what a lazily pulled image lacks and prove its layers.
     /// `access`: the credentials and certificates the layers that were
     /// pulled with such need again.

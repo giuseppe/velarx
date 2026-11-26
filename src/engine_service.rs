@@ -87,11 +87,11 @@ use velarx_proto::workload::{
     MountKind, NetworkCreated, NetworkDriver, NetworkInspected, NetworkListed, NetworkMember,
     NetworkRecord, NetworkRoute, NetworkSpec, NetworkSubnet, PodInspected, PodListed, PodLogLine,
     PodLogListed, PodMember, PodMetrics, PodMetricsListed, PodRecord, PodStatus, ProcessConfig,
-    ProcessUser, Pruned, PrunedImage, PullState, Pulled, PulledImage, PullsListed, Pushed,
-    PushedImage, PushedTag, Reclaimed, RegistryDigested, RemoteImage, Resources, RunState, Scopes,
-    SecretInspected, SecretListed, SecretRecord, StatsListed, StatsRecord, TransferProgress,
-    TransferStats, TransferStatus, Ulimit, VolumeInspected, VolumeListed, VolumeRecord, VolumeSpec,
-    VolumesPruned,
+    ProcessUser, Pruned, PrunedImage, PullState, Pulled, PulledImage, PullingAnswer, PullsListed,
+    Pushed, PushedImage, PushedTag, Reclaimed, RegistryDigested, RemoteImage, Resources, RunState,
+    Scopes, SecretInspected, SecretListed, SecretRecord, StatsListed, StatsRecord,
+    TransferProgress, TransferStats, TransferStatus, Ulimit, VolumeInspected, VolumeListed,
+    VolumeRecord, VolumeSpec, VolumesPruned,
 };
 use velarx_proto::{DIGEST, INLINE_MAX, PROTO};
 
@@ -4482,6 +4482,19 @@ mod service {
         async fn image_pulls(&self) -> Result<PullsListed, EngineError> {
             self.api(ErrorKind::Image, |state| async move {
                 podman::images::pull::pulls_of(&state).await
+            })
+            .await
+        }
+
+        /// Whether a pull in progress has the name or the id `name`.
+        async fn image_pulling(&self, name: String) -> Result<PullingAnswer, EngineError> {
+            use velarx_content::pull::staged::PullState;
+            self.api(ErrorKind::Image, |state| async move {
+                let entry = state.image_service.pulling(&name);
+                // (a cancelled pull is none: `image_pulls` does not list it)
+                Ok(PullingAnswer {
+                    pulling: entry.is_some_and(|e| e.state.state != PullState::Cancelled),
+                })
             })
             .await
         }

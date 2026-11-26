@@ -62,7 +62,7 @@ use crate::workload::{
     ImageHistoryListed, ImageInspected, ImageListed, ImagePruneListed, ImageRemoved,
     ImageTreeInspected, ImagesRemoved, ManifestListRecord, ManifestRemoved, MetricDescriptorListed,
     NetworkCreated, NetworkInspected, NetworkListed, NetworkSpec, PodInspected, PodListed,
-    PodLogListed, PodMetricsListed, Pruned, Pulled, PullsListed, Pushed, Reclaimed,
+    PodLogListed, PodMetricsListed, Pruned, Pulled, PullingAnswer, PullsListed, Pushed, Reclaimed,
     RegistryDigested, RemoteImage, Scopes, SecretInspected, SecretListed, StatsListed,
     VolumeInspected, VolumeListed, VolumeSpec, VolumesPruned,
 };
@@ -2735,6 +2735,12 @@ pub trait EngineProxy {
     /// The pulls in progress: images whose layers are not all in the store
     /// (`images` lists only complete ones).
     async fn image_pulls(&mut self) -> zlink::Result<Result<PullsListed, EngineError>>;
+
+    /// Whether a pull in progress has the name or the id `name`.
+    async fn image_pulling(
+        &mut self,
+        name: &str,
+    ) -> zlink::Result<Result<PullingAnswer, EngineError>>;
 
     /// Fetch what a lazily pulled image lacks and prove its layers; the
     /// credentials as `ImageSearch`'s.

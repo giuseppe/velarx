@@ -1211,6 +1211,13 @@ pub struct PullsListed {
     pub pulls: Vec<PullListed>,
 }
 
+/// `ImagePulling` answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "proxy", derive(zlink::introspect::Type))]
+pub struct PullingAnswer {
+    pub pulling: bool,
+}
+
 /// `ImageComplete` answers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "proxy", derive(zlink::introspect::Type))]

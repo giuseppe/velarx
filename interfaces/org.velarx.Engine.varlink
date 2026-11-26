@@ -3913,6 +3913,9 @@ method ImagePulls() -> (
 	)
 )
 
+# Whether a pull in progress has the name or the id `name`.
+method ImagePulling(name: string) -> (pulling: bool)
+
 # Fetch what a lazily pulled image lacks and prove its layers.
 # The credentials are one descriptor, the sealed memory file `access` names.
 method ImageComplete(name: string, access: ?int) -> (stats: TransferStats)
