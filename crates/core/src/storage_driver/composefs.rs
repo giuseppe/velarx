@@ -348,7 +348,7 @@ fn shared_answer(mounted: std::io::Result<bool>) -> std::io::Result<Option<bool>
 /// empty; a sync for each file cost more than making the images.
 struct Durable<'a> {
     store: &'a velarx_storage::FileStore,
-    files: Vec<(tempfile::TempPath, PathBuf)>,
+    files: Vec<(tempfile::TempPath, velarx_storage::TempLock, PathBuf)>,
     /// Whether the commit makes the files durable itself: not when a
     /// barrier of the caller does (the images of a pull are written between
     /// the link of its files and the barrier of the store; one that
@@ -390,7 +390,9 @@ impl<'a> Durable<'a> {
             .parent()
             .ok_or_else(|| std::io::Error::other("an image path without a directory"))?;
         std::fs::create_dir_all(dir)?;
-        let mut tmp = tempfile::Builder::new().prefix(".tmp").tempfile_in(dir)?;
+        // (locked until it has its name, which is how the check tells it
+        // from a leftover)
+        let (mut tmp, lock) = velarx_storage::create_locked(dir, ".tmp", 0o600)?;
         tmp.write_all(contents)?;
         // (closed for writing, and writable by its owner: what enabling
         // fs-verity needs)
@@ -404,7 +406,7 @@ impl<'a> Durable<'a> {
                 .map_err(|e| std::io::Error::other(format!("{}: {e}", path.display())))?;
         }
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444))?;
-        self.files.push((tmp, path.to_path_buf()));
+        self.files.push((tmp, lock, path.to_path_buf()));
         Ok(())
     }
 
@@ -413,7 +415,7 @@ impl<'a> Durable<'a> {
         let Some(dir) = self
             .files
             .first()
-            .and_then(|(_, p)| p.parent())
+            .and_then(|(_, _, p)| p.parent())
             .map(Path::to_path_buf)
         else {
             return Ok(());
@@ -422,7 +424,7 @@ impl<'a> Durable<'a> {
             self.store.barrier(&dir)?;
         }
         let mut dirs = std::collections::BTreeSet::new();
-        for (tmp, path) in self.files {
+        for (tmp, _lock, path) in self.files {
             // (an image of a layer that is recorded already is never replaced
             // by bytes that are not on the disk: a crash after the rename
             // and before the barrier would tear what its row names.  A new
