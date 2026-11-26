@@ -617,6 +617,8 @@ mod tests {
         }
         let mut config = Config::default();
         config.server.socket = dir.join("velarx.sock");
+        // (the fetcher makes the staging of its store)
+        config.storage.root = tmp.path().join("store");
         let one = shared_registry(&config).unwrap();
         assert!(one.socket().as_os_str().len() > 107);
         assert!(one.socket().starts_with(config.services_dir()));

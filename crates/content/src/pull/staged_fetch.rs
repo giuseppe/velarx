@@ -590,6 +590,8 @@ impl StagedFetch {
             );
         let mut found: Vec<(Probed, Option<(Vec<u8>, Vec<u8>)>)> = Vec::new();
         let mut left: Vec<u32> = at.to_vec();
+        // (the layers the origin said it has no table of contents for)
+        let mut told_by_origin: Vec<u32> = Vec::new();
         let breaker = Breaker::new(self.fetchers.len());
         for (fetcher_at, fetcher) in self.fetchers.iter().enumerate() {
             if !breaker.usable(fetcher_at) || self.unwilling(fetcher_at) {
@@ -627,8 +629,15 @@ impl StagedFetch {
             };
             for (reply, metadata) in answered {
                 // (the last word on a layer is the best one heard: a
-                // fetcher that cannot reach it leaves it to the next)
+                // fetcher that cannot reach it leaves it to the next; the
+                // reason the origin gives, who knows the blob, stays)
                 if reply.toc == TocSource::None {
+                    if told_by_origin.contains(&reply.layer) {
+                        continue;
+                    }
+                    if self.origin == Some(fetcher_at) {
+                        told_by_origin.push(reply.layer);
+                    }
                     found.retain(|(r, _)| r.layer != reply.layer);
                     found.push((reply, None));
                     continue;
@@ -1984,6 +1993,8 @@ mod tests {
     struct Probes {
         has: Vec<u32>,
         refuse: bool,
+        /// What it says of the layers it has not
+        reason: NotLazy,
     }
 
     #[async_trait]
@@ -2020,7 +2031,7 @@ mod tests {
                         TocSource::None
                     },
                     on_demand: has,
-                    reason: (!has).then_some(NotLazy::Unreachable),
+                    reason: (!has).then_some(self.reason),
                     toc_file: None,
                     tarsplit_file: None,
                 };
@@ -2049,9 +2060,14 @@ mod tests {
     }
 
     fn local(has: &[u32], refuse: bool) -> LocalFetcher {
+        local_saying(has, refuse, NotLazy::Unreachable)
+    }
+
+    fn local_saying(has: &[u32], refuse: bool, reason: NotLazy) -> LocalFetcher {
         let api = Arc::new(Probes {
             has: has.to_vec(),
             refuse,
+            reason,
         });
         LocalFetcher::start(api, Limits::default()).unwrap()
     }
@@ -2108,6 +2124,37 @@ mod tests {
                 (3, TocSource::None)
             ]
         );
+    }
+
+    /// The reason of the origin for a layer that is not lazy is the one
+    /// told, not that of a source listed after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reason_of_the_origin_for_a_layer_stays() {
+        let peers = local(&[], false);
+        let registry = local_saying(&[], false, NotLazy::NoToc);
+        let cache = local(&[], false);
+        let link = |name: &str, f: &LocalFetcher| Link {
+            name: name.to_string(),
+            conn: FetchConn::new(f.connect().unwrap()).unwrap(),
+            idle: REGISTRY_IDLE,
+        };
+        let staging = tempfile::tempdir().unwrap();
+        let staged = StagedFetch::open(
+            (
+                vec![link("peers", &peers)],
+                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                vec![link("cache", &cache)],
+            ),
+            staging.path(),
+            false,
+            ("localhost/a", true),
+            Some(b"{}"),
+            &manifest(),
+        )
+        .await
+        .unwrap();
+        let got = staged.probe_all(&[0], false, Parts::All).await.unwrap();
+        assert_eq!(got[0].0.reason, Some(NotLazy::NoToc));
     }
 
     /// A fetcher that carries the table of contents and the tar-split of

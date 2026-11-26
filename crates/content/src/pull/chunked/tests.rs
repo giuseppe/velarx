@@ -1900,6 +1900,10 @@ fn a_full_disk_is_no_fault_of_the_index() {
         FailureClass::NoSpace,
         "full"
     )));
+    // (an I/O error the system did not give is of the bytes read)
+    assert!(!of_this_end(&ImageError::Io(
+        io::ErrorKind::UnexpectedEof.into()
+    )));
     assert!(!of_this_end(&ImageError::Contradicted("wrong".into())));
     assert!(!of_this_end(&ImageError::DigestMismatch {
         expected: "a".into(),

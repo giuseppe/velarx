@@ -2213,10 +2213,12 @@ async fn replay_claim(
 }
 
 /// Whether `e` is a failure of this end (its disk, its store), not of what
-/// the sources sent.
+/// the sources sent: an I/O error is this end's when the system gave an
+/// errno, as for [`io_fail`].
 fn of_this_end(e: &ImageError) -> bool {
     match e {
-        ImageError::Io(_) | ImageError::Storage(_) | ImageError::Database(_) => true,
+        ImageError::Io(e) => e.raw_os_error().is_some(),
+        ImageError::Storage(_) | ImageError::Database(_) => true,
         ImageError::Transfer { failure, .. } => failure.class == FailureClass::NoSpace,
         _ => false,
     }
