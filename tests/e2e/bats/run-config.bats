@@ -347,8 +347,8 @@ by-precreate" "$out"
 # An image whose /etc is a link: the runtime makes the bind mounts of /etc/hosts
 # and /etc/hostname at /var/etc, and has to tell CRIU of them there.  The spec
 # carries the destinations as given; resolving them for CRIU is the runtime's
-# job, and crun's (1.30 and its main branch) does not: CRIU says "doesn't have
-# a proper root mount".  The checkpoint fails.
+# job (crun 1.30 did not, and CRIU refused the checkpoint: "doesn't have a
+# proper root mount"; crun 1.31 does).
 @test "checkpoint and restore of an image whose /etc is a link" {
     skip_unless_criu
     mkdir "$WORKDIR/etclink" "$WORKDIR/etcbind"
@@ -356,13 +356,17 @@ by-precreate" "$out"
     printf 'FROM %s\nRUN mkdir -p /var && mv /etc /var/etc && ln -s /var/etc /etc\n' "$IMAGE" > "$WORKDIR/etclink/Dockerfile"
     sh_ build --tls-verify=false -t localhost/e2e-etclink:1 "$WORKDIR/etclink" > "$WORKDIR/etclink.log" 2>&1
     check "the image is built" 0 $?
-    sh_ container run -d --name cpl --network none -v "$WORKDIR/etcbind:/etc/bound" \
+    sh_ container run -d --name cpl --network none -v "$WORKDIR/etcbind:/etc/bound:z" \
         localhost/e2e-etclink:1 sh -c 'while :; do sleep 0.2; done' > /dev/null
     check "/etc is a link" "/var/etc" "$(sh_ container exec cpl readlink /etc)"
     check "inspect shows the destination given" "/etc/bound" \
         "$(sh_ container inspect --format '{{range .Mounts}}{{.Destination}}{{end}}' cpl)"
-    out=$(sh_ container checkpoint cpl 2>&1)
-    check_match "checkpoint fails in CRIU" "proper root mount" "$out"
+    sh_ container checkpoint cpl > /dev/null
+    check "the checkpoint" 0 $?
+    sh_ container restore cpl > /dev/null
+    check "the restore" 0 $?
+    check "the bind mount below the link after the restore" bound \
+        "$(sh_ container exec cpl cat /etc/bound/f)"
     sh_ container rm -t 0 -f cpl > /dev/null
     sh_ image rm -f localhost/e2e-etclink:1 > /dev/null
 }
