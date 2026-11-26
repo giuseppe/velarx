@@ -1455,6 +1455,11 @@ pub async fn side() -> Side {
 /// A service with its own store and, if given, the registries.conf `conf`
 /// (its client's and its registry fetcher's).
 pub async fn side_with(conf: Option<&str>) -> Side {
+    side_with_pull(conf, |_| {}).await
+}
+
+/// [`side_with`] with `edit` of the `[pull]` settings.
+pub async fn side_with_pull(conf: Option<&str>, edit: impl FnOnce(&mut PullConfig)) -> Side {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::open_in_memory()
         .await
@@ -1470,11 +1475,12 @@ pub async fn side_with(conf: Option<&str>) -> Side {
         velarx_storage::VerityMode::Off,
     )
     .unwrap();
-    let pull = PullConfig {
+    let mut pull = PullConfig {
         worker_path: Some(registry_bin().into()),
         registry_hints: false,
         ..PullConfig::default()
     };
+    edit(&mut pull);
     let origin = origin_for(tmp.path(), conf.unwrap_or_default(), &pull);
     let service = service.with_pull_config(pull).unwrap().with_origin(origin);
     let service = match conf {

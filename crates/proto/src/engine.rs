@@ -783,9 +783,10 @@ pub struct PlatformSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, introspect::CustomType)]
 pub struct PullSpec {
     /// A docker reference, `oci:DIR[:REF]`, `oci-archive:FILE[:REF]`,
-    /// `docker-archive:FILE[:REF]`, `dir:DIR`, `archive:FILE` (a load: every
-    /// image of an archive of either kind) or `SCHEME://...` of a
-    /// `[[transports]]`
+    /// `docker-archive:FILE[:REF]`, `dir:DIR`, `rootfs:DIR` (a root file
+    /// system), `docker-daemon:IMAGE` (read from the socket of `[pull]
+    /// docker_socket`), `archive:FILE` (a load: every image of an archive of
+    /// either kind) or `SCHEME://...` of a `[[transports]]`
     pub source: String,
     /// The path of `source` as a descriptor the client opened (a file, a
     /// directory, or the read end of a pipe of frames, which the engine

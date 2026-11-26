@@ -443,7 +443,9 @@ async fn pull_origin_of(
         }
         None => {
             if let Origin::Path { path, scheme, .. } = origin {
-                local_path(path, scheme.is_directory())?;
+                if scheme.is_path() {
+                    local_path(path, scheme.is_directory())?;
+                }
             }
             None
         }

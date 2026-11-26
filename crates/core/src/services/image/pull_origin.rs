@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Pulls from an origin that is no registry: a path (`oci:`, `dir:`,
-//! `oci-archive:`, `docker-archive:`, `archive:`), the origin `velarx-dir
-//! --origin`, or a transport of `[[transports]]`.  It is a pull like the
+//! `oci-archive:`, `docker-archive:`, `archive:`, `rootfs:`) or the socket of
+//! a Docker daemon (`docker-daemon:`), the origin `velarx-dir --origin`, or
+//! a transport of `[[transports]]`.  It is a pull like the
 //! others: the engine asks the origin for the index of what it has, the
 //! manifests and the configurations, checks every digest, and its layers are
 //! unpacked by the fetchers into the staging and replayed against the diff
@@ -189,6 +190,23 @@ impl ImageService {
             Origin::Path { path, scheme, .. } => {
                 let fd = match target {
                     Some(fd) => fd,
+                    None if !scheme.is_path() => {
+                        let socket = self.pull_config.docker_socket.clone();
+                        tokio::task::spawn_blocking(move || {
+                            std::os::unix::net::UnixStream::connect(&socket).map_err(|e| {
+                                ImageError::Io(std::io::Error::new(
+                                    e.kind(),
+                                    format!(
+                                        "cannot connect to the Docker daemon at `{}`: {e}",
+                                        socket.display()
+                                    ),
+                                ))
+                            })
+                        })
+                        .await
+                        .map_err(|e| ImageError::Layer(e.to_string()))??
+                        .into()
+                    }
                     None => {
                         let (path, directory) = (path.clone(), scheme.is_directory());
                         tokio::task::spawn_blocking(move || {

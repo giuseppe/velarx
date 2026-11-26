@@ -86,6 +86,15 @@ async fn pull_from(
     source: &str,
     target: impl Into<std::os::fd::OwnedFd>,
 ) -> velarx_types::ImageResult<Vec<velarx_core::services::LoadedImage>> {
+    pull_origin_of(service, source, Some(target.into())).await
+}
+
+/// A pull of `source` from `target`, or from where the engine opens it.
+async fn pull_origin_of(
+    service: &ImageService,
+    source: &str,
+    target: Option<std::os::fd::OwnedFd>,
+) -> velarx_types::ImageResult<Vec<velarx_core::services::LoadedImage>> {
     let origin = velarx_content::origin::Origin::parse(source).unwrap();
     // (the progress is told to nobody: a channel nobody reads is read
     // here)
@@ -94,7 +103,7 @@ async fn pull_from(
     let loaded = service
         .pull_origin(
             &origin,
-            Some(target.into()),
+            target,
             &velarx_core::services::PullOptions::default(),
             tx,
         )
@@ -758,6 +767,170 @@ async fn test_a_layout_directory_and_a_dir_are_pulled_by_their_scheme() {
         .unwrap();
     assert_eq!(loaded.len(), 1);
     assert!(loaded[0].names.is_empty());
+}
+
+/// A root file system in a directory is the one layer of an image, which is
+/// the same image whenever and wherever it is made: its files are in the
+/// store, and the layer is the tar of the directory.
+#[tokio::test]
+async fn test_a_root_file_system_directory_is_an_image_of_one_layer() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let at = |name: &str| root.path().join(name);
+    std::fs::create_dir_all(at("etc")).unwrap();
+    std::fs::create_dir_all(at("empty/dir")).unwrap();
+    std::fs::write(at("etc/hello"), b"hello\n").unwrap();
+    std::fs::write(at("etc/script"), b"exec data\n").unwrap();
+    std::fs::set_permissions(at("etc/script"), std::fs::Permissions::from_mode(0o751)).unwrap();
+    std::fs::hard_link(at("etc/hello"), at("etc/again")).unwrap();
+    std::os::unix::fs::symlink("hello", at("etc/link")).unwrap();
+    let open = |p: &std::path::Path| std::fs::File::open(p).unwrap();
+
+    let a = side().await;
+    let loaded = pull_from(&a.service, "rootfs:/x", open(root.path()))
+        .await
+        .unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert!(loaded[0].names.is_empty());
+    let image = a.service.get(&loaded[0].id).await.unwrap();
+    let manifest: velarx_types::OciManifest = serde_json::from_str(&image.manifest).unwrap();
+    assert_eq!(manifest.layers.len(), 1);
+    let config: serde_json::Value = serde_json::from_str(&image.config).unwrap();
+    assert_eq!(config["os"], "linux");
+    let layers = a.db.get_image_layers(&loaded[0].id).await.unwrap();
+    assert_eq!(layers.len(), 1);
+    // the diff id is the digest of the tar of the directory, which has each
+    // of its entries
+    let diff = layers[0].diff_id.unwrap();
+    assert_eq!(config["rootfs"]["diff_ids"], serde_json::json!([diff]));
+    assert!(a.store.contains(&vid(b"hello\n")));
+    assert!(a.store.contains(&vid(b"exec data\n")));
+
+    // the same directory is the same image, in another store and again in
+    // the same one
+    let b = side().await;
+    let again = pull_from(&b.service, "rootfs:/x", open(root.path()))
+        .await
+        .unwrap();
+    assert_eq!(again[0].id, loaded[0].id);
+    let stored = b.service.get(&again[0].id).await.unwrap();
+    assert_eq!(stored.manifest_digest, image.manifest_digest);
+    assert_eq!(stored.config, image.config);
+    let twice = pull_from(&b.service, "rootfs:/x", open(root.path()))
+        .await
+        .unwrap();
+    assert_eq!(twice[0].id, loaded[0].id);
+    assert_eq!(b.db.list_images().await.unwrap().len(), 1);
+
+    // another directory is another image; a file is no root file system
+    std::fs::write(at("etc/hello"), b"hello!\n").unwrap();
+    let other = pull_from(&b.service, "rootfs:/x", open(root.path()))
+        .await
+        .unwrap();
+    assert_ne!(other[0].id, loaded[0].id);
+    let e = pull_from(&b.service, "rootfs:/x", spooled(b"x"))
+        .await
+        .unwrap_err();
+    assert!(party_of(&e).is_some(), "{e}");
+}
+
+/// A Docker daemon on a socket, as far as `docker save` goes: it answers
+/// `GET /images/NAME/get` of `images` with the archive, in chunks, and an
+/// image it has not with a 404.  It serves `connections` connections and
+/// gives the request lines it got.
+fn fake_daemon(
+    socket: &std::path::Path,
+    images: Vec<(&'static str, Vec<u8>)>,
+    connections: usize,
+) -> std::thread::JoinHandle<Vec<String>> {
+    use std::io::BufRead;
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..connections {
+            let (conn, _) = listener.accept().unwrap();
+            let mut from = std::io::BufReader::new(&conn);
+            let mut request = String::new();
+            from.read_line(&mut request).unwrap();
+            loop {
+                let mut line = String::new();
+                from.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let name = request
+                .split_whitespace()
+                .nth(1)
+                .and_then(|p| p.strip_prefix("/images/")?.strip_suffix("/get"))
+                .unwrap_or_default()
+                .to_string();
+            let mut to = &conn;
+            match images.iter().find(|(n, _)| *n == name) {
+                Some((_, archive)) => {
+                    to.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+                    for chunk in archive.chunks(30_000) {
+                        write!(to, "{:x}\r\n", chunk.len()).unwrap();
+                        to.write_all(chunk).unwrap();
+                        to.write_all(b"\r\n").unwrap();
+                    }
+                    to.write_all(b"0\r\n\r\n").unwrap();
+                }
+                None => {
+                    let body = format!("{{\"message\":\"No such image: {name}\"}}\n");
+                    write!(
+                        to,
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            }
+            requests.push(request.trim_end().to_string());
+        }
+        requests
+    })
+}
+
+/// The image a Docker daemon saves is pulled over the connection the engine
+/// makes to the socket of `[pull] docker_socket`: the same layers as the
+/// image the daemon saved, named as the archive names it; an image the
+/// daemon has not is its message.
+#[tokio::test]
+async fn test_an_image_of_a_docker_daemon_is_pulled_from_its_socket() {
+    let a = source().await;
+    let name = format!("{}/test:latest", a.host);
+    let archive = docker_archive(&save(&a.service, &[&name]).await);
+    let run = tempfile::tempdir().unwrap();
+    let socket = run.path().join("docker.sock");
+    let daemon = fake_daemon(&socket, vec![("localhost/docker:v1", archive)], 2);
+
+    let b = side_with_pull(None, |pull| pull.docker_socket = socket.clone()).await;
+    let loaded = pull_origin_of(&b.service, "docker-daemon:localhost/docker:v1", None)
+        .await
+        .unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].names, ["localhost/docker:v1"]);
+    same_layers(&a, &b, &name, "localhost/docker:v1").await;
+    let e = pull_origin_of(&b.service, "docker-daemon:nope:1", None)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("No such image: nope:1"), "{e}");
+    assert_eq!(
+        daemon.join().unwrap(),
+        [
+            "GET /images/localhost/docker:v1/get HTTP/1.1",
+            "GET /images/nope:1/get HTTP/1.1"
+        ]
+    );
+    // no daemon there: the engine says where it looked (the socket goes
+    // too: a child another test forks may still hold the listener until it
+    // execs, and a connection to it would be cut instead of refused)
+    std::fs::remove_file(&socket).unwrap();
+    let e = pull_origin_of(&b.service, "docker-daemon:localhost/docker:v1", None)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("docker.sock"), "{e}");
 }
 
 #[tokio::test]

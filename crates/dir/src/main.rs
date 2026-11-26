@@ -244,7 +244,7 @@ fn serve_origin(
         // (the test hook: the origin of the scheme is the descriptor 5)
         let scheme = PathScheme::of(scheme.trim_end_matches(':')).ok_or_else(|| {
             anyhow::anyhow!(
-                "--self-test needs a scheme: oci, dir, oci-archive, docker-archive or archive"
+                "--self-test needs a scheme: oci, dir, oci-archive, docker-archive, docker-daemon, rootfs or archive"
             )
         })?;
         let target = adopt("target", Some(5))?;

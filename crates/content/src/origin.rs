@@ -7,6 +7,9 @@
 //! * `oci:DIR[:REF]`, `oci-archive:FILE[:REF]`, `docker-archive:FILE[:REF]`,
 //!   `dir:DIR` and `archive:FILE` (a load: every image of an archive of
 //!   either kind): `velarx-dir` as the origin of a path;
+//! * `rootfs:DIR` (a root file system, the one layer of an image) and
+//!   `docker-daemon:IMAGE` (the archive of `docker save`, read from the
+//!   socket of the daemon the engine connects to): `velarx-dir` as well;
 //! * `SCHEME://...` of a `[[transports]]`: the transport process on its
 //!   socket.
 
@@ -28,6 +31,11 @@ pub enum PathScheme {
     DockerArchive,
     /// `archive:FILE`: a load, either kind, every image
     Archive,
+    /// `rootfs:DIR`: a directory that is the one layer of an image
+    Rootfs,
+    /// `docker-daemon:IMAGE`: the archive a Docker daemon saves, read from
+    /// the connection to its socket
+    DockerDaemon,
 }
 
 impl PathScheme {
@@ -39,6 +47,8 @@ impl PathScheme {
             PathScheme::OciArchive => "oci-archive",
             PathScheme::DockerArchive => "docker-archive",
             PathScheme::Archive => "archive",
+            PathScheme::Rootfs => "rootfs",
+            PathScheme::DockerDaemon => "docker-daemon",
         }
     }
 
@@ -49,13 +59,21 @@ impl PathScheme {
             "oci-archive" => PathScheme::OciArchive,
             "docker-archive" => PathScheme::DockerArchive,
             "archive" => PathScheme::Archive,
+            "rootfs" => PathScheme::Rootfs,
+            "docker-daemon" => PathScheme::DockerDaemon,
             _ => return None,
         })
     }
 
     /// A directory (a layout), not a file.
     pub fn is_directory(self) -> bool {
-        matches!(self, PathScheme::Oci | PathScheme::Dir)
+        matches!(self, PathScheme::Oci | PathScheme::Dir | PathScheme::Rootfs)
+    }
+
+    /// A path of this host, which the client opens or the engine opens for
+    /// it (the origin of a daemon is the connection to its socket).
+    pub fn is_path(self) -> bool {
+        self != PathScheme::DockerDaemon
     }
 }
 
@@ -67,7 +85,8 @@ pub enum Origin {
     /// A path of this host: the client opens it and hands the descriptor
     /// (`source_fd`); the engine opens `path` for a call that has none
     /// (podman's local routes).  `selector`: the image of it (`:REF` or
-    /// `:@N`)
+    /// `:@N`; for a daemon the image it saves).  A daemon has no path: the
+    /// engine connects to the socket of `[pull] docker_socket`
     Path {
         scheme: PathScheme,
         path: PathBuf,
@@ -122,6 +141,16 @@ impl Origin {
                 scheme: PathScheme::Dir,
                 path: path.into(),
                 selector: None,
+            },
+            ImageLocation::Rootfs { path } => Origin::Path {
+                scheme: PathScheme::Rootfs,
+                path: path.into(),
+                selector: None,
+            },
+            ImageLocation::DockerDaemon { reference } => Origin::Path {
+                scheme: PathScheme::DockerDaemon,
+                path: PathBuf::new(),
+                selector: Some(reference),
             },
             ImageLocation::Storage(_) => {
                 return Err(TransportError::NotHere {
@@ -217,6 +246,14 @@ mod tests {
         assert_eq!(
             Origin::parse("archive:/x.tar").unwrap(),
             path(PathScheme::Archive, "/x.tar", None)
+        );
+        assert_eq!(
+            Origin::parse("rootfs:/srv/root").unwrap(),
+            path(PathScheme::Rootfs, "/srv/root", None)
+        );
+        assert_eq!(
+            Origin::parse("docker-daemon:alpine:3").unwrap(),
+            path(PathScheme::DockerDaemon, "", Some("alpine:3"))
         );
         assert_eq!(
             Origin::parse("s3://bucket/x:1").unwrap(),

@@ -217,17 +217,15 @@ fn test_the_directory_pusher_tries_its_confinement_from_inside() {
 /// port, no UNIX socket by name.
 #[test]
 fn test_the_origin_of_a_path_tries_its_confinement_from_inside() {
-    for scheme in ["oci:", "oci-archive:"] {
+    // (what a daemon is handed is a connection, a file here: it is read)
+    for scheme in ["oci:", "oci-archive:", "rootfs:", "docker-daemon:"] {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("staging")).unwrap();
         std::fs::create_dir(dir.path().join("layout")).unwrap();
         std::fs::write(dir.path().join("layout/index.json"), b"{}").unwrap();
         std::fs::write(dir.path().join("archive"), b"x").unwrap();
-        let target = if scheme == "oci:" {
-            "layout"
-        } else {
-            "archive"
-        };
+        let is_directory = matches!(scheme, "oci:" | "rootfs:");
+        let target = if is_directory { "layout" } else { "archive" };
         let script = format!(
             "exec \"$0\" --origin --staging-fd 6 --self-test {scheme} 5<\"$1/{target}\" 6<\"$1/staging\""
         );
@@ -255,7 +253,7 @@ fn test_the_origin_of_a_path_tries_its_confinement_from_inside() {
             "connects to no UNIX socket by name",
             "opens no file outside its origin",
             "writes nothing in its origin",
-            if scheme == "oci:" {
+            if is_directory {
                 "reads the directory it was handed"
             } else {
                 "reads the file it was handed"

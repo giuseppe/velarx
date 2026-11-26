@@ -135,7 +135,9 @@ fn select(
 ) -> Result<Vec<ArchiveImage>, FetcherError> {
     let what = format!("{}:{}", scheme.name(), selector.unwrap_or(""));
     match scheme {
-        PathScheme::Archive | PathScheme::Dir => Ok(images),
+        PathScheme::Archive | PathScheme::Dir | PathScheme::Rootfs | PathScheme::DockerDaemon => {
+            Ok(images)
+        }
         PathScheme::Oci | PathScheme::OciArchive => {
             let chosen: Vec<usize> = (0..images.len())
                 .filter(|&i| {
@@ -288,6 +290,15 @@ fn read_origin(
     staging: &File,
     (ratio, floor, max): (u64, u64, u64),
 ) -> Result<Read_, FetcherError> {
+    let target = if scheme == PathScheme::DockerDaemon {
+        // (the archive the daemon saves is spooled, a tar to index as any)
+        let spool = crate::pull::unnamed::unnamed_file_at(staging).map_err(read_error)?;
+        crate::docker_daemon::save(target, selector.unwrap_or_default(), &spool, max)
+            .map_err(read_error)?;
+        spool
+    } else {
+        target
+    };
     let meta = target
         .metadata()
         .map_err(|e| FetcherError::failed(e.to_string()))?;
@@ -305,31 +316,43 @@ fn read_origin(
             ),
         });
     }
-    let archive = if meta.is_dir() {
-        Archive::tree(target)
+    let (archive, images) = if scheme == PathScheme::Rootfs {
+        let (archive, image) = crate::rootfs::image(&target, staging).map_err(read_error)?;
+        (archive, vec![image])
     } else {
-        Archive::open(target, staging, |size| {
-            crate::pull::inflate_limit(i64::try_from(size).unwrap_or(i64::MAX), ratio, floor, max)
-        })
-    }
-    .map_err(read_error)?;
-    let images = if scheme == PathScheme::Dir {
-        vec![archive.dir_image().map_err(read_error)?]
-    } else {
-        archive.images().map_err(|e| {
-            // (a docker-archive read as an OCI one, and the other way round,
-            // is said so)
-            let message = e.to_string();
-            if e.kind() == std::io::ErrorKind::InvalidData && message.contains("no index.json") {
-                if archive.find("manifest.json").is_some() {
-                    return FetcherError::NotSupported {
-                        feature: velarx_types::docker::archive_refusal(),
-                    };
+        let archive = if meta.is_dir() {
+            Archive::tree(target)
+        } else {
+            Archive::open(target, staging, |size| {
+                crate::pull::inflate_limit(
+                    i64::try_from(size).unwrap_or(i64::MAX),
+                    ratio,
+                    floor,
+                    max,
+                )
+            })
+        }
+        .map_err(read_error)?;
+        let images = if scheme == PathScheme::Dir {
+            vec![archive.dir_image().map_err(read_error)?]
+        } else {
+            archive.images().map_err(|e| {
+                // (a docker-archive read as an OCI one, and the other way
+                // round, is said so)
+                let message = e.to_string();
+                if e.kind() == std::io::ErrorKind::InvalidData && message.contains("no index.json")
+                {
+                    if archive.find("manifest.json").is_some() {
+                        return FetcherError::NotSupported {
+                            feature: velarx_types::docker::archive_refusal(),
+                        };
+                    }
+                    return invalid("no index.json: this is no OCI archive");
                 }
-                return invalid("no index.json: this is no OCI archive");
-            }
-            read_error(e)
-        })?
+                read_error(e)
+            })?
+        };
+        (archive, images)
     };
     let images = select(images, scheme, selector)?;
     let mut manifests = HashMap::new();

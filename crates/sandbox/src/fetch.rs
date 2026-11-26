@@ -441,6 +441,11 @@ fn serving(allow: Allow, role: Role) -> Result<Allow, String> {
         Role::Front => allow.calls(&[libc::SYS_renameat, libc::SYS_renameat2, libc::SYS_accept4]),
         // (the index of a layout is replaced whole)
         Role::DirPush => allow.calls(&[libc::SYS_renameat, libc::SYS_renameat2]),
+        // (the attributes of the files of a root file system it makes a
+        // layer of, by their /proc/self/fd path: an O_PATH descriptor has
+        // no f*xattr.  Landlock does not cover reading attributes, so the
+        // process can read those of any path it names, as it can stat it)
+        Role::Dir => allow.calls(&[libc::SYS_llistxattr, libc::SYS_lgetxattr]),
         _ => allow,
     };
     #[cfg(target_arch = "x86_64")]

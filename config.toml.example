@@ -348,6 +348,8 @@ pids_max = 128
 require_cgroup = false
 # An archive given to `load` that inflates to more than this is refused
 max_archive_gib = 256
+# The socket of the Docker daemon that `pull docker-daemon:IMAGE` reads
+docker_socket = "/var/run/docker.sock"
 # Signature policy, in the format of containers-policy.json(5) (default: the first
 # of ~/.config/velarx/policy.json (rootless only), /etc/velarx/policy.json;
 # without either file the built-in default accepts every image and verifies

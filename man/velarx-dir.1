@@ -87,7 +87,8 @@ as the origin of a pull whose source is a path (\fBoci:DIR[:REF]\fR,
 \fBoci\-archive:FILE[:REF]\fR, \fBdocker\-archive:FILE[:REF]\fR,
 \fBdir:DIR\fR, or \fBarchive:FILE\fR of
 .BR "velarx load" ),
-one process for each pull.  The
+of a root file system (\fBrootfs:DIR\fR) or of a Docker daemon
+(\fBdocker\-daemon:IMAGE\fR), one process for each pull.  The
 .I source
 of
 .B Open
@@ -105,6 +106,26 @@ takes (\fBGetManifest("")\fR), their manifests and blobs, and
 of every layer.  What it says is a claim: the engine checks the digests of
 the manifests and the configurations, and replays the layers against the
 diff ids.
+.PP
+For \fBrootfs:\fR the
+.I target
+is the directory: its files, read beneath it, are written as the tar of one
+layer, which with a configuration that has no time in it is an image that
+is the same whenever the directory is the same.  The files keep the owners,
+modes, times and attributes (not the SELinux label) they have, as the
+engine's user namespace sees them (a file of an id it does not map is
+owned by the overflow id).  For
+\fBdocker\-daemon:\fR the selector is the image to save and the
+.I target
+is the connection that the engine made to the socket of
+.B [pull] docker_socket
+(see
+.BR velarx.conf (5)):
+the process opens no socket of its own, it asks
+.B GET /images/IMAGE/get
+on that connection and reads the archive as it reads a
+\fBdocker\-archive:\fR,
+whose names its images keep (none for an image saved by its ID).
 .SH PUSH MODE
 With
 .B \-\-push

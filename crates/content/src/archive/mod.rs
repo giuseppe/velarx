@@ -48,8 +48,8 @@ pub const MAX_METADATA: u64 = 4 * 1024 * 1024;
 pub const LAYER: &str = "application/vnd.oci.image.layer.v1.tar";
 const LAYER_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 const LAYER_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
-const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
-const OCI_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
+pub(crate) const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+pub(crate) const OCI_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
 
 fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
@@ -399,16 +399,27 @@ impl Archive {
 
     /// An archive of one file: the blob `digest` is the content of `file`.
     pub fn single(file: File, digest: Digest, size: u64) -> Self {
+        Self::blobs(file, &[(digest, 0, size)])
+    }
+
+    /// An archive of blobs that are parts of `file`, each with its digest,
+    /// where it starts and its size.
+    pub fn blobs(file: File, blobs: &[(Digest, u64, u64)]) -> Self {
         Self {
             backing: Backing::Tar(Arc::new(file)),
-            members: vec![(
-                "blob".to_string(),
-                Member::Regular {
-                    offset: 0,
-                    size,
-                    digest: Some(digest),
-                },
-            )],
+            members: blobs
+                .iter()
+                .map(|&(digest, offset, size)| {
+                    (
+                        format!("blobs/{}/{}", digest.alg(), digest.hex()),
+                        Member::Regular {
+                            offset,
+                            size,
+                            digest: Some(digest),
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 

@@ -1572,7 +1572,7 @@ impl EngineClient {
     }
 
     /// Pull what `source` names (`oci:DIR`, `oci-archive:FILE`,
-    /// `docker-archive:FILE`, `dir:DIR` or `archive:FILE`, a load) from
+    /// `docker-archive:FILE`, `dir:DIR`, `rootfs:DIR` or `archive:FILE`, a load) from
     /// `target`, the file or the directory the command opened: the images
     /// it put in the store, with their names; the progress of their layers
     /// told to `on`.

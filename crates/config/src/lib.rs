@@ -516,6 +516,11 @@ pub struct PullConfig {
     /// An archive given to `load` that inflates to more than this is refused
     #[serde(default = "default_max_archive_gib")]
     pub max_archive_gib: u64,
+    /// The socket of the Docker daemon a pull from `docker-daemon:` reads
+    /// the image of; the engine connects to it, the process that reads the
+    /// image is handed the connection
+    #[serde(default = "default_docker_socket")]
+    pub docker_socket: PathBuf,
     /// Signature policy file; by default ~/.config/velarx/policy.json
     /// (rootless) or /etc/velarx/policy.json; without either, the built-in
     /// policy accepts every image
@@ -701,6 +706,10 @@ fn default_max_archive_gib() -> u64 {
     256
 }
 
+fn default_docker_socket() -> PathBuf {
+    PathBuf::from("/var/run/docker.sock")
+}
+
 impl Default for PullConfig {
     fn default() -> Self {
         Self {
@@ -718,6 +727,7 @@ impl Default for PullConfig {
             pids_max: default_pids_max(),
             require_cgroup: false,
             max_archive_gib: default_max_archive_gib(),
+            docker_socket: default_docker_socket(),
             policy_path: None,
             registries_d: None,
             require_userns: false,

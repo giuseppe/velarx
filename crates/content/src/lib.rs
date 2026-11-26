@@ -14,6 +14,7 @@ pub use velarx_tarsplit::decompress;
 pub mod dir_fetch;
 pub mod dir_origin;
 pub mod dir_push;
+pub mod docker_daemon;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fakes;
 pub mod fetcher;
@@ -27,6 +28,7 @@ pub mod origin;
 pub mod pull;
 pub mod push;
 pub mod pusher;
+pub mod rootfs;
 pub mod serve_fetch;
 pub mod serve_push;
 pub mod serve_registry;

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The transports of an image name, as podman and skopeo write them
 //! (`docker://REF`, `oci:PATH[:TAG]`, `oci-archive:FILE[:TAG]`,
-//! `docker-archive:FILE[:REF|:@N]`, `dir:PATH`, `containers-storage:NAME`): the one parser that every command and every
-//! API route that takes an image name uses.
+//! `docker-archive:FILE[:REF|:@N]`, `dir:PATH`, `containers-storage:NAME`, and
+//! the sources `docker-daemon:IMAGE` and `rootfs:DIR`): the one parser that
+//! every command and every API route that takes an image name uses.
 //!
 //! A name without a transport is a name of the local store or of a registry.
 //! Only the transports of containers/image are recognised, so that an image
@@ -12,11 +13,10 @@
 //! called `name`.
 
 use thiserror::Error;
-use velarx_base::docker::refusal;
 
 /// The transports that velarx implements, for the messages.
 pub const SUPPORTED: &str =
-    "docker://, oci:, oci-archive:, docker-archive:, dir: and containers-storage: (or a name without a transport)";
+    "docker://, oci:, oci-archive:, docker-archive:, docker-daemon:, rootfs:, dir: and containers-storage: (or a name without a transport)";
 
 /// Where an image is, as its name says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,13 +40,17 @@ pub enum ImageLocation {
         path: String,
         selector: Option<String>,
     },
+    /// `docker-daemon:IMAGE`: an image of a running Docker daemon, a source
+    /// only.  `reference` is what the daemon takes in `docker save`: a name
+    /// with a tag, or an ID.
+    DockerDaemon { reference: String },
+    /// `rootfs:DIR`: a root file system in a directory, which becomes the one
+    /// layer of an image; a source only.
+    Rootfs { path: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TransportError {
-    /// `docker-daemon:`: Docker's formats.
-    #[error("{}", refusal(&format!("the transport {name}")))]
-    Docker { name: String },
     /// A transport of containers/image that velarx does not have.
     #[error("the transport {name} is not supported: velarx supports {SUPPORTED}")]
     Unsupported { name: String },
@@ -144,7 +148,13 @@ impl ImageLocation {
             if is_name
                 && !matches!(
                     name,
-                    "oci" | "oci-archive" | "docker-archive" | "dir" | "containers-storage"
+                    "oci"
+                        | "oci-archive"
+                        | "docker-archive"
+                        | "docker-daemon"
+                        | "rootfs"
+                        | "dir"
+                        | "containers-storage"
                 )
             {
                 return Err(match Self::by_name(name) {
@@ -188,6 +198,25 @@ impl ImageLocation {
                     selector: selector.map(str::to_string),
                 })
             }
+            "docker-daemon" => {
+                if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_graphic()) {
+                    return Err(invalid(
+                        spec,
+                        "no image name, or a name with a space or a control character",
+                    ));
+                }
+                Ok(Self::DockerDaemon {
+                    reference: rest.to_string(),
+                })
+            }
+            "rootfs" => {
+                if rest.is_empty() || rest.contains('\0') {
+                    return Err(invalid(spec, "the path is empty"));
+                }
+                Ok(Self::Rootfs {
+                    path: rest.to_string(),
+                })
+            }
             "dir" => {
                 if rest.is_empty() || rest.contains('\0') {
                     return Err(invalid(spec, "the path is empty"));
@@ -220,9 +249,6 @@ impl ImageLocation {
     /// implemented.
     fn by_name(name: &str) -> Option<TransportError> {
         match name {
-            "docker-daemon" => Some(TransportError::Docker {
-                name: name.to_string(),
-            }),
             "ostree" | "sif" | "tarball" => Some(TransportError::Unsupported {
                 name: name.to_string(),
             }),
@@ -235,7 +261,14 @@ impl ImageLocation {
     pub fn is_transport_name(name: &str) -> bool {
         matches!(
             name,
-            "docker" | "oci" | "oci-archive" | "docker-archive" | "dir" | "containers-storage"
+            "docker"
+                | "oci"
+                | "oci-archive"
+                | "docker-archive"
+                | "docker-daemon"
+                | "rootfs"
+                | "dir"
+                | "containers-storage"
         ) || Self::by_name(name).is_some()
     }
 
@@ -346,6 +379,8 @@ impl ImageLocation {
             Self::Dir { .. } => "dir:",
             Self::Storage(_) => "containers-storage:",
             Self::DockerArchive { .. } => "docker-archive:",
+            Self::DockerDaemon { .. } => "docker-daemon:",
+            Self::Rootfs { .. } => "rootfs:",
         }
     }
 
@@ -643,16 +678,36 @@ mod tests {
     }
 
     #[test]
-    fn docker_daemon_is_refused_by_the_rule() {
-        for s in ["docker-daemon:alpine:3", "docker-daemon://x"] {
-            let e = ImageLocation::parse(s).unwrap_err();
-            assert!(matches!(e, TransportError::Docker { .. }), "{s}");
+    fn a_daemon_and_a_root_file_system_are_sources() {
+        assert_eq!(
+            ImageLocation::parse("docker-daemon:alpine:3").unwrap(),
+            ImageLocation::DockerDaemon {
+                reference: "alpine:3".into()
+            }
+        );
+        assert_eq!(
+            ImageLocation::parse("rootfs:/srv/root").unwrap(),
+            ImageLocation::Rootfs {
+                path: "/srv/root".into()
+            }
+        );
+        for bad in [
+            "docker-daemon:",
+            "docker-daemon:a b",
+            "docker-daemon:a\r\nb",
+            "rootfs:",
+            "rootfs:/a\0b",
+        ] {
             assert!(
-                e.to_string()
-                    .contains("Docker image formats are not supported"),
-                "{e}"
+                matches!(
+                    ImageLocation::parse(bad),
+                    Err(TransportError::Invalid { .. })
+                ),
+                "{bad:?}"
             );
         }
+        let e = ImageLocation::registry("docker-daemon:alpine", "the REST API").unwrap_err();
+        assert!(e.to_string().contains("docker-daemon"), "{e}");
     }
 
     #[test]

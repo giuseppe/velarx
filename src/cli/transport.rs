@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The transports of the image names of the command line (`pull`, `push`,
 //! `run`, `create`): `docker://` and a plain name are a registry's, and
-//! `oci:`, `oci-archive:`, `docker-archive:` and `dir:` are pulled from a
-//! path — or written from the store, for the OCI ones, by a push.  The
+//! `oci:`, `oci-archive:`, `docker-archive:`, `dir:` and `rootfs:` are pulled
+//! from a path — or written from the store, for the OCI ones, by a push —
+//! and `docker-daemon:` from the socket of a Docker daemon, which the engine
+//! connects to.  The
 //! syntax is `velarx_types::transport`'s.
 //!
 //! The command opens the path and the engine pulls from it, as from any
@@ -47,7 +49,10 @@ pub fn pull(client: &EngineClient, spec: &str, platform: Option<&str>) -> anyhow
     let (path, directory) = match ImageLocation::parse(spec)? {
         ImageLocation::Registry(name) => return Ok(Source::Name(name)),
         ImageLocation::Storage(name) => return Ok(Source::Local(name)),
-        ImageLocation::OciLayout { path, .. } | ImageLocation::Dir { path } => (path, true),
+        ImageLocation::DockerDaemon { .. } => return Ok(Source::Name(spec.to_string())),
+        ImageLocation::OciLayout { path, .. }
+        | ImageLocation::Dir { path }
+        | ImageLocation::Rootfs { path } => (path, true),
         ImageLocation::OciArchive { path, .. } | ImageLocation::DockerArchive { path, .. } => {
             (path, false)
         }
@@ -126,6 +131,10 @@ pub fn registry_destination(destination: &ImageLocation) -> anyhow::Result<Optio
         ImageLocation::DockerArchive { .. } => {
             Err(anyhow!("{}", velarx_types::docker::archive_refusal()))
         }
+        ImageLocation::DockerDaemon { .. } | ImageLocation::Rootfs { .. } => bail!(
+            "{} is a source of a pull, not a destination",
+            destination.transport()
+        ),
         _ => Ok(None),
     }
 }

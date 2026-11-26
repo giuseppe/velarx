@@ -506,10 +506,10 @@ PY
     $SH image pull "containers-storage:localhost/e2e-not-there:1" > /dev/null 2>&1
     check "containers-storage: of an image that is not there" 125 $?
 
-    for ref in docker-daemon:alpine; do
-        out=$($SH image pull "$ref" 2>&1)
-        check "$ref is refused" 125 $?
-        check_match "$ref: by the rule" "Docker image formats are not supported" "$out"
+    for ref in docker-daemon:alpine rootfs:$t; do
+        out=$($SH image push "$IMG" "$ref" 2>&1)
+        check "push to $ref is refused" 125 $?
+        check_match "...a source, not a destination" "is a source of a pull" "$out"
     done
     out=$($SH image pull "registry://x/y" 2>&1)
     check "an unknown transport" 125 $?
