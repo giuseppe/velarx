@@ -952,6 +952,38 @@ mod tests {
     }
 
     #[test]
+    fn test_context_tar_sends_the_hard_links_as_links() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("sub")).unwrap();
+        std::fs::write(d.path().join("a"), "data").unwrap();
+        std::fs::hard_link(d.path().join("a"), d.path().join("sub/b")).unwrap();
+        let mut out = Vec::new();
+        context_tar(d.path(), None, Vec::new(), &[], &[], &mut out).unwrap();
+        let entries: Vec<(String, tar::EntryType, Option<String>)> = tar::Archive::new(&out[..])
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.path().unwrap().to_string_lossy().into_owned(),
+                    e.header().entry_type(),
+                    e.link_name()
+                        .unwrap()
+                        .map(|l| l.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            entries.contains(&("a".into(), tar::EntryType::Regular, None)),
+            "{entries:?}"
+        );
+        assert!(
+            entries.contains(&("sub/b".into(), tar::EntryType::Link, Some("a".into()))),
+            "{entries:?}"
+        );
+    }
+
+    #[test]
     fn test_context_tar_refuses_a_file_that_shrank() {
         let (r, _) = context_tar_of_changing_file(|f| {
             std::fs::OpenOptions::new()

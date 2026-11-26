@@ -215,6 +215,10 @@ struct Dest<'a> {
     cancel: &'a Cancel,
     /// A node copied changed at or after `job.unchanged_since`.
     changed: bool,
+    /// The regular files with other links copied so far, by the node of
+    /// the source: their copy (its directory, name and node), which a copy
+    /// of another link of the source becomes a link of.
+    linked: std::collections::HashMap<(u64, u64), (OwnedFd, OsString, u64)>,
 }
 
 /// A node to copy: opened with `O_PATH` (`open` opens it for reading), its
@@ -523,6 +527,16 @@ impl Dest<'_> {
         let Node { src, open, st, .. } = node;
         match kind(st) {
             FileType::RegularFile => {
+                let source = (st.st_dev, st.st_ino);
+                if let Some((dir, first, ino)) = self.linked.get(&source) {
+                    // (unless its copy was replaced since)
+                    if statat(dir, first.as_os_str(), AtFlags::SYMLINK_NOFOLLOW)
+                        .is_ok_and(|now| now.st_ino == *ino)
+                    {
+                        remove_tree(dst, name)?;
+                        return Ok(linkat(dir, first.as_os_str(), dst, name, AtFlags::empty())?);
+                    }
+                }
                 self.spend(st.st_size.max(0) as u64, 0)?;
                 remove_tree(dst, name)?;
                 let input = open.open(st)?;
@@ -545,7 +559,13 @@ impl Dest<'_> {
                     || self.cancel.check(),
                 )?;
                 self.finish(out.as_fd(), st, None)?;
-                copy_xattrs(attrs.as_fd(), out.as_fd())
+                copy_xattrs(attrs.as_fd(), out.as_fd())?;
+                if st.st_nlink > 1 {
+                    let dir = rustix::io::fcntl_dupfd_cloexec(dst, 0)?;
+                    let copy = (dir, name.to_owned(), fstat(&out)?.st_ino);
+                    self.linked.insert(source, copy);
+                }
+                Ok(())
             }
             FileType::Symlink => {
                 remove_tree(dst, name)?;
@@ -668,7 +688,11 @@ impl Visit for CopyWalk<'_, '_> {
         }
         // An ignored directory: what a `!` pattern takes back from it is
         // copied, the directory kept only if something is.
-        if !is_dir || (ignored && !d.ignore.has_negations()) {
+        if !is_dir
+            || child_rel
+                .as_deref()
+                .is_some_and(|p| ignored && !d.ignore.may_take_back(p))
+        {
             return Ok(None);
         }
         let (sub, created) = d.open_dir(self.dst.fd(), child, 0o700)?;
@@ -1071,6 +1095,7 @@ pub fn run(
         entries: Default::default(),
         cancel,
         changed: false,
+        linked: Default::default(),
     };
     run_dest(&mut d, source)?;
     for (path, mtime) in d.created.iter().rev() {
@@ -1240,7 +1265,7 @@ impl Visit for Digester<'_> {
         // As a copy: an ignored path is left out, but for a directory a `!`
         // pattern may take something back from.
         if self.ignore.ignored(&p)
-            && !(kind(&cst) == FileType::Directory && self.ignore.has_negations())
+            && !(kind(&cst) == FileType::Directory && self.ignore.may_take_back(&p))
         {
             return Ok(None);
         }
@@ -1595,6 +1620,36 @@ mod tests {
             std::fs::read_to_string(s.out.join("x/renamed")).unwrap(),
             "top"
         );
+    }
+
+    #[test]
+    fn the_links_of_a_file_copied_by_one_job_stay_links() {
+        let s = setup();
+        std::fs::hard_link(s.ctx.join("a/one.txt"), s.ctx.join("a/sub/also")).unwrap();
+        std::fs::hard_link(s.ctx.join("a/one.txt"), s.ctx.join("again")).unwrap();
+        run_job(&s, &job(&[("a", "/app/", true), ("again", "/app/", true)])).unwrap();
+        let ino = |p: &str| std::fs::metadata(s.out.join(p)).unwrap().ino();
+        assert_eq!(ino("app/one.txt"), ino("app/sub/also"));
+        assert_eq!(ino("app/one.txt"), ino("app/again"));
+        assert_ne!(ino("app/one.txt"), ino("app/sub/two.log"));
+        // (a copy replaced since is not linked to)
+        std::fs::create_dir(s.ctx.join("other")).unwrap();
+        std::fs::write(s.ctx.join("other/one.txt"), "other").unwrap();
+        run_job(
+            &s,
+            &job(&[
+                ("a", "/b/", true),
+                ("other/one.txt", "/b/", true),
+                ("again", "/b/", true),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(s.out.join("b/one.txt")).unwrap(),
+            "other"
+        );
+        assert_eq!(std::fs::read_to_string(s.out.join("b/again")).unwrap(), "1");
+        assert_ne!(ino("b/one.txt"), ino("b/again"));
     }
 
     #[test]

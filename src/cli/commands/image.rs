@@ -2319,7 +2319,7 @@ pub(super) fn context_tar(
 
         /// Whether something below `rel` may be sent though it is ignored.
         fn may_send_below(&self, rel: &str) -> bool {
-            self.ignore.has_negations()
+            self.ignore.may_take_back(rel)
                 || self.keep.iter().any(|k| k.starts_with(&format!("{rel}/")))
         }
 
@@ -2339,7 +2339,11 @@ pub(super) fn context_tar(
             .run(
                 velarx_base::tree::open_root(dir)?,
                 rel.to_string(),
-                &mut Context { walk: self, tar },
+                &mut Context {
+                    walk: self,
+                    tar,
+                    links: Default::default(),
+                },
             )?;
             Ok(())
         }
@@ -2351,6 +2355,9 @@ pub(super) fn context_tar(
     struct Context<'a, 'b> {
         walk: Walk<'a>,
         tar: &'a mut tar::Builder<&'b mut dyn std::io::Write>,
+        /// The path of the first file sent of each node with other links:
+        /// the next ones are links to it, as the context has them.
+        links: std::collections::HashMap<(u64, u64), String>,
     }
     impl velarx_base::walk::Visit for Context<'_, '_> {
         type Dir = String;
@@ -2387,6 +2394,18 @@ pub(super) fn context_tar(
                 return Ok((sent || self.walk.may_send_below(&child)).then_some(child));
             }
             let is_link = ft == rustix::fs::FileType::Symlink;
+            if sent && ft == rustix::fs::FileType::RegularFile && st.st_nlink > 1 {
+                let node = (st.st_dev, st.st_ino);
+                if let Some(first) = self.links.get(&node) {
+                    let mut h = tar::Header::new_gnu();
+                    h.set_metadata(&std::fs::symlink_metadata(&path)?);
+                    h.set_entry_type(tar::EntryType::Link);
+                    h.set_size(0);
+                    tar.append_link(&mut h, &child, first)?;
+                    return Ok(None);
+                }
+                self.links.insert(node, child.clone());
+            }
             if sent && (ft == rustix::fs::FileType::RegularFile || is_link) {
                 if !is_link {
                     append_xattrs(tar, &path).map_err(other)?;

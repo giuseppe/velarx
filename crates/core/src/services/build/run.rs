@@ -1047,6 +1047,7 @@ impl Build<'_> {
             env,
             secret_env: mounts.secret_env.clone(),
             working_dir: st.workdir.clone(),
+            image_working_dir: true,
             // USER: a name, uid or uid:gid resolved in the current image;
             // no passwd or group entry is made for a user it lacks (buildah).
             user: st.user.clone(),

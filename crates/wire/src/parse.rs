@@ -1019,10 +1019,15 @@ impl Ignore {
         self.patterns.len()
     }
 
-    /// Whether a `!` pattern can take back something an ignored
-    /// directory holds.
-    pub fn has_negations(&self) -> bool {
-        self.patterns.iter().any(|(_, negated)| *negated)
+    /// Whether a `!` pattern can take back something the ignored
+    /// directory `dir` holds: as Docker's and buildah's, one that names a
+    /// path in it (`!dir/keep*`); `!*/keep` does not reach into an ignored
+    /// directory.
+    pub fn may_take_back(&self, dir: &str) -> bool {
+        let dir = components(dir).join("/") + "/";
+        self.patterns
+            .iter()
+            .any(|(pat, negated)| *negated && (pat.join("/") + "/").starts_with(&dir))
     }
 
     /// Whether there is no pattern.
@@ -1475,6 +1480,9 @@ mod tests {
         assert!(!ig.ignored(&path));
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         assert!(Ignore::parse("**/**/**/b").ignored("a/a/b"));
-        assert!(Ignore::parse("dir\n!dir/keep").has_negations());
+        let ignore = Ignore::parse("dir\nother\n!dir/keep*\n!*/sub1*");
+        assert!(ignore.may_take_back("dir"));
+        assert!(!ignore.may_take_back("other"));
+        assert!(!ignore.may_take_back("di"));
     }
 }

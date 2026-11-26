@@ -143,6 +143,10 @@ pub struct CreateContainerRequest {
     pub reset_entrypoint: bool,
     #[serde(default)]
     pub working_dir: String,
+    /// `working_dir` is the working directory of an image (the runtime
+    /// makes it when it is missing), not a `--workdir`, which must be there.
+    #[serde(default)]
+    pub image_working_dir: bool,
     #[serde(default)]
     pub env: Vec<String>,
     #[serde(default)]
@@ -1106,6 +1110,7 @@ impl Default for CreateContainerRequest {
             entrypoint: Vec::new(),
             reset_entrypoint: false,
             working_dir: String::new(),
+            image_working_dir: false,
             env: Vec::new(),
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),

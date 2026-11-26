@@ -277,6 +277,14 @@ EOT
     sh_ rmi localhost/e2e-bx:buildx localhost/e2e-bx:builder > /dev/null 2>&1
 }
 
+@test "build: COPY of a URL is refused in buildah's words" {
+    local ctx=$WORKDIR/uctx out
+    mkdir -p "$ctx"
+    printf 'FROM %s\nCOPY http://127.0.0.1:9/x /x\n' "$IMAGE" > "$ctx/Containerfile"
+    out=$(sh_ image build -q "$ctx" 2>&1)
+    check_match "COPY http://..." "building at STEP .*: source can't be a URL for COPY" "$out"
+}
+
 @test "build --save-stages and --stage-labels" {
     local ctx=$WORKDIR/sctx stage_ids
     mkdir -p "$ctx"
@@ -336,4 +344,41 @@ EOT
     check "a short name of an image built here, denied" 125 $rc
     check_match "...by its name" "base image localhost/e2e-policy:1 is denied" "$out"
     sh_ rmi localhost/e2e-policy:1 > /dev/null 2>&1
+}
+
+@test "build: a ! pattern takes back from an ignored directory only where it names it" {
+    local ctx=$WORKDIR/ictx
+    mkdir -p "$ctx/subdir1" "$ctx/subdir2"
+    touch "$ctx/subdir1/sub1" "$ctx/subdir1/sub2" "$ctx/subdir2/sub1"
+    printf 'FROM scratch\nCOPY ./ /d/\n' > "$ctx/Containerfile"
+    printf 'subdir1\nsubdir2\n!subdir1/sub1*\n!*/sub1*\n' > "$ctx/.dockerignore"
+    sh_ image build -q -o "$WORKDIR/iout" "$ctx" > /dev/null
+    check "build" 0 $?
+    check "the files kept" "d/subdir1/sub1" "$(cd "$WORKDIR/iout" && find d/subdir1 d/subdir2 -type f | sort)"
+}
+
+@test "build: a WORKDIR the image lacks is made, owned by the USER" {
+    local ctx=$WORKDIR/wctx
+    mkdir -p "$ctx"
+    printf 'FROM %s\nUSER 1000\nWORKDIR /not/in/the/image\nRUN pwd > where\nUSER 0\nWORKDIR /last\n' "$IMAGE" > "$ctx/Containerfile"
+    sh_ image build -q -t localhost/e2e-workdir:1 "$ctx" > /dev/null
+    check "build with a WORKDIR the image lacks" 0 $?
+    check "the step ran there, as the user" /not/in/the/image "$(sh_ run --rm localhost/e2e-workdir:1 cat /not/in/the/image/where)"
+    check "the directories, of the USER of the WORKDIR, 0755" "1000 755 /not
+1000 755 /not/in/the/image
+0 755 /last" "$(sh_ run --rm localhost/e2e-workdir:1 stat -c '%u %a %n' /not /not/in/the/image /last)"
+    sh_ rmi localhost/e2e-workdir:1 > /dev/null 2>&1
+}
+
+@test "build: COPY keeps the hard links of what it copies" {
+    local ctx=$WORKDIR/hctx
+    mkdir -p "$ctx/sub/subsub"
+    printf 'FROM %s\nCOPY . /test\n' "$IMAGE" > "$ctx/Containerfile"
+    ln "$ctx/Containerfile" "$ctx/hardlink1"
+    ln "$ctx/Containerfile" "$ctx/sub/hardlink2"
+    ln "$ctx/Containerfile" "$ctx/sub/subsub/hardlink3"
+    sh_ image build -q -t localhost/e2e-hardlinks:1 "$ctx" > /dev/null
+    check "build" 0 $?
+    check "one inode" 1 "$(sh_ run --rm localhost/e2e-hardlinks:1 stat -c %i /test/Containerfile /test/hardlink1 /test/sub/hardlink2 /test/sub/subsub/hardlink3 | sort -u | wc -l)"
+    sh_ rmi localhost/e2e-hardlinks:1 > /dev/null 2>&1
 }

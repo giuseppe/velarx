@@ -3058,6 +3058,13 @@ impl<'a> Build<'a> {
                 st.workdir = velarx_wire::cp::clean_path(&joined);
                 let w = st.workdir.clone();
                 st.edit(ConfigEdit::Set("WorkingDir".into(), json!(w)));
+                // (made owned by the USER of now, as buildah's: root when
+                // the image does not know it)
+                let owner = match st.user.as_str() {
+                    "" => None,
+                    user => self.chown_of(st, user).await.ok(),
+                };
+                self.make_dirs(st, i, &[w], owner).await?;
             }
             "USER" => {
                 let v = expand(st)?;
@@ -3136,7 +3143,7 @@ impl<'a> Build<'a> {
                 }
                 let paths: Vec<String> = vols.keys().cloned().collect();
                 st.edit(ConfigEdit::Merge("Volumes".into(), vols));
-                self.volume_dirs(st, i, &paths).await?;
+                self.make_dirs(st, i, &paths, None).await?;
             }
             "MAINTAINER" => st.author = Some(i.args.clone()),
             "HEALTHCHECK" => {
@@ -3156,14 +3163,16 @@ impl<'a> Build<'a> {
         Ok(())
     }
 
-    /// The directories VOLUME names that the image lacks are made in a
-    /// layer, with the attributes the image has for their parents: a RUN
-    /// step finds them, whether it mounts the volumes or not.
-    async fn volume_dirs(
+    /// The directories VOLUME or WORKDIR names that the image lacks are
+    /// made in a layer, mode 0755 and owned by `owner` (else root), with the
+    /// attributes the image has for their parents: a RUN step finds them,
+    /// whether it mounts the volumes or not.
+    async fn make_dirs(
         &mut self,
         st: &mut StageState,
         i: &Instr,
         paths: &[String],
+        owner: Option<(u32, u32)>,
     ) -> BuildResult<()> {
         let tocs = match &st.image {
             Some(id) => {
@@ -3194,6 +3203,8 @@ impl<'a> Build<'a> {
         let upper = self.new_dir("upper")?;
         let result = async {
             let mut job = CopyJob::new(Source::Context);
+            job.chown = owner;
+            job.chmod = Some(0o755);
             for (n, dir) in missing.iter().enumerate() {
                 std::fs::create_dir(source.join(n.to_string()))?;
                 job.items.push(Item {
@@ -3460,6 +3471,11 @@ impl<'a> Build<'a> {
                 "ADD only supports the --chmod=<permissions>, --chown=<uid:gid>, --checksum=<checksum>, --link, --keep-git-dir, and --exclude=<pattern> flags",
             ));
         }
+        // (`--link` is accepted and changes nothing: the layer of a COPY
+        // holds the files it copies and their parent directories only,
+        // never the content of the base, and the build cache keeps a step
+        // with the image it follows.  Unlike BuildKit, the symbolic links
+        // of the base on the way to the destination are followed.)
         let allowed: &[&str] = if add {
             &[
                 "chown",
@@ -3653,7 +3669,7 @@ impl<'a> Build<'a> {
                 let urls: Vec<&String> = sources.iter().filter(|s| is_url(s)).collect();
                 if !urls.is_empty() {
                     if !add {
-                        return Err(step_error(i, "COPY from a URL: use ADD"));
+                        return Err(step_error(i, "source can't be a URL for COPY: use ADD"));
                     }
                     let dir = self.new_dir("download")?;
                     downloads = Some(dir.clone());

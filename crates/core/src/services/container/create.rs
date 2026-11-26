@@ -1255,7 +1255,7 @@ impl ContainerService {
         velarx_base::trace::point("create composefs");
         // a --workdir the image lacks is not made (podman's), unless a
         // mount is there
-        if !req.working_dir.is_empty() && rootfs_dir.is_none() {
+        if !req.working_dir.is_empty() && !req.image_working_dir && rootfs_dir.is_none() {
             let view = self.image_view(&layers)?;
             // (podman makes the container, and its start says so)
             match check_workdir(

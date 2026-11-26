@@ -2705,6 +2705,9 @@ type CreateContainerRequest (
 	# `"Entrypoint": []`); `[""]` in `entrypoint` drops both
 	reset_entrypoint: bool,
 	working_dir: string,
+	# `working_dir` is the working directory of an image (the runtime
+	# makes it when it is missing), not a `--workdir`, which must be there.
+	image_working_dir: bool,
 	env: []string,
 	labels: [string]string,
 	annotations: [string]string,
