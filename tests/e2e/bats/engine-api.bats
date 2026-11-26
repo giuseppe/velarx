@@ -184,6 +184,8 @@ engine_pid () { # the engine a frontend of this file started: a descendant of a
 }
 
 active () { "${SCTL[@]}" show -P ActiveState "$1"; }
+# when the unit last became active (microseconds, monotonic)
+started () { "${SCTL[@]}" show -P ActiveEnterTimestampMonotonic "$1"; }
 
 # (the answers without their date, whose length may differ)
 
@@ -618,9 +620,14 @@ units_linked () {
     "${SCTL[@]}" start "$U-engine.socket" "$U-api.socket"
     check "the sockets listen" "active active" "$(active $U-engine.socket) $(active $U-api.socket)"
     check "nothing runs before a request" "inactive inactive" "$(active $U-engine.service) $(active $U-api.service)"
+    # (each became active after the request: not its state now, which the
+    # idle time may have changed already)
+    local api engine
+    api=$(started "$U-api.service") engine=$(started "$U-engine.service")
     out=$(get http://x/_ping)
     check "a request starts the API" OK "$out"
-    check "...and its first call the engine" "active active" "$(active $U-api.service) $(active $U-engine.service)"
+    check "...and its first call the engine" "yes yes" \
+        "$([ "$(started "$U-api.service")" -gt "$api" ] && echo yes) $([ "$(started "$U-engine.service")" -gt "$engine" ] && echo yes)"
     check "the engine answers through the API" "[" "$(get http://x/libpod/containers/json?all=true | cut -c1)"
 }
 
@@ -639,6 +646,11 @@ units_linked () {
     check "...cleanly" "success success" \
         "$("${SCTL[@]}" show -P Result "$U-api.service") $("${SCTL[@]}" show -P Result "$U-engine.service")"
     check "...and the sockets stay" "active active" "$(active $U-engine.socket) $(active $U-api.socket)"
+    # (each became active again after the request: not its state now,
+    # which the idle time may have changed already)
+    local api engine
+    api=$(started "$U-api.service") engine=$(started "$U-engine.service")
     check "the next request starts them again" OK "$(get http://x/_ping)"
-    check "...both" "active active" "$(active $U-api.service) $(active $U-engine.service)"
+    check "...both" "yes yes" \
+        "$([ "$(started "$U-api.service")" -gt "$api" ] && echo yes) $([ "$(started "$U-engine.service")" -gt "$engine" ] && echo yes)"
 }
