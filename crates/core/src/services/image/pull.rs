@@ -1759,25 +1759,18 @@ impl ImageService {
                 Ok::<_, ImageError>((from, layers, walker, planned))
             });
             let set = set.transpose()?;
-            let area = self.staging_area();
-            let mut barrier = velarx_content::pull::staged::Barrier::default();
-            // (the barrier holds the leases of the layers until it commits:
-            // taken in the order `lock_layers` takes them)
-            let mut lazy: Vec<&LayerDone> = done_layers.values().filter(|d| d.lazy).collect();
-            lazy.sort_unstable_by_key(|d| d.key.file_stem());
-            for d in lazy {
-                let m = made.get(&d.key).ok_or_else(|| {
-                    ImageError::Layer(format!("no EROFS image was made for layer {}", d.key))
-                })?;
-                pull::stage_layer(
-                    &area,
-                    &mut barrier,
-                    d,
-                    registry_ref.as_deref(),
-                    reach,
-                    (&m.image_digest, &m.owners),
-                )?;
-            }
+            // (each with the EROFS image and the owners made of its table)
+            let mut lazy = done_layers
+                .values()
+                .filter(|d| d.lazy)
+                .map(|d| {
+                    let m = made.get(&d.key).ok_or_else(|| {
+                        ImageError::Layer(format!("no EROFS image was made for layer {}", d.key))
+                    })?;
+                    Ok((d.clone(), m.image_digest.clone(), m.owners.clone()))
+                })
+                .collect::<ImageResult<Vec<_>>>()?;
+            lazy.sort_unstable_by_key(|(d, ..)| d.key.file_stem());
             let staged = velarx_content::pull::staged::StagedPull {
                 id: image_id.clone(),
                 manifest_digest: image.manifest_digest,
@@ -1808,10 +1801,32 @@ impl ImageService {
                 registry_ref: registry_ref.clone(),
                 started_at: started_at.clone(),
             };
-            // the publish point: from here on the pull is visible, and its
-            // layers are pinned by it
-            area.publish_pull_after(&staged, barrier)?;
-            drop(hold);
+            // (a lease is waited for while another process holds it: not on
+            // a worker of the runtime; the hold goes once the pull is
+            // published, even when this pull is cancelled meanwhile)
+            let (area, registry_ref) = (self.staging_area(), registry_ref.clone());
+            tokio::task::spawn_blocking(move || -> ImageResult<()> {
+                let mut barrier = velarx_content::pull::staged::Barrier::default();
+                // (the barrier holds the leases of the layers until it
+                // commits: taken in the order `lock_layers` takes them)
+                for (d, erofs, owners) in &lazy {
+                    pull::stage_layer(
+                        &area,
+                        &mut barrier,
+                        d,
+                        registry_ref.as_deref(),
+                        reach,
+                        (erofs, owners),
+                    )?;
+                }
+                // the publish point: from here on the pull is visible, and
+                // its layers are pinned by it
+                area.publish_pull_after(&staged, barrier)?;
+                drop(hold);
+                Ok(())
+            })
+            .await
+            .map_err(|e| ImageError::Storage(e.to_string()))??;
             velarx_base::trace::point("pull layers staged");
             if let Some((from, layers, walker, planned)) = set {
                 let first = planned.await.unwrap_or_default();
