@@ -488,7 +488,9 @@ answer () { # socket method path [body]
         name=hx-bulkx
         if [ $kind = attach ]; then
             name=hx-bulk
-            "$BIN/velarx" --config "$CONF" container run -d -i --name $name "$IMG" cat > /dev/null 2>&1
+            # (no log: 100 MiB in the journal of the user would hit its rate
+            # limit, which drops what other tests write there for a while)
+            "$BIN/velarx" --config "$CONF" container run -d -i --log-driver none --name $name "$IMG" cat > /dev/null 2>&1
         fi
         out=$(timeout 120 python3 -I "$E2E_DIR/stream_bytes.py" "$API" $kind $name "$ep" 100)
         echo "# $kind: $out" >&3
