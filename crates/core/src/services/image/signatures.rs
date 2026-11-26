@@ -655,6 +655,7 @@ mod tests {
         .with_fetchers(vec![velarx_config::ExternalSourceConfig {
             name: "peer".into(),
             socket: Some(socket),
+            command: Vec::new(),
             dir: None,
             idle_timeout_secs: 15,
             settings: Default::default(),

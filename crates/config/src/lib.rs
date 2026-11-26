@@ -237,6 +237,10 @@ pub struct ExternalSourceConfig {
     /// root.
     #[serde(default)]
     pub socket: Option<PathBuf>,
+    /// Or a program started for each use ([`Reach::Command`]): its absolute
+    /// path and its arguments, no shell
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
     /// Or a directory of files named by the hex of their SHA-256, read by the
     /// process that pulls (no daemon, no socket)
     #[serde(default)]
@@ -248,6 +252,38 @@ pub struct ExternalSourceConfig {
     /// file itself: kept as they are, never read or checked here.
     #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
     pub settings: toml::Table,
+}
+
+impl ExternalSourceConfig {
+    /// How its process is reached, when it is not a `dir`.
+    pub fn reach(&self) -> Reach {
+        Reach::of(&self.socket, &self.command)
+    }
+}
+
+/// How the engine reaches a program of the configuration (a source, a
+/// sink, a transport): a socket where it runs, or the command that starts it for
+/// each use.  A started program gets the connection to it as its descriptor
+/// 3, nothing added to its arguments, an empty environment, and it is gone
+/// when the connection is closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    /// The unix socket of a program that runs (or that a service manager
+    /// starts)
+    Socket(PathBuf),
+    /// The program to start: its absolute path, then its arguments
+    Command(Vec<String>),
+}
+
+impl Reach {
+    /// The socket if there is one, else the command (an empty one, of a
+    /// configuration that was not checked, fails to start).
+    fn of(socket: &Option<PathBuf>, command: &[String]) -> Self {
+        match socket {
+            Some(socket) => Self::Socket(socket.clone()),
+            None => Self::Command(command.to_vec()),
+        }
+    }
 }
 
 /// The `idle_timeout_secs` of a source that does not set it.
@@ -269,6 +305,22 @@ fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
+/// Whether `socket` or `command` (exactly one of them) names a program
+/// by an absolute path; `what` says whose they are.
+fn check_reach(what: &str, socket: Option<&Path>, command: &[String]) -> Result<(), ConfigError> {
+    let invalid = |msg: String| Err(ConfigError::Invalid(format!("{what}: {msg}")));
+    match (socket, command.first()) {
+        (Some(socket), None) if !socket.is_absolute() => {
+            invalid(format!("`{}` is not an absolute path", socket.display()))
+        }
+        (None, Some(program)) if !Path::new(program).is_absolute() => {
+            invalid("the first item of command must be an absolute path".into())
+        }
+        (Some(_), None) | (None, Some(_)) => Ok(()),
+        _ => invalid("give a socket or a command, one of them".into()),
+    }
+}
+
 /// Pushers besides the destination's own (`org.velarx.Pusher`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -287,7 +339,13 @@ pub struct ExternalSinkConfig {
     /// The unix socket of a pusher that is a separate process, an absolute
     /// path.  The pusher must run as the user of the process that asks, or
     /// as root.
-    pub socket: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<PathBuf>,
+    /// Or a program started for each use ([`Reach::Command`]): its absolute
+    /// path and its arguments, no shell.  Exactly one of `socket` and
+    /// `command`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
     /// Seconds without a byte after which the process is given up
     #[serde(default = "default_source_idle_secs")]
     pub idle_timeout_secs: u64,
@@ -295,6 +353,13 @@ pub struct ExternalSinkConfig {
     /// places objects in a registry); by default it is not
     #[serde(default)]
     pub credentials: bool,
+}
+
+impl ExternalSinkConfig {
+    /// How its process is reached.
+    pub fn reach(&self) -> Reach {
+        Reach::of(&self.socket, &self.command)
+    }
 }
 
 /// The names of the destination's own pushers (`registry`, and `dir` for a
@@ -315,7 +380,13 @@ pub struct TransportConfig {
     /// `org.velarx.Fetcher` and/or `org.velarx.Pusher` and announces the
     /// capability `origin` in the `GetInfo` of each it is the origin for.  It
     /// must run as the user of the process that asks, or as root.
-    pub socket: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<PathBuf>,
+    /// Or a program started for each use ([`Reach::Command`]): its absolute
+    /// path and its arguments, no shell.  Exactly one of `socket` and
+    /// `command`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
     /// Seconds without a byte after which the process is given up
     #[serde(default = "default_source_idle_secs")]
     pub idle_timeout_secs: u64,
@@ -323,6 +394,13 @@ pub struct TransportConfig {
     /// default it is not
     #[serde(default)]
     pub credentials: bool,
+}
+
+impl TransportConfig {
+    /// How its process is reached.
+    pub fn reach(&self) -> Reach {
+        Reach::of(&self.socket, &self.command)
+    }
 }
 
 /// How images are pushed.
@@ -1761,12 +1839,11 @@ impl Config {
             if defined.contains(&name) {
                 return invalid(format!("[[sinks.external]] `{name}` is defined twice"));
             }
-            if !sink.socket.is_absolute() {
-                return invalid(format!(
-                    "[[sinks.external]] `{name}`: `{}` is not an absolute path",
-                    sink.socket.display()
-                ));
-            }
+            check_reach(
+                &format!("[[sinks.external]] `{name}`"),
+                sink.socket.as_deref(),
+                &sink.command,
+            )?;
             if sink.idle_timeout_secs == 0 {
                 return invalid(format!(
                     "[[sinks.external]] `{name}`: idle_timeout_secs must not be 0"
@@ -1836,12 +1913,11 @@ impl Config {
             if seen.contains(&scheme) {
                 return invalid(format!("[[transports]] `{scheme}` is defined twice"));
             }
-            if !transport.socket.is_absolute() {
-                return invalid(format!(
-                    "[[transports]] `{scheme}`: `{}` is not an absolute path",
-                    transport.socket.display()
-                ));
-            }
+            check_reach(
+                &format!("[[transports]] `{scheme}`"),
+                transport.socket.as_deref(),
+                &transport.command,
+            )?;
             if transport.idle_timeout_secs == 0 {
                 return invalid(format!(
                     "[[transports]] `{scheme}`: idle_timeout_secs must not be 0"
@@ -1870,19 +1946,26 @@ impl Config {
             if defined.contains(&name) {
                 return invalid(format!("[[sources.external]] `{name}` is defined twice"));
             }
-            let place = match (&source.socket, &source.dir) {
-                (Some(p), None) | (None, Some(p)) => p,
-                _ => {
+            let what = format!("[[sources.external]] `{name}`");
+            let given = [
+                source.socket.is_some(),
+                !source.command.is_empty(),
+                source.dir.is_some(),
+            ];
+            if given.iter().filter(|g| **g).count() != 1 {
+                return invalid(format!(
+                    "{what}: give a socket, a command or a dir, one of them"
+                ));
+            }
+            match &source.dir {
+                Some(dir) if !dir.is_absolute() => {
                     return invalid(format!(
-                        "[[sources.external]] `{name}`: give a socket or a dir, one of them"
+                        "{what}: `{}` is not an absolute path",
+                        dir.display()
                     ))
                 }
-            };
-            if !place.is_absolute() {
-                return invalid(format!(
-                    "[[sources.external]] `{name}`: `{}` is not an absolute path",
-                    place.display()
-                ));
+                Some(_) => {}
+                None => check_reach(&what, source.socket.as_deref(), &source.command)?,
             }
             if source.idle_timeout_secs == 0 {
                 return invalid(format!(
@@ -2555,6 +2638,46 @@ mod tests {
             let e = err(&format!("[pull]\nsources = [\"{name}\"]\n"));
             assert!(e.contains(&format!("unknown source `{name}`")), "{e}");
         }
+    }
+
+    /// A source or a transport is reached by a socket or by a command that
+    /// starts it for each use, exactly one of them; a command is a list
+    /// whose first item is an absolute path.
+    #[test]
+    fn test_a_program_is_reached_by_a_socket_or_a_command() {
+        let source = |text: &str| parse(&format!("[[sources.external]]\nname = \"a\"\n{text}\n"));
+        let sink = |text: &str| parse(&format!("[[sinks.external]]\nname = \"a\"\n{text}\n"));
+        let transport = |text: &str| parse(&format!("[[transports]]\nscheme = \"s3\"\n{text}\n"));
+        let command = "command = [\"/usr/libexec/velarx/dircache\", \"/var/cache/layers\"]";
+        let started = Reach::Command(vec![
+            "/usr/libexec/velarx/dircache".into(),
+            "/var/cache/layers".into(),
+        ]);
+        assert_eq!(
+            source(command).unwrap().sources.external[0].reach(),
+            started
+        );
+        assert_eq!(sink(command).unwrap().sinks.external[0].reach(), started);
+        assert_eq!(transport(command).unwrap().transports[0].reach(), started);
+        assert_eq!(
+            transport("socket = \"/s\"").unwrap().transports[0].reach(),
+            Reach::Socket("/s".into())
+        );
+        for (text, why) in [
+            (format!("socket = \"/s\"\n{command}"), "one of them"),
+            (String::new(), "one of them"),
+            ("command = []".into(), "one of them"),
+            ("command = [\"dircache\"]".into(), "absolute path"),
+        ] {
+            for e in [source(&text), sink(&text), transport(&text)] {
+                let e = e.unwrap_err().to_string();
+                assert!(e.contains(why), "{text}: {e}");
+            }
+        }
+        let e = source(&format!("dir = \"/d\"\n{command}"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("one of them"), "{e}");
     }
 
     #[test]

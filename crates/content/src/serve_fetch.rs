@@ -659,6 +659,66 @@ pub fn run_one_blocking(
     run_one(stream, move || endpoint, idle, limits)
 }
 
+/// Serve `api` on descriptor 3, which the process that started this passed:
+/// what any fetcher program does, whoever starts it.  A listening socket (a
+/// service manager's, or the one a client bound) is served as a service,
+/// until the process is stopped; a connected one is served once, as
+/// [`run_one_blocking`] does, and the process leaves at its end.  `startup`
+/// is taken first thing in `main`.
+pub fn run_descriptor_3(
+    startup: &velarx_sys::fd::Startup,
+    api: Arc<dyn StagingFetcher>,
+    limits: activation::Limits,
+) -> std::io::Result<()> {
+    let socket = startup
+        .adopt(3)
+        .ok_or_else(|| std::io::Error::other("no socket on descriptor 3"))?;
+    // (not passed on to anything this process starts)
+    rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
+    if rustix::net::sockopt::socket_acceptconn(&socket)? {
+        run_service(std::os::unix::net::UnixListener::from(socket), api, limits)
+    } else {
+        let idle = activation::IdleExit {
+            after: limits.first_call,
+            socket: None,
+            last: true,
+            lock: None,
+        };
+        run_one(
+            std::os::unix::net::UnixStream::from(socket),
+            move || FetchEndpoint::new(api),
+            idle,
+            limits,
+        )
+    }
+}
+
+/// Serve `api` on `listener` on a runtime of this thread, for ever.
+fn run_service(
+    listener: std::os::unix::net::UnixListener,
+    api: Arc<dyn StagingFetcher>,
+    limits: activation::Limits,
+) -> std::io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async move {
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::UnixListener::from_std(listener)?;
+        let endpoint = FetchEndpoint::new(api);
+        serve(
+            listener,
+            endpoint,
+            None,
+            velarx_base::ipc::trusted_uid,
+            limits,
+        )
+        .await;
+        Ok(())
+    })
+}
+
 /// [`run_one_blocking`] for an `api` whose calls run on the same thread as
 /// the connection: the process has no other thread until a call makes one
 /// (a pusher of a path confines the process in `Open`, which needs that).

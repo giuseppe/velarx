@@ -824,14 +824,16 @@ async fn with_sink(
             service.with_sinks(vec![
                 velarx_config::ExternalSinkConfig {
                     name: "mirror".into(),
-                    socket,
+                    socket: Some(socket),
+                    command: Vec::new(),
                     idle_timeout_secs: 1,
                     credentials: false,
                 },
                 // (nobody serves it)
                 velarx_config::ExternalSinkConfig {
                     name: "gone".into(),
-                    socket: "/nonexistent/gone.sock".into(),
+                    socket: Some("/nonexistent/gone.sock".into()),
+                    command: Vec::new(),
                     idle_timeout_secs: 15,
                     credentials: false,
                 },
@@ -1367,7 +1369,8 @@ async fn test_an_external_transport_is_the_origin_of_its_scheme() {
         sink::serve(mirror_dir.path(), sink::Says::Unavailable);
     let transports = vec![velarx_config::TransportConfig {
         scheme: "fake".into(),
-        socket,
+        socket: Some(socket),
+        command: Vec::new(),
         idle_timeout_secs: 15,
         credentials: false,
     }];
@@ -1381,7 +1384,8 @@ async fn test_an_external_transport_is_the_origin_of_its_scheme() {
             service.with_transports(transports).with_sinks(vec![
                 velarx_config::ExternalSinkConfig {
                     name: "mirror".into(),
-                    socket: mirror_socket,
+                    socket: Some(mirror_socket),
+                    command: Vec::new(),
                     idle_timeout_secs: 15,
                     credentials: false,
                 },
@@ -1616,13 +1620,15 @@ async fn test_a_transport_that_hangs_fails_the_push_naming_its_scheme() {
     let transports = vec![
         velarx_config::TransportConfig {
             scheme: "hangs".into(),
-            socket,
+            socket: Some(socket),
+            command: Vec::new(),
             idle_timeout_secs: 1,
             credentials: false,
         },
         velarx_config::TransportConfig {
             scheme: "silent".into(),
-            socket: silent.clone(),
+            socket: Some(silent.clone()),
+            command: Vec::new(),
             idle_timeout_secs: 1,
             credentials: false,
         },
@@ -1671,13 +1677,15 @@ async fn test_a_transport_gets_the_credentials_of_its_own_key_and_no_others() {
     let transports = vec![
         velarx_config::TransportConfig {
             scheme: "taking".into(),
-            socket: taking_socket,
+            socket: Some(taking_socket),
+            command: Vec::new(),
             idle_timeout_secs: 15,
             credentials: true,
         },
         velarx_config::TransportConfig {
             scheme: "refusing".into(),
-            socket: refusing_socket,
+            socket: Some(refusing_socket),
+            command: Vec::new(),
             idle_timeout_secs: 15,
             credentials: false,
         },
@@ -1740,7 +1748,8 @@ async fn test_a_transport_destination_with_userinfo_is_refused_and_its_key_has_n
     let (fake, socket, _thread) = transport::serve_as(dir.path(), "fake", false);
     let transports = vec![velarx_config::TransportConfig {
         scheme: "fake".into(),
-        socket,
+        socket: Some(socket),
+        command: Vec::new(),
         idle_timeout_secs: 15,
         credentials: true,
     }];
@@ -1807,7 +1816,8 @@ async fn test_a_manifest_list_is_pushed_to_a_transport() {
     let (fake, socket, _thread) = transport::serve(dir.path());
     let transports = vec![velarx_config::TransportConfig {
         scheme: "fake".into(),
-        socket,
+        socket: Some(socket),
+        command: Vec::new(),
         idle_timeout_secs: 15,
         credentials: false,
     }];

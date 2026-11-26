@@ -27,7 +27,7 @@ impl Cache {
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("cache");
         std::fs::create_dir(&cache).unwrap();
-        // The example makes the directory of its socket (mode 0700) itself.
+        // (the directory of the socket, mode 0700, is made when it is bound)
         let socket = dir.path().join("services").join("dircache.sock");
         let mut this = Self {
             dir,
@@ -39,46 +39,19 @@ impl Cache {
         this
     }
 
+    /// Start the example as a service manager does: the socket bound here
+    /// is its descriptor 3.
     async fn spawn(&mut self) {
         let bin = example();
         assert!(bin.exists(), "{} is not built: `cargo test` builds the examples, or `cargo build --example dircache`", bin.display());
-        // (it says READY=1 once it serves, as a service does)
-        let notify = self.dir.path().join("notify");
-        let _ = std::fs::remove_file(&notify);
-        let ready = std::os::unix::net::UnixDatagram::bind(&notify).unwrap();
-        ready
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
-        let child = Command::new(bin)
-            .arg(&self.socket)
-            .arg(&self.cache)
-            .env("NOTIFY_SOCKET", &notify)
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        self.child = Some(child);
-        let mut buf = [0u8; 64];
-        let said = ready.recv(&mut buf).map(|n| buf[..n].to_vec());
-        let answer =
-            match velarx_content::fetcher::fetch_client::FetchConn::connect_checked(&self.socket)
-                .await
-            {
-                Ok(mut conn) => conn
-                    .get_info()
-                    .await
-                    .map(|i| i.name)
-                    .map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            };
-        if said.as_deref().is_ok_and(|s| s.starts_with(b"READY=1")) && answer.is_ok() {
-            return;
-        }
-        let status = self.child.as_mut().unwrap().try_wait();
-        panic!(
-            "the example does not answer: {said:?}, {answer:?}, {status:?}, {:?}",
-            std::fs::read_dir(self.dir.path())
-                .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
-        );
+        let mut cmd = Command::new(bin);
+        cmd.arg(&self.cache);
+        let (stream, child) =
+            velarx_content::activation::start(&self.socket, cmd, Stdio::inherit()).unwrap();
+        self.child = child;
+        let mut conn = velarx_content::fetcher::fetch_client::FetchConn::new(stream).unwrap();
+        let info = conn.get_info().await;
+        assert!(info.is_ok(), "the example does not answer: {info:?}");
     }
 
     fn stop(&mut self) {

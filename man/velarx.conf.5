@@ -155,7 +155,7 @@ names of
 the destination's own pusher always follows them and is not named),
 and the process of each scheme that is none of velarx's own
 .RB ( [[transports]] :
-.BR scheme ", " socket ", " idle_timeout_secs " and " credentials ;
+.BR scheme ", " socket " or " command ", " idle_timeout_secs " and " credentials ;
 a top level table for both directions: it serves
 .B org.velarx.Fetcher
 and/or
@@ -191,12 +191,26 @@ The helper pushers
 separate processes that speak
 .IR org.velarx.Pusher ,
 asked before the destination's own pusher
-.RB ( name ", " socket ", " idle_timeout_secs ", " credentials ).
+.RB ( name ", " socket " or " command ", " idle_timeout_secs ", " credentials ).
 The process serving
 .B socket
 must run as the user of the engine or as root; the engine checks it
 .RB ( SO_PEERCRED )
 on every connection and refuses another.
+Instead of
+.B socket
+an entry (a source, a sink or a
+.BR [[transports]] )
+may have a
+.BR command :
+a list, the absolute path of a program and its arguments (no shell), exactly
+one of the two.
+The engine starts it for each use, with the connection to it as its
+descriptor 3, nothing added to its arguments, an empty environment and the
+user of the engine; the program leaves at the end of the connection, and the
+engine kills it when it is silent for
+.BR idle_timeout_secs .
+It is for a program that keeps nothing between uses.
 .TP
 .B build
 The builds: what an extraction may write, the builds that run or wait at

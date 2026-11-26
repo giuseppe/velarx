@@ -704,27 +704,26 @@ impl ImageService {
     }
 
     /// Connections to the fetchers of `names` but the registry fetcher, in
-    /// their order: a fetcher of `[[sources.external]]` on its socket, or the
-    /// fetcher of a `dir`, a confined process of its own for this connection.  A
-    /// fetcher that cannot be reached is left out.
+    /// their order: a fetcher of `[[sources.external]]` on its socket or
+    /// started for the pull (`command`), or the fetcher of a `dir`, a
+    /// confined process of its own for this connection.  A fetcher that
+    /// cannot be reached is left out.
     pub(super) async fn source_links(
         &self,
         names: &[String],
     ) -> Vec<velarx_content::pull::staged_fetch::Link> {
-        use velarx_content::fetcher::fetch_client::FetchConn;
         use velarx_content::pull::staged_fetch::Link;
         let mut links = Vec::new();
         for name in names.iter().filter(|n| *n != "registry") {
             let Some(def) = self.fetchers.iter().find(|f| f.name == *name) else {
                 continue;
             };
-            let conn = match (&def.dir, &def.socket) {
-                (Some(dir), _) => match self.origin() {
+            let conn = match &def.dir {
+                Some(dir) => match self.origin() {
                     Ok(origin) => origin.connect_dir(name, dir).await,
                     Err(e) => Err(std::io::Error::other(e.to_string())),
                 },
-                (None, Some(socket)) => FetchConn::connect_checked(socket).await,
-                (None, None) => continue,
+                None => velarx_content::list::connect_reach(&def.reach()).await,
             };
             match conn {
                 Ok(conn) => links.push(Link {

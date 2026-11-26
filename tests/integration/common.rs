@@ -1826,6 +1826,7 @@ pub fn chain_of(sockets: &[&std::path::Path]) -> Fetchers {
             .map(|(i, s)| velarx_config::ExternalSourceConfig {
                 name: format!("source{i}"),
                 socket: Some(s.to_path_buf()),
+                command: Vec::new(),
                 dir: None,
                 idle_timeout_secs: velarx_config::default_source_idle_secs(),
                 settings: Default::default(),

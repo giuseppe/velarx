@@ -4,18 +4,29 @@
 //!
 //! ```sh
 //! mkdir -p cache && cp layer.tar.gz cache/$(sha256sum layer.tar.gz | cut -d' ' -f1)
-//! cargo run --example dircache -- "$XDG_RUNTIME_DIR/velarx/services/dircache.sock" cache
 //! ```
 //!
-//! and in `config.toml`:
+//! It keeps nothing between pulls, so the engine can start it for each use:
+//! the connection to it is its descriptor 3, and it leaves at its end.  In
+//! `config.toml`:
+//!
+//! ```toml
+//! [[sources.external]]
+//! name = "dircache"
+//! command = ["/usr/local/bin/dircache", "/var/cache/layers"]
+//!
+//! [pull]
+//! sources = ["dircache", "registry"]
+//! ```
+//!
+//! Or as a service that runs: a socket unit (`ListenStream=`, `Accept=no`)
+//! starts it with the listening socket as descriptor 3, and the entry names
+//! that socket:
 //!
 //! ```toml
 //! [[sources.external]]
 //! name = "dircache"
 //! socket = "/run/user/1000/velarx/services/dircache.sock"
-//!
-//! [pull]
-//! sources = ["dircache", "registry"]
 //! ```
 //!
 //! A file of a layer is staged from the file of its content, or from the
@@ -24,40 +35,22 @@
 //! prefix.  The engine checks everything this stages; the interface
 //! (`org.velarx.Fetcher`) is `interfaces/org.velarx.Fetcher.varlink`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use velarx_content::dir_fetch::DirFetch;
-use velarx_content::serve_fetch::{self, FetchEndpoint};
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> std::io::Result<()> {
-    velarx_wire::sdnotify::take_manager_env();
+fn main() -> std::io::Result<()> {
+    // (first thing: it notes the descriptors it was passed)
+    let startup = velarx_sys::fd::Startup::take().expect("the first call");
     let mut args = std::env::args_os().skip(1);
-    let (Some(socket), Some(dir)) = (args.next(), args.next()) else {
-        eprintln!("usage: dircache <socket> <directory>");
+    let (Some(dir), None) = (args.next().map(PathBuf::from), args.next()) else {
+        eprintln!("usage: dircache <directory>");
         std::process::exit(2);
     };
-    let (socket, dir) = (PathBuf::from(socket), PathBuf::from(dir));
-    if !Path::new(&dir).is_dir() {
+    if !dir.is_dir() {
         eprintln!("{} is not a directory", dir.display());
         std::process::exit(2);
     }
-    // The socket is created with mode 0600 in a directory of mode 0700, and
-    // only this user (and root) can talk to it.
-    let listener = velarx_base::ipc::bind_private(&socket)?;
-    listener.set_nonblocking(true)?;
-    // (a service manager, or a test, learns that it serves)
-    velarx_wire::sdnotify::notify("READY=1");
-    let listener = tokio::net::UnixListener::from_std(listener)?;
-    let endpoint = FetchEndpoint::new(DirFetch::new("dircache", dir));
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            tokio::select! {
-                _ = serve_fetch::serve(listener, endpoint, None, velarx_base::ipc::trusted_uid, velarx_content::activation::Limits::default()) => {}
-                _ = tokio::signal::ctrl_c() => {}
-            }
-        })
-        .await;
-    let _ = std::fs::remove_file(&socket);
-    Ok(())
+    let api = DirFetch::new("dircache", dir);
+    let limits = velarx_content::activation::Limits::default();
+    velarx_content::serve_fetch::run_descriptor_3(&startup, api, limits)
 }

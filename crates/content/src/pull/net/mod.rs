@@ -178,7 +178,7 @@ mod tests {
     #[tokio::test]
     async fn a_tag_without_a_registry_says_it_needs_one() {
         let net = Net::Origin(origin::OriginNet::of_transport(
-            "/nonexistent/velarx-registry.sock".into(),
+            velarx_config::Reach::Socket("/nonexistent/velarx-registry.sock".into()),
             std::time::Duration::from_secs(5),
             "docker://example.com/a".into(),
             true,
@@ -202,7 +202,7 @@ mod tests {
         // (a socket that would be an error of another kind if it were used)
         let net = Net::Origin(
             origin::OriginNet::of_transport(
-                "/nonexistent/velarx-registry.sock".into(),
+                velarx_config::Reach::Socket("/nonexistent/velarx-registry.sock".into()),
                 std::time::Duration::from_secs(5),
                 "docker://example.com/a".into(),
                 true,

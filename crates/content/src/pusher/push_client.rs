@@ -114,7 +114,7 @@ impl FetchConn {
             .into_iter()
             .next()
             .ok_or_else(|| CallError::Protocol("Connect carried no connection".into()))?;
-        Ok(FetchConn::new(std::os::unix::net::UnixStream::from(fd))?)
+        Ok(self.handed(fd)?)
     }
 
     /// Replace the credentials of the scope.

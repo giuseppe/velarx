@@ -640,7 +640,8 @@ async fn test_a_transport_is_an_origin_of_pulls() {
     .unwrap();
     let b = env_transports(vec![velarx_config::TransportConfig {
         scheme: "s3".into(),
-        socket,
+        socket: Some(socket),
+        command: Vec::new(),
         idle_timeout_secs: 15,
         credentials: false,
     }])

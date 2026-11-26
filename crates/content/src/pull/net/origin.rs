@@ -141,9 +141,9 @@ enum Via {
     Registry(Arc<RegistryOrigin>),
     /// `velarx-dir --origin`: a path
     Path(Arc<PathOrigin>),
-    /// The process of a `[[transports]]`, on its socket, and how long it may
-    /// be silent in a call (its `idle_timeout_secs`)
-    Transport(std::path::PathBuf, std::time::Duration),
+    /// The process of a `[[transports]]`, as its entry reaches it, and how
+    /// long it may be silent in a call (its `idle_timeout_secs`)
+    Transport(velarx_config::Reach, std::time::Duration),
 }
 
 /// Where one pull gets its metadata: the registry fetcher, on a connection
@@ -204,17 +204,17 @@ impl OriginNet {
         }
     }
 
-    /// Where the metadata of a pull from the transport on `socket` comes
+    /// Where the metadata of a pull from the transport at `reach` comes
     /// from: its process, scoped to `location` (`SCHEME://...`) and with
     /// the credentials of the command.
     pub fn of_transport(
-        socket: std::path::PathBuf,
+        reach: velarx_config::Reach,
         idle: std::time::Duration,
         location: String,
         tls_verify: bool,
     ) -> Self {
         Self {
-            via: Via::Transport(socket, idle),
+            via: Via::Transport(reach, idle),
             repository: location,
             tls_verify,
             access: None,
@@ -259,8 +259,8 @@ impl OriginNet {
                 Via::Registry(origin) => origin.connect().await.map_err(|e| {
                     ImageError::transfer(REGISTRY, FailureClass::Transient, e.to_string())
                 })?,
-                Via::Transport(socket, _) => {
-                    let mut conn = FetchConn::connect_checked(socket).await.map_err(|e| {
+                Via::Transport(reach, _) => {
+                    let mut conn = crate::list::connect_reach(reach).await.map_err(|e| {
                         ImageError::transfer(self.party(), FailureClass::Unavailable, e.to_string())
                     })?;
                     // (a transport that does not serve a pull says so)
@@ -793,7 +793,7 @@ mod tests {
         let (sources, _keep) = sources_of(body).await;
         // (a socket that would be an error of another kind if it were used)
         let net = OriginNet::of_transport(
-            "/nonexistent/velarx-registry.sock".into(),
+            velarx_config::Reach::Socket("/nonexistent/velarx-registry.sock".into()),
             std::time::Duration::from_secs(5),
             "docker://example.com/a".into(),
             true,

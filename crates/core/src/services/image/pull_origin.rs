@@ -25,7 +25,7 @@ pub(super) enum Via {
     Path(Arc<velarx_content::pull::net::origin::PathOrigin>),
     /// A transport's process, scoped to the location of the pull
     Transport {
-        socket: PathBuf,
+        reach: velarx_config::Reach,
         location: String,
         tls_verify: bool,
         access: Option<velarx_content::fetcher::fetch_client::Access>,
@@ -116,7 +116,7 @@ impl ImageService {
         sources: Option<&[String]>,
         manifest: &[u8],
     ) -> ImageResult<Arc<velarx_content::pull::staged_fetch::StagedFetch>> {
-        use velarx_content::fetcher::fetch_client::{Access, FetchConn, Scoping};
+        use velarx_content::fetcher::fetch_client::{Access, Scoping};
         use velarx_content::pull::net::origin::image_error_of;
         use velarx_content::pull::staged_fetch::StagedFetch;
         let names = self.origin_sources(sources)?;
@@ -125,20 +125,22 @@ impl ImageService {
         let (end, name) = match via {
             Via::Path(path) => (path.connect().await?, via.party().to_string()),
             Via::Transport {
-                socket,
+                reach,
                 location,
                 tls_verify,
                 access,
                 scheme,
                 idle,
             } => {
-                let mut conn = FetchConn::connect_checked(socket).await.map_err(|e| {
-                    ImageError::transfer(
-                        scheme.clone(),
-                        velarx_proto::transfer::FailureClass::Unavailable,
-                        e.to_string(),
-                    )
-                })?;
+                let mut conn = velarx_content::list::connect_reach(reach)
+                    .await
+                    .map_err(|e| {
+                        ImageError::transfer(
+                            scheme.clone(),
+                            velarx_proto::transfer::FailureClass::Unavailable,
+                            e.to_string(),
+                        )
+                    })?;
                 conn.get_info()
                     .await
                     .map_err(|e| image_error_of(scheme, e))?;
@@ -237,7 +239,7 @@ impl ImageService {
                 (
                     Net::Origin(
                         OriginNet::of_transport(
-                            def.socket.clone(),
+                            def.reach(),
                             std::time::Duration::from_secs(def.idle_timeout_secs),
                             location.clone(),
                             options.tls_verify,
@@ -245,7 +247,7 @@ impl ImageService {
                         .with_access(access.clone()),
                     ),
                     Via::Transport {
-                        socket: def.socket.clone(),
+                        reach: def.reach(),
                         location: location.clone(),
                         tls_verify: options.tls_verify,
                         access,

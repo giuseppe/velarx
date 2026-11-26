@@ -764,6 +764,14 @@ timeout_secs = 60
 # [[sources.external]]
 # name = "dircache"
 # socket = "/run/user/1000/velarx/services/dircache.sock"
+# Or, instead of `socket`, a program the engine starts for each use that
+# keeps nothing between uses (exactly one of `socket`, `command` and `dir`):
+# the absolute path of the program and its arguments, no shell.  The
+# connection to it is its descriptor 3, nothing is added to its arguments,
+# its environment is empty, and it leaves at the end of the connection (the
+# engine kills it when it is silent for the idle time).  It runs as the user
+# of the engine.  examples/dircache.rs works both ways.
+# command = ["/usr/local/bin/dircache", "/var/cache/layers"]
 # Seconds without a reply after which the source is given up
 # idle_timeout_secs = 15
 #
@@ -1076,6 +1084,8 @@ cidr = "10.192.0.0/10"
 # [[sinks.external]]
 # name = "backup"
 # socket = "/run/user/1000/velarx/services/backup.sock"
+# (or `command = [...]` instead, as for [[sources.external]]: the program is
+# started for each push, exactly one of the two)
 # idle_timeout_secs = 15
 # credentials = false
 #
@@ -1100,5 +1110,7 @@ cidr = "10.192.0.0/10"
 # [[transports]]
 # scheme = "s3"
 # socket = "/run/user/1000/velarx/services/s3.sock"
+# (or `command = [...]` instead, as for [[sources.external]]: the program is
+# started for each pull or push, exactly one of the two)
 # idle_timeout_secs = 15
 # credentials = false

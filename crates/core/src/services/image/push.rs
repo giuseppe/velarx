@@ -241,21 +241,20 @@ impl ImageService {
     }
 
     /// Connections to the helper sinks `names`, in their order, each on its
-    /// socket.  A sink named by the push (`explicit`) that cannot be reached
+    /// socket or started for the push (`command`).  A sink named by the push (`explicit`) that cannot be reached
     /// is an error; one of `[push] sinks` is left out.
     async fn helper_links(
         &self,
         names: &[String],
         explicit: bool,
     ) -> ImageResult<Vec<velarx_content::push::staged_push::PushLink>> {
-        use velarx_content::fetcher::fetch_client::FetchConn;
         use velarx_content::push::staged_push::PushLink;
         let mut links = Vec::new();
         for name in names {
             let Some(def) = self.sinks.iter().find(|f| f.name == *name) else {
                 continue;
             };
-            match FetchConn::connect_checked(&def.socket).await {
+            match velarx_content::list::connect_reach(&def.reach()).await {
                 Ok(conn) => links.push(PushLink {
                     name: name.clone(),
                     conn,
@@ -361,16 +360,15 @@ impl ImageService {
                 velarx_types::transport::ImageLocation::external(&transport.destination)
                     .map_err(|e| ImageError::Invalid(e.to_string()))?;
                 let def = self.transport_of(&transport.scheme)?;
-                let end =
-                    velarx_content::fetcher::fetch_client::FetchConn::connect_checked(&def.socket)
-                        .await
-                        .map_err(|e| {
-                            ImageError::transfer(
-                                transport.scheme.clone(),
-                                velarx_proto::transfer::FailureClass::Unavailable,
-                                e.to_string(),
-                            )
-                        })?;
+                let end = velarx_content::list::connect_reach(&def.reach())
+                    .await
+                    .map_err(|e| {
+                        ImageError::transfer(
+                            transport.scheme.clone(),
+                            velarx_proto::transfer::FailureClass::Unavailable,
+                            e.to_string(),
+                        )
+                    })?;
                 let access = if def.credentials {
                     // (the credentials of `SCHEME://AUTHORITY` and nothing
                     // a docker reference may mean, whatever tls_verify)

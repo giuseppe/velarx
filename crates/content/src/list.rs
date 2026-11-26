@@ -207,9 +207,8 @@ impl Inputs {
 }
 
 /// A fetcher that is this process's alone: started with the one
-/// connection to it as a descriptor (`--varlink-fd`), no socket in the file
-/// system, and gone when the connection (and every one it handed out) is
-/// closed.
+/// connection to it as its descriptor 3, no socket in the file system, and
+/// gone when the connection (and every one it handed out) is closed.
 pub struct Private {
     /// This end of the connection
     pub stream: std::os::unix::net::UnixStream,
@@ -219,24 +218,29 @@ pub struct Private {
 
 impl Private {
     /// The connection as a client, the process left to a thread that waits
-    /// for it (a fetcher that ended is not a zombie of this process).
+    /// for it (a fetcher that ended is not a zombie of this process).  This
+    /// connection, or one it hands out, dropped while a call is in flight
+    /// (given up, as for silence) kills the process; connections that end
+    /// between calls do not: the process leaves by itself at end of file.
     pub fn connect(self) -> io::Result<FetchConn> {
         let Self { stream, mut child } = self;
+        // (before the thread that reaps it: the number is not reused until then)
+        let pid = rustix::process::Pid::from_child(&child);
+        let process = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())?;
         std::thread::Builder::new()
             .name("fetcher-reaper".into())
             .spawn(move || {
                 let _ = child.wait();
             })?;
-        FetchConn::new(stream)
+        Ok(FetchConn::new(stream)?.killing(process))
     }
 }
 
-/// Start `inputs.exe` with `args` and the connection to it as its
-/// descriptor 3 (the configuration is 4 and the staging 5).
-fn spawn_private(inputs: &Inputs, args: &[&str], staging: bool) -> io::Result<Private> {
+/// Start `cmd` with the connection to it as its descriptor 3 and `extra`
+/// as 4, 5, ...: standard input and output are `/dev/null`, the directory
+/// is `/`, and no other descriptor is passed.
+fn spawn_private(mut cmd: std::process::Command, extra: Vec<OwnedFd>) -> io::Result<Private> {
     use std::os::fd::AsRawFd;
-    let (mut cmd, extra) = inputs.command(&[], staging)?;
-    cmd.args(args).args(["--varlink-fd", "3"]);
     let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
     cmd.current_dir("/")
         .stdin(std::process::Stdio::null())
@@ -253,11 +257,50 @@ fn spawn_private(inputs: &Inputs, args: &[&str], staging: bool) -> io::Result<Pr
     })
 }
 
+/// Start one of our programs (`inputs.exe`) with `args` and the
+/// connection to it as `--varlink-fd 3` (the configuration is 4 and the
+/// staging 5).
+fn spawn_ours(inputs: &Inputs, args: &[&str], staging: bool) -> io::Result<Private> {
+    let (mut cmd, extra) = inputs.command(&[], staging)?;
+    cmd.args(args).args(["--varlink-fd", "3"]);
+    spawn_private(cmd, extra)
+}
+
+/// Start the program `command` (its path, absolute, and its arguments; no
+/// shell) for one use: the connection to it is its descriptor 3, nothing is
+/// added to its arguments, and its environment is empty.  Its standard
+/// error is ours.
+pub fn private_command(command: &[String]) -> io::Result<Private> {
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "an empty command"))?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args).env_clear();
+    spawn_private(cmd, Vec::new())
+}
+
+/// A connection to the program `reach` names: on its socket, or to
+/// the one started for it ([`private_command`]).
+pub async fn connect_reach(reach: &velarx_config::Reach) -> io::Result<FetchConn> {
+    match reach {
+        velarx_config::Reach::Socket(socket) => FetchConn::connect_checked(socket).await,
+        velarx_config::Reach::Command(command) => connect_command(command).await,
+    }
+}
+
+/// A connection to `command` started for it ([`private_command`]).
+async fn connect_command(command: &[String]) -> io::Result<FetchConn> {
+    let command = command.to_vec();
+    tokio::task::spawn_blocking(move || private_command(&command)?.connect())
+        .await
+        .map_err(io::Error::other)?
+}
+
 /// Start a registry fetcher for `config` with a connection of its own (see
 /// [`Private`]; [`shared_registry`] is the one several processes find by
 /// its socket).
 pub fn private_registry(config: &Config) -> io::Result<Private> {
-    spawn_private(&Inputs::of(config)?, &[], true)
+    spawn_ours(&Inputs::of(config)?, &[], true)
 }
 
 /// Start the fetcher of the directory `dir` (items named by their
@@ -272,7 +315,7 @@ pub fn private_dir(config: &Config, name: &str, dir: &Path) -> io::Result<Privat
     // (it reads a directory: no home, no credentials, no proxy, no helper)
     inputs.environment.clear();
     inputs.json = settings_json(config)?;
-    spawn_private(&inputs, &["--name", name, "--dir", &dir], true)
+    spawn_ours(&inputs, &["--name", name, "--dir", &dir], true)
 }
 
 /// What `velarx-dir` does for one path it is told by `Open`: it writes the
@@ -302,7 +345,7 @@ pub fn private_dir_origin(config: &Config, direction: Direction) -> io::Result<P
     inputs.exe = dir_binary(config);
     inputs.environment.clear();
     inputs.json = settings_json(config)?;
-    spawn_private(&inputs, &[direction.flag()], direction == Direction::Pull)
+    spawn_ours(&inputs, &[direction.flag()], direction == Direction::Pull)
 }
 
 fn settings_json(config: &Config) -> io::Result<Vec<u8>> {
@@ -655,5 +698,123 @@ mod tests {
         )
         .unwrap();
         shared_registry(&config).unwrap();
+    }
+
+    fn sh(script: &str, arg: &str) -> Vec<String> {
+        ["/bin/sh", "-c", script, arg].map(String::from).to_vec()
+    }
+
+    const GONE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The program gets the connection as its descriptor 3, the directory
+    /// `/` and no environment, and what it writes there is what the
+    /// engine reads until the program ends.
+    #[test]
+    fn a_command_is_started_with_the_connection_as_descriptor_3() {
+        use std::io::Read;
+        let script = "echo \"$PWD\" >&3; /usr/bin/env >&3";
+        let mut private = private_command(&sh(script, "")).unwrap();
+        let mut said = String::new();
+        private.stream.read_to_string(&mut said).unwrap();
+        assert!(said.starts_with("/\n"), "{said}");
+        assert!(!said.contains("HOME=") && !said.contains("PATH="), "{said}");
+        assert!(private.child.wait().unwrap().success());
+    }
+
+    /// A command that cannot be started is an error at once, and one that
+    /// exits before it answers is a connection that fails.
+    #[tokio::test]
+    async fn a_command_that_does_not_run_is_an_error() {
+        assert!(private_command(&["/nonexistent/program".into()]).is_err());
+        assert!(private_command(&[]).is_err());
+        let private = private_command(&["/bin/true".into()]).unwrap();
+        let pid = private.child.id() as i32;
+        let mut conn = private.connect().unwrap();
+        assert!(conn.get_info().await.is_err());
+        assert!(velarx_base::testing::wait_exit(pid, GONE));
+    }
+
+    /// The end of the connection ends the program, and does not kill it:
+    /// it was let to finish what it does at end of file.
+    #[tokio::test]
+    async fn the_end_of_the_connection_ends_the_program() {
+        let tmp = tempfile::tempdir().unwrap();
+        let done = tmp.path().join("done");
+        let script = "cat <&3; touch \"$0\"";
+        let private = private_command(&sh(script, &done.to_string_lossy())).unwrap();
+        let pid = private.child.id() as i32;
+        drop(private.connect().unwrap());
+        assert!(velarx_base::testing::wait_exit(pid, GONE));
+        assert!(done.exists(), "the program was killed");
+    }
+
+    /// A program that is silent for its idle time is given up: the call
+    /// ends with the silence, and the process is killed with the connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_program_that_is_silent_is_killed() {
+        let private = private_command(&sh("exec sleep 100000", "")).unwrap();
+        let pid = private.child.id() as i32;
+        let mut conn = private.connect().unwrap();
+        let idle = std::time::Duration::from_secs(5);
+        let e = crate::idle::within(idle, conn.get_info())
+            .await
+            .unwrap_err();
+        assert!(crate::idle::is_silent(&e));
+        drop(conn);
+        assert!(velarx_base::testing::wait_exit(pid, GONE));
+    }
+
+    /// A fetcher whose manifests never come.
+    struct Silent;
+
+    #[async_trait::async_trait]
+    impl crate::serve_fetch::StagingFetcher for Silent {
+        fn described(&self) -> crate::serve_fetch::Described {
+            crate::serve_fetch::Described {
+                name: "silent".into(),
+                capabilities: vec!["metadata".into()],
+                max_objects: 1,
+            }
+        }
+
+        async fn get_manifest(
+            &self,
+            _scope: &crate::serve_fetch::Scope,
+            _reference: &str,
+            _max: u64,
+        ) -> Result<(std::fs::File, Option<String>), crate::fetcher::fetch::FetcherError> {
+            std::future::pending().await
+        }
+    }
+
+    /// A call given up on a connection that the program handed out kills
+    /// the program too.
+    #[tokio::test(start_paused = true)]
+    async fn a_program_silent_on_a_connection_it_handed_out_is_killed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("silent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let api = Arc::new(Silent);
+        let _served =
+            crate::serve_fetch::serve_in_thread(listener, api, Default::default()).unwrap();
+        // (the process is started for the connection, whose calls are
+        // served here)
+        let started = private_command(&sh("exec sleep 100000", "")).unwrap();
+        let pid = started.child.id() as i32;
+        let private = Private {
+            stream: std::os::unix::net::UnixStream::connect(&socket).unwrap(),
+            child: started.child,
+        };
+        let mut conn = private.connect().unwrap();
+        let idle = std::time::Duration::from_secs(5);
+        let scope = crate::fetcher::fetch_client::Scoping::bare(idle);
+        conn.open(scope).await.unwrap();
+        let mut handed = conn.connect().await.unwrap();
+        let e = crate::idle::within(idle, handed.get_manifest("a", 1))
+            .await
+            .unwrap_err();
+        assert!(crate::idle::is_silent(&e));
+        drop(handed);
+        assert!(velarx_base::testing::wait_exit(pid, GONE));
     }
 }

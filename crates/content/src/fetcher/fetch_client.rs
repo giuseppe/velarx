@@ -93,6 +93,20 @@ pub struct FetchConn {
     /// A call has replies to come (or was dropped before they were read):
     /// the next call reads and drops them first
     busy: Arc<AtomicBool>,
+    /// The process started for this connection (a pidfd), shared with the
+    /// connections it hands out: killed when one of them is dropped with a
+    /// call in flight
+    process: Option<Arc<OwnedFd>>,
+}
+
+impl Drop for FetchConn {
+    fn drop(&mut self) {
+        if let Some(process) = &self.process {
+            if self.busy.load(Ordering::Acquire) {
+                let _ = rustix::process::pidfd_send_signal(process, rustix::process::Signal::KILL);
+            }
+        }
+    }
 }
 
 /// A reply of a typed call: its record or its error, and its descriptors.
@@ -311,7 +325,22 @@ impl FetchConn {
         Ok(Self {
             conn: Connection::new(stream),
             busy: Arc::default(),
+            process: None,
         })
+    }
+
+    /// The connection of the process `process` (a pidfd) started for it:
+    /// a call that is given up (it was silent) takes the process with it.
+    pub fn killing(mut self, process: OwnedFd) -> Self {
+        self.process = Some(Arc::new(process));
+        self
+    }
+
+    /// The connection `fd` this one's process handed out (`Connect`).
+    pub(crate) fn handed(&self, fd: OwnedFd) -> io::Result<FetchConn> {
+        let mut conn = FetchConn::new(std::os::unix::net::UnixStream::from(fd))?;
+        conn.process = self.process.clone();
+        Ok(conn)
     }
 
     /// A connection to the socket at `path`, served by this user or by
@@ -421,7 +450,7 @@ impl FetchConn {
             .into_iter()
             .next()
             .ok_or_else(|| CallError::Protocol("Connect carried no connection".into()))?;
-        Ok(FetchConn::new(std::os::unix::net::UnixStream::from(fd))?)
+        Ok(self.handed(fd)?)
     }
 
     /// Tell the fetcher of a layer: its staging directory, its table of
