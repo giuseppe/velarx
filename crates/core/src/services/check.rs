@@ -62,6 +62,8 @@ enum Fix {
     /// Nothing can be done here.
     None,
     RemoveFile(PathBuf),
+    /// Remove the temporary file, if no writer holds its lock.
+    RemoveTemp(PathBuf),
     /// Remove the hold in this directory, if nobody holds it.
     RemoveHold(PathBuf),
     /// Forget the rows of these files, which are not in the store.
@@ -722,7 +724,7 @@ impl CheckService {
         for (path, why) in stray {
             scan.findings.push(
                 Finding::of_store("stale_temp", why, Some(path.clone()))
-                    .with(Fix::RemoveFile(path)),
+                    .with(Fix::RemoveTemp(path)),
             );
         }
         for path in orphans {
@@ -1079,6 +1081,16 @@ impl CheckService {
             for f in scan.findings {
                 let action = match &f.fix {
                     Fix::RemoveFile(p) => remove(|| std::fs::remove_file(p), p),
+                    Fix::RemoveTemp(p) => match velarx_storage::remove_abandoned(p) {
+                        Ok(Some(_)) => true,
+                        // (a writer holds it now, or it is gone: the
+                        // finding no longer holds)
+                        Ok(None) => continue,
+                        Err(e) => {
+                            warn!("Cannot remove {}: {e}", p.display());
+                            false
+                        }
+                    },
                     Fix::RemoveHold(p) => match remove_hold(p).await {
                         Ok(true) => true,
                         // (in use now, or gone: the finding no longer holds)

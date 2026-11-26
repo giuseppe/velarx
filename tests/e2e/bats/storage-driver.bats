@@ -103,7 +103,6 @@ teardown_file () {
     # a leftover of the driver is found by the check and removed by its repair
     mkdir -p "$WORKDIR/store/composefs"
     : > "$WORKDIR/store/composefs/.tmp-leftover"
-    touch -d '2 days ago' "$WORKDIR/store/composefs/.tmp-leftover"
     out=$(sh_ system check 2>&1 || true)
     check_match "the leftover is a problem" "stale_temp|temporary file of the composefs" "$out"
 }

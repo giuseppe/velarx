@@ -181,11 +181,18 @@ teardown () {
 
 @test "leftovers: a temporary file and a stale staging directory" {
     mkdir -p "$WORKDIR/store/objects/ab"
-    echo partial > "$WORKDIR/store/objects/ab/.tmpleft"
+    echo partial > "$WORKDIR/store/objects/ab/.linkleft"
     out=$(sh_ system check --max 1h 2>&1); rc=$?
-    check "--max: a temporary file younger than that is no leftover" 0 $rc
+    check "--max: a stray file younger than that is no leftover" 0 $rc
     out=$(sh_ system check --max 0s 2>&1); rc=$?
     check "--max 0s: any is" 125 $rc
+    rm "$WORKDIR/store/objects/ab/.linkleft"
+    # (a temporary file is judged by its lock, not by its age)
+    echo partial > "$WORKDIR/store/objects/ab/.tmpleft"
+    flock "$WORKDIR/store/objects/ab/.tmpleft" "$BIN/velarx" --socket "$ESOCK" system check --repair > /dev/null 2>&1
+    check "a repair keeps a temporary file whose lock is held" 1 "$(ls -A "$WORKDIR/store/objects/ab" | grep -c tmpleft)"
+    out=$(sh_ system check --max 1h 2>&1); rc=$?
+    check "one nobody holds is a leftover, however young" 125 $rc
     mkdir -p "$WORKDIR/store/staging/pull-0123abcd/files"
     out=$(sh_ system check 2>&1); rc=$?
     check "a stale staging directory fails the check" 125 $rc

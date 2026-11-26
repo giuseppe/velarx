@@ -358,9 +358,12 @@ async fn the_store_is_looked_at() {
 #[tokio::test]
 async fn what_may_belong_to_a_running_process_is_left_alone() {
     let (e, _) = pulled().await;
-    let tmp = e.store.root().join("ab").join(".tmpX1y2z3");
-    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
-    std::fs::write(&tmp, b"being written").unwrap();
+    let dir = e.store.root().join("ab");
+    std::fs::create_dir_all(&dir).unwrap();
+    // (a writer holds the lock of its temporary file until it has its name)
+    let (mut written, _lock) = velarx_storage::create_locked(&dir, ".tmp", 0o644).unwrap();
+    std::io::Write::write_all(&mut written, b"being written").unwrap();
+    let tmp = written.path().to_path_buf();
     let held = velarx_content::pull::holds::Hold::create(&e.staging, "pull-0123abcd").unwrap();
     let live = held.path().to_path_buf();
     let svc = CheckService::new(
@@ -1429,4 +1432,22 @@ async fn a_check_of_the_volumes_waits_for_a_change_and_a_change_for_it() {
     assert!(!volumes.volumes_dir().join("a").exists());
     drop(held);
     creating.await.unwrap();
+}
+
+/// A temporary file whose writer holds its lock is kept by a repair, however
+/// old it is; the one of a writer that is gone is a leftover at any age.
+#[tokio::test]
+async fn a_temporary_file_of_a_live_writer_is_kept() {
+    let (e, _id) = pulled().await;
+    let dir = e.store.root().join("ab");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (live, lock) = velarx_storage::create_locked(&dir, ".tmp", 0o644).unwrap();
+    let dead = dir.join(".tmpdead");
+    std::fs::write(&dead, b"abandoned").unwrap();
+    // (a day of grace: the age says nothing)
+    let checker = checker(&e).with_grace(Duration::from_secs(86400));
+    let r = checker.check(&request(true, true)).await.unwrap();
+    assert_eq!(kinds(&r), ["stale_temp"], "{:?}", r.problems);
+    assert!(live.path().exists() && !dead.exists());
+    drop(lock);
 }

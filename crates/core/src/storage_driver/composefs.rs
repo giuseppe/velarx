@@ -1967,7 +1967,8 @@ impl StorageDriver for ComposefsDriver {
         let composefs = objects.parent().unwrap_or(&objects).join(cfs::DIR);
         tokio::task::spawn_blocking(move || stray_images(&composefs, grace))
             .await
-            .map_err(|e| DriverError::storage(NAME, e.to_string()))
+            .map_err(|e| DriverError::storage(NAME, e.to_string()))?
+            .map_err(|e| DriverError::io(NAME, e))
     }
 
     async fn check(
@@ -2419,16 +2420,22 @@ fn set_root(
     .map_err(|e| context("time", e))
 }
 
-/// The temporary files of the composefs directory that are old enough to be
-/// leftovers.
-fn stray_images(composefs: &Path, grace: Duration) -> Vec<(PathBuf, String)> {
+/// The temporary files of the composefs directory that are leftovers: those
+/// of a writer that is gone (`.tmp*`, by their lock) and the others that are
+/// old enough (the image of the probe, which is locked once it is opened
+/// only).
+fn stray_images(composefs: &Path, grace: Duration) -> std::io::Result<Vec<(PathBuf, String)>> {
     let mut found = Vec::new();
     if let Ok(entries) = std::fs::read_dir(composefs) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if (name.starts_with(".tmp") || name.starts_with(".image"))
-                && objects::idle(&entry.path()).is_some_and(|d| d >= grace)
-            {
+            let gone = if name.starts_with(".tmp") && !name.starts_with(PROBE_PREFIX) {
+                velarx_storage::is_abandoned(&entry.path())?
+            } else {
+                (name.starts_with(".tmp") || name.starts_with(".image"))
+                    && objects::idle(&entry.path()).is_some_and(|d| d >= grace)
+            };
+            if gone {
                 found.push((
                     entry.path(),
                     "a temporary file of the composefs images".into(),
@@ -2437,7 +2444,7 @@ fn stray_images(composefs: &Path, grace: Duration) -> Vec<(PathBuf, String)> {
         }
     }
     found.sort();
-    found
+    Ok(found)
 }
 
 /// The options of a driver on a scratch store in `dir`, for the tests of what
@@ -3273,14 +3280,15 @@ mod tests {
                 (".tmp-x".to_string(), "a temporary file in the objects"),
             ]
         );
-        // (a file that changed within the grace period may be being written)
+        // (a file that is not a temporary file and changed within the grace
+        // period may be being written; a temporary file is a leftover when
+        // nobody holds its lock, however young)
         let found = objects::objects(&objects, &recorded, Duration::from_secs(3600)).unwrap();
-        assert!(found.orphans.is_empty() && found.stray.is_empty());
-        assert!(d
-            .leftovers(Duration::from_secs(3600))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(found.orphans.is_empty());
+        assert_eq!(found.stray.len(), 1, "{found:?}");
+        let young = d.leftovers(Duration::from_secs(3600)).await.unwrap();
+        assert_eq!(young.len(), 1, "{young:?}");
+        assert!(young[0].0.ends_with(".tmp1"));
     }
 
     #[test]

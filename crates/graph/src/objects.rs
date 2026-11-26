@@ -99,9 +99,11 @@ pub fn is_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Walk the objects of a store: the temporary files that are old enough to be
+/// Walk the objects of a store: the temporary files (`.tmp*`) whose writer is
+/// gone, the other files that are not objects and are old enough to be
 /// leftovers (with why), and the objects whose digest is not in `recorded`
-/// and are old enough.
+/// and are old enough.  A temporary file is judged by its lock
+/// ([`velarx_storage::create_locked`]), however old it is.
 pub fn objects(
     objects: &Path,
     recorded: &HashSet<String>,
@@ -138,7 +140,12 @@ pub fn objects(
                         }
                     }
                     _ => {
-                        if old(&fpath) {
+                        let gone = if fname.starts_with(".tmp") {
+                            velarx_storage::is_abandoned(&fpath)?
+                        } else {
+                            old(&fpath)
+                        };
+                        if gone {
                             stray.push((fpath, "a temporary file in the objects".into()));
                         }
                     }
@@ -447,6 +454,29 @@ mod tests {
 
     use super::*;
     use crate::DriverErrorKind;
+
+    /// A temporary file is a leftover when its writer is gone, not when it
+    /// is old: one whose lock is held is not named, whatever the grace, and
+    /// the one of a writer that ended is named at once.
+    #[test]
+    fn a_temporary_file_is_judged_by_its_lock() {
+        velarx_base::testing::in_child(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let sub = dir.path().join("ab");
+            std::fs::create_dir(&sub).unwrap();
+            let (temp, lock) = velarx_storage::create_locked(&sub, ".tmp", 0o644).unwrap();
+            let path = temp.path().to_path_buf();
+            let none = HashSet::new();
+            let day = Duration::from_secs(86400);
+            let found = objects(dir.path(), &none, Duration::ZERO).unwrap();
+            assert!(found.stray.is_empty(), "{found:?}");
+            drop(lock);
+            // (old or young: the grace does not matter)
+            let found = objects(dir.path(), &none, day).unwrap();
+            assert_eq!(found.stray.len(), 1, "{found:?}");
+            assert_eq!(found.stray[0].0, path);
+        });
+    }
 
     /// The sweep keeps the known files, hands a dot-temporary one to the
     /// driver whatever its name, and removes and counts the rest; a missing
