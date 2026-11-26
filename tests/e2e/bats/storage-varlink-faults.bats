@@ -860,7 +860,9 @@ dir_root () { printf 'root={"kind":"directory","path":"%s","idmap":"none","label
     mount -t tmpfs tmpfs "$sub/mnt"
     echo mounted > "$sub/mnt/m"
     fault CreateRoot patch "$(dir_root sub)"
-    ec container create --name sm --network none "$IMAGE" sh -c 'ls /mnt > /seen' > /dev/null
+    # (no SELinux label: the engine labels the root WritableRoot gives, which
+    # a fault cannot change, so the files of this one keep the test's label)
+    ec container create --name sm --network none --security-opt label=disable "$IMAGE" sh -c 'ls /mnt > /seen' > /dev/null
     check "a create with a directory root" 0 $?
     fault Mounts patch "$(dir_root sub)"
     ec container start --attach sm > /dev/null
