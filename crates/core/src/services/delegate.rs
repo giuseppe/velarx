@@ -264,6 +264,27 @@ fn remove_tree(dir: &Path) -> io::Result<()> {
     std::fs::remove_dir(dir)
 }
 
+/// A daemon that ends makes no more of its cgroup `velarx-PID` ([`sibling`])
+/// than a directory nothing removes: it goes back into the cgroup `started`
+/// it was in before, then the tree goes.  A cgroup that is not the one
+/// [`sibling`] made (the manager's scope, a unit's cgroup the daemon
+/// keeps) is not touched.  The tree stays where `started` is gone (a leaf
+/// is the only cgroup a process may enter) or a container still runs in it:
+/// the kernel refuses to remove it.
+pub fn release(pid: u32, started: &str) {
+    let Some(parent) = Path::new(started).parent() else {
+        return;
+    };
+    let own = parent.join(format!("velarx-{pid}"));
+    match velarx_base::cgroup::of_process(Some(pid as i32)) {
+        Ok(now) if Path::new(&now) == own.join(DAEMON_CGROUP) => {}
+        _ => return,
+    }
+    if std::fs::write(full(started).join("cgroup.procs"), pid.to_string()).is_ok() {
+        let _ = remove_tree(&full(&own.to_string_lossy()));
+    }
+}
+
 /// Why the daemon does not own the cgroup `cg`.
 fn why_not_owned(cg: &Path, pid: u32) -> String {
     let own = if cg.ends_with(DAEMON_CGROUP) {
@@ -492,5 +513,41 @@ mod tests {
         let got = got.unwrap();
         assert!(got.ends_with(&format!("/velarx-{pid}")), "{got}");
         assert_eq!(moved.unwrap(), got);
+    }
+
+    /// A child stands for the daemon, in `velarx-PID/engine` next to the
+    /// cgroup of the test as `delegated_cgroup` and `prepare` leave a
+    /// daemon: it goes back where it started and the tree goes.
+    #[test]
+    fn a_daemon_that_ends_takes_its_cgroup_away() {
+        let started = velarx_base::cgroup::of_process(None).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .unwrap();
+        let made = sibling(&started, child.id(), Limits::default()).and_then(|own| {
+            let engine = full(&own).join(DAEMON_CGROUP);
+            std::fs::create_dir(&engine)
+                .and_then(|()| std::fs::write(engine.join("cgroup.procs"), child.id().to_string()))
+                .map(|()| full(&own))
+                .map_err(|e| e.to_string())
+        });
+        let own = match made {
+            Ok(own) => own,
+            Err(e) => {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                eprintln!("skipped: no cgroup can be made next to the test's: {e}");
+                return;
+            }
+        };
+        release(child.id(), &started);
+        let back = velarx_base::cgroup::of_process(Some(child.id() as i32));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let left = own.exists();
+        let _ = remove_tree(&own);
+        assert_eq!(back.unwrap(), started);
+        assert!(!left, "{} is still there", own.display());
     }
 }

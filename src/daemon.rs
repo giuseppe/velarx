@@ -32,8 +32,17 @@ pub fn run(cli: DaemonCli, startup: &velarx_sys::fd::Startup) -> anyhow::Result<
     // cgroup v2 only: no fallback
     velarx_base::cgroup::require_v2().map_err(anyhow::Error::msg)?;
     // A cgroup of its own for the containers of the daemon (rootless too):
-    // before any thread or child exists.
-    if matches!(cli.command, DaemonCommand::Daemon { .. }) && !userns::rootless::marked() {
+    // before any thread or child exists.  Where it started is where it
+    // goes back to when it ends (`delegate::release`).  A restart runs in
+    // the cgroup made then, and is told where it started.
+    let told = std::env::var(STARTED_CGROUP_ENV).ok();
+    std::env::remove_var(STARTED_CGROUP_ENV);
+    let restarted = told.is_some();
+    let started = told.or_else(|| velarx_base::cgroup::of_process(None).ok());
+    if matches!(cli.command, DaemonCommand::Daemon { .. })
+        && !userns::rootless::marked()
+        && !restarted
+    {
         use services::delegate;
         let conf = velarx_config::Config::load_or_default(&cli.config).ok();
         let systemd = conf
@@ -168,12 +177,24 @@ pub fn run(cli: DaemonCli, startup: &velarx_sys::fd::Startup) -> anyhow::Result<
                     lifeline,
                     held,
                     listen_file,
-                ))?;
+                ));
             match ended {
-                Ended::Stop => Ok(()),
                 // (the runtime and its threads are gone)
-                Ended::Restart(listener, own, file, lifeline, holds, upgrade) => {
-                    Err(restart(listener, own, file, lifeline, holds, upgrade))
+                Ok(Ended::Restart(listener, own, file, lifeline, holds, upgrade)) => Err(restart(
+                    listener,
+                    own,
+                    file,
+                    lifeline,
+                    holds,
+                    upgrade,
+                    started.as_deref(),
+                )),
+                // a stop, or a failure
+                ended => {
+                    if let Some(started) = &started {
+                        services::delegate::release(std::process::id(), started);
+                    }
+                    ended.map(|_| ())
                 }
             }
         }
@@ -405,6 +426,7 @@ fn restart(
     lifeline: Option<std::os::fd::OwnedFd>,
     holds: Vec<std::os::fd::OwnedFd>,
     upgrade: bool,
+    started: Option<&str>,
 ) -> anyhow::Error {
     use std::os::unix::process::CommandExt;
     let exe = match engine_service::installed_binary().filter(|_| upgrade) {
@@ -418,6 +440,7 @@ fn restart(
         owns_socket,
         lifeline.as_ref(),
         &holds,
+        started,
     );
     let mut cmd = match restarted {
         Ok(cmd) => cmd,
@@ -429,7 +452,8 @@ fn restart(
 
 /// The command [`restart`] executes: `exe` with the arguments and the
 /// environment of this process, the listener at 3 (its socket file named,
-/// `socket_file`, when it is the daemon's), the lifeline at 4.
+/// `socket_file`, when it is the daemon's), the lifeline at 4, the cgroup
+/// the daemon started in named ([`STARTED_CGROUP_ENV`]).
 /// The holds of the other frontends stay at the numbers of their copies,
 /// which this process owns, named in [`engine_service::HOLD_FDS_ENV`]: a
 /// fixed number may be the descriptor of something another thread still
@@ -442,6 +466,7 @@ fn restart_command(
     owns_socket: bool,
     lifeline: Option<&std::os::fd::OwnedFd>,
     holds: &[std::os::fd::OwnedFd],
+    started: Option<&str>,
 ) -> std::io::Result<std::process::Command> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
@@ -463,6 +488,9 @@ fn restart_command(
         );
     if let Some((dev, ino)) = socket_file {
         cmd.env(LISTEN_FILE_ENV, format!("{dev}:{ino}"));
+    }
+    if let Some(started) = started {
+        cmd.env(STARTED_CGROUP_ENV, started);
     }
     for hold in holds {
         rustix::io::fcntl_setfd(hold, rustix::io::FdFlags::empty())?;
@@ -1467,6 +1495,10 @@ fn build_rest(
 /// removed when the daemon stops), not systemd's.
 const OWN_SOCKET: &str = "velarx-own";
 
+/// The variable that tells a restarted daemon the cgroup it started in,
+/// before the cgroup of its own.
+const STARTED_CGROUP_ENV: &str = "VELARX_STARTED_CGROUP";
+
 fn activated_listener(
     activated: Vec<sdnotify::ActivatedFd>,
 ) -> anyhow::Result<Option<(std::os::unix::net::UnixListener, bool)>> {
@@ -1529,6 +1561,7 @@ mod tests {
             true,
             None,
             &holds,
+            None,
         )
         .unwrap();
         let env = |name: &str| {
