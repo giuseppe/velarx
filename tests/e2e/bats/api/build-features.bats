@@ -256,6 +256,24 @@ EOT
     pm rmi -f localhost/bm:stages > /dev/null 2>&1
 }
 
+@test "Docker build: securityopt takes label, apparmor and seccomp" {
+    local c=$WORKDIR/secopt code
+    mkdir -p "$c"
+    printf 'FROM %s\nRUN grep -E "^Seccomp:" /proc/self/status > /seccomp\n' "$IMG" > "$c/Containerfile"
+    tar -C "$c" -cf "$WORKDIR/secopt.tar" Containerfile
+    code=$(api -g -o "$WORKDIR/out" -w '%{http_code}' -X POST -H "Content-Type: application/x-tar" --data-binary "@$WORKDIR/secopt.tar" \
+        "http://d/v5.0.0/build?t=localhost/bm:secopt&nocache=1&securityopt=%5B%22seccomp%3Dunconfined%22%5D")
+    check "build?securityopt=seccomp=unconfined" 200 "$code"
+    check_match "the steps have no seccomp filter" '^Seccomp:\s+0$' \
+        "$("$CLI" run --rm --network none localhost/bm:secopt cat /seccomp 2>&1)"
+    for opt in no-new-privileges "no-new-privileges%3Dtrue" bogus "bogus%3D1"; do
+        code=$(api -g -o "$WORKDIR/out" -w '%{http_code}' -X POST -H "Content-Type: application/x-tar" --data-binary "@$WORKDIR/secopt.tar" \
+            "http://d/v5.0.0/build?securityopt=%5B%22$opt%22%5D")
+        check "securityopt $opt" 400 "$code"
+    done
+    "$CLI" rmi -f localhost/bm:secopt > /dev/null 2>&1
+}
+
 @test "build --build-context: a directory, an image; COPY --from and RUN --mount from=" {
     local c=$WORKDIR/named
     mkdir -p "$c" "$WORKDIR/extra/sub"

@@ -83,7 +83,7 @@ EOT
 @test "build parameters that ask for what the build lacks are refused" {
     for q in isolation=2 cppflags=-DX \
         ignore=true \
-        rusage=true rusagelogfile=x securityopt=x sourcePolicy=x \
+        rusage=true rusagelogfile=x sourcePolicy=x \
         "idmappingoptions=%7B%22AutoUserNs%22%3Atrue%2C%22AutoUserNsOpts%22%3A%7B%22InitialSize%22%3A1024%7D%7D"; do
         check "build?$q" 501 "$(req POST "/v5.0.0/libpod/build?$q" "@$WORKDIR/ctx.tar" application/x-tar)"
         check_match "build?$q: names it" "not supported" "$(cat "$WORKDIR/out")"

@@ -83,7 +83,7 @@ any ANY * sbom-scanner-command implemented
 any ANY * sbom-scanner-image implemented
 any ANY * seccomp implemented
 any ANY * secrets implemented
-any ANY * securityopt refused
+any ANY * securityopt implemented
 any ANY * setenv implemented
 any ANY * shmsize implemented
 any ANY * skipunusedstages implemented

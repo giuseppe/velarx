@@ -257,6 +257,22 @@ fn run_of(call: &Call, ns: &NsOptions) -> ApiResult<(BuildRun, Vec<(String, Stri
             .into_iter()
             .map(|o| format!("label={o}")),
     );
+    // Docker's `securityopt`: `label=`, `apparmor=` and `seccomp=` values
+    for opt in json_values(call, "securityopt")? {
+        match opt.split_once('=') {
+            Some(("label" | "apparmor" | "seccomp", _)) => security_opts.push(opt),
+            _ if opt.starts_with("no-new-privileges") => {
+                return Err(ApiError::bad_request(format!(
+                    "securityopt `{opt}`: no-new-privileges is not supported"
+                )))
+            }
+            _ => {
+                return Err(ApiError::bad_request(format!(
+                    "invalid securityopt `{opt}`: only label=, apparmor= and seccomp= are taken"
+                )))
+            }
+        }
+    }
     // the output format: only OCI's is written
     match call.q("outputformat").filter(|f| !f.is_empty()) {
         None => {}
@@ -495,7 +511,6 @@ const REFUSED: &[(&str, Given)] = &[
     ),
     ("rusage", Given::True),
     ("rusagelogfile", Given::Any),
-    ("securityopt", Given::Any),
     ("sourcePolicy", Given::Any),
 ];
 
