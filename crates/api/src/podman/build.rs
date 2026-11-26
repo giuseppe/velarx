@@ -420,6 +420,7 @@ fn flags_of(call: &Call) -> ApiResult<BuildFlags> {
         },
         cache_from: json_values(call, "cachefrom")?,
         cache_to: json_values(call, "cacheto")?,
+        run_mounts: json_values(call, "transientRunMounts")?,
         layer_labels: pair_values(call, "layerLabel")?,
         sbom: velarx_proto::buildspec::SbomFlags {
             preset: None,
@@ -489,7 +490,6 @@ const REFUSED: &[(&str, Given)] = &[
     ("securityopt", Given::Any),
     ("sourcePolicy", Given::Any),
     ("stage-labels", Given::True),
-    ("transientRunMounts", Given::Any),
 ];
 
 fn given(rule: Given, values: &[&str]) -> bool {

@@ -920,20 +920,32 @@ impl Build<'_> {
         let esc = self.file.escape;
         let mut specs = Vec::new();
         let mut ssh_index = 0;
+        let own = i.flags.iter().filter(|f| f.starts_with("--mount=")).count();
+        let mut texts = Vec::new();
         for f in i.flags.iter().filter_map(|f| f.strip_prefix("--mount=")) {
-            let f = parse::expand(f, esc, &|n| st.lookup(n)).map_err(|e| step_error(i, e))?;
-            let m = RunMount::parse(&f, &st.workdir, ssh_index).map_err(|e| step_error(i, e))?;
+            texts.push(parse::expand(f, esc, &|n| st.lookup(n)).map_err(|e| step_error(i, e))?);
+        }
+        // (the mounts of the build come after the step's own: on a target
+        // the step mounts itself, the step's wins; two mounts of the build
+        // on one target are an error, as two of the step)
+        texts.extend(self.opts.flags.run_mounts.iter().cloned());
+        for (n, f) in texts.iter().enumerate() {
+            let m = RunMount::parse(f, &st.workdir, ssh_index).map_err(|e| step_error(i, e))?;
             if m.kind == Kind::Ssh {
                 ssh_index += 1;
             }
-            if specs
+            match specs
                 .iter()
-                .any(|(o, _): &(RunMount, _)| o.target == m.target)
+                .position(|(o, _): &(RunMount, _)| o.target == m.target)
             {
-                return Err(step_error(
-                    i,
-                    format!("{}: duplicate mount destination", m.target),
-                ));
+                Some(p) if p < own && n >= own => continue,
+                Some(_) => {
+                    return Err(step_error(
+                        i,
+                        format!("{}: duplicate mount destination", m.target),
+                    ))
+                }
+                None => {}
             }
             let root = match m.kind {
                 Kind::Bind => Some(self.root_of(st, m.from.as_deref()).await?),

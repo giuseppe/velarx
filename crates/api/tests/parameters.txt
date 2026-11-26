@@ -93,7 +93,7 @@ any ANY * stage-labels refused
 any ANY * target implemented
 any ANY * term implemented
 any ANY * timestamp implemented
-any ANY * transientrunmounts refused
+any ANY * transientrunmounts implemented
 any ANY * ulimits implemented
 any ANY * unsetannotation implemented
 any ANY * unsetenv implemented

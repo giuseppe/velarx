@@ -2608,6 +2608,10 @@ type BuildFlags (
 	cache_from: []string,
 	# `--cache-to`: repositories the image of every new step is pushed to.
 	cache_to: []string,
+	# `--mount`: `RUN --mount` values added to every RUN step, after
+	# the step's own, without expansion of the build arguments (on a
+	# target both mount, the step's wins).
+	run_mounts: []string,
 	# `--layer-label`: labels of the intermediate images (not
 	# of the last image of a stage).
 	layer_labels: []BuildPair,

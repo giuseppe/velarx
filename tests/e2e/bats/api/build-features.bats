@@ -197,6 +197,52 @@ ${#mark}
     pm rmi -f localhost/bm:secret localhost/bm:secret-remote > /dev/null 2>&1
 }
 
+@test "build --mount: transient mounts of every RUN step" {
+    local c=$WORKDIR/transient out
+    mkdir -p "$c"
+    printf 'tokvalue' > "$WORKDIR/transient-secret.txt"
+    cat > "$c/Containerfile" <<EOT
+FROM $IMG
+RUN cat /run/secrets/tok > /seen
+RUN echo one > /c/a
+RUN cat /c/a > /cached
+RUN grep ' /t ' /proc/mounts | grep -o 'size=[0-9]*k' > /sizes
+RUN --mount=type=tmpfs,target=/t,size=2m grep ' /t ' /proc/mounts | grep -o 'size=[0-9]*k' >> /sizes
+EOT
+    out=$("$CLI" image build --tls-verify=false --layers --secret id=tok,src="$WORKDIR/transient-secret.txt" \
+        --mount type=secret,id=tok --mount type=cache,target=/c,id=transient$$ --mount type=tmpfs,target=/t,size=1m \
+        -t localhost/bm:transient "$c" 2>&1)
+    check "build --mount" 0 $?
+    check "a secret in every step, not in the image" "tokvalue" \
+        "$("$CLI" run --rm --network none localhost/bm:transient cat /seen 2>&1)"
+    check "the cache is shared by the steps, not in the image" "one" \
+        "$("$CLI" run --rm --network none localhost/bm:transient sh -c 'cat /cached; ls -A /c /run/secrets 2> /dev/null' 2>&1)"
+    check "the step's own mount wins on a target" "size=2048k" \
+        "$("$CLI" run --rm --network none localhost/bm:transient tail -n1 /sizes 2>&1)"
+    # a different mount is not served by the cache of the first build
+    out=$("$CLI" image build --tls-verify=false --layers --secret id=tok,src="$WORKDIR/transient-secret.txt" \
+        --mount type=secret,id=tok --mount type=cache,target=/c,id=transient$$ --mount type=tmpfs,target=/t,size=3m \
+        -t localhost/bm:transient2 "$c" 2>&1)
+    check "build with another mount" 0 $?
+    check "...runs the step again" "size=3072k" \
+        "$("$CLI" run --rm --network none localhost/bm:transient2 sh -c 'head -n1 /sizes' 2>&1)"
+    out=$("$CLI" image build --tls-verify=false --mount type=nfs,target=/x -t localhost/bm:transient3 "$c" 2>&1)
+    check "a bad mount" 125 $?
+    out=$("$CLI" image build --tls-verify=false --mount type=tmpfs,target=/x --mount type=cache,target=/x \
+        -t localhost/bm:transient3 "$c" 2>&1)
+    check "two mounts of the build on one target" 125 $?
+    check_match "...name it" "/x: duplicate mount destination" "$out"
+    # the same through podman's route
+    out=$(pm build --tls-verify=false --secret id=tok,src="$WORKDIR/transient-secret.txt" \
+        --mount type=secret,id=tok --mount type=cache,target=/c,id=transient$$ --mount type=tmpfs,target=/t,size=1m \
+        -t localhost/bm:transient-remote "$c" 2>&1)
+    check "podman build --mount" 0 $?
+    check "podman: a secret in every step, not in the image" "tokvalue" \
+        "$(pm run --rm localhost/bm:transient-remote cat /seen 2>&1)"
+    "$CLI" rmi -f localhost/bm:transient localhost/bm:transient2 > /dev/null 2>&1
+    pm rmi -f localhost/bm:transient-remote > /dev/null 2>&1
+}
+
 @test "build --build-context: a directory, an image; COPY --from and RUN --mount from=" {
     local c=$WORKDIR/named
     mkdir -p "$c" "$WORKDIR/extra/sub"

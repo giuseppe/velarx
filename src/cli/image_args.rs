@@ -1021,6 +1021,9 @@ pub struct BuildExtra {
     /// A repository to push the image of every new step to (needs --layers)
     #[arg(long, value_name = "REPOSITORY")]
     pub cache_to: Vec<String>,
+    /// A mount for every RUN, as RUN --mount (after the step's own), e.g. type=secret,id=ID
+    #[arg(long, value_name = "MOUNT")]
+    pub mount: Vec<String>,
     /// A flag for cpp(1), which preprocesses a Containerfile named *.in
     #[arg(long, value_name = "FLAG", allow_hyphen_values = true)]
     pub cpp_flag: Vec<String>,

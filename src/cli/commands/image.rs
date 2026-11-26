@@ -1351,6 +1351,7 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                 compat_volumes,
                 cache_from,
                 cache_to,
+                mount,
                 layer_label,
                 cpp_flag,
                 sbom,
@@ -1490,6 +1491,7 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                 identity_label,
                 cache_from,
                 cache_to,
+                run_mounts: mount,
                 layer_labels: layer_label
                     .iter()
                     .map(|a| velarx_proto::buildspec::BuildPair::parse(a))

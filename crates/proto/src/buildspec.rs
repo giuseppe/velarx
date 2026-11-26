@@ -99,6 +99,10 @@ pub struct BuildFlags {
     pub cache_from: Vec<String>,
     /// `--cache-to`: repositories the image of every new step is pushed to.
     pub cache_to: Vec<String>,
+    /// `--mount`: `RUN --mount` values added to every RUN step, after
+    /// the step's own, without expansion of the build arguments (on a
+    /// target both mount, the step's wins).
+    pub run_mounts: Vec<String>,
     /// `--layer-label`: labels of the intermediate images (not
     /// of the last image of a stage).
     pub layer_labels: Vec<BuildPair>,
@@ -130,6 +134,7 @@ impl Default for BuildFlags {
             identity_label: None,
             cache_from: Vec::new(),
             cache_to: Vec::new(),
+            run_mounts: Vec::new(),
             layer_labels: Vec::new(),
             sbom: Default::default(),
         }
