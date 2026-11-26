@@ -508,16 +508,34 @@ impl NetworkMode {
     }
 
     /// The modes of a list `a,b`: each piece, trimmed, read as a mode (a
-    /// mode that is no list is one piece).  The options of pasta are a list
-    /// of their own: `pasta:OPTIONS` is one piece.
+    /// mode that is no list is one piece).  The options of pasta and those
+    /// of a network (`NAME:OPTIONS`, `bridge:OPTIONS`) are a list of their
+    /// own: each is one piece.
     pub fn pieces(&self) -> Vec<Self> {
         match self {
-            Self::Pasta(_) => vec![self.clone()],
+            Self::Pasta(_) | Self::Bridge(Some(_)) => vec![self.clone()],
+            Self::Network(n) if Self::options_of(n).is_some() => vec![self.clone()],
             m => m
                 .to_string()
                 .split(',')
                 .map(|piece| Self::parse(piece.trim()))
                 .collect(),
+        }
+    }
+
+    /// NAME and OPTIONS of a network `NAME:OPTIONS` (`cni:NAME` has none).
+    fn options_of(network: &str) -> Option<(&str, &str)> {
+        network.split_once(':').filter(|(name, _)| *name != "cni")
+    }
+
+    /// The network a piece of a list of networks names, without its
+    /// options: NAME of `NAME:OPTIONS`, `bridge` of `bridge:OPTIONS`, any
+    /// other piece itself.
+    pub fn network_name(piece: &str) -> &str {
+        match Self::parse(piece) {
+            Self::Bridge(Some(_)) => "bridge",
+            Self::Network(_) => Self::options_of(piece).map_or(piece, |(name, _)| name),
+            _ => piece,
         }
     }
 

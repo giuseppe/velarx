@@ -55,7 +55,7 @@ pub fn bridge_input(
         };
         attachments.push(Attachment {
             net: n.net_def(),
-            ifname: format!("eth{}", row.idx),
+            ifname: spec.ifname(&row.network_id, row.idx),
             ip,
             mac,
             aliases: row.aliases,

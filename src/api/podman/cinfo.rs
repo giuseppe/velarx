@@ -443,14 +443,19 @@ fn default_pasta(info: &Info) -> Result<bool, velarx_base::ids::IdsError> {
 /// The networks of a container as podman names them.
 fn network_names(info: &Info) -> Result<Vec<String>, velarx_base::ids::IdsError> {
     if !info.cfg.networks.is_empty() {
-        return Ok(info.cfg.networks.clone());
+        return Ok(info
+            .cfg
+            .networks
+            .iter()
+            .map(|n| NetworkMode::network_name(n).to_string())
+            .collect());
     }
     if default_pasta(info)? {
         return Ok(vec!["pasta".to_string()]);
     }
     Ok(match &info.cfg.network_mode {
         NetworkMode::Unset | NetworkMode::Bridge(None) => vec!["podman".to_string()],
-        m => vec![m.to_string()],
+        m => vec![NetworkMode::network_name(&m.to_string()).to_string()],
     })
 }
 
@@ -464,14 +469,15 @@ fn network_mode(info: &Info) -> Result<String, velarx_base::ids::IdsError> {
                 .cfg
                 .networks
                 .first()
+                .map(|n| NetworkMode::network_name(n))
                 .filter(|n| *n != velarx_netdetach::def::DEFAULT_NETWORK)
             {
-                n.clone()
+                n.to_string()
             } else {
                 "bridge".to_string()
             }
         }
-        m => m.to_string(),
+        m => NetworkMode::network_name(&m.to_string()).to_string(),
     })
 }
 

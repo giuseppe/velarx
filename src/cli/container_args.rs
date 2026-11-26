@@ -177,7 +177,9 @@ pub struct CreateArgs {
     #[arg(long)]
     pub add_host: Vec<String>,
 
-    /// Connect a container to a network (can be specified multiple times)
+    /// Connect a container to a network (can be specified multiple times);
+    /// NAME:ip=,ip6=,mac=,alias=,interface_name= gives that network its own
+    /// address, MAC address, aliases and interface name
     #[arg(long, visible_alias = "net")]
     pub network: Vec<String>,
 

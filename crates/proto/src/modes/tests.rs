@@ -204,6 +204,27 @@ fn a_network_mode_is_lossless() {
         [Pasta(Some(s("-T,none")))]
     );
     assert_eq!(NetworkMode::parse(" none").pieces(), [Off]);
+    // so are the options of a network
+    for text in [
+        "n:ip=10.0.0.2,mac=02:00:00:00:00:01",
+        "bridge:alias=a,alias=b",
+    ] {
+        assert_eq!(
+            NetworkMode::parse(text).pieces(),
+            [NetworkMode::parse(text)]
+        );
+    }
+    // and the network a piece names is without them
+    for (piece, name) in [
+        ("n:ip=10.0.0.2,alias=a", "n"),
+        ("n", "n"),
+        ("bridge:alias=a", "bridge"),
+        ("cni:k8s", "cni:k8s"),
+        ("pasta:-T,1", "pasta:-T,1"),
+        ("container:x", "container:x"),
+    ] {
+        assert_eq!(NetworkMode::network_name(piece), name);
+    }
 }
 
 /// The request carries the modes as typed fields and as the text it always

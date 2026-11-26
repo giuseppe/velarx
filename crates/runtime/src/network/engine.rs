@@ -141,8 +141,8 @@ pub struct EtcInfo {
 pub struct Planned {
     pub spec: NetSpec,
     nets: Vec<NetworkDef>,
-    ip: Option<Ipv4Addr>,
-    ip6: Option<Ipv6Addr>,
+    /// What each of `nets` was asked for.
+    options: Vec<NetOptions>,
     aliases: Vec<String>,
     pub etc: EtcInfo,
     /// The published ports (indexes of `spec.ports`) whose host port was
@@ -438,9 +438,108 @@ fn is_default_mode(m: &NetworkMode) -> bool {
     )
 }
 
-/// The networks of a request: the mode and the bridge networks by name (the
-/// CNI network of `cni:NAME`, which may be empty).
-fn parse_modes(req: &NetRequest) -> NetworkResult<(Mode, Vec<String>, Vec<String>, bool)> {
+/// What `--network NAME:OPTIONS` asks of one network: `ip=`, `ip6=`, `mac=`,
+/// `alias=` (any number of times) and `interface_name=`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NetOptions {
+    ip: Option<Ipv4Addr>,
+    ip6: Option<Ipv6Addr>,
+    mac: Option<[u8; 6]>,
+    aliases: Vec<String>,
+    ifname: Option<String>,
+}
+
+/// Give `slot` its VALUE: once.
+fn set_once<T>(slot: &mut Option<T>, key: &str, value: T) -> NetworkResult<()> {
+    match slot.replace(value) {
+        None => Ok(()),
+        Some(_) => Err(NetworkError::InvalidConfig(format!(
+            "the network option `{key}` is given more than once"
+        ))),
+    }
+}
+
+impl NetOptions {
+    /// The options of the list `a=b,c=d` of the network `network`.
+    fn parse(network: &str, list: &str) -> NetworkResult<Self> {
+        let bad = |what: &str, v: &str| {
+            NetworkError::InvalidConfig(format!("invalid {what} `{v}` of the network `{network}`"))
+        };
+        let mut o = Self::default();
+        for option in list.split(',').filter(|o| !o.is_empty()) {
+            let (key, v) = option
+                .split_once('=')
+                .ok_or_else(|| bad("network option", option))?;
+            match key {
+                "ip" => set_once(
+                    &mut o.ip,
+                    key,
+                    v.parse().map_err(|_| bad("IPv4 address", v))?,
+                )?,
+                "ip6" => set_once(
+                    &mut o.ip6,
+                    key,
+                    v.parse().map_err(|_| bad("IPv6 address", v))?,
+                )?,
+                "mac" => set_once(
+                    &mut o.mac,
+                    key,
+                    addr::parse_mac(v).ok_or_else(|| bad("MAC address", v))?,
+                )?,
+                "alias" if !v.is_empty() => o.aliases.push(v.to_string()),
+                "interface_name" if addr::valid_ifname(v) => {
+                    set_once(&mut o.ifname, key, v.to_string())?
+                }
+                "interface_name" => return Err(bad("interface name", v)),
+                _ => return Err(bad("network option", option)),
+            }
+        }
+        Ok(o)
+    }
+}
+
+/// The first `ethN` that is none of `taken`.
+fn free_ifname<'a>(taken: impl Iterator<Item = &'a str> + Clone) -> String {
+    (0..)
+        .map(|i| format!("eth{i}"))
+        .find(|n| !taken.clone().any(|t| t == n))
+        .expect("an endless list of names")
+}
+
+/// The interface names of the networks: the one each asked for, else the
+/// first `ethN` that no other network has.  Two networks cannot ask for one
+/// name.
+fn ifnames(options: &[NetOptions]) -> NetworkResult<Vec<String>> {
+    let asked: Vec<&str> = options.iter().filter_map(|o| o.ifname.as_deref()).collect();
+    for (i, name) in asked.iter().enumerate() {
+        if asked[..i].contains(name) {
+            return Err(NetworkError::InvalidConfig(format!(
+                "the interface name `{name}` is asked for by more than one network"
+            )));
+        }
+    }
+    let mut names: Vec<String> = Vec::new();
+    for o in options {
+        let name = match &o.ifname {
+            Some(n) => n.clone(),
+            None => free_ifname(
+                asked
+                    .iter()
+                    .copied()
+                    .chain(names.iter().map(String::as_str)),
+            ),
+        };
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// A network by name (the CNI network of `cni:NAME` may be empty) and its
+/// options.
+type NamedNet = (String, NetOptions);
+
+/// The networks of a request: the mode and the bridge networks.
+fn parse_modes(req: &NetRequest) -> NetworkResult<(Mode, Vec<NamedNet>, Vec<String>, bool)> {
     // `a,b` is a list of networks
     let names: Vec<NetworkMode> = if !req.networks.is_empty() {
         req.networks
@@ -464,7 +563,12 @@ fn parse_modes(req: &NetRequest) -> NetworkResult<(Mode, Vec<String>, Vec<String
                 // bridge` is the default network too); nothing or
                 // `default` is the default mode.
                 implicit = *n != NetworkMode::Bridge(None);
-                bridges.push(String::new());
+                bridges.push((String::new(), NetOptions::default()));
+                Mode::Bridge
+            }
+            // the default network, with options
+            NetworkMode::Bridge(Some(options)) => {
+                bridges.push((String::new(), NetOptions::parse("bridge", options)?));
                 Mode::Bridge
             }
             NetworkMode::Host => Mode::Host,
@@ -498,22 +602,24 @@ fn parse_modes(req: &NetRequest) -> NetworkResult<(Mode, Vec<String>, Vec<String
                         "invalid CNI network name `{name}`"
                     )));
                 }
-                bridges.push(name.to_string());
+                bridges.push((name.to_string(), NetOptions::default()));
                 Mode::Cni
             }
-            // a network by name (`pod` and `bridge:NAME` are no name of one:
-            // refused for the colon, or found as a network)
-            n @ (NetworkMode::Network(_) | NetworkMode::Pod | NetworkMode::Bridge(Some(_))) => {
-                let n = n.to_string();
-                if !n
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+            // a network by name and its options (`pod` is no name of one:
+            // found as a network)
+            n @ (NetworkMode::Network(_) | NetworkMode::Pod) => {
+                let text = n.to_string();
+                let (name, options) = text.split_once(':').unwrap_or((&text, ""));
+                if name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
                 {
                     return Err(NetworkError::InvalidConfig(format!(
-                        "invalid network mode `{n}`"
+                        "invalid network mode `{text}`"
                     )));
                 }
-                bridges.push(n);
+                bridges.push((name.to_string(), NetOptions::parse(name, options)?));
                 Mode::Bridge
             }
         };
@@ -831,7 +937,7 @@ impl ContainerNetworks {
     /// is written.
     pub async fn plan(&self, req: &NetRequest) -> NetworkResult<Planned> {
         let bad = |m: &str| Err(NetworkError::InvalidConfig(m.to_string()));
-        let (mut mode, bridges, pasta_options, implicit) = parse_modes(req)?;
+        let (mut mode, mut bridges, pasta_options, implicit) = parse_modes(req)?;
         // The default when nothing is asked: pasta when rootless (as podman,
         // bridges are asked for), the default bridge as root.
         if implicit && self.rootless {
@@ -847,7 +953,7 @@ impl ContainerNetworks {
             return bad("port mappings need the pasta, a bridge or a CNI network mode");
         }
         let cni = if mode == Mode::Cni {
-            bridges.first().cloned().unwrap_or_default()
+            bridges.first().map(|b| b.0.clone()).unwrap_or_default()
         } else {
             String::new()
         };
@@ -921,6 +1027,26 @@ impl ContainerNetworks {
             }
             None => None,
         };
+        if mode == Mode::Bridge {
+            if bridges.len() > 1 && (ip.is_some() || ip6.is_some() || mac.is_some()) {
+                return bad(
+                    "--ip, --ip6 and --mac-address can only be set for a single network: give \
+                     each network its own with `--network NAME:ip=ADDRESS,mac=ADDRESS`",
+                );
+            }
+            // (the addresses of the request are those of the first network)
+            if let Some((_, first)) = bridges.first_mut() {
+                if let Some(ip) = ip {
+                    set_once(&mut first.ip, "ip", ip)?;
+                }
+                if let Some(ip6) = ip6 {
+                    set_once(&mut first.ip6, "ip6", ip6)?;
+                }
+                if mac.is_some() && first.mac.is_some() {
+                    return bad("the network option `mac` is given more than once");
+                }
+            }
+        }
         if shareable {
             if mode != Mode::Bridge {
                 return bad("a shareable network namespace needs bridge networks");
@@ -928,11 +1054,17 @@ impl ContainerNetworks {
             if !ports.is_empty() {
                 return bad("a shareable network namespace cannot publish ports");
             }
-            if ip.is_some() || ip6.is_some() {
+            if bridges
+                .iter()
+                .any(|(_, o)| o.ip.is_some() || o.ip6.is_some())
+            {
                 return bad("a shareable network namespace cannot have a static address");
             }
-            if mac.is_some() {
+            if mac.is_some() || bridges.iter().any(|(_, o)| o.mac.is_some()) {
                 return bad("a shareable network namespace cannot have a static MAC address");
+            }
+            if bridges.iter().any(|(_, o)| o.ifname.is_some()) {
+                return bad("a shareable network namespace cannot name its interfaces");
             }
         }
         if mode == Mode::Pasta {
@@ -940,15 +1072,26 @@ impl ContainerNetworks {
             pasta::require_pasta()?;
         }
         let mut nets = Vec::new();
+        let mut options = Vec::new();
+        let mut names = Vec::new();
         if mode == Mode::Bridge {
             self.bridge_opts()?;
-            for name in &bridges {
-                let n = self.lookup(name).await?;
+            for (name, o) in bridges {
+                let n = self.lookup(&name).await?;
                 if nets.iter().any(|o: &NetworkDef| o.id == n.id) {
+                    // (the options of one network are given once)
+                    if o != NetOptions::default() {
+                        return Err(NetworkError::InvalidConfig(format!(
+                            "the network `{}` is given more than once",
+                            n.name
+                        )));
+                    }
                     continue;
                 }
                 nets.push(n);
+                options.push(o);
             }
+            names = ifnames(&options)?;
             if nets.iter().any(|n| n.macvlan.is_some()) {
                 if self.rootless {
                     return bad("macvlan networks need root");
@@ -963,11 +1106,13 @@ impl ContainerNetworks {
             if shareable && nets.iter().any(|n| n.subnet6.is_some()) {
                 return bad("a shareable network namespace needs IPv4-only networks");
             }
-            if let (Some(ip6), Some(first)) = (ip6, nets.first()) {
-                check_static_ip6(first, ip6)?;
-            }
-            if let (Some(ip), Some(first)) = (ip, nets.first()) {
-                check_static_ip(first, ip)?;
+            for (n, o) in nets.iter().zip(&options) {
+                if let Some(ip) = o.ip6 {
+                    check_static_ip6(n, ip)?;
+                }
+                if let Some(ip) = o.ip {
+                    check_static_ip(n, ip)?;
+                }
             }
         }
         for p in &ports {
@@ -1071,7 +1216,18 @@ impl ContainerNetworks {
                 name: req.name.clone(),
                 ports: ports.iter().map(|p| p.to_string()).collect(),
                 mac,
-                macs: BTreeMap::new(),
+                macs: nets
+                    .iter()
+                    .zip(&options)
+                    .filter_map(|(n, o)| Some((n.id.clone(), addr::format_mac(&o.mac?))))
+                    .collect(),
+                ifnames: nets
+                    .iter()
+                    .zip(names)
+                    .enumerate()
+                    .filter(|(idx, (_, name))| *name != format!("eth{idx}"))
+                    .map(|(_, (n, name))| (n.id.clone(), name))
+                    .collect(),
                 shareable,
                 pasta_options,
                 cni,
@@ -1093,8 +1249,7 @@ impl ContainerNetworks {
                 },
             },
             nets,
-            ip,
-            ip6,
+            options,
             aliases,
             etc,
             auto_ports,
@@ -1167,21 +1322,12 @@ impl ContainerNetworks {
             .map_err(|e| NetworkError::InvalidConfig(e.to_string()))?;
         self.db.net_set_container_spec(id, &spec).await?;
         let mut first = Vec::new();
-        for (idx, n) in p.nets.iter().enumerate() {
-            let (requested, requested6) = if idx == 0 {
-                (p.ip, p.ip6)
-            } else {
-                (None, None)
-            };
+        for (idx, (n, o)) in p.nets.iter().zip(&p.options).enumerate() {
+            let mut aliases = p.aliases.clone();
+            aliases.extend(o.aliases.iter().cloned());
             let (ip, ip6) = self
                 .db
-                .net_attach(
-                    id,
-                    &n.id,
-                    idx as u32,
-                    &p.aliases,
-                    choice(n, requested, requested6),
-                )
+                .net_attach(id, &n.id, idx as u32, &aliases, choice(n, o.ip, o.ip6))
                 .await
                 .map_err(|e| match e {
                     velarx_types::DbError::AlreadyExists(m) => {
@@ -1286,7 +1432,7 @@ impl ContainerNetworks {
                 out.push(Interface {
                     network: n.name.clone(),
                     network_id: n.id.clone(),
-                    ifname: format!("eth{}", row.idx),
+                    ifname: spec.ifname(&row.network_id, row.idx),
                     ip: row.ip,
                     prefix: n.subnet.prefix,
                     gateway: n.gateway,
@@ -2041,6 +2187,15 @@ impl ContainerNetworks {
             )));
         }
         let idx = rows.iter().map(|r| r.idx + 1).max().unwrap_or(0);
+        // (`eth<idx>`, else the first `ethN` the other networks do not have)
+        let taken: Vec<String> = rows
+            .iter()
+            .map(|r| spec.ifname(&r.network_id, r.idx))
+            .collect();
+        let mut ifname = format!("eth{idx}");
+        if taken.contains(&ifname) {
+            ifname = free_ifname(taken.iter().map(String::as_str));
+        }
         if let Some(ip) = ip {
             check_static_ip(&n, ip)?;
         }
@@ -2073,6 +2228,10 @@ impl ContainerNetworks {
             })?;
         let stored = spec.clone();
         let mut changed = mac.map(|m| spec.macs.insert(n.id.clone(), m)).is_some();
+        if ifname != format!("eth{idx}") {
+            changed = true;
+            spec.ifnames.insert(n.id.clone(), ifname);
+        }
         if spec.mode == Mode::None {
             changed = true;
             spec.mode = Mode::Bridge;
@@ -2149,7 +2308,8 @@ impl ContainerNetworks {
             // (nothing to set up at the next start: the loopback only)
             spec.mode = Mode::None;
         }
-        if spec.macs.remove(&n.id).is_some() || last {
+        let named = spec.macs.remove(&n.id).is_some() | spec.ifnames.remove(&n.id).is_some();
+        if named || last {
             let s = serde_json::to_string(&spec)
                 .map_err(|e| NetworkError::InvalidConfig(e.to_string()))?;
             self.db.net_set_container_spec(id, &s).await?;
@@ -2738,7 +2898,10 @@ mod tests {
 
     #[test]
     fn modes() {
-        let m = |mode: &str, nets: &[&str]| parse_modes(&req(mode, nets)).map(|r| (r.0, r.1, r.3));
+        let m = |mode: &str, nets: &[&str]| {
+            parse_modes(&req(mode, nets))
+                .map(|r| (r.0, r.1.into_iter().map(|b| b.0).collect::<Vec<_>>(), r.3))
+        };
         assert_eq!(
             m("", &[]).unwrap(),
             (Mode::Bridge, vec![String::new()], true)
@@ -2777,7 +2940,7 @@ mod tests {
         assert_eq!(m("provider:x", &[]).unwrap().0, Mode::Other);
         assert!(m("host", &["host", "a"]).is_err());
         assert!(m("a;b", &[]).is_err());
-        // (`pod` names a network, `bridge:NAME` none; the words of the
+        // (`pod` names a network, `bridge:` takes options; the words of the
         // default network, trimmed, in a list too)
         assert_eq!(m("pod", &[]).unwrap().1, vec!["pod".to_string()]);
         assert!(m("bridge:x", &[]).is_err());
@@ -2789,6 +2952,72 @@ mod tests {
         let (mode, _, opts, _) = parse_modes(&req("pasta:--ipv4-only,-a,10.0.2.0", &[])).unwrap();
         assert_eq!(mode, Mode::Pasta);
         assert_eq!(opts, vec!["--ipv4-only", "-a", "10.0.2.0"]);
+    }
+
+    #[test]
+    fn the_options_of_a_network() {
+        let (_, nets, _, _) = parse_modes(&req(
+            "",
+            &[
+                "n1:ip=10.90.1.60,mac=02:42:ac:11:00:98,interface_name=foo0",
+                "n2:ip6=fd00::5,alias=a,alias=b",
+                "n3",
+                "bridge:alias=c",
+            ],
+        ))
+        .unwrap();
+        let names: Vec<&str> = nets.iter().map(|n| n.0.as_str()).collect();
+        assert_eq!(names, ["n1", "n2", "n3", ""]);
+        assert_eq!(
+            nets[0].1,
+            NetOptions {
+                ip: Some(Ipv4Addr::new(10, 90, 1, 60)),
+                mac: Some([2, 0x42, 0xac, 0x11, 0, 0x98]),
+                ifname: Some("foo0".into()),
+                ..Default::default()
+            }
+        );
+        assert_eq!(nets[1].1.ip6, Some("fd00::5".parse().unwrap()));
+        assert_eq!(nets[1].1.aliases, ["a", "b"]);
+        assert_eq!(nets[2].1, NetOptions::default());
+        assert_eq!(nets[3].1.aliases, ["c"]);
+        for bad in [
+            "n:ip=nope",
+            "n:ip6=10.0.0.1",
+            "n:mac=zz",
+            "n:interface_name=a/b",
+            "n:interface_name=0123456789abcdef",
+            "n:ip=10.0.0.1,ip=10.0.0.2",
+            "n:colour=red",
+            "n:ip",
+            "n:alias=",
+            "n:interface_name=",
+            ":ip=10.0.0.1",
+        ] {
+            assert!(parse_modes(&req("", &[bad])).is_err(), "{bad}");
+        }
+        // (pasta has no options of a network)
+        assert!(parse_modes(&req("", &["pasta", "n:ip=10.0.0.1"])).is_err());
+    }
+
+    #[test]
+    fn the_interface_names_of_the_networks() {
+        let names = |a: &[&str]| {
+            let o: Vec<NetOptions> = a
+                .iter()
+                .map(|n| match *n {
+                    "" => NetOptions::default(),
+                    n => NetOptions::parse("n", &format!("interface_name={n}")).unwrap(),
+                })
+                .collect();
+            ifnames(&o)
+        };
+        assert_eq!(names(&["", ""]).unwrap(), ["eth0", "eth1"]);
+        assert_eq!(names(&["foo0", ""]).unwrap(), ["foo0", "eth0"]);
+        // (a network without one gets the first `ethN` no other has)
+        assert_eq!(names(&["", "eth0", ""]).unwrap(), ["eth1", "eth0", "eth2"]);
+        assert!(names(&["foo0", "foo0"]).is_err());
+        assert_eq!(free_ifname(["eth0", "foo0", "eth2"].into_iter()), "eth1");
     }
 
     #[test]

@@ -15,6 +15,7 @@ use velarx_proto::pod::PodAction;
 
 use velarx_proto::workload::EventKind;
 use velarx_proto::workload::{PodMember, PodRecord, PodStatus, RunState};
+use velarx_wire::request::NetworkMode;
 use velarx_wire::wire::TopResult;
 
 /// The pod of a container: (pod id, pod name, is the infra container).
@@ -332,7 +333,12 @@ fn filter_match(filters: &Filters, p: &PodRecord) -> bool {
                     velarx_shape::container::state_word(m.state) == want
                 })
             }),
-            "network" => values.iter().any(|v| p.spec.networks.contains(v)),
+            "network" => values.iter().any(|v| {
+                p.spec
+                    .networks
+                    .iter()
+                    .any(|n| NetworkMode::network_name(n) == v)
+            }),
             _ => true,
         };
         if !ok {

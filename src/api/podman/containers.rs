@@ -21,6 +21,7 @@ use velarx_proto::engine::{UpdateBlockIo, UpdateDevice, UpdateHealth, UpdateSpec
 use velarx_proto::health::Healthcheck;
 use velarx_proto::stream::{Event, Out};
 use velarx_proto::workload::RunState;
+use velarx_wire::request::NetworkMode;
 use velarx_wire::wire::LogDriver;
 
 /// The image of a create request must exist.
@@ -427,7 +428,11 @@ fn filter_match(filters: &Filters, info: &Info, bounds: &Bounds) -> bool {
                     let nets = if info.cfg.networks.is_empty() {
                         vec!["bridge".to_string()]
                     } else {
-                        info.cfg.networks.clone()
+                        info.cfg
+                            .networks
+                            .iter()
+                            .map(|n| NetworkMode::network_name(n).to_string())
+                            .collect()
                     };
                     nets.iter().any(|n| n == want)
                         || (want == "bridge" && nets.iter().any(|n| n == "podman"))

@@ -36,6 +36,11 @@ pub struct NetSpec {
     /// The MAC addresses `network connect` asked for, by network id.
     #[serde(default)]
     pub macs: BTreeMap<String, String>,
+    /// The interface names that are not `eth<idx>`, by network id: those
+    /// `--network NAME:interface_name=` asked for, and the first free
+    /// `ethN` of a network whose `eth<idx>` another one has.
+    #[serde(default)]
+    pub ifnames: BTreeMap<String, String>,
     #[serde(default)]
     pub shareable: bool,
     /// `--network pasta:OPTIONS`.
@@ -67,6 +72,15 @@ pub fn parse_spec(id: &str, text: &str) -> NetworkResult<NetSpec> {
 }
 
 impl NetSpec {
+    /// The name of the interface on the network `network_id`, which is the
+    /// attachment `idx` of the container.
+    pub fn ifname(&self, network_id: &str, idx: u32) -> String {
+        self.ifnames
+            .get(network_id)
+            .cloned()
+            .unwrap_or_else(|| format!("eth{idx}"))
+    }
+
     pub fn port_specs(&self) -> NetworkResult<Vec<PortSpec>> {
         self.ports
             .iter()

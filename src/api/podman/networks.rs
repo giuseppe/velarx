@@ -25,6 +25,7 @@ use velarx_proto::workload::{
 };
 use velarx_runtime::container::ContainerConfig;
 use velarx_runtime::network::{CreateNetworkRequest, NetworkDriver as Driver};
+use velarx_wire::request::NetworkMode;
 
 const LABEL: &str = "label.";
 
@@ -313,7 +314,10 @@ async fn members(state: &AppState, net: &Net) -> ApiResult<Vec<NetworkMember>> {
             let Ok(cfg) = serde_json::from_str::<ContainerConfig>(&c.config) else {
                 continue;
             };
-            if cfg.networks.iter().any(|n| n == &net.name || n == &net.id) {
+            if cfg.networks.iter().any(|n| {
+                let n = NetworkMode::network_name(n);
+                n == net.name || n == net.id
+            }) {
                 out.push(NetworkMember {
                     running: c.state == RecordState::Running,
                     id: c.id,

@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS network_ipam (
 pub struct AttachmentRow {
     pub container_id: String,
     pub network_id: String,
-    /// The interface is `eth<idx>`.
+    /// The interface is `eth<idx>` unless the container's setup names it.
     pub idx: u32,
     /// None while a pooled namespace has it.
     pub ip: Option<Ipv4Addr>,

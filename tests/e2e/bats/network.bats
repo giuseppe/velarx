@@ -273,6 +273,54 @@ nameserver 10.213.4.1" "$out"
     check_match "port mapping without a network is dropped" "Port mappings have been discarded" "$out"
 }
 
+@test "the options of each network: --network NAME:ip=,mac=,alias=,interface_name=" {
+    sh_ network create --subnet 10.213.60.0/24 optnet1 > /dev/null
+    sh_ network create --subnet 10.213.61.0/24 optnet2 > /dev/null
+    sh_ network create --subnet 10.213.62.0/24 optnet3 > /dev/null
+    # (the second network gets the first free ethN: eth0)
+    out=$(run_ctr --network optnet1:ip=10.213.60.20,mac=02:42:ac:11:00:98,interface_name=foo0 \
+        --network optnet2:ip=10.213.61.30,alias=second "$IMG" sh -c \
+        'cat /sys/class/net/foo0/address; ip -o -4 addr show foo0; ip -o -4 addr show eth0' | awk 'NF == 1 {print; next} {print $2, $3, $4}')
+    check "an address, a MAC address and an interface name for each network" \
+        "$(printf '02:42:ac:11:00:98\nfoo0 inet 10.213.60.20/24\neth0 inet 10.213.61.30/24')" "$out"
+    sh_ container run -d --name optc --network optnet1:alias=first,interface_name=eth1 \
+        --network optnet2:alias=second "$IMG" top > /dev/null
+    out=$(sh_ container inspect --format '{{range .NetworkSettings.Networks}}{{.Aliases}} {{end}}' optc | tr -d ' ' | grep -o 'first\|second' | sort | tr '\n' ' ')
+    check "the aliases of each network" "first second " "$out"
+    out=$(sh_ container inspect --format '{{.NetworkSettings.Networks.optnet1.Aliases}}' optc)
+    case "$out" in *second*) fail "the alias of the other network" "$out" ;; esac
+    out=$(sh_ container inspect --format '{{.HostConfig.NetworkMode}}' optc)
+    check "the network mode names the network, not its options" "optnet1" "$out"
+    out=$(sh_ container ps --filter network=optnet1 --format '{{.Names}}')
+    check "ps finds the container by the name of its network" "optc" "$out"
+    # the interface asked for, the free eth0 for the other, and eth2 for the
+    # one connected (eth1 is taken)
+    sh_ network connect optnet3 optc
+    out=$(sh_ container exec optc sh -c 'for i in eth0 eth1 eth2; do ip -o -4 addr show $i; done' | awk '{print $2, $4}' | cut -d. -f1-3)
+    check "the interfaces of the networks" "$(printf 'eth0 10.213.61\neth1 10.213.60\neth2 10.213.62')" "$out"
+    sh_ container rm -t 0 -f optc > /dev/null
+    # one address of the command line cannot be on two networks
+    out=$(run_ctr --network optnet1 --network optnet2 --ip 10.213.60.21 "$IMG" true)
+    check_match "--ip with two networks" "can only be set for a single network" "$out"
+    out=$(run_ctr --network optnet1 --network optnet2 --mac-address 02:42:ac:11:00:99 "$IMG" true)
+    check_match "--mac-address with two networks" "can only be set for a single network" "$out"
+    out=$(run_ctr --network optnet1:ip=10.213.61.5 "$IMG" true)
+    check_match "an address outside the network" "not in any subnet" "$out"
+    out=$(run_ctr --network optnet1:colour=red "$IMG" true)
+    check_match "an unknown option" "invalid network option" "$out"
+    out=$(run_ctr --network optnet1:alias= "$IMG" true)
+    check_match "an empty alias" "invalid network option .alias=" "$out"
+    out=$(run_ctr --network :ip=10.213.60.22 "$IMG" true)
+    check_match "no network name" "invalid network mode" "$out"
+    out=$(run_ctr --network optnet1:interface_name=foo0 --network optnet2:interface_name=foo0 "$IMG" true)
+    check_match "an interface name of two networks" "more than one network" "$out"
+    out=$(run_ctr --network optnet1:ip=10.213.60.20 --ip 10.213.60.21 "$IMG" true)
+    check_match "an address twice" "given more than once" "$out"
+    out=$(run_ctr --network optnet1:ip=10.213.60.20 --network optnet1:ip=10.213.60.21 "$IMG" true)
+    check_match "a network twice with options" "given more than once" "$out"
+    sh_ network rm optnet1 optnet2 optnet3 > /dev/null
+}
+
 @test "a free host port and -P" {
     need_brnet
     # A free host port.
