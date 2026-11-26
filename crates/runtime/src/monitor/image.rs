@@ -666,11 +666,8 @@ mod imp {
         let lowers = escape_lower(&v.lower);
         fsconfig_set_string(fs_fd.as_fd(), "lowerdir", lowers.as_str())
             .map_err(|e| fail("fsconfig(lowerdir)", e))?;
-        for (key, path) in [("upperdir", &v.upper), ("workdir", &v.work)] {
-            let value = path.to_string_lossy();
-            fsconfig_set_string(fs_fd.as_fd(), key, value.as_ref())
-                .map_err(|e| fail(&format!("fsconfig({key})"), e))?;
-        }
+        crate::imagemount::set_dir(fs_fd.as_fd(), "upperdir", &v.upper)?;
+        crate::imagemount::set_dir(fs_fd.as_fd(), "workdir", &v.work)?;
         if cfg.userxattr {
             fsconfig_set_flag(fs_fd.as_fd(), "userxattr")
                 .map_err(|e| fail("fsconfig(userxattr)", e))?;
@@ -1269,6 +1266,45 @@ mod imp {
                     std::fs::read_to_string(at.join("in")).unwrap(),
                     "now a directory"
                 );
+            });
+        }
+    }
+
+    #[cfg(test)]
+    mod overlay_volume_tests {
+        use super::*;
+
+        /// An overlay volume whose upper and work directories have a path
+        /// over the 256 bytes of a string for `fsconfig` is mounted.
+        #[test]
+        fn an_overlay_volume_with_a_long_upper_path_is_mounted() {
+            velarx_base::testing::in_child(|| {
+                if !velarx_base::testing::private_namespace() {
+                    return;
+                }
+                let d = tempfile::tempdir().unwrap();
+                let mut deep = d.path().to_path_buf();
+                while deep.as_os_str().len() < 300 {
+                    deep.push("d".repeat(50));
+                }
+                let v = OverlayVolume {
+                    lower: d.path().join("lower"),
+                    upper: deep.join("upper"),
+                    work: deep.join("work"),
+                    target: d.path().join("target"),
+                    discard: true,
+                    owner: None,
+                };
+                std::fs::create_dir(&v.lower).unwrap();
+                std::fs::write(v.lower.join("file"), "lower").unwrap();
+                let cfg: ImageConfig = serde_json::from_value(serde_json::json!({
+                    "spec": "/b/rootfs.json", "overlay": "/b/overlay", "rootfs": "/b/rootfs",
+                }))
+                .unwrap();
+                mount_overlay_volume(&v, &cfg).unwrap();
+                std::fs::write(v.target.join("new"), "upper").unwrap();
+                assert_eq!(std::fs::read(v.target.join("file")).unwrap(), b"lower");
+                assert_eq!(std::fs::read(v.upper.join("new")).unwrap(), b"upper");
             });
         }
     }

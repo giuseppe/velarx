@@ -12,7 +12,7 @@
 
 use crate::container::IdMapping;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use velarx_fuse::erofs_tree::Stubs;
 
@@ -344,6 +344,24 @@ pub struct RootOverlay<'a> {
     pub label: Option<&'a str>,
 }
 
+/// Give the directory `path` to the overlay being made (`fs`) as its
+/// `key` (`upperdir`, `workdir`) by descriptor: a string is at most 256
+/// bytes, too short for a path deep in a store.
+pub(crate) fn set_dir(fs: BorrowedFd<'_>, key: &str, path: &Path) -> io::Result<()> {
+    use rustix::fs::{open, Mode, OFlags};
+    let fail = |what: &str, e: rustix::io::Errno| {
+        io_err(format!("{what}({key} {}) failed: {e}", path.display()))
+    };
+    let dir = open(
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| fail("open", e))?;
+    // (the overlay holds the directory itself: the descriptor can go)
+    rustix::mount::fsconfig_set_fd(fs, key, dir.as_fd()).map_err(|e| fail("fsconfig", e))
+}
+
 /// The writable overlay of `o`, detached.
 pub fn writable_overlay(o: &RootOverlay<'_>) -> io::Result<OwnedFd> {
     use rustix::mount::{
@@ -365,10 +383,6 @@ pub fn writable_overlay(o: &RootOverlay<'_>) -> io::Result<OwnedFd> {
     // The layers one by one, the top one first (a path is at most 256
     // bytes for fsconfig, and the overlay takes many); the data-only
     // layers last.
-    let (upper, work) = (
-        o.upper.to_string_lossy().into_owned(),
-        o.work.to_string_lossy().into_owned(),
-    );
     let single = o.lowers.len() == 1 && o.datas.is_empty();
     let lower_key = if single { "lowerdir" } else { "lowerdir+" };
     for (key, value) in o
@@ -376,11 +390,12 @@ pub fn writable_overlay(o: &RootOverlay<'_>) -> io::Result<OwnedFd> {
         .iter()
         .map(|p| (lower_key, p.as_str()))
         .chain(o.datas.iter().map(|p| ("datadir+", p.as_str())))
-        .chain([("upperdir", upper.as_str()), ("workdir", work.as_str())])
     {
         fsconfig_set_string(fs_fd.as_fd(), key, value)
             .map_err(|e| fail(&format!("fsconfig({key} {value})"), e))?;
     }
+    set_dir(fs_fd.as_fd(), "upperdir", o.upper)?;
+    set_dir(fs_fd.as_fd(), "workdir", o.work)?;
     let followdata = needs_followdata(o.userxattr, o.stubs, o.lowers.len(), o.datas.len());
     for (key, value) in o
         .verity
@@ -451,6 +466,40 @@ mod tests {
                 let e = mount(&image, &[p(bad)]).unwrap_err().to_string();
                 assert!(e.contains(&refused), "data {bad}: {e}");
             }
+        });
+    }
+
+    /// The upper and work directories of a path over the 256 bytes of a
+    /// string for `fsconfig` are mounted: they go by descriptor.
+    #[test]
+    fn an_upper_directory_with_a_long_path_is_mounted() {
+        velarx_base::testing::in_child(|| {
+            if !velarx_base::testing::private_namespace() {
+                return;
+            }
+            let d = tempfile::tempdir().unwrap();
+            let mut deep = d.path().to_path_buf();
+            while deep.as_os_str().len() < 300 {
+                deep.push("d".repeat(50));
+            }
+            let (image, upper, work) = (
+                d.path().join("image"),
+                deep.join("upper"),
+                deep.join("work"),
+            );
+            std::fs::create_dir(&image).unwrap();
+            writable_overlay(&RootOverlay {
+                lowers: &[image.to_string_lossy().into_owned()],
+                datas: &[],
+                upper: &upper,
+                work: &work,
+                verity: None,
+                userxattr: true,
+                volatile: false,
+                stubs: Stubs::Every,
+                label: None,
+            })
+            .unwrap();
         });
     }
 
