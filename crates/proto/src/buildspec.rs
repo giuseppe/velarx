@@ -63,6 +63,9 @@ pub struct BuildFlags {
     /// `--skip-unused-stages=false`: every stage before the target is
     /// built, those it does not use too.
     pub skip_unused_stages: bool,
+    /// `--source-policy-file`: the text of a BuildKit source policy, which
+    /// allows, denies or converts the base images of the stages.
+    pub source_policy: Option<String>,
     /// `--save-stages`: the image of every stage stays after the build.
     pub save_stages: bool,
     /// `--stage-labels`: the images of the stages (the built image too)
@@ -126,6 +129,7 @@ impl Default for BuildFlags {
             omit_history: false,
             inherit_labels: true,
             skip_unused_stages: true,
+            source_policy: None,
             save_stages: false,
             stage_labels: false,
             jobs: 1,

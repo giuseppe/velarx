@@ -274,6 +274,20 @@ EOT
     "$CLI" rmi -f localhost/bm:secopt > /dev/null 2>&1
 }
 
+@test "podman build --source-policy-file" {
+    local c=$WORKDIR/policy
+    mkdir -p "$c"
+    printf 'FROM %s\nLABEL policy=yes\n' "$IMG" > "$c/Containerfile"
+    printf '{"rules": [{"action": "DENY", "selector": {"identifier": "docker-image://*"}}]}\n' > "$WORKDIR/deny.json"
+    out=$(pm build --tls-verify=false --source-policy-file "$WORKDIR/deny.json" -t localhost/bm:policy "$c" 2>&1)
+    check "a base image the policy denies" 125 $?
+    check_match "...is refused" "denied by the source policy" "$out"
+    printf '{"rules": [{"action": "ALLOW", "selector": {"identifier": "docker-image://*"}}]}\n' > "$WORKDIR/allow.json"
+    pm build --tls-verify=false --source-policy-file "$WORKDIR/allow.json" -t localhost/bm:policy "$c" > /dev/null 2>&1
+    check "a base image it allows" 0 $?
+    pm rmi -f localhost/bm:policy > /dev/null 2>&1
+}
+
 @test "build --build-context: a directory, an image; COPY --from and RUN --mount from=" {
     local c=$WORKDIR/named
     mkdir -p "$c" "$WORKDIR/extra/sub"

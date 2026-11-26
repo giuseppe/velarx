@@ -21,6 +21,7 @@ pub mod entitlement;
 pub mod external;
 pub mod git;
 mod helper;
+mod policy;
 mod remote;
 mod run;
 mod runmount;
@@ -910,6 +911,8 @@ struct Build<'a> {
     run_dir: Option<tempfile::TempDir>,
     /// The stage of the built image.
     target: usize,
+    /// `--source-policy-file`.
+    policy: Option<Arc<policy::SourcePolicy>>,
 }
 
 /// What a stage that was built next to others leaves to the build.
@@ -1497,6 +1500,14 @@ impl BuildService {
             .map(velarx_registry::target::Platform::parse)
             .transpose()
             .map_err(BuildError::Parse)?;
+        let policy = opts
+            .flags
+            .source_policy
+            .as_deref()
+            .map(policy::SourcePolicy::parse)
+            .transpose()
+            .map_err(BuildError::Parse)?
+            .map(Arc::new);
         let opts = &BuildOptions {
             network: build_network(opts.network.as_deref())?.map(|m| m.to_string()),
             ..opts.clone()
@@ -1537,6 +1548,7 @@ impl BuildService {
             file,
             run_dir: None,
             target,
+            policy,
         };
         let needed = b.plan(target)?;
         let hold = self.image_service.hold_build()?;
@@ -1729,6 +1741,7 @@ impl<'a> Build<'a> {
             platform: self.platform.clone(),
             run_dir: None,
             target: self.target,
+            policy: self.policy.clone(),
         })
     }
 
@@ -2115,6 +2128,23 @@ impl<'a> Build<'a> {
                 )))
             }
             None => base,
+        };
+        // `--source-policy-file`: the base images, not a stage; a short name
+        // is decided, and then pulled, by the one name it stands for
+        let base = match self.policy.clone() {
+            Some(policy) if base != "scratch" && self.stage_index(&base, index).is_none() => {
+                let base = self.svc.image_service.qualify(&base).await?;
+                match policy.decide(&base) {
+                    policy::Decision::Keep => base,
+                    policy::Decision::Convert(to) => to,
+                    policy::Decision::Deny(rule) => {
+                        return Err(BuildError::Parse(format!(
+                            "the base image {base} is denied by the source policy: {rule}"
+                        )))
+                    }
+                }
+            }
+            _ => base,
         };
         let image = if base == "scratch" {
             None

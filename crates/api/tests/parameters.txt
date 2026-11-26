@@ -88,7 +88,7 @@ any ANY * setenv implemented
 any ANY * shmsize implemented
 any ANY * skipunusedstages implemented
 any ANY * sourcedateepoch implemented
-any ANY * sourcepolicy refused
+any ANY * sourcepolicy implemented
 any ANY * stage-labels implemented
 any ANY * target implemented
 any ANY * term implemented

@@ -421,6 +421,10 @@ fn flags_of(call: &Call) -> ApiResult<BuildFlags> {
         omit_history: call.q_bool("omithistory", false)?,
         inherit_labels: call.q_bool("inheritlabels", true)?,
         skip_unused_stages: call.q_bool("skipunusedstages", true)?,
+        source_policy: call
+            .q("sourcePolicy")
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
         save_stages,
         stage_labels,
         jobs: match call.q("jobs").filter(|v| !v.is_empty()) {
@@ -511,7 +515,6 @@ const REFUSED: &[(&str, Given)] = &[
     ),
     ("rusage", Given::True),
     ("rusagelogfile", Given::Any),
-    ("sourcePolicy", Given::Any),
 ];
 
 fn given(rule: Given, values: &[&str]) -> bool {

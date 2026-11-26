@@ -302,3 +302,38 @@ EOT
     check "the first stage has its base" "$IMAGE" "$(sh_ image inspect -f '{{index .Config.Labels "io.buildah.stage.base"}}' "$first")"
     sh_ rmi -f localhost/e2e-stages:1 localhost/e2e-stages:2 "$second" "$first" > /dev/null 2>&1
 }
+
+@test "build --source-policy-file: deny and convert the base images" {
+    local ctx=$WORKDIR/pctx2 gone=$E2E_REGISTRY/velarx-e2e/not-there:1
+    mkdir -p "$ctx"
+    printf 'FROM %s AS first\nLABEL policy=yes\n' "$gone" > "$ctx/Containerfile"
+    cat > "$WORKDIR/convert.json" <<EOT
+{"rules": [
+  {"action": "CONVERT", "selector": {"identifier": "docker-image://$gone", "matchType": "EXACT"},
+   "updates": {"identifier": "docker-image://$IMAGE"}}
+]}
+EOT
+    sh_ image build -q --source-policy-file "$WORKDIR/convert.json" -t localhost/e2e-policy:1 "$ctx" > /dev/null
+    check "a base image converted to another" 0 $?
+    check "...is the base" yes "$(sh_ image inspect -f '{{index .Config.Labels "policy"}}' localhost/e2e-policy:1)"
+    cat > "$WORKDIR/deny.json" <<EOT
+{"rules": [{"action": "DENY", "selector": {"identifier": "docker-image://$E2E_REGISTRY/*"}}]}
+EOT
+    rc=0
+    out=$(sh_ image build -q --source-policy-file "$WORKDIR/deny.json" -t localhost/e2e-policy:2 "$ctx" 2>&1) || rc=$?
+    check "a base image denied" 125 $rc
+    check_match "...says by which rule" "denied by the source policy: matched rule 0" "$out"
+    echo '{"rules": [{"action": "KEEP", "selector": {"identifier": "x"}}]}' > "$WORKDIR/bad.json"
+    rc=0
+    out=$(sh_ image build -q --source-policy-file "$WORKDIR/bad.json" -t localhost/e2e-policy:3 "$ctx" 2>&1) || rc=$?
+    check "a policy that is not understood" 125 $rc
+    check_match "...is named" "source policy: " "$out"
+    # a short name is decided by the name of the image it stands for
+    printf 'FROM e2e-policy:1\n' > "$ctx/Containerfile.short"
+    echo '{"rules": [{"action": "DENY", "selector": {"identifier": "docker-image://localhost/*"}}]}' > "$WORKDIR/local.json"
+    rc=0
+    out=$(sh_ image build -q --source-policy-file "$WORKDIR/local.json" -f "$ctx/Containerfile.short" "$ctx" 2>&1) || rc=$?
+    check "a short name of an image built here, denied" 125 $rc
+    check_match "...by its name" "base image localhost/e2e-policy:1 is denied" "$out"
+    sh_ rmi localhost/e2e-policy:1 > /dev/null 2>&1
+}

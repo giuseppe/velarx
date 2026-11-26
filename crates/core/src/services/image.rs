@@ -798,6 +798,35 @@ impl ImageService {
         Err(tried.into_error(reference))
     }
 
+    /// The one fully qualified name a short name stands for: the image
+    /// built here (`localhost/NAME`) or the first candidate the store has an
+    /// image of, else the first candidate, the one a pull tries first.  A
+    /// name with a registry or a digest, or an image id, is itself.
+    pub async fn qualify(&self, reference: &str) -> ImageResult<String> {
+        let Some((name, tag)) = short_name_and_tag(reference) else {
+            return Ok(reference.to_string());
+        };
+        if self.by_id(reference).await?.is_some() {
+            return Ok(reference.to_string());
+        }
+        let local = format!("localhost/{name}");
+        if self.db.get_image_by_tag(&local, tag).await.is_ok() {
+            return Ok(format!("{local}:{tag}"));
+        }
+        let candidates = self.candidates(reference)?;
+        for candidate in &candidates {
+            let r = ImageReference::parse(candidate)?;
+            let tag = r.tag.as_deref().unwrap_or("latest");
+            if self.db.get_image_by_tag(&r.name(), tag).await.is_ok() {
+                return Ok(candidate.clone());
+            }
+        }
+        candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| ImageError::NotFound(reference.to_string()))
+    }
+
     /// The fully qualified references `reference` can mean, through the
     /// short name aliases and the unqualified search registries.
     pub fn candidates(&self, reference: &str) -> ImageResult<Vec<String>> {

@@ -1339,6 +1339,7 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                 omit_history,
                 inherit_labels,
                 skip_unused_stages,
+                source_policy_file,
                 save_stages,
                 stage_labels,
                 cache_ttl,
@@ -1476,6 +1477,12 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                 omit_history: omit_history.unwrap_or(false),
                 inherit_labels: inherit_labels.unwrap_or(true),
                 skip_unused_stages: skip_unused_stages.unwrap_or(true),
+                source_policy: source_policy_file
+                    .map(|path| {
+                        std::fs::read_to_string(&path)
+                            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+                    })
+                    .transpose()?,
                 save_stages: save_stages.unwrap_or(false),
                 stage_labels: stage_labels.unwrap_or(false),
                 jobs: jobs.unwrap_or(1),
