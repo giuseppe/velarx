@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# What ../run passes to Charon and Aeneas for this crate, besides what
+# every crate gets.  float.rs, the one f64 of the crate, is not translated.
+CHARON_FLAGS="--opaque velarx_limit_core::float"
+AENEAS_FLAGS=
