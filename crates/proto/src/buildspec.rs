@@ -63,6 +63,11 @@ pub struct BuildFlags {
     /// `--skip-unused-stages=false`: every stage before the target is
     /// built, those it does not use too.
     pub skip_unused_stages: bool,
+    /// `--save-stages`: the image of every stage stays after the build.
+    pub save_stages: bool,
+    /// `--stage-labels`: the images of the stages (the built image too)
+    /// have the labels `io.buildah.stage.name` and `.base`.
+    pub stage_labels: bool,
     /// `--jobs`: how many independent stages run at the same time (0: as
     /// many as there are).
     pub jobs: u32,
@@ -121,6 +126,8 @@ impl Default for BuildFlags {
             omit_history: false,
             inherit_labels: true,
             skip_unused_stages: true,
+            save_stages: false,
+            stage_labels: false,
             jobs: 1,
             cache_ttl_ms: None,
             annotations: Vec::new(),

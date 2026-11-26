@@ -980,6 +980,13 @@ pub struct BuildExtra {
     /// Build only the stages the target needs (default: true)
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     pub skip_unused_stages: Option<bool>,
+    /// Keep the image of every stage (default: false)
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub save_stages: Option<bool>,
+    /// Label the images of the stages, the built image too, with the name
+    /// and the base of the stage (needs --save-stages)
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub stage_labels: Option<bool>,
     /// Use the images of the build cache made at most this long ago (1h, 30m)
     #[arg(long, value_name = "DURATION")]
     pub cache_ttl: Option<String>,

@@ -385,6 +385,13 @@ fn flags_of(call: &Call) -> ApiResult<BuildFlags> {
                 .ok_or_else(|| call.bad_parameter(name)),
         }
     };
+    let save_stages = call.q_bool("save-stages", false)?;
+    let stage_labels = call.q_bool("stage-labels", false)?;
+    if stage_labels && !save_stages {
+        return Err(ApiError::bad_request(
+            "stage-labels requires save-stages be set as well",
+        ));
+    }
     let flags = BuildFlags {
         from: call.q("from").filter(|v| !v.is_empty()).map(str::to_string),
         retry: Retry {
@@ -398,6 +405,8 @@ fn flags_of(call: &Call) -> ApiResult<BuildFlags> {
         omit_history: call.q_bool("omithistory", false)?,
         inherit_labels: call.q_bool("inheritlabels", true)?,
         skip_unused_stages: call.q_bool("skipunusedstages", true)?,
+        save_stages,
+        stage_labels,
         jobs: match call.q("jobs").filter(|v| !v.is_empty()) {
             None => 1,
             Some(v) => v.parse().map_err(|_| call.bad_parameter("jobs"))?,
@@ -486,10 +495,8 @@ const REFUSED: &[(&str, Given)] = &[
     ),
     ("rusage", Given::True),
     ("rusagelogfile", Given::Any),
-    ("save-stages", Given::True),
     ("securityopt", Given::Any),
     ("sourcePolicy", Given::Any),
-    ("stage-labels", Given::True),
 ];
 
 fn given(rule: Given, values: &[&str]) -> bool {

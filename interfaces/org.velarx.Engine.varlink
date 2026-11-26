@@ -2574,6 +2574,11 @@ type BuildFlags (
 	# `--skip-unused-stages=false`: every stage before the target is
 	# built, those it does not use too.
 	skip_unused_stages: bool,
+	# `--save-stages`: the image of every stage stays after the build.
+	save_stages: bool,
+	# `--stage-labels`: the images of the stages (the built image too)
+	# have the labels `io.buildah.stage.name` and `.base`.
+	stage_labels: bool,
 	# `--jobs`: how many independent stages run at the same time (0: as
 	# many as there are).
 	jobs: int,

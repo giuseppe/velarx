@@ -276,3 +276,29 @@ EOT
     done
     sh_ rmi localhost/e2e-bx:buildx localhost/e2e-bx:builder > /dev/null 2>&1
 }
+
+@test "build --save-stages and --stage-labels" {
+    local ctx=$WORKDIR/sctx stage_ids
+    mkdir -p "$ctx"
+    printf 'FROM %s AS first\nLABEL a=1\nFROM first AS second\nLABEL b=2\nFROM second\nLABEL c=3\n' "$IMAGE" > "$ctx/Containerfile"
+    rc=0
+    out=$(sh_ image build -q --stage-labels -t localhost/e2e-stages:1 "$ctx" 2>&1) || rc=$?
+    check "--stage-labels alone" 125 $rc
+    check_match "...is refused" "requires --save-stages" "$out"
+    local before
+    before=$(sh_ image list -a -q | wc -l)
+    sh_ image build -q --layers=false -t localhost/e2e-stages:1 "$ctx" > /dev/null
+    check "build" 0 $?
+    check "no image of a stage stays" $((before + 1)) "$(sh_ image list -a -q | wc -l)"
+    sh_ image build -q --layers=false --save-stages --stage-labels -t localhost/e2e-stages:2 "$ctx" > /dev/null
+    check "build --save-stages --stage-labels" 0 $?
+    check "the built image is the stage 2" 2 "$(sh_ image inspect -f '{{index .Config.Labels "io.buildah.stage.name"}}' localhost/e2e-stages:2)"
+    second=$(sh_ image list -a -q --filter label=io.buildah.stage.name=second)
+    check "the image of a stage stays" 1 "$(echo "$second" | wc -l)"
+    check "...with its labels" "second" "$(sh_ image inspect -f '{{index .Config.Labels "io.buildah.stage.name"}}' "$second")"
+    first=$(sh_ image list -a -q --filter label=io.buildah.stage.name=first)
+    check "the image of the first stage stays" 1 "$(echo "$first" | wc -l)"
+    check "a stage FROM a stage has its image as the base" "$(sh_ image inspect -f '{{.Id}}' "$first")" "$(sh_ image inspect -f '{{index .Config.Labels "io.buildah.stage.base"}}' "$second")"
+    check "the first stage has its base" "$IMAGE" "$(sh_ image inspect -f '{{index .Config.Labels "io.buildah.stage.base"}}' "$first")"
+    sh_ rmi -f localhost/e2e-stages:1 localhost/e2e-stages:2 "$second" "$first" > /dev/null 2>&1
+}

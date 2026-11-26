@@ -73,7 +73,7 @@ any ANY * retry-delay implemented
 any ANY * rewritetimestamp implemented
 any ANY * rusage refused
 any ANY * rusagelogfile refused
-any ANY * save-stages refused
+any ANY * save-stages implemented
 any ANY * sbom-image-output implemented
 any ANY * sbom-image-purl-output implemented
 any ANY * sbom-merge-strategy implemented
@@ -89,7 +89,7 @@ any ANY * shmsize implemented
 any ANY * skipunusedstages implemented
 any ANY * sourcedateepoch implemented
 any ANY * sourcepolicy refused
-any ANY * stage-labels refused
+any ANY * stage-labels implemented
 any ANY * target implemented
 any ANY * term implemented
 any ANY * timestamp implemented

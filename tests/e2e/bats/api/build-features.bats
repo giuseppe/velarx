@@ -243,6 +243,19 @@ EOT
     pm rmi -f localhost/bm:transient-remote > /dev/null 2>&1
 }
 
+@test "podman build --save-stages and --stage-labels" {
+    local c=$WORKDIR/stages out
+    mkdir -p "$c"
+    printf 'FROM %s AS first\nLABEL a=1\nFROM first\nLABEL b=2\n' "$IMG" > "$c/Containerfile"
+    out=$(pm build --tls-verify=false --layers=false --save-stages --stage-labels -t localhost/bm:stages "$c" 2>&1)
+    check "podman build --save-stages --stage-labels" 0 $?
+    check "the built image has the labels of its stage" "1" \
+        "$(pm image inspect --format '{{index .Config.Labels "io.buildah.stage.name"}}' localhost/bm:stages)"
+    check "the image of the first stage stays" "first" \
+        "$(pm images -a --filter label=io.buildah.stage.name=first --format '{{index .Labels "io.buildah.stage.name"}}')"
+    pm rmi -f localhost/bm:stages > /dev/null 2>&1
+}
+
 @test "build --build-context: a directory, an image; COPY --from and RUN --mount from=" {
     local c=$WORKDIR/named
     mkdir -p "$c" "$WORKDIR/extra/sub"

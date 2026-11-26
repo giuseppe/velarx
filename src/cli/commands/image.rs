@@ -1339,6 +1339,8 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                 omit_history,
                 inherit_labels,
                 skip_unused_stages,
+                save_stages,
+                stage_labels,
                 cache_ttl,
                 output,
                 compress: _,
@@ -1373,6 +1375,9 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                 runtime_flag: _,
                 hooks_dir: _,
             } = extra;
+            if stage_labels == Some(true) && save_stages != Some(true) {
+                anyhow::bail!("--stage-labels requires --save-stages");
+            }
             let pull = match (pull_always, pull_never) {
                 (true, true) => {
                     anyhow::bail!("--pull-always and --pull-never cannot be used together")
@@ -1471,6 +1476,8 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                 omit_history: omit_history.unwrap_or(false),
                 inherit_labels: inherit_labels.unwrap_or(true),
                 skip_unused_stages: skip_unused_stages.unwrap_or(true),
+                save_stages: save_stages.unwrap_or(false),
+                stage_labels: stage_labels.unwrap_or(false),
                 jobs: jobs.unwrap_or(1),
                 cache_ttl_ms: cache_ttl
                     .as_deref()

@@ -2230,6 +2230,24 @@ impl<'a> Build<'a> {
                     .collect(),
             ));
         }
+        // `--stage-labels`: the name of the stage and its base, the image
+        // of the stage a stage is FROM
+        if self.opts.flags.stage_labels && !stage.instrs.is_empty() {
+            let name = stage.name.clone().unwrap_or_else(|| index.to_string());
+            let from = match self.stage_image(&base, index) {
+                Some(id) => self.svc.image_service.get(&id).await?.config_digest.hex(),
+                None => base.clone(),
+            };
+            st.edit(ConfigEdit::Merge(
+                "Labels".into(),
+                [
+                    ("io.buildah.stage.name".to_string(), json!(name)),
+                    ("io.buildah.stage.base".to_string(), json!(from)),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+        }
         // `--env`: every stage, its RUN steps too; an ENV of the
         // Containerfile wins (as buildah)
         if !self.opts.env.is_empty() {
@@ -2344,8 +2362,13 @@ impl<'a> Build<'a> {
         }
         st.base.args = st.args;
         self.stage_bases[index] = st.base;
-        st.image
-            .ok_or_else(|| BuildError::Parse(format!("the stage {index} has no content")))
+        let id = st
+            .image
+            .ok_or_else(|| BuildError::Parse(format!("the stage {index} has no content")))?;
+        if self.opts.flags.save_stages {
+            self.cached.insert(id.clone());
+        }
+        Ok(id)
     }
 
     /// The identity label wins over a LABEL of the Containerfile and over
