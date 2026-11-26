@@ -3502,6 +3502,38 @@ mod tests {
         (dir, EngineClient::new(&socket).unwrap())
     }
 
+    /// An image the engine just said it does not have is pulled with no
+    /// lookup of it first.
+    #[test]
+    fn a_missing_image_is_pulled_without_a_lookup() {
+        use crate::client::policy::{pull_with, EnsureImage};
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let served = asked.clone();
+        let (_dir, client) = mock_engine(move |method, _| {
+            served.lock().unwrap().push(method.to_string());
+            json!({"error": "org.velarx.Engine.NoSuchImage", "parameters": {
+                "cause": "", "message": "no such image",
+            }})
+        });
+        let access = Default::default();
+        let ask = EnsureImage {
+            image: "localhost/missing",
+            policy: crate::cli::PullPolicy::Missing,
+            pull: PullOptions {
+                tls_verify: true,
+                platform: None,
+                access: &access,
+                retry: Default::default(),
+                sources: None,
+            },
+            quiet: true,
+            show: None,
+            lazy: false,
+        };
+        assert!(pull_with(&client, &ask).is_err());
+        assert_eq!(*asked.lock().unwrap(), ["ImagePull"]);
+    }
+
     /// `prune --filter label` (no `=`) is refused through the engine as it
     /// is without it: the engine is not asked.
     #[test]

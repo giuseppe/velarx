@@ -913,7 +913,7 @@ pub fn run_container(
         client::policy::ensure_image_with(daemon_client, &ask)?;
     }
     let image_missing = |e: &client::ClientError| pull_when_missing && e.is(Condition::NoSuchImage);
-    let pull = || client::policy::ensure_image_with(daemon_client, &ask);
+    let pull = || client::policy::pull_with(daemon_client, &ask);
 
     // the caller's (--env-host), its proxy variables (--http-proxy), then -e
     // and --env-file over them; `-e KEY` takes the caller's value

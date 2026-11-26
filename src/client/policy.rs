@@ -78,9 +78,7 @@ pub fn ensure_image_with(client: &EngineClient, ask: &EnsureImage<'_>) -> Client
         image,
         policy,
         pull,
-        quiet,
-        show,
-        lazy,
+        ..
     } = *ask;
     let present = match policy {
         PullPolicy::Always => false,
@@ -107,17 +105,32 @@ pub fn ensure_image_with(client: &EngineClient, ask: &EnsureImage<'_>) -> Client
         ));
     }
     if needs_pull(policy, present) {
-        if !quiet {
-            eprintln!("Trying to pull {image}...");
+        pull_with(client, ask)?;
+    }
+    Ok(())
+}
+
+/// Pull the image of `ask` now, as its `quiet`, `show` and `lazy` say:
+/// for an image the engine just said it does not have.
+pub fn pull_with(client: &EngineClient, ask: &EnsureImage<'_>) -> ClientResult<()> {
+    let EnsureImage {
+        image,
+        pull,
+        quiet,
+        show,
+        lazy,
+        ..
+    } = *ask;
+    if !quiet {
+        eprintln!("Trying to pull {image}...");
+    }
+    match show {
+        _ if lazy => {
+            client.pull_image_lazy(image, &pull)?;
         }
-        match show {
-            _ if lazy => {
-                client.pull_image_lazy(image, &pull)?;
-            }
-            Some(show) => show(client, image, &pull, quiet)?,
-            None => {
-                client.pull_image(image, &pull)?;
-            }
+        Some(show) => show(client, image, &pull, quiet)?,
+        None => {
+            client.pull_image(image, &pull)?;
         }
     }
     Ok(())
