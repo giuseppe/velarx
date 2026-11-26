@@ -402,16 +402,11 @@ impl FileStore {
         // and given fs-verity (where the store has it) before it has its
         // name, which is synced in turn: a name of the store is a file that
         // has the digest it is named by.
-        let mut file = tempfile::Builder::new()
-            .prefix(".tmp")
-            .tempfile_in(parent)?;
+        // It is locked until it has its name: the check removes a
+        // temporary file whose lock is free.
+        let (mut file, _lock) = crate::create_locked(parent, ".tmp", 0o644)?;
         file.write_all(data)?;
         file.as_file().sync_all()?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.as_file()
-                .set_permissions(fs::Permissions::from_mode(0o644))?;
-        }
         // (closed for writing, which fs-verity wants)
         let file = file.into_temp_path();
         if let Some(manager) = self.verity.manager() {
