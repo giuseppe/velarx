@@ -253,16 +253,18 @@ pub fn readonly_overlay(
     let fail = |what: &str, e: rustix::io::Errno| io_err(format!("{what} failed: {e}"));
     let fs =
         fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC).map_err(|e| fail("fsopen(overlay)", e))?;
-    for (key, value) in lowers
+    for (key, dir) in lowers
         .iter()
-        .map(|d| ("lowerdir+", d.as_str()))
-        .chain(datas.iter().map(|d| ("datadir+", d.as_str())))
-        .chain(stub_options(
-            verity,
-            userxattr,
-            needs_followdata(userxattr, stubs, lowers.len(), datas.len()),
-        ))
+        .map(|d| ("lowerdir+", d))
+        .chain(datas.iter().map(|d| ("datadir+", d)))
     {
+        set_dir(fs.as_fd(), key, Path::new(dir))?;
+    }
+    for (key, value) in stub_options(
+        verity,
+        userxattr,
+        needs_followdata(userxattr, stubs, lowers.len(), datas.len()),
+    ) {
         fsconfig_set_string(fs.as_fd(), key, value).map_err(|e| option_error(key, value, e))?;
     }
     if userxattr {
@@ -345,8 +347,8 @@ pub struct RootOverlay<'a> {
 }
 
 /// Give the directory `path` to the overlay being made (`fs`) as its
-/// `key` (`upperdir`, `workdir`) by descriptor: a string is at most 256
-/// bytes, too short for a path deep in a store.
+/// `key` (a layer, `upperdir`, `workdir`) by descriptor: a string is at
+/// most 256 bytes, too short for a path deep in a store.
 pub(crate) fn set_dir(fs: BorrowedFd<'_>, key: &str, path: &Path) -> io::Result<()> {
     use rustix::fs::{open, Mode, OFlags};
     let fail = |what: &str, e: rustix::io::Errno| {
@@ -380,19 +382,15 @@ pub fn writable_overlay(o: &RootOverlay<'_>) -> io::Result<OwnedFd> {
     let fail = |what: &str, e: rustix::io::Errno| io_err(format!("{what} failed: {e}"));
     let fs_fd =
         fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC).map_err(|e| fail("fsopen(overlay)", e))?;
-    // The layers one by one, the top one first (a path is at most 256
-    // bytes for fsconfig, and the overlay takes many); the data-only
-    // layers last.
-    let single = o.lowers.len() == 1 && o.datas.is_empty();
-    let lower_key = if single { "lowerdir" } else { "lowerdir+" };
-    for (key, value) in o
+    // The layers one by one, the top one first; the data-only layers
+    // last.
+    for (key, dir) in o
         .lowers
         .iter()
-        .map(|p| (lower_key, p.as_str()))
-        .chain(o.datas.iter().map(|p| ("datadir+", p.as_str())))
+        .map(|p| ("lowerdir+", p))
+        .chain(o.datas.iter().map(|p| ("datadir+", p)))
     {
-        fsconfig_set_string(fs_fd.as_fd(), key, value)
-            .map_err(|e| fail(&format!("fsconfig({key} {value})"), e))?;
+        set_dir(fs_fd.as_fd(), key, Path::new(dir))?;
     }
     set_dir(fs_fd.as_fd(), "upperdir", o.upper)?;
     set_dir(fs_fd.as_fd(), "workdir", o.work)?;
@@ -500,6 +498,43 @@ mod tests {
                 label: None,
             })
             .unwrap();
+        });
+    }
+
+    /// The lower and data-only layers of a path over the 256 bytes of a
+    /// string for `fsconfig` are mounted, by the writable and by the
+    /// read-only overlay: they go by descriptor too.
+    #[test]
+    fn layers_with_a_long_path_are_mounted() {
+        velarx_base::testing::in_child(|| {
+            if !velarx_base::testing::private_namespace() {
+                return;
+            }
+            let d = tempfile::tempdir().unwrap();
+            let mut deep = d.path().to_path_buf();
+            while deep.as_os_str().len() < 300 {
+                deep.push("d".repeat(50));
+            }
+            let p = |n: &str| deep.join(n).to_string_lossy().into_owned();
+            for n in ["lower1", "lower2", "data"] {
+                std::fs::create_dir_all(p(n)).unwrap();
+            }
+            std::fs::create_dir(d.path().join("upper")).unwrap();
+            std::fs::create_dir(d.path().join("work")).unwrap();
+            let (lowers, datas) = ([p("lower1"), p("lower2")], [p("data")]);
+            writable_overlay(&RootOverlay {
+                lowers: &lowers,
+                datas: &datas,
+                upper: &d.path().join("upper"),
+                work: &d.path().join("work"),
+                verity: None,
+                userxattr: true,
+                volatile: false,
+                stubs: Stubs::Every,
+                label: None,
+            })
+            .unwrap();
+            readonly_overlay(&lowers, &datas, "off", true, Stubs::Every, None).unwrap();
         });
     }
 

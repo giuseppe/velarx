@@ -2322,7 +2322,8 @@ impl StorageDriver for ComposefsDriver {
 
     /// The root of the process is the root of an overlay that has the
     /// upper directory of the container among its options (the kernel
-    /// tells the mount of the process's root, as `proc_dir/root` opens it).
+    /// tells the mount of the process's root, as `proc_dir/root` opens it,
+    /// with the upper directory as it is on the disk: no link of its path).
     fn is_root_of(&self, w: &Writable, proc_dir: &Path) -> DriverResult<bool> {
         use rustix::fs::{open, Mode, OFlags};
         use std::os::fd::AsFd;
@@ -2340,7 +2341,12 @@ impl StorageDriver for ComposefsDriver {
         }
         let mount = velarx_sys::statmount::of_fd(root.as_fd()).map_err(io)?;
         let mut upper = std::ffi::OsString::from("upperdir=");
-        upper.push(self.writable_paths(w).upper);
+        match self.writable_paths(w).upper.canonicalize() {
+            Ok(path) => upper.push(path),
+            // (a container with no upper directory has no overlay)
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(io(e)),
+        }
         Ok(mount.fs_type == "overlay" && mount.options.contains(&upper))
     }
 
@@ -3357,8 +3363,9 @@ mod tests {
     }
 
     /// The driver asks the kernel for the root of the process in its
-    /// directory of `/proc`: this process is not a container's, and a
-    /// process that is gone is an error (its pid was not checked).
+    /// directory of `/proc`: this process is not the one of a container
+    /// (with no upper directory yet), and a process that is gone is an
+    /// error (its pid was not checked).
     #[tokio::test]
     async fn the_root_of_a_process_is_read_in_its_proc_directory() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3378,7 +3385,7 @@ mod tests {
     /// writes as escapes, or that are not UTF-8): the driver says it is the
     /// root of that container, and not of another one.  In a process of its
     /// own, which `in_child` makes.
-    fn the_root_is_the_overlay_of(name: &[u8]) {
+    fn the_root_is_the_overlay_of(name: &[u8], through_a_link: bool) {
         use rustix::mount::{
             fsconfig_create, fsconfig_set_fd, fsconfig_set_flag, fsconfig_set_string, fsmount,
             fsopen, move_mount, FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags,
@@ -3397,8 +3404,17 @@ mod tests {
         for dir in [&lower, &root] {
             std::fs::create_dir(dir).unwrap();
         }
+        // (the bundles are where a link leads, as with a store whose
+        // root is a link)
+        let bundles = if through_a_link {
+            std::fs::create_dir(tmp.path().join("real")).unwrap();
+            std::os::unix::fs::symlink("real", tmp.path().join("link")).unwrap();
+            tmp.path().join("link")
+        } else {
+            tmp.path().to_path_buf()
+        };
         let make = |n: &[u8]| {
-            let w = Writable::new("c", tmp.path().join(std::ffi::OsStr::from_bytes(n)));
+            let w = Writable::new("c", bundles.join(std::ffi::OsStr::from_bytes(n)));
             d.writable_create(&w, None, &WritableOptions::default(), None)
                 .unwrap();
             w
@@ -3436,6 +3452,11 @@ mod tests {
         // (what the process needs of `/proc` stays reachable)
         std::fs::create_dir(root.join("proc")).unwrap();
         rustix::mount::mount_bind_recursive("/proc", root.join("proc")).unwrap();
+        // (the driver resolves the upper directory in the root it has: the
+        // directories of the test are in it where they were)
+        let here = root.join(tmp.path().strip_prefix("/").unwrap());
+        std::fs::create_dir_all(&here).unwrap();
+        rustix::mount::mount_bind_recursive(tmp.path(), &here).unwrap();
         rustix::process::chroot(&root).unwrap();
         std::env::set_current_dir("/").unwrap(); // child-only
         let proc_dir = Path::new("/proc/self");
@@ -3447,17 +3468,24 @@ mod tests {
 
     #[test]
     fn the_root_of_a_process_is_the_overlay_of_its_container() {
-        velarx_base::testing::in_child(|| the_root_is_the_overlay_of(b"plain"));
+        velarx_base::testing::in_child(|| the_root_is_the_overlay_of(b"plain", false));
+    }
+
+    /// The kernel shows the upper directory without the links of its
+    /// path, so a store whose root is a link has its root all the same.
+    #[test]
+    fn a_bundle_path_through_a_link_is_the_root_all_the_same() {
+        velarx_base::testing::in_child(|| the_root_is_the_overlay_of(b"plain", true));
     }
 
     #[test]
     fn a_bundle_path_the_table_escapes_is_the_root_all_the_same() {
-        velarx_base::testing::in_child(|| the_root_is_the_overlay_of(b"a b\tc\nd\\e,x=y"));
+        velarx_base::testing::in_child(|| the_root_is_the_overlay_of(b"a b\tc\nd\\e,x=y", false));
     }
 
     #[test]
     fn a_bundle_path_that_is_not_utf8_is_the_root_too() {
-        velarx_base::testing::in_child(|| the_root_is_the_overlay_of(b"n\xffn"));
+        velarx_base::testing::in_child(|| the_root_is_the_overlay_of(b"n\xffn", false));
     }
 
     fn set_xattr(path: &Path, name: &str, value: &[u8]) -> bool {

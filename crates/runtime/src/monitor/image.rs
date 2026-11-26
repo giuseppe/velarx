@@ -555,18 +555,6 @@ mod imp {
         }
     }
 
-    /// `lowerdir` takes `:` and `,` as separators: escape them.
-    fn escape_lower(p: &Path) -> String {
-        let mut out = String::new();
-        for c in p.to_string_lossy().chars() {
-            if matches!(c, ':' | ',' | '\\') {
-                out.push('\\');
-            }
-            out.push(c);
-        }
-        out
-    }
-
     /// A directory or a file of a volume (or of a host directory): looked
     /// up inside the volume, and what was looked up is what is mounted (a
     /// clone of the mount at that descriptor), so another container of the
@@ -663,9 +651,7 @@ mod imp {
         let fail = |what: &str, e: rustix::io::Errno| io_err(format!("{what} failed: {e}"));
         let fs_fd = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)
             .map_err(|e| fail("fsopen(overlay)", e))?;
-        let lowers = escape_lower(&v.lower);
-        fsconfig_set_string(fs_fd.as_fd(), "lowerdir", lowers.as_str())
-            .map_err(|e| fail("fsconfig(lowerdir)", e))?;
+        crate::imagemount::set_dir(fs_fd.as_fd(), "lowerdir+", &v.lower)?;
         crate::imagemount::set_dir(fs_fd.as_fd(), "upperdir", &v.upper)?;
         crate::imagemount::set_dir(fs_fd.as_fd(), "workdir", &v.work)?;
         if cfg.userxattr {
@@ -1274,10 +1260,10 @@ mod imp {
     mod overlay_volume_tests {
         use super::*;
 
-        /// An overlay volume whose upper and work directories have a path
-        /// over the 256 bytes of a string for `fsconfig` is mounted.
+        /// An overlay volume whose lower, upper and work directories have a
+        /// path over the 256 bytes of a string for `fsconfig` is mounted.
         #[test]
-        fn an_overlay_volume_with_a_long_upper_path_is_mounted() {
+        fn an_overlay_volume_with_long_paths_is_mounted() {
             velarx_base::testing::in_child(|| {
                 if !velarx_base::testing::private_namespace() {
                     return;
@@ -1288,14 +1274,14 @@ mod imp {
                     deep.push("d".repeat(50));
                 }
                 let v = OverlayVolume {
-                    lower: d.path().join("lower"),
+                    lower: deep.join("lower"),
                     upper: deep.join("upper"),
                     work: deep.join("work"),
                     target: d.path().join("target"),
                     discard: true,
                     owner: None,
                 };
-                std::fs::create_dir(&v.lower).unwrap();
+                std::fs::create_dir_all(&v.lower).unwrap();
                 std::fs::write(v.lower.join("file"), "lower").unwrap();
                 let cfg: ImageConfig = serde_json::from_value(serde_json::json!({
                     "spec": "/b/rootfs.json", "overlay": "/b/overlay", "rootfs": "/b/rootfs",
