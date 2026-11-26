@@ -1794,8 +1794,11 @@ impl PeerSource {
             active.len()
         );
         loop {
-            // what is still under way is dropped when nothing is left
+            // what is still under way is dropped when nothing is left,
+            // and what it sent is settled
             if sent.iter().all(|s| *s) {
+                self.settle_sending(items, sent, Some(layer), &mut answers, out)
+                    .await?;
                 return Ok(false);
             }
             // every idle peer takes the next part it was not asked for, or
@@ -1882,10 +1885,13 @@ impl PeerSource {
                             .sum::<u64>();
                     }
                     *busy.entry(peer).or_default() += 1;
+                    let request = answers.requests;
                     let (ask, stop) =
                         futures::future::abortable(self.ask(&mut answers, peer, urgency, wanted));
                     part.stops.push(stop);
-                    running.push(futures::FutureExt::map(ask, move |a| (n, peer, a.ok())));
+                    running.push(futures::FutureExt::map(ask, move |a| {
+                        (n, peer, a.map_err(|_| request))
+                    }));
                 }
             }
             if running.is_empty() {
@@ -1923,9 +1929,19 @@ impl PeerSource {
                 *b = b.saturating_sub(1);
             }
             parts[n].running -= 1;
-            // (a request stopped because the part came from another peer)
-            let Some(attempt) = attempt else {
-                continue;
+            // (a request stopped because the part came from another peer:
+            // what it sent is settled as an answer that ended well)
+            let attempt = match attempt {
+                Ok(attempt) => attempt,
+                Err(request) => match answers.sending.get(&request) {
+                    Some(&(peer, started)) => Attempt {
+                        request,
+                        peer,
+                        took: started.elapsed(),
+                        result: Ok(()),
+                    },
+                    None => continue,
+                },
             };
             let taken = self
                 .settle(items, sent, Some(layer), &mut answers, attempt, out)
@@ -3008,6 +3024,35 @@ mod tests {
             (1, 4, bytes as u64)
         );
         assert_eq!(s.knowledge().providers(LAYER), [peer]);
+    }
+
+    /// A big group spread over peers that do not end their answers is
+    /// done when every part is in, and each peer is counted for its parts.
+    #[tokio::test]
+    async fn the_parts_of_answers_not_over_are_counted() {
+        let c = big_chunks(8);
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let s = PeerSource::with_peers(Arc::new(Unfinished(vec![a, b], c.clone())));
+        for (peer, ms) in [(a, 1), (b, 2)] {
+            s.knowledge()
+                .served(Some(LAYER), peer, Duration::from_millis(ms));
+        }
+        let mut out = Collect::default();
+        s.fetch_group(&items(&c), Some(LAYER), &mut out)
+            .await
+            .unwrap();
+        assert_eq!(digests_of(&out), sorted(&c));
+        // four parts of two chunks, two for each peer
+        let mut traffic: Vec<_> = s
+            .knowledge()
+            .traffic()
+            .into_iter()
+            .map(|(p, t)| (p, t.requests, t.chunks, t.bytes))
+            .collect();
+        traffic.sort();
+        let mut want = vec![(a, 2, 4, 4 << 20), (b, 2, 4, 4 << 20)];
+        want.sort();
+        assert_eq!(traffic, want);
     }
 
     /// The requests nobody waits for take at most half of the places of a
