@@ -20,6 +20,8 @@ fn child(dir: &Path) {
     };
     let mut config = velarx_config::Config::default();
     config.server.socket = dir.join("api.sock");
+    // (the content service makes the staging of its store)
+    config.storage.root = dir.join("store");
     config.pull.max_layer_gib = 1;
     let conf_path = dir.join("config.toml");
     std::fs::write(&conf_path, "").unwrap();

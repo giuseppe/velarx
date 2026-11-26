@@ -2088,7 +2088,9 @@ impl PeerSource {
                     took,
                 });
                 self.knowledge.failed(peer);
-                self.knowledge.count(peer, took, None);
+                // (what it sent right before it failed was given)
+                self.knowledge.count_failed(peer, (n as u64, bytes));
+                self.rate.add(bytes);
                 return Ok(Taken::Failed);
             }
         }
@@ -2191,6 +2193,8 @@ mod tests {
         /// Peers that answer only what they are asked, and how many chunks
         /// each request asked
         honest: Mutex<std::collections::HashSet<PeerId>>,
+        /// Peers whose requests fail after they sent their chunks
+        cut: Mutex<std::collections::HashSet<PeerId>>,
         sizes: Mutex<Vec<(PeerId, usize)>>,
         /// The bytes of the answers as they come (an eighth of an answer
         /// each eighth of its delay)
@@ -2283,6 +2287,9 @@ mod tests {
             self.answered.fetch_add(1, Ordering::SeqCst);
             for chunk in reply.map_err(PeerError::Failed)? {
                 let _ = out.send(chunk).await;
+            }
+            if self.cut.lock().unwrap().contains(&peer) {
+                return Err(PeerError::Failed("the connection was lost".into()));
             }
             Ok(())
         }
@@ -2651,6 +2658,28 @@ mod tests {
             .unwrap();
         assert_eq!(digests_of(&out), sorted(&c));
         assert_eq!(s.knowledge().providers(LAYER), [seed]);
+    }
+
+    /// The chunks a peer sent right before its request failed are counted
+    /// as given, with the failure.
+    #[tokio::test]
+    async fn the_chunks_of_a_request_that_failed_are_counted() {
+        let fake = Arc::new(Fake::default());
+        let c = chunks(2);
+        let seed = fake.peer(0, Ok(c.clone()));
+        fake.cut.lock().unwrap().insert(seed);
+        let s = querying(&fake, 8);
+        let mut out = Collect::default();
+        s.fetch_group(&items(&c), Some(LAYER), &mut out)
+            .await
+            .unwrap();
+        assert_eq!(digests_of(&out), sorted(&c));
+        let t = s.knowledge().traffic();
+        let bytes = c.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
+        assert_eq!(
+            (t[0].1.failures, t[0].1.chunks, t[0].1.bytes),
+            (1, 2, bytes)
+        );
     }
 
     /// A peer with no room is asked again in the same group once something

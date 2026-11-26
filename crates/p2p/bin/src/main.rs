@@ -136,7 +136,7 @@ fn run_overlay(
         .map_err(|e| anyhow::anyhow!("the identity of the overlay node: {e}"))?;
     let authority = settings.authority(&identity)?;
     // (removed when this process is gone: once confined it may not)
-    let _remover = velarx_base::ipc::remove_when_gone(&[socket])
+    let _remover = velarx_base::ipc::remove_when_gone(&[socket], None)
         .map_err(|e| anyhow::anyhow!("cannot start the remover of the socket: {e}"))?;
     sandbox::enter(Role::Overlay, &config, &settings, config_path)
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -204,17 +204,18 @@ fn main() -> anyhow::Result<()> {
 
     // The store service first (no process is started once confined), then
     // the confinement, before the runtime starts its threads.
-    let store = service::start_store_service(&config, &args.config)?;
     let sockets = service::bind_sockets(&config, &settings)?;
+    let store = service::start_store_service(&config, &args.config)?;
+    // (removed and ended when this process is gone, from here on, however
+    // it ends: once confined it may not)
+    let _remover = velarx_base::ipc::remove_when_gone(&sockets.paths, store.as_ref())
+        .map_err(|e| anyhow::anyhow!("cannot start the remover of the sockets: {e}"))?;
     // (made or read before: the confined service makes no file)
     let identity_file = settings.identity_file(&config);
     let identity = velarx_p2p::identity::load_or_create(&identity_file)
         .map_err(|e| anyhow::anyhow!("the identity of the node: {e}"))?;
     let authority = settings.authority(&identity)?;
     service::reach_store_by_connector(&config)?;
-    // (removed when this process is gone: once confined it may not)
-    let _remover = velarx_base::ipc::remove_when_gone(&sockets.paths)
-        .map_err(|e| anyhow::anyhow!("cannot start the remover of the sockets: {e}"))?;
     sandbox::enter(Role::Content, &config, &settings, &args.config)
         .map_err(|e| anyhow::anyhow!(e))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()

@@ -70,6 +70,16 @@ impl Node {
     fn command(&self, config: &Path) -> Command {
         let mut cmd = Command::new(BIN);
         cmd.arg("--config").arg(config);
+        // (the store the node starts a service for is in the directory)
+        for name in [
+            "HOME",
+            "XDG_DATA_HOME",
+            "XDG_RUNTIME_DIR",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+        ] {
+            cmd.env(name, self.dir.path());
+        }
         cmd.env_remove("VELARX_P2P_SWARM_KEY");
         cmd
     }
@@ -253,4 +263,82 @@ fn test_a_socket_directory_others_can_enter_is_refused() {
     assert!(!ok, "the service runs with a socket others could reach");
     assert!(stderr.contains("chmod 700"), "{stderr}");
     assert!(!node.socket().exists());
+}
+
+/// The store services started for `config`, by their /proc directory.
+fn store_services(config: &Path) -> Vec<PathBuf> {
+    let wanted = format!("store-service\0--config\0{}\0", config.display());
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|proc| {
+            std::fs::read(proc.join("cmdline"))
+                .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&wanted))
+        })
+        .collect()
+}
+
+/// Whether the processes `procs` end well before the 60 s a store service
+/// waits for a connection.
+fn end_soon(procs: &[PathBuf]) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        // (gone, or a zombie its new parent did not reap yet)
+        if procs.iter().all(|proc| {
+            std::fs::read_to_string(proc.join("stat")).map_or(true, |s| s.contains(") Z "))
+        }) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// The store service the node started goes with it: a confined node
+/// signals nobody outside its domain, so a death signal never reaches it.
+#[test]
+fn test_the_store_service_it_started_ends_with_the_node() {
+    let mut node = Node::new();
+    let key = node.key(0o600);
+    let config = node.config(&format!("private_key_path = \"{}\"\n", key.display()));
+    // (it starts the store service, as nothing serves the store)
+    node.start(&config);
+    let service = store_services(&config);
+    assert_eq!(service.len(), 1);
+    // (the end of the node, as a crash is)
+    let mut child = node.child.take().unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        end_soon(&service),
+        "the store service of the node is still there"
+    );
+}
+
+/// The store service also goes with a node that fails after it started it.
+#[test]
+fn test_the_store_service_ends_with_a_node_that_fails_to_start() {
+    let node = Node::new();
+    let key = node.key(0o600);
+    let missing = node.path("none.crt");
+    let config = node.config(&format!(
+        "private_key_path = \"{}\"\nca_path = \"{m}\"\ncertificate_path = \"{m}\"\n",
+        key.display(),
+        m = missing.display()
+    ));
+    // (to a file: the service shares it, and a pipe would stay open as
+    // long as it does)
+    let log = node.path("stderr");
+    let status = node
+        .command(&config)
+        .stderr(std::fs::File::create(&log).unwrap())
+        .status()
+        .unwrap();
+    let stderr = std::fs::read_to_string(&log).unwrap();
+    assert!(!status.success() && stderr.contains("none.crt"), "{stderr}");
+    assert!(
+        end_soon(&store_services(&config)),
+        "the store service of the node is still there"
+    );
 }

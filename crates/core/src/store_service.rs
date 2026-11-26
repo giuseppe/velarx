@@ -1589,13 +1589,11 @@ pub fn start_command(
 }
 
 /// Start the store service of `config` if nothing serves it, for a process
-/// that cannot start one once it confined itself.  The service lives as long
-/// as the calling process (it is told to leave when it ends), and leaves
-/// after `idle` without a connection.  Call it from the main thread of the
-/// process, which the service is tied to (the parent-death signal follows
-/// the thread that forked), before any other thread exists: the process
-/// started, if one was, is the caller's to reap, from a thread started
-/// after the process confined itself.
+/// that cannot start one once it confined itself, and leaves after `idle`
+/// without a connection.  The process started, if one was, is the caller's
+/// to end when it ends (no death signal: one does not cross the domain of a
+/// confined parent) and to reap, from a thread started after the process
+/// confined itself.
 pub fn start_if_absent(
     config: &Config,
     config_path: &Path,
@@ -1603,16 +1601,7 @@ pub fn start_if_absent(
     idle: Option<Duration>,
 ) -> io::Result<Option<std::process::Child>> {
     let socket = socket_path(config);
-    let mut cmd = start_command(exe, config_path, idle);
-    let parent = rustix::process::getpid();
-    velarx_sys::spawn::pre_exec(&mut cmd, move |_| {
-        rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))?;
-        // (the parent ended before the signal was asked for)
-        if rustix::process::getppid() != Some(parent) {
-            velarx_sys::process::exit_now(0);
-        }
-        Ok(())
-    });
+    let cmd = start_command(exe, config_path, idle);
     activation::start(&socket, cmd, std::process::Stdio::inherit()).map(|(_, child)| child)
 }
 

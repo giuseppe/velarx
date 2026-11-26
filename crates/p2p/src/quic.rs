@@ -1433,6 +1433,7 @@ impl Quic {
             .entry(addr)
             .or_default()
             .clone();
+        let entry = slot.clone();
         let mut slot = slot.lock_owned().await;
         if let Some(c) = slot.as_ref().filter(|c| c.close_reason().is_none()) {
             return Ok(c.clone());
@@ -1450,11 +1451,28 @@ impl Quic {
         tokio::spawn(async move {
             match this.connect(addr, None).await {
                 Ok(connection) => {
+                    // (kept, and the slot let go, under the lock of the map:
+                    // a `forget` before finds the slot out of the map, one
+                    // after finds the connection in the slot to close)
+                    let connections = this.connections.lock().unwrap_or_else(|e| e.into_inner());
+                    if !connections
+                        .get(&addr)
+                        .is_some_and(|s| Arc::ptr_eq(s, &entry))
+                    {
+                        drop(connections);
+                        connection.close(0u32.into(), b"gone");
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "the peer was forgotten while connecting",
+                        ));
+                    }
+                    *slot = Some(connection.clone());
+                    drop(slot);
+                    drop(connections);
                     this.unreachable
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&addr);
-                    *slot = Some(connection.clone());
                     Ok(connection)
                 }
                 Err(e) => {
@@ -3588,9 +3606,8 @@ mod tests {
         assert!(connection.close_reason().is_none());
     }
 
-    /// A server that proves the key and then answers `answer` to any
-    /// request.
-    fn lying_server(answer: Vec<u8>) -> SocketAddr {
+    /// A QUIC server endpoint with a certificate of its own, on a free port.
+    fn raw_server() -> Endpoint {
         let key = rcgen::generate_simple_self_signed(vec!["velarx".to_string()]).unwrap();
         let cert = key.cert.der().clone();
         let private =
@@ -3607,7 +3624,13 @@ mod tests {
         let server = ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(crypto).unwrap(),
         ));
-        let liar = Endpoint::server(server, "127.0.0.1:0".parse().unwrap()).unwrap();
+        Endpoint::server(server, "127.0.0.1:0".parse().unwrap()).unwrap()
+    }
+
+    /// A server that proves the key and then answers `answer` to any
+    /// request.
+    fn lying_server(answer: Vec<u8>) -> SocketAddr {
+        let liar = raw_server();
         let liar_addr = liar.local_addr().unwrap();
         tokio::spawn(async move {
             while let Some(incoming) = liar.accept().await {
@@ -3626,6 +3649,40 @@ mod tests {
             }
         });
         liar_addr
+    }
+
+    /// A peer forgotten while the node connects to it is not connected to:
+    /// the connection made meanwhile is closed, not handed to the asker.
+    #[tokio::test]
+    async fn a_peer_forgotten_while_connecting_is_not_connected_to() {
+        let server = raw_server();
+        let addr = server.local_addr().unwrap();
+        let (accepted, handshaken) = tokio::sync::oneshot::channel();
+        let (go, go_on) = tokio::sync::oneshot::channel::<()>();
+        let (closed, closing) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let c = server.accept().await.unwrap().await.unwrap();
+            accepted.send(()).unwrap();
+            go_on.await.unwrap();
+            // (the proofs are over for the server and the client waits)
+            let _ = send_proof(&c, &KEY, SERVER, CONNECT).await;
+            let _ = check_proof(&c, &KEY, CLIENT, CONNECT).await;
+            closed.send(c.closed().await).unwrap();
+        });
+        let client = Quic::bind("127.0.0.1:0".parse().unwrap(), Arc::default(), KEY).unwrap();
+        let asking = tokio::spawn({
+            let client = client.clone();
+            async move { client.connection(addr).await }
+        });
+        handshaken.await.unwrap();
+        client.forget(addr);
+        go.send(()).unwrap();
+        let e = asking.await.unwrap().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionAborted, "{e}");
+        assert!(matches!(
+            closing.await.unwrap(),
+            quinn::ConnectionError::ApplicationClosed(c) if c.reason.as_ref() == b"gone"
+        ));
     }
 
     #[tokio::test]

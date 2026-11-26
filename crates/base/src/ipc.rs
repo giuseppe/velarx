@@ -179,7 +179,13 @@ pub fn bind_private(path: &Path) -> io::Result<UnixListener> {
 /// for the life of the process; when it is closed (the process ends,
 /// however) the child removes each socket that is still the one it was
 /// (the same inode: one bound since by another process stays) and ends.
-pub fn remove_when_gone(paths: &[std::path::PathBuf]) -> io::Result<std::os::fd::OwnedFd> {
+/// It then ends `service`, a child of this one: once this process confined
+/// itself, its death signal does not leave its domain and would not reach
+/// it.  (Its pidfd, taken now, names that process even once it is reaped.)
+pub fn remove_when_gone(
+    paths: &[std::path::PathBuf],
+    service: Option<&std::process::Child>,
+) -> io::Result<std::os::fd::OwnedFd> {
     let ids: Vec<(std::path::PathBuf, u64, u64)> = paths
         .iter()
         .filter_map(|p| {
@@ -188,6 +194,12 @@ pub fn remove_when_gone(paths: &[std::path::PathBuf]) -> io::Result<std::os::fd:
                 .map(|m| (p.clone(), m.dev(), m.ino()))
         })
         .collect();
+    let service = service
+        .map(|child| {
+            let pid = rustix::process::Pid::from_child(child);
+            rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+        })
+        .transpose()?;
     let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
     match velarx_sys::process::fork_single_threaded("the remover of the sockets")? {
         velarx_sys::process::Fork::Child(child) => {
@@ -195,7 +207,9 @@ pub fn remove_when_gone(paths: &[std::path::PathBuf]) -> io::Result<std::os::fd:
             // credentials...)
             {
                 use std::os::fd::AsRawFd;
-                child.close_all_but(&[read.as_raw_fd(), write.as_raw_fd()]);
+                let mut keep = vec![read.as_raw_fd(), write.as_raw_fd()];
+                keep.extend(service.as_ref().map(|fd| fd.as_raw_fd()));
+                child.close_all_but(&keep);
             }
             drop(write);
             let mut byte = [0u8; 1];
@@ -212,6 +226,9 @@ pub fn remove_when_gone(paths: &[std::path::PathBuf]) -> io::Result<std::os::fd:
                 {
                     let _ = std::fs::remove_file(path);
                 }
+            }
+            if let Some(service) = &service {
+                let _ = rustix::process::pidfd_send_signal(service, rustix::process::Signal::TERM);
             }
             velarx_sys::process::exit_now(0)
         }

@@ -516,6 +516,16 @@ impl Knowledge {
         });
     }
 
+    /// A request to `peer` failed after it sent `valid` (chunks, bytes) that
+    /// matched their digests (its time is no answer's: [`Traffic::average`]).
+    pub fn count_failed(&self, peer: PeerId, valid: (u64, u64)) {
+        self.traffic_of(peer, |t| {
+            t.failures += 1;
+            t.chunks += valid.0;
+            t.bytes += valid.1;
+        });
+    }
+
     /// `peer` sent `chunks` chunks whose bytes did not match their digests
     /// (counted apart from the request, which [`Self::count`] counts).
     pub fn wrong(&self, peer: PeerId, chunks: u64) {
@@ -945,13 +955,14 @@ mod tests {
         k.count(a, Duration::from_millis(10), Some((2, 100)));
         k.count(a, Duration::from_millis(30), Some((0, 0)));
         k.count(a, Duration::from_secs(10), None);
+        k.count_failed(a, (1, 50));
         k.count(b, Duration::from_millis(5), Some((1, 1000)));
         let t = k.traffic();
         assert_eq!(t[0].0, b);
         let a_t = t[1].1;
         assert_eq!(
             (a_t.requests, a_t.failures, a_t.chunks, a_t.bytes),
-            (3, 1, 2, 100)
+            (4, 2, 3, 150)
         );
         assert_eq!(a_t.average(), Some(Duration::from_millis(20)));
         assert_eq!(Traffic::default().average(), None);
