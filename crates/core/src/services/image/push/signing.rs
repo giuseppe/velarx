@@ -33,7 +33,6 @@ pub(in crate::services::image) struct Signing {
 /// that go together wherever a push makes a request.
 #[derive(Clone, Copy)]
 pub(super) struct Remote<'a> {
-    pub(super) client: &'a Resolver,
     pub(super) staged: &'a Arc<StagedPush>,
     pub(super) worker: &'a PushWorker,
     pub(super) destination: &'a ImageReference,
@@ -149,11 +148,10 @@ impl ImageService {
         // (refuses a blocked registry or a name that is not valid)
         client.push_target(destination)?;
         let staged = self
-            .staged_push(&client, destination, tls_verify, access, None)
+            .staged_push(destination, tls_verify, access, None)
             .await?;
         let worker = self.push_worker(None);
         let remote = Remote {
-            client: &client,
             staged: &staged,
             worker: &worker,
             destination,
@@ -172,7 +170,6 @@ impl ImageService {
         signature: Sigstore,
     ) -> ImageResult<()> {
         let Remote {
-            client,
             staged,
             worker,
             destination,
@@ -181,7 +178,7 @@ impl ImageService {
         } = *remote;
         let tag = format!("{}-{}.sig", digest.alg(), digest.hex());
         destination.validate()?;
-        let reader = self.inspect_net(client, destination, tls_verify, access)?;
+        let reader = self.inspect_net(destination, tls_verify, access)?;
         let mut layers = match reader.manifest_opt(&tag).await? {
             Some((body, _)) => {
                 serde_json::from_slice::<OciManifest>(&body)

@@ -405,7 +405,12 @@ impl ImageService {
             db,
             file_store,
             staging_dir,
-            resolver: Resolver::new()?,
+            // (the registry fetcher holds the credentials: this process
+            // reads no auth file)
+            resolver: Resolver::with_config(
+                velarx_registry::target::TransportConfig::system()?,
+                velarx_registry::AuthConfig::default(),
+            ),
             fsverity,
             store_verity: Arc::default(),
             storage,
@@ -450,9 +455,6 @@ impl ImageService {
     /// pulls that need nothing it does not have.
     pub fn with_origin(mut self, origin: Arc<velarx_content::list::RegistryOrigin>) -> Self {
         self.origin = Some(origin);
-        // this process asks the fetcher for what the registry holds for
-        // it, and holds no credentials of its own
-        self.resolver = self.resolver.without_credentials();
         self
     }
 

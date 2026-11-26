@@ -14,8 +14,6 @@ use velarx_signature::registries_d::{self, RegistriesD};
 use velarx_signature::sigstore::{Signature, MAX_SIGNATURE_SIZE};
 use velarx_signature::PolicyRequirement;
 
-/// Most layers of a sigstore attachment read.
-const MAX_ATTACHMENTS: usize = 128;
 /// The bytes of all the signatures of an image read at most (lookaside
 /// storage and attachments together).
 const MAX_SIGNATURES_TOTAL: u64 = 8 << 20;
@@ -156,12 +154,8 @@ fn shown_id(image: &velarx_db::ImageRecord) -> String {
 
 impl ImageService {
     pub(super) fn registries_config(&self) -> ImageResult<RegistriesD> {
-        match &self.pull_config.registries_d {
-            Some(dir) if !dir.is_dir() => Err(format!("{} is not a directory", dir.display())),
-            Some(dir) => RegistriesD::load_dirs(std::slice::from_ref(dir)),
-            None => RegistriesD::load(),
-        }
-        .map_err(|e| ImageError::Registry(format!("registries.d: {e}")))
+        RegistriesD::load_configured(self.pull_config.registries_d.as_deref())
+            .map_err(|e| ImageError::Registry(format!("registries.d: {e}")))
     }
 
     /// The digest the tag of `image_ref` names according to `[pull] names`,
@@ -235,16 +229,25 @@ impl ImageService {
         }
         let reference = intended(image_ref)?;
         let config = self.registries_config()?;
+        // (the scopes of registries.d are matched on the name and its tag,
+        // here as in the registry fetcher, which is given the digest of the
+        // manifest besides)
+        let scoped = DockerRef {
+            digest: None,
+            ..reference.clone()
+        };
         let mut budget = MAX_SIGNATURES_TOTAL;
-        let mut signatures = self
-            .lookaside_signatures(net, &config, &reference, &text, &mut budget)
-            .await?;
-        let attachments = config.use_sigstore_attachments(&reference);
-        if attachments && net.has_registry() {
-            signatures.extend(self.sigstore_attachments(net, &text, &mut budget).await?);
-        }
-        // (what the fetchers of the sources keep: judged like the rest)
-        let fetched = net.fetched_signatures(digest).await;
+        let mut signatures =
+            Self::local_lookaside_signatures(&config, &scoped, &text, &mut budget)?;
+        let attachments = config.use_sigstore_attachments(&scoped);
+        // (what the fetchers of the sources find, the registry's included
+        // (a lookaside storage on the network, the attachments), judged
+        // like the rest)
+        let named = DockerRef {
+            digest: Some(text.clone()),
+            ..scoped.clone()
+        };
+        let fetched = net.fetched_signatures(&named.string(), digest).await?;
         for record in fetched.into_iter().filter(|r| r.digest == text) {
             for signature in read_record(record, &mut budget).signatures {
                 if !signatures.contains(&signature) {
@@ -266,7 +269,7 @@ impl ImageService {
             && !signatures
                 .iter()
                 .any(|s| matches!(s, Signature::Sigstore(_))))
-        .then(|| reference.string());
+        .then(|| scoped.string());
         let used = accepted_blocking(
             Mode::Whole,
             requirements.to_vec(),
@@ -484,11 +487,11 @@ impl ImageService {
         }
     }
 
-    /// The signatures of `digest` in the lookaside storage of `reference`:
-    /// `signature-1`, `signature-2`... up to the first that is missing.
-    async fn lookaside_signatures(
-        &self,
-        net: &Net,
+    /// The signatures of `digest` in the lookaside storage of `reference`
+    /// when it is a directory (`file:`): `signature-1`, `signature-2`... up
+    /// to the first that is missing.  A storage on the network is read by
+    /// the registry fetcher (`GetSignatures`).
+    fn local_lookaside_signatures(
         config: &RegistriesD,
         reference: &DockerRef,
         digest: &str,
@@ -507,69 +510,19 @@ impl ImageService {
             }
             let url =
                 registries_d::lookaside_url(&base, digest, i).map_err(ImageError::Registry)?;
-            let blob = match registries_d::file_path(&url) {
-                Some(path) => match read_bounded(path) {
-                    Ok(b) => b,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                    Err(e) => return Err(ImageError::Registry(format!("{}: {e}", path.display()))),
-                },
-                // (over the network: the registry fetcher reads it, when
-                // the registry is one of the sources)
-                None if !net.has_registry() => break,
-                None => match net
-                    .signature(&url, MAX_SIGNATURE_SIZE.min(*budget))
-                    .await
-                    .map_err(|e| {
-                        ImageError::Registry(format!("reading signature from {url}: {e}"))
-                    })? {
-                    Some(blob) => blob,
-                    None => break,
-                },
+            let Some(path) = registries_d::file_path(&url) else {
+                break;
+            };
+            let blob = match read_bounded(path) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(ImageError::Registry(format!("{}: {e}", path.display()))),
             };
             spend(budget, blob.len() as u64)?;
             out.push(
                 Signature::from_blob(&blob)
                     .map_err(|e| ImageError::Registry(format!("parsing signature {url}: {e}")))?,
             );
-        }
-        Ok(out)
-    }
-
-    /// The sigstore attachments of `digest`: the layers of the manifest
-    /// tagged `ALGO-HEX.sig` in the repository, if it has one.
-    async fn sigstore_attachments(
-        &self,
-        net: &Net,
-        digest: &str,
-        budget: &mut u64,
-    ) -> ImageResult<Vec<Signature>> {
-        let tag = format!("{}.sig", digest.replacen(':', "-", 1));
-        let Some((body, _)) = net.manifest_opt(&tag).await? else {
-            return Ok(Vec::new());
-        };
-        let manifest: OciManifest = serde_json::from_slice(&body).map_err(|e| {
-            ImageError::Registry(format!("invalid sigstore attachment manifest: {e}"))
-        })?;
-        if manifest.layers.len() > MAX_ATTACHMENTS {
-            return Err(ImageError::Registry("too many sigstore attachments".into()));
-        }
-        let mut out = Vec::new();
-        for layer in manifest.layers {
-            if layer.size < 0 || layer.size as u64 > MAX_SIGNATURE_SIZE {
-                return Err(ImageError::Registry(format!(
-                    "the sigstore attachment {} is too large",
-                    layer.digest
-                )));
-            }
-            spend(budget, layer.size as u64)?;
-            let payload = net
-                .small_blob(&layer.digest, layer.size as u64, MAX_SIGNATURE_SIZE)
-                .await?;
-            out.push(Signature::Sigstore(velarx_signature::sigstore::Sigstore {
-                mime_type: layer.media_type,
-                payload: payload.to_vec(),
-                annotations: layer.annotations.into_iter().collect(),
-            }));
         }
         Ok(out)
     }

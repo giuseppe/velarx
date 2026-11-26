@@ -64,12 +64,8 @@ impl ImageService {
         image_ref.validate()?;
         self.check_policy(&image_ref)?;
         let name = normalize_name(reference).map_err(store_error)?;
-        let client = self
-            .resolver
-            .with_tls_verify(tls_verify)
-            .with_access(access);
         image_ref.validate()?;
-        let net = self.inspect_net(&client, &image_ref, tls_verify, access)?;
+        let net = self.inspect_net(&image_ref, tls_verify, access)?;
         let tag = image_ref.tag.clone().unwrap_or_else(|| "latest".into());
         let (bytes, digest) = net.manifest_top(&tag).await?;
         let manifest: Value = serde_json::from_slice(&bytes)?;
@@ -145,7 +141,7 @@ impl ImageService {
         // (refuses a blocked registry or a name that is not valid)
         client.push_target(&dest_ref)?;
         let staged = self
-            .staged_push(&client, &dest_ref, tls_verify, access, None)
+            .staged_push(&dest_ref, tls_verify, access, None)
             .await?;
         let worker = self.push_worker(None);
         // the config too, even one the manifest carries as data: the

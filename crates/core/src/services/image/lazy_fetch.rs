@@ -996,15 +996,8 @@ impl ImageService {
             },
             certs: given.certs.filter(|_| walk.3),
         };
-        let access = velarx_content::pull::access::access_for(
-            &self.resolver,
-            repository,
-            *tls_verify,
-            &given,
-            true,
-        )?;
         let walker = self
-            .staged_fetch((repository, None), *tls_verify, Some(&access), manifest)
+            .staged_fetch((repository, None), *tls_verify, Some(&given), manifest)
             .await?;
         Ok((epoch, walker))
     }

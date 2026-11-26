@@ -19,14 +19,11 @@ fn env_path(name: &str) -> Option<PathBuf> {
 
 /// The files and directories of velarx's configuration directories that a
 /// pull reads.
-const REGISTRY_FILES: [&str; 7] = [
+const REGISTRY_FILES: [&str; 4] = [
     "registries.conf",
     "registries.conf.d",
     "certs.d",
     "policy.json",
-    "registries.d",
-    "registries.rootless.d",
-    "registries.rootful.d",
 ];
 
 /// What the process that starts the workers needs: what a worker reads
@@ -73,6 +70,11 @@ pub fn reach(
         read.extend(REGISTRY_FILES.iter().map(|f| dir.join(f)));
     }
     read.push("/etc/docker/certs.d".into());
+    // registries.d, where the signatures are (`GetSignatures`)
+    match &config.pull.registries_d {
+        Some(dir) => read.push(dir.clone()),
+        None => read.extend(velarx_signature::registries_d::default_dirs()?),
+    }
     read.extend(env_path(velarx_registry::config::REGISTRIES_CONF_ENV));
     // the auth files, in the order the credentials are looked up: the file
     // `$REGISTRY_AUTH_FILE` names, the directories of the others (`login`

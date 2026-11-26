@@ -201,7 +201,6 @@ fn mount_source(registry_ref: Option<&str>, registry: &str, repository: &str) ->
 /// `[push] sinks` are asked before.
 pub(super) enum Origin<'a> {
     Registry {
-        client: &'a Resolver,
         destination: &'a ImageReference,
         tls_verify: bool,
         access: &'a velarx_registry::auth::RegistryAccess,
@@ -299,7 +298,6 @@ impl ImageService {
         let before = self.helper_links(&helpers, names.is_some()).await?;
         let (end, destinations, access, target) = match origin {
             Origin::Registry {
-                client,
                 destination,
                 tls_verify,
                 access,
@@ -314,13 +312,6 @@ impl ImageService {
                     )
                 })?;
                 let repository = format!("{}/{}", destination.registry, destination.repository);
-                let access = velarx_content::pull::access::access_for(
-                    client,
-                    &repository,
-                    tls_verify,
-                    access,
-                    false,
-                )?;
                 let access = (!access.is_empty())
                     .then(|| serde_json::to_vec(&access))
                     .transpose()?;
@@ -417,7 +408,6 @@ impl ImageService {
     /// The walker of a push to the registry `destination`.
     pub(super) async fn staged_push(
         &self,
-        client: &Resolver,
         destination: &ImageReference,
         tls_verify: bool,
         access: &velarx_registry::auth::RegistryAccess,
@@ -425,7 +415,6 @@ impl ImageService {
     ) -> ImageResult<Arc<StagedPush>> {
         self.staged(
             Origin::Registry {
-                client,
                 destination,
                 tls_verify,
                 access,
@@ -582,7 +571,7 @@ impl ImageService {
                 .await?;
             info!("Pushing image {} to {}", image_ref, path.label);
             let result = self
-                .push_staged((&staged, client), image_ref, options, (None, None))
+                .push_staged(&staged, image_ref, options, (None, None))
                 .await?;
             staged.finish().await?;
             return Ok(result);
@@ -610,7 +599,7 @@ impl ImageService {
                 velarx_types::transport::ImageLocation::loggable(&transport.destination)
             );
             let result = self
-                .push_staged((&staged, client), image_ref, options, (None, None))
+                .push_staged(&staged, image_ref, options, (None, None))
                 .await?;
             staged.finish().await?;
             return Ok(result);
@@ -628,7 +617,6 @@ impl ImageService {
         // The pushers, each in a process of its own.
         let staged = self
             .staged_push(
-                client,
                 &destination,
                 options.tls_verify,
                 &options.access,
@@ -638,7 +626,7 @@ impl ImageService {
         info!("Pushing image {} to {}", image_ref, destination.full_name());
         let result = self
             .push_staged(
-                (&staged, client),
+                &staged,
                 image_ref,
                 options,
                 (Some(&destination), signing.as_ref()),
@@ -659,7 +647,6 @@ impl ImageService {
     ) -> ImageResult<()> {
         // (no other pusher than the path's own: a save writes one file)
         let staged = self.staged(Origin::Path(path), Some(&[])).await?;
-        let client = self.resolver.clone();
         for (reference, names) in references {
             let options = PushOptions {
                 compression: Some(Compression::None),
@@ -672,7 +659,7 @@ impl ImageService {
             };
             let options = self.with_push_defaults(&options)?;
             info!("Saving image {} to {}", reference, path.label);
-            self.push_staged((&staged, &client), reference, &options, (None, None))
+            self.push_staged(&staged, reference, &options, (None, None))
                 .await?;
         }
         staged.finish().await
@@ -682,7 +669,7 @@ impl ImageService {
     /// walker `staged`.
     async fn push_staged(
         &self,
-        (staged, client): (&Arc<StagedPush>, &Resolver),
+        staged: &Arc<StagedPush>,
         image_ref: &str,
         options: &PushOptions,
         (destination, signing): (Option<&ImageReference>, Option<&signing::Signing>),
@@ -894,7 +881,6 @@ impl ImageService {
         if let (Some(signing), Some(destination)) = (signing, destination) {
             worker.phase("signing");
             let remote = signing::Remote {
-                client,
                 staged,
                 worker: &worker,
                 destination,
@@ -946,10 +932,8 @@ impl ImageService {
         // (refuses a blocked registry or a name that is not valid)
         client.push_target(dest)?;
         // Both registries through the fetcher process.
-        let src_net = self.inspect_net(&client, &src_ref, tls_verify, access)?;
-        let staged = self
-            .staged_push(&client, dest, tls_verify, access, sinks)
-            .await?;
+        let src_net = self.inspect_net(&src_ref, tls_verify, access)?;
+        let staged = self.staged_push(dest, tls_verify, access, sinks).await?;
         let (body, _) = src_net
             .manifest_top(&super::pull::manifest_reference(&src_ref))
             .await?;
@@ -1040,13 +1024,7 @@ impl ImageService {
         // (refuses a blocked registry or a name that is not valid)
         client.push_target(dest)?;
         let staged = self
-            .staged_push(
-                &client,
-                dest,
-                opts.tls_verify,
-                &opts.access,
-                opts.sinks.as_deref(),
-            )
+            .staged_push(dest, opts.tls_verify, &opts.access, opts.sinks.as_deref())
             .await?;
         let worker = self.push_worker(None);
         for blob in std::iter::once(&manifest.config).chain(&manifest.layers) {

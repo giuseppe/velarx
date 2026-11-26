@@ -89,11 +89,7 @@ impl ImageService {
     ) -> ImageResult<Vec<String>> {
         let image_ref = ImageReference::parse(reference)?;
         self.check_policy(&image_ref)?;
-        let client = self
-            .resolver
-            .with_access(&options.access)
-            .with_tls_verify(options.tls_verify);
-        self.tags_of(&client, &image_ref, options.tls_verify, &options.access)
+        self.tags_of(&image_ref, options.tls_verify, &options.access)
             .await
     }
 
@@ -102,13 +98,12 @@ impl ImageService {
     /// pulls are confined.
     async fn tags_of(
         &self,
-        client: &Resolver,
         image_ref: &ImageReference,
         tls_verify: bool,
         access: &velarx_registry::auth::RegistryAccess,
     ) -> ImageResult<Vec<String>> {
         let repository = format!("{}/{}", image_ref.registry, image_ref.repository);
-        self.remote_of(client, &repository, tls_verify, access)?
+        self.remote_of(&repository, tls_verify, access)?
             .tags()
             .await
     }
@@ -130,14 +125,9 @@ impl ImageService {
             ));
         }
         let tls_verify = !velarx_base::host::is_loopback_host(host);
-        self.remote_of(
-            &self.resolver,
-            &format!("{host}/library/login"),
-            tls_verify,
-            access,
-        )?
-        .login()
-        .await
+        self.remote_of(&format!("{host}/library/login"), tls_verify, access)?
+            .login()
+            .await
     }
 
     /// The registries a short name is searched in (registries.conf's
@@ -183,10 +173,6 @@ impl ImageService {
                 printable(registry)
             )));
         }
-        let mut client = self.resolver.with_access(&opts.access);
-        if let Some(v) = opts.tls_verify {
-            client = client.with_tls_verify(v);
-        }
         let limit = if opts.limit == 0 {
             DEFAULT_LIMIT
         } else {
@@ -205,7 +191,7 @@ impl ImageService {
             let name = format!("{}/{}", image_ref.registry, image_ref.repository);
             let tls_verify = opts.tls_verify.unwrap_or(true);
             return Ok(self
-                .tags_of(&client, &image_ref, tls_verify, &opts.access)
+                .tags_of(&image_ref, tls_verify, &opts.access)
                 .await?
                 .into_iter()
                 .take(limit)
@@ -223,12 +209,7 @@ impl ImageService {
         let docker = image_ref.registry == "docker.io";
         let tls_verify = opts.tls_verify.unwrap_or(true);
         let found: Vec<SearchHit> = self
-            .remote_of(
-                &client,
-                &format!("{registry}/search"),
-                tls_verify,
-                &opts.access,
-            )?
+            .remote_of(&format!("{registry}/search"), tls_verify, &opts.access)?
             .search(term, limit)
             .await?
             .into_iter()

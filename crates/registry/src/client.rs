@@ -254,19 +254,6 @@ impl RegistryClient {
         }
     }
 
-    /// A client that holds no credentials of its own (the auth files and the
-    /// credential helpers are not read).  What a request
-    /// brings ([`with_access`](Self::with_access)) it still uses.
-    pub fn without_credentials(&self) -> Self {
-        Self {
-            resolver: self.resolver.without_credentials(),
-            brokered: None,
-            tokens: Arc::new(Mutex::new(HashMap::new())),
-            redirects: Arc::default(),
-            ..self.clone()
-        }
-    }
-
     /// This client with the auth files read again (a `login` or a `logout`
     /// since it was made): the tokens taken with the old ones are dropped.
     /// Why not when the files cannot be read now.  `files`: the auth files

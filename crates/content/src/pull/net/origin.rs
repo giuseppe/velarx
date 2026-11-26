@@ -323,21 +323,45 @@ impl OriginNet {
         ImageError::transfer_of(REGISTRY, what, FailureClass::Unavailable, reason)
     }
 
-    /// Whether the registry is one of the sources.
-    pub fn has_registry(&self) -> bool {
-        self.sources.iter().any(|s| matches!(s, Source::Registry))
-    }
-
     /// The records of the signatures of the manifest `digest` that the
-    /// fetchers among the sources give.
-    pub async fn fetched_signatures(&self, digest: &Digest) -> Vec<SignedRecord> {
+    /// sources give: `reference` is the name of the image (`NAME[:TAG]`)
+    /// with the digest (`@DIGEST`).  The registry fetcher reads the
+    /// lookaside storage on the network and the sigstore attachments; an
+    /// error of it is the pull's, as the fetchers of `[pull] sources` have
+    /// none (what they cannot give is left out).
+    pub async fn fetched_signatures(
+        &self,
+        reference: &str,
+        digest: &Digest,
+    ) -> ImageResult<Vec<SignedRecord>> {
         let mut records = Vec::new();
         for source in &self.sources {
-            if let Source::Fetchers(fetchers) = source {
-                records.extend(fetchers.signatures(&digest.to_string()).await);
+            match source {
+                Source::Fetchers(fetchers) => {
+                    records.extend(fetchers.signatures(&digest.to_string()).await);
+                }
+                Source::Registry => records.extend(self.registry_signatures(reference).await?),
             }
         }
-        records
+        Ok(records)
+    }
+
+    async fn registry_signatures(&self, reference: &str) -> ImageResult<Vec<SignedRecord>> {
+        let mut slot = self.conn.lock().await;
+        let conn = self.scoped(&mut slot).await?;
+        let got = conn.get_signatures(reference, SIGNATURES_MAX_BYTES).await;
+        let Some(file) = self.answered(&mut slot, got)? else {
+            return Ok(Vec::new());
+        };
+        let body = sealed_bytes(self.party(), &file, SIGNATURES_MAX_BYTES, reference)?;
+        serde_json::from_slice(&body).map_err(|e| {
+            ImageError::transfer_of(
+                self.party(),
+                reference,
+                FailureClass::Invalid,
+                format!("the signatures are not records: {e}"),
+            )
+        })
     }
 
     /// The manifest `reference` (a tag or a digest) names and the digest of
@@ -426,30 +450,6 @@ impl OriginNet {
             MAX_MANIFEST_SIZE,
             "the index",
         )?))
-    }
-
-    /// The signature at `url` of a lookaside storage, at most `limit`
-    /// bytes; None when it has none there.
-    pub async fn signature(&self, url: &str, limit: u64) -> ImageResult<Option<Vec<u8>>> {
-        let file = rustix::fs::memfd_create("signature", rustix::fs::MemfdFlags::CLOEXEC)
-            .map(std::fs::File::from)
-            .map_err(|e| ImageError::Io(e.into()))?;
-        // (a path has no lookaside storage)
-        let Via::Registry(origin) = &self.via else {
-            return Ok(None);
-        };
-        let mut conn = origin
-            .connect()
-            .await
-            .map_err(|e| ImageError::transfer(REGISTRY, FailureClass::Transient, e.to_string()))?;
-        match conn.download(url, limit.max(1), &file).await {
-            Ok(got) => {
-                let bytes = written_bytes(&file, got.length, limit, url)?;
-                Ok(Some(bytes))
-            }
-            Err(e) if absent(&e) => Ok(None),
-            Err(e) => Err(image_error(e)),
-        }
     }
 
     /// The blob, written into `file` (empty, the engine's, open for

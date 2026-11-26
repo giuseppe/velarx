@@ -1726,7 +1726,7 @@ mod service {
             Ok(RegistryAck {})
         }
 
-        /// An http or https GET of `url` (a lookaside signature, an import,
+        /// An http or https GET of `url` (an import,
         /// an ADD of a build, a remote build context) into `file`, a file
         /// with no name the engine made, open for writing, among the
         /// descriptors of the call; at most `max` bytes.  No scope is

@@ -443,11 +443,11 @@ async fn test_no_secret_is_in_a_message() {
 
 /// `--tls-verify=false` for a registry that registries.conf does not mark
 /// insecure: the fetcher makes the requests on the asker's word, with the
-/// credentials of the call only, never its own (the stored ones a command
-/// wants for this registry go in the file of the call); this process opens no
-/// connection.
+/// credentials of the call first and then its own, as for a verified
+/// request, so the same bytes reach the same unchecked host whoever looked
+/// them up; this process opens no connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_a_request_without_tls_verification_uses_the_credentials_of_the_call_only() {
+async fn test_a_request_without_tls_verification_uses_the_credentials_of_the_call_then_its_own() {
     use base64::Engine as _;
     let g = guarded("u", "marker-password").await;
     let dir = tempfile::tempdir().unwrap();
@@ -463,38 +463,44 @@ async fn test_a_request_without_tls_verification_uses_the_credentials_of_the_cal
         format!(r#"{{"auths":{{"{}":{{"auth":"{basic}"}}}}}}"#, g.host),
     )
     .unwrap();
-    let tags = |tls_verify, access: RegistryAccess| {
+    let tags = |access: RegistryAccess| {
         let (origin, repository) = (origin.clone(), format!("{}/r", g.host));
         async move {
-            OriginRemote::new(origin, &repository, tls_verify, &access)
+            OriginRemote::new(origin, &repository, false, &access)
                 .unwrap()
                 .tags()
                 .await
         }
     };
-    // with it, the credentials of the call are the only ones
+    let sent = |g: &Guarded| {
+        let seen = g.seen.lock().unwrap();
+        let last = seen.last().cloned().flatten();
+        let all_anonymous = seen.iter().all(Option::is_none);
+        (last, all_anonymous)
+    };
+    // a call without credentials is answered with the fetcher's own
     g.seen.lock().unwrap().clear();
-    let anonymous = tags(false, RegistryAccess::default()).await;
-    let got = tags(false, access_of("u", "marker-password"))
-        .await
-        .unwrap();
-    assert_eq!(got, ["guarded"]);
-    anonymous.unwrap_err();
-    let seen = g.seen.lock().unwrap().clone();
-    // (the call without credentials sent none, though the fetcher has
-    // some: only the call with credentials sent them)
-    let (last, before) = seen.split_last().unwrap();
-    assert!(
-        last.is_some() && before.iter().all(Option::is_none),
-        "{seen:?}"
+    assert_eq!(tags(RegistryAccess::default()).await.unwrap(), ["guarded"]);
+    let (stored, all_anonymous) = sent(&g);
+    assert!(!all_anonymous);
+    assert_eq!(stored.as_deref(), Some(format!("Basic {basic}").as_str()));
+    // the credentials of the call are the same bytes on the wire
+    g.seen.lock().unwrap().clear();
+    assert_eq!(
+        tags(access_of("u", "marker-password")).await.unwrap(),
+        ["guarded"]
     );
-    let refused = tags(false, access_of("u", "wrong"))
-        .await
-        .unwrap_err()
-        .to_string();
+    assert_eq!(sent(&g).0, stored);
+    // and come first: wrong ones are refused, the stored ones are not tried
+    g.seen.lock().unwrap().clear();
+    let refused = tags(access_of("u", "wrong")).await.unwrap_err().to_string();
     assert!(
         refused.contains("401") || refused.contains("nauthorized"),
         "{refused}"
+    );
+    assert!(
+        !g.seen.lock().unwrap().contains(&stored),
+        "the stored credentials were tried after the call's"
     );
     assert_eq!(g.mine.load(Ordering::SeqCst), 0, "a request of the engine");
 }

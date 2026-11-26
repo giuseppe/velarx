@@ -25,6 +25,7 @@ velarx-types = { path = "../types" }
 velarx-registry = { path = "../registry", features = ["net"] }
 velarx-config = { path = "../config", features = ["engine"] }
 velarx-wire = { path = "../wire" }
+velarx-signature = { path = "../signature" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process", "net", "signal", "fs", "io-util", "io-std"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -40,6 +41,7 @@ zstd.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
 zeroize.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 velarx-storage = { path = "../storage", features = ["test-support"] }

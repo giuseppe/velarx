@@ -375,15 +375,11 @@ impl ImageService {
         reference: &str,
         add: &AddOptions,
     ) -> ImageResult<(Vec<Value>, String)> {
-        let client = self
-            .resolver
-            .with_tls_verify(add.tls_verify)
-            .with_access(&add.access);
         let image_ref = ImageReference::parse(reference)?;
         image_ref.validate()?;
         self.check_policy(&image_ref)?;
         image_ref.validate()?;
-        let net = self.inspect_net(&client, &image_ref, add.tls_verify, &add.access)?;
+        let net = self.inspect_net(&image_ref, add.tls_verify, &add.access)?;
         let wanted = super::pull::manifest_reference(&image_ref);
         let (body, mut digest) = net.manifest_top(&wanted).await?;
         if let Some(pinned) = &image_ref.digest {
@@ -645,15 +641,11 @@ impl ImageService {
         tls_verify: bool,
         access: &velarx_registry::auth::RegistryAccess,
     ) -> ImageResult<(Bytes, Digest)> {
-        let client = self
-            .resolver
-            .with_tls_verify(tls_verify)
-            .with_access(access);
         let image_ref = ImageReference::parse(reference)?;
         image_ref.validate()?;
         self.check_policy(&image_ref)?;
         image_ref.validate()?;
-        let net = self.inspect_net(&client, &image_ref, tls_verify, access)?;
+        let net = self.inspect_net(&image_ref, tls_verify, access)?;
         let wanted = super::pull::manifest_reference(&image_ref);
         let (body, mut digest) = net.manifest_top(&wanted).await?;
         if let Some(pinned) = &image_ref.digest {
@@ -874,13 +866,7 @@ impl ImageService {
                 // (the digest of the bytes in the algorithm of the destination's, if it names one)
                 let alg = dest.digest.map_or(list.alg, |d| d.alg());
                 let staged = self
-                    .staged_push(
-                        &client,
-                        dest,
-                        opts.tls_verify,
-                        &opts.access,
-                        opts.sinks.as_deref(),
-                    )
+                    .staged_push(dest, opts.tls_verify, &opts.access, opts.sinks.as_deref())
                     .await?;
                 (tag, alg, staged)
             }

@@ -409,21 +409,11 @@ pub struct Resolver {
     store: Option<Arc<HintStore>>,
     /// The least a download must bring
     speed: crate::speed::Speed,
-    /// What the requests brought, kept to put it before the stored
-    /// credentials of [`with_stored_credentials`](Self::with_stored_credentials)
+    /// What the requests brought
     access: Option<Arc<super::auth::RegistryAccess>>,
 }
 
 impl Resolver {
-    /// The configuration of the system: `registries.conf`, `certs.d`,
-    /// `auth.json`.
-    pub fn new() -> Result<Self, velarx_base::ids::IdsError> {
-        Ok(Self::with_config(
-            TransportConfig::system()?,
-            AuthConfig::load()?,
-        ))
-    }
-
     pub fn with_config(config: TransportConfig, auth: AuthConfig) -> Self {
         Self {
             config: Arc::new(config),
@@ -482,37 +472,12 @@ impl Resolver {
         }
     }
 
-    /// No credentials of its own (the auth files and the credential
-    /// helpers are not read): for a process whose registry requests are
-    /// made by the fetcher.  What a request brings
-    /// ([`with_access`](Self::with_access)) it still uses.
-    pub fn without_credentials(&self) -> Self {
-        Self {
-            auth: Arc::new(AuthConfig::default()),
-            ..self.clone()
-        }
-    }
-
     /// The auth files read again (a `login` or a `logout` since it was
     /// made).  Why not when the files cannot be read now.  `files`: the
     /// auth files of the process ([`crate::auth::default_auth_files`]).
     pub fn with_reloaded_credentials(&self, files: &[PathBuf]) -> Result<Self, String> {
         Ok(Self {
             auth: Arc::new(self.auth.reloaded(files)?),
-            ..self.clone()
-        })
-    }
-
-    /// The stored credentials after all (the auth files and the credential
-    /// helpers): what the request brought comes first.
-    pub fn with_stored_credentials(&self) -> Result<Self, velarx_base::ids::IdsError> {
-        let stored = AuthConfig::load()?;
-        let auth = match &self.access {
-            Some(access) => stored.with_access(access),
-            None => stored,
-        };
-        Ok(Self {
-            auth: Arc::new(auth),
             ..self.clone()
         })
     }

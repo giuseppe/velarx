@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use velarx_content::fetcher::fetch::{
-    Blob, EventKind, Failure, FetchEvent as Event, FetcherError, NotLazy, Parts, Probed, TocSource,
-    MAX_FDS,
+    Blob, EventKind, Failure, FetchEvent as Event, FetcherError, NotLazy, Parts, Probed,
+    SignedRecord, TocSource, MAX_FDS,
 };
 use velarx_content::pull::chunked::{
     self, fetch_with_tries, make_batches, Batch, MAX_METADATA_COMPRESSED,
@@ -1026,6 +1026,20 @@ impl StagingFetcher for RegistryFetch {
         out.finish()
     }
 
+    async fn get_signatures(
+        &self,
+        scope: &Scope,
+        reference: &str,
+        max: u64,
+    ) -> Result<File, FetcherError> {
+        let (pool, _) = self.pool(scope)?;
+        let records = crate::signatures::of(&self.service, &pool, reference, max).await?;
+        let bytes = SignedRecord::encoded(records, max)
+            .ok_or_else(|| FetcherError::unavailable(format!("{reference}: no signature")))?;
+        let fd = velarx_base::sealed::sealed_memory(&bytes).map_err(failed)?;
+        Ok(fd.into())
+    }
+
     fn registry(&self) -> Option<Arc<dyn velarx_content::serve_registry::RegistryCalls>> {
         Some(self.service.clone())
     }
@@ -1617,6 +1631,114 @@ mod tests {
         assert!(got.is_err());
         let (got, _) = get_blob_of(&blob, blob.len() as u64, frames[..2].to_vec()).await;
         assert!(got.is_err());
+    }
+
+    /// `GetSignatures` gives the sigstore attachment of a manifest as the
+    /// base64 of the blob of a signature, for a registry whose registries.d
+    /// asks for attachments (the storage of the signatures is a directory,
+    /// which the engine reads); one that does not has no signature, and a
+    /// reference with no digest is refused.
+    #[tokio::test]
+    async fn the_sigstore_attachment_of_a_manifest_is_its_signature() {
+        use crate::net::proto::{read_bytes, read_header, write_data, write_frame, Kind};
+        use base64::Engine;
+        let payload = br#"{"critical":{}}"#.to_vec();
+        let layer = Digest::of(velarx_types::digest::Algorithm::Sha256, &payload);
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "0".repeat(64)),
+                "size": 2,
+            },
+            "layers": [{
+                "mediaType": "application/vnd.dev.cosign.simplesigning.v1+json",
+                "digest": layer.to_string(),
+                "size": payload.len(),
+                "annotations": {"dev.cosignproject.cosign/signature": "c2ln"},
+            }],
+        })
+        .to_string();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("e.yaml"),
+            "docker:\n  registry.invalid:\n    lookaside: file:///signatures\n    use-sigstore-attachments: true\n",
+        )
+        .unwrap();
+        let signed = payload.clone();
+        let pool = crate::net::pool::tests::pool_with(move |mut w| async move {
+            // (the manifest tagged `ALGO-HEX.sig`, then its layer)
+            write_data(&mut w, Kind::Data, &[], 0, 0, manifest.as_bytes())
+                .await
+                .unwrap();
+            write_frame(&mut w, Kind::Reply, b"{}", &[]).await.unwrap();
+            let next = read_header(&mut w, 0).await.unwrap();
+            read_bytes(&mut w, next.json_len).await.unwrap();
+            write_data(&mut w, Kind::Data, &[], 0, 0, &signed)
+                .await
+                .unwrap();
+            write_frame(&mut w, Kind::Reply, b"{}", &[]).await.unwrap();
+        })
+        .await;
+        let fetch = RegistryFetch::new(
+            crate::registry::pool_tests::service_of(velarx_config::PullConfig {
+                registries_d: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            }),
+            Arc::new(OwnedFd::from(File::open("/").unwrap())),
+        );
+        let scope = Scope {
+            verity: false,
+            source: Some("registry.invalid/r/app".into()),
+            tls_verify: None,
+            target: None,
+            access: None,
+            idle: std::time::Duration::from_secs(1),
+            kept: Arc::default(),
+        };
+        scope.kept.lock().unwrap().insert(
+            WORKERS.into(),
+            Arc::new(Workers {
+                access: None,
+                pool,
+                host: "registry.invalid".into(),
+            }),
+        );
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let reference = format!("registry.invalid/r/app:v1@{digest}");
+        let file = fetch
+            .get_signatures(&scope, &reference, 1 << 20)
+            .await
+            .unwrap();
+        let records: Vec<SignedRecord> = serde_json::from_slice(
+            &velarx_base::sealed::read_sealed_whole(&file, 1 << 20).unwrap(),
+        )
+        .unwrap();
+        let expected =
+            velarx_signature::sigstore::Signature::Sigstore(velarx_signature::sigstore::Sigstore {
+                mime_type: "application/vnd.dev.cosign.simplesigning.v1+json".into(),
+                payload,
+                annotations: [(
+                    "dev.cosignproject.cosign/signature".to_string(),
+                    "c2ln".to_string(),
+                )]
+                .into(),
+            });
+        assert_eq!(
+            records,
+            [SignedRecord {
+                digest,
+                platform: None,
+                signatures: vec![
+                    base64::engine::general_purpose::STANDARD.encode(expected.to_blob())
+                ],
+            }]
+        );
+        // (no digest: not a reference of a signature)
+        let got = fetch
+            .get_signatures(&scope, "registry.invalid/r/app:v1", 1 << 20)
+            .await;
+        assert!(matches!(got, Err(FetcherError::InvalidArgument { .. })));
     }
 
     /// The table of contents of a zstd:chunked layer is found through the

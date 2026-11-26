@@ -136,6 +136,16 @@ impl RegistriesD {
         Self::load_dirs(&default_dirs().map_err(|e| e.to_string())?)
     }
 
+    /// The configuration of the directory `dir` when one is configured
+    /// (`[pull] registries_d`), else that of the default directories.
+    pub fn load_configured(dir: Option<&Path>) -> Result<Self, String> {
+        match dir {
+            Some(dir) if !dir.is_dir() => Err(format!("{} is not a directory", dir.display())),
+            Some(dir) => Self::load_dirs(&[dir.to_path_buf()]),
+            None => Self::load(),
+        }
+    }
+
     /// The configuration of `dirs`, highest priority first.
     pub fn load_dirs(dirs: &[PathBuf]) -> Result<Self, String> {
         let mut files: BTreeMap<String, PathBuf> = BTreeMap::new();

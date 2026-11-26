@@ -13,6 +13,7 @@ pub mod net;
 pub mod registry;
 pub mod registry_fetch;
 pub mod registry_push;
+mod signatures;
 
 /// The sha256 digest of `data`, for the tests.
 #[cfg(test)]

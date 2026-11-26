@@ -549,7 +549,6 @@ impl ImageService {
         reference: &str,
         options: &PullOptions,
     ) -> ImageResult<Digest> {
-        let client = self.resolver.with_tls_verify(options.tls_verify);
         let platform = options
             .platform
             .as_deref()
@@ -563,8 +562,7 @@ impl ImageService {
                 // nothing of the image is kept: `reject` refuses it
                 self.policy_for(&image_ref)?;
                 image_ref.validate()?;
-                let net =
-                    self.inspect_net(&client, &image_ref, options.tls_verify, &options.access)?;
+                let net = self.inspect_net(&image_ref, options.tls_verify, &options.access)?;
                 let (_, digest, _, _) = net
                     .manifest_raw(&image_ref, platform.as_ref(), None)
                     .await?;
@@ -587,10 +585,6 @@ impl ImageService {
         reference: &str,
         options: &PullOptions,
     ) -> ImageResult<RemoteDescriptor> {
-        let client = self
-            .resolver
-            .with_tls_verify(options.tls_verify)
-            .with_access(&options.access);
         let mut tried = Tried::default();
         for candidate in self.candidates(reference)? {
             let result = async {
@@ -599,8 +593,7 @@ impl ImageService {
                 // nothing of the image is kept: `reject` refuses it
                 self.policy_for(&image_ref)?;
                 image_ref.validate()?;
-                let net =
-                    self.inspect_net(&client, &image_ref, options.tls_verify, &options.access)?;
+                let net = self.inspect_net(&image_ref, options.tls_verify, &options.access)?;
                 let wanted = manifest_reference(&image_ref);
                 let (body, mut digest) = net.manifest_top(&wanted).await?;
                 if let Some(pinned) = &image_ref.digest {
@@ -940,24 +933,19 @@ impl ImageService {
 
     /// How a call about the repository `repository` (`registry/name`) of a
     /// registry reaches it through the fetcher.  The credentials of the
-    /// command go to the fetcher in a file with no name (the stored ones
-    /// for a registry whose TLS verification the command turns off); this
-    /// process opens no connection.
+    /// command go to the fetcher in a file with no name; this process opens
+    /// no connection.
     pub(super) fn remote_of(
         &self,
-        client: &Resolver,
         repository: &str,
         tls_verify: bool,
         access: &velarx_registry::auth::RegistryAccess,
     ) -> ImageResult<velarx_content::pull::net::origin::OriginRemote> {
-        let origin = self.origin()?;
-        let access =
-            velarx_content::pull::access::access_for(client, repository, tls_verify, access, true)?;
         velarx_content::pull::net::origin::OriginRemote::new(
-            origin.clone(),
+            self.origin()?.clone(),
             repository,
             tls_verify,
-            &access,
+            access,
         )
     }
 
@@ -967,7 +955,6 @@ impl ImageService {
     /// credentials and certificates of the command in a sealed memory file.
     pub(super) fn inspect_net(
         &self,
-        client: &Resolver,
         image_ref: &ImageReference,
         tls_verify: bool,
         access: &velarx_registry::auth::RegistryAccess,
@@ -975,9 +962,7 @@ impl ImageService {
         let origin = self.origin()?;
         let name = image_ref.full_name();
         let access =
-            velarx_content::pull::access::access_for(client, &name, tls_verify, access, true)?;
-        let access =
-            velarx_content::fetcher::fetch_client::Access::new(&access).map_err(ImageError::Io)?;
+            velarx_content::fetcher::fetch_client::Access::new(access).map_err(ImageError::Io)?;
         Ok(Net::Origin(
             velarx_content::pull::net::origin::OriginNet::new(origin.clone(), name, tls_verify)
                 .with_access(access),
@@ -1189,7 +1174,7 @@ impl ImageService {
         };
         let target = client.target(&image_ref)?;
         let access = client.request_access().cloned().unwrap_or_default();
-        let mut net = self.inspect_net(client, &image_ref, reach.tls_verify, &access)?;
+        let mut net = self.inspect_net(&image_ref, reach.tls_verify, &access)?;
         // (the sources are asked in their order; a digest vouches for the
         // manifest, and the manifest for the rest: what the fetchers have is
         // checked against them, and only the registry resolves a tag)
@@ -1329,13 +1314,7 @@ impl ImageService {
             hold: None,
             pulled: signed,
             indexes,
-            access: Some(velarx_content::pull::access::access_for(
-                client,
-                &image_ref.full_name(),
-                reach.tls_verify,
-                &access,
-                true,
-            )?),
+            access: Some(access.clone()),
             recorded: Vec::new(),
         };
         let result = self.install(net, incoming, progress_tx, start).await?;

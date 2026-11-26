@@ -129,6 +129,18 @@ struct Fetcher {
     /// Its connection failed (the peer restarted, the socket went): the
     /// scope it was given is gone with it
     lost: std::sync::atomic::AtomicBool,
+    /// The scope the registry fetcher is given by the first call that needs
+    /// it (none: it has it, or is not the registry's)
+    pending: Mutex<Option<Pending>>,
+}
+
+/// What `Open` gives the registry fetcher.
+struct Pending {
+    verity: bool,
+    repository: String,
+    tls_verify: bool,
+    /// The JSON of a `RegistryAccess`
+    access: Option<zeroize::Zeroizing<Vec<u8>>>,
 }
 
 /// What one call learnt of the fetchers of the list: the breaker.  One
@@ -196,9 +208,49 @@ impl Fetcher {
             .acquire_owned()
             .await
             .map_err(|e| CallError::Protocol(e.to_string()))?;
-        let mut control = self.control.lock().await;
+        let mut control = self.control().await?;
         let conn = crate::idle::within(self.idle, control.connect()).await?;
         Ok((conn, permit))
+    }
+
+    /// The scope still to open (registry fetcher only).
+    fn pending(&self) -> std::sync::MutexGuard<'_, Option<Pending>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The control connection, with its scope open: the registry fetcher is
+    /// given its scope by the first call that reaches it, so a pull that
+    /// the other fetchers serve never opens it.
+    async fn control(&self) -> Result<tokio::sync::MutexGuard<'_, FetchConn>, CallError> {
+        let mut control = self.control.lock().await;
+        let Some(scope) = self.pending().take() else {
+            return Ok(control);
+        };
+        let opened = async {
+            let access = scope
+                .access
+                .as_ref()
+                .map(|a| velarx_base::sealed::sealed_memory(a))
+                .transpose()?;
+            let requires = ["objects".to_string(), "metadata".to_string()];
+            let opened = control.open(Scoping {
+                verity: scope.verity,
+                source: Some(&scope.repository),
+                tls_verify: Some(scope.tls_verify),
+                target: None,
+                access,
+                idle: self.idle,
+                requires: &requires,
+            });
+            crate::idle::within(self.idle, opened).await
+        };
+        // (a scope that failed to open is no scope: the next call opens it
+        // again, and fails as this one did)
+        if let Err(e) = opened.await {
+            *self.pending() = Some(scope);
+            return Err(e);
+        }
+        Ok(control)
     }
 }
 
@@ -387,6 +439,7 @@ impl StagedFetch {
                     handover: info.can("handover"),
                     table: info.can("table"),
                     lost: Default::default(),
+                    pending: Mutex::default(),
                 }),
                 Err(e) => debug!("The fetcher {name} is left out of the pull: {e}"),
             }
@@ -398,7 +451,8 @@ impl StagedFetch {
     /// on those of `before` and `after` with nothing but the verity of the
     /// store, on the registry fetcher `end` between them (none: `registry`
     /// is not one of the sources) with the repository and the credentials
-    /// `access` (the JSON of a `RegistryAccess`, in a sealed memory file).
+    /// `access` (the JSON of a `RegistryAccess`; the scope is opened by the
+    /// first call that reaches the registry fetcher).
     /// A fetcher of `before` or `after` that is not there or refuses the
     /// scope is left out.
     #[allow(clippy::type_complexity)]
@@ -417,22 +471,6 @@ impl StagedFetch {
                 .get_info()
                 .await
                 .map_err(|e| fetcher_error("registry", e))?;
-            let access = access
-                .map(velarx_base::sealed::sealed_memory)
-                .transpose()
-                .map_err(ImageError::Io)?;
-            let requires = vec!["objects".to_string(), "metadata".to_string()];
-            end.open(Scoping {
-                verity,
-                source: Some(repository),
-                tls_verify: Some(tls_verify),
-                target: None,
-                access,
-                idle: REGISTRY_IDLE,
-                requires: &requires,
-            })
-            .await
-            .map_err(|e| fetcher_error("registry", e))?;
             origin = Some(fetchers.len());
             fetchers.push(Fetcher {
                 name: "registry".into(),
@@ -444,6 +482,12 @@ impl StagedFetch {
                 handover: info.can("handover"),
                 table: info.can("table"),
                 lost: Default::default(),
+                pending: Mutex::new(Some(Pending {
+                    verity,
+                    repository: repository.to_string(),
+                    tls_verify,
+                    access: access.map(|a| a.to_vec().into()),
+                })),
             });
         }
         fetchers.extend(Self::open_links(after, verity).await);
@@ -474,6 +518,7 @@ impl StagedFetch {
             handover: info.can("handover"),
             table: info.can("table"),
             lost: Default::default(),
+            pending: Mutex::default(),
         });
         Self::assemble(fetchers, origin, root, verity, manifest)
     }
@@ -1028,6 +1073,10 @@ impl StagedFetch {
                 continue;
             }
             let mut control = fetcher.control.lock().await;
+            // (a scope that is not open was told of nothing)
+            if fetcher.pending().is_some() {
+                continue;
+            }
             if let Err(e) = crate::idle::within(fetcher.idle, control.forget(layer)).await {
                 debug!("The fetcher {} keeps the layer {layer}: {e}", fetcher.name);
             }
@@ -1115,10 +1164,11 @@ impl StagedFetch {
                 // (the blob of the layer only to a fetcher that reaches an
                 // origin: the word `origin`)
                 let blob = fetcher.origin.then_some(&described);
-                let said = {
-                    let mut control = fetcher.control.lock().await;
+                let said = async {
+                    let mut control = fetcher.control().await?;
                     crate::idle::within(fetcher.idle, control.layer(&name, blob, dir, toc)).await
-                };
+                }
+                .await;
                 match said {
                     Ok(()) => {
                         let mut told = self.told.lock().unwrap_or_else(|e| e.into_inner());
@@ -2096,6 +2146,74 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// A fetcher that counts the scopes it is given, and fails the first
+    /// `.1` of them.
+    struct Opens(Arc<std::sync::atomic::AtomicUsize>, usize, Probes);
+
+    fn opens(fails: usize, has: &[u32]) -> (Arc<std::sync::atomic::AtomicUsize>, LocalFetcher) {
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probes = Probes {
+            has: has.to_vec(),
+            refuse: false,
+            reason: NotLazy::Unreachable,
+        };
+        let api = Arc::new(Opens(opened.clone(), fails, probes));
+        (opened, LocalFetcher::start(api, Limits::default()).unwrap())
+    }
+
+    #[async_trait]
+    impl StagingFetcher for Opens {
+        fn described(&self) -> Described {
+            self.2.described()
+        }
+
+        async fn opened(&self, _scope: &Scope) -> Result<(), FetcherError> {
+            if self.0.fetch_add(1, Ordering::SeqCst) < self.1 {
+                return Err(FetcherError::unavailable("not now"));
+            }
+            Ok(())
+        }
+
+        async fn probe(
+            &self,
+            scope: &Scope,
+            layers: Vec<Blob>,
+            asked: (bool, Parts),
+            out: &Out<Probed>,
+        ) -> Result<(), FetcherError> {
+            self.2.probe(scope, layers, asked, out).await
+        }
+    }
+
+    /// The scope of the registry fetcher is opened by the first call that
+    /// reaches it: a pull that the peers answer never opens it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_registry_scope_is_opened_when_a_call_reaches_it() {
+        let peers = local(&[0, 1], false);
+        let (opened, registry) = opens(0, &[2]);
+        let staged = pull(&[("peers", &peers)], &registry).await;
+        staged.probe_all(&[0, 1], false, Parts::All).await.unwrap();
+        staged.forget(&format!("sha256:{:064x}", 0)).await;
+        assert_eq!(opened.load(Ordering::SeqCst), 0, "the peers had both");
+        staged.probe_all(&[1, 2], false, Parts::All).await.unwrap();
+        staged.probe_all(&[2], false, Parts::All).await.unwrap();
+        assert_eq!(opened.load(Ordering::SeqCst), 1, "opened once");
+    }
+
+    /// A registry scope that failed to open is no scope: the call it failed
+    /// leaves the registry fetcher out, the next call opens it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registry_scope_that_failed_to_open_is_opened_again() {
+        let (opened, registry) = opens(1, &[2]);
+        let staged = pull(&[], &registry).await;
+        let toc = |r: Vec<(Probed, _)>| r.into_iter().map(|(p, _)| p.toc).collect::<Vec<_>>();
+        let first = staged.probe_all(&[2], false, Parts::All).await.unwrap();
+        assert_eq!(toc(first), [TocSource::None]);
+        let again = staged.probe_all(&[2], false, Parts::All).await.unwrap();
+        assert_eq!(toc(again), [TocSource::Unpack]);
+        assert_eq!(opened.load(Ordering::SeqCst), 2);
     }
 
     /// The engine walks its list: each layer is answered once, by the first

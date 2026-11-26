@@ -168,6 +168,12 @@ impl RegistryService {
         }
     }
 
+    /// Where a URL is read: [`Self::fetcher`] at the speed `[pull]` asks.
+    pub(crate) fn url_fetcher(&self) -> crate::net::url::Fetcher {
+        self.fetcher(&self.pull)
+            .with_min_speed(velarx_content::pull::min_speed(&self.pull))
+    }
+
     /// What starts the confined workers that make the requests.
     pub(crate) fn spawner(&self) -> Arc<Spawner> {
         self.spawner.clone()
@@ -259,18 +265,14 @@ impl RegistryService {
     /// asker turns TLS verification off for a registry that registries.conf
     /// does not mark insecure (`--tls-verify=false`, as podman allows), the
     /// requests are made on its word, with the credentials of the call
-    /// only: none of the fetcher's own are sent to a host whose
-    /// certificate is not checked, and what that host answers is not kept
-    /// as a hint for the requests that check it.
+    /// first and then the fetcher's own, as for a verified request; what
+    /// that host answers is not kept as a hint for the requests that check
+    /// it.
     fn request_client(&self, repository: &str, tls_verify: bool) -> RegistryClient {
-        let client = self.client();
-        let client = if !tls_verify && !client.registries().is_insecure(repository) {
-            let mut unverified = client.without_credentials();
-            unverified.set_hints(None);
-            unverified
-        } else {
-            client
-        };
+        let mut client = self.client();
+        if !tls_verify && !client.registries().is_insecure(repository) {
+            client.set_hints(None);
+        }
         client.with_tls_verify(tls_verify)
     }
 
@@ -490,10 +492,7 @@ impl RegistryCalls for RegistryService {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             return Err(bad("a URL is http or https"));
         }
-        let pull = &self.pull;
-        let fetcher = self
-            .fetcher(pull)
-            .with_min_speed(velarx_content::pull::min_speed(pull));
+        let fetcher = self.url_fetcher();
         let mut writer = velarx_storage::SparseWriter::new(file);
         let mut sink = |chunk: &[u8]| writer.write_all(chunk);
         let found = tokio::select! {
@@ -870,9 +869,14 @@ pub(crate) mod pool_tests {
 
     /// A service that starts no worker.
     pub(crate) fn service() -> Arc<RegistryService> {
+        service_of(Default::default())
+    }
+
+    /// [`service`] with the `[pull]` configuration `pull`.
+    pub(crate) fn service_of(pull: PullConfig) -> Arc<RegistryService> {
         let spawner = Arc::new(Spawner::start_beside_idle_threads(Vec::new(), |_| Ok(())).unwrap());
         RegistryService::with_client(
-            Default::default(),
+            (pull, Default::default()),
             RegistryClient::with_config(
                 velarx_registry::target::TransportConfig {
                     registries: Default::default(),

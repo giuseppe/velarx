@@ -58,32 +58,17 @@ impl Net {
         self.origin()?.path_index().await
     }
 
-    /// Whether the registry is one of the sources of the pull: the places
-    /// it keeps signatures in are looked at only then.
-    pub fn has_registry(&self) -> bool {
-        match self {
-            Net::Origin(origin) => origin.has_registry(),
-            Net::Offline => false,
-        }
-    }
-
-    /// The records of the signatures of the manifest `digest` that the
-    /// fetchers among the sources give (untrusted).
+    /// The records of the signatures of the manifest `digest` of the image
+    /// `reference` (`NAME[:TAG]@DIGEST`) that the sources give (untrusted).
     pub async fn fetched_signatures(
         &self,
+        reference: &str,
         digest: &Digest,
-    ) -> Vec<crate::fetcher::fetch::SignedRecord> {
+    ) -> ImageResult<Vec<crate::fetcher::fetch::SignedRecord>> {
         match self {
-            Net::Origin(origin) => origin.fetched_signatures(digest).await,
-            Net::Offline => Vec::new(),
+            Net::Origin(origin) => origin.fetched_signatures(reference, digest).await,
+            Net::Offline => Ok(Vec::new()),
         }
-    }
-
-    /// The signature at `url` of a lookaside storage (http or https), at
-    /// most `limit` bytes, None when there is none: the registry fetcher
-    /// reads it.
-    pub async fn signature(&self, url: &str, limit: u64) -> ImageResult<Option<Vec<u8>>> {
-        self.origin()?.signature(url, limit).await
     }
 
     /// The manifest `reference` names, None when the registry has none.
@@ -105,22 +90,6 @@ impl Net {
                     annotations: None,
                 },
                 file,
-            )
-            .await
-    }
-
-    /// A small blob (a signature) in memory: refused when `size` is above
-    /// `limit`; measured like [`Net::blob`].
-    pub async fn small_blob(&self, digest: &Digest, size: u64, limit: u64) -> ImageResult<Bytes> {
-        self.origin()?
-            .small_blob(
-                &crate::fetcher::fetch::Blob {
-                    digest: digest.to_string(),
-                    size,
-                    media_type: "application/octet-stream".into(),
-                    annotations: None,
-                },
-                limit,
             )
             .await
     }
