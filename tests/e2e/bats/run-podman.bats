@@ -266,7 +266,8 @@ Are you sure you want to continue? [y/N] ponet2" "$(echo n | sh_ network prune 2
     sh_ rm --ignore --cidfile "$WORKDIR/nosuch.cid" > /dev/null 2>&1
     check "rm --ignore of a cidfile that is not there" 0 $?
 
-    sh_ run -d --name pll --network none "$IMAGE" sh -c 'echo logline; exec sleep 100' > /dev/null
+    sh_ run -d --name pll --network none --log-driver k8s-file "$IMAGE" sh -c 'echo logline; exec sleep 100' > /dev/null
+    wait_log pll logline
     check "ps --latest" pll "$(sh_ ps --latest --format '{{.Names}}' 2>&1)"
     check "inspect --latest" pll "$(sh_ inspect -l --format '{{.Name}}' 2>&1)"
     check "logs --latest" logline "$(sh_ logs --latest 2>&1)"
