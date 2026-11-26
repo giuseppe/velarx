@@ -110,8 +110,9 @@ EOT
 }
 
 # the host service of the bridge test ends with a test that failed; the
-# engine a test killed is started again
+# engine a test killed is started again (none when setup_file skipped)
 teardown () {
+    [ -n "${WORKDIR:-}" ] || return 0
     [ -z "${hostsvc:-}" ] || kill "$hostsvc" 2> /dev/null
     kill -0 "$(cat "$WORKDIR/daemon.pid")" 2> /dev/null || restart_engine
     return 0
