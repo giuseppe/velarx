@@ -221,7 +221,7 @@ RULES = [
     # libpod containers/create
     (r"libpod POST /containers/create$", r"devices\.(type|major|minor|uid|gid|fileMode)$", "noop", "podman reads only the path of a device", False),
     (r"libpod POST /containers/create$", r"host_device_list\..*", "refused", "via host_device_list", False),
-    (r"libpod POST /containers/create$", r"Networks\.(options|interface_name)$", "refused", "", False),
+    (r"libpod POST /containers/create$", r"Networks\.options$", "refused", "", False),
     (r"libpod POST /containers/create$", r"(containerCreateCommand|raw_image_name)$", "noop", "kept by podman for inspect, no effect on the container", False),
     (r"libpod POST /containers/create$", r"volatile$", "noop", "a hint that the upper layer needs no sync", False),
     (r"libpod POST /containers/create$", r"create_working_dir$", "noop", "a missing working directory is always made", False),

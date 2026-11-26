@@ -508,41 +508,80 @@ fn netns(spec: &Value, req: &mut CreateContainerRequest, default: &str) -> ApiRe
     }
     if let Some(nets) = nets {
         for (name, opts) in nets {
-            refuse_members(opts, "Networks", &["options", "interface_name"])?;
+            refuse_members(opts, "Networks", &["options"])?;
             // podman's `--network bridge`: the bridge mode on the network
             // named `default`, the default network
-            if mode == "bridge" && name == "default" {
-                req.networks
-                    .push(velarx_netdetach::def::DEFAULT_NETWORK.to_string());
-            } else {
-                req.networks.push(name.clone());
-            }
-            req.network_aliases.extend(strs(opts, "aliases"));
-            for ip in strs(opts, "static_ips") {
-                let slot = if ip.contains(':') {
-                    &mut req.ip6_address
-                } else {
-                    &mut req.ip_address
-                };
-                if slot.replace(ip).is_some() {
-                    return Err(ApiError::not_implemented(
-                        "more than one static IP address of a family is not supported",
-                    ));
-                }
-            }
-            if let Some(mac) = nonempty(s(opts, "static_mac")) {
-                if req.mac_address.replace(mac).is_some() {
-                    return Err(ApiError::not_implemented(
-                        "a static MAC address on more than one network is not supported",
-                    ));
-                }
-            }
+            let name = match mode == "bridge" && name == "default" {
+                true => velarx_netdetach::def::DEFAULT_NETWORK,
+                false => name.as_str(),
+            };
+            req.networks.push(network_with_options(
+                name,
+                &strs(opts, "static_ips"),
+                s(opts, "static_mac"),
+                &strs(opts, "aliases"),
+                s(opts, "interface_name"),
+            )?);
         }
     }
     if req.mac_address.is_none() {
         req.mac_address = nonempty(s(spec, "static_mac"));
     }
     Ok(())
+}
+
+/// The IPv4 and the IPv6 address (each may be empty) an endpoint of Docker's
+/// create asks for: `IPAMConfig`, else `IPAddress`, which is a static
+/// address too, as podman takes it.
+fn endpoint_addresses(cfg: &Value) -> ApiResult<(&str, &str)> {
+    let plain = s(cfg, "IPAddress");
+    let (v4, v6) = match plain.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => (plain, ""),
+        Ok(std::net::IpAddr::V6(_)) => ("", plain),
+        Err(_) if plain.is_empty() => ("", ""),
+        Err(_) => {
+            return Err(ApiError::bad_request(format!(
+                "failed to parse the ip address {plain:?}"
+            )))
+        }
+    };
+    let ipam = get(cfg, "IPAMConfig");
+    let or = |a: &'static str, b| Some(s(ipam, a)).filter(|v| !v.is_empty()).unwrap_or(b);
+    Ok((or("IPv4Address", v4), or("IPv6Address", v6)))
+}
+
+/// `--network NAME:OPTIONS`: the network with the addresses, the MAC
+/// address, the names and the interface name the endpoint asks for.
+fn network_with_options(
+    name: &str,
+    ips: &[String],
+    mac: &str,
+    aliases: &[String],
+    ifname: &str,
+) -> ApiResult<String> {
+    let mut options = Vec::new();
+    for (key, v6) in [("ip", false), ("ip6", true)] {
+        let mut of_family = ips.iter().filter(|ip| ip.contains(':') == v6);
+        if let Some(ip) = of_family.next() {
+            if of_family.next().is_some() {
+                return Err(ApiError::not_implemented(
+                    "more than one static IP address of a family is not supported",
+                ));
+            }
+            options.push(format!("{key}={ip}"));
+        }
+    }
+    if !mac.is_empty() {
+        options.push(format!("mac={mac}"));
+    }
+    options.extend(aliases.iter().map(|a| format!("alias={a}")));
+    if !ifname.is_empty() {
+        options.push(format!("interface_name={ifname}"));
+    }
+    Ok(match options.is_empty() {
+        true => name.to_string(),
+        false => format!("{name}:{}", options.join(",")),
+    })
 }
 
 fn ns_mode(spec: &Value, key: &str) -> ApiResult<NsMode> {
@@ -1756,34 +1795,48 @@ pub async fn from_docker(
                 _ => req.networks.extend(names),
             }
         }
-        for cfg in net.values() {
-            // (`IPAddress` is a static address too, as podman takes it)
-            let plain = s(cfg, "IPAddress");
-            let (v4, v6) = match plain.parse::<std::net::IpAddr>() {
-                Ok(std::net::IpAddr::V4(_)) => (plain, ""),
-                Ok(std::net::IpAddr::V6(_)) => ("", plain),
-                Err(_) if plain.is_empty() => ("", ""),
-                Err(_) => {
-                    return Err(ApiError::bad_request(format!(
-                        "failed to parse the ip address {plain:?}"
-                    )))
-                }
-            };
-            let ipam = get(cfg, "IPAMConfig");
-            let or = |a: &'static str, b| Some(s(ipam, a)).filter(|v| !v.is_empty()).unwrap_or(b);
-            // (the addresses are the container's: one network has them)
-            for (slot, value) in [
-                (&mut req.ip_address, or("IPv4Address", v4)),
-                (&mut req.ip6_address, or("IPv6Address", v6)),
-                (&mut req.mac_address, s(cfg, "MacAddress")),
-            ] {
-                if !value.is_empty() && slot.replace(value.to_string()).is_some() {
-                    return Err(ApiError::not_implemented(
-                        "static addresses on more than one network are not supported",
-                    ));
+        if req.networks.len() > 1 {
+            // each network has the addresses of its endpoint (the default
+            // network is the endpoint `bridge` or `default`)
+            for name in &mut req.networks {
+                let endpoint = |k: &str| net.get(k);
+                let cfg = match name == velarx_netdetach::def::DEFAULT_NETWORK {
+                    true => endpoint("bridge").or_else(|| endpoint("default")),
+                    false => endpoint(name),
+                };
+                if let Some(cfg) = cfg {
+                    let (v4, v6) = endpoint_addresses(cfg)?;
+                    let ips: Vec<String> = [v4, v6]
+                        .into_iter()
+                        .filter(|ip| !ip.is_empty())
+                        .map(String::from)
+                        .collect();
+                    *name = network_with_options(
+                        name,
+                        &ips,
+                        s(cfg, "MacAddress"),
+                        &strs(cfg, "Aliases"),
+                        "",
+                    )?;
                 }
             }
-            req.network_aliases.extend(strs(cfg, "Aliases"));
+        } else {
+            for cfg in net.values() {
+                let (v4, v6) = endpoint_addresses(cfg)?;
+                // (the addresses are the container's: one network has them)
+                for (slot, value) in [
+                    (&mut req.ip_address, v4),
+                    (&mut req.ip6_address, v6),
+                    (&mut req.mac_address, s(cfg, "MacAddress")),
+                ] {
+                    if !value.is_empty() && slot.replace(value.to_string()).is_some() {
+                        return Err(ApiError::not_implemented(
+                            "static addresses on more than one network are not supported",
+                        ));
+                    }
+                }
+                req.network_aliases.extend(strs(cfg, "Aliases"));
+            }
         }
     }
     if default_bridge && req.network_mode == NetworkMode::Unset && req.networks.is_empty() {
@@ -1973,11 +2026,8 @@ pub async fn from_docker(
 pub fn refuse_endpoint(cfg: &Value, scope: &str) -> ApiResult<()> {
     // `DriverOpts`, `GwPriority` and `Links` are read by no network backend
     // of podman either: they are dropped as it drops them
-    refuse_members(
-        get(cfg, "IPAMConfig"),
-        &format!("{scope}.IPAMConfig"),
-        &["LinkLocalIPs"],
-    )
+    let ipam = format!("{scope}.IPAMConfig");
+    refuse_members(get(cfg, "IPAMConfig"), &ipam, &["LinkLocalIPs"])
 }
 
 fn refuse_endpoints<'a>(cfgs: impl Iterator<Item = &'a Value>) -> ApiResult<()> {
@@ -2347,42 +2397,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.networks, ["a", "b"]);
-        for (body, name) in [
-            (
-                json!({"Networks": {"n": {"options": {"mode": "x"}}}}),
-                "Networks.options",
-            ),
-            (
-                json!({"Networks": {"n": {"interface_name": "e0"}}}),
-                "Networks.interface_name",
-            ),
-        ] {
-            let mut req = CreateContainerRequest::default();
-            let e = netns(&body, &mut req, "").unwrap_err();
-            assert!(e.message.contains(name), "{}", e.message);
-        }
-        // addresses are not dropped: one of a family, on one network
-        for body in [
-            json!({"Networks": {"n": {"static_ips": ["10.0.0.2", "10.0.0.3"]}}}),
-            json!({"Networks": {"n": {"static_ips": ["10.0.0.2"]}, "m": {"static_ips": ["10.1.0.2"]}}}),
-            json!({"Networks": {"n": {"static_mac": "aa:bb:cc:dd:ee:01"}, "m": {"static_mac": "aa:bb:cc:dd:ee:02"}}}),
-        ] {
-            let mut req = CreateContainerRequest::default();
-            assert_eq!(
-                netns(&body, &mut req, "").unwrap_err().status.as_u16(),
-                501,
-                "{body}"
-            );
-        }
+        let mut req = CreateContainerRequest::default();
+        let e = netns(
+            &json!({"Networks": {"n": {"options": {"mode": "x"}}}}),
+            &mut req,
+            "",
+        )
+        .unwrap_err();
+        assert!(e.message.contains("Networks.options"), "{}", e.message);
+        // more than one address of a family on a network is refused
+        let mut req = CreateContainerRequest::default();
+        let body = json!({"Networks": {"n": {"static_ips": ["10.0.0.2", "10.0.0.3"]}}});
+        assert_eq!(netns(&body, &mut req, "").unwrap_err().status.as_u16(), 501);
+        // the addresses, the names and the interface go with their network
         let mut req = CreateContainerRequest::default();
         netns(
-            &json!({"Networks": {"n": {"static_ips": ["10.0.0.2", "fd00::2"], "static_mac": "aa:bb:cc:dd:ee:01"}}}),
+            &json!({"Networks": {
+                "m": {"static_ips": ["10.1.0.2"], "interface_name": "foo0"},
+                "n": {"static_ips": ["10.0.0.2", "fd00::2"], "static_mac": "aa:bb:cc:dd:ee:01",
+                      "aliases": ["a", "b"]},
+            }}),
             &mut req,
             "",
         )
         .unwrap();
-        assert_eq!(req.ip_address.as_deref(), Some("10.0.0.2"));
-        assert_eq!(req.ip6_address.as_deref(), Some("fd00::2"));
+        assert_eq!(
+            req.networks,
+            [
+                "m:ip=10.1.0.2,interface_name=foo0",
+                "n:ip=10.0.0.2,ip6=fd00::2,mac=aa:bb:cc:dd:ee:01,alias=a,alias=b"
+            ]
+        );
+        assert!(req.ip_address.is_none() && req.mac_address.is_none());
     }
 
     #[test]

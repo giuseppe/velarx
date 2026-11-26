@@ -56,6 +56,36 @@ setup () { api_setup; }
     pm network rm apinet6 > /dev/null
 }
 
+@test "create: the options of each network" {
+    skip_unless_bridges
+    pm network create --subnet 10.153.1.0/24 apinetopt1 > /dev/null
+    pm network create --subnet 10.153.2.0/24 apinetopt2 > /dev/null
+    # libpod: the addresses, names and interface of each network
+    code=$(api -o /dev/null -w '%{http_code}' -X POST -d '{"image":"'"$IMG"'","name":"apiopt","command":["top"],
+        "Networks":{"apinetopt1":{"static_ips":["10.153.1.20"],"static_mac":"02:42:ac:11:00:98","interface_name":"foo0"},
+                    "apinetopt2":{"static_ips":["10.153.2.30"],"aliases":["second"]}}}' \
+        http://d/v5.0.0/libpod/containers/create)
+    check "libpod create with the options of two networks" 201 "$code"
+    pm start apiopt > /dev/null
+    out=$(pm exec apiopt sh -c 'cat /sys/class/net/foo0/address; ip -o -4 addr show foo0; ip -o -4 addr show eth0' | awk 'NF == 1 {print; next} {print $2, $3, $4}')
+    check "libpod: an address, a MAC address and an interface name for each network" \
+        "$(printf '02:42:ac:11:00:98\nfoo0 inet 10.153.1.20/24\neth0 inet 10.153.2.30/24')" "$out"
+    pm rm -t 0 -f apiopt > /dev/null
+    # Docker: the addresses of each endpoint
+    code=$(api -o /dev/null -w '%{http_code}' -X POST -d '{"Image":"'"$IMG"'","Cmd":["top"],
+        "NetworkingConfig":{"EndpointsConfig":{
+            "apinetopt1":{"IPAMConfig":{"IPv4Address":"10.153.1.21"},"MacAddress":"02:42:ac:11:00:99"},
+            "apinetopt2":{"IPAMConfig":{"IPv4Address":"10.153.2.31"}}}}}' \
+        "http://d/v1.41/containers/create?name=apiopt2")
+    check "compat create with the endpoints of two networks" 201 "$code"
+    pm start apiopt2 > /dev/null
+    out=$(pm exec apiopt2 sh -c 'cat /sys/class/net/eth0/address; ip -o -4 addr show eth0; ip -o -4 addr show eth1' | awk 'NF == 1 {print; next} {print $2, $3, $4}')
+    check "compat: an address and a MAC address for each network" \
+        "$(printf '02:42:ac:11:00:99\neth0 inet 10.153.1.21/24\neth1 inet 10.153.2.31/24')" "$out"
+    pm rm -t 0 -f apiopt2 > /dev/null
+    pm network rm apinetopt1 apinetopt2 > /dev/null
+}
+
 @test "network exists" {
     skip_unless_bridges
     pm network exists apinet

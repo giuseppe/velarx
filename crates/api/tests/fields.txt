@@ -414,7 +414,7 @@ libpod POST /commit Volumes implemented
 libpod POST /commit WorkingDir implemented
 libpod POST /containers/create Networks implemented
 libpod POST /containers/create Networks.aliases implemented
-libpod POST /containers/create Networks.interface_name refused
+libpod POST /containers/create Networks.interface_name implemented
 libpod POST /containers/create Networks.options refused
 libpod POST /containers/create Networks.static_ips implemented
 libpod POST /containers/create Networks.static_mac implemented
