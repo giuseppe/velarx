@@ -453,6 +453,10 @@ fn private_dir(socket: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The variable that names the socket file of the listener an engine is
+/// passed: `DEV:INO`, as the process that bound it saw it.
+pub const LISTEN_FILE_ENV: &str = "VELARX_LISTEN_FILE";
+
 /// Start the engine for a process that no service manager activates it
 /// for: under the lock of the socket, nothing is started if something
 /// serves it, else the socket is bound here and `cmd` is run with the
@@ -488,6 +492,14 @@ pub fn start_engine(socket: &Path, mut cmd: std::process::Command) -> io::Result
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    }
+    // (the file just bound, which the engine takes away when it ends: by
+    // its path it may be another one when the engine looks, removed and
+    // bound again meanwhile)
+    let file = std::fs::symlink_metadata(socket)?;
+    {
+        use std::os::unix::fs::MetadataExt;
+        cmd.env(LISTEN_FILE_ENV, format!("{}:{}", file.dev(), file.ino()));
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -751,11 +763,12 @@ mod tests {
     }
 
     /// The engine a frontend starts gets the listening socket as its
-    /// descriptor 3 and the lifeline as 4; nothing is started when something
-    /// serves the socket; and the engine sees the lifeline closed when the
-    /// frontend lets go of what it started.
+    /// descriptor 3, the socket file named, and the lifeline as 4; nothing is
+    /// started when something serves the socket; and the engine sees the
+    /// lifeline closed when the frontend lets go of what it started.
     #[test]
     fn the_engine_started_has_the_socket_and_a_lifeline() {
+        use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
         let private = dir.path().join("run");
         std::fs::DirBuilder::new()
@@ -766,14 +779,16 @@ mod tests {
         let marker = dir.path().join("marker");
         // a stand-in for the engine: it says what it has, and waits for the
         // end of the lifeline
-        let script = r#"[ -S /dev/fd/3 ] && echo socket > "$1"; read _ <&4; echo closed >> "$1""#;
+        let script = r#"[ -S /dev/fd/3 ] && echo "socket $VELARX_LISTEN_FILE" > "$1"; read _ <&4; echo closed >> "$1""#;
         let command = || {
             let mut cmd = std::process::Command::new("sh");
             cmd.args(["-c", script, "sh"]).arg(&marker);
             cmd
         };
         let started = start_engine(&socket, command()).unwrap().expect("started");
-        assert_eq!(wait_for(&marker, "socket").trim(), "socket");
+        let file = std::fs::symlink_metadata(&socket).unwrap();
+        let said = format!("socket {}:{}", file.dev(), file.ino());
+        assert_eq!(wait_for(&marker, "socket").trim(), said);
         assert!(
             std::os::unix::net::UnixStream::connect(&socket).is_ok(),
             "the socket listens"
@@ -782,7 +797,10 @@ mod tests {
         assert!(start_engine(&socket, command()).unwrap().is_none());
         assert!(!std::fs::read_to_string(&marker).unwrap().contains("closed"));
         drop(started);
-        assert_eq!(wait_for(&marker, "closed").trim(), "socket\nclosed");
+        assert_eq!(
+            wait_for(&marker, "closed").trim(),
+            format!("{said}\nclosed")
+        );
     }
 
     /// An engine that cannot be started leaves no socket behind.

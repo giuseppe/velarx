@@ -13,6 +13,7 @@ use velarx_content::activation;
 use velarx_core::services;
 use velarx_core::services::{CgroupManager, ContainerService, ImageService, ServerService};
 use velarx_db::Database;
+use velarx_proto::connect::LISTEN_FILE_ENV;
 use velarx_runtime::container;
 use velarx_runtime::network::{self, NetworkService};
 use velarx_runtime::userns::{self, UserNamespaceManager};
@@ -132,6 +133,7 @@ pub fn run(cli: DaemonCli, startup: &velarx_sys::fd::Startup) -> anyhow::Result<
             // above 2: the ones systemd passed are ours)
             let activated = sdnotify::take_listen_fds(startup);
             let held = engine_service::take_hold_fds(startup);
+            let listen_file = take_listen_file();
             // (the sockets systemd passed, or those of a restart of this
             // daemon, come first: the number of `--listen-fd` is then the
             // same descriptor, which is already owned)
@@ -165,12 +167,13 @@ pub fn run(cli: DaemonCli, startup: &velarx_sys::fd::Startup) -> anyhow::Result<
                     listen,
                     lifeline,
                     held,
+                    listen_file,
                 ))?;
             match ended {
                 Ended::Stop => Ok(()),
                 // (the runtime and its threads are gone)
-                Ended::Restart(listener, own, lifeline, holds, upgrade) => {
-                    Err(restart(listener, own, lifeline, holds, upgrade))
+                Ended::Restart(listener, own, file, lifeline, holds, upgrade) => {
+                    Err(restart(listener, own, file, lifeline, holds, upgrade))
                 }
             }
         }
@@ -180,6 +183,18 @@ pub fn run(cli: DaemonCli, startup: &velarx_sys::fd::Startup) -> anyhow::Result<
 /// The socket of the engine service: the one systemd passed (socket
 /// activation) or a frontend that started the engine (`--listen-fd`), else
 /// bound here, which waits while another engine serves it ([`bind_engine`]).
+/// The socket file of the listener this process was passed, as the process
+/// that bound it named it ([`LISTEN_FILE_ENV`]).  Call it before any thread
+/// is started.
+fn take_listen_file() -> Option<(u64, u64)> {
+    let named = std::env::var(LISTEN_FILE_ENV).ok();
+    std::env::remove_var(LISTEN_FILE_ENV);
+    let (dev, ino) = named?
+        .split_once(':')
+        .map(|(d, i)| (d.parse().ok(), i.parse().ok()))?;
+    Some((dev?, ino?))
+}
+
 async fn engine_listener(
     config: &Config,
     activated: Vec<sdnotify::ActivatedFd>,
@@ -361,13 +376,14 @@ async fn what_ends(
 enum Ended {
     Stop,
     /// It starts again with this listening socket of the engine (its file
-    /// the daemon's, or systemd's).
+    /// the daemon's, which it names, or systemd's).
     /// The lifeline of the frontend that started the engine, and the holds
     /// of the others, go on in the new process.
     /// With `true` last: from the binary installed (an upgrade).
     Restart(
         std::os::fd::OwnedFd,
         bool,
+        Option<(u64, u64)>,
         Option<std::os::fd::OwnedFd>,
         Vec<std::os::fd::OwnedFd>,
         bool,
@@ -385,6 +401,7 @@ enum Ended {
 fn restart(
     listener: std::os::fd::OwnedFd,
     owns_socket: bool,
+    socket_file: Option<(u64, u64)>,
     lifeline: Option<std::os::fd::OwnedFd>,
     holds: Vec<std::os::fd::OwnedFd>,
     upgrade: bool,
@@ -394,7 +411,15 @@ fn restart(
         Some(installed) => installed,
         None => PathBuf::from("/proc/self/exe"),
     };
-    let mut cmd = match restart_command(&exe, &listener, owns_socket, lifeline.as_ref(), &holds) {
+    let restarted = restart_command(
+        &exe,
+        &listener,
+        owns_socket.then_some(socket_file).flatten(),
+        owns_socket,
+        lifeline.as_ref(),
+        &holds,
+    );
+    let mut cmd = match restarted {
         Ok(cmd) => cmd,
         Err(e) => return anyhow::anyhow!("restart: {e}"),
     };
@@ -403,7 +428,8 @@ fn restart(
 }
 
 /// The command [`restart`] executes: `exe` with the arguments and the
-/// environment of this process, the listener at 3, the lifeline at 4.
+/// environment of this process, the listener at 3 (its socket file named,
+/// `socket_file`, when it is the daemon's), the lifeline at 4.
 /// The holds of the other frontends stay at the numbers of their copies,
 /// which this process owns, named in [`engine_service::HOLD_FDS_ENV`]: a
 /// fixed number may be the descriptor of something another thread still
@@ -412,6 +438,7 @@ fn restart(
 fn restart_command(
     exe: &Path,
     listener: &std::os::fd::OwnedFd,
+    socket_file: Option<(u64, u64)>,
     owns_socket: bool,
     lifeline: Option<&std::os::fd::OwnedFd>,
     holds: &[std::os::fd::OwnedFd],
@@ -434,6 +461,9 @@ fn restart_command(
             "LISTEN_FDNAMES",
             if owns_socket { OWN_SOCKET } else { "engine" },
         );
+    if let Some((dev, ino)) = socket_file {
+        cmd.env(LISTEN_FILE_ENV, format!("{dev}:{ino}"));
+    }
     for hold in holds {
         rustix::io::fcntl_setfd(hold, rustix::io::FdFlags::empty())?;
     }
@@ -455,6 +485,7 @@ async fn run_daemon(
     listen: Option<std::os::unix::net::UnixListener>,
     lifeline: Option<std::os::fd::OwnedFd>,
     held: Vec<std::os::fd::OwnedFd>,
+    listen_file: Option<(u64, u64)>,
 ) -> anyhow::Result<Ended> {
     let mut config = Config::load_or_default(config_path)?;
     config.validate()?;
@@ -500,8 +531,11 @@ async fn run_daemon(
         return Ok(Ended::Stop);
     };
     // (the socket file this engine serves: the one it takes away when it
-    // ends, not one another engine bound in its place meanwhile)
-    let socket_file = own_socket.as_deref().and_then(activation::socket_file_id);
+    // ends, not one another engine bound in its place meanwhile; the one
+    // the process that bound the listener named, else the one bound here)
+    let socket_file = own_socket
+        .as_deref()
+        .and_then(|path| listen_file.or_else(|| activation::socket_file_id(path)));
 
     // A signal that comes before the daemon is ready ends it, as one after
     // does (the containers go on): the start waits for the store, the
@@ -932,6 +966,7 @@ async fn run_daemon(
         return Ok(Ended::Restart(
             api_fd,
             own_socket.is_some(),
+            socket_file,
             lifeline_keep,
             holds.fds()?,
             state.server_service.upgrading(),
@@ -1473,9 +1508,10 @@ fn engine_command(config_path: &Path) -> Option<Vec<std::ffi::OsString>> {
 mod tests {
     use super::*;
 
-    /// A restart names the holds of the other frontends by the numbers of
-    /// their copies, which this process owns, left open across the exec: it
-    /// moves only the listener and the lifeline, to 3 and 4.
+    /// A restart names the socket file of the daemon, and the holds of the
+    /// other frontends by the numbers of their copies, which this process
+    /// owns, left open across the exec: it moves only the listener and the
+    /// lifeline, to 3 and 4.
     #[test]
     fn a_restart_passes_the_holds_at_their_own_numbers() {
         use std::os::fd::{AsRawFd, OwnedFd};
@@ -1486,13 +1522,22 @@ mod tests {
         let listener: OwnedFd = std::os::unix::net::UnixListener::bind(dir.path().join("s"))
             .unwrap()
             .into();
-        let cmd = restart_command(Path::new("/bin/true"), &listener, true, None, &holds).unwrap();
+        let cmd = restart_command(
+            Path::new("/bin/true"),
+            &listener,
+            Some((7, 9)),
+            true,
+            None,
+            &holds,
+        )
+        .unwrap();
         let env = |name: &str| {
             cmd.get_envs()
                 .find(|(k, _)| *k == name)
                 .and_then(|(_, v)| v)
                 .map(|v| v.to_str().unwrap().to_string())
         };
+        assert_eq!(env(LISTEN_FILE_ENV).as_deref(), Some("7:9"));
         let numbers: Vec<String> = holds.iter().map(|h| h.as_raw_fd().to_string()).collect();
         assert_eq!(env(engine_service::HOLD_FDS_ENV), Some(numbers.join(",")));
         for hold in &holds {
