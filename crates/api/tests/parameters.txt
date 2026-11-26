@@ -38,7 +38,7 @@ any ANY * fromimage implemented
 any ANY * groupadd implemented
 any ANY * httpproxy implemented
 any ANY * identitylabel implemented
-any ANY * idmappingoptions refused
+any ANY * idmappingoptions implemented
 any ANY * image implemented
 any ANY * include-volumes implemented
 any ANY * inheritannotations implemented
@@ -56,7 +56,7 @@ any ANY * networkmode implemented
 any ANY * newname implemented
 any ANY * nocache implemented
 any ANY * nohosts implemented
-any ANY * nsoptions refused
+any ANY * nsoptions implemented
 any ANY * omithistory implemented
 any ANY * osfeature implemented
 any ANY * osversion implemented
@@ -155,7 +155,7 @@ compat GET /secrets/{} showsecret implemented
 compat POST /build compression noop the layers of a build are stored uncompressed; a push picks its compression
 compat POST /build excludes noop podman's client leaves the excluded files out of the context it sends
 compat POST /build forcerm noop the build makes no intermediate container to keep or remove
-compat POST /build jobs noop the stages are built in order (the image is the same)
+compat POST /build jobs implemented
 compat POST /build registry noop a name prefix of buildah's that podman's client never sets
 compat POST /build rm noop the build makes no intermediate container to keep or remove
 compat POST /commit author implemented
@@ -329,7 +329,7 @@ libpod POST /artifacts/{}/push tlsVerify implemented
 libpod POST /build compression noop the layers of a build are stored uncompressed; a push picks its compression
 libpod POST /build excludes noop podman's client leaves the excluded files out of the context it sends
 libpod POST /build forcerm noop the build makes no intermediate container to keep or remove
-libpod POST /build jobs noop the stages are built in order (the image is the same)
+libpod POST /build jobs implemented
 libpod POST /build registry noop a name prefix of buildah's that podman's client never sets
 libpod POST /build rm noop the build makes no intermediate container to keep or remove
 libpod POST /commit author implemented

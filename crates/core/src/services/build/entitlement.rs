@@ -4,6 +4,11 @@
 //! allow it.  The one place that decides; the build asks before its first
 //! step and a RUN step asks again (an ONBUILD trigger of a base image is
 //! not in the Containerfile).
+//!
+//! Only what the untrusted Containerfile can ask for (`RUN --network=host`,
+//! `RUN --security=insecure`) and the network of the build is an
+//! entitlement; the run options of the request (`-v`, `--device`,
+//! `--cap-add`, `--pid`, `--uts`, ...) are the client's choice, as for `run`.
 
 use std::collections::BTreeMap;
 use velarx_base::entitlement::Entitlement;

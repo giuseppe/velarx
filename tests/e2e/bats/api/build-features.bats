@@ -411,6 +411,36 @@ EOT
     "$CLI" network rm bnet > /dev/null 2>&1
 }
 
+@test "podman --remote build: the network and the namespaces of the RUN steps" {
+    local c=$WORKDIR/netmodes
+    mkdir -p "$c"
+    printf 'FROM %s\nRUN sed 1,2d /proc/net/dev | cut -d: -f1 | tr -d " " | sort | tr "\\n" " " > /ifs\n' "$IMG" > "$c/Containerfile"
+    ifs() { "$CLI" run --rm --network none "$1" cat /ifs 2>&1; }
+    "$CLI" network create bnet > /dev/null 2>&1
+    check "network create" 0 $?
+    pm build --tls-verify=false --no-cache --network=none -t localhost/bm:net-none-r "$c" > /dev/null 2>&1
+    check "podman --remote build --network=none: only lo" "lo " "$(ifs localhost/bm:net-none-r)"
+    pm build --tls-verify=false --no-cache --network=bnet -t localhost/bm:net-named-r "$c" > /dev/null 2>&1
+    check_match "podman --remote build --network NAME" "eth0" "$(ifs localhost/bm:net-named-r)"
+    if [ "$(id -u)" != 0 ]; then
+        pm build --tls-verify=false --no-cache --network=pasta -t localhost/bm:net-pasta-r "$c" > /dev/null 2>&1
+        check_match "podman --remote build --network=pasta" "^[a-z][a-z0-9]* lo $" "$(ifs localhost/bm:net-pasta-r)"
+    fi
+    # Docker's networkmode
+    tar -C "$c" -cf "$WORKDIR/netctx.tar" Containerfile
+    check "Docker's networkmode=none" 200 "$(api -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/x-tar' \
+        --data-binary "@$WORKDIR/netctx.tar" 'http://d/v1.41/build?networkmode=none&t=localhost/bm:net-docker')"
+    check "Docker: only lo" "lo " "$(ifs localhost/bm:net-docker)"
+
+    # the other namespaces of podman --remote
+    pm build --tls-verify=false --no-cache --ipc=host --pid=private --uts=private --userns=private \
+        -t localhost/bm:ns-r "$c" > /dev/null 2>&1
+    check "podman --remote build --ipc --pid --uts --userns" 0 $?
+
+    "$CLI" rmi -f localhost/bm:net-none-r localhost/bm:net-named-r localhost/bm:net-pasta-r localhost/bm:net-docker localhost/bm:ns-r > /dev/null 2>&1
+    "$CLI" network rm bnet > /dev/null 2>&1
+}
+
 @test "build: VOLUME as buildah (--compat-volumes as Docker), the identity label" {
     local c=$WORKDIR/volumes out
     mkdir -p "$c"

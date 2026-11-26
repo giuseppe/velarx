@@ -20,7 +20,7 @@ use velarx_proto::buildspec::{
     BuildPull, BuildSecretKind, BuildSecretSpec, BuildSpec,
 };
 use velarx_proto::godecode::parse_bool;
-use velarx_proto::request::{BuildRun, DeviceMapping, ResourceLimits, Ulimit};
+use velarx_proto::request::{BuildRun, DeviceMapping, ResourceLimits, Ulimit, UsernsChoice};
 use velarx_proto::retry::Retry;
 
 /// podman sends a JSON array of paths, Docker a path: relative to the
@@ -211,7 +211,7 @@ fn pair_values(call: &Call, name: &str) -> ApiResult<Vec<BuildPair>> {
 
 /// The options of the RUN containers and of the final image the request
 /// has, as the command line's `build` takes them.
-fn run_of(call: &Call) -> ApiResult<(BuildRun, Vec<(String, String)>)> {
+fn run_of(call: &Call, ns: &NsOptions) -> ApiResult<(BuildRun, Vec<(String, String)>)> {
     let values = |name: &str| -> Vec<String> {
         call.q_all(name)
             .into_iter()
@@ -294,7 +294,7 @@ fn run_of(call: &Call) -> ApiResult<(BuildRun, Vec<(String, String)>)> {
             .filter(|n| *n != DEFAULT_SHM && *n != 0),
             None => None,
         },
-        ..run_more_of(call)?
+        ..run_more_of(call, ns)?
     };
     run.ulimits = ulimits
         .iter()
@@ -329,7 +329,7 @@ fn q_number<T: std::str::FromStr + PartialEq + Default>(
 
 /// The options of the RUN containers that are not text: the groups, the
 /// hosts file, the resources.
-fn run_more_of(call: &Call) -> ApiResult<BuildRun> {
+fn run_more_of(call: &Call, ns: &NsOptions) -> ApiResult<BuildRun> {
     let resources = ResourceLimits {
         memory: q_number(call, "memory")?,
         memory_swap: q_number(call, "memswap")?,
@@ -353,7 +353,7 @@ fn run_more_of(call: &Call) -> ApiResult<BuildRun> {
         || resources.cpu_shares.is_some()
         || resources.cpuset_cpus.is_some()
         || resources.cpuset_mems.is_some();
-    Ok(BuildRun {
+    let mut run = BuildRun {
         group_add: list_param(call, "groupadd")?,
         no_hosts: call.q_bool("nohosts", false)?,
         resources: limited.then_some(resources),
@@ -361,8 +361,17 @@ fn run_more_of(call: &Call) -> ApiResult<BuildRun> {
             .q("cgroupparent")
             .filter(|v| !v.is_empty())
             .map(str::to_string),
+        ipc: ns.mode("ipc")?,
+        pid: ns.mode("pid")?,
+        uts: ns.mode("uts")?,
+        cgroupns: ns.mode("cgroup")?,
+        userns: ns.mode("user")?,
         ..Default::default()
-    })
+    };
+    if let Some(v) = call.q("idmappingoptions").filter(|v| !v.is_empty()) {
+        id_mappings_of(v, &mut run)?;
+    }
+    Ok(run)
 }
 
 /// `from`, `retry`, the times, `omithistory`, `inheritlabels`,
@@ -455,10 +464,6 @@ enum Given {
     True,
     /// A value that is none of these (what the client sends by default)
     NotIn(&'static [&'static str]),
-    /// podman's namespace options that are not the host's
-    Namespaces,
-    /// podman's ID mapping options that are not the host's
-    IdMapping,
 }
 
 /// The parameters of [`velarx_proto::build::BUILD_REFUSED`] and what makes
@@ -472,14 +477,12 @@ enum Given {
 /// layers uncompressed, the compression is a push's.
 const REFUSED: &[(&str, Given)] = &[
     ("cppflags", Given::Any),
-    ("idmappingoptions", Given::IdMapping),
     ("ignore", Given::True),
     // (0 the default, 1 OCI, 3 rootless OCI; 2 is chroot)
     (
         "isolation",
         Given::NotIn(&["0", "1", "3", "default", "oci", "rootless"]),
     ),
-    ("nsoptions", Given::Namespaces),
     ("rusage", Given::True),
     ("rusagelogfile", Given::Any),
     ("save-stages", Given::True),
@@ -495,41 +498,110 @@ fn given(rule: Given, values: &[&str]) -> bool {
         Given::Any => values.iter().any(set),
         Given::True => values.iter().any(|v| parse_bool(v) == Some(true)),
         Given::NotIn(defaults) => values.iter().any(|v| set(v) && !defaults.contains(v)),
-        Given::Namespaces => values.iter().any(|v| {
-            set(v)
-                && serde_json::from_str::<Vec<Value>>(v).map_or(true, |l| {
-                    l.iter().any(|o| {
-                        o["Host"].as_bool() != Some(true)
-                            || !o["Path"].as_str().unwrap_or("").is_empty()
-                    })
-                })
-        }),
-        Given::IdMapping => values.iter().any(|v| {
-            set(v)
-                && serde_json::from_str::<Value>(v).map_or(true, |o| {
-                    let host = |k: &str| o[k].as_bool() != Some(false);
-                    let list = |k: &str| o[k].as_array().is_some_and(|a| !a.is_empty());
-                    !host("HostUIDMapping")
-                        || !host("HostGIDMapping")
-                        || list("UIDMap")
-                        || list("GIDMap")
-                        || o["AutoUserNs"].as_bool() == Some(true)
-                })
-        }),
     }
 }
 
-/// Whether podman's `nsoptions` ask for the network of the host.
-fn host_network(call: &Call) -> bool {
-    call.q_all("nsoptions").iter().any(|v| {
-        serde_json::from_str::<Vec<Value>>(v).is_ok_and(|l| {
-            l.iter().any(|o| {
-                o["Name"].as_str() == Some("network")
-                    && o["Host"].as_bool() == Some(true)
-                    && o["Path"].as_str().unwrap_or("").is_empty()
-            })
+/// The namespace entries of podman's `nsoptions`: `{"Name": "ipc",
+/// "Host": false, "Path": ""}`, one a namespace the client sets.
+struct NsOptions(Vec<Value>);
+
+impl NsOptions {
+    fn of(call: &Call) -> ApiResult<Self> {
+        match call.q("nsoptions").filter(|v| !v.is_empty()) {
+            None => Ok(Self(Vec::new())),
+            Some(v) => Self::parse(v),
+        }
+    }
+
+    fn parse(v: &str) -> ApiResult<Self> {
+        serde_json::from_str(v)
+            .map(Self)
+            .map_err(|e| ApiError::bad_request(format!("invalid nsoptions `{v}`: {e}")))
+    }
+
+    /// The mode of the namespace `name` the client sets: the host's, the
+    /// one pinned at a path, or a namespace of its own; none: the default.
+    /// The network's path may be the name of a network or `pasta`, which
+    /// is not a path.
+    fn text(&self, name: &str) -> Option<String> {
+        let o = self.0.iter().find(|o| o["Name"].as_str() == Some(name))?;
+        Some(match (o["Host"].as_bool(), o["Path"].as_str()) {
+            (Some(true), _) => "host".to_string(),
+            (_, None | Some("")) => "private".to_string(),
+            (_, Some(path)) if name == "network" && !path.starts_with('/') => path.to_string(),
+            (_, Some(path)) => format!("ns:{path}"),
         })
-    })
+    }
+
+    fn mode<T: Default + std::str::FromStr<Err = velarx_proto::request::ModeError>>(
+        &self,
+        name: &str,
+    ) -> ApiResult<T> {
+        self.text(name).map_or(Ok(T::default()), |t| {
+            t.parse()
+                .map_err(|e| ApiError::bad_request(format!("{name}: {e}")))
+        })
+    }
+}
+
+/// The network of the RUN steps: `mode` is podman's policy.
+fn network_of(mode: &str, ns: &NsOptions) -> Option<String> {
+    match mode {
+        "" | "default" | "0" => None,
+        "1" => Some("none".to_string()),
+        "2" => ns.text("network").filter(|n| n != "private"),
+        n => Some(n.to_string()),
+    }
+}
+
+/// podman's `idmappingoptions` as the `--userns*` options of the CLI: the
+/// user namespace is of the host unless a mapping or `AutoUserNs` says
+/// otherwise (as `nsoptions` of `user`).
+fn id_mappings_of(v: &str, run: &mut BuildRun) -> ApiResult<()> {
+    let o: Value = serde_json::from_str(v)
+        .map_err(|e| ApiError::bad_request(format!("invalid idmappingoptions `{v}`: {e}")))?;
+    let maps = |k: &str| -> Vec<String> {
+        o[k].as_array()
+            .into_iter()
+            .flatten()
+            .map(|m| format!("{}:{}:{}", m["containerID"], m["hostID"], m["size"]))
+            .collect()
+    };
+    run.uidmap = maps("UIDMap");
+    run.gidmap = maps("GIDMap");
+    if o["AutoUserNs"].as_bool() == Some(true) {
+        let opts = &o["AutoUserNsOpts"];
+        // (what changes the mapping and is not read is refused)
+        for k in [
+            "InitialSize",
+            "PasswdFile",
+            "GroupFile",
+            "AdditionalUIDMappings",
+            "AdditionalGIDMappings",
+        ] {
+            let v = &opts[k];
+            let set = match v {
+                Value::Null => false,
+                Value::Number(n) => n.as_u64() != Some(0),
+                Value::String(s) => !s.is_empty(),
+                Value::Array(a) => !a.is_empty(),
+                _ => true,
+            };
+            if set {
+                return Err(ApiError::not_implemented(format!(
+                    "the build parameter `idmappingoptions` with `AutoUserNsOpts.{k}` \
+                     is not supported"
+                )));
+            }
+        }
+        run.userns = UsernsChoice::Auto(
+            opts["Size"]
+                .as_u64()
+                .filter(|n| *n > 0)
+                .map(|n| format!("size={n}")),
+        );
+    }
+    Ok(())
 }
 
 /// A parameter that asks for what the build does not have is refused
@@ -553,6 +625,7 @@ fn spec_of(
     local: bool,
 ) -> ApiResult<(BuildSpec, velarx_registry::auth::RegistryAccess)> {
     refuse_unsupported(call)?;
+    let ns_options = NsOptions::of(call)?;
     if let Some(c) = call.q("compressionformat").filter(|c| !c.is_empty()) {
         velarx_proto::engine::LayerCompression::of_word(c)
             .ok_or_else(|| ApiError::bad_request(format!("invalid compression `{c}`")))?;
@@ -607,16 +680,9 @@ fn spec_of(
     let squash_param = call.q_bool("squash", false)?;
     let (squash, squash_all) = (squash_param && docker, squash_param && !docker);
     // podman sends buildah's policy as a number: 0 default, 1 disabled,
-    // 2 enabled; Docker a mode.
-    let network = match call.q("networkmode").unwrap_or("") {
-        "" | "default" | "0" => None,
-        // (`--network=host` is the policy 2 and a host network entry of
-        // the namespace options)
-        "2" if host_network(call) => Some("host".to_string()),
-        "2" => None,
-        "1" => Some("none".to_string()),
-        n => Some(n.to_string()),
-    };
+    // 2 enabled (what the namespace options of the network say); Docker a
+    // mode.
+    let network = network_of(call.q("networkmode").unwrap_or(""), &ns_options);
     let tls_verify = call.q_bool("tlsVerify", true)?;
     // libpod's `pullpolicy`, else the `pull` boolean (Docker's, and
     // podman's older clients): pull every time when true.
@@ -644,7 +710,7 @@ fn spec_of(
             .map_err(ApiError::bad_request)?,
         None => Default::default(),
     };
-    let (run, env) = run_of(call)?;
+    let (run, env) = run_of(call, &ns_options)?;
     let all_platforms = call.q_bool("allplatforms", false)?;
     let flags = flags_of(call)?;
     // (as `outputs`: the engine's working directory means nothing to the
@@ -1114,6 +1180,107 @@ pub(super) static ROUTES: &[Route] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use velarx_proto::request::{NsMode, UsernsChoice};
+
+    #[test]
+    fn the_namespaces_podman_sends() {
+        let ns = NsOptions::parse(
+            r#"[{"Name":"network","Host":false,"Path":"mynet"},
+                {"Name":"ipc","Host":true},
+                {"Name":"pid","Host":false,"Path":"/proc/7/ns/pid"},
+                {"Name":"uts","Host":false},
+                {"Name":"user","Host":false}]"#,
+        )
+        .unwrap();
+        assert_eq!(ns.mode::<NsMode>("ipc").unwrap(), NsMode::Host);
+        assert_eq!(
+            ns.mode::<NsMode>("pid").unwrap(),
+            NsMode::Ns("/proc/7/ns/pid".into())
+        );
+        assert_eq!(ns.mode::<NsMode>("uts").unwrap(), NsMode::Private);
+        assert_eq!(ns.mode::<NsMode>("cgroup").unwrap(), NsMode::Default);
+        assert_eq!(
+            ns.mode::<UsernsChoice>("user").unwrap(),
+            UsernsChoice::Private
+        );
+        assert!(NsOptions::parse("{").is_err());
+    }
+
+    #[test]
+    fn the_network_podman_sends() {
+        let net =
+            |entry: &str| NsOptions::parse(&format!(r#"[{{"Name":"network",{entry}}}]"#)).unwrap();
+        // no flag: the default; --network=none: the policy 1
+        assert_eq!(network_of("0", &NsOptions(Vec::new())), None);
+        assert_eq!(
+            network_of("1", &net(r#""Host":false"#)).as_deref(),
+            Some("none")
+        );
+        // the policy 2 and what the entry says
+        assert_eq!(network_of("2", &net(r#""Host":false"#)), None);
+        assert_eq!(
+            network_of("2", &net(r#""Host":true"#)).as_deref(),
+            Some("host")
+        );
+        assert_eq!(
+            network_of("2", &net(r#""Host":false,"Path":"mynet""#)).as_deref(),
+            Some("mynet")
+        );
+        assert_eq!(
+            network_of("2", &net(r#""Host":false,"Path":"pasta:-T,80""#)).as_deref(),
+            Some("pasta:-T,80")
+        );
+        assert_eq!(
+            network_of("2", &net(r#""Host":false,"Path":"/run/netns/x""#)).as_deref(),
+            Some("ns:/run/netns/x")
+        );
+        // Docker's mode
+        assert_eq!(
+            network_of("mynet", &NsOptions(Vec::new())).as_deref(),
+            Some("mynet")
+        );
+    }
+
+    #[test]
+    fn the_id_mappings_podman_sends() {
+        let mut run = BuildRun::default();
+        id_mappings_of(
+            r#"{"UIDMap":[{"containerID":0,"hostID":1000,"size":1}],
+                "GIDMap":[{"containerID":0,"hostID":100,"size":2}],"AutoUserNs":false}"#,
+            &mut run,
+        )
+        .unwrap();
+        assert_eq!(run.uidmap, ["0:1000:1"]);
+        assert_eq!(run.gidmap, ["0:100:2"]);
+        assert_eq!(run.userns, UsernsChoice::Host);
+        id_mappings_of(
+            r#"{"AutoUserNs":true,"AutoUserNsOpts":{"Size":512}}"#,
+            &mut run,
+        )
+        .unwrap();
+        assert_eq!(run.userns.to_string(), "auto:size=512");
+        // what podman sends for `--userns=auto`: the options unset
+        id_mappings_of(
+            r#"{"AutoUserNs":true,"AutoUserNsOpts":{"Size":0,"InitialSize":0,
+                "PasswdFile":"","GroupFile":"","AdditionalUIDMappings":null,
+                "AdditionalGIDMappings":null}}"#,
+            &mut run,
+        )
+        .unwrap();
+        assert_eq!(run.userns.to_string(), "auto");
+        for opt in [
+            r#""InitialSize":1024"#,
+            r#""PasswdFile":"/etc/passwd""#,
+            r#""AdditionalUIDMappings":[{"container_id":0,"host_id":0,"size":1}]"#,
+        ] {
+            let e = id_mappings_of(
+                &format!(r#"{{"AutoUserNs":true,"AutoUserNsOpts":{{{opt}}}}}"#),
+                &mut run,
+            )
+            .unwrap_err();
+            assert_eq!(e.status, 501, "{opt}");
+        }
+    }
 
     #[test]
     fn platforms_as_podman_parses_them() {
@@ -1166,22 +1333,6 @@ mod tests {
                 Given::NotIn(&["0", "default"]),
                 &["2"],
                 &["0", "default", ""],
-            ),
-            (
-                Given::Namespaces,
-                &[r#"[{"Name":"pid","Host":false}]"#, "x"],
-                &[r#"[{"Name":"user","Host":true,"Path":""}]"#],
-            ),
-            (
-                Given::IdMapping,
-                &[
-                    r#"{"HostUIDMapping":false}"#,
-                    r#"{"AutoUserNs":true}"#,
-                    r#"{"UIDMap":[{}]}"#,
-                ],
-                &[
-                    r#"{"HostUIDMapping":true,"HostGIDMapping":true,"UIDMap":[],"GIDMap":[],"AutoUserNs":false}"#,
-                ],
             ),
         ];
         for (rule, asks, defaults) in table {

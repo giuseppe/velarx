@@ -6,7 +6,8 @@
 # request alone and the configuration alone are not enough; both together
 # let a step see the network namespace of the host (and a privileged step
 # have no seccomp filter); the REST routes have no `allow`, the
-# configuration alone decides.  Rootless.
+# configuration alone decides; the namespaces of the request (--uts host)
+# need none.  Rootless.
 
 load ../helpers
 load ../api_helpers
@@ -77,6 +78,9 @@ two_stages () {
     out=$("$CLI" image build --tls-verify=false --network ns:/proc/self/ns/net -f "$WORKDIR/ctx/Containerfile.plain" "$WORKDIR/ctx" 2>&1)
     check "build --network=ns:PATH refused" 1 "$(( $? != 0 ))"
     check_match "build --network=ns:PATH: message" 'network.host is not allowed \(build --network=ns:/proc/self/ns/net\): start the build with --allow network.host and enable it' "$out"
+    out=$(pm build --tls-verify=false --network=ns:/proc/self/ns/net -f "$WORKDIR/ctx/Containerfile.plain" "$WORKDIR/ctx" 2>&1)
+    check "REST: a network namespace by its path refused" 1 "$(( $? != 0 ))"
+    check_match "REST: a network namespace by its path: message" 'network.host is not allowed \(build --network=ns:/proc/self/ns/net\): enable it in the engine configuration' "$out"
 
     # --allow without the configuration
     out=$("$CLI" image build --tls-verify=false --allow network.host -f "$WORKDIR/ctx/Containerfile.plain" "$WORKDIR/ctx" 2>&1)
@@ -108,6 +112,27 @@ two_stages () {
     check "REST: the trigger refused" 1 "$(( $? != 0 ))"
     check_match "REST: the trigger: message" 'network.host is not allowed \(line 1: RUN --network=host\)' "$out"
     "$CLI" image rm -f localhost/ent:plain localhost/ent:onbuild > /dev/null 2>&1
+}
+
+@test "the namespaces of the request need no entitlement" {
+    with_entitlements ''
+    check "the daemon is up" 0 $?
+    local host; host=$(readlink /proc/self/ns/uts)
+    printf 'FROM %s\nRUN readlink /proc/self/ns/uts > /utsns\n' "$IMG" > "$WORKDIR/ctx/Containerfile.uts"
+    out=$("$CLI" image build --tls-verify=false --no-cache --uts host -t localhost/ent:uts -f "$WORKDIR/ctx/Containerfile.uts" "$WORKDIR/ctx" 2>&1)
+    rc=$?
+    [ $rc = 0 ] || echo "$out" >&2
+    check "build --uts host" 0 $rc
+    check "the namespace of the host" "$host" "$("$CLI" run --rm --network none localhost/ent:uts cat /utsns 2>&1)"
+    pm build --tls-verify=false --no-cache --uts host -t localhost/ent:uts2 -f "$WORKDIR/ctx/Containerfile.uts" "$WORKDIR/ctx" > /dev/null 2>&1
+    check "REST nsoptions uts host" 0 $?
+    check "REST: the namespace of the host" "$host" "$("$CLI" run --rm --network none localhost/ent:uts2 cat /utsns 2>&1)"
+    "$CLI" image build --tls-verify=false --no-cache -q -t localhost/ent:uts0 -f "$WORKDIR/ctx/Containerfile.uts" "$WORKDIR/ctx" > /dev/null 2>&1
+    own=$("$CLI" run --rm --network none localhost/ent:uts0 cat /utsns 2>&1)
+    check_match "...without it, a namespace of its own" '^uts:\[[0-9]+\]$' "$own"
+    [ "$own" != "$host" ]
+    check "...not the host's" 0 $?
+    "$CLI" image rm -f localhost/ent:uts localhost/ent:uts2 localhost/ent:uts0 > /dev/null 2>&1
 }
 
 @test "enabled by the configuration, not allowed by the request" {

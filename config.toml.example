@@ -553,6 +553,10 @@ digest = "sha256"
 # The REST build routes (Docker's and podman's) cannot say `allow`: for them
 # this list alone decides, as with Docker's classic builder where the daemon
 # does.  Whoever can reach the API is an administrator (docs/THREAT-MODEL.md).
+# The list covers what a Containerfile can ask for and the network of the
+# build, not the run options of the request (-v, --device, --cap-add,
+# --security-opt, --pid, --ipc, --uts, --userns, ...): those are the client's
+# choice, as for `run`, and apply to every RUN step.
 insecure_entitlements = []
 
 # The OCI runtimes a container can be made with besides the default one ([server]

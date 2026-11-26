@@ -84,7 +84,7 @@ EOT
     for q in save-stages=true stage-labels=true isolation=2 cppflags=-DX \
         ignore=true \
         rusage=true rusagelogfile=x securityopt=x sourcePolicy=x transientRunMounts=x \
-        nsoptions=%5B%7B%22Name%22%3A%22pid%22%2C%22Host%22%3Afalse%7D%5D; do
+        "idmappingoptions=%7B%22AutoUserNs%22%3Atrue%2C%22AutoUserNsOpts%22%3A%7B%22InitialSize%22%3A1024%7D%7D"; do
         check "build?$q" 501 "$(req POST "/v5.0.0/libpod/build?$q" "@$WORKDIR/ctx.tar" application/x-tar)"
         check_match "build?$q: names it" "not supported" "$(cat "$WORKDIR/out")"
     done
@@ -110,7 +110,8 @@ EOT
         memory=67108864 memswap=-1 cpushares=2 cpusetcpus=0 sourcedateepoch=5 timestamp=5 \
         groupadd=wheel \
         "idmappingoptions=%7B%22HostUIDMapping%22%3Atrue%2C%22HostGIDMapping%22%3Atrue%2C%22UIDMap%22%3A%5B%5D%2C%22GIDMap%22%3A%5B%5D%2C%22AutoUserNs%22%3Afalse%7D" \
-        "nsoptions=%5B%7B%22Name%22%3A%22user%22%2C%22Host%22%3Atrue%2C%22Path%22%3A%22%22%7D%5D"; do
+        "nsoptions=%5B%7B%22Name%22%3A%22user%22%2C%22Host%22%3Atrue%2C%22Path%22%3A%22%22%7D%5D" \
+        "nsoptions=%5B%7B%22Name%22%3A%22pid%22%2C%22Host%22%3Afalse%7D%5D"; do
         check "build?$q" 200 "$(req POST "/v5.0.0/libpod/build?$q" "@$WORKDIR/ctx.tar" application/x-tar)"
     done
 }
