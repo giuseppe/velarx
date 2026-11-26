@@ -128,6 +128,16 @@ fn still_named(locked: &File, made: &File) -> io::Result<bool> {
     Ok(l.dev() == m.dev() && l.ino() == m.ino() && l.nlink() > 0)
 }
 
+/// Whether the temporary file `path` has no writer: its lock is free (a
+/// file that is gone has none to take, and is not reported).
+pub fn is_abandoned(path: &Path) -> io::Result<bool> {
+    match try_lock(path) {
+        Ok(found) => Ok(found.is_some()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Remove the temporary file `path` if no writer holds its lock: the bytes
 /// freed, `None` when a writer holds it (or it is gone).
 pub fn remove_abandoned(path: &Path) -> io::Result<Option<u64>> {
@@ -178,6 +188,20 @@ mod tests {
             assert!(!path_buf.exists());
             // nothing left to remove
             assert_eq!(remove_abandoned(&path_buf).unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn a_file_is_abandoned_when_its_lock_is_free() {
+        velarx_base::testing::in_child(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let (temp, lock) = create_locked(dir.path(), ".tmp", 0o644).unwrap();
+            assert!(!is_abandoned(temp.path()).unwrap());
+            drop(lock);
+            assert!(is_abandoned(temp.path()).unwrap());
+            // (nothing was removed)
+            assert!(temp.path().exists());
+            assert!(!is_abandoned(&dir.path().join("gone")).unwrap());
         });
     }
 

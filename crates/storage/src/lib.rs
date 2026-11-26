@@ -17,4 +17,4 @@ pub use lock::{locks, StorageLock};
 pub use served::*;
 pub use sparse::*;
 pub use toc_verity::*;
-pub use unfinished::{create_locked, create_locked_at, remove_abandoned, TempLock};
+pub use unfinished::{create_locked, create_locked_at, is_abandoned, remove_abandoned, TempLock};
