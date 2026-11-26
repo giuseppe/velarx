@@ -8,7 +8,7 @@ load helpers
 load run_lib
 
 setup_file () {
-    run_setup_file
+    E2E_BEFORE_DAEMON=events_in_a_file run_setup_file
 }
 
 teardown_file () {
@@ -447,9 +447,8 @@ rc=125" "$out"
     check "the image of the others stays" 0 "$(sh_ image exists "$IMAGE"; echo $?)"
     # (the events are kept in a file: the monitor writes the ones of the
     # image it removes there, and tells them to the daemon, which streams
-    # them)
-    events_daemon 'events_logger = "file"'
-    "$SH" events --stream > "$WORKDIR/rmi.ev" 2>&1 3>&- &
+    # them; the stream starts from now, whenever it is ready)
+    "$SH" events --stream --since "$(date +%s.%N)" > "$WORKDIR/rmi.ev" 2>&1 3>&- &
     local ev=$!
     sh_ container run -d --name rmi-d --rmi --network none localhost/rmi-img:2 sleep 100 > /dev/null 2>&1
     e2e_wait_line "$WORKDIR/rmi.ev" 'container create .*name=rmi-d' 30 || e2e_die "the events stream does not start"
@@ -465,7 +464,6 @@ rc=125" "$out"
     check "and the remove event" 0 $?
     kill "$ev"
     wait "$ev"
-    events_daemon ""
     sh_ image exists localhost/rmi-img:2
     check "a detached run --rmi removes the image at its end" 1 $?
 }

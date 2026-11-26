@@ -310,6 +310,13 @@ wait_log () {
         e2e_die "the container $1 printed no '$2' within ${3:-30} s"
 }
 
+# events_in_a_file: the events of the engine are kept in a file (an
+# E2E_BEFORE_DAEMON): the journal of a busy host drops what the units of a
+# user send above its rate limit, and the tests are not about it.
+events_in_a_file () {
+    sed -i '/^\[server\]/a events_logger = "file"' "$CONFIG"
+}
+
 # daemon_forget_log / wait_daemon_started: the engine that restarts (system
 # restart, SIGHUP) says so as it begins to, and the socket stays open: a
 # request waits for the engine that comes next.  Forget the log before the

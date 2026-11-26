@@ -7,12 +7,6 @@
 load helpers
 load run_lib
 
-# (the events are kept in a file: the journal of a busy host drops what the
-# units of a user send above its rate limit, and the tests are not about it)
-events_in_a_file () {
-    sed -i '/^\[server\]/a events_logger = "file"' "$CONFIG"
-}
-
 setup_file () {
     E2E_BEFORE_DAEMON=events_in_a_file run_setup_file
 }

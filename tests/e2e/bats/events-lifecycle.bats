@@ -6,7 +6,7 @@ load helpers
 load run_lib
 
 setup_file () {
-    run_setup_file
+    E2E_BEFORE_DAEMON=events_in_a_file run_setup_file
 }
 
 teardown_file () {
