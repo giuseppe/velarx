@@ -35,7 +35,7 @@
 
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use velarx_sys::statmount;
 
@@ -203,63 +203,101 @@ pub(super) fn attach_held(held: &Held, index: u32, target: &Path, way: &Way) -> 
     }
     let fd = held.take(index, way.what).map_err(under)?;
     // (the server first: a mount whose server is gone answers nothing)
-    if way.server {
-        let pidfd = held.take(index + 1, way.what).map_err(under)?;
-        adopt_server(pidfd, way.what, way.in_cgroup).map_err(under)?;
-    }
+    let server = match way.server {
+        true => {
+            let pidfd = held.take(index + 1, way.what).map_err(under)?;
+            Some(Server::of(pidfd).map_err(under)?)
+        }
+        false => None,
+    };
     attach(fd, target, way).map_err(|e| {
         io::Error::new(
             e.kind(),
             format!("{}, mount descriptor {index}: {e}", way.what),
         )
-    })
+    })?;
+    let Some(server) = server else {
+        return Ok(());
+    };
+    let cgroup = way
+        .in_cgroup
+        .then(|| velarx_base::cgroup::of_process(None).map_err(|e| e.to_string()));
+    server
+        .adopt(way.what, move |pid| {
+            cgroup.map(|rel| rel.and_then(|rel| place_in(rel, pid)))
+        })
+        .map_err(under)
 }
 
-/// Take the server of a mount: put it in the cgroup of this monitor (it
-/// serves the files of the container, so the container's limits and its
-/// stop reach it as they reach the monitor), and say in the log when it ends.
-/// A cgroup that cannot take it leaves it where it is.
-fn adopt_server(pidfd: OwnedFd, what: &str, in_cgroup: bool) -> io::Result<()> {
-    let pid = velarx_sys::pidfd::pid_of(&pidfd).map_err(|e| match e.raw_os_error() {
-        Some(libc::ESRCH) => io_err("the server ended before the container started"),
-        _ => io_err(format!("the server: {e}")),
-    })?;
-    let cgroup = match in_cgroup {
-        true => velarx_base::cgroup::of_process(None).map_err(|e| e.to_string()),
-        false => Err("the container has no cgroups".to_string()),
-    };
+/// The process that serves a mount.
+struct Server {
+    pidfd: OwnedFd,
+    pid: i32,
+}
+
+impl Server {
+    /// The server of the pidfd, which has not ended.
+    fn of(pidfd: OwnedFd) -> io::Result<Self> {
+        let pid = velarx_sys::pidfd::pid_of(&pidfd).map_err(|e| match e.raw_os_error() {
+            Some(libc::ESRCH) => io_err("the server ended before the container started"),
+            _ => io_err(format!("the server: {e}")),
+        })?;
+        Ok(Self { pidfd, pid })
+    }
+
+    /// Take the server of an attached mount: `place` puts it in the cgroup of
+    /// this monitor (it serves the files of the container, so the container's
+    /// limits and its stop reach it as they reach the monitor), and the log
+    /// says when it ends.  The thread that watches the server does both, so
+    /// the start does not wait for the kernel to move a process between
+    /// cgroups (a grace period, several milliseconds); the first file the
+    /// container reads does not need the move.  `place` gives nothing for a
+    /// container without cgroups; a cgroup that cannot take the server
+    /// leaves it where it is, and the log warns why.
+    fn adopt(
+        self,
+        what: &str,
+        place: impl FnOnce(i32) -> Option<Result<PathBuf, String>> + Send + 'static,
+    ) -> io::Result<()> {
+        let Self { pidfd, pid } = self;
+        let what = what.to_string();
+        std::thread::Builder::new()
+            .name("image-server".into())
+            .spawn(move || {
+                match place(pid) {
+                    Some(Ok(dir)) => tracing::info!(
+                        "image server of the {what}: pid {pid}, in the cgroup {}",
+                        dir.display()
+                    ),
+                    Some(Err(why)) => tracing::warn!(
+                        "image server of the {what}: pid {pid}, not moved to the cgroup of the monitor: {why}"
+                    ),
+                    None => tracing::info!(
+                        "image server of the {what}: pid {pid}, the container has no cgroups"
+                    ),
+                }
+                // (a process that ended, or a pidfd that cannot be waited for)
+                let _ = velarx_sys::pidfd::wait_ended(&pidfd);
+                tracing::info!("image server of the {what}: pid {pid} ended");
+            })
+            .map(|_| ())
+            .map_err(|e| io_err(format!("cannot watch the server: {e}")))
+    }
+}
+
+/// Put the process `pid` in the cgroup `rel`, the monitor's.
+fn place_in(rel: String, pid: i32) -> Result<PathBuf, String> {
+    let dir = velarx_base::cgroup::dir(&rel);
     // (the server of a rootless container starts in the cgroup of its
     // engine, which is usually the monitor's: the write would change nothing
     // and costs the kernel a grace period)
-    let placed = cgroup.and_then(|rel| {
-        let dir = velarx_base::cgroup::dir(&rel);
-        if velarx_base::cgroup::of_process(Some(pid)).is_ok_and(|now| now == rel) {
-            return Ok(dir);
-        }
-        let procs = dir.join("cgroup.procs");
-        std::fs::write(&procs, pid.to_string())
-            .map(|()| dir)
-            .map_err(|e| format!("{}: {e}", procs.display()))
-    });
-    match &placed {
-        Ok(dir) => tracing::info!(
-            "image server of the {what}: pid {pid}, in the cgroup {}",
-            dir.display()
-        ),
-        Err(why) => tracing::info!(
-            "image server of the {what}: pid {pid}, not moved to the cgroup of the monitor: {why}"
-        ),
+    if velarx_base::cgroup::of_process(Some(pid)).is_ok_and(|now| now == rel) {
+        return Ok(dir);
     }
-    let what = what.to_string();
-    std::thread::Builder::new()
-        .name("image-server".into())
-        .spawn(move || {
-            // (a process that ended, or a pidfd that cannot be waited for)
-            let _ = velarx_sys::pidfd::wait_ended(&pidfd);
-            tracing::info!("image server of the {what}: pid {pid} ended");
-        })
-        .map(|_| ())
-        .map_err(|e| io_err(format!("cannot watch the server: {e}")))
+    let procs = dir.join("cgroup.procs");
+    std::fs::write(&procs, pid.to_string())
+        .map(|()| dir)
+        .map_err(|e| format!("{}: {e}", procs.display()))
 }
 
 /// An image mount: the mount of the descriptor `index` at `target`, or the
@@ -618,6 +656,78 @@ mod tests {
         assert!(e.contains("root file system"), "{e}");
         assert!(mount_at(&target).is_none(), "{e}: mounted");
         assert!(!target.exists(), "{e}: {} was made", target.display());
+    }
+
+    /// A process that serves nothing and waits to be killed, with its pidfd.
+    fn sleeper() -> (std::process::Child, OwnedFd) {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pidfd = velarx_sys::pidfd::open(child.id() as i32).unwrap();
+        (child, pidfd)
+    }
+
+    #[test]
+    fn the_server_is_placed_by_its_watcher_not_by_the_caller() {
+        let (mut child, pidfd) = sleeper();
+        let caller = std::thread::current().id();
+        let (placed, done) = std::sync::mpsc::channel();
+        Server::of(pidfd)
+            .unwrap()
+            .adopt("root file system", move |pid| {
+                placed.send((std::thread::current().id(), pid)).unwrap();
+                None
+            })
+            .unwrap();
+        let (on, pid) = done.recv().unwrap();
+        assert_ne!(on, caller, "the caller of the attach placed the server");
+        assert_eq!(pid, child.id() as i32);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_server_that_no_cgroup_takes_does_not_fail_the_attach() {
+        velarx_base::testing::in_child(|| {
+            if !private_namespace() {
+                return;
+            }
+            let d = tempfile::tempdir().unwrap();
+            let target = d.path().join("rootfs");
+            let (mut child, pidfd) = sleeper();
+            let h = held(vec![Some(detached_tmpfs()), Some(pidfd)]);
+            let way = Way {
+                server: true,
+                ..ROOT
+            };
+            attach_held(&h, 0, &target, &way).unwrap();
+            assert_eq!(std::fs::read(target.join("marker")).unwrap(), b"driver");
+            child.kill().unwrap();
+            child.wait().unwrap();
+        });
+    }
+
+    #[test]
+    fn a_server_that_ended_is_refused_and_nothing_is_attached() {
+        velarx_base::testing::in_child(|| {
+            if !private_namespace() {
+                return;
+            }
+            let d = tempfile::tempdir().unwrap();
+            let target = d.path().join("rootfs");
+            let (mut child, pidfd) = sleeper();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let h = held(vec![Some(detached_tmpfs()), Some(pidfd)]);
+            let way = Way {
+                server: true,
+                ..ROOT
+            };
+            let e = attach_held(&h, 0, &target, &way).unwrap_err().to_string();
+            assert!(e.contains("the server ended"), "{e}");
+            assert!(mount_at(&target).is_none(), "{e}: mounted");
+        });
     }
 
     #[test]
