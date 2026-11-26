@@ -374,6 +374,43 @@ EOT
     pm rmi -f localhost/bm:annotated localhost/bm:plain localhost/bm:proxy localhost/bm:outside > /dev/null 2>&1
 }
 
+@test "build --network: none, a named network, pasta; RUN --network" {
+    local c=$WORKDIR/netmodes out
+    mkdir -p "$c"
+    # the interfaces the RUN step sees
+    printf 'FROM %s\nRUN sed 1,2d /proc/net/dev | cut -d: -f1 | tr -d " " | sort | tr "\\n" " " > /ifs\n' "$IMG" > "$c/Containerfile"
+    ifs() { "$CLI" run --rm --network none "$1" cat /ifs 2>&1; }
+    "$CLI" network create bnet > /dev/null 2>&1
+    check "network create" 0 $?
+
+    "$CLI" image build --tls-verify=false -q --no-cache --network=none -t localhost/bm:net-none "$c" > /dev/null 2>&1
+    check "--network=none: only lo" "lo " "$(ifs localhost/bm:net-none)"
+    "$CLI" image build --tls-verify=false -q --no-cache --network=bnet -t localhost/bm:net-named "$c" > /dev/null 2>&1
+    check_match "--network NAME: an interface of the network" "eth0" "$(ifs localhost/bm:net-named)"
+    # (pasta is the network of a rootless engine, as in pasta.bats)
+    if [ "$(id -u)" != 0 ]; then
+        "$CLI" image build --tls-verify=false -q --no-cache --network=pasta -t localhost/bm:net-pasta "$c" > /dev/null 2>&1
+        check_match "--network=pasta: an interface of pasta" "^[a-z][a-z0-9]* lo $" "$(ifs localhost/bm:net-pasta)"
+        "$CLI" image build --tls-verify=false -q --no-cache --network=pasta:--no-map-gw -t localhost/bm:net-pasta-opts "$c" > /dev/null 2>&1
+        check_match "--network=pasta:OPTIONS" "^[a-z][a-z0-9]* lo $" "$(ifs localhost/bm:net-pasta-opts)"
+    fi
+    # a RUN step's own network: default is the build's
+    printf 'FROM %s\nRUN --network=default sed 1,2d /proc/net/dev | cut -d: -f1 | tr -d " " | sort | tr "\\n" " " > /ifs\n' "$IMG" > "$c/Containerfile.default"
+    "$CLI" image build --tls-verify=false -q --no-cache --network=none -f "$c/Containerfile.default" -t localhost/bm:net-default "$c" > /dev/null 2>&1
+    check "RUN --network=default: the network of the build" "lo " "$(ifs localhost/bm:net-default)"
+    for bad in bnet pasta private bridge ns:/proc/self/ns/net container:x; do
+        printf 'FROM %s\nRUN --network=%s true\n' "$IMG" "$bad" > "$c/Containerfile.bad"
+        out=$("$CLI" image build --tls-verify=false -q --no-cache -f "$c/Containerfile.bad" "$c" 2>&1)
+        check "RUN --network=$bad refused" 1 "$(( $? != 0 ))"
+        check_match "RUN --network=$bad: message" "invalid --network \`$bad\`: default, none or host" "$out"
+    done
+    out=$("$CLI" image build --tls-verify=false -q --no-cache --network=container:x "$c" 2>&1)
+    check_match "--network=container:ID refused" "unsupported network \`container:x\` for a build" "$out"
+
+    "$CLI" rmi -f localhost/bm:net-none localhost/bm:net-named localhost/bm:net-pasta localhost/bm:net-pasta-opts localhost/bm:net-default > /dev/null 2>&1
+    "$CLI" network rm bnet > /dev/null 2>&1
+}
+
 @test "build: VOLUME as buildah (--compat-volumes as Docker), the identity label" {
     local c=$WORKDIR/volumes out
     mkdir -p "$c"

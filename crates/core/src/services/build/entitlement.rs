@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use velarx_base::entitlement::Entitlement;
 use velarx_wire::parse::{Containerfile, Instr};
+use velarx_wire::request::NetworkMode;
 
 /// What a build request allows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -40,15 +41,22 @@ pub fn instruction_needs(i: &Instr) -> Vec<(Entitlement, String)> {
 }
 
 /// What the stages the build makes (`built`, one flag per stage) and the
-/// network of the build need.
+/// network of the build need.  A namespace joined by its path may be the
+/// host's (`ns:/proc/1/ns/net`) or another container's: it needs what the
+/// host network needs.
 pub fn needs(
     file: &Containerfile,
     built: &[bool],
     network: Option<&str>,
 ) -> Vec<(Entitlement, String)> {
     let mut out = Vec::new();
-    if network == Some("host") {
-        out.push((Entitlement::NetworkHost, "build --network=host".to_string()));
+    if let Some(n) = network {
+        if matches!(
+            NetworkMode::parse(n),
+            NetworkMode::Host | NetworkMode::Ns(_)
+        ) {
+            out.push((Entitlement::NetworkHost, format!("build --network={n}")));
+        }
     }
     for (stage, _) in file.stages.iter().zip(built).filter(|(_, b)| **b) {
         for i in &stage.instrs {
@@ -119,6 +127,8 @@ mod tests {
         assert!(needs(&f, &[true], None).is_empty());
         assert!(needs(&f, &[true], Some("none")).is_empty());
         assert!(needs(&f, &[true], Some("bridge")).is_empty());
+        assert!(needs(&f, &[true], Some("mynet")).is_empty());
+        assert!(needs(&f, &[true], Some("pasta:-T,80")).is_empty());
     }
 
     #[test]
@@ -137,6 +147,9 @@ mod tests {
         assert_eq!(needs(&f, &[true, true, true], None).len(), 4);
         assert_eq!(needs(&f, &[true, false, false], None).len(), 1);
         assert_eq!(needs(&f, &[false, true, true], None).len(), 3);
+        // a namespace by its path may be the host's
+        let n = needs(&f, &[false, false, false], Some("ns:/proc/1/ns/net"));
+        assert_eq!(n, [(Host, "build --network=ns:/proc/1/ns/net".to_string())]);
     }
 
     #[test]

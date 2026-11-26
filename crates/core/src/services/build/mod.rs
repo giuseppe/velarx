@@ -733,17 +733,19 @@ fn disk_usage(dir: &Path) -> std::io::Result<u64> {
     Ok(u.blocks.saturating_mul(512))
 }
 
-/// The network of the RUN containers: the modes podman takes for a build
-/// (not a container's namespace or a network of the host by name).
+/// The network of the RUN containers: any mode of `run --network` that
+/// does not name another container, a pod or a provider: the build has
+/// none.
 fn build_network(mode: Option<&str>) -> BuildResult<Option<NetworkMode>> {
-    match mode.unwrap_or("") {
-        "" | "private" | "default" => Ok(None),
-        "none" => Ok(Some(NetworkMode::Off)),
-        "host" => Ok(Some(NetworkMode::Host)),
-        "bridge" => Ok(Some(NetworkMode::Bridge(None))),
-        n => Err(BuildError::Parse(format!(
-            "unsupported network `{n}` for a build: none, host, bridge or private"
-        ))),
+    match NetworkMode::parse(mode.unwrap_or("")) {
+        NetworkMode::Unset | NetworkMode::Default | NetworkMode::Private => Ok(None),
+        NetworkMode::Pod | NetworkMode::Container(_) | NetworkMode::Provider(_) => {
+            Err(BuildError::Parse(format!(
+                "unsupported network `{}` for a build",
+                mode.unwrap_or("")
+            )))
+        }
+        m => Ok(Some(m)),
     }
 }
 
@@ -4836,7 +4838,23 @@ mod tests {
         assert_eq!(build_network(None).unwrap(), None);
         assert_eq!(build_network(Some("private")).unwrap(), None);
         assert_eq!(build_network(Some("none")).unwrap(), Some(NetworkMode::Off));
-        for bad in ["container:abc", "ns:/proc/1/ns/net", "mynet", "slirp4netns"] {
+        assert_eq!(
+            build_network(Some("mynet")).unwrap(),
+            Some(NetworkMode::Network("mynet".into()))
+        );
+        assert_eq!(
+            build_network(Some("ns:/proc/1/ns/net")).unwrap(),
+            Some(NetworkMode::Ns("/proc/1/ns/net".into()))
+        );
+        assert_eq!(
+            build_network(Some("pasta:-T,80")).unwrap(),
+            Some(NetworkMode::Pasta(Some("-T,80".into())))
+        );
+        assert_eq!(
+            build_network(Some("pasta")).unwrap(),
+            Some(NetworkMode::Pasta(None))
+        );
+        for bad in ["container:abc", "pod", "provider:x"] {
             assert!(build_network(Some(bad)).is_err(), "{bad}");
         }
     }

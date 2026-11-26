@@ -893,9 +893,17 @@ impl Build<'_> {
             .image
             .clone()
             .ok_or_else(|| step_error(i, "RUN in a stage without a base image"))?;
+        // (the network of the build, or the step's: none or the host's)
         let network = match i.flag("network") {
-            None => self.opts.network.as_deref().map(NetworkMode::parse),
-            Some(n) => build_network(Some(n)).map_err(|e| step_error(i, e))?,
+            None | Some("default") => self.opts.network.as_deref().map(NetworkMode::parse),
+            Some("none") => Some(NetworkMode::Off),
+            Some("host") => Some(NetworkMode::Host),
+            Some(n) => {
+                return Err(step_error(
+                    i,
+                    format!("invalid --network `{n}`: default, none or host"),
+                ))
+            }
         };
         self.svc
             .require(&self.opts.allow, &entitlement::instruction_needs(i))?;

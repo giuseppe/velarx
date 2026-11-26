@@ -540,10 +540,11 @@ max_scratch_gib = 100
 digest = "sha256"
 # What a build may do that goes beyond the sandbox of its RUN steps (as
 # BuildKit's entitlements; none by default):
-#   "network.host"      RUN --network=host, and a build with --network=host:
-#                       the steps share the network of the engine (for an
-#                       engine run as root, the real network of the host;
-#                       rootless, the network namespace of the user)
+#   "network.host"      RUN --network=host, and a build with --network=host
+#                       or --network=ns:PATH: the steps share the network of
+#                       the engine (for an engine run as root, the real
+#                       network of the host; rootless, the network namespace
+#                       of the user) or one it can join by its path
 #   "security.insecure" RUN --security=insecure: the step runs as
 #                       `run --privileged` does (all capabilities, no seccomp,
 #                       AppArmor or SELinux confinement, the devices of the host)

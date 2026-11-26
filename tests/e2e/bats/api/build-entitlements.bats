@@ -73,6 +73,11 @@ two_stages () {
     check "REST: a RUN --network=host refused" 1 "$(( $? != 0 ))"
     check_match "REST: a RUN --network=host: message" 'network.host is not allowed \(line 4: RUN --network=host\)' "$out"
 
+    # a namespace by its path may be the host's: as the host network
+    out=$("$CLI" image build --tls-verify=false --network ns:/proc/self/ns/net -f "$WORKDIR/ctx/Containerfile.plain" "$WORKDIR/ctx" 2>&1)
+    check "build --network=ns:PATH refused" 1 "$(( $? != 0 ))"
+    check_match "build --network=ns:PATH: message" 'network.host is not allowed \(build --network=ns:/proc/self/ns/net\): start the build with --allow network.host and enable it' "$out"
+
     # --allow without the configuration
     out=$("$CLI" image build --tls-verify=false --allow network.host -f "$WORKDIR/ctx/Containerfile.plain" "$WORKDIR/ctx" 2>&1)
     check "--allow alone refused" 1 "$(( $? != 0 ))"
@@ -157,6 +162,18 @@ two_stages () {
     check "build --network=host --allow network.host" 0 $?
     check "the whole build: the namespace of the host" "$host" "$("$CLI" run --rm --network none localhost/ent:whole cat /netns 2>&1)"
 
+    # a namespace by its path: another container's
+    "$CLI" run -d --name ent-ns --network none "$IMG" sleep 600 > /dev/null 2>&1
+    check "a container to join" 0 $?
+    local pid; pid=$("$CLI" inspect --format '{{.State.Pid}}' ent-ns 2>&1)
+    out=$("$CLI" image build --tls-verify=false --network "ns:/proc/$pid/ns/net" --allow network.host --no-cache -t localhost/ent:ns -f "$WORKDIR/ctx/Containerfile.whole" "$WORKDIR/ctx" 2>&1)
+    rc=$?
+    [ $rc = 0 ] || echo "$out" >&2
+    check "build --network=ns:PATH --allow network.host" 0 $rc
+    check "ns:PATH: the namespace at the path" "$("$CLI" exec ent-ns readlink /proc/self/ns/net 2>&1)" \
+        "$("$CLI" run --rm --network none localhost/ent:ns cat /netns 2>&1)"
+    "$CLI" rm -f -t 0 ent-ns > /dev/null 2>&1
+
     # REST: the configuration is the opt-in
     pm build --tls-verify=false --network=host --no-cache -t localhost/ent:rest -f "$WORKDIR/ctx/Containerfile.whole" "$WORKDIR/ctx" > /dev/null 2>&1
     check "REST networkmode=host" 0 $?
@@ -164,7 +181,7 @@ two_stages () {
     pm build --tls-verify=false --no-cache -t localhost/ent:rest2 -f "$WORKDIR/ctx/Containerfile.open" "$WORKDIR/ctx" > /dev/null 2>&1
     check "REST: RUN --network=host and --security=insecure" 0 $?
     check "REST: the namespace of the host (RUN)" "$host" "$("$CLI" run --rm --network none localhost/ent:rest2 cat /netns 2>&1)"
-    "$CLI" image rm -f localhost/ent:private localhost/ent:open localhost/ent:open2 localhost/ent:whole localhost/ent:rest localhost/ent:rest2 > /dev/null 2>&1
+    "$CLI" image rm -f localhost/ent:private localhost/ent:open localhost/ent:open2 localhost/ent:whole localhost/ent:ns localhost/ent:rest localhost/ent:rest2 > /dev/null 2>&1
 }
 
 @test "an unknown entitlement in the configuration is an error" {

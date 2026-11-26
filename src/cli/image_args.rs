@@ -198,7 +198,8 @@ pub enum ImageCommands {
         /// Squash all the layers, the base image's too, into one
         #[arg(long)]
         squash_all: bool,
-        /// The network of the RUN steps
+        /// The network of the RUN steps: none, host, private, bridge, pasta[:OPTIONS], ns:PATH
+        /// or the name of a network (host and ns:PATH need --allow network.host)
         #[arg(long)]
         network: Option<String>,
         /// Algorithm of the digests of everything the build makes (layers, configuration,
@@ -871,7 +872,7 @@ pub struct BuildExtra {
     #[arg(long, value_name = "default|ID[=SOCKET]")]
     pub ssh: Vec<String>,
     /// Allow an entitlement the engine configuration enables: network.host
-    /// (RUN --network=host, --network=host), security.insecure (RUN
+    /// (RUN --network=host, --network=host or ns:PATH), security.insecure (RUN
     /// --security=insecure); repeatable, or a comma separated list
     #[arg(long, value_name = "ENTITLEMENT")]
     pub allow: Vec<String>,
