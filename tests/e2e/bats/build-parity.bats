@@ -264,3 +264,15 @@ EOT
     sh_ manifest rm localhost/e2e-meta-list > /dev/null 2>&1
     sh_ rmi localhost/e2e-meta:1 > /dev/null 2>&1
 }
+
+@test "buildx build and builder build are build" {
+    local ctx=$WORKDIR/bxctx
+    mkdir -p "$ctx"
+    printf 'FROM scratch\nLABEL via=x\n' > "$ctx/Containerfile"
+    for group in buildx builder; do
+        sh_ "$group" build -q -t localhost/e2e-bx:$group "$ctx" > /dev/null
+        check "$group build" 0 $?
+        check "the image of $group build" x "$(sh_ image inspect -f '{{index .Config.Labels "via"}}' localhost/e2e-bx:$group)"
+    done
+    sh_ rmi localhost/e2e-bx:buildx localhost/e2e-bx:builder > /dev/null 2>&1
+}

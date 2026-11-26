@@ -518,6 +518,10 @@ pub fn end_options_after_operand(
 pub(super) const PODMAN_PATHS: &[(&str, &str, &[&str])] = &[
     ("system", "events", &["events"]),
     ("container", "commit", &["image", "commit"]),
+    ("buildx", "build", &["image", "build"]),
+    ("buildx", "prune", &["image", "prune"]),
+    ("builder", "build", &["image", "build"]),
+    ("builder", "prune", &["image", "prune"]),
 ];
 
 /// podman's commands that do not apply to velarx: refused with why, and
@@ -872,6 +876,20 @@ mod podman_layout_tests {
         assert!(layout(&["velarx", "varlink"]).is_ok());
         let e = layout(&["velarx", "container", "runlabel", "run", "img"]).unwrap_err();
         assert!(e.contains("`container runlabel` is not supported"), "{e}");
+    }
+
+    #[test]
+    fn buildx_and_builder_are_build_and_prune() {
+        for group in ["buildx", "builder"] {
+            assert_eq!(
+                layout(&["velarx", group, "build", "-t", "x", "."]).unwrap(),
+                ["velarx", "image", "build", "-t", "x", "."]
+            );
+            assert_eq!(
+                layout(&["velarx", group, "prune", "-f"]).unwrap(),
+                ["velarx", "image", "prune", "-f"]
+            );
+        }
     }
 
     #[test]
