@@ -162,9 +162,8 @@ impl Default for HoldsInner {
     }
 }
 
-/// The first descriptor of the holds a restarted engine gets, and the
-/// variable that says how many there are.
-pub const HOLD_FDS_START: i32 = 5;
+/// The variable that names the descriptors of the holds a restarted engine
+/// gets: their numbers, separated by commas.
 pub const HOLD_FDS_ENV: &str = "VELARX_HOLD_FDS";
 
 /// The most holds at once.
@@ -340,20 +339,22 @@ impl Holds {
 /// The holds a previous process of this engine passed on
 /// ([`HOLD_FDS_ENV`]).
 ///
-/// Call it once, early, while nothing else owns the descriptors from
-/// [`HOLD_FDS_START`] on.
+/// Call it once, early, before anything else adopts descriptors.
 pub fn take_hold_fds(startup: &velarx_sys::fd::Startup) -> Vec<OwnedFd> {
     use std::os::fd::IntoRawFd;
-    // (the variable is ours, but the environment is not to be trusted: a
-    // count in range, digits only, and each descriptor checked)
-    let n = std::env::var(HOLD_FDS_ENV)
-        .ok()
-        .filter(|v| !v.is_empty() && v.len() <= 3 && v.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|v| v.parse::<i32>().ok())
-        .filter(|n| (0..=MAX_HOLDS as i32).contains(n))
-        .unwrap_or(0);
+    // (the variable is ours, but the environment is not to be trusted:
+    // numbers of digits only, at most MAX_HOLDS, each descriptor checked)
+    let numbers: Vec<i32> = std::env::var(HOLD_FDS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|v| !v.is_empty() && v.len() <= 9 && v.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|v| v.parse::<i32>().ok())
+        .filter(|fd| *fd > 2)
+        .take(MAX_HOLDS)
+        .collect();
     std::env::remove_var(HOLD_FDS_ENV);
-    (HOLD_FDS_START..HOLD_FDS_START + n)
+    numbers
+        .into_iter()
         .filter_map(|fd| {
             // (a number that is no descriptor is not ours to close; one
             // that is no hold is not taken, nor closed, nor passed to a child)
@@ -5146,6 +5147,15 @@ impl Server {
     pub fn stop(&mut self) {
         self.stop = None;
     }
+
+    /// Return once the thread of the service has ended (after
+    /// [`Server::stop`], or when it left): what it held, the engine and
+    /// the descriptors of its state, is dropped then.
+    pub async fn ended(&mut self) {
+        if let Some(ended) = self.ended.take() {
+            let _ = ended.await;
+        }
+    }
 }
 
 /// The stack of the thread that serves the connections: the dispatch of the
@@ -5584,6 +5594,24 @@ mod tests {
     /// follows, it is not served (and cut) by this one, the connection of
     /// the call ends once answered; and a call that changes something is
     /// refused with the reason.
+    /// Once a stopped service has ended, its thread holds nothing of the
+    /// engine: the descriptors of the state are closed before a restart
+    /// places the ones it passes on (a close there after the placing took
+    /// away a hold of another frontend).
+    #[tokio::test]
+    async fn a_stopped_service_has_let_its_engine_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path()).await;
+        let state = engine.state.clone();
+        let held = Arc::strong_count(&state);
+        let listener =
+            std::os::unix::net::UnixListener::bind(dir.path().join("engine.sock")).unwrap();
+        let mut server = spawn(engine, listener, None).unwrap();
+        server.stop();
+        server.ended().await;
+        assert_eq!(Arc::strong_count(&state), held - 1);
+    }
+
     #[tokio::test]
     async fn restart_is_answered_when_the_engine_takes_no_connection() {
         let dir = tempfile::tempdir().unwrap();

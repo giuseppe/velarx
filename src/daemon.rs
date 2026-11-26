@@ -390,13 +390,37 @@ fn restart(
     upgrade: bool,
 ) -> anyhow::Error {
     use std::os::unix::process::CommandExt;
-    // (not current_exe(): the path of a binary replaced on disk is gone)
     let exe = match engine_service::installed_binary().filter(|_| upgrade) {
         Some(installed) => installed,
         None => PathBuf::from("/proc/self/exe"),
     };
+    let mut cmd = match restart_command(&exe, &listener, owns_socket, lifeline.as_ref(), &holds) {
+        Ok(cmd) => cmd,
+        Err(e) => return anyhow::anyhow!("restart: {e}"),
+    };
+    info!("Restarting");
+    anyhow::anyhow!("restart: cannot execute {}: {}", exe.display(), cmd.exec())
+}
+
+/// The command [`restart`] executes: `exe` with the arguments and the
+/// environment of this process, the listener at 3, the lifeline at 4.
+/// The holds of the other frontends stay at the numbers of their copies,
+/// which this process owns, named in [`engine_service::HOLD_FDS_ENV`]: a
+/// fixed number may be the descriptor of something another thread still
+/// drops (the epoll of the runtime that is gone, kept by a handle), whose
+/// close after the placing would take the hold away.
+fn restart_command(
+    exe: &Path,
+    listener: &std::os::fd::OwnedFd,
+    owns_socket: bool,
+    lifeline: Option<&std::os::fd::OwnedFd>,
+    holds: &[std::os::fd::OwnedFd],
+) -> std::io::Result<std::process::Command> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    // (not current_exe(): the path of a binary replaced on disk is gone)
     let mut args = std::env::args_os();
-    let mut cmd = std::process::Command::new(&exe);
+    let mut cmd = std::process::Command::new(exe);
     if let Some(argv0) = args.next() {
         cmd.arg0(argv0);
     }
@@ -410,24 +434,18 @@ fn restart(
             "LISTEN_FDNAMES",
             if owns_socket { OWN_SOCKET } else { "engine" },
         );
-    cmd.env(engine_service::HOLD_FDS_ENV, holds.len().to_string());
+    for hold in holds {
+        rustix::io::fcntl_setfd(hold, rustix::io::FdFlags::empty())?;
+    }
+    let held: Vec<String> = holds.iter().map(|h| h.as_raw_fd().to_string()).collect();
+    cmd.env(engine_service::HOLD_FDS_ENV, held.join(","));
     cmd.envs(userns::rootless::marker_env());
-    let fd = std::os::fd::AsRawFd::as_raw_fd(&listener);
-    let held: Vec<i32> = holds.iter().map(std::os::fd::AsRawFd::as_raw_fd).collect();
     // The lifeline of the frontend that started the engine goes on as
     // descriptor 4 (the arguments say `--lifeline-fd 4`).
-    let life = lifeline.as_ref().map(std::os::fd::AsRawFd::as_raw_fd);
-    let mut places = vec![(fd, 3)];
-    places.extend(life.map(|life| (life, 4)));
-    // The holds of the other frontends, each in its place.
-    places.extend(
-        held.iter()
-            .enumerate()
-            .map(|(i, fd)| (*fd, engine_service::HOLD_FDS_START + i as i32)),
-    );
+    let mut places = vec![(listener.as_raw_fd(), 3)];
+    places.extend(lifeline.map(|life| (life.as_raw_fd(), 4)));
     velarx_sys::exec::place_fds(&mut cmd, places);
-    info!("Restarting");
-    anyhow::anyhow!("restart: cannot execute {}: {}", exe.display(), cmd.exec())
+    Ok(cmd)
 }
 
 async fn run_daemon(
@@ -890,6 +908,11 @@ async fn run_daemon(
         );
     }
     engine_server.stop();
+    // (its thread drops the engine and the state it holds, and closes
+    // their descriptors, before this process goes on: a restart places the
+    // descriptors it passes on at fixed numbers, where such a close would
+    // take one away, the hold of another frontend)
+    engine_server.ended().await;
 
     if let Some(handle) = gc_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
@@ -1449,6 +1472,34 @@ fn engine_command(config_path: &Path) -> Option<Vec<std::ffi::OsString>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restart names the holds of the other frontends by the numbers of
+    /// their copies, which this process owns, left open across the exec: it
+    /// moves only the listener and the lifeline, to 3 and 4.
+    #[test]
+    fn a_restart_passes_the_holds_at_their_own_numbers() {
+        use std::os::fd::{AsRawFd, OwnedFd};
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _a) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (b, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let holds: Vec<OwnedFd> = vec![a.into(), b.into()];
+        let listener: OwnedFd = std::os::unix::net::UnixListener::bind(dir.path().join("s"))
+            .unwrap()
+            .into();
+        let cmd = restart_command(Path::new("/bin/true"), &listener, true, None, &holds).unwrap();
+        let env = |name: &str| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == name)
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        let numbers: Vec<String> = holds.iter().map(|h| h.as_raw_fd().to_string()).collect();
+        assert_eq!(env(engine_service::HOLD_FDS_ENV), Some(numbers.join(",")));
+        for hold in &holds {
+            let flags = rustix::io::fcntl_getfd(hold).unwrap();
+            assert!(!flags.contains(rustix::io::FdFlags::CLOEXEC));
+        }
+    }
 
     /// A signal ends the wait for an engine that serves the socket but does
     /// not answer the hold.
