@@ -180,3 +180,16 @@ EOT
     check_match "...says which step" "b-fails" "$out"
     sh_ rmi localhost/e2e-jobs:1 localhost/e2e-jobs:2 > /dev/null 2>&1
 }
+
+@test "build -f: a pipe is the Containerfile" {
+    local ctx=$WORKDIR/fctx
+    mkdir -p "$ctx"
+    sh_ image build -q -t localhost/e2e-fpipe:1 -f <(printf 'FROM %s\nLABEL from=pipe\n' "$IMAGE") "$ctx" > /dev/null
+    check "build with -f <(...)" 0 $?
+    check "the Containerfile of the pipe" pipe "$(sh_ image inspect -f '{{index .Config.Labels "from"}}' localhost/e2e-fpipe:1)"
+    printf 'LABEL second=yes\n' > "$ctx/second"
+    sh_ image build -q -t localhost/e2e-fpipe:2 -f <(printf 'FROM %s\n' "$IMAGE") -f "$ctx/second" "$ctx" > /dev/null
+    check "a pipe among several -f" 0 $?
+    check "...is one Containerfile with the others" yes "$(sh_ image inspect -f '{{index .Config.Labels "second"}}' localhost/e2e-fpipe:2)"
+    sh_ rmi localhost/e2e-fpipe:1 localhost/e2e-fpipe:2 > /dev/null 2>&1
+}

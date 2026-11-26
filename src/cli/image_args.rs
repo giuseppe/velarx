@@ -126,7 +126,7 @@ pub enum ImageCommands {
         /// Name and optionally a tag in the 'name:tag' format (repeatable)
         #[arg(long, short)]
         tag: Vec<String>,
-        /// The Containerfile (default: Containerfile or Dockerfile of the context); given again, the files are joined into one
+        /// The Containerfile (default: Containerfile or Dockerfile of the context); given again, the files are joined into one; - is the standard input, a pipe (<(...)) is read as it
         #[arg(long, short)]
         file: Vec<PathBuf>,
         /// Set build-time variables: NAME=VALUE, or NAME for the value of the environment

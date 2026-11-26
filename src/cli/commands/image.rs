@@ -1623,6 +1623,10 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                             let mut part = Vec::new();
                             std::io::stdin().read_to_end(&mut part)?;
                             part
+                        } else if is_pipe(f) {
+                            std::fs::read(f).map_err(|e| {
+                                anyhow::anyhow!("the Containerfile {}: {e}", f.display())
+                            })?
                         } else {
                             let abs = containerfile_path(f, &context)?;
                             if abs.extension().is_some_and(|e| e == "in") {
@@ -1644,11 +1648,18 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                     containerfile_outside = true;
                     Some(name)
                 }
-                // `-f -`: the Containerfile is the standard input, the context a directory
-                ([f], None) if f.as_os_str() == "-" => {
+                // `-f -`: the Containerfile is the standard input, the context a
+                // directory; `-f <(...)` and `-f /dev/fd/N` are read as it is
+                ([f], None) if f.as_os_str() == "-" || is_pipe(f) => {
                     use std::io::Read;
                     let mut text = Vec::new();
-                    std::io::stdin().read_to_end(&mut text)?;
+                    if f.as_os_str() == "-" {
+                        std::io::stdin().read_to_end(&mut text)?;
+                    } else {
+                        text = std::fs::read(f).map_err(|e| {
+                            anyhow::anyhow!("the Containerfile {}: {e}", f.display())
+                        })?;
+                    }
                     let name = format!(".velarx-containerfile-{}", std::process::id());
                     extra = Some((name.clone(), text));
                     containerfile_outside = true;
@@ -1966,6 +1977,13 @@ fn containerfile_ignore(files: &[std::path::PathBuf]) -> Option<std::path::PathB
             path.is_file().then_some(path)
         })
     })
+}
+
+/// Whether `-f` names a pipe (a process substitution): it has no path to
+/// canonicalize, and is read once.
+fn is_pipe(f: &std::path::Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(f).is_ok_and(|m| m.file_type().is_fifo())
 }
 
 /// The path of a Containerfile named by `-f`: where the command is, else in
