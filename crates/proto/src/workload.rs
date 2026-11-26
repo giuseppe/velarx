@@ -819,6 +819,8 @@ pub struct ImageRecord {
     pub annotations: BTreeMap<String, String>,
     /// The media type of its manifest
     pub manifest_type: String,
+    /// The size of its manifest in bytes
+    pub manifest_size: u64,
     pub config: ImageConfigRecord,
     pub history: Vec<ImageHistoryEntry>,
     /// The digests of its uncompressed layers (`rootfs.diff_ids`), the
@@ -1957,8 +1959,8 @@ deserialize_members! {
     ImageRecord {
         id, names, digest_names, names_history, digests, digest, size, created_ns, stored_ns,
         parent_id, has_children, containers, read_only, manifest_list, lazy, os, architecture,
-        variant, author, comment, labels, annotations, manifest_type, config, history, layers,
-        composefs, graph_driver,
+        variant, author, comment, labels, annotations, manifest_type, manifest_size, config, history,
+        layers, composefs, graph_driver,
     }
     VolumeRecord {
         name, driver, mountpoint, created_ns, labels, options, scope, uid, gid, anonymous,

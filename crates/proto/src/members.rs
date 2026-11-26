@@ -474,6 +474,7 @@ mod tests {
             labels: map("l"),
             annotations: map("a"),
             manifest_type: "m".into(),
+            manifest_size: 5,
             config,
             history: vec![ImageHistoryEntry {
                 created_ns: 1,

@@ -32,6 +32,25 @@ pub(super) fn inspect_latest(
     }
 }
 
+fn write_file(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+    std::fs::write(path, content).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))
+}
+
+/// What `--metadata-file` writes (buildx's keys): the digest of the
+/// manifest, the digest of the configuration and the descriptor of the
+/// manifest.
+fn build_metadata(image: &velarx_proto::workload::ImageRecord) -> serde_json::Value {
+    serde_json::json!({
+        "containerimage.digest": image.digest,
+        "containerimage.config.digest": velarx_shape::id_with_algorithm(&image.id),
+        "containerimage.descriptor": {
+            "mediaType": image.manifest_type,
+            "digest": image.digest,
+            "size": image.manifest_size,
+        },
+    })
+}
+
 pub(super) fn image_id_of(client: &client::EngineClient, name: &str) -> anyhow::Result<String> {
     // (a manifest list is no image: its id is what the build gives)
     match client.inspect_image(name) {
@@ -1242,6 +1261,8 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
             pull,
             access,
             iidfile,
+            iidfile_raw,
+            metadata_file,
             quiet,
             context,
         } => {
@@ -1550,6 +1571,16 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
             }
             let platform =
                 cli::platform_of(platform, os, arch, variant).map_err(anyhow::Error::msg)?;
+            // buildah: the digests of one image only (the id files take
+            // the id the build gives, as podman's)
+            if let Some(file) = &metadata_file {
+                if all_platforms || platform.as_deref().is_some_and(|p| p.contains(',')) {
+                    anyhow::bail!(
+                        "building multiple images, but metadata file {:?} can only be used to store information about one image",
+                        file.display()
+                    );
+                }
+            }
             let (access, auth) = build_access(&access)?;
             // `-`: the context is a tar on the standard input, or a
             // Containerfile with an empty context
@@ -1951,22 +1982,40 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
             for output in &outputs {
                 export_image(&client, &image_id, output)?;
             }
-            // buildah: the id in the file, or else on the standard output
-            match iidfile {
-                Some(path) => {
-                    let id = velarx_shape::without_algorithm(&image_id);
-                    std::fs::write(&path, velarx_shape::id_with_algorithm(id))
-                        .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
-                }
-                None => {
-                    let id = image_id_of(&client, &image_id)?;
-                    match id_out {
-                        Some(mut out) => {
-                            use std::io::Write;
-                            writeln!(out, "{id}")?;
-                        }
-                        None => println!("{id}"),
+            // buildah: the id in the files, or else on the standard output
+            let id = image_id_of(&client, &image_id)?;
+            if let Some(path) = &iidfile {
+                write_file(path, &velarx_shape::id_with_algorithm(&id))?;
+            }
+            if let Some(path) = &iidfile_raw {
+                write_file(path, &id)?;
+            }
+            if let Some(path) = &metadata_file {
+                // with --manifest the build gives the list, and the image
+                // is its last instance (an instance added again moves to
+                // the end)
+                let image = match req.manifest {
+                    Some(_) => client.manifest_inspect(&image_id, &Default::default())?
+                        ["manifests"]
+                        .as_array()
+                        .and_then(|m| m.last())
+                        .and_then(|m| m["digest"].as_str())
+                        .ok_or_else(|| anyhow::anyhow!("the list {image_id} has no instance"))?
+                        .to_string(),
+                    None => image_id.clone(),
+                };
+                write_file(
+                    path,
+                    &build_metadata(&client.inspect_image(&image)?).to_string(),
+                )?;
+            }
+            if iidfile.is_none() && iidfile_raw.is_none() {
+                match id_out {
+                    Some(mut out) => {
+                        use std::io::Write;
+                        writeln!(out, "{id}")?;
                     }
+                    None => println!("{id}"),
                 }
             }
         }
@@ -2419,6 +2468,29 @@ mod push_format_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_metadata_of_a_build_has_buildx_keys() {
+        let image = velarx_proto::workload::ImageRecord {
+            id: "c".repeat(64),
+            digest: format!("sha256:{}", "d".repeat(64)),
+            manifest_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            manifest_size: 428,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_metadata(&image),
+            serde_json::json!({
+                "containerimage.digest": format!("sha256:{}", "d".repeat(64)),
+                "containerimage.config.digest": format!("sha256:{}", "c".repeat(64)),
+                "containerimage.descriptor": {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": format!("sha256:{}", "d".repeat(64)),
+                    "size": 428,
+                },
+            })
+        );
+    }
 
     #[test]
     fn the_config_of_a_commit_is_read_as_podman_s() {

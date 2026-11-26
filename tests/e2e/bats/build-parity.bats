@@ -229,3 +229,38 @@ EOT
     check "a level that is no number" 125 $?
     sh_ rmi localhost/e2e-comp:1 localhost/e2e-comp:2 > /dev/null 2>&1
 }
+
+@test "build --iidfile-raw and --metadata-file" {
+    local ctx=$WORKDIR/metactx raw=$WORKDIR/iid-raw meta=$WORKDIR/meta.json iid=$WORKDIR/iid
+    mkdir -p "$ctx"
+    printf 'FROM %s\nLABEL m=1\n' "$IMAGE" > "$ctx/Containerfile"
+    out=$(sh_ image build -q --iidfile-raw "$raw" --iidfile "$iid" --metadata-file "$meta" -t localhost/e2e-meta:1 "$ctx" 2> /dev/null)
+    check "build" 0 $?
+    check "the id is in the files, not on the standard output" "" "$out"
+    check_match "the raw id has no algorithm" "^[0-9a-f]{64}$" "$(cat "$raw")"
+    check "the id file has it" "sha256:$(cat "$raw")" "$(cat "$iid")"
+    check "the id is the image's" "$(sh_ image inspect -f '{{.Id}}' localhost/e2e-meta:1)" "$(cat "$raw")"
+    check "the config digest" "sha256:$(cat "$raw")" "$(jq -r '."containerimage.config.digest"' "$meta")"
+    digest=$(sh_ image inspect -f '{{.Digest}}' localhost/e2e-meta:1)
+    check "the manifest digest" "$digest" "$(jq -r '."containerimage.digest"' "$meta")"
+    check "the descriptor digest" "$digest" "$(jq -r '."containerimage.descriptor".digest' "$meta")"
+    check "the descriptor media type" "application/vnd.oci.image.manifest.v1+json" "$(jq -r '."containerimage.descriptor".mediaType' "$meta")"
+    check_match "the descriptor size" "^[1-9][0-9]*$" "$(jq -r '."containerimage.descriptor".size' "$meta")"
+    # with --manifest the image the build added to the list
+    sh_ image build -q --manifest localhost/e2e-meta-list --metadata-file "$meta" "$ctx" > /dev/null 2>&1
+    check "build --manifest" 0 $?
+    check "...the digest of the image" "$digest" "$(jq -r '."containerimage.digest"' "$meta")"
+    # several images: one id is written, the metadata is refused
+    rm "$raw"
+    rc=0
+    sh_ image build -q --iidfile-raw "$raw" --platform linux/amd64,linux/arm64 "$ctx" > /dev/null 2>&1 || rc=$?
+    check "several platforms with --iidfile-raw" 0 $rc
+    check_match "...write an id" "^[0-9a-f]{64}$" "$(cat "$raw")"
+    rc=0
+    sh_ image build --metadata-file "$WORKDIR/none" --platform linux/amd64,linux/arm64 "$ctx" > /dev/null 2> "$WORKDIR/err" || rc=$?
+    check "several platforms with --metadata-file" 125 $rc
+    check_match "...say why" "building multiple images, but metadata file .* can only be used to store information about one image" "$(cat "$WORKDIR/err")"
+    check "...and write nothing" "no" "$([ -e "$WORKDIR/none" ] && echo yes || echo no)"
+    sh_ manifest rm localhost/e2e-meta-list > /dev/null 2>&1
+    sh_ rmi localhost/e2e-meta:1 > /dev/null 2>&1
+}

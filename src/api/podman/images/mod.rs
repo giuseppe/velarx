@@ -378,6 +378,7 @@ impl View {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            manifest_size: self.rec.manifest.len() as u64,
             config,
             history,
             layers: strings(self.config.pointer("/rootfs/diff_ids")),

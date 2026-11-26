@@ -230,6 +230,12 @@ pub enum ImageCommands {
         /// Write the image id to this file
         #[arg(long)]
         iidfile: Option<PathBuf>,
+        /// Write the image id to this file, without the `sha256:` prefix
+        #[arg(long)]
+        iidfile_raw: Option<PathBuf>,
+        /// Write the digests of the image to this file, as JSON
+        #[arg(long)]
+        metadata_file: Option<PathBuf>,
         /// Suppress the build output
         #[arg(long, short)]
         quiet: bool,

@@ -1510,6 +1510,8 @@ type ImageRecord (
 	annotations: [string]string,
 	# The media type of its manifest
 	manifest_type: string,
+	# The size of its manifest in bytes
+	manifest_size: int,
 	config: ImageConfigRecord,
 	history: []ImageHistoryEntry,
 	# The digests of its uncompressed layers (`rootfs.diff_ids`), the
