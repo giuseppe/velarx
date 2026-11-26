@@ -377,7 +377,7 @@ os.waitpid(pid, 0)
     sh_ container run -d --name ex --network none "$IMAGE" sleep 1000 > /dev/null
     sh_ container stop -t 1 ex > /dev/null
     sh_ container exec ex echo x > /dev/null 2>&1
-    check "exec in a stopped container fails" 125 $?
+    check "exec in a stopped container fails, with podman's status" 255 $?
     out=$(sh_ container exec ex echo x 2>&1)
     # (podman's words, with or without an engine service)
     check "and says why, as podman" "Error: can only create exec sessions on running containers: container state improper" "$out"

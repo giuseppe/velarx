@@ -103,16 +103,11 @@ fn session(state: &AppState, id: &str) -> ApiResult<Arc<Session>> {
 pub async fn create_of(state: &Arc<AppState>, name: &str, spec: &ExecSpec) -> ApiResult<String> {
     let rec = lifecycle::resolve(state, name).await?;
     let status = lifecycle::status(state, &rec).await;
-    if status.state == RunState::Paused {
-        return Err(ApiError::invalid_state(format!(
-            "cannot create exec session as container {} is paused",
-            rec.id
-        )));
-    }
-    if !status.alive() {
+    if !status.alive() || status.state == RunState::Paused {
         return Err(ApiError::invalid_state(
             "can only create exec sessions on running containers: container state improper",
-        ));
+        )
+        .with_cause("container state improper"));
     }
     let keys = spec.detach_keys.as_str();
     if !keys.is_empty() {

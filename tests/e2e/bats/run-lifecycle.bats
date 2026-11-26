@@ -694,6 +694,46 @@ hooks_dir = [\"$hd\"]"
     sh_ container rm -t 0 -f stp > /dev/null
 }
 
+# What else a paused container refuses, in podman's words and with its
+# statuses.  The commands on several containers do the others and fail at
+# the end; a kill still reaches it.
+@test "a paused container is not restarted, stopped or run in, and --all fails for it" {
+    sh_ container run -d --name pcr --network none "$IMAGE" sleep 300 > /dev/null
+    sh_ container create --name pcs --network none "$IMAGE" sleep 300 > /dev/null
+    sh_ pause pcr > /dev/null 2>&1 || e2e_die "pause of pcr failed"
+    id=$(inspect_of pcr id)
+    out=$(sh_ container restart pcr 2>&1)
+    check "restart fails" 125 $?
+    check "and says why" "Error: unable to restart a container in a paused or unknown state: container state improper" "$out"
+    out=$(sh_ container stop -t 0 pcr 2>&1)
+    check "stop fails" 125 $?
+    check "and says why" "Error: container $id is running or paused, refusing to clean up: container state improper" "$out"
+    out=$(sh_ container exec pcr true 2>&1)
+    check "exec fails with podman's status" 255 $?
+    check "and says why" "Error: can only create exec sessions on running containers: container state improper" "$out"
+    out=$(sh_ container top pcr 2>&1)
+    check "top fails" 125 $?
+    check "and says why" "Error: top can only be used on running containers" "$out"
+    out=$(sh_ pause pcr 2>&1)
+    check "a second pause fails" 125 $?
+    check "and says why" "Error: \"$id\" is already paused: container state improper" "$out"
+    out=$(sh_ container start --all 2>&1)
+    check "start --all fails" 125 $?
+    check_match "and says why" "unable to start container \"$id\": container $id must be in Created or Stopped state to be started: container state improper" "$out"
+    check "it started the others" running "$(state_of pcs)"
+    pid=$(inspect_of pcs pid)
+    out=$(sh_ container restart --all -t 0 2>&1)
+    check "restart --all fails" 125 $?
+    check "it restarted the others" yes "$(test "$(inspect_of pcs pid)" != "$pid" && echo yes)"
+    out=$(sh_ container stop --all -t 0 2>&1)
+    check "stop --all fails" 125 $?
+    check "it stopped the others" exited "$(state_of pcs)"
+    check "the paused one stays paused" paused "$(state_of pcr)"
+    sh_ container kill pcr > /dev/null
+    check "a kill reaches it" exited "$(state_of pcr)"
+    sh_ container rm -t 0 -f pcr pcs > /dev/null
+}
+
 # the shutdown timeout: a client that stays is cut at its end
 @test "the shutdown timeout" {
     stop_daemon

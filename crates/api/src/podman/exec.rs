@@ -10,8 +10,9 @@ use super::{route, Route};
 use crate::engine::engine_call;
 use serde::Serialize;
 use serde_json::Value;
+use velarx_proto::engine::Condition;
 use velarx_proto::godecode;
-use velarx_proto::workload::{ExecRecord, ExecSpec};
+use velarx_proto::workload::{ExecRecord, ExecSpec, RunState};
 
 /// The most bytes of the body of an exec request.
 const MAX_EXEC_BODY: usize = 1 << 20;
@@ -168,8 +169,26 @@ fn document_of(e: &ExecRecord) -> Inspected<'_> {
 /// `POST /containers/{name}/exec`
 async fn create(mut call: Call) -> ApiResult {
     let spec = spec_of(&body(&mut call).await?)?;
-    let id = engine_call!(call.engine, exec_create(call.param(0), spec))?.id;
+    let id = match engine_call!(call.engine, exec_create(call.param(0), spec)) {
+        Ok(created) => created.id,
+        Err(e) => return Err(create_refused(&call, e).await),
+    };
     Ok(reply::json(201, &serde_json::json!({"Id": id})))
+}
+
+/// The answer to a create the engine refused for the state of the
+/// container: a 409 that says so for a paused one, a 500 for another.
+async fn create_refused(call: &Call, e: ApiError) -> ApiError {
+    if !e.is(Condition::InvalidState) {
+        return e;
+    }
+    match engine_call!(call.engine, container_inspect(call.param(0), false)) {
+        Ok(found) if found.container.state == RunState::Paused => ApiError::conflict(format!(
+            "cannot create exec session as container {} is paused",
+            found.container.id
+        )),
+        _ => e.as_podman_failure(),
+    }
 }
 
 /// `GET /exec/{id}/json`

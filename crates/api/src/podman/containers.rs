@@ -341,7 +341,8 @@ async fn start(call: Call) -> ApiResult {
     let started = call
         .engine
         .container_start(call.param(0), &verify_image(&call))
-        .await?;
+        .await
+        .map_err(ApiError::as_podman_failure)?;
     Ok(reply::empty(if started { 204 } else { 304 }))
 }
 
@@ -390,7 +391,8 @@ async fn restart(call: Call) -> ApiResult {
     engine_call!(
         call.engine,
         container_restart(call.param(0), timeout, verify)
-    )?;
+    )
+    .map_err(ApiError::as_podman_failure)?;
     Ok(reply::empty(204))
 }
 
@@ -398,7 +400,8 @@ async fn pause(call: Call) -> ApiResult {
     engine_call!(
         call.engine,
         container_pause(call.param(0), true, None::<u64>)
-    )?;
+    )
+    .map_err(ApiError::as_podman_failure)?;
     Ok(reply::empty(204))
 }
 
@@ -406,7 +409,8 @@ async fn unpause(call: Call) -> ApiResult {
     engine_call!(
         call.engine,
         container_pause(call.param(0), false, None::<u64>)
-    )?;
+    )
+    .map_err(ApiError::as_podman_failure)?;
     Ok(reply::empty(204))
 }
 
@@ -641,7 +645,8 @@ async fn top(call: Call) -> ApiResult {
     };
     let (engine, name) = (call.engine.clone(), call.param(0).to_string());
     let args = ps_args.clone();
-    let top = engine_call!(engine, container_top(&name, args))?;
+    let top =
+        engine_call!(engine, container_top(&name, args)).map_err(ApiError::as_podman_failure)?;
     Ok(reply::reports(
         super::pods::top_document(top),
         stream,

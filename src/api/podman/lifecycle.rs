@@ -702,6 +702,13 @@ pub async fn end_pause_lease(state: &Arc<AppState>, id: &str, until: i64) -> Api
 
 async fn pause_locked(state: &Arc<AppState>, rec: &ContainerRecord) -> ApiResult<()> {
     let st = status(state, rec).await;
+    if st.state == typed::RunState::Paused {
+        return Err(ApiError::invalid_state(format!(
+            "\"{}\" is already paused: container state improper",
+            rec.id
+        ))
+        .with_cause("container state improper"));
+    }
     if st.state != typed::RunState::Running {
         return Err(ApiError::invalid_state(format!(
             "{} is not running, can't pause: container state improper",

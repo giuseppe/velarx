@@ -350,6 +350,20 @@ fn is_not_started(e: &client::ClientError) -> bool {
     e.is(Condition::NotStarted) || e.is(Condition::CommandNotFound)
 }
 
+/// The error `e` of an exec, with podman's status 255 when the state of
+/// the container did not allow it.
+pub fn exec_failure(e: client::ClientError) -> anyhow::Error {
+    if e.is(Condition::InvalidState) {
+        Failed {
+            status: 255,
+            message: e.to_string(),
+        }
+        .into()
+    } else {
+        e.into()
+    }
+}
+
 /// An error of a command with the exit status podman gives it, when that
 /// is not the 125 of the other errors.
 #[derive(Debug)]
@@ -2394,7 +2408,7 @@ pub fn start_targets(
     if containers.is_empty() {
         return Ok(matching
             .into_iter()
-            .filter(|(_, _, state)| state != "running" && state != "paused")
+            .filter(|(_, _, state)| state != "running")
             .map(|(id, _, _)| id)
             .collect());
     }
@@ -2408,9 +2422,10 @@ pub fn start_targets(
         .collect())
 }
 
-/// The containers `start --all [--filter ...]` starts: every one that is not
-/// running, and with `should-start-on-boot=true` (the only filter) those
-/// that a boot starts again (see `services::boot::should_start_on_boot`).
+/// The containers `start --all [--filter ...]` starts: every one that does
+/// not run (the start of a paused one fails), and with
+/// `should-start-on-boot=true` (the only filter) those that a boot starts
+/// again (see `services::boot::should_start_on_boot`).
 pub fn containers_to_start(
     client: &EngineClient,
     filters: &[String],
@@ -2430,7 +2445,7 @@ pub fn containers_to_start(
     Ok(client
         .list_containers(true, &filters, false, false)?
         .into_iter()
-        .filter(|c| !matches!(c.state, RunState::Running | RunState::Paused))
+        .filter(|c| c.state != RunState::Running)
         .map(|c| c.id)
         .collect())
 }

@@ -684,6 +684,15 @@ pub(crate) async fn stop_of(
         Err(e) if ignore && e.status == 404 => return Ok((true, None)),
         Err(e) => return Err(e),
     };
+    // a service manager's stop resumes a paused container, a user's is
+    // refused
+    if !service && lifecycle::status(state, &rec).await.state == RunState::Paused {
+        return Err(ApiError::invalid_state(format!(
+            "container {} is running or paused, refusing to clean up: container state improper",
+            rec.id
+        ))
+        .with_cause("container state improper"));
+    }
     // the stop tells of itself (events)
     let timeout = timeout.map(|t| t.min(u32::MAX as u64) as u32);
     let stopped = if service {
@@ -751,6 +760,12 @@ pub(crate) async fn restart_of(
     check: &StartCheck,
 ) -> ApiResult<()> {
     let rec = lifecycle::resolve(state, name).await?;
+    if lifecycle::status(state, &rec).await.state == RunState::Paused {
+        return Err(ApiError::invalid_state(
+            "unable to restart a container in a paused or unknown state: container state improper",
+        )
+        .with_cause("container state improper"));
+    }
     state.container_service.keep(&rec.id).await?;
     // a stop or a kill meanwhile waits for the restart to end, as podman's
     // (the event comes first, then the `died` of the stop, `init`, `start`)
@@ -1548,11 +1563,11 @@ pub(crate) async fn processes_of(
     ps_args: &[String],
 ) -> ApiResult<(velarx_db::ContainerRecord, velarx_wire::wire::TopResult)> {
     let rec = lifecycle::resolve(state, name).await?;
-    if !lifecycle::status(state, &rec).await.alive() {
-        return Err(ApiError::invalid_state(format!(
-            "container {} is not running: container state improper",
-            rec.id
-        )));
+    let st = lifecycle::status(state, &rec).await;
+    if !st.alive() || st.state == RunState::Paused {
+        return Err(ApiError::invalid_state(
+            "top can only be used on running containers",
+        ));
     }
     let top = state.container_service.top(&rec.id, ps_args).await?;
     Ok((rec, top))

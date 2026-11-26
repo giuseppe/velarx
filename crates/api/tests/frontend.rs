@@ -2605,8 +2605,9 @@ async fn a_top_is_the_typed_call() {
             )
             .await;
             assert_eq!(st, 200);
+            // (a container that does not run: a failure, not a conflict)
             let (st, _, body) = get(&app, "GET", "/libpod/containers/gone/top").await;
-            assert_eq!(st, 409, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(st, 500, "{}", String::from_utf8_lossy(&body));
             let (st, _, body) = get(&app, "GET", "/libpod/containers/c1/top?delay=0").await;
             assert_eq!(
                 (st.as_u16(), json(&body)["message"].as_str()),

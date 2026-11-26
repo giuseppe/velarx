@@ -110,9 +110,10 @@ impl ApiError {
         }
     }
 
-    /// podman answers every failure of a removal or a stop that is not a
-    /// missing object with a 500 (a state, a dependent or a use the engine
-    /// tells apart): the engine's condition is kept in the message only.
+    /// podman answers every failure of a removal, a start, a stop, a
+    /// restart, a pause or a top that is not a missing object with a 500 (a
+    /// state, a dependent or a use the engine tells apart): the engine's
+    /// condition is kept in the message only.
     pub fn as_podman_failure(self) -> Self {
         match self.status.as_u16() {
             400 | 409 => self.with_status(StatusCode::INTERNAL_SERVER_ERROR),

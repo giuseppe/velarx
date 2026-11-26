@@ -204,6 +204,21 @@ teardown_file () {
         pm pause bg > /dev/null
         out=$(pm inspect bg --format '{{.State.Status}}')
         check "pause" "paused" "$out"
+        # (what a paused container refuses, in podman's words)
+        bgid=$(pm inspect bg --format '{{.ID}}')
+        check_match "restart of a paused container" "unable to restart a container in a paused or unknown state: container state improper" "$(pm restart bg 2>&1)"
+        check_match "stop of a paused container" "container $bgid is running or paused, refusing to clean up: container state improper" "$(pm stop bg 2>&1)"
+        check_match "exec in a paused container" "cannot create exec session as container $bgid is paused" "$(pm exec bg true 2>&1)"
+        check_match "top of a paused container" "top can only be used on running containers" "$(pm top bg 2>&1)"
+        check_match "pause of a paused container" "\"$bgid\" is already paused: container state improper" "$(pm pause bg 2>&1)"
+        check "it stays paused" "paused" "$(pm inspect bg --format '{{.State.Status}}')"
+        # (the statuses: a 409 for the exec, a 500 for the others)
+        for op in start stop restart pause; do
+            check "REST $op of a paused container" 500 "$(api -o /dev/null -w '%{http_code}' -X POST "http://d/v5.0.0/libpod/containers/bg/$op")"
+        done
+        check "REST top of a paused container" 500 "$(api -o /dev/null -w '%{http_code}' "http://d/v5.0.0/libpod/containers/bg/top")"
+        out=$(api -w ' %{http_code}' -X POST -H 'Content-Type: application/json' -d '{"Cmd":["true"]}' "http://d/v1.41/containers/bg/exec")
+        check "REST exec in a paused container" "cannot create exec session as container $bgid is paused 409" "$(echo "${out% *}" | jq -rj .message) ${out##* }"
         pm unpause bg > /dev/null
     else
         note_skip pause "no cgroup freezer we may write here"
@@ -316,6 +331,7 @@ PY
     pm rm rotc > /dev/null
     pm stop bg > /dev/null
     check "stop of a stopped container" 0 $?
+    check "REST exec in a stopped container" 500 "$(api -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"Cmd":["true"]}' "http://d/v1.41/containers/bg/exec")"
 
     pm rm bg > /dev/null
     check "rm" 0 $?

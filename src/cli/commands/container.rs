@@ -734,7 +734,9 @@ pub(super) fn run_container_command(
                     timeout,
                     detach: false,
                 };
-                let session = client.create_exec(&container, &params)?;
+                let session = client
+                    .create_exec(&container, &params)
+                    .map_err(cli::run::exec_failure)?;
                 let (preserved, holes) = preserved.map(|t| (t.fds, t.holes)).unwrap_or_default();
                 let size = cli::attach::terminal_size()
                     .filter(|_| tty)
@@ -765,23 +767,25 @@ pub(super) fn run_container_command(
                 exit_with(code);
             }
             // (the output as it comes, as podman shows it)
-            let result = client.exec_container(
-                &container,
-                &client::ExecParams {
-                    command,
-                    env,
-                    working_dir: workdir,
-                    user,
-                    tty,
-                    privileged,
-                    stdin: false,
-                    detach_keys: None,
-                    timeout,
-                    detach,
-                },
-                &mut std::io::stdout().lock(),
-                &mut std::io::stderr().lock(),
-            )?;
+            let result = client
+                .exec_container(
+                    &container,
+                    &client::ExecParams {
+                        command,
+                        env,
+                        working_dir: workdir,
+                        user,
+                        tty,
+                        privileged,
+                        stdin: false,
+                        detach_keys: None,
+                        timeout,
+                        detach,
+                    },
+                    &mut std::io::stdout().lock(),
+                    &mut std::io::stderr().lock(),
+                )
+                .map_err(cli::run::exec_failure)?;
             if detach {
                 println!("{}", result.session_id);
             }
