@@ -758,25 +758,36 @@ impl ImageService {
                 media_type: "application/octet-stream".into(),
                 annotations: None,
             };
-            let got = velarx_content::idle::within(link.idle, async {
-                link.conn
-                    .open(velarx_content::fetcher::fetch_client::Scoping::bare(
-                        link.idle,
-                    ))
-                    .await?;
-                link.conn.get_blob(&blob).await
-            })
-            .await;
-            let Ok(file) = got else {
-                continue;
+            // (a piece or a manifest of a checkpoint: small, and decrypted
+            // whole)
+            let Ok(file) = rustix::fs::memfd_create("blob", rustix::fs::MemfdFlags::CLOEXEC)
+                .map(std::fs::File::from)
+            else {
+                return None;
             };
-            let read = tokio::task::spawn_blocking(move || {
-                velarx_base::sealed::read_sealed_whole(&file, size).map_err(std::io::Error::other)
-            })
+            let asked = async {
+                let scope = velarx_content::fetcher::fetch_client::Scoping::bare(link.idle);
+                velarx_content::idle::within(link.idle, link.conn.open(scope)).await?;
+                velarx_content::idle::writing(link.idle, &file, link.conn.get_blob(&blob, &file))
+                    .await
+            }
             .await;
-            if let Ok(Ok(bytes)) = read {
-                if bytes.len() as u64 == size && Digest::of(digest.alg(), &bytes) == *digest {
-                    return Some(bytes);
+            if asked.is_ok() {
+                let read = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+                    use std::os::unix::fs::FileExt;
+                    if file.metadata()?.len() != size {
+                        return Err(std::io::Error::other("another size"));
+                    }
+                    let mut bytes =
+                        vec![0u8; usize::try_from(size).map_err(std::io::Error::other)?];
+                    file.read_exact_at(&mut bytes, 0)?;
+                    Ok(bytes)
+                })
+                .await;
+                if let Ok(Ok(bytes)) = read {
+                    if Digest::of(digest.alg(), &bytes) == *digest {
+                        return Some(bytes);
+                    }
                 }
             }
             debug!("The fetcher {}: {name} is not what it says", link.name);

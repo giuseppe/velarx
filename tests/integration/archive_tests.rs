@@ -593,8 +593,9 @@ impl velarx_content::serve_fetch::StagingFetcher for ArchiveTransport {
         &self,
         scope: &velarx_content::serve_fetch::Scope,
         blob: &velarx_content::fetcher::fetch::Blob,
-    ) -> Result<std::fs::File, velarx_content::fetcher::fetch::FetcherError> {
-        self.inner.get_blob(&self.scope(scope), blob).await
+        file: std::fs::File,
+    ) -> Result<(), velarx_content::fetcher::fetch::FetcherError> {
+        self.inner.get_blob(&self.scope(scope), blob, file).await
     }
 
     async fn unpack(

@@ -97,6 +97,99 @@ pub async fn beating<T, F: std::future::Future>(
     }
 }
 
+/// The file of a `GetBlob` while the blob is written into it: the size and
+/// the digest the descriptor says are checked as the bytes go, so that a
+/// fetcher streams a blob of any size and holds none of it.  Whole blocks
+/// of zeros are holes of the file.
+pub struct BlobFile {
+    file: Arc<File>,
+    out: velarx_storage::SparseWriter<Arc<File>>,
+    hasher: velarx_types::digest::DigestWriter,
+    digest: velarx_types::digest::Digest,
+    size: u64,
+    written: u64,
+}
+
+/// How often [`BlobFile`] gives the file the length of what it was given.
+const LENGTHENED: u64 = 1 << 20;
+
+impl BlobFile {
+    pub fn new(file: File, blob: &Blob) -> Result<Self, FetcherError> {
+        let digest: velarx_types::digest::Digest =
+            blob.digest
+                .parse()
+                .map_err(|_| FetcherError::InvalidArgument {
+                    reason: "not the digest of a blob".into(),
+                })?;
+        let file = Arc::new(file);
+        Ok(Self {
+            out: velarx_storage::SparseWriter::new(file.clone()),
+            file,
+            hasher: velarx_types::digest::DigestWriter::for_digest(&digest),
+            digest,
+            size: blob.size,
+            written: 0,
+        })
+    }
+
+    /// The next bytes of the blob; more than its size is an error.
+    pub fn write(&mut self, data: &[u8]) -> Result<(), FetcherError> {
+        let before = self.written;
+        self.written += data.len() as u64;
+        if self.written > self.size {
+            return Err(FetcherError::invalid(format!(
+                "the blob {} is longer than the {} bytes of its descriptor",
+                self.digest, self.size
+            )));
+        }
+        self.hasher.update(data);
+        self.out.write(data).map_err(write_error)?;
+        // (a hole does not lengthen the file, and the engine sees the
+        // progress of a call by its length: a long run of zeros is not a
+        // fetcher that stopped)
+        // (the bytes up to the block in progress are written or holes)
+        if self.written / LENGTHENED != before / LENGTHENED {
+            let whole = self.written - self.written % velarx_storage::HOLE_BLOCK as u64;
+            self.file.set_len(whole).map_err(write_error)?;
+        }
+        Ok(())
+    }
+
+    /// The blob is complete: it has all its bytes and its digest.
+    pub fn finish(self) -> Result<(), FetcherError> {
+        if self.written != self.size {
+            return Err(FetcherError::invalid(format!(
+                "the blob {} has {} bytes, the descriptor says {}",
+                self.digest, self.written, self.size
+            )));
+        }
+        self.out.finish().map_err(write_error)?;
+        let got = self.hasher.finalize();
+        if got != self.digest {
+            return Err(FetcherError::invalid(format!(
+                "the blob {} has the digest {got}",
+                self.digest
+            )));
+        }
+        Ok(())
+    }
+
+    /// A blob a fetcher has in memory (its items are small), written whole.
+    pub fn put(file: File, blob: &Blob, bytes: &[u8]) -> Result<(), FetcherError> {
+        let mut out = Self::new(file, blob)?;
+        out.write(bytes)?;
+        out.finish()
+    }
+}
+
+/// A write of a [`BlobFile`] that failed.
+fn write_error(e: std::io::Error) -> FetcherError {
+    match e.raw_os_error() {
+        Some(libc::ENOSPC) => FetcherError::no_space(e.to_string()),
+        _ => FetcherError::failed(e.to_string()),
+    }
+}
+
 /// What `Layer` told of a layer.
 pub struct LayerScope {
     /// The digest of the layer's blob, which names it
@@ -250,8 +343,11 @@ pub trait StagingFetcher: Send + Sync + 'static {
         )))
     }
 
-    /// A small blob: its bytes, as many as the descriptor says.
-    async fn get_blob(&self, _scope: &Scope, blob: &Blob) -> Result<File, FetcherError> {
+    /// The blob the descriptor names, written from the start of `file`
+    /// (empty, open for writing, the engine's): exactly the bytes the
+    /// descriptor says, of its digest.  A fetcher streams it through a
+    /// [`BlobFile`]; it never holds the blob.
+    async fn get_blob(&self, _scope: &Scope, blob: &Blob, _file: File) -> Result<(), FetcherError> {
         Err(FetcherError::unavailable(format!(
             "{}: nobody has it",
             blob.digest
@@ -1164,28 +1260,31 @@ mod service {
             }
         }
 
-        /// A small blob (a configuration), its bytes in `file`, a sealed
-        /// memory file in the reply, which the engine hashes.
-        #[zlink(return_fds)]
-        pub async fn get_blob(&self, blob: Blob) -> (Result<Item, FetcherError>, Vec<OwnedFd>) {
-            let scope = match self.scope() {
-                Ok(s) if blob.size > 0 => s,
-                Ok(_) => {
-                    return (Err(maximum()), Vec::new());
-                }
-                Err(e) => return (Err(e), Vec::new()),
-            };
+        /// A blob, its bytes written into `file`, a file with no name the
+        /// engine made, open for writing, among the descriptors of the call:
+        /// exactly `blob.size` bytes of the digest, which the fetcher checks as it
+        /// writes and the engine checks again.  Nothing holds the blob in
+        /// memory.
+        pub async fn get_blob(
+            &self,
+            #[zlink(fds)] fds: Vec<OwnedFd>,
+            blob: Blob,
+            file: u32,
+        ) -> Result<Ack, FetcherError> {
+            let scope = self.scope()?;
+            let mut fds = Descriptors::new(fds);
+            let file = File::from(
+                fds.take("the file of the blob", file)
+                    .map_err(FetcherScope::invalid)?,
+            );
+            fds.finish().map_err(FetcherScope::invalid)?;
             let api = self.api.clone();
-            let got = owned(
-                &self.runtime,
-                async move { api.get_blob(&scope, &blob).await },
-            )
+            owned(&self.runtime, async move {
+                api.get_blob(&scope, &blob, file).await
+            })
             .await
-            .unwrap_or_else(|e| Err(stopped(e)));
-            match got {
-                Ok(file) => (Ok(Item { file: 0 }), vec![file.into()]),
-                Err(e) => (Err(e), Vec::new()),
-            }
+            .unwrap_or_else(|e| Err(stopped(e)))?;
+            Ok(Ack {})
         }
 
         /// The startup profile of the image `image` (its id): digests of
@@ -2284,6 +2383,118 @@ mod tests {
         assert!(!text.contains("[`"), "a rustdoc link in the definition");
     }
 
+    /// A fetcher that has one blob.
+    struct Has(Vec<u8>);
+
+    #[async_trait]
+    impl StagingFetcher for Has {
+        fn described(&self) -> Described {
+            Described {
+                name: "has".into(),
+                capabilities: vec!["objects".into()],
+                max_objects: 4,
+            }
+        }
+
+        async fn get_blob(&self, _: &Scope, blob: &Blob, file: File) -> Result<(), FetcherError> {
+            // (in pieces: no more than a piece is ever held)
+            let mut out = BlobFile::new(file, blob)?;
+            for piece in self.0.chunks(3) {
+                out.write(piece)?;
+            }
+            out.finish()
+        }
+    }
+
+    fn described_blob(bytes: &[u8]) -> Blob {
+        Blob {
+            digest: velarx_types::digest::Digest::of(
+                velarx_types::digest::Algorithm::Sha256,
+                bytes,
+            )
+            .to_string(),
+            size: bytes.len() as u64,
+            media_type: "application/octet-stream".into(),
+            annotations: None,
+        }
+    }
+
+    /// `GetBlob` writes the blob into the file the call carries: the reply
+    /// has no bytes, and the file has them all.
+    #[tokio::test]
+    async fn a_blob_is_written_into_the_file_of_the_call() {
+        use std::os::unix::fs::FileExt;
+        let e = FetchEndpoint::new(Arc::new(Has(b"0123456789".to_vec())));
+        open(&e).await.unwrap();
+        let file = tempfile::tempfile().unwrap();
+        let sent = vec![OwnedFd::from(file.try_clone().unwrap())];
+        e.get_blob(sent, described_blob(b"0123456789"), 0)
+            .await
+            .unwrap();
+        let mut got = vec![0u8; 10];
+        file.read_exact_at(&mut got, 0).unwrap();
+        assert_eq!(got, b"0123456789");
+        // (a file the call does not carry, and a descriptor nobody names)
+        let none = e
+            .get_blob(Vec::new(), described_blob(b"0123456789"), 0)
+            .await;
+        assert!(matches!(none, Err(FetcherError::InvalidArgument { .. })));
+        let extra = vec![dir(), dir()];
+        let extra = e.get_blob(extra, described_blob(b"0123456789"), 0).await;
+        assert!(matches!(extra, Err(FetcherError::InvalidArgument { .. })));
+    }
+
+    /// What does not have the size or the digest of its descriptor is
+    /// `invalid`, as the bytes go, not at the end of a copy.
+    #[test]
+    fn a_blob_file_checks_size_and_digest_as_it_is_written() {
+        let blob = described_blob(b"abcdef");
+        let invalid = |e: FetcherError| e.failure().unwrap().class == FailureClass::Invalid;
+        let file = || tempfile::tempfile().unwrap();
+        BlobFile::put(file(), &blob, b"abcdef").unwrap();
+        assert!(invalid(
+            BlobFile::put(file(), &blob, b"abcdefg").unwrap_err()
+        ));
+        assert!(invalid(BlobFile::put(file(), &blob, b"abcde").unwrap_err()));
+        assert!(invalid(
+            BlobFile::put(file(), &blob, b"abcdeX").unwrap_err()
+        ));
+        // (the first byte past the size is refused, without waiting for the end)
+        let mut out = BlobFile::new(file(), &blob).unwrap();
+        out.write(b"abcdef").unwrap();
+        assert!(invalid(out.write(b"g").unwrap_err()));
+    }
+
+    /// The zeros of a blob are holes of its file, and the file grows
+    /// through them as they are given (the engine sees the progress of a
+    /// call by its length).
+    #[test]
+    fn the_zeros_of_a_blob_are_holes_and_the_file_grows() {
+        use std::os::unix::fs::MetadataExt;
+        let mut data = vec![7u8; 100];
+        data.extend(vec![0u8; 4 << 20]);
+        data.extend(b"end");
+        let blob = described_blob(&data);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut out = BlobFile::new(file.try_clone().unwrap(), &blob).unwrap();
+        let (head, tail) = data.split_at(3 << 20);
+        for piece in head.chunks(1000) {
+            out.write(piece).unwrap();
+        }
+        let len = file.metadata().unwrap().len();
+        assert!(len >= (3 << 20) - (1 << 20), "{len}");
+        for piece in tail.chunks(1000) {
+            out.write(piece).unwrap();
+        }
+        out.finish().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        // (two blocks of data at most, where the file system has holes)
+        let blocks = file.metadata().unwrap().blocks();
+        assert!(blocks <= 64, "{blocks} blocks of 512 bytes");
+    }
+
     #[tokio::test]
     async fn a_connection_has_a_scope_once_and_only_then() {
         let e = endpoint();
@@ -2487,8 +2698,8 @@ mod tests {
         // an item: nobody has it
         let got = e.get_manifest("latest".into(), 100).await;
         assert!(matches!(got.0, Err(FetcherError::Failed { .. })));
-        let got = e.get_blob(blob("sha256:aa")).await;
-        assert!(matches!(got.0, Err(FetcherError::Failed { .. })));
+        let got = e.get_blob(vec![dir()], blob("sha256:aa"), 0).await;
+        assert!(matches!(got, Err(FetcherError::Failed { .. })));
         let got = e.get_profile("sha256:aa".into(), 100).await;
         assert!(matches!(got.0, Err(FetcherError::Failed { .. })));
         let got = e.get_signatures("a/b:c".into(), 100).await;

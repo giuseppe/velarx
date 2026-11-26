@@ -452,8 +452,31 @@ impl OriginNet {
         }
     }
 
-    /// A small blob of `size` bytes (its descriptor's); the caller checks
-    /// its digest.
+    /// The blob, written into `file` (empty, the engine's, open for
+    /// reading and writing) by the first source that has it, and measured:
+    /// its size and its digest are the descriptor's.
+    pub async fn blob_into(&self, blob: &Blob, file: &std::fs::File) -> ImageResult<()> {
+        let mut got = Err(Self::unlisted(&blob.digest));
+        for source in &self.sources {
+            match source {
+                Source::Registry => {
+                    got = self.registry_blob(blob, file).await;
+                    if got.is_ok() {
+                        break;
+                    }
+                }
+                Source::Fetchers(fetchers) => {
+                    if fetchers.blob(blob, file).await {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        got
+    }
+
+    /// A small blob (a configuration): its bytes, of the size of its
+    /// descriptor and of its digest.
     pub async fn small_blob(&self, blob: &Blob, limit: u64) -> ImageResult<Bytes> {
         if blob.size > limit {
             return Err(ImageError::transfer_of(
@@ -463,30 +486,24 @@ impl OriginNet {
                 "the blob is too large",
             ));
         }
-        let mut got = Err(Self::unlisted(&blob.digest));
-        for source in &self.sources {
-            match source {
-                Source::Registry => {
-                    got = self.registry_blob(blob).await;
-                    if got.is_ok() {
-                        break;
-                    }
-                }
-                Source::Fetchers(fetchers) => {
-                    if let Some(bytes) = fetchers.blob(blob).await {
-                        return Ok(bytes);
-                    }
-                }
-            }
-        }
-        got
+        let file = rustix::fs::memfd_create("blob", rustix::fs::MemfdFlags::CLOEXEC)
+            .map(std::fs::File::from)
+            .map_err(|e| ImageError::Io(e.into()))?;
+        self.blob_into(blob, &file).await?;
+        Ok(Bytes::from(written_bytes(
+            &file,
+            blob.size,
+            limit,
+            &blob.digest,
+        )?))
     }
 
-    async fn registry_blob(&self, blob: &Blob) -> ImageResult<Bytes> {
+    async fn registry_blob(&self, blob: &Blob, file: &std::fs::File) -> ImageResult<()> {
         let mut slot = self.conn.lock().await;
         let conn = self.scoped(&mut slot).await?;
-        let got = conn.get_blob(blob).await;
-        let file = self.answered(&mut slot, got)?.ok_or_else(|| {
+        reset(file)?;
+        let got = conn.get_blob(blob, file).await;
+        self.answered(&mut slot, got)?.ok_or_else(|| {
             ImageError::transfer_of(
                 self.party(),
                 blob.digest.clone(),
@@ -498,13 +515,53 @@ impl OriginNet {
                 },
             )
         })?;
-        Ok(Bytes::from(sealed_bytes(
-            self.party(),
-            &file,
-            blob.size,
-            &blob.digest,
-        )?))
+        measure(self.party(), blob, file).await
     }
+}
+
+/// `file` empty and at its start, for a source to write the blob into.
+fn reset(file: &std::fs::File) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    file.set_len(0)?;
+    (&*file).seek(SeekFrom::Start(0)).map(|_| ())
+}
+
+/// That `file`, which `party` wrote, is the blob `blob` describes: it has
+/// its size and its digest.  Read in pieces, so that no blob is in memory.
+async fn measure(party: &str, blob: &Blob, file: &std::fs::File) -> ImageResult<()> {
+    let invalid = |what: String| {
+        ImageError::transfer_of(party, blob.digest.clone(), FailureClass::Invalid, what)
+    };
+    let digest: Digest = blob
+        .digest
+        .parse()
+        .map_err(|_| invalid("not the digest of a blob".into()))?;
+    let (file, size) = (file.try_clone()?, blob.size);
+    let (length, got) = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+        use std::os::unix::fs::FileExt;
+        let mut hasher = velarx_types::digest::DigestWriter::for_digest(&digest);
+        let mut buf = vec![0u8; 1 << 20];
+        let mut at = 0u64;
+        loop {
+            let n = file.read_at(&mut buf, at)?;
+            if n == 0 {
+                return Ok((at, (hasher.finalize(), digest)));
+            }
+            hasher.update(&buf[..n]);
+            at += n as u64;
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    if length != size {
+        return Err(invalid(format!(
+            "{length} bytes, the descriptor says {size}"
+        )));
+    }
+    if got.0 != got.1 {
+        return Err(invalid(format!("the digest of what it sent is {}", got.0)));
+    }
+    Ok(())
 }
 
 /// The bytes of a file the fetcher wrote (not sealed: the engine made it and
@@ -600,20 +657,25 @@ impl MetadataSources {
         SignedRecord::merged(records)
     }
 
-    /// The blob `blob` names, of exactly its size, from the first fetcher
-    /// that has it.
-    pub async fn blob(&self, blob: &Blob) -> Option<Bytes> {
-        let digest: Digest = blob.digest.parse().ok()?;
+    /// The blob `blob` names, written into `file` by the first fetcher that
+    /// has it with its size and digest.
+    pub async fn blob(&self, blob: &Blob, file: &std::fs::File) -> bool {
         let mut links = self.links.lock().await;
         for link in links.iter_mut() {
-            let got = crate::idle::within(link.idle, link.conn.get_blob(blob)).await;
-            if let Some(bytes) = checked(&link.name, &digest, got.ok(), blob.size)
-                .filter(|b| b.len() as u64 == blob.size)
-            {
-                return Some(bytes);
+            if reset(file).is_err() {
+                return false;
             }
+            let got = crate::idle::writing(link.idle, file, link.conn.get_blob(blob, file)).await;
+            if got.is_ok() && measure(&link.name, blob, file).await.is_ok() {
+                return true;
+            }
+            tracing::debug!(
+                "The fetcher {}: {} is not what it says",
+                link.name,
+                blob.digest
+            );
         }
-        None
+        false
     }
 }
 
@@ -816,20 +878,21 @@ mod tests {
             media_type: "x".into(),
             annotations: None,
         };
-        assert!(sources.blob(&blob).await.is_some());
+        let file = tempfile::tempfile().unwrap();
+        assert!(sources.blob(&blob, &file).await);
         // (a descriptor that says another size is not the blob sent)
         let bigger = Blob {
             size: blob.size + 1,
             ..blob.clone()
         };
-        assert!(sources.blob(&bigger).await.is_none());
+        assert!(!sources.blob(&bigger, &file).await);
         let wrong = Digest::of(velarx_types::digest::Algorithm::Sha256, b"other");
         assert!(sources.manifest(&wrong).await.is_none());
         let other = Blob {
             digest: wrong.to_string(),
             ..blob
         };
-        assert!(sources.blob(&other).await.is_none());
+        assert!(!sources.blob(&other, &file).await);
     }
 
     /// The refusals and the absences the fetcher tells keep their class: the

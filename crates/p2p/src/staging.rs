@@ -30,7 +30,9 @@ use velarx_content::fetcher::fetch::{
     Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, Parts, SignedRecord,
     Urgency,
 };
-use velarx_content::serve_fetch::{Described, FetchCall, LayerScope, Out, Scope, StagingFetcher};
+use velarx_content::serve_fetch::{
+    BlobFile, Described, FetchCall, LayerScope, Out, Scope, StagingFetcher,
+};
 use velarx_content::stager::{self, name_of, LayerToc, Name, Unnamed};
 use velarx_storage::Toc;
 use velarx_types::digest::{Algorithm, Digest};
@@ -494,7 +496,12 @@ impl StagingFetcher for PeerSource {
 
     /// A blob by its digest, of exactly the bytes its descriptor says (a
     /// piece of a shared checkpoint).
-    async fn get_blob(&self, _scope: &Scope, blob: &Blob) -> Result<std::fs::File, FetcherError> {
+    async fn get_blob(
+        &self,
+        _scope: &Scope,
+        blob: &Blob,
+        file: std::fs::File,
+    ) -> Result<(), FetcherError> {
         let mut one = One(None);
         let item = [Item {
             digest: blob.digest.clone(),
@@ -505,7 +512,14 @@ impl StagingFetcher for PeerSource {
                 .await
                 .map_err(failed)?;
         }
-        self.given(one, &blob.digest).await
+        // (a peer gives at most an item: the bytes are small)
+        let Some(bytes) = one.0 else {
+            return Err(FetcherError::unavailable(
+                self.nobody(&format!("{}: no peer has it", blob.digest))
+                    .await,
+            ));
+        };
+        BlobFile::put(file, blob, &bytes)
     }
 
     /// The table of contents and tar-split of the zstd:chunked layers whose

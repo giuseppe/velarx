@@ -286,9 +286,12 @@ method Forget(layer: string) -> ()
 # engine hashes it.
 method GetManifest(reference: string, max: int) -> (file: int, media_type: ?string)
 
-# A small blob (a configuration), its bytes in `file`, a sealed
-# memory file in the reply, which the engine hashes.
-method GetBlob(blob: Blob) -> (file: int)
+# A blob, its bytes written into `file`, a file with no name the
+# engine made, open for writing, among the descriptors of the call:
+# exactly `blob.size` bytes of the digest, which the fetcher checks as it
+# writes and the engine checks again.  Nothing holds the blob in
+# memory.
+method GetBlob(blob: Blob, file: int) -> ()
 
 # The startup profile of the image `image` (its id): digests of
 # files, one a line, in the order the image read them, at most
@@ -352,7 +355,7 @@ error Refused (reason: string)
 # A word of `requires` that is not known
 error NotSupported (feature: string)
 
-# The answer of a `GetManifest`, `GetBlob` or `GetProfile` is larger
+# The answer of a `GetManifest` or `GetProfile` is larger
 # than `max`
 error TooLarge (max: int)
 

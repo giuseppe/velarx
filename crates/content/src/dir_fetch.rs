@@ -19,7 +19,7 @@ use crate::fetcher::fetch::{
     Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, NotLazy, Parts,
     Probed, TocSource,
 };
-use crate::serve_fetch::{Described, FetchCall, LayerScope, Out, Scope, StagingFetcher};
+use crate::serve_fetch::{BlobFile, Described, FetchCall, LayerScope, Out, Scope, StagingFetcher};
 use crate::stager::{self, content_of, name_of, LayerToc, Unnamed};
 use async_trait::async_trait;
 use std::io::Read;
@@ -39,6 +39,21 @@ pub trait Items: Send + Sync {
     /// `size` of them (none: at most `max`).
     fn item(&self, name: &str, size: Option<u64>, max: u64) -> Option<Vec<u8>>;
 
+    /// The item `name` of exactly `size` bytes, given to `sink` in order;
+    /// false when this source has not got it.  An item is as large as a
+    /// chunk: a source whose items are larger streams them.
+    fn copy(
+        &self,
+        name: &str,
+        size: u64,
+        sink: &mut dyn FnMut(&[u8]) -> Result<(), FetcherError>,
+    ) -> Result<bool, FetcherError> {
+        match self.item(name, Some(size), MAX_ITEM) {
+            Some(data) => sink(&data).map(|()| true),
+            None => Ok(false),
+        }
+    }
+
     /// The index of the layer of the blob `layer` (`pull::index`): its table
     /// and tar-split, when this source keeps one.
     fn index(&self, _layer: &str) -> Option<Vec<u8>> {
@@ -49,12 +64,13 @@ pub trait Items: Send + Sync {
 /// A directory of files named by the digest of their content (or its hex).
 pub struct Dir(pub PathBuf);
 
-impl Items for Dir {
-    fn item(&self, name: &str, size: Option<u64>, max: u64) -> Option<Vec<u8>> {
+impl Dir {
+    /// The file of the item `name`, and its length.
+    fn open(&self, name: &str) -> Option<(std::fs::File, u64)> {
         // (only the hash of content names a file here; a FIFO is not waited
         // for)
         let digest: Digest = name.parse().ok()?;
-        let (file, len) = [digest.hex().to_string(), digest.to_string()]
+        [digest.hex().to_string(), digest.to_string()]
             .into_iter()
             .find_map(|name| {
                 let file = std::fs::OpenOptions::new()
@@ -64,7 +80,13 @@ impl Items for Dir {
                     .ok()?;
                 let meta = file.metadata().ok()?;
                 meta.is_file().then_some((file, meta.len()))
-            })?;
+            })
+    }
+}
+
+impl Items for Dir {
+    fn item(&self, name: &str, size: Option<u64>, max: u64) -> Option<Vec<u8>> {
+        let (file, len) = self.open(name)?;
         if size.is_some_and(|s| s != len) || len > max {
             return None;
         }
@@ -75,6 +97,28 @@ impl Items for Dir {
             .read_to_end(&mut data)
             .ok()?;
         (data.len() as u64 == len).then_some(data)
+    }
+
+    fn copy(
+        &self,
+        name: &str,
+        size: u64,
+        sink: &mut dyn FnMut(&[u8]) -> Result<(), FetcherError>,
+    ) -> Result<bool, FetcherError> {
+        let Some((file, len)) = self.open(name).filter(|(_, len)| *len == size) else {
+            return Ok(false);
+        };
+        let mut from = file.take(len);
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = from
+                .read(&mut buf)
+                .map_err(|e| FetcherError::failed(e.to_string()))?;
+            if n == 0 {
+                return Ok(true);
+            }
+            sink(&buf[..n])?;
+        }
     }
 }
 
@@ -256,9 +300,25 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
     }
 
     /// A blob of exactly the bytes its descriptor says, by its digest.
-    async fn get_blob(&self, _scope: &Scope, blob: &Blob) -> Result<std::fs::File, FetcherError> {
-        self.item_file(&blob.digest, Some(blob.size), blob.size)
-            .await
+    async fn get_blob(
+        &self,
+        _scope: &Scope,
+        blob: &Blob,
+        file: std::fs::File,
+    ) -> Result<(), FetcherError> {
+        let (items, wanted) = (self.items.clone(), blob.clone());
+        tokio::task::spawn_blocking(move || {
+            let mut out = BlobFile::new(file, &wanted)?;
+            if !items.copy(&wanted.digest, wanted.size, &mut |data| out.write(data))? {
+                return Err(FetcherError::unavailable(format!(
+                    "{}: not here",
+                    wanted.digest
+                )));
+            }
+            out.finish()
+        })
+        .await
+        .map_err(|e| FetcherError::failed(e.to_string()))?
     }
 
     /// The startup profile of an image.
@@ -345,6 +405,65 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A blob larger than an item is written into the file of `GetBlob` in
+    /// pieces: a source that holds an item in memory has none of that size
+    /// (`item` is bounded by `MAX_ITEM`), the directory streams it.
+    #[tokio::test]
+    async fn a_blob_larger_than_an_item_is_streamed() {
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let piece = vec![7u8; 1 << 20];
+        let pieces = (MAX_ITEM >> 20) + 2;
+        let mut hasher =
+            velarx_types::digest::DigestWriter::new(velarx_types::digest::Algorithm::Sha256);
+        let mut stored = std::fs::File::create(dir.path().join("blob")).unwrap();
+        for _ in 0..pieces {
+            hasher.update(&piece);
+            stored.write_all(&piece).unwrap();
+        }
+        let digest = hasher.finalize();
+        std::fs::rename(dir.path().join("blob"), dir.path().join(digest.hex())).unwrap();
+        let size = pieces << 20;
+        assert!(size > MAX_ITEM);
+        let blob = Blob {
+            digest: digest.to_string(),
+            size,
+            media_type: "application/octet-stream".into(),
+            annotations: None,
+        };
+        let fetcher = DirFetch::new("dir", dir.path());
+        let scope = Scope {
+            verity: false,
+            source: None,
+            tls_verify: None,
+            target: None,
+            access: None,
+            idle: std::time::Duration::from_secs(30),
+            kept: Arc::default(),
+        };
+        let file = tempfile::tempfile().unwrap();
+        fetcher
+            .get_blob(&scope, &blob, file.try_clone().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(file.metadata().unwrap().len(), size);
+        let mut tail = [0u8; 4];
+        file.read_exact_at(&mut tail, size - 4).unwrap();
+        assert_eq!(tail, [7; 4]);
+        // (a blob that is not here is `unavailable`, with the file untouched)
+        let other = Blob {
+            digest: crate::sha256(b"nothing").to_string(),
+            ..blob
+        };
+        let empty = tempfile::tempfile().unwrap();
+        let got = fetcher
+            .get_blob(&scope, &other, empty.try_clone().unwrap())
+            .await;
+        assert!(matches!(got, Err(FetcherError::Failed { .. })));
+        assert_eq!(empty.metadata().unwrap().len(), 0);
+    }
 
     /// A file of a sha512 layer is staged from the items of its chunks,
     /// asked by their sha512 digests.

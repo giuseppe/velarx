@@ -2,8 +2,8 @@
 //! The registry as a fetcher: what `velarx-registry` serves, and
 //! what a process that pulls runs in itself over a socket pair.
 //!
-//! * `GetManifest`, `GetBlob`: a manifest by a tag or a digest, a small blob
-//!   (a configuration) by its digest.
+//! * `GetManifest`, `GetBlob`: a manifest by a tag or a digest, a blob by its
+//!   digest, written into the file the engine hands over as it arrives.
 //! * `Probe`: for each blob the call carries, whether it has a table of
 //!   contents (zstd:chunked, by the annotations of its descriptor); when it has, the table and
 //!   the tar-split come back in sealed memory files, so that the engine
@@ -38,7 +38,7 @@ use velarx_content::pull::chunked::{
 };
 use velarx_content::pull::ranges::{self, Piece, RangesError};
 use velarx_content::serve_fetch::{
-    Described, FetchCall, Gone, LayerScope, Out, Scope, StagingFetcher, UnpackCall,
+    BlobFile, Described, FetchCall, Gone, LayerScope, Out, Scope, StagingFetcher, UnpackCall,
 };
 use velarx_content::stager::{
     content_of, in_memory, name_of, staged, LayerToc, Name, StageError, Unnamed,
@@ -1006,19 +1006,24 @@ impl StagingFetcher for RegistryFetch {
 
     // (`blob.size` is the size of the descriptor: a blob of another size is
     // not the one asked for)
-    async fn get_blob(&self, scope: &Scope, blob: &Blob) -> Result<File, FetcherError> {
+    async fn get_blob(&self, scope: &Scope, blob: &Blob, file: File) -> Result<(), FetcherError> {
         let (pool, _) = self.pool(scope)?;
         let digest: Digest = blob
             .digest
             .parse()
             .map_err(|_| bad("not the digest of a blob"))?;
-        let size = i64::try_from(blob.size).map_err(|_| bad("a size"))?;
-        let bytes = pool
-            .small_blob(&digest, size, blob.size)
-            .await
-            .map_err(refused)?;
-        let fd = velarx_base::sealed::sealed_memory(&bytes).map_err(failed)?;
-        Ok(fd.into())
+        let mut out = BlobFile::new(file, blob)?;
+        let mut wrong = None;
+        let got = pool
+            .blob(&digest, blob.size, &mut |data| {
+                out.write(data).map_err(|e| {
+                    wrong = Some(e);
+                    std::io::Error::other("the blob is not what was asked for")
+                })
+            })
+            .await;
+        got.map_err(|e| wrong.take().unwrap_or_else(|| refused(e)))?;
+        out.finish()
     }
 
     fn registry(&self) -> Option<Arc<dyn velarx_content::serve_registry::RegistryCalls>> {
@@ -1526,6 +1531,92 @@ mod tests {
                 .is_err()
         );
         assert_eq!(unnamed(&root), 0);
+    }
+
+    /// `GetBlob` of a blob described as `size` bytes of the digest of
+    /// `blob`, from a worker that sends `frames`: what it answered, and
+    /// what it wrote into the file.
+    async fn get_blob_of(
+        blob: &[u8],
+        size: u64,
+        frames: Vec<Vec<u8>>,
+    ) -> (Result<(), FetcherError>, Vec<u8>) {
+        use crate::net::proto::{write_data, write_frame, Kind};
+        let pool = crate::net::pool::tests::pool_with(move |mut w| async move {
+            let mut at = 0;
+            for frame in frames {
+                write_data(&mut w, Kind::Data, &[], 0, at, &frame)
+                    .await
+                    .unwrap();
+                at += frame.len() as u64;
+            }
+            write_frame(&mut w, Kind::Reply, b"{}", &[]).await.unwrap();
+        })
+        .await;
+        let fetch = RegistryFetch::new(
+            crate::registry::pool_tests::service(),
+            Arc::new(OwnedFd::from(File::open("/").unwrap())),
+        );
+        let scope = Scope {
+            verity: false,
+            source: Some("registry.invalid/r/app".into()),
+            tls_verify: None,
+            target: None,
+            access: None,
+            idle: std::time::Duration::from_secs(1),
+            kept: Arc::default(),
+        };
+        scope.kept.lock().unwrap().insert(
+            WORKERS.into(),
+            Arc::new(Workers {
+                access: None,
+                pool,
+                host: "registry.invalid".into(),
+            }),
+        );
+        let described = Blob {
+            digest: Digest::of(velarx_types::digest::Algorithm::Sha256, blob).to_string(),
+            size,
+            media_type: "application/octet-stream".into(),
+            annotations: None,
+        };
+        let file = tempfile::tempfile().unwrap();
+        let got = fetch
+            .get_blob(&scope, &described, file.try_clone().unwrap())
+            .await;
+        // (written at their offsets: the file is still at its start)
+        let mut written = Vec::new();
+        std::io::Read::read_to_end(&mut &file, &mut written).unwrap();
+        (got, written)
+    }
+
+    /// `GetBlob` writes the blob into the file of the call as its frames
+    /// come (more than one: it is not one piece held in memory); another
+    /// size or digest is `invalid`.
+    #[tokio::test]
+    async fn a_blob_is_written_into_the_file_as_it_comes() {
+        let invalid = |got: Result<(), FetcherError>| {
+            got.unwrap_err().failure().unwrap().class
+                == velarx_proto::transfer::FailureClass::Invalid
+        };
+        let blob: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8 + 1).collect();
+        let frames: Vec<Vec<u8>> = blob.chunks(65536).map(<[u8]>::to_vec).collect();
+        assert!(frames.len() > 1);
+        let (got, written) = get_blob_of(&blob, blob.len() as u64, frames.clone()).await;
+        got.unwrap();
+        assert_eq!(written, blob);
+        // (other bytes of the same size, and a blob longer than its
+        // descriptor)
+        let mut other = frames.clone();
+        other[1][7] ^= 1;
+        let (got, _) = get_blob_of(&blob, blob.len() as u64, other).await;
+        assert!(invalid(got));
+        let mut longer = frames.clone();
+        longer.push(b"more".to_vec());
+        let (got, _) = get_blob_of(&blob, blob.len() as u64, longer).await;
+        assert!(got.is_err());
+        let (got, _) = get_blob_of(&blob, blob.len() as u64, frames[..2].to_vec()).await;
+        assert!(got.is_err());
     }
 
     /// The table of contents of a zstd:chunked layer is found through the

@@ -1783,9 +1783,15 @@ pub async fn blob_from(socket: &std::path::Path, digest: &str, size: u64) -> Opt
         media_type: "application/octet-stream".into(),
         annotations: None,
     };
-    let file = conn.get_blob(&blob).await.ok()?;
+    let file = tempfile::tempfile().ok()?;
+    conn.get_blob(&blob, &file).await.ok()?;
     let length = file.metadata().ok()?.len();
-    velarx_base::sealed::read_sealed(&file, length, size).ok()
+    if length != size {
+        return None;
+    }
+    let mut bytes = vec![0u8; length as usize];
+    std::os::unix::fs::FileExt::read_exact_at(&file, &mut bytes, 0).ok()?;
+    Some(bytes)
 }
 
 /// The startup profile of `image` (at most `max` bytes) from the fetcher on

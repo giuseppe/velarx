@@ -133,10 +133,11 @@ impl StagingFetcher for Metadata {
         &self,
         _scope: &Scope,
         _blob: &crate::fetcher::fetch::Blob,
-    ) -> Result<std::fs::File, FetcherError> {
-        let file = velarx_base::sealed::sealed_memory(&self.0)
-            .map_err(|e| FetcherError::failed(e.to_string()))?;
-        Ok(file.into())
+        mut file: std::fs::File,
+    ) -> Result<(), FetcherError> {
+        // (as it is: the engine checks what a fetcher wrote)
+        std::io::Write::write_all(&mut file, &self.0)
+            .map_err(|e| FetcherError::failed(e.to_string()))
     }
 
     async fn get_signatures(

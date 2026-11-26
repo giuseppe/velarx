@@ -13,8 +13,8 @@ use super::auth::{AuthConfig, Credentials};
 use super::hints::{Auth as HintAuth, HintStore, Note, Notices};
 use super::netpolicy::{local_host, local_ip, lookup};
 use super::target::{
-    manifest_digest, manifest_reference, resolve_manifest, verify_digest, Challenge, Endpoint,
-    EndpointSpec, Platform, Resolver, Target, TransportConfig, MAX_MANIFEST_SIZE,
+    manifest_digest, manifest_reference, resolve_manifest, Challenge, Endpoint, EndpointSpec,
+    Platform, Resolver, Target, TransportConfig, MAX_MANIFEST_SIZE,
 };
 use super::transport::{HostTransport, RedirectCache, Transport};
 use base64::Engine;
@@ -33,7 +33,7 @@ use tracing::{debug, info};
 use velarx_send_core as send_core;
 use velarx_send_core::{Action, Answer, Event, Request, Why};
 use velarx_types::digest::{Algorithm, Digest};
-use velarx_types::{ImageError, ImageReference, ImageResult, OciDescriptor, OciManifest};
+use velarx_types::{ImageError, ImageReference, ImageResult, OciManifest};
 
 /// What stays as it is in a value of a URL query: the unreserved characters
 /// of RFC 3986.
@@ -1560,40 +1560,6 @@ impl RegistryClient {
             },
         )
         .await
-    }
-
-    /// GET a blob that must be small: at most `limit` bytes, whose digest
-    /// and size are checked against the descriptor.
-    pub async fn get_small_blob(
-        &self,
-        t: &Target,
-        desc: &OciDescriptor,
-        limit: u64,
-    ) -> ImageResult<Bytes> {
-        if desc.size < 0 || desc.size as u64 > limit {
-            return Err(ImageError::Registry(format!(
-                "blob {} is too large ({} bytes, at most {} are accepted)",
-                desc.digest, desc.size, limit
-            )));
-        }
-        let resp = self.get_blob(t, &desc.digest, None).await?;
-        if !resp.status().is_success() {
-            return Err(answered(
-                resp.status(),
-                format!("Failed to get blob {}: {}", desc.digest, resp.status()),
-            ));
-        }
-        let body = read_limited_by(resp, desc.size as u64, self.resolver.speed()).await?;
-        if body.len() as i64 != desc.size {
-            return Err(ImageError::Registry(format!(
-                "blob {} has {} bytes, the descriptor says {}",
-                desc.digest,
-                body.len(),
-                desc.size
-            )));
-        }
-        verify_digest(&desc.digest, &body)?;
-        Ok(body)
     }
 
     /// The manifest of `image_ref` and its digest.  An index or manifest

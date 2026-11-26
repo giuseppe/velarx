@@ -7,8 +7,8 @@
 //! [`FetchConn::connect`].
 //!
 //! Nothing of what a fetcher answers is trusted here: the caller hashes what
-//! `GetManifest`, `GetBlob`, `GetProfile` and `Probe` return and measures
-//! what `Fetch` staged.
+//! `GetManifest`, `GetProfile` and `Probe` return and measures what `GetBlob`
+//! wrote and what `Fetch` staged.
 
 use super::fetch::{
     Blob, FetchEvent, FetchReply, FetcherError, FetcherProxy, Parts, ProbeReply, Probed, Reuse,
@@ -466,13 +466,15 @@ impl FetchConn {
         Ok((file_at(fds, manifest.file, reference)?, manifest.media_type))
     }
 
-    /// A small blob: the sealed memory file of the reply.
-    pub async fn get_blob(&mut self, blob: &Blob) -> Result<File, CallError> {
+    /// The blob, written by the fetcher into `dest` (a file of the engine,
+    /// with no name, empty, open for writing).  What it wrote is a claim:
+    /// the caller checks its size and digest.
+    pub async fn get_blob(&mut self, blob: &Blob, dest: &File) -> Result<(), CallError> {
+        let fds = vec![OwnedFd::from(dest.try_clone()?)];
         let (conn, busy) = self.begin().await?;
-        let got = conn.get_blob(blob).await;
+        let got = conn.get_blob(fds, blob, 0).await;
         busy.store(false, Ordering::Release);
-        let (item, fds) = done_fds(got)?;
-        file_at(fds, item.file, &blob.digest)
+        done(got).map(|_| ())
     }
 
     /// The startup profile of `image`: the sealed memory file of the reply.

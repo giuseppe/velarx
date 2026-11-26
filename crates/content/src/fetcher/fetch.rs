@@ -275,7 +275,7 @@ pub struct Manifest {
     pub media_type: Option<String>,
 }
 
-/// What `GetBlob`, `GetProfile` and `GetSignatures` answer: the item is in the sealed memory
+/// What `GetProfile` and `GetSignatures` answer: the item is in the sealed memory
 /// file `file` of the reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::Type)]
 pub struct Item {
@@ -374,7 +374,7 @@ pub enum FetcherError {
     NotSupported {
         feature: String,
     },
-    /// The answer of a `GetManifest`, `GetBlob` or `GetProfile` is larger
+    /// The answer of a `GetManifest` or `GetProfile` is larger
     /// than `max`
     TooLarge {
         max: u64,
@@ -420,6 +420,11 @@ impl FetcherError {
 
     pub fn forbidden(reason: impl Into<String>) -> Self {
         Self::with(FailureClass::Forbidden, reason)
+    }
+
+    /// What it has is not what was asked for (another size or digest).
+    pub fn invalid(reason: impl Into<String>) -> Self {
+        Self::with(FailureClass::Invalid, reason)
     }
 
     /// It tried and failed for good.
@@ -514,12 +519,13 @@ mod proxy {
             max: u64,
         ) -> zlink::Result<(Result<Manifest, FetcherError>, Vec<OwnedFd>)>;
 
-        /// A small blob.
-        #[zlink(return_fds)]
+        /// A blob, written into the file at position `file`.
         async fn get_blob(
             &mut self,
+            #[zlink(fds)] fds: Vec<OwnedFd>,
             blob: &Blob,
-        ) -> zlink::Result<(Result<Item, FetcherError>, Vec<OwnedFd>)>;
+            file: u32,
+        ) -> zlink::Result<Result<Ack, FetcherError>>;
 
         /// The startup profile of the image `image`.
         #[zlink(return_fds)]

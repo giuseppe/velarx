@@ -28,7 +28,9 @@ use crate::archive::{Archive, ArchiveImage, MAX_METADATA};
 use crate::fetcher::fetch::{Failure, FailureClass, FetchEvent as Event, FetcherError};
 use crate::list::HelperSettings;
 use crate::origin::{path_source, PathScheme};
-use crate::serve_fetch::{beating, Described, LayerScope, Out, Scope, StagingFetcher, UnpackCall};
+use crate::serve_fetch::{
+    beating, BlobFile, Described, LayerScope, Out, Scope, StagingFetcher, UnpackCall,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::fs::File;
@@ -457,33 +459,36 @@ impl StagingFetcher for DirOrigin {
         &self,
         scope: &Scope,
         blob: &crate::fetcher::fetch::Blob,
-    ) -> Result<File, FetcherError> {
+        file: File,
+    ) -> Result<(), FetcherError> {
+        use std::io::Read;
         let read = self.read(scope).await?;
+        let mut out = BlobFile::new(file, blob)?;
         let digest: Digest = blob
             .digest
             .parse()
             .map_err(|_| FetcherError::InvalidArgument {
                 reason: "not the digest of a blob".into(),
             })?;
-        let (archive, size) = (read.archive.clone(), blob.size);
-        let bytes = tokio::task::spawn_blocking(move || archive.blob(&digest, size))
-            .await
-            .map_err(|e| FetcherError::failed(e.to_string()))?
-            .map_err(|e| match e.kind() {
+        let (archive, name) = (read.archive.clone(), blob.digest.clone());
+        tokio::task::spawn_blocking(move || {
+            let mut from = archive.blob_reader(&digest).map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => {
-                    FetcherError::unavailable(format!("{}: not here", blob.digest))
+                    FetcherError::unavailable(format!("{name}: not here"))
                 }
                 _ => read_error(e),
             })?;
-        if bytes.len() as u64 != blob.size {
-            return Err(invalid(format!(
-                "the blob {} has {} bytes, the descriptor says {}",
-                blob.digest,
-                bytes.len(),
-                blob.size
-            )));
-        }
-        sealed(&bytes)
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = from.read(&mut buf).map_err(read_error)?;
+                if n == 0 {
+                    return out.finish();
+                }
+                out.write(&buf[..n])?;
+            }
+        })
+        .await
+        .map_err(|e| FetcherError::failed(e.to_string()))?
     }
 
     async fn unpack(
@@ -761,5 +766,79 @@ mod tests {
         assert!(same_name("alpine:3", "docker.io/library/alpine:3"));
         assert!(same_name("v1", "v1"));
         assert!(!same_name("alpine:3", "alpine:4"));
+    }
+
+    /// `GetBlob` of a layout directory streams the blob into the file of
+    /// the call, in pieces (it is larger than a piece); a descriptor of
+    /// another size is `invalid`, a blob the layout has not is
+    /// `unavailable`.
+    #[tokio::test]
+    async fn a_blob_of_a_layout_is_streamed_into_the_file() {
+        let class = |got: Result<(), FetcherError>| got.unwrap_err().failure().unwrap().class;
+        let layout = tempfile::tempdir().unwrap();
+        let blobs = layout.path().join("blobs/sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let put = |data: &[u8]| {
+            let digest = crate::sha256(data);
+            std::fs::write(blobs.join(digest.hex()), data).unwrap();
+            digest
+        };
+        let manifest = br#"{"schemaVersion":2,"config":{"mediaType":"x","digest":"sha256:00","size":1},"layers":[]}"#;
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": put(manifest),
+                "size": manifest.len(),
+            }]
+        });
+        std::fs::write(layout.path().join("index.json"), index.to_string()).unwrap();
+        std::fs::write(
+            layout.path().join("oci-layout"),
+            r#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        let data: Vec<u8> = (0..(3u32 << 20) + 5).map(|i| (i % 251) as u8).collect();
+        let blob = crate::fetcher::fetch::Blob {
+            digest: put(&data).to_string(),
+            size: data.len() as u64,
+            media_type: "application/octet-stream".into(),
+            annotations: None,
+        };
+        let staging = File::open(layout.path()).unwrap();
+        let origin = DirOrigin::new(
+            Box::new(|_, _| Ok(())),
+            HelperSettings::of(&velarx_config::Config::default()),
+            Arc::new(staging),
+        );
+        let scope = Scope {
+            verity: false,
+            source: Some("oci:".into()),
+            tls_verify: None,
+            target: Some(Arc::new(File::open(layout.path()).unwrap())),
+            access: None,
+            idle: std::time::Duration::from_secs(30),
+            kept: Arc::default(),
+        };
+        let file = tempfile::tempfile().unwrap();
+        origin
+            .get_blob(&scope, &blob, file.try_clone().unwrap())
+            .await
+            .unwrap();
+        let mut written = Vec::new();
+        std::io::Read::read_to_end(&mut &file, &mut written).unwrap();
+        assert!(written == data);
+        let shorter = crate::fetcher::fetch::Blob {
+            size: blob.size - 1,
+            ..blob.clone()
+        };
+        let got = origin.get_blob(&scope, &shorter, tempfile::tempfile().unwrap());
+        assert_eq!(class(got.await), FailureClass::Invalid);
+        let absent = crate::fetcher::fetch::Blob {
+            digest: crate::sha256(b"absent").to_string(),
+            ..blob
+        };
+        let got = origin.get_blob(&scope, &absent, tempfile::tempfile().unwrap());
+        assert_eq!(class(got.await), FailureClass::Unavailable);
     }
 }

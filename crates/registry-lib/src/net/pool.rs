@@ -955,7 +955,7 @@ fn authority_of(url: &reqwest::Url) -> Option<String> {
 /// The blob a request asks for.
 fn blob_of(request: &Request) -> Option<&Digest> {
     match request {
-        Request::SmallBlob { digest, .. }
+        Request::Blob { digest, .. }
         | Request::Ranges { digest, .. }
         | Request::Chunks { digest, .. } => Some(digest),
         _ => None,
@@ -1597,28 +1597,6 @@ impl Pool {
         Ok(Some((Bytes::from(body), digest)))
     }
 
-    /// A small blob; the caller checks its digest and size.
-    pub async fn small_blob(
-        self: &Arc<Self>,
-        digest: &Digest,
-        size: i64,
-        limit: u64,
-    ) -> ImageResult<Bytes> {
-        let mut x = self
-            .begin(
-                &Request::SmallBlob {
-                    digest: *digest,
-                    size,
-                    limit,
-                },
-                limit as usize,
-                limit,
-            )
-            .await?;
-        let body = x.one_blob().await?;
-        Ok(Bytes::from(body))
-    }
-
     /// Ranges of a blob, handed to `sink` as they arrive.
     pub async fn ranges(
         self: &Arc<Self>,
@@ -1934,7 +1912,7 @@ pub(crate) mod tests {
         })
         .await;
         let err = pool
-            .small_blob(&crate::sha256(b"aa"), 10, 10)
+            .blob(&crate::sha256(b"aa"), 10, &mut |_| Ok(()))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("pull worker"), "{err}");
@@ -2334,7 +2312,7 @@ pub(crate) mod tests {
         })
         .await;
         let text = pool
-            .small_blob(&crate::sha256(b"aa"), 10, 10)
+            .blob(&crate::sha256(b"aa"), 10, &mut |_| Ok(()))
             .await
             .unwrap_err()
             .to_string();
@@ -2366,7 +2344,7 @@ pub(crate) mod tests {
             })
             .await;
             let e = pool
-                .small_blob(&crate::sha256(b"aa"), 10, 10)
+                .blob(&crate::sha256(b"aa"), 10, &mut |_| Ok(()))
                 .await
                 .unwrap_err();
             assert_eq!(

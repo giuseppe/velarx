@@ -328,12 +328,6 @@ pub enum Request {
     Warm,
     /// A manifest by tag or digest; its bytes come in one data frame.
     Manifest { reference: String },
-    /// A small blob (the configuration); its bytes come in one data frame.
-    SmallBlob {
-        digest: Digest,
-        size: i64,
-        limit: u64,
-    },
     /// A layer, decompressed, in data frames; the reply tells what the
     /// compressed bytes were.
     Layer {

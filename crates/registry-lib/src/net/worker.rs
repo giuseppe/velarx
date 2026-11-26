@@ -12,7 +12,6 @@ use super::proto::{
     AuthRequest, ChunkSpec, Done, ErrorKind, ErrorMsg, Kind, LayerTrailer, Request,
 };
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -26,7 +25,7 @@ use velarx_registry::client::RegistryClient;
 use velarx_registry::target::Target;
 use velarx_sandbox as sandbox;
 use velarx_types::digest::{Algorithm, Digest, DigestWriter};
-use velarx_types::{ImageError, ImageResult, OciDescriptor};
+use velarx_types::{ImageError, ImageResult};
 
 /// The writing side of the socket, shared by the tasks of a request.
 #[derive(Clone)]
@@ -227,7 +226,7 @@ impl State {
                 "the blob {digest} has {at} bytes, not {size}"
             )));
         }
-        self.done(Done::default()).await
+        self.done_for(digest).await
     }
 
     /// The reply to a request about the blob `digest`: where the registry
@@ -423,22 +422,6 @@ impl State {
     async fn done(&self, mut done: Done) -> Result<(), ErrorMsg> {
         done.notices = self.client.take_notices();
         self.out.reply(&done).await.map_err(failed)
-    }
-
-    async fn small_blob(&self, digest: Digest, size: i64, limit: u64) -> Result<(), ErrorMsg> {
-        let desc = OciDescriptor {
-            media_type: String::new(),
-            digest,
-            size,
-            annotations: HashMap::new(),
-        };
-        let body = self
-            .client
-            .get_small_blob(&self.target, &desc, limit)
-            .await
-            .map_err(image_failed)?;
-        self.out.whole(0, 0, &body).await.map_err(failed)?;
-        self.done_for(&desc.digest).await
     }
 
     /// A layer, decompressed.  The compressed bytes are hashed here; the
@@ -863,14 +846,6 @@ async fn serve(socket: tokio::net::UnixStream) -> io::Result<()> {
                 },
                 Some(s),
             ) => s.search(&needle, n, docker, limit).await,
-            (
-                Request::SmallBlob {
-                    digest,
-                    size,
-                    limit,
-                },
-                Some(s),
-            ) => s.small_blob(digest, size, limit).await,
             (
                 Request::Layer {
                     digest,

@@ -562,22 +562,12 @@ impl ImageService {
                 )));
             }
             spend(budget, layer.size as u64)?;
-            let mut payload = Vec::new();
-            net.blob(&layer.digest, layer.size as u64, &mut |b| {
-                payload.extend_from_slice(b);
-                Ok(())
-            })
-            .await?;
-            let actual = Digest::of(layer.digest.alg(), &payload);
-            if actual != layer.digest {
-                return Err(ImageError::DigestMismatch {
-                    expected: layer.digest.to_string(),
-                    actual: actual.to_string(),
-                });
-            }
+            let payload = net
+                .small_blob(&layer.digest, layer.size as u64, MAX_SIGNATURE_SIZE)
+                .await?;
             out.push(Signature::Sigstore(velarx_signature::sigstore::Sigstore {
                 mime_type: layer.media_type,
-                payload,
+                payload: payload.to_vec(),
                 annotations: layer.annotations.into_iter().collect(),
             }));
         }

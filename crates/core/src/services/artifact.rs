@@ -71,18 +71,15 @@ pub struct StagedBlob {
     pub sniffed: &'static str,
 }
 
-/// A blob being written in pieces, hashed as it goes.
+/// A blob being written (a pull gives its file to a fetcher).
 pub struct BlobWriter {
     file: tempfile::NamedTempFile,
-    hasher: DigestWriter,
-    size: u64,
 }
 
 impl BlobWriter {
-    pub fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        self.hasher.update(data);
-        self.size += data.len() as u64;
-        self.file.write_all(data)
+    /// The file the blob goes into.
+    pub fn file(&self) -> &File {
+        self.file.as_file()
     }
 }
 
@@ -581,25 +578,22 @@ impl ArtifactStore {
         Ok(got)
     }
 
-    /// A blob written in pieces (a pull), kept by `BlobWriter::finish`.
-    pub fn begin_blob(&self, alg: Algorithm) -> ArtifactResult<BlobWriter> {
+    /// A file for a blob that a pull writes, kept by `finish_blob`.
+    pub fn begin_blob(&self) -> ArtifactResult<BlobWriter> {
         let file = tempfile::Builder::new()
             .prefix(".staged-")
             .tempfile_in(&self.dir)?;
-        Ok(BlobWriter {
-            file,
-            hasher: DigestWriter::new(alg),
-            size: 0,
-        })
+        Ok(BlobWriter { file })
     }
 
-    /// Keep what `w` was given under `digest`, which it must have.
+    /// Keep what `w` was given under `digest`, which the pull measured.
     pub fn finish_blob(&self, w: BlobWriter, digest: &Digest) -> ArtifactResult<()> {
-        let BlobWriter { file, hasher, size } = w;
+        let BlobWriter { file } = w;
         file.as_file().sync_all()?;
+        let size = file.as_file().metadata()?.len();
         let blob = StagedBlob {
             file,
-            digest: hasher.finalize(),
+            digest: *digest,
             size,
             sniffed: "application/octet-stream",
         };

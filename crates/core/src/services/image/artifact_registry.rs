@@ -86,15 +86,14 @@ impl ImageService {
             if store.has_blob(&blob) {
                 continue;
             }
-            let mut w = {
+            let w = {
                 let s = store.clone();
-                let alg = blob.alg();
-                tokio::task::spawn_blocking(move || s.begin_blob(alg))
+                tokio::task::spawn_blocking(move || s.begin_blob())
                     .await
                     .map_err(std::io::Error::other)?
                     .map_err(store_error)?
             };
-            net.blob(&blob, size, &mut |data| w.write(data)).await?;
+            net.blob(&blob, size, w.file()).await?;
             let s = store.clone();
             tokio::task::spawn_blocking(move || s.finish_blob(w, &blob))
                 .await

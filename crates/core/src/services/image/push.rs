@@ -20,7 +20,6 @@ use velarx_content::layer::writer::{
 use velarx_content::push::staged_push::{Destinations, How, StagedPush};
 use velarx_content::pusher::push::{Object, Role};
 use velarx_db::BlobSource;
-use velarx_types::digest::DigestWriter;
 
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
@@ -986,27 +985,12 @@ impl ImageService {
             if worker.find(&staged, &object).await?.is_some() {
                 continue;
             }
-            // Through a file of the staging area, checked against its digest.
+            // Through a file of the staging area the fetcher writes, measured
+            // against the descriptor.
             std::fs::create_dir_all(&self.staging_dir)?;
             let file = tempfile::tempfile_in(&self.staging_dir)?;
-            let mut hasher = DigestWriter::for_digest(&blob.digest);
-            // (the zeros of the blob are holes of the file)
-            let mut out = velarx_storage::SparseWriter::new(&file);
-            let max = blob.size.max(0) as u64;
-            src_net
-                .blob(&blob.digest, max, &mut |chunk| {
-                    hasher.update(chunk);
-                    out.write(chunk)
-                })
-                .await?;
-            let size = out.finish()?;
-            let got = hasher.finalize();
-            if got != blob.digest {
-                return Err(ImageError::DigestMismatch {
-                    expected: blob.digest.to_string(),
-                    actual: got.to_string(),
-                });
-            }
+            let size = blob.size.max(0) as u64;
+            src_net.blob(&blob.digest, size, &file).await?;
             worker
                 .ensure(
                     &staged,

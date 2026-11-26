@@ -9,9 +9,7 @@ pub mod origin;
 
 use bytes::Bytes;
 use velarx_proto::transfer::FailureClass;
-use velarx_registry::target::{
-    resolve_manifest_chain, verify_digest, KnownManifests, Platform, MAX_CONFIG_SIZE,
-};
+use velarx_registry::target::{resolve_manifest_chain, KnownManifests, Platform, MAX_CONFIG_SIZE};
 use velarx_types::digest::Digest;
 use velarx_types::{
     ImageError, ImageReference, ImageResult, OciConfig, OciDescriptor, OciManifest,
@@ -94,15 +92,27 @@ impl Net {
     }
 
     /// The blob `digest` of `size` bytes as the registry of `target` has
-    /// it, given to `sink` in order.
-    pub async fn blob(
-        &self,
-        digest: &Digest,
-        size: u64,
-        sink: &mut (dyn FnMut(&[u8]) -> std::io::Result<()> + Send),
-    ) -> ImageResult<()> {
-        let body = self
-            .origin()?
+    /// it, written into `file` (empty, open for reading and writing) by the
+    /// fetcher, and measured: its size and digest are the ones given.  No
+    /// blob is held in memory.
+    pub async fn blob(&self, digest: &Digest, size: u64, file: &std::fs::File) -> ImageResult<()> {
+        self.origin()?
+            .blob_into(
+                &crate::fetcher::fetch::Blob {
+                    digest: digest.to_string(),
+                    size,
+                    media_type: "application/octet-stream".into(),
+                    annotations: None,
+                },
+                file,
+            )
+            .await
+    }
+
+    /// A small blob (a signature) in memory: refused when `size` is above
+    /// `limit`; measured like [`Net::blob`].
+    pub async fn small_blob(&self, digest: &Digest, size: u64, limit: u64) -> ImageResult<Bytes> {
+        self.origin()?
             .small_blob(
                 &crate::fetcher::fetch::Blob {
                     digest: digest.to_string(),
@@ -110,17 +120,9 @@ impl Net {
                     media_type: "application/octet-stream".into(),
                     annotations: None,
                 },
-                size,
+                limit,
             )
-            .await?;
-        if body.len() as u64 != size {
-            return Err(ImageError::Layer(format!(
-                "the blob {digest} has {} bytes, not {size}",
-                body.len()
-            )));
-        }
-        sink(&body)?;
-        Ok(())
+            .await
     }
 
     /// The manifest `image_ref` names, resolved for `platform`, its digest
@@ -184,22 +186,6 @@ impl Net {
                 MAX_CONFIG_SIZE,
             )
             .await?;
-        if body.len() as i64 != desc.size {
-            return Err(ImageError::transfer_of(
-                origin.party(),
-                desc.digest.to_string(),
-                FailureClass::Invalid,
-                format!("{} bytes, the descriptor says {}", body.len(), desc.size),
-            ));
-        }
-        verify_digest(&desc.digest, &body).map_err(|e| {
-            ImageError::transfer_of(
-                origin.party(),
-                desc.digest.to_string(),
-                FailureClass::Invalid,
-                e.to_string(),
-            )
-        })?;
         Ok((serde_json::from_slice(&body)?, body))
     }
 }
@@ -214,10 +200,8 @@ mod tests {
     async fn offline_refuses_every_request() {
         let net = Net::offline();
         assert!(net.manifest_top("latest").await.is_err());
-        assert!(net
-            .blob(&crate::sha256(b"x"), 1, &mut |_| Ok(()))
-            .await
-            .is_err());
+        let file = tempfile::tempfile().unwrap();
+        assert!(net.blob(&crate::sha256(b"x"), 1, &file).await.is_err());
     }
 
     /// A tag is resolved by the registry only: a pull of one with no
