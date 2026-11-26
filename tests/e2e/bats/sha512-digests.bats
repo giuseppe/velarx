@@ -315,8 +315,11 @@ EOT
 
 # A kernel without the SHA-512 hash of fs-verity, under a store whose file
 # system has fs-verity: the ioctl that enables it says ENOPKG for SHA-512
-# (an LD_PRELOAD of the test makes it say so: this kernel has the hash).
-@test "a store whose fs-verity lacks SHA-512 refuses the pull of a sha512 image by name, and stores nothing of it" {
+# (an LD_PRELOAD of the test makes it say so: this kernel has the hash).  The
+# preload reaches the engine's process only: the fetcher, which seals the
+# files it stages, keeps no LD_PRELOAD, so the objects of the layers are
+# stored and the refusal comes when the engine makes the EROFS images.
+@test "a store whose fs-verity lacks SHA-512 refuses the pull of a sha512 image by name, and keeps nothing of it" {
     need_verity
     command -v cc > /dev/null || skip "no C compiler"
     cat > "$WORKDIR/nosha512.c" <<'C'
@@ -350,7 +353,10 @@ C
     out=$(LD_PRELOAD=$WORKDIR/nosha512.so shs "$store" image pull --tls-verify=false "$ZOT/$REPO@$ALL_ZOT" 2>&1)
     check "the sha512 image is refused" 125 $?
     check_match "naming the hash" "fs-verity with SHA-512 is not available here" "$out"
-    check "no object of it" 0 "$(objects_of "$store" 126)"
     shs "$store" image exists "$ZOT/$REPO@$ALL_ZOT" 2> /dev/null
     check "no image of it" 1 $?
+    shs "$store" system check > /dev/null 2>&1
+    check "system check" 0 $?
+    shs "$store" system prune -f > /dev/null 2>&1
+    check "a collection leaves no object of it" 0 "$(objects_of "$store" 126)"
 }
