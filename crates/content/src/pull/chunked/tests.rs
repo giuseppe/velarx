@@ -51,6 +51,32 @@ fn test_parse_info() {
     bad.annotations
         .insert(format!("{prefix}manifest-checksum"), "sha256:zz".into());
     assert!(parse_info(&bad).is_err());
+    // a position spelled `01` or `+1`, a checksum in upper case, gets the
+    // same answer here and from the key of the layer
+    let upper = crate::sha256_text(b"")
+        .to_uppercase()
+        .replace("SHA256", "sha256");
+    for (name, value, ok) in [
+        ("manifest-position", "100:50:200:01", true),
+        ("manifest-position", "100:50:200:+1", false),
+        ("manifest-checksum", upper.as_str(), false),
+    ] {
+        let mut spelled = l.clone();
+        spelled
+            .annotations
+            .insert(format!("{prefix}{name}"), value.into());
+        assert_eq!(parse_info(&spelled).is_ok(), ok, "{value}");
+        assert_eq!(
+            velarx_types::layer::chunked_checksum(&spelled).is_some(),
+            ok,
+            "{value}"
+        );
+    }
+    let mut bad = l.clone();
+    bad.annotations
+        .insert(format!("{prefix}tarsplit-position"), "1:2".into());
+    let e = parse_info(&bad).unwrap_err().to_string();
+    assert!(e.contains(&format!("layer {}", l.digest)), "{e}");
     // a table the layer names and this does not know, or half of its
     // labels, is not "no table": the layer is refused
     let mut other = l.clone();

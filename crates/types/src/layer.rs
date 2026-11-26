@@ -149,27 +149,84 @@ pub fn is_zstd(media_type: &str) -> bool {
     )
 }
 
-/// The TOC digest of a descriptor with zstd:chunked labels: a zstd layer
-/// with `table-checksum` and `table-position` (a binary table: offset,
-/// length, length uncompressed), else with `manifest-checksum` and
-/// `manifest-position` (the two that podman requires), the position of a
-/// TOC (its fourth field is 1: another kind of manifest is no TOC to pull
-/// by).  None for any other (the pull refuses a descriptor that has one of
-/// the two): the blob is never looked at to decide.
+/// `s`, `N` numbers of decimal digits joined by `:`.
+pub fn parse_numbers<const N: usize>(s: &str) -> Option<[u64; N]> {
+    let mut out = [0u64; N];
+    let mut parts = s.split(':');
+    for slot in out.iter_mut() {
+        let p = parts.next()?;
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *slot = p.parse().ok()?;
+    }
+    parts.next().is_none().then_some(out)
+}
+
+/// The table a descriptor with zstd:chunked labels is pulled by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkedToc {
+    /// Offset, length, length uncompressed.
+    pub position: (u64, u64, u64),
+    pub checksum: Digest,
+    /// The binary table (`table-*`), not the JSON TOC (`manifest-*`).
+    pub table: bool,
+}
+
+/// The table of the zstd:chunked labels of `desc`: `table-position` and
+/// `table-checksum` (a binary table), else `manifest-position` and
+/// `manifest-checksum` (the two that podman requires), whose position has
+/// a fourth field that is 1 (another kind of manifest is no TOC to pull
+/// by).  The error says what is wrong with the labels.  The media type is
+/// not looked at.
+pub fn chunked_toc(desc: &OciDescriptor) -> Result<ChunkedToc, String> {
+    let (position, checksum, table) = match (
+        chunked_annotation(desc, "table-position"),
+        chunked_annotation(desc, "table-checksum"),
+    ) {
+        (Some(position), Some(checksum)) => (position, checksum, true),
+        (None, None) => match (
+            chunked_annotation(desc, "manifest-position"),
+            chunked_annotation(desc, "manifest-checksum"),
+        ) {
+            (Some(position), Some(checksum)) => (position, checksum, false),
+            _ => {
+                return Err(
+                    "do not give both the position and the checksum of its table of contents"
+                        .into(),
+                )
+            }
+        },
+        _ => {
+            return Err("do not give both the position and the checksum of its table".into());
+        }
+    };
+    let kind = if table { "table" } else { "manifest" };
+    let at = if table {
+        parse_numbers::<3>(position).map(|p| [p[0], p[1], p[2], 1])
+    } else {
+        parse_numbers::<4>(position)
+    }
+    .ok_or_else(|| format!("have an invalid {kind} position `{position}`"))?;
+    if at[3] != 1 {
+        return Err(format!("have an unknown manifest type {}", at[3]));
+    }
+    let checksum = checksum
+        .parse()
+        .map_err(|e| format!("have an invalid {kind} checksum `{checksum}`: {e}"))?;
+    Ok(ChunkedToc {
+        position: (at[0], at[1], at[2]),
+        checksum,
+        table,
+    })
+}
+
+/// The TOC digest of a descriptor with zstd:chunked labels ([`chunked_toc`]
+/// of a zstd layer).  None for any other (the pull refuses a descriptor
+/// that has one of the labels): the blob is never looked at to decide.
 pub fn chunked_checksum(desc: &OciDescriptor) -> Option<Digest> {
-    if !is_zstd(&desc.media_type) {
-        return None;
-    }
-    if let Some(table) = chunked_annotation(desc, "table-checksum") {
-        let position = chunked_annotation(desc, "table-position")?;
-        return (position.split(':').count() == 3)
-            .then(|| table.parse().ok())
-            .flatten();
-    }
-    let checksum = chunked_annotation(desc, "manifest-checksum")?;
-    let position = chunked_annotation(desc, "manifest-position")?;
-    (position.rsplit(':').next() == Some("1") && position.split(':').count() == 4)
-        .then(|| checksum.parse().ok())
+    is_zstd(&desc.media_type)
+        .then(|| chunked_toc(desc).ok().map(|t| t.checksum))
         .flatten()
 }
 
@@ -383,5 +440,27 @@ mod tests {
         assert_eq!(one[0], a);
         assert_ne!(one[0], one[2]);
         assert_ne!(chain_ids(&[b, a])[1], chain_ids(&[a, b])[1]);
+    }
+
+    /// The readers of the position agree on every spelling.
+    #[test]
+    fn the_readers_of_the_position_agree() {
+        for (position, ok) in [
+            ("1:2:3:1", true),
+            ("1:2:3:01", true),
+            ("001:2:3:1", true),
+            ("1:2:3:+1", false),
+            ("+1:2:3:1", false),
+            ("1:2:3:0x1", false),
+            ("1:2:3:1 ", false),
+            ("1:2:3:2", false),
+            ("1:2:3", false),
+        ] {
+            let d = desc(ZSTD, &[(CHECKSUM, T), (POSITION, position)]);
+            assert_eq!(chunked_toc(&d).is_ok(), ok, "{position}");
+            assert_eq!(chunked_checksum(&d).is_some(), ok, "{position}");
+        }
+        let d = desc(ZSTD, &[(CHECKSUM, T), (POSITION, "1:2:3:01")]);
+        assert_eq!(chunked_toc(&d).unwrap().position, (1, 2, 3));
     }
 }

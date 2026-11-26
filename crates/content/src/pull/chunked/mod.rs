@@ -42,11 +42,6 @@ use velarx_storage::{canonical, table, Toc, TocEntry, TocEntryType, TOC_VERSION}
 use velarx_types::digest::{Algorithm, Digest, DigestWriter, Offloaded};
 use velarx_types::{ImageError, ImageResult, LayerKey, OciDescriptor};
 
-const ANNOTATION_PREFIXES: [&str; 2] = [
-    "io.github.containers.zstd-chunked.",
-    "io.containers.zstd-chunked.",
-];
-
 /// Largest compressed TOC or tar-split fetched, and largest TOC once
 /// decompressed.
 pub const MAX_METADATA_COMPRESSED: u64 = 64 * 1024 * 1024;
@@ -95,25 +90,6 @@ pub struct Info {
     pub table: bool,
 }
 
-fn annotation<'a>(layer: &'a OciDescriptor, name: &str) -> Option<&'a String> {
-    ANNOTATION_PREFIXES
-        .iter()
-        .find_map(|p| layer.annotations.get(&format!("{p}{name}")))
-}
-
-fn parse_numbers<const N: usize>(s: &str) -> Option<[u64; N]> {
-    let mut out = [0u64; N];
-    let mut parts = s.split(':');
-    for slot in out.iter_mut() {
-        let p = parts.next()?;
-        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        *slot = p.parse().ok()?;
-    }
-    parts.next().is_none().then_some(out)
-}
-
 /// The zstd:chunked metadata of a layer, if it has any.  A descriptor with
 /// any zstd:chunked annotation says that the layer has a table of contents,
 /// which it is pulled by or not at all: annotations that do not name one
@@ -123,11 +99,11 @@ fn parse_numbers<const N: usize>(s: &str) -> Option<[u64; N]> {
 /// pulled by it: its JSON TOC is never read, and a table that cannot be
 /// used is an error, never a reason to read the JSON.
 pub fn parse_info(layer: &OciDescriptor) -> ImageResult<Option<Info>> {
-    if !layer
-        .annotations
-        .keys()
-        .any(|k| ANNOTATION_PREFIXES.iter().any(|p| k.starts_with(p)))
-    {
+    if !layer.annotations.keys().any(|k| {
+        velarx_types::layer::CHUNKED_PREFIXES
+            .iter()
+            .any(|p| k.starts_with(p))
+    }) {
         return Ok(None);
     }
     let refused = |why: &str| {
@@ -144,65 +120,20 @@ pub fn parse_info(layer: &OciDescriptor) -> ImageResult<Option<Info>> {
             layer.media_type
         )));
     }
-    // (a layer with a binary table is pulled by it: its JSON TOC is for
-    // the readers that do not know the table)
-    let (toc, checksum, table) = match (
-        annotation(layer, "table-position"),
-        annotation(layer, "table-checksum"),
-    ) {
-        (Some(position), Some(checksum)) => {
-            let at = parse_numbers::<3>(position).ok_or_else(|| {
-                ImageError::Manifest(format!("invalid zstd:chunked table position `{position}`"))
-            })?;
-            (at, checksum, true)
-        }
-        (None, None) => {
-            let (Some(position), Some(checksum)) = (
-                annotation(layer, "manifest-position"),
-                annotation(layer, "manifest-checksum"),
-            ) else {
-                return Err(refused(
-                    "do not give both the position and the checksum of its table of contents",
-                ));
-            };
-            let toc = parse_numbers::<4>(position).ok_or_else(|| {
-                ImageError::Manifest(format!(
-                    "invalid zstd:chunked manifest position `{position}`"
-                ))
-            })?;
-            if toc[3] != 1 {
-                return Err(ImageError::Manifest(format!(
-                    "unknown zstd:chunked manifest type {}",
-                    toc[3]
-                )));
-            }
-            ([toc[0], toc[1], toc[2]], checksum, false)
-        }
-        _ => {
-            return Err(refused(
-                "do not give both the position and the checksum of its table",
-            ))
-        }
-    };
-    let checksum: Digest = checksum.parse().map_err(|e| {
-        ImageError::Manifest(format!(
-            "invalid zstd:chunked manifest checksum `{checksum}`: {e}"
-        ))
-    })?;
-    let tarsplit = match annotation(layer, "tarsplit-position") {
+    let toc = velarx_types::layer::chunked_toc(layer).map_err(|why| refused(&why))?;
+    let tarsplit = match velarx_types::layer::chunked_annotation(layer, "tarsplit-position") {
         Some(p) => {
-            let t = parse_numbers::<3>(p).ok_or_else(|| {
-                ImageError::Manifest(format!("invalid zstd:chunked tar-split position `{p}`"))
-            })?;
+            let t = velarx_types::layer::parse_numbers::<3>(p)
+                .ok_or_else(|| refused(&format!("have an invalid tar-split position `{p}`")))?;
             Some((t[0], t[1], t[2]))
         }
         None => None,
     };
     Ok(Some(Info {
-        toc: (toc[0], toc[1], toc[2]),
-        checksum,
+        toc: toc.position,
+        checksum: toc.checksum,
         tarsplit,
-        table,
+        table: toc.table,
     }))
 }
 

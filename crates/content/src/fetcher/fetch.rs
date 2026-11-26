@@ -98,9 +98,8 @@ impl Blob {
     /// Whether its descriptor names a binary table: a layer that is pulled
     /// by it, which only a fetcher that announces `table` is asked for.
     pub fn has_table(&self) -> bool {
-        self.descriptor().is_some_and(|d| {
-            velarx_types::layer::chunked_annotation(&d, "table-checksum").is_some()
-        })
+        self.descriptor()
+            .is_some_and(|d| velarx_types::layer::chunked_toc(&d).is_ok_and(|t| t.table))
     }
 
     fn descriptor(&self) -> Option<velarx_types::OciDescriptor> {

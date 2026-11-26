@@ -115,6 +115,16 @@ PY
     check_match "the layer is the JSON TOC's" "toc:$(annotation "$REPO:json" manifest-checksum)" "$key"
 }
 
+@test "a JSON TOC whose type is spelled 01 is pulled and stored by it" {
+    retag "$REPO:json" zero 'p = "io.github.containers.zstd-chunked.manifest-position"; a[p] = a[p].rsplit(":", 1)[0] + ":01"'
+    check "the image with the type 01" 0 $?
+    check_match "the type is 01" ':01$' "$(annotation "$REPO:zero" manifest-position)"
+    v z image pull -q --tls-verify=false "$REPO:zero" > /dev/null
+    check "pull of the type 01" 0 $?
+    key=$(sqlite3 "file:$WORKDIR/z/store/db.sqlite?mode=ro" "select id from layers")
+    check_match "the layer is the JSON TOC's" "toc:$(annotation "$REPO:zero" manifest-checksum)" "$key"
+}
+
 @test "a table that cannot be used fails the pull, the JSON TOC is not read instead" {
     retag "$REPO:t256" bad 'a["io.github.containers.zstd-chunked.table-checksum"] = "sha256:" + "0" * 64'
     out=$(v d image pull --tls-verify=false "$REPO:bad" 2>&1)
