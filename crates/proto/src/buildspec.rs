@@ -493,6 +493,10 @@ pub struct BuildSpec {
     pub containerfile_outside: bool,
     /// The Containerfile is an http(s) URL the engine fetches (`-f URL`)
     pub containerfile_url: Option<String>,
+    /// The ignore file of the build, a path in the uploaded context
+    /// (podman's `--ignorefile` of a remote client): the context's own
+    /// ignore files are not read
+    pub ignore_file: Option<String>,
     /// The context is a git repository or the URL of a tar, not the upload
     pub remote: Option<String>,
     /// The context is a directory of the host of the engine

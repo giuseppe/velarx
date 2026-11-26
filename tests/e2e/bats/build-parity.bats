@@ -285,6 +285,10 @@ EOT
     check_match "COPY http://..." "building at STEP .*: source can't be a URL for COPY" "$out"
 }
 
+@test "build --help: the default of --pull, as podman says it" {
+    check_match "--pull" '^ +When to pull .*[(]default "missing"[)]$' "$(sh_ image build --help 2>&1)"
+}
+
 @test "build --save-stages and --stage-labels" {
     local ctx=$WORKDIR/sctx stage_ids
     mkdir -p "$ctx"
@@ -368,6 +372,16 @@ EOT
 1000 755 /not/in/the/image
 0 755 /last" "$(sh_ run --rm localhost/e2e-workdir:1 stat -c '%u %a %n' /not /not/in/the/image /last)"
     sh_ rmi localhost/e2e-workdir:1 > /dev/null 2>&1
+}
+
+@test "build --load and --progress are accepted" {
+    local ctx=$WORKDIR/ldctx
+    mkdir -p "$ctx"
+    printf 'FROM scratch\nLABEL via=load\n' > "$ctx/Containerfile"
+    sh_ buildx build --load --progress=plain -q -t localhost/e2e-load:1 "$ctx" > /dev/null
+    check "buildx build --load --progress" 0 $?
+    check "the image is there" load "$(sh_ image inspect -f '{{index .Config.Labels "via"}}' localhost/e2e-load:1)"
+    sh_ rmi localhost/e2e-load:1 > /dev/null 2>&1
 }
 
 @test "build: COPY keeps the hard links of what it copies" {

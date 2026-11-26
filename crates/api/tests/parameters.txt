@@ -39,6 +39,7 @@ any ANY * groupadd implemented
 any ANY * httpproxy implemented
 any ANY * identitylabel implemented
 any ANY * idmappingoptions implemented
+any ANY * ignorefile implemented
 any ANY * image implemented
 any ANY * include-volumes implemented
 any ANY * inheritannotations implemented

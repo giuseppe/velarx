@@ -216,10 +216,11 @@ pub enum ImageCommands {
             default_missing_value = "true"
         )]
         tls_verify: bool,
-        /// When to pull the base images: missing, always, never or newer
+        /// When to pull the base images: "always", "missing", "never" or "newer" (default "missing")
         #[arg(
             long,
             default_value = "missing",
+            hide_default_value = true,
             num_args = 0..=1,
             require_equals = true,
             default_missing_value = "always"
@@ -774,11 +775,16 @@ pub struct BuildUnsupported {
     pub decryption_key: Vec<String>,
     #[arg(long = "sign-by", hide = true, allow_hyphen_values = true)]
     pub sign_by: Option<String>,
+    #[arg(long = "log-rusage", hide = true, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub log_rusage: Option<bool>,
+    #[arg(long = "rusage-logfile", hide = true, allow_hyphen_values = true)]
+    pub rusage_logfile: Option<String>,
 }
 
 impl BuildUnsupported {
     /// The options that were given.
     pub fn given(&self) -> Vec<String> {
+        const RUSAGE: &str = "the resource usage of the steps is not logged";
         [
             (
                 "--cw",
@@ -792,9 +798,15 @@ impl BuildUnsupported {
             ),
             (
                 "--sign-by",
-                "GPG signing is not implemented: sign what the build made with `push --sign-by-sigstore-private-key`",
+                "a build does not sign: sign what it made with `push --sign-by` or `image sign --sign-by`, or with `push --sign-by-sigstore-private-key`",
                 self.sign_by.is_some(),
             ),
+            (
+                "--log-rusage",
+                RUSAGE,
+                self.log_rusage == Some(true),
+            ),
+            ("--rusage-logfile", RUSAGE, self.rusage_logfile.is_some()),
         ]
         .into_iter()
         .filter(|(_, _, given)| *given)
@@ -1002,6 +1014,12 @@ pub struct BuildExtra {
     /// An option of podman's build that has no effect there either
     #[arg(long, hide = true)]
     pub compress: bool,
+    /// `buildx build --load`: the image is in the store of the engine anyway
+    #[arg(long, hide = true)]
+    pub load: bool,
+    /// `buildx build --progress`, as podman's: given and ignored
+    #[arg(long, hide = true)]
+    pub progress: Option<String>,
     /// A Docker option of podman's build with no effect
     #[arg(long, hide = true, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     pub disable_content_trust: Option<bool>,

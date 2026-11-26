@@ -2396,6 +2396,10 @@ type BuildSpec (
 	containerfile_outside: bool,
 	# The Containerfile is an http(s) URL the engine fetches (`-f URL`)
 	containerfile_url: ?string,
+	# The ignore file of the build, a path in the uploaded context
+	# (podman's `--ignorefile` of a remote client): the context's own
+	# ignore files are not read
+	ignore_file: ?string,
 	# The context is a git repository or the URL of a tar, not the upload
 	remote: ?string,
 	# The context is a directory of the host of the engine

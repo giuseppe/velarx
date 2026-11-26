@@ -1345,6 +1345,8 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                 cache_ttl,
                 output,
                 compress: _,
+                load: _,
+                progress: _,
                 disable_content_trust: _,
                 annotation,
                 unsetannotation,

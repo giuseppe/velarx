@@ -288,6 +288,20 @@ EOT
     pm rmi -f localhost/bm:policy > /dev/null 2>&1
 }
 
+@test "podman build --ignorefile: in the context or out of it, over .dockerignore" {
+    local c=$WORKDIR/ignf f out
+    mkdir -p "$c"
+    echo x > "$c/kept-file"
+    echo kept-file > "$c/.dockerignore"
+    printf 'FROM %s\nCOPY . /d/\nRUN ls /d\n' "$IMG" > "$c/Containerfile"
+    touch "$c/.empty" "$WORKDIR/outside-ignore"
+    for f in "$c/.empty" "$WORKDIR/outside-ignore"; do
+        out=$(pm build --tls-verify=false --no-cache --ignorefile "$f" "$c" 2>&1)
+        check "podman build --ignorefile $f" 0 $?
+        check_match "...the file .dockerignore names is copied" "kept-file" "$out"
+    done
+}
+
 @test "build --build-context: a directory, an image; COPY --from and RUN --mount from=" {
     local c=$WORKDIR/named
     mkdir -p "$c" "$WORKDIR/extra/sub"
@@ -722,7 +736,11 @@ EOT
     out=$("$CLI" image build --tls-verify=false --sbom-scanner-image "$IMG" --sbom-scanner-command "$one" --sbom-output "$WORKDIR/x" "$c" 2>&1)
     check_match "a command needs a merge strategy, as buildah" "unrecognized merge strategy" "$out"
     out=$("$CLI" image build --tls-verify=false --sign-by me "$c" 2>&1)
-    check_match "--sign-by is refused with its reason" "not supported by velarx's build yet: --sign-by [(]GPG signing is not implemented: sign what the build made with \`push --sign-by-sigstore-private-key\`[)]" "$out"
+    check_match "--sign-by is refused with its reason" "not supported by velarx's build yet: --sign-by [(]a build does not sign: sign what it made with \`push --sign-by\` or \`image sign --sign-by\`, or with \`push --sign-by-sigstore-private-key\`[)]" "$out"
+    out=$("$CLI" image build --tls-verify=false --log-rusage --rusage-logfile=x "$c" 2>&1)
+    check_match "--log-rusage and --rusage-logfile are refused" "not supported by velarx's build yet: --log-rusage [(]the resource usage of the steps is not logged[)], --rusage-logfile" "$out"
+    out=$("$CLI" image build --tls-verify=false --log-rusage=false -t localhost/bm:sbom "$c" 2>&1)
+    check "--log-rusage=false is no ask" 0 $?
     pm rmi -f localhost/bm:sbom > /dev/null 2>&1
 }
 

@@ -377,7 +377,7 @@ mod tests {
     /// says so.  A new one must be refused (`anyhow::bail!("--x is not
     /// supported ...")`) or used; one that is truly harmless goes here with
     /// its reason.
-    const DROPPED_OPTIONS: [(&str, &str, &str); 21] = [
+    const DROPPED_OPTIONS: [(&str, &str, &str); 23] = [
         (
             "commands/image.rs",
             "quiet",
@@ -392,6 +392,16 @@ mod tests {
             "commands/image.rs",
             "disable_compression",
             "a build stores its layers uncompressed, as the build route of the API",
+        ),
+        (
+            "commands/image.rs",
+            "load",
+            "`buildx build --load`: the image is in the store of the engine anyway",
+        ),
+        (
+            "commands/image.rs",
+            "progress",
+            "`buildx build --progress`: given and ignored, as podman's",
         ),
         (
             "commands/image.rs",

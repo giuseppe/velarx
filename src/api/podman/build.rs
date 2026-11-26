@@ -278,6 +278,7 @@ pub async fn build_of(
     let remote = spec.remote.clone();
     let containerfile = spec.containerfile.clone().map(PathBuf::from);
     let containerfile_url = spec.containerfile_url.clone();
+    let ignore_file = spec.ignore_file.clone().map(PathBuf::from);
     let (secrets, contexts) = (spec.secrets.clone(), spec.contexts.clone());
     let req = request_of(state, spec, access)?;
     let state = state.clone();
@@ -369,9 +370,14 @@ pub async fn build_of(
     }
     crate::api::blocking(|| take_secrets(&secrets, &mut req, Some(&context_dir)))?;
     named_contexts_of(&state, &contexts, &mut req, &mut dir, false).await?;
-    let mut ctx =
-        crate::api::blocking(|| BuildContext::new(&context_dir, containerfile.as_deref()))
-            .map_err(|e| ApiError::bad_request(format!("invalid build context: {e}")))?;
+    let mut ctx = crate::api::blocking(|| {
+        let ctx = BuildContext::new(&context_dir, containerfile.as_deref())?;
+        match &ignore_file {
+            Some(f) => ctx.with_ignore_file(f),
+            None => Ok(ctx),
+        }
+    })
+    .map_err(|e| ApiError::bad_request(format!("invalid build context: {e}")))?;
     ctx.containerfile_text = text;
     Ok(BuildRun {
         state,

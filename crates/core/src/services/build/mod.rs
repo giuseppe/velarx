@@ -262,6 +262,19 @@ impl BuildContext {
         Ok(self)
     }
 
+    /// `--ignorefile`: the file `name` of the context is the ignore file,
+    /// the context's own are not read.
+    pub fn with_ignore_file(mut self, name: &Path) -> BuildResult<Self> {
+        let text = self.read(name, parse::MAX_FILE)?.ok_or_else(|| {
+            BuildError::Parse(format!(
+                "the ignore file {} is not in the context",
+                name.display()
+            ))
+        })?;
+        self.ignore_text = Some(text);
+        Ok(self)
+    }
+
     fn containerfile(&self) -> BuildResult<String> {
         if let Some(text) = &self.containerfile_text {
             return Ok(text.clone());

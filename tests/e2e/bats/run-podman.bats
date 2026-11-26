@@ -389,7 +389,7 @@ rc=125" "$out"
     out=$(sh_ build --squash --squash-all "$ctx" 2>&1)
     check "--squash and --squash-all" "Error: cannot specify --squash-all with --squash" "$out"
     out=$(sh_ build --sign-by me "$ctx" 2>&1)
-    check_match "an option that velarx's build has not" "not supported by velarx's build yet: --sign-by" "$out"
+    check_match "an option that velarx's build has not" "not supported by velarx's build yet: --sign-by .a build does not sign: sign what it made with .push --sign-by. or .image sign --sign-by." "$out"
     mkdir "$ctx/in"
     printf 'FROM scratch\n' > "$ctx/in/Containerfile"
     echo '*' > "$ctx/in/.dockerignore"

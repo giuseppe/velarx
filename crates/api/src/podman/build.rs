@@ -40,19 +40,25 @@ fn containerfile_path(param: &str) -> ApiResult<Option<String>> {
         return Ok(None);
     }
     not_preprocessed(&path)?;
+    in_context("dockerfile", &path).map(Some)
+}
+
+/// The path `path` of the parameter `what` in the context: an absolute
+/// one is the file the client put in the upload at that path.
+fn in_context(what: &str, path: &str) -> ApiResult<String> {
     let mut clean = PathBuf::new();
-    for c in Path::new(&path).components() {
+    for c in Path::new(path).components() {
         match c {
             Component::Normal(n) => clean.push(n),
             Component::CurDir | Component::RootDir => {}
             _ => {
                 return Err(ApiError::bad_request(format!(
-                    "the dockerfile `{path}` is outside of the context"
+                    "the {what} `{path}` is outside of the context"
                 )))
             }
         }
     }
-    Ok(Some(clean.to_string_lossy().into_owned()))
+    Ok(clean.to_string_lossy().into_owned())
 }
 
 /// The `dockerfile` parameter when it is an http(s) URL (or a list whose
@@ -499,7 +505,7 @@ enum Given {
 /// The parameters of [`velarx_proto::build::BUILD_REFUSED`] and what makes
 /// a request for one: podman's client sends the defaults of several of
 /// them (`isolation=0`, `rusage=false`...), which are not asks.
-/// `rm`, `forcerm`, `excludes` and `ignorefile` are
+/// `rm`, `forcerm` and `excludes` are
 /// not here: they change nothing of the image (no intermediate container
 /// is kept, the client leaves the ignored files out of the tar it sends);
 /// nor `compressionFormat`, `compressionLevel` and `forceCompressionFormat`
@@ -784,6 +790,7 @@ fn spec_of(
     let contexts = named_contexts(call, local)?;
     let dockerfile = call.q("dockerfile").unwrap_or("");
     let (mut containerfile, mut containerfile_host, mut local_dir) = (None, None, None);
+    let mut ignore_file = None;
     // (a Containerfile of an http(s) URL is fetched by the engine)
     let containerfile_url = url_containerfile(dockerfile)?;
     let dockerfile = if containerfile_url.is_some() {
@@ -811,6 +818,11 @@ fn spec_of(
     } else {
         check_content_type(call)?;
         containerfile = containerfile_path(dockerfile)?;
+        // (podman's client sends the whole context and names the ignore
+        // file in it; one from outside of it is added at its path)
+        if let Some(f) = call.q("ignorefile").filter(|f| !f.is_empty()) {
+            ignore_file = Some(in_context("ignorefile", f)?);
+        }
     }
     let spec = BuildSpec {
         client: if docker {
@@ -857,6 +869,7 @@ fn spec_of(
         containerfile,
         containerfile_host,
         containerfile_url,
+        ignore_file,
         remote,
         local_dir,
         output,
