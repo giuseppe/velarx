@@ -193,3 +193,22 @@ EOT
     check "...is one Containerfile with the others" yes "$(sh_ image inspect -f '{{index .Config.Labels "second"}}' localhost/e2e-fpipe:2)"
     sh_ rmi localhost/e2e-fpipe:1 localhost/e2e-fpipe:2 > /dev/null 2>&1
 }
+
+@test "build: --platform and --output may be given again" {
+    local ctx=$WORKDIR/mctx
+    mkdir -p "$ctx"
+    printf 'FROM scratch\nCOPY f /f\n' > "$ctx/Containerfile"
+    echo x > "$ctx/f"
+    sh_ image build --platform linux/amd64 --platform linux/arm64 --logfile "$ctx/log" --logsplit "$ctx" > /dev/null
+    check "build with --platform twice" 0 $?
+    for p in amd64 arm64; do
+        check_match "a build for $p" "COPY f /f" "$(cat "$ctx/log_linux_$p")"
+    done
+    sh_ image build -q -o "$WORKDIR/out-dir" -o "type=tar,dest=$WORKDIR/out.tar" "$ctx" > /dev/null
+    check "build with -o twice" 0 $?
+    check "the directory" x "$(cat "$WORKDIR/out-dir/f")"
+    check "the tar" f "$(tar -tf "$WORKDIR/out.tar" | grep -x f)"
+    out=$(sh_ image build -q -o - -o type=tar,dest=- "$ctx" 2>&1 > /dev/null)
+    check "two tars on the standard output" 125 $?
+    check_match "...are refused" "only one --output may be the standard output" "$out"
+}

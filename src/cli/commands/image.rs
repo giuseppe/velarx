@@ -1493,11 +1493,20 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                 .collect(),
             };
             velarx_wire::buildopts::BuildFlagsCheck::check(&flags).map_err(anyhow::Error::msg)?;
-            let output = output
-                .as_deref()
-                .map(velarx_wire::buildopts::parse_output)
-                .transpose()
+            let outputs = output
+                .iter()
+                .map(|o| velarx_wire::buildopts::parse_output(o))
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(anyhow::Error::msg)?;
+            // (two tars one after the other are no archive one can read)
+            if outputs
+                .iter()
+                .filter(|o| **o == velarx_wire::buildopts::Output::Tar(None))
+                .count()
+                > 1
+            {
+                anyhow::bail!("only one --output may be the standard output");
+            }
             // (read as the build routes of the API read theirs)
             let parsed = velarx_wire::text::RunText {
                 volumes: volume
@@ -1528,6 +1537,7 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                 .parse(|k| std::env::var(k).ok())
                 .map_err(anyhow::Error::msg)?;
             // (buildah's words)
+            let platform = (!platform.is_empty()).then(|| platform.join(","));
             if platform.is_some() && (os.is_some() || arch.is_some() || variant.is_some()) {
                 anyhow::bail!("invalid --platform may not be used with --os, --arch, or --variant");
             }
@@ -1931,8 +1941,8 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
             );
             shown.finish();
             let image_id = built?;
-            if let Some(output) = output {
-                export_image(&client, &image_id, &output)?;
+            for output in &outputs {
+                export_image(&client, &image_id, output)?;
             }
             // buildah: the id in the file, or else on the standard output
             match iidfile {

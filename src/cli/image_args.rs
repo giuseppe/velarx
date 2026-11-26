@@ -165,10 +165,10 @@ pub enum ImageCommands {
         /// Set the target build stage to build
         #[arg(long)]
         target: Option<String>,
-        /// Set the target platform for the build (several, comma separated:
-        /// an image for each)
-        #[arg(long)]
-        platform: Option<String>,
+        /// Set the target platform for the build (several, comma separated
+        /// or repeated: an image for each)
+        #[arg(long, value_delimiter = ',')]
+        platform: Vec<String>,
         /// The OS of the image to build (with --arch, --variant)
         #[arg(long)]
         os: Option<String>,
@@ -978,9 +978,10 @@ pub struct BuildExtra {
     #[arg(long, value_name = "DURATION")]
     pub cache_ttl: Option<String>,
     /// Write the files of the image: DIRECTORY, type=local,dest=DIRECTORY,
-    /// type=tar,dest=FILE (- for the standard output)
+    /// type=tar,dest=FILE (- for the standard output); repeatable, the image
+    /// is built once and written to each (one of them may be -)
     #[arg(long, short = 'o', value_name = "OUTPUT")]
-    pub output: Option<String>,
+    pub output: Vec<String>,
     /// An option of podman's build that has no effect there either
     #[arg(long, hide = true)]
     pub compress: bool,
