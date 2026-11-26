@@ -364,7 +364,9 @@ fcntl.ioctl(fd, 0x40806685, struct.pack("=IIIIQIIQ88x", 1, 1, 4096, 0, 0, 0, 0, 
 
 # the FUSE file system of a rootless container is served by threads of its
 # monitor: the session's, confined before it reads a request, and the I/O
-# threads, which it makes once confined; what the kernel says of each task
+# threads, which it makes once confined, at the first time it is busy (none
+# when the requests come one at a time: the unit tests of image_fs make
+# them); what the kernel says of each task
 # the pid of the image server of the root of the container with this id
 image_server_of () {
     local p
@@ -398,7 +400,6 @@ fuse_threads () { # pid of the process that serves the files (the image server):
         threads=$(fuse_threads "$srv")
         shs "$store" rm -f "t-$how" > /dev/null 2>&1
         check_match "$how: the session's thread" "^fuse " "$threads"
-        check_match "$how: its I/O threads" "^fuse-io-0 " "$threads"
         check "$how: every one under seccomp, with no_new_privs" "" "$(printf '%s\n' "$threads" | grep -v ' 2 1$')"
     done
 }
