@@ -30,8 +30,13 @@ setup_file () {
     command -v crun > /dev/null || skip "no crun"
     curl -sf -m 5 "http://$REG/v2/" > /dev/null || skip "no registry at $REG"
     e2e_setup_file
-    export IMG=$REG/alpine:chunked
     export SEALED=$REG/velarx-e2e/verity-start-$$:zstd
+    # an image whose layers state no digest of their EROFS images (another
+    # writer's): the one of the registry with the digests taken off, whoever
+    # wrote it
+    export IMG=$REG/velarx-e2e/verity-start-plain-$$:1
+    python3 -I "$E2E_DIR/registry_images.py" copy "$REG" alpine chunked "velarx-e2e/verity-start-plain-$$" 1 > /dev/null ||
+        e2e_die "an image without digests"
     cat > "$WORKDIR/registries.conf" <<EOT
 [[registry]]
 location = "$REG"
