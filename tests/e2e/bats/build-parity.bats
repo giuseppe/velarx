@@ -384,6 +384,26 @@ EOT
     sh_ rmi localhost/e2e-load:1 > /dev/null 2>&1
 }
 
+@test "build: COMMIT, the id, the names and the full id end the output, as buildah's" {
+    local ctx=$WORKDIR/octx out opt
+    mkdir -p "$ctx"
+    printf 'FROM %s\nRUN echo hello\n' "$IMAGE" > "$ctx/Containerfile"
+    # a last step that commits, a commit of the --label after it, a step
+    # of the cache
+    for opt in --no-cache --label=a=b --label=a=b; do
+        out=$(sh_ image build "$opt" -t e2e-out -t localhost/e2e-out:2 "$ctx" 2>&1)
+        check "build $opt" 0 $?
+        check "...the end of its output" "COMMIT e2e-out
+--> SHORT
+Successfully tagged localhost/e2e-out:latest
+Successfully tagged localhost/e2e-out:2
+ID" "$(printf '%s\n' "$out" | tail -n 5 | sed -E 's/^[0-9a-f]{64}$/ID/; s/^--> [0-9a-f]{12}$/--> SHORT/')"
+        check "...one COMMIT" 1 "$(printf '%s\n' "$out" | grep -c '^COMMIT')"
+    done
+    check_match "...the last one from the cache" "^--> Using cache" "$out"
+    sh_ rmi localhost/e2e-out localhost/e2e-out:2 > /dev/null 2>&1
+}
+
 @test "build: COPY keeps the hard links of what it copies" {
     local ctx=$WORKDIR/hctx
     mkdir -p "$ctx/sub/subsub"

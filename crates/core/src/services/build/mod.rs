@@ -973,6 +973,9 @@ struct StageState {
     /// The step being built makes the image the build names (the last one
     /// of the target stage, given a name): it is not an intermediate image.
     named: bool,
+    /// The next commit (or image of the build cache) is the image of the
+    /// build: buildah's `COMMIT name` comes before it.
+    last_commit: bool,
     /// The `--layer-label` labels the current image has that are not labels
     /// of the stage (an intermediate image has those it has no value for).
     layer_added: Vec<String>,
@@ -1028,6 +1031,18 @@ impl StageState {
                 v
             }
         }
+    }
+}
+
+/// The `created_by` of the history entry of a step, as buildah writes it:
+/// `/bin/sh -c COMMAND` for RUN, `/bin/sh -c #(nop) INSTRUCTION` for the
+/// others; without the values of the build arguments, which would be
+/// published with the image, and the digest of what a COPY copied.
+fn created_by(i: &Instr) -> String {
+    let text = i.text();
+    match text.strip_prefix("RUN ") {
+        Some(command) => format!("/bin/sh -c {command}"),
+        None => format!("/bin/sh -c #(nop) {text}"),
     }
 }
 
@@ -1900,8 +1915,8 @@ impl<'a> Build<'a> {
             .ok_or_else(|| BuildError::Parse("the target stage was not built".into()))?;
         let id = self.sbom(id).await?;
         for t in &self.opts.tags {
-            self.svc.image_service.tag_local(&id, t).await?;
-            self.say(format!("COMMIT {t}\n")).await;
+            let name = self.svc.image_service.tag_local(&id, t).await?;
+            self.say(format!("Successfully tagged {name}\n")).await;
         }
         Ok(id)
     }
@@ -2196,6 +2211,7 @@ impl<'a> Build<'a> {
                 ..Default::default()
             },
             named: false,
+            last_commit: false,
             layer_added: Vec::new(),
         };
         let mut triggers = Vec::new();
@@ -2317,8 +2333,18 @@ impl<'a> Build<'a> {
         // (as buildah: the image of a build without a name is an
         // intermediate one too)
         let named = last && (!self.opts.tags.is_empty() || self.opts.manifest.is_some());
+        // (the options that edit the built image make a commit of their own
+        // after the last step, as do --squash and MAINTAINER)
+        let edits_after = !self.opts.unset_env.is_empty()
+            || !self.opts.labels.is_empty()
+            || !self.opts.unset_labels.is_empty();
         for (n, i) in stage.instrs.iter().enumerate() {
             st.named = named && n + 1 == stage.instrs.len();
+            st.last_commit = last
+                && n + 1 == stage.instrs.len()
+                && !edits_after
+                && st.squash_dir.is_none()
+                && st.author.is_none();
             self.step += 1;
             let header = format!("{prefix}STEP {}/{stage_steps}: {}", n + 2, i.text());
             self.send(BuildProgress::StepStarted {
@@ -2332,6 +2358,7 @@ impl<'a> Build<'a> {
         }
 
         st.named = named;
+        st.last_commit = last;
         if last && !self.opts.unset_env.is_empty() {
             st.edit(ConfigEdit::UnsetEnv(self.opts.unset_env.clone()));
         }
@@ -2794,6 +2821,7 @@ impl<'a> Build<'a> {
             return Ok(false);
         };
         self.say(format!("--> Using cache {id}\n")).await;
+        self.say_commit(st).await;
         self.say(format!("--> {}\n", &id[..12.min(id.len())])).await;
         st.layer_added = self.layer_label_edits(st).await?.2;
         st.committed = st.edits.len();
@@ -2994,6 +3022,7 @@ impl<'a> Build<'a> {
         drop(opts);
         let _ = forwarded.await;
         let id = id.map_err(|e| self.stopped(e))?;
+        self.say_commit(st).await;
         self.say(format!("--> {}\n", &id[..12.min(id.len())])).await;
         self.intermediates.push(id.clone());
         if let Some(key) = key.filter(|_| self.caching(st)) {
@@ -3006,6 +3035,17 @@ impl<'a> Build<'a> {
         }
         st.image = Some(id);
         Ok(())
+    }
+
+    /// buildah's `COMMIT name` (the first name as given) before the id of
+    /// the image of the build, after the progress of its commit: the
+    /// output ends as buildah's.
+    async fn say_commit(&mut self, st: &mut StageState) {
+        if std::mem::take(&mut st.last_commit) {
+            let name = self.opts.tags.first().map(|t| format!(" {t}"));
+            self.say(format!("COMMIT{}\n", name.unwrap_or_default()))
+                .await;
+        }
     }
 
     async fn metadata(&mut self, st: &mut StageState, i: &Instr) -> BuildResult<()> {
@@ -3984,7 +4024,7 @@ impl<'a> Build<'a> {
         };
         self.commit(
             st,
-            &i.text(),
+            &created_by(i),
             Some(Changes::Dir(upper.to_path_buf())),
             files_onto(tree),
             key.as_deref(),

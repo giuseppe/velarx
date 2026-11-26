@@ -1125,7 +1125,7 @@ impl Build<'_> {
                         Ok(squash) => self
                             .commit(
                                 st,
-                                &i.text(),
+                                &created_by(i),
                                 diff.map(Changes::Writable),
                                 walk.clone(),
                                 (!mounts.changed).then_some(&key),

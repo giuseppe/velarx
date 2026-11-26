@@ -58,7 +58,9 @@ fn request_of(
     }
     flags.check().map_err(ApiError::bad_request)?;
     let options = BuildOptions {
-        tags: tags.clone(),
+        // (as given on libpod: the engine qualifies them, and the build
+        // says the first one as written)
+        tags: if compat { tags.clone() } else { spec.tags },
         build_args: velarx_proto::buildspec::unpair(spec.build_args).collect(),
         no_cache: spec.no_cache,
         layers: spec.layers,

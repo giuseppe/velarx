@@ -599,10 +599,17 @@ impl ImageService {
     }
 
     /// Name an image; a name without a registry is `localhost/NAME`.
-    pub async fn tag_local(&self, source: &str, name: &str) -> ImageResult<()> {
+    /// Returns the full name (`localhost/NAME:latest`).
+    pub async fn tag_local(&self, source: &str, name: &str) -> ImageResult<String> {
         let local = local_reference(name)?;
-        ImageReference::parse(&local)?.validate()?;
-        self.tag(source, &local).await
+        let r = ImageReference::parse(&local)?;
+        r.validate()?;
+        self.tag(source, &local).await?;
+        Ok(format!(
+            "{}:{}",
+            r.name(),
+            r.tag.as_deref().unwrap_or("latest")
+        ))
     }
 
     /// The merged tree of the layers of an image and the bytes of its

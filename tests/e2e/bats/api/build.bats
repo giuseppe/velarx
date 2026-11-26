@@ -27,7 +27,7 @@ teardown () {
 # The output of the last step of a build's standard output (the progress of
 # the commit is on the standard error, as podman's).
 last_step () {
-    awk '/STEP [0-9]+\/[0-9]+: /{buf=""; grab=1; next} grab && /^-->/{grab=0} grab{buf=buf $0 "\n"} END{printf "%s", buf}'
+    awk '/STEP [0-9]+\/[0-9]+: /{buf=""; grab=1; next} grab && /^(-->|COMMIT)/{grab=0} grab{buf=buf $0 "\n"} END{printf "%s", buf}'
 }
 
 # The variables of the builds and the context (made once), the content checks
@@ -84,8 +84,9 @@ echo done
     # The intermediate images are kept as the build cache, not shown (the
     # earlier stages are, without a name).
     check "no intermediate image shown" "$((before + 1))" "$(pm images -q --filter dangling=false | sort -u | wc -l)"
-    out=$(pm history --format '{{.CreatedBy}}' localhost/built:e2e | head -3 | tr '\n' '|')
-    check_match "history of the steps" "RUN test" "$out"
+    out=$(pm history --no-trunc --format '{{.CreatedBy}}' localhost/built:e2e | head -5 | tr '\n' '|')
+    check_match "history of the steps, as buildah's" '[|]/bin/sh -c test "[$]LEGACY" = "legacy value"[|]' "$out"
+    check_match "...a step that is not RUN" '[|]/bin/sh -c #[(]nop[)] ADD hello.txt /app/added.txt[|]' "$out"
 }
 
 @test "--target, --squash and --squash-all" {
@@ -396,6 +397,8 @@ uid=1234 gid=2345 groups=2345
     check "a RUN's standard output on the standard output" "to-out" "$(printf '%s\n' "$out" | last_step)"
     check_match "and the image id last" "^[0-9a-f]{64}$" "$(printf '%s\n' "$out" | tail -n 1)"
     check "a RUN's standard error on the standard error" "to-err" "$(grep '^to-' "$bw/streams.err")"
+    out=$(pm build --tls-verify=false -t built:streams "$uctx" 2>&1)
+    check "podman build: COMMIT and the first name as given" "COMMIT built:streams" "$(printf '%s\n' "$out" | grep '^COMMIT')"
     out=$("$CLI" image build -q --no-cache --tls-verify=false -t built:streams "$uctx" 2> "$bw/streams.err")
     check "build -q: the RUN's output" "to-out" "$(printf '%s\n' "$out" | head -n 1)"
     check_match "and the full id" "^[0-9a-f]{64}$" "$(printf '%s\n' "$out" | sed 1d)"
