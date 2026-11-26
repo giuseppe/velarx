@@ -462,6 +462,15 @@ impl LayerCompression {
             _ => None,
         }
     }
+
+    /// `--compression-format` / `compressionFormat` of a build: a word
+    /// podman knows.  The layers of a build are stored uncompressed, so it
+    /// changes nothing; the compression is a push's.
+    pub fn check_for_build(word: &str) -> Result<(), String> {
+        Self::of_word(word)
+            .map(drop)
+            .ok_or_else(|| format!("invalid compression `{word}`"))
+    }
 }
 
 /// What `StorageInspect` answers: the file system of the storage.

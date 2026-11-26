@@ -1054,10 +1054,20 @@ pub struct BuildExtra {
     /// Pass the proxy variables of this command to the RUN steps (default: true)
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     pub http_proxy: Option<bool>,
-    /// As podman's, no effect on the images of the store: their layers are
-    /// compressed as --compression-format says
+    /// As podman's, no effect: the layers of a build are stored
+    /// uncompressed
     #[arg(long, short = 'D', hide = true, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     pub disable_compression: Option<bool>,
+    /// Checked, no effect: the layers of a build are stored uncompressed
+    /// (gzip, zstd, zstd:chunked or none)
+    #[arg(long, value_name = "FORMAT")]
+    pub compression_format: Option<String>,
+    /// Checked, no effect (the layers of a build are stored uncompressed)
+    #[arg(long, value_name = "LEVEL")]
+    pub compression_level: Option<i32>,
+    /// Checked, no effect (the layers of a build are stored uncompressed)
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub force_compression: Option<bool>,
     /// A flag of the OCI runtime for the RUN steps (as the global --runtime-flag)
     #[arg(long, value_name = "FLAG")]
     pub runtime_flag: Vec<String>,

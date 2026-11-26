@@ -377,7 +377,7 @@ mod tests {
     /// says so.  A new one must be refused (`anyhow::bail!("--x is not
     /// supported ...")`) or used; one that is truly harmless goes here with
     /// its reason.
-    const DROPPED_OPTIONS: [(&str, &str, &str); 20] = [
+    const DROPPED_OPTIONS: [(&str, &str, &str); 21] = [
         (
             "commands/image.rs",
             "quiet",
@@ -385,8 +385,13 @@ mod tests {
         ),
         (
             "commands/image.rs",
+            "compression_level",
+            "a build stores its layers uncompressed, as the build route of the API",
+        ),
+        (
+            "commands/image.rs",
             "disable_compression",
-            "as podman's local storage: the layers of the store follow --compression-format",
+            "a build stores its layers uncompressed, as the build route of the API",
         ),
         (
             "commands/image.rs",
@@ -432,7 +437,7 @@ mod tests {
         (
             "commands/image.rs",
             "force_compression",
-            "a push compresses as asked: velarx knows of no other variant of a layer to take",
+            "a push compresses as asked: velarx knows of no other variant of a layer to take; a build stores its layers uncompressed",
         ),
         (
             "commands/image.rs",

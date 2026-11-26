@@ -1344,6 +1344,9 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                 os_feature,
                 http_proxy,
                 disable_compression: _,
+                compression_format,
+                compression_level: _,
+                force_compression: _,
                 // (taken as the global options: src/cli/mod.rs)
                 runtime_flag: _,
                 hooks_dir: _,
@@ -1493,6 +1496,10 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                 .collect(),
             };
             velarx_wire::buildopts::BuildFlagsCheck::check(&flags).map_err(anyhow::Error::msg)?;
+            if let Some(c) = compression_format.as_deref() {
+                velarx_proto::engine::LayerCompression::check_for_build(c)
+                    .map_err(anyhow::Error::msg)?;
+            }
             let outputs = output
                 .iter()
                 .map(|o| velarx_wire::buildopts::parse_output(o))

@@ -212,3 +212,20 @@ EOT
     check "two tars on the standard output" 125 $?
     check_match "...are refused" "only one --output may be the standard output" "$out"
 }
+
+@test "build: --compression-format, --compression-level and --force-compression are checked and change nothing" {
+    local ctx=$WORKDIR/cctx
+    mkdir -p "$ctx"
+    printf 'FROM scratch\nCOPY f /f\n' > "$ctx/Containerfile"
+    echo x > "$ctx/f"
+    sh_ image build -q --compression-format zstd:chunked --compression-level 3 --force-compression -t localhost/e2e-comp:1 "$ctx" > /dev/null
+    check "build with the compression options" 0 $?
+    sh_ image build -q --compression-format gzip --force-compression=false -t localhost/e2e-comp:2 "$ctx" > /dev/null
+    check "build with gzip" 0 $?
+    out=$(sh_ image build -q --compression-format lz4 -t localhost/e2e-comp:3 "$ctx" 2>&1)
+    check "an unknown format" 125 $?
+    check_match "...is named" "invalid compression .lz4." "$out"
+    out=$(sh_ image build -q --compression-level x -t localhost/e2e-comp:3 "$ctx" 2>&1)
+    check "a level that is no number" 125 $?
+    sh_ rmi localhost/e2e-comp:1 localhost/e2e-comp:2 > /dev/null 2>&1
+}

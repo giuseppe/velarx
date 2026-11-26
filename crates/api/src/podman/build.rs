@@ -627,8 +627,8 @@ fn spec_of(
     refuse_unsupported(call)?;
     let ns_options = NsOptions::of(call)?;
     if let Some(c) = call.q("compressionformat").filter(|c| !c.is_empty()) {
-        velarx_proto::engine::LayerCompression::of_word(c)
-            .ok_or_else(|| ApiError::bad_request(format!("invalid compression `{c}`")))?;
+        velarx_proto::engine::LayerCompression::check_for_build(c)
+            .map_err(ApiError::bad_request)?;
     }
     q_number::<i32>(call, "compressionlevel")?;
     call.q_bool("forcecompressionformat", false)?;
