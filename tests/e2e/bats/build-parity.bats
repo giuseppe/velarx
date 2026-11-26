@@ -350,6 +350,106 @@ EOT
     sh_ rmi localhost/e2e-policy:1 > /dev/null 2>&1
 }
 
+@test "build --source-policy-file: COPY --from and RUN --mount from take an image" {
+    local ctx=$WORKDIR/pctx3 src=localhost/e2e-psrc:1 gone=$E2E_REGISTRY/velarx-e2e/not-there:1 out rc kind base step uses gets
+    mkdir -p "$ctx/src"
+    echo marker > "$ctx/src/marker"
+    printf 'FROM scratch\nCOPY marker /marker\n' > "$ctx/src/Containerfile"
+    sh_ image build -q -t "$src" "$ctx/src" > /dev/null
+    check "the image to take files from" 0 $?
+    # the base is allowed, the images the steps take are the policy's to say
+    cat > "$WORKDIR/deny3.json" <<EOT
+{"rules": [
+  {"action": "ALLOW", "selector": {"identifier": "docker-image://$IMAGE", "matchType": "EXACT"}},
+  {"action": "DENY", "selector": {"identifier": "docker-image://localhost/*"}}
+]}
+EOT
+    cat > "$WORKDIR/convert3.json" <<EOT
+{"rules": [
+  {"action": "CONVERT", "selector": {"identifier": "docker-image://$gone", "matchType": "EXACT"},
+   "updates": {"identifier": "docker-image://$src"}}
+]}
+EOT
+    cat > "$WORKDIR/keep3.json" <<EOT
+{"rules": [{"action": "ALLOW", "selector": {"identifier": "docker-image://localhost/*"}}]}
+EOT
+    # the image named in the step, or a named context of the build that is
+    # an image
+    for kind in copy mount copy-context mount-context; do
+        base=scratch step='COPY --from=%s /marker /got'
+        case $kind in
+        mount*) base=$IMAGE step='RUN --mount=type=bind,from=%s,source=/marker,target=/m cp /m /got' ;;
+        esac
+        case $kind in
+        *-context)
+            printf "FROM %s\n$step\n" "$base" img > "$ctx/Containerfile.deny"
+            cp "$ctx/Containerfile.deny" "$ctx/Containerfile.convert"
+            uses=(--build-context "img=docker-image://$src")
+            gets=(--build-context "img=docker-image://$gone")
+            ;;
+        *)
+            printf "FROM %s\n$step\n" "$base" "$src" > "$ctx/Containerfile.deny"
+            printf "FROM %s\n$step\n" "$base" "$gone" > "$ctx/Containerfile.convert"
+            uses=() gets=()
+            ;;
+        esac
+        rc=0
+        out=$(sh_ image build -q --source-policy-file "$WORKDIR/deny3.json" "${uses[@]}" -f "$ctx/Containerfile.deny" "$ctx" 2>&1) || rc=$?
+        check "$kind: an image the policy denies" 125 $rc
+        check_match "$kind: ...says by which rule" "$src is denied by the source policy: matched rule 1" "$out"
+        rc=0
+        sh_ image build -q --source-policy-file "$WORKDIR/keep3.json" "${uses[@]}" -f "$ctx/Containerfile.deny" -o "$WORKDIR/kept-$kind" "$ctx" > /dev/null 2>&1 || rc=$?
+        check "$kind: an image the policy allows" 0 $rc
+        rc=0
+        sh_ image build -q --source-policy-file "$WORKDIR/convert3.json" "${gets[@]}" -f "$ctx/Containerfile.convert" -o "$WORKDIR/conv-$kind" "$ctx" > /dev/null 2>&1 || rc=$?
+        check "$kind: an image converted to another" 0 $rc
+        check "$kind: ...is the one taken" marker "$(cat "$WORKDIR/conv-$kind/got")"
+    done
+    # FROM a named context that is an image
+    printf 'FROM img\n' > "$ctx/Containerfile.from"
+    rc=0
+    out=$(sh_ image build -q --source-policy-file "$WORKDIR/deny3.json" --build-context "img=docker-image://$src" -f "$ctx/Containerfile.from" "$ctx" 2>&1) || rc=$?
+    check "a base named by a context, denied" 125 $rc
+    check_match "...by the name of its image" "base image $src is denied by the source policy: matched rule 1" "$out"
+    # a stage is not an image of a registry: the policy leaves it alone
+    printf 'FROM scratch AS first\nCOPY marker /marker\nFROM scratch\nCOPY --from=first /marker /got\n' > "$ctx/Containerfile.stage"
+    cp "$ctx/src/marker" "$ctx/marker"
+    echo '{"rules": [{"action": "DENY", "selector": {"identifier": "docker-image://*"}}]}' > "$WORKDIR/denyall3.json"
+    sh_ image build -q --source-policy-file "$WORKDIR/denyall3.json" -f "$ctx/Containerfile.stage" -o "$WORKDIR/stage" "$ctx" > /dev/null 2>&1
+    check "COPY --from a stage" 0 $?
+    sh_ rmi localhost/e2e-psrc:1 > /dev/null 2>&1
+}
+
+@test "build --all-platforms: the source policy judges the bases before their lists are read" {
+    local ctx=$WORKDIR/actx port
+    mkdir -p "$ctx"
+    ( setsid python3 -I "$E2E_DIR/registry_log.py" "$E2E_REGISTRY" "$WORKDIR/registry.log" > "$WORKDIR/registry.port" 2> /dev/null 3>&- &
+      echo $! > "$WORKDIR/registry.pid" )
+    e2e_wait_content "$WORKDIR/registry.port" '[0-9]' 10
+    port=$(cat "$WORKDIR/registry.port")
+    printf 'FROM 127.0.0.1:%s/alpine:latest\n' "$port" > "$ctx/Containerfile"
+    echo '{"rules": [{"action": "DENY", "selector": {"identifier": "docker-image://127.0.0.1:*"}}]}' > "$WORKDIR/deny-all.json"
+    rc=0
+    out=$(sh_ image build -q --tls-verify=false --all-platforms --source-policy-file "$WORKDIR/deny-all.json" "$ctx" 2>&1) || rc=$?
+    check "a base denied, with --all-platforms" 125 $rc
+    check_match "...by the policy" "base image 127.0.0.1:$port/alpine:latest is denied by the source policy: matched rule 0" "$out"
+    # a base named by a context is judged by the name of its image
+    printf 'FROM img\n' > "$ctx/Containerfile.ctx"
+    rc=0
+    out=$(sh_ image build -q --tls-verify=false --all-platforms --source-policy-file "$WORKDIR/deny-all.json" --build-context "img=docker-image://127.0.0.1:$port/alpine:latest" -f "$ctx/Containerfile.ctx" "$ctx" 2>&1) || rc=$?
+    check "a base named by a context, denied" 125 $rc
+    check_match "...by the name of its image" "base image 127.0.0.1:$port/alpine:latest is denied" "$out"
+    # --from is the base of the first stage, judged in place of the FROM
+    printf 'FROM scratch\n' > "$ctx/Containerfile.scratch"
+    rc=0
+    out=$(sh_ image build -q --tls-verify=false --all-platforms --source-policy-file "$WORKDIR/deny-all.json" --from "127.0.0.1:$port/alpine:latest" -f "$ctx/Containerfile.scratch" "$ctx" 2>&1) || rc=$?
+    check "a base given by --from, denied" 125 $rc
+    check_match "...by its name" "base image 127.0.0.1:$port/alpine:latest is denied" "$out"
+    [ ! -s "$WORKDIR/registry.log" ]
+    check "the registry was not asked" 0 $?
+    kill "$(cat "$WORKDIR/registry.pid")" 2> /dev/null
+}
+
 @test "build: a ! pattern takes back from an ignored directory only where it names it" {
     local ctx=$WORKDIR/ictx
     mkdir -p "$ctx/subdir1" "$ctx/subdir2"

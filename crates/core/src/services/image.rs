@@ -868,12 +868,7 @@ impl ImageService {
         &self,
         image_ref: &ImageReference,
     ) -> ImageResult<(String, Vec<velarx_signature::PolicyRequirement>)> {
-        use velarx_signature::SignaturePolicy;
-        let policy = match &self.pull_config.policy_path {
-            Some(path) => SignaturePolicy::load(path),
-            None => SignaturePolicy::load_default(),
-        }
-        .map_err(|e| ImageError::Registry(format!("cannot read the signature policy: {e}")))?;
+        let policy = self.signature_policy()?;
         let (scope, requirements) =
             policy.scoped_requirements_for("docker", &signatures::intended(image_ref)?);
         if requirements.is_empty() {
@@ -883,6 +878,31 @@ impl ImageService {
             )));
         }
         Ok((scope, requirements.to_vec()))
+    }
+
+    /// The signature policy: `policy_path`, else the default files.
+    fn signature_policy(&self) -> ImageResult<velarx_signature::SignaturePolicy> {
+        use velarx_signature::SignaturePolicy;
+        match &self.pull_config.policy_path {
+            Some(path) => SignaturePolicy::load(path),
+            None => SignaturePolicy::load_default(),
+        }
+        .map_err(|e| ImageError::Registry(format!("cannot read the signature policy: {e}")))
+    }
+
+    /// The policy for a pull from a transport of `[[transports]]`: it has
+    /// no name to judge and its signatures are not verified, so one whose
+    /// requirements for `scheme` need signatures (or reject it) is
+    /// refused.
+    pub(super) fn check_transport_policy(&self, scheme: &str) -> ImageResult<()> {
+        use velarx_signature::evaluate::{needs_signatures, Mode};
+        let policy = self.signature_policy()?;
+        if needs_signatures(Mode::Whole, policy.transport_requirements(scheme)) {
+            return Err(ImageError::Registry(format!(
+                "the signature policy does not accept an image of {scheme}:// without signatures, and a pull from it does not verify them"
+            )));
+        }
+        Ok(())
     }
 
     /// The policy for what reads or copies an image without verifying its

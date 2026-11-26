@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `--source-policy-file`: a BuildKit source policy for the base images of
-//! the stages.  The rules are tried in order and the first that matches
-//! the image (`docker-image://REGISTRY/REPOSITORY:TAG`, the name written in
+//! `--source-policy-file`: a BuildKit source policy for every image a build
+//! takes: the bases of the stages (also when only the platforms of their
+//! indexes are read, for `--all-platforms`) and the images of `COPY --from` and
+//! `RUN --mount from`, named directly or through `--build-context` (a stage
+//! is not an image).  The rules are tried in order and the first that matches the
+//! image (`docker-image://REGISTRY/REPOSITORY:TAG`, the name written in
 //! full, `latest` for none) allows it, denies it or converts it to another
 //! reference; an image no rule matches is allowed.  Only what is understood
 //! is accepted: a rule with a field not named here, or a `REGEX` selector,
@@ -55,7 +58,7 @@ struct Updates {
     identifier: String,
 }
 
-/// What the policy says of a base image.
+/// What the policy says of an image a build takes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Decision {
     /// Use the image as it is.
@@ -86,7 +89,7 @@ impl SourcePolicy {
         Ok(policy)
     }
 
-    /// What the policy says of the base image `name`, as written in the
+    /// What the policy says of the image `name`, as written in the
     /// Containerfile.
     pub fn decide(&self, name: &str) -> Decision {
         let source = match name.starts_with(IMAGE_SCHEME) {

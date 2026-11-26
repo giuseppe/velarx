@@ -386,23 +386,25 @@ impl Build<'_> {
                 path: self.ctx.path.clone(),
             }));
         };
-        Ok(match self.opts.contexts.get(from) {
-            Some(NamedContext::Dir(d)) => Root::Dir(DirRoot {
-                fd: open_path_dir(d)?,
-                context: false,
-                path: Some(d.clone()),
-            }),
-            Some(NamedContext::Image(i)) => {
-                Root::Image(self.ensure_image(i, self.opts.platform.as_deref()).await?)
+        let image = match self.opts.contexts.get(from) {
+            Some(NamedContext::Dir(d)) => {
+                return Ok(Root::Dir(DirRoot {
+                    fd: open_path_dir(d)?,
+                    context: false,
+                    path: Some(d.clone()),
+                }))
             }
+            Some(NamedContext::Image(i)) => i,
             None => match self.stage_image(from, st.index) {
-                Some(id) => Root::Image(id),
-                None => Root::Image(
-                    self.ensure_image(from, self.opts.platform.as_deref())
-                        .await?,
-                ),
+                Some(id) => return Ok(Root::Image(id)),
+                None => from,
             },
-        })
+        };
+        let image = self.judged(image, "the RUN --mount image").await?;
+        Ok(Root::Image(
+            self.ensure_image(&image, self.opts.platform.as_deref())
+                .await?,
+        ))
     }
 
     /// Whether `path` is a directory of the image `id`.

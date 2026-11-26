@@ -835,6 +835,38 @@ mod tests {
         (tmp, service)
     }
 
+    /// A pull from a transport is judged by the policy of its scheme
+    /// before anything is asked: `reject` and a signature requirement
+    /// refuse it, an accepting policy goes on (to the transport, which
+    /// this service lacks).
+    #[tokio::test]
+    async fn a_transport_origin_is_judged_by_the_policy() {
+        let pull = |service: ImageService| async move {
+            let origin = velarx_content::origin::Origin::Transport {
+                scheme: "s3".into(),
+                location: "bucket/image".into(),
+            };
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            service
+                .pull_origin(&origin, None, &Default::default(), tx)
+                .await
+                .unwrap_err()
+                .to_string()
+        };
+        for rule in [
+            r#"{"type": "reject"}"#,
+            r#"{"type": "signedBy", "keyType": "GPGKeys", "keyPath": "/k"}"#,
+        ] {
+            let (_tmp, service) = with_policy(&format!(r#"{{"default": [{rule}]}}"#)).await;
+            let said = pull(service).await;
+            assert!(said.contains("signature policy"), "{said}");
+        }
+        let (_tmp, service) =
+            with_policy(r#"{"default": [{"type": "insecureAcceptAnything"}]}"#).await;
+        let said = pull(service).await;
+        assert!(said.contains("no transport is configured"), "{said}");
+    }
+
     fn scope_of(service: &ImageService, name: &str) -> String {
         service
             .scoped_requirements_of(&ImageReference::parse(name).unwrap())

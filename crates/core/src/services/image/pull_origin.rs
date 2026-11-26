@@ -224,6 +224,7 @@ impl ImageService {
                 )
             }
             Origin::Transport { scheme, location } => {
+                self.check_transport_policy(scheme)?;
                 let def = transport_of(&self.transports, scheme)?;
                 let access =
                     velarx_content::pull::access::access_for_transport(location, &options.access)?;

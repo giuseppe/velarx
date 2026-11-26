@@ -1439,14 +1439,27 @@ impl BuildService {
         opts: &BuildOptions,
     ) -> BuildResult<Vec<velarx_registry::target::Platform>> {
         let file = Containerfile::parse(&ctx.containerfile()?).map_err(BuildError::Parse)?;
-        let bases = base_images(&file, &opts.build_args, None)?;
+        let bases = base_images(&file, &opts.build_args, None, opts.flags.from.as_deref())?;
         if bases.is_empty() {
             return Err(BuildError::Parse(
                 "--all-platforms: the build uses no base image but scratch".into(),
             ));
         }
+        let policy = source_policy(opts)?;
         let mut common: Option<Vec<String>> = None;
         for base in &bases {
+            // FROM a named context: its image.
+            let base = match opts.contexts.get(base) {
+                Some(NamedContext::Image(image)) => image,
+                _ => base,
+            };
+            let base = &judge(
+                policy.as_deref(),
+                &self.image_service,
+                base,
+                "the base image",
+            )
+            .await?;
             let access = access_for(
                 &self.image_service,
                 &opts.access,
@@ -1528,14 +1541,7 @@ impl BuildService {
             .map(velarx_registry::target::Platform::parse)
             .transpose()
             .map_err(BuildError::Parse)?;
-        let policy = opts
-            .flags
-            .source_policy
-            .as_deref()
-            .map(policy::SourcePolicy::parse)
-            .transpose()
-            .map_err(BuildError::Parse)?
-            .map(Arc::new);
+        let policy = source_policy(opts)?;
         let opts = &BuildOptions {
             network: build_network(opts.network.as_deref())?.map(|m| m.to_string()),
             ..opts.clone()
@@ -1984,6 +1990,21 @@ impl<'a> Build<'a> {
         stage_before(&self.file.stages, name, before)
     }
 
+    /// `--source-policy-file`: the image `reference` that the build is
+    /// about to pull or use from the store (`what`: a base, the image of a
+    /// `COPY --from` or of a `RUN --mount from`, directly or through a
+    /// named context), as the policy has it.  A short name is decided,
+    /// and then pulled, by the one name it stands for.
+    async fn judged(&self, reference: &str, what: &str) -> BuildResult<String> {
+        judge(
+            self.policy.as_deref(),
+            &self.svc.image_service,
+            reference,
+            what,
+        )
+        .await
+    }
+
     /// The credentials the build has for the registry of `reference`.
     async fn access_of(
         &self,
@@ -2148,7 +2169,7 @@ impl<'a> Build<'a> {
             _ => base,
         };
         // FROM a named context: its image.
-        let base = match self.opts.contexts.get(&base) {
+        let mut base = match self.opts.contexts.get(&base) {
             Some(NamedContext::Image(image)) => image.clone(),
             Some(NamedContext::Dir(_)) => {
                 return Err(BuildError::Parse(format!(
@@ -2157,29 +2178,13 @@ impl<'a> Build<'a> {
             }
             None => base,
         };
-        // `--source-policy-file`: the base images, not a stage; a short name
-        // is decided, and then pulled, by the one name it stands for
-        let base = match self.policy.clone() {
-            Some(policy) if base != "scratch" && self.stage_index(&base, index).is_none() => {
-                let base = self.svc.image_service.qualify(&base).await?;
-                match policy.decide(&base) {
-                    policy::Decision::Keep => base,
-                    policy::Decision::Convert(to) => to,
-                    policy::Decision::Deny(rule) => {
-                        return Err(BuildError::Parse(format!(
-                            "the base image {base} is denied by the source policy: {rule}"
-                        )))
-                    }
-                }
-            }
-            _ => base,
-        };
         let image = if base == "scratch" {
             None
         } else {
             match self.stage_image(&base, index) {
                 Some(id) => Some(id),
                 None => {
+                    base = self.judged(&base, "the base image").await?;
                     let platform = stage
                         .platform
                         .as_deref()
@@ -3843,6 +3848,7 @@ impl<'a> Build<'a> {
                     let image = match self.stage_image(&from, st.index) {
                         Some(id) => id,
                         None => {
+                            let from = self.judged(&from, "the COPY --from image").await?;
                             self.ensure_image(&from, self.opts.platform.as_deref())
                                 .await?
                         }
@@ -4235,11 +4241,13 @@ fn platform_args(
 }
 
 /// The base images of the stages (not scratch, not an earlier stage), the
-/// global arguments expanded as the build expands them.
+/// global arguments expanded as the build expands them; `from` (`--from`)
+/// is the base of the first stage.
 fn base_images(
     file: &Containerfile,
     build_args: &HashMap<String, String>,
     platform: Option<&velarx_registry::target::Platform>,
+    from: Option<&str>,
 ) -> BuildResult<Vec<String>> {
     let predefined = platform_args(platform, build_args);
     let mut globals = predefined.clone();
@@ -4261,13 +4269,51 @@ fn base_images(
     let lookup = lookup(&globals);
     let mut out: Vec<String> = Vec::new();
     for (i, stage) in file.stages.iter().enumerate() {
-        let base = parse::expand(&stage.base, file.escape, &lookup).map_err(BuildError::Parse)?;
+        let base = match (from, i) {
+            // `--from`: the base of the first stage
+            (Some(from), 0) => from.to_string(),
+            _ => parse::expand(&stage.base, file.escape, &lookup).map_err(BuildError::Parse)?,
+        };
         let earlier = stage_before(&file.stages, &base, i).is_some();
         if base != "scratch" && !earlier && !out.contains(&base) {
             out.push(base);
         }
     }
     Ok(out)
+}
+
+/// `--source-policy-file`, read.
+fn source_policy(opts: &BuildOptions) -> BuildResult<Option<Arc<policy::SourcePolicy>>> {
+    Ok(opts
+        .flags
+        .source_policy
+        .as_deref()
+        .map(policy::SourcePolicy::parse)
+        .transpose()
+        .map_err(BuildError::Parse)?
+        .map(Arc::new))
+}
+
+/// The image `reference` as the source `policy` has it, an error if it is
+/// denied; `what` says what the build takes it for.  A short name is
+/// decided, and then pulled, by the one name it stands for.
+async fn judge(
+    policy: Option<&policy::SourcePolicy>,
+    images: &ImageService,
+    reference: &str,
+    what: &str,
+) -> BuildResult<String> {
+    let Some(policy) = policy else {
+        return Ok(reference.to_string());
+    };
+    let name = images.qualify(reference).await?;
+    match policy.decide(&name) {
+        policy::Decision::Keep => Ok(name),
+        policy::Decision::Convert(to) => Ok(to),
+        policy::Decision::Deny(rule) => Err(BuildError::Parse(format!(
+            "{what} {name} is denied by the source policy: {rule}"
+        ))),
+    }
 }
 
 /// The platform of an instance of an index, as --all-platforms takes it:
@@ -4771,6 +4817,40 @@ mod tests {
     use super::*;
     use velarx_storage::TocEntry;
 
+    /// The policy judges a reference as one function for every place the
+    /// build reads an image, the platform lists of the bases included.
+    #[tokio::test]
+    async fn a_policy_denies_or_converts_a_reference_before_it_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images = ImageService::new(
+            velarx_db::Database::open_in_memory().await.unwrap(),
+            Arc::new(velarx_storage::FileStore::new(tmp.path().join("objects")).unwrap()),
+            tmp.path().join("pulls"),
+            velarx_storage::VerityMode::Off,
+        )
+        .unwrap();
+        let policy = policy::SourcePolicy::parse(
+            r#"{"rules": [
+              {"action": "DENY", "selector": {"identifier": "docker-image://r.io/denied:1"}},
+              {"action": "CONVERT", "selector": {"identifier": "docker-image://r.io/old:1"},
+               "updates": {"identifier": "docker-image://r.io/new:1"}}
+            ]}"#,
+        )
+        .unwrap();
+        let judged = |r: &'static str| judge(Some(&policy), &images, r, "the base image");
+        let denied = judged("r.io/denied:1").await.unwrap_err().to_string();
+        assert!(
+            denied.contains(
+                "the base image r.io/denied:1 is denied by the source policy: matched rule 0"
+            ),
+            "{denied}"
+        );
+        assert_eq!(judged("r.io/old:1").await.unwrap(), "r.io/new:1");
+        assert_eq!(judged("r.io/other:1").await.unwrap(), "r.io/other:1");
+        let none = judge(None, &images, "r.io/denied:1", "the base image");
+        assert_eq!(none.await.unwrap(), "r.io/denied:1");
+    }
+
     #[test]
     fn test_platforms_and_bases_of_all_platforms() {
         let p = |v: Value| index_platform(&v).map(|p| p.to_string());
@@ -4796,11 +4876,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            base_images(&f, &HashMap::new(), None).unwrap(),
+            base_images(&f, &HashMap::new(), None, None).unwrap(),
             ["a:1", "b"]
         );
         let args = HashMap::from([("BASE".to_string(), "c".to_string())]);
-        assert_eq!(base_images(&f, &args, None).unwrap(), ["c", "b", "a:1"]);
+        assert_eq!(
+            base_images(&f, &args, None, None).unwrap(),
+            ["c", "b", "a:1"]
+        );
+        // (`--from` is the base of the first stage)
+        assert_eq!(
+            base_images(&f, &HashMap::new(), None, Some("d")).unwrap(),
+            ["d", "b", "a:1"]
+        );
     }
 
     #[test]
@@ -4824,7 +4912,7 @@ mod tests {
         // (a base image may use them)
         let f = Containerfile::parse("FROM img-$TARGETARCH\n").unwrap();
         assert_eq!(
-            base_images(&f, &HashMap::new(), Some(&target)).unwrap(),
+            base_images(&f, &HashMap::new(), Some(&target), None).unwrap(),
             ["img-arm64"]
         );
     }

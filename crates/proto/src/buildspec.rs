@@ -64,7 +64,9 @@ pub struct BuildFlags {
     /// built, those it does not use too.
     pub skip_unused_stages: bool,
     /// `--source-policy-file`: the text of a BuildKit source policy, which
-    /// allows, denies or converts the base images of the stages.
+    /// allows, denies or converts every image of the build: the bases of
+    /// the stages, `COPY --from` and `RUN --mount from`, also through a
+    /// named context.
     pub source_policy: Option<String>,
     /// `--save-stages`: the image of every stage stays after the build.
     pub save_stages: bool,

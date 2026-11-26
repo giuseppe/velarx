@@ -993,7 +993,8 @@ pub struct BuildExtra {
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     pub skip_unused_stages: Option<bool>,
     /// A BuildKit source policy (JSON) that allows, denies or converts the
-    /// base images of the stages
+    /// images of the build: bases, COPY --from and RUN --mount from, also
+    /// through --build-context
     #[arg(long, value_name = "PATH")]
     pub source_policy_file: Option<PathBuf>,
     /// Keep the image of every stage (default: false)

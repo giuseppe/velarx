@@ -273,6 +273,16 @@ impl SignaturePolicy {
         self.scoped_requirements_for(transport, reference).1
     }
 
+    /// The requirements for what a transport serves whole, with no name
+    /// the scopes could match: the default of the transport, else the
+    /// default.
+    pub fn transport_requirements(&self, transport: &str) -> &[PolicyRequirement] {
+        self.transports
+            .get(transport)
+            .and_then(|scopes| scopes.get(""))
+            .unwrap_or(&self.default)
+    }
+
     /// Like [`Self::requirements_for`], with the scope that applies, as a
     /// message names it.
     pub fn scoped_requirements_for(
@@ -508,6 +518,25 @@ mod tests {
             body.join(",")
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn a_transport_has_its_default_else_the_default() {
+        let policy = SignaturePolicy::parse(
+            r#"{"default": [{"type": "insecureAcceptAnything"}],
+                "transports": {"s3": {"": [{"type": "reject"}], "a": [{"type": "reject"}]},
+                               "gs": {"a": [{"type": "reject"}]}}}"#,
+        )
+        .unwrap();
+        let rejects = |t: &str| {
+            matches!(
+                policy.transport_requirements(t),
+                [PolicyRequirement::Reject]
+            )
+        };
+        assert!(rejects("s3"));
+        assert!(!rejects("gs"));
+        assert!(!rejects("other"));
     }
 
     #[test]
