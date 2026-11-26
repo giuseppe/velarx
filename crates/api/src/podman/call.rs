@@ -36,6 +36,43 @@ pub struct Call {
     pub socket: Option<LocalSocket>,
 }
 
+/// The most of a request body that nobody read that is read and thrown
+/// away.
+const MAX_DISCARDED_BODY: usize = 64 * 1024 * 1024;
+
+/// A request answered before its body was read (a refused parameter, no
+/// route) leaves the body to the connection, which closes when the body
+/// is dropped unread: the client, still writing, gets a reset and loses
+/// the answer.  The rest of the body is read and thrown away, up to a
+/// bound, while the answer goes out.
+pub(super) fn discard(body: Body) {
+    use axum::body::HttpBody;
+    use futures::StreamExt;
+    // (a call made outside a runtime has no connection behind it)
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    if body.is_end_stream() {
+        return;
+    }
+    runtime.spawn(async move {
+        let mut chunks = body.into_data_stream();
+        let mut left = MAX_DISCARDED_BODY;
+        while let Some(Ok(chunk)) = chunks.next().await {
+            match left.checked_sub(chunk.len()) {
+                Some(rest) => left = rest,
+                None => return,
+            }
+        }
+    });
+}
+
+impl Drop for Call {
+    fn drop(&mut self) {
+        discard(self.take_body());
+    }
+}
+
 /// A descriptor of the connection of the client, of its own (put in the
 /// request by the server): the connection can be taken over and served
 /// after the request, and its hang up watched with this.

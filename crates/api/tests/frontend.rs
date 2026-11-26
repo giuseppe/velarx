@@ -4241,3 +4241,54 @@ async fn removals_stops_and_waits_answer_as_podman() {
         })
         .await;
 }
+
+/// A route that refuses a request before it reads the body (a refused
+/// parameter), and a request no route takes, still answer the client that
+/// is writing it: the answer is not lost to a reset of the connection.
+/// The body is larger than what the sockets hold, and is written while
+/// the answer is read.
+#[tokio::test]
+async fn a_refusal_before_the_body_is_read_reaches_the_writer() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const BODY: usize = 16 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("api.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(velarx_api::serve::serve(
+        vec![velarx_api::serve::Listener::Unix(listener)],
+        Engine::new(&dir.path().join("engine.sock")),
+        velarx_proto::serving::Peers::Any,
+        None,
+        None,
+    ));
+    for (target, status) in [
+        ("/libpod/build?cppflags=-DX", "501"),
+        ("/libpod/nothing", "404"),
+    ] {
+        let (mut read, mut write) = tokio::net::UnixStream::connect(&socket)
+            .await
+            .unwrap()
+            .into_split();
+        let writer = tokio::spawn(async move {
+            write
+                .write_all(
+                    format!(
+                        "POST {target} HTTP/1.1\r\nHost: d\r\n\
+                         Content-Type: application/x-tar\r\nContent-Length: {BODY}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            write.write_all(&vec![0u8; BODY]).await
+        });
+        let mut answer = Vec::new();
+        read.read_buf(&mut answer).await.unwrap();
+        assert!(
+            answer.starts_with(format!("HTTP/1.1 {status} ").as_bytes()),
+            "{target}: {}",
+            String::from_utf8_lossy(&answer)
+        );
+        writer.await.unwrap().unwrap();
+    }
+    server.abort();
+}

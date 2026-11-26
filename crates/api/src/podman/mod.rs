@@ -278,12 +278,18 @@ pub async fn dispatch(State(engine): State<Engine>, req: Request) -> Response {
                 }
             }
         }
-        Found::WrongMethod => ApiError::new(
-            405,
-            format!("method `{}` not allowed for `{}`", parts.method, raw_path),
-        )
-        .into_response(Kind::None),
-        Found::None => no_route(&parts.method, &raw_path),
+        Found::WrongMethod => {
+            call::discard(body);
+            ApiError::new(
+                405,
+                format!("method `{}` not allowed for `{}`", parts.method, raw_path),
+            )
+            .into_response(Kind::None)
+        }
+        Found::None => {
+            call::discard(body);
+            no_route(&parts.method, &raw_path)
+        }
     };
     common_headers(&mut res);
     res
