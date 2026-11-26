@@ -254,7 +254,8 @@ answer () { # socket method path [body]
     PIDS=$!
     track $PIDS
     e2e_wait_path "$WORKDIR/tcp.sock"
-    check "an address that is not loopback is bound" "0.0.0.0:$port" "$(ss -Htln "sport = :$port" | awk '{ print $4 }')"
+    # (IPv4 only: another process may hold the port number on [::])
+    check "an address that is not loopback is bound" "0.0.0.0:$port" "$(ss -4Htln "sport = :$port" | awk '{ print $4 }')"
     check "...and served, with the token" yes "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer 0123456789abcdefghijklmnopqrstuv' "http://127.0.0.1:$port/_ping" | grep -qv 401 && echo yes)"
     check "...not without it" 401 "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/_ping")"
     check "...and the warning is podman's" yes "$(grep -q 'Using the velarx API service with TCP sockets without TLS is not recommended' "$WORKDIR/tcp.log" && echo yes)"
