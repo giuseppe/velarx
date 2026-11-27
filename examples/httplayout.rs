@@ -38,44 +38,19 @@
 //! serves; the interface (`org.velarx.Fetcher`) is
 //! `interfaces/org.velarx.Fetcher.varlink`.
 
-use async_trait::async_trait;
-use std::fs::File;
 use std::io::Read;
 use std::sync::OnceLock;
-use velarx_content::dir_origin::unpack_layer;
-use velarx_content::fetcher::fetch::{Blob, FetchEvent as Event, FetcherError};
+use velarx_content::blob_fetch::{BlobFetch, Blobs};
+use velarx_content::fetcher::fetch::FetcherError;
 use velarx_content::list::HelperSettings;
-use velarx_content::serve_fetch::{
-    BlobFile, Described, LayerScope, Out, Scope, StagingFetcher, UnpackCall,
-};
+use velarx_content::serve_fetch::Scope;
 use velarx_types::digest::Digest;
 use velarx_types::transport::ImageLocation;
 
 const REF_NAME: &str = "org.opencontainers.image.ref.name";
 
 struct HttpLayout {
-    settings: HelperSettings,
-    client: OnceLock<reqwest::Client>,
-}
-
-/// The error of a request, as a kind of `std::io::Error`.
-fn io_error(e: impl std::fmt::Display, kind: std::io::ErrorKind) -> std::io::Error {
-    std::io::Error::new(kind, e.to_string())
-}
-
-/// What the error of a request is to the engine: a file the layout lacks
-/// is unavailable, one it refuses is unauthorized.
-fn fetch_error(e: std::io::Error) -> FetcherError {
-    match e.kind() {
-        std::io::ErrorKind::NotFound => FetcherError::unavailable(e.to_string()),
-        std::io::ErrorKind::PermissionDenied => FetcherError::unauthorized(e.to_string()),
-        _ => FetcherError::failed(e.to_string()),
-    }
-}
-
-/// The path of the blob `digest` in a layout.
-fn blob_path(digest: &Digest) -> String {
-    format!("blobs/{}", digest.to_string().replace(':', "/"))
+    client: OnceLock<reqwest::blocking::Client>,
 }
 
 /// The base URL of the layout of the location `scope` was opened with, and
@@ -90,85 +65,39 @@ fn location(scope: &Scope) -> Result<(String, Option<String>), FetcherError> {
     Ok((url.to_string(), ImageLocation::external_name(source)))
 }
 
-/// The body of a response as a `Read`, for a thread of the blocking pool.
-struct Body {
-    runtime: tokio::runtime::Handle,
-    response: reqwest::Response,
-    chunk: bytes::Bytes,
-}
-
-impl Read for Body {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.chunk.is_empty() {
-            match self.runtime.block_on(self.response.chunk()) {
-                Ok(Some(chunk)) => self.chunk = chunk,
-                Ok(None) => return Ok(0),
-                Err(e) => return Err(io_error(e, std::io::ErrorKind::Other)),
-            }
-        }
-        let n = buf.len().min(self.chunk.len());
-        buf[..n].copy_from_slice(&self.chunk.split_to(n));
-        Ok(n)
-    }
-}
-
-/// A successful response to a GET of `url`; the status of a failed one is
-/// the kind of the error.
-async fn request(client: &reqwest::Client, url: &str) -> std::io::Result<reqwest::Response> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| io_error(e, std::io::ErrorKind::Other))?;
-    let status = response.status();
-    let kind = match status.as_u16() {
-        _ if status.is_success() => return Ok(response),
-        404 => std::io::ErrorKind::NotFound,
-        401 | 403 => std::io::ErrorKind::PermissionDenied,
-        _ => std::io::ErrorKind::Other,
-    };
-    Err(io_error(format!("{url}: {status}"), kind))
-}
-
 impl HttpLayout {
-    fn client(&self, scope: &Scope) -> Result<reqwest::Client, FetcherError> {
-        if let Some(client) = self.client.get() {
-            return Ok(client.clone());
-        }
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(scope.tls_verify == Some(false))
-            .build()
-            .map_err(|e| FetcherError::failed(e.to_string()))?;
-        Ok(self.client.get_or_init(|| client).clone())
-    }
-
-    /// The file `path` of the layout.
-    async fn get(&self, scope: &Scope, path: &str) -> Result<reqwest::Response, FetcherError> {
-        let (base, _) = location(scope)?;
-        let client = self.client(scope)?;
-        request(&client, &format!("{base}/{path}"))
-            .await
-            .map_err(fetch_error)
-    }
-
-    /// The file `path` of the layout, at most `max` bytes.
-    async fn small(&self, scope: &Scope, path: &str, max: u64) -> Result<Vec<u8>, FetcherError> {
-        let mut response = self.get(scope, path).await?;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| FetcherError::failed(e.to_string()))?
-        {
-            if (bytes.len() + chunk.len()) as u64 > max {
-                return Err(FetcherError::invalid(format!(
-                    "{path} has more than the {max} bytes it may"
-                )));
+    /// The file `path` of the layout of `scope`; a file the layout lacks is
+    /// unavailable, one it refuses is unauthorized.
+    fn get(&self, scope: &Scope, path: &str) -> Result<reqwest::blocking::Response, FetcherError> {
+        let client = match self.client.get() {
+            Some(client) => client,
+            None => {
+                let client = reqwest::blocking::Client::builder()
+                    .danger_accept_invalid_certs(scope.tls_verify == Some(false))
+                    .build()
+                    .map_err(|e| FetcherError::failed(e.to_string()))?;
+                self.client.get_or_init(|| client)
             }
-            bytes.extend_from_slice(&chunk);
+        };
+        let url = format!("{}/{path}", location(scope)?.0);
+        let response = client
+            .get(&url)
+            .send()
+            .map_err(|e| FetcherError::failed(e.to_string()))?;
+        let status = response.status();
+        let reason = format!("{url}: {status}");
+        match status.as_u16() {
+            _ if status.is_success() => Ok(response),
+            404 => Err(FetcherError::unavailable(reason)),
+            401 | 403 => Err(FetcherError::unauthorized(reason)),
+            _ => Err(FetcherError::failed(reason)),
         }
-        Ok(bytes)
     }
+}
+
+/// The path of the blob `digest` in a layout.
+fn blob_path(digest: &Digest) -> String {
+    format!("blobs/{}", digest.to_string().replace(':', "/"))
 }
 
 /// Whether the reference name `ref_name` of an entry is `name`, or names
@@ -183,7 +112,7 @@ fn names(ref_name: &str, name: &str) -> bool {
 
 /// The entry of the index `index` that the name `name` takes: its digest
 /// and its media type.
-fn entry(index: &[u8], name: Option<&str>) -> Result<(String, Option<String>), FetcherError> {
+fn entry(index: &[u8], name: Option<&str>) -> Result<(Digest, Option<String>), FetcherError> {
     let index: serde_json::Value = serde_json::from_slice(index)
         .map_err(|e| FetcherError::invalid(format!("index.json: {e}")))?;
     let manifests = index["manifests"].as_array().map_or(&[][..], Vec::as_slice);
@@ -205,107 +134,47 @@ fn entry(index: &[u8], name: Option<&str>) -> Result<(String, Option<String>), F
         )));
     };
     let text = |key| one[key].as_str().map(str::to_string);
-    let digest = text("digest").ok_or_else(|| FetcherError::invalid("an entry has no digest"))?;
+    let digest = text("digest")
+        .and_then(|d| d.parse().ok())
+        .ok_or_else(|| FetcherError::invalid("an entry has no digest"))?;
     Ok((digest, text("mediaType")))
 }
 
-fn sealed(bytes: &[u8]) -> Result<File, FetcherError> {
-    velarx_base::sealed::sealed_memory(bytes)
-        .map(File::from)
-        .map_err(|e| FetcherError::failed(e.to_string()))
-}
-
-#[async_trait]
-impl StagingFetcher for HttpLayout {
-    fn described(&self) -> Described {
-        Described {
-            name: "httplayout".into(),
-            capabilities: vec!["metadata".into(), "origin".into()],
-            max_objects: 1,
-        }
-    }
-
-    /// `""` is the image the location names; a digest is a manifest of the
-    /// layout.
-    async fn get_manifest(
+impl Blobs for HttpLayout {
+    fn open(
         &self,
         scope: &Scope,
-        reference: &str,
-        max: u64,
-    ) -> Result<(File, Option<String>), FetcherError> {
-        let (digest, media_type) = if reference.is_empty() {
-            let index = self.small(scope, "index.json", max).await?;
-            let (_, name) = location(scope)?;
-            // (`@sha256:...` names the manifest, whatever the index says)
-            match name.as_deref().and_then(|n| n.parse::<Digest>().ok()) {
-                Some(digest) => (digest.to_string(), None),
-                None => entry(&index, name.as_deref())?,
-            }
-        } else {
-            (reference.to_string(), None)
-        };
-        let digest: Digest = digest
-            .parse()
-            .map_err(|_| FetcherError::unavailable(format!("{digest}: not here")))?;
-        let bytes = self.small(scope, &blob_path(&digest), max).await?;
-        Ok((sealed(&bytes)?, media_type))
+        digest: &Digest,
+    ) -> Result<(Box<dyn std::io::Read + Send>, u64), FetcherError> {
+        let response = self.get(scope, &blob_path(digest))?;
+        let size = response
+            .content_length()
+            .ok_or_else(|| FetcherError::failed("no Content-Length"))?;
+        Ok((Box::new(response), size))
     }
 
-    async fn get_blob(&self, scope: &Scope, blob: &Blob, file: File) -> Result<(), FetcherError> {
-        let mut out = BlobFile::new(file, blob)?;
-        let digest: Digest = blob
-            .digest
-            .parse()
-            .map_err(|_| FetcherError::InvalidArgument {
-                reason: "not the digest of a blob".into(),
-            })?;
-        let mut response = self.get(scope, &blob_path(&digest)).await?;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| FetcherError::failed(e.to_string()))?
-        {
-            out.write(&chunk)?;
+    /// The image the location names: by the digest it gives (`@sha256:...`,
+    /// whatever the index says) or by the name it gives in `index.json`.
+    fn resolve(&self, scope: &Scope, max: u64) -> Result<(Digest, Option<String>), FetcherError> {
+        let name = location(scope)?.1;
+        if let Some(digest) = name.as_deref().and_then(|n| n.parse().ok()) {
+            return Ok((digest, None));
         }
-        out.finish()
-    }
-
-    async fn unpack(
-        &self,
-        scope: &Scope,
-        layer: &LayerScope,
-        call: UnpackCall,
-        out: &Out<Event>,
-    ) -> Result<(), FetcherError> {
-        let runtime = tokio::runtime::Handle::current();
-        let client = self.client(scope)?;
-        let base = location(scope)?.0;
-        unpack_layer(&self.settings, scope, layer, call, out, move |digest| {
-            let response =
-                runtime.block_on(request(&client, &format!("{base}/{}", blob_path(digest))))?;
-            let size = response
-                .content_length()
-                .ok_or_else(|| io_error("no Content-Length", std::io::ErrorKind::InvalidData))?;
-            Ok((
-                Body {
-                    runtime,
-                    response,
-                    chunk: Default::default(),
-                },
-                size,
-            ))
-        })
-        .await
+        let mut index = Vec::new();
+        self.get(scope, "index.json")?
+            .take(max.saturating_add(1))
+            .read_to_end(&mut index)?;
+        if index.len() as u64 > max {
+            return Err(FetcherError::TooLarge { max });
+        }
+        entry(&index, name.as_deref())
     }
 }
 
 fn main() -> std::io::Result<()> {
-    // (first thing: it notes the descriptors it was passed)
-    let startup = velarx_sys::fd::Startup::take().expect("the first call");
-    let api = std::sync::Arc::new(HttpLayout {
-        settings: HelperSettings::of(&velarx_config::Config::default()),
-        client: OnceLock::new(),
-    });
-    let limits = velarx_content::activation::Limits::default();
-    velarx_content::serve_fetch::run_descriptor_3(&startup, api, limits)
+    velarx_content::serve_fetch::main(|| {
+        let settings = HelperSettings::of(&velarx_config::Config::default());
+        let client = OnceLock::new();
+        BlobFetch::new("httplayout", settings, HttpLayout { client })
+    })
 }

@@ -2,13 +2,13 @@
 //! The registry reached through the registry fetcher (`velarx-registry`):
 //! this process holds no credentials for it and makes no request.
 //!
-//! A pull's metadata (manifests and small blobs) comes with `GetManifest` and
+//! A pull's metadata (manifests and small blobs) comes with `GetFile` and
 //! `GetBlob` on a connection scoped to its repository (`Open`), the calls of
 //! `org.velarx.Registry` (tags, search, login, download) on a connection of
 //! their own.
 //! Everything the fetcher sends is untrusted: the callers check the digests.
 
-use crate::fetcher::fetch::{Blob, FetcherError, SignedRecord, SIGNATURES_MAX_BYTES};
+use crate::fetcher::fetch::{Blob, FetcherError, FileKind, SignedRecord, SIGNATURES_MAX_BYTES};
 use crate::fetcher::fetch_client::{Access, CallError, FetchConn, Scoping};
 use crate::fetcher::proto::{Hit, RegistryError, Remote};
 use crate::list::RegistryOrigin;
@@ -353,7 +353,10 @@ impl OriginNet {
     async fn registry_signatures(&self, reference: &str) -> ImageResult<Vec<SignedRecord>> {
         let mut slot = self.conn.lock().await;
         let conn = self.scoped(&mut slot).await?;
-        let got = conn.get_signatures(reference, SIGNATURES_MAX_BYTES).await;
+        let got = conn
+            .get_file(FileKind::Signatures, reference, SIGNATURES_MAX_BYTES)
+            .await
+            .map(|(file, _)| file);
         let Some(file) = self.answered(&mut slot, got)? else {
             return Ok(Vec::new());
         };
@@ -396,7 +399,9 @@ impl OriginNet {
     async fn registry_manifest(&self, reference: &str) -> ImageResult<Option<(Bytes, Digest)>> {
         let mut slot = self.conn.lock().await;
         let conn = self.scoped(&mut slot).await?;
-        let got = conn.get_manifest(reference, MAX_MANIFEST_SIZE).await;
+        let got = conn
+            .get_file(FileKind::Manifest, reference, MAX_MANIFEST_SIZE)
+            .await;
         let Some((file, _)) = self.answered(&mut slot, got)? else {
             return Ok(None);
         };
@@ -437,7 +442,10 @@ impl OriginNet {
     pub async fn path_index(&self) -> ImageResult<Bytes> {
         let mut slot = self.conn.lock().await;
         let conn = self.scoped(&mut slot).await?;
-        let (file, _) = match conn.get_manifest("", MAX_MANIFEST_SIZE).await {
+        let (file, _) = match conn
+            .get_file(FileKind::Manifest, "", MAX_MANIFEST_SIZE)
+            .await
+        {
             Ok(got) => got,
             Err(e) => {
                 if matches!(e, CallError::Io(_) | CallError::Protocol(_)) {
@@ -618,7 +626,7 @@ impl MetadataSources {
             let got = crate::idle::within(
                 link.idle,
                 link.conn
-                    .get_manifest(&digest.to_string(), MAX_MANIFEST_SIZE),
+                    .get_file(FileKind::Manifest, &digest.to_string(), MAX_MANIFEST_SIZE),
             )
             .await;
             if let Some(bytes) =
@@ -640,9 +648,11 @@ impl MetadataSources {
         for link in links.iter_mut() {
             let got = crate::idle::within(
                 link.idle,
-                link.conn.get_signatures(reference, SIGNATURES_MAX_BYTES),
+                link.conn
+                    .get_file(FileKind::Signatures, reference, SIGNATURES_MAX_BYTES),
             )
-            .await;
+            .await
+            .map(|(file, _)| file);
             let file = match got {
                 Ok(file) => file,
                 Err(e) => {

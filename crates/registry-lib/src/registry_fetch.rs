@@ -2,7 +2,7 @@
 //! The registry as a fetcher: what `velarx-registry` serves, and
 //! what a process that pulls runs in itself over a socket pair.
 //!
-//! * `GetManifest`, `GetBlob`: a manifest by a tag or a digest, a blob by its
+//! * `GetFile` (manifests), `GetBlob`: a manifest by a tag or a digest, a blob by its
 //!   digest, written into the file the engine hands over as it arrives.
 //! * `Probe`: for each blob the call carries, whether it has a table of
 //!   contents (zstd:chunked, by the annotations of its descriptor); when it has, the table and
@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use velarx_content::fetcher::fetch::{
-    Blob, EventKind, Failure, FetchEvent as Event, FetcherError, NotLazy, Parts, Probed,
-    SignedRecord, TocSource, CAPABILITIES, MAX_FDS,
+    sealed, Blob, EventKind, Failure, FetchEvent as Event, FetcherError, FileKind, NotLazy, Parts,
+    Probed, SignedRecord, TocSource, CAPABILITIES, MAX_FDS,
 };
 use velarx_content::pull::chunked::{
     self, fetch_with_tries, make_batches, Batch, MAX_METADATA_COMPRESSED,
@@ -976,27 +976,43 @@ impl StagingFetcher for RegistryFetch {
         }
     }
 
-    async fn get_manifest(
+    async fn get_file(
         &self,
         scope: &Scope,
+        kind: FileKind,
         reference: &str,
         max: u64,
     ) -> Result<(File, Option<String>), FetcherError> {
         let (pool, _) = self.pool(scope)?;
-        velarx_content::serve_registry::checked_reference(reference)
-            .map_err(|_| bad("not a tag or a digest"))?;
-        let found = pool
-            .manifest_opt(reference, max.min(MAX_MANIFEST_SIZE))
-            .await
-            .map_err(refused)?;
-        let (bytes, _) = found.ok_or_else(|| {
-            FetcherError::not_found(format!("{reference}: the registry has no such manifest"))
-        })?;
-        let media_type = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|v| v.get("mediaType")?.as_str().map(str::to_string));
-        let fd = velarx_base::sealed::sealed_memory(&bytes).map_err(failed)?;
-        Ok((fd.into(), media_type))
+        match kind {
+            FileKind::Manifest => {
+                velarx_content::serve_registry::checked_reference(reference)
+                    .map_err(|_| bad("not a tag or a digest"))?;
+                let found = pool
+                    .manifest_opt(reference, max.min(MAX_MANIFEST_SIZE))
+                    .await
+                    .map_err(refused)?;
+                let (bytes, _) = found.ok_or_else(|| {
+                    FetcherError::not_found(format!(
+                        "{reference}: the registry has no such manifest"
+                    ))
+                })?;
+                let media_type = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .and_then(|v| v.get("mediaType")?.as_str().map(str::to_string));
+                Ok((sealed(&bytes)?, media_type))
+            }
+            FileKind::Signatures => {
+                let records = crate::signatures::of(&self.service, &pool, reference, max).await?;
+                let bytes = SignedRecord::encoded(records, max).ok_or_else(|| {
+                    FetcherError::unavailable(format!("{reference}: no signature"))
+                })?;
+                Ok((sealed(&bytes)?, None))
+            }
+            FileKind::Profile => Err(FetcherError::unavailable(format!(
+                "{reference}: nobody has it"
+            ))),
+        }
     }
 
     // (`blob.size` is the size of the descriptor: a blob of another size is
@@ -1019,20 +1035,6 @@ impl StagingFetcher for RegistryFetch {
             .await;
         got.map_err(|e| wrong.take().unwrap_or_else(|| refused(e)))?;
         out.finish()
-    }
-
-    async fn get_signatures(
-        &self,
-        scope: &Scope,
-        reference: &str,
-        max: u64,
-    ) -> Result<File, FetcherError> {
-        let (pool, _) = self.pool(scope)?;
-        let records = crate::signatures::of(&self.service, &pool, reference, max).await?;
-        let bytes = SignedRecord::encoded(records, max)
-            .ok_or_else(|| FetcherError::unavailable(format!("{reference}: no signature")))?;
-        let fd = velarx_base::sealed::sealed_memory(&bytes).map_err(failed)?;
-        Ok(fd.into())
     }
 
     fn registry(&self) -> Option<Arc<dyn velarx_content::serve_registry::RegistryCalls>> {
@@ -1094,7 +1096,7 @@ impl StagingFetcher for RegistryFetch {
                 if bytes.is_empty() {
                     return Ok(None);
                 }
-                fds.push(velarx_base::sealed::sealed_memory(&bytes).map_err(failed)?);
+                fds.push(sealed(&bytes)?.into());
                 Ok(Some(fds.len() as u32 - 1))
             };
             let (toc_file, tarsplit_file) = (carry(toc_z)?, carry(ts_z)?);
@@ -1642,7 +1644,7 @@ mod tests {
         assert!(got.is_err());
     }
 
-    /// `GetSignatures` gives the sigstore attachment of a manifest as the
+    /// A `GetFile` of signatures gives the sigstore attachment of a manifest as the
     /// base64 of the blob of a signature, for a registry whose registries.d
     /// asks for attachments (the storage of the signatures is a directory,
     /// which the engine reads); one that does not has no signature, and a
@@ -1715,8 +1717,8 @@ mod tests {
         );
         let digest = format!("sha256:{}", "ab".repeat(32));
         let reference = format!("registry.invalid/r/app:v1@{digest}");
-        let file = fetch
-            .get_signatures(&scope, &reference, 1 << 20)
+        let (file, _) = fetch
+            .get_file(&scope, FileKind::Signatures, &reference, 1 << 20)
             .await
             .unwrap();
         let records: Vec<SignedRecord> = serde_json::from_slice(
@@ -1745,7 +1747,12 @@ mod tests {
         );
         // (no digest: not a reference of a signature)
         let got = fetch
-            .get_signatures(&scope, "registry.invalid/r/app:v1", 1 << 20)
+            .get_file(
+                &scope,
+                FileKind::Signatures,
+                "registry.invalid/r/app:v1",
+                1 << 20,
+            )
             .await;
         assert!(matches!(got, Err(FetcherError::InvalidArgument { .. })));
     }

@@ -1801,10 +1801,17 @@ pub async fn blob_from(socket: &std::path::Path, digest: &str, size: u64) -> Opt
 }
 
 /// The startup profile of `image` (at most `max` bytes) from the fetcher on
-/// `socket` (`GetProfile`); none when it has not got it.
+/// `socket` (`GetFile`); none when it has not got it.
 pub async fn profile_from(socket: &std::path::Path, image: &str, max: u64) -> Option<Vec<u8>> {
     let mut conn = scoped(socket).await?;
-    let file = conn.get_profile(image, max).await.ok()?;
+    let (file, _) = conn
+        .get_file(
+            velarx_content::fetcher::fetch::FileKind::Profile,
+            image,
+            max,
+        )
+        .await
+        .ok()?;
     let length = file.metadata().ok()?.len();
     velarx_base::sealed::read_sealed(&file, length, max).ok()
 }

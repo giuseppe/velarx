@@ -223,7 +223,7 @@ indicatif = "0.18"
 # (a test of the REST API: the error of a server with an untrusted certificate)
 openssl.workspace = true
 # (the tests make registry requests of their own)
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 velarx-registry = { path = "crates/registry", features = ["net"] }
 # (the registry fetcher of the tests, in this process or its binary's)
 velarx-registry-lib = { path = "crates/registry-lib" }

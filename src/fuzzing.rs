@@ -473,13 +473,12 @@ pub fn fetcher(data: &[u8]) {
 }
 
 /// A message of a fetcher as the engine's client reads it: split at its
-/// NULs, each parsed as a reply of `Fetch`, `Get`, `Probe` or `GetInfo`.
+/// NULs, each parsed as a reply of `Fetch`, `GetFile`, `Probe` or `GetInfo`.
 pub fn fetcher_reply(data: &[u8]) {
     use velarx_content::fetcher::fetch;
     for message in data.split(|&b| b == 0).take(64) {
         let _ = velarx_wire::varlink::parse_reply::<fetch::FetchReply>(message);
-        let _ = velarx_wire::varlink::parse_reply::<fetch::Manifest>(message);
-        let _ = velarx_wire::varlink::parse_reply::<fetch::Item>(message);
+        let _ = velarx_wire::varlink::parse_reply::<fetch::Answer>(message);
         let _ = velarx_wire::varlink::parse_reply::<fetch::ProbeReply>(message);
         let _ = velarx_wire::varlink::parse_reply::<velarx_proto::info::Info>(message);
     }

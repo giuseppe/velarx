@@ -11,6 +11,7 @@ pub mod activation;
 pub mod archive;
 /// Telling gzip and zstd by the first bytes and reading them, the window of zstd capped.
 pub use velarx_tarsplit::decompress;
+pub mod blob_fetch;
 pub mod dir_fetch;
 pub mod dir_origin;
 pub mod dir_push;

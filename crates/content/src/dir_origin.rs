@@ -11,13 +11,13 @@
 //!
 //! It serves:
 //!
-//! * `GetManifest("")`: the index of the images the selector of the source
+//! * `GetFile("")`: the index of the images the selector of the source
 //!   (`Open(source)`: the scheme and the selector, `oci-archive:NAME`, never
 //!   the path) takes, as an OCI index (`rootfs:` has the algorithm of the
 //!   digests of its image for selector: `rootfs:sha512`); each name an image has in the archive
 //!   is the annotation `org.opencontainers.image.ref.name` of a descriptor
 //!   (a docker-archive's manifests are made of its `manifest.json`);
-//! * `GetManifest(digest)` and `GetBlob`;
+//! * `GetFile(digest)` and `GetBlob`;
 //! * `Unpack` of every layer (an archive carries no table of contents): the
 //!   files of the layer staged by the object contract, the claim of the table
 //!   and the tar-split.
@@ -25,18 +25,16 @@
 //! All of it is a claim: the engine checks the digests of the manifests and
 //! of the configurations, and replays the layers against the diff ids.
 
-use crate::archive::{Archive, ArchiveImage, MAX_METADATA};
-use crate::fetcher::fetch::{Failure, FailureClass, FetchEvent as Event, FetcherError};
+use crate::archive::{Archive, ArchiveImage};
+use crate::blob_fetch::{BlobFetch, Blobs};
+use crate::fetcher::fetch::{FailureClass, FetchEvent as Event, FetcherError};
 use crate::list::HelperSettings;
 use crate::origin::{path_source, PathScheme};
-use crate::serve_fetch::{
-    beating, BlobFile, Described, LayerScope, Out, Scope, StagingFetcher, UnpackCall,
-};
-use async_trait::async_trait;
+use crate::serve_fetch::{beating, LayerScope, Out, Scope, UnpackCall};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use velarx_types::digest::{Algorithm, Digest, DigestWriter};
 use velarx_types::ImageReference;
 
@@ -51,48 +49,24 @@ pub type Confine = Box<dyn Fn(PathScheme, &File) -> Result<(), String> + Send + 
 /// What the process read of its origin, once, at the first call.
 struct Read_ {
     archive: Arc<Archive>,
-    /// The index of the images the selector takes
-    index: Vec<u8>,
-    /// Their manifests (a docker-archive's are made, not members), by digest
-    manifests: HashMap<String, (Vec<u8>, String)>,
+    /// The index of the images the selector takes, and their manifests (a
+    /// docker-archive's are made, not members), by digest
+    manifests: HashMap<Digest, Vec<u8>>,
+    index: Digest,
 }
 
-/// The fetcher of the origin of a path.
+/// The origin of a path.
 pub struct DirOrigin {
     confine: Confine,
     settings: HelperSettings,
     /// The staging of the layers of the store: where a compressed archive
     /// is decompressed to
     staging: Arc<File>,
-    read: tokio::sync::OnceCell<Arc<Read_>>,
+    read: Mutex<Option<Arc<Read_>>>,
 }
 
 fn invalid(reason: impl Into<String>) -> FetcherError {
-    FetcherError::Failed {
-        failure: Failure {
-            class: FailureClass::Invalid,
-            reason: reason.into(),
-        },
-    }
-}
-
-/// An error of reading the archive: a Docker format is what the engine
-/// refuses by name, what is not an archive is invalid content.
-fn read_error(e: std::io::Error) -> FetcherError {
-    match e.kind() {
-        std::io::ErrorKind::Unsupported => FetcherError::NotSupported {
-            feature: e.to_string(),
-        },
-        // (an archive cut short is not what it claims)
-        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
-            invalid(e.to_string())
-        }
-        std::io::ErrorKind::NotFound => FetcherError::not_found(e.to_string()),
-        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => {
-            FetcherError::no_space(e.to_string())
-        }
-        _ => FetcherError::failed(e.to_string()),
-    }
+    FetcherError::invalid(reason)
 }
 
 /// Whether `name` is `tag`, as the same reference.
@@ -226,54 +200,64 @@ fn select(
 }
 
 impl DirOrigin {
-    /// The origin of a path, which it learns from `Open`; `confine` is what
-    /// restricts the process then.
-    pub fn new(confine: Confine, settings: HelperSettings, staging: Arc<File>) -> Arc<Self> {
-        Arc::new(Self {
-            confine,
-            settings,
-            staging,
-            read: tokio::sync::OnceCell::new(),
-        })
+    /// The fetcher of the origin of a path, which it learns from `Open`;
+    /// `confine` is what restricts the process then.
+    pub fn new(
+        confine: Confine,
+        settings: HelperSettings,
+        staging: Arc<File>,
+    ) -> Arc<BlobFetch<Self>> {
+        BlobFetch::new(
+            "dir",
+            settings.clone(),
+            Self {
+                confine,
+                settings,
+                staging,
+                read: Mutex::new(None),
+            },
+        )
     }
 
     /// What the origin holds, read at the first call (after the process
     /// confined itself).
-    async fn read(&self, scope: &Scope) -> Result<Arc<Read_>, FetcherError> {
-        self.read
-            .get_or_try_init(|| async {
-                let (scheme, selector) =
-                    scope
-                        .source
-                        .as_deref()
-                        .and_then(path_source)
-                        .ok_or_else(|| FetcherError::InvalidArgument {
-                            reason: "the source of a path is its scheme and its selector".into(),
-                        })?;
-                let target = scope
-                    .target
-                    .as_ref()
-                    .ok_or_else(|| FetcherError::InvalidArgument {
-                        reason: "the origin of a path needs a target".into(),
-                    })?
-                    .try_clone()
-                    .map_err(|e| FetcherError::failed(e.to_string()))?;
-                let (staging, s) = (self.staging.clone(), &self.settings);
-                let caps = Caps {
-                    ratio: s.max_inflate_ratio.max(1),
-                    floor: s.inflate_floor_mib * 1024 * 1024,
-                    archive: s.max_archive_gib.max(1) * 1024 * 1024 * 1024,
-                    layer: s.max_file_bytes,
-                };
-                tokio::task::spawn_blocking(move || {
-                    read_origin(scheme, selector.as_deref(), target, &staging, caps)
-                })
-                .await
-                .map_err(|e| FetcherError::failed(e.to_string()))?
-                .map(Arc::new)
-            })
-            .await
-            .cloned()
+    fn read(&self, scope: &Scope) -> Result<Arc<Read_>, FetcherError> {
+        let mut read = self.read.lock().unwrap();
+        if let Some(read) = &*read {
+            return Ok(read.clone());
+        }
+        let (scheme, selector) =
+            scope
+                .source
+                .as_deref()
+                .and_then(path_source)
+                .ok_or_else(|| FetcherError::InvalidArgument {
+                    reason: "the source of a path is its scheme and its selector".into(),
+                })?;
+        let target = scope
+            .target
+            .as_ref()
+            .ok_or_else(|| FetcherError::InvalidArgument {
+                reason: "the origin of a path needs a target".into(),
+            })?
+            .try_clone()?;
+        let s = &self.settings;
+        let caps = Caps {
+            ratio: s.max_inflate_ratio.max(1),
+            floor: s.inflate_floor_mib * 1024 * 1024,
+            archive: s.max_archive_gib.max(1) * 1024 * 1024 * 1024,
+            layer: s.max_file_bytes,
+        };
+        // (what the origin lacks, an image of the daemon or of the
+        // archive, is not found: unavailable is a blob of the origin)
+        let origin = read_origin(scheme, selector.as_deref(), target, &self.staging, caps)
+            .map_err(|e| match e.failure() {
+                Some(f) if f.class == FailureClass::Unavailable => {
+                    FetcherError::not_found(f.reason.clone())
+                }
+                _ => e,
+            })?;
+        Ok(read.insert(Arc::new(origin)).clone())
     }
 }
 
@@ -306,9 +290,8 @@ fn read_origin(
 ) -> Result<Read_, FetcherError> {
     let target = if scheme == PathScheme::DockerDaemon {
         // (the archive the daemon saves is spooled, a tar to index as any)
-        let spool = crate::pull::unnamed::unnamed_file_at(staging).map_err(read_error)?;
-        crate::docker_daemon::save(target, selector.unwrap_or_default(), &spool, max)
-            .map_err(read_error)?;
+        let spool = crate::pull::unnamed::unnamed_file_at(staging)?;
+        crate::docker_daemon::save(target, selector.unwrap_or_default(), &spool, max)?;
         spool
     } else {
         target
@@ -348,8 +331,7 @@ fn read_origin(
         let inflate = |size: u64| {
             crate::pull::inflate_limit(i64::try_from(size).unwrap_or(i64::MAX), ratio, floor, layer)
         };
-        let (archive, image) =
-            crate::rootfs::image(&target, staging, alg, inflate, layer).map_err(read_error)?;
+        let (archive, image) = crate::rootfs::image(&target, staging, alg, inflate, layer)?;
         (archive, vec![image])
     } else {
         let archive = if meta.is_dir() {
@@ -363,10 +345,9 @@ fn read_origin(
                     max,
                 )
             })
-        }
-        .map_err(read_error)?;
+        }?;
         let images = if scheme == PathScheme::Dir {
-            vec![archive.dir_image().map_err(read_error)?]
+            vec![archive.dir_image()?]
         } else {
             archive.images().map_err(|e| {
                 // (a docker-archive read as an OCI one, and the other way
@@ -381,7 +362,7 @@ fn read_origin(
                     }
                     return invalid("no index.json: this is no OCI archive");
                 }
-                read_error(e)
+                FetcherError::from(e)
             })?
         };
         (archive, images)
@@ -390,10 +371,7 @@ fn read_origin(
     let mut manifests = HashMap::new();
     let mut descriptors = Vec::new();
     for image in &images {
-        manifests.insert(
-            image.digest.to_string(),
-            (image.manifest.clone(), image.media_type.clone()),
-        );
+        manifests.insert(image.digest, image.manifest.clone());
         let descriptor = |name: Option<&str>| {
             let mut d = serde_json::json!({
                 "mediaType": image.media_type,
@@ -418,18 +396,13 @@ fn read_origin(
         "manifests": descriptors,
     }))
     .map_err(|e| FetcherError::failed(e.to_string()))?;
+    let index_digest = Digest::of(Algorithm::Sha256, &index);
+    manifests.insert(index_digest, index);
     Ok(Read_ {
         archive: Arc::new(archive),
-        index,
         manifests,
+        index: index_digest,
     })
-}
-
-/// A sealed memory file with `bytes`.
-fn sealed(bytes: &[u8]) -> Result<File, FetcherError> {
-    velarx_base::sealed::sealed_memory(bytes)
-        .map(File::from)
-        .map_err(|e| FetcherError::failed(e.to_string()))
 }
 
 /// What reads a blob and counts and hashes what it gave.
@@ -452,17 +425,8 @@ impl<R: Read> Read for Hashing<R> {
     }
 }
 
-#[async_trait]
-impl StagingFetcher for DirOrigin {
-    fn described(&self) -> Described {
-        Described {
-            name: "dir".into(),
-            capabilities: vec!["metadata".into(), "origin".into()],
-            max_objects: 1,
-        }
-    }
-
-    async fn opened(&self, scope: &Scope) -> Result<(), FetcherError> {
+impl Blobs for DirOrigin {
+    fn opened(&self, scope: &Scope) -> Result<(), FetcherError> {
         let (scheme, _) = scope
             .source
             .as_deref()
@@ -480,91 +444,30 @@ impl StagingFetcher for DirOrigin {
             .map_err(|e| FetcherError::failed(format!("cannot confine: {e}")))
     }
 
-    async fn get_manifest(
+    fn open(
         &self,
         scope: &Scope,
-        reference: &str,
-        max: u64,
-    ) -> Result<(File, Option<String>), FetcherError> {
-        let read = self.read(scope).await?;
-        if reference.is_empty() {
-            return Ok((sealed(&read.index)?, Some(OCI_INDEX.to_string())));
+        digest: &Digest,
+    ) -> Result<(Box<dyn Read + Send>, u64), FetcherError> {
+        let read = self.read(scope)?;
+        if let Some(bytes) = read.manifests.get(digest) {
+            return Ok((
+                Box::new(std::io::Cursor::new(bytes.clone())),
+                bytes.len() as u64,
+            ));
         }
-        if let Some((bytes, media_type)) = read.manifests.get(reference) {
-            return Ok((sealed(bytes)?, Some(media_type.clone())));
-        }
-        let digest: Digest = reference
-            .parse()
-            .map_err(|_| FetcherError::unavailable(format!("{reference}: not here")))?;
-        let archive = read.archive.clone();
-        let bytes =
-            tokio::task::spawn_blocking(move || archive.blob(&digest, max.min(MAX_METADATA)))
-                .await
-                .map_err(|e| FetcherError::failed(e.to_string()))?
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::NotFound => {
-                        FetcherError::unavailable(format!("{reference}: not here"))
-                    }
-                    _ => read_error(e),
-                })?;
-        Ok((sealed(&bytes)?, None))
+        let section = read.archive.blob_reader(digest)?;
+        let size = section.size();
+        Ok((Box::new(section), size))
     }
 
-    async fn get_blob(
-        &self,
-        scope: &Scope,
-        blob: &crate::fetcher::fetch::Blob,
-        file: File,
-    ) -> Result<(), FetcherError> {
-        use std::io::Read;
-        let read = self.read(scope).await?;
-        let mut out = BlobFile::new(file, blob)?;
-        let digest: Digest = blob
-            .digest
-            .parse()
-            .map_err(|_| FetcherError::InvalidArgument {
-                reason: "not the digest of a blob".into(),
-            })?;
-        let (archive, name) = (read.archive.clone(), blob.digest.clone());
-        tokio::task::spawn_blocking(move || {
-            let mut from = archive.blob_reader(&digest).map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => {
-                    FetcherError::unavailable(format!("{name}: not here"))
-                }
-                _ => read_error(e),
-            })?;
-            let mut buf = vec![0u8; 1 << 20];
-            loop {
-                let n = from.read(&mut buf).map_err(read_error)?;
-                if n == 0 {
-                    return out.finish();
-                }
-                out.write(&buf[..n])?;
-            }
-        })
-        .await
-        .map_err(|e| FetcherError::failed(e.to_string()))?
-    }
-
-    async fn unpack(
-        &self,
-        scope: &Scope,
-        layer: &LayerScope,
-        call: UnpackCall,
-        out: &Out<Event>,
-    ) -> Result<(), FetcherError> {
-        let archive = self.read(scope).await?.archive.clone();
-        unpack_layer(&self.settings, scope, layer, call, out, move |digest| {
-            let section = archive.blob_reader(digest)?;
-            let size = section.size();
-            Ok((section, size))
-        })
-        .await
+    fn resolve(&self, scope: &Scope, _max: u64) -> Result<(Digest, Option<String>), FetcherError> {
+        Ok((self.read(scope)?.index, Some(OCI_INDEX.to_string())))
     }
 }
 
 /// `Unpack` of the layer `layer`: `open` gives its blob and its length (an
-/// error of kind `NotFound` when the origin lacks it).  The files of the
+/// unavailable one when the origin lacks it).  The files of the
 /// layer are staged by the object contract, with the claim of the table and
 /// the tar-split; the blob is checked against its digest as it is read.
 pub async fn unpack_layer<R: Read + Send + 'static>(
@@ -573,7 +476,7 @@ pub async fn unpack_layer<R: Read + Send + 'static>(
     layer: &LayerScope,
     call: UnpackCall,
     out: &Out<Event>,
-    open: impl FnOnce(&Digest) -> std::io::Result<(R, u64)> + Send + 'static,
+    open: impl FnOnce(&Digest) -> Result<(R, u64), FetcherError> + Send + 'static,
 ) -> Result<(), FetcherError> {
     let Some(blob) = &layer.blob else {
         return Err(FetcherError::unavailable(
@@ -606,7 +509,7 @@ pub async fn unpack_layer<R: Read + Send + 'static>(
     let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counted = count.clone();
     let work = tokio::task::spawn_blocking(move || {
-        let (section, length) = open(&digest)?;
+        let (section, length) = open(&digest).map_err(ImageFailure::Fetch)?;
         if length != size {
             return Err(ImageFailure::Invalid(format!(
                 "layer {digest} has {length} bytes, its descriptor says {size}"
@@ -667,12 +570,15 @@ pub async fn unpack_layer<R: Read + Send + 'static>(
         Err(ImageFailure::Invalid(reason)) => Err(invalid(reason)),
         // (a layer its manifest names that the origin lacks: what the
         // origin holds is not what it claims)
-        Err(ImageFailure::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(invalid(e.to_string()))
+        Err(ImageFailure::Fetch(FetcherError::Failed { failure }))
+            if failure.class == FailureClass::Unavailable =>
+        {
+            Err(invalid(failure.reason))
         }
-        Err(ImageFailure::Io(e)) => Err(read_error(e)),
+        Err(ImageFailure::Fetch(e)) => Err(e),
+        Err(ImageFailure::Io(e)) => Err(e.into()),
         // (the staging cannot be written: not what the origin holds)
-        Err(ImageFailure::Image(velarx_types::ImageError::Io(e))) => Err(read_error(e)),
+        Err(ImageFailure::Image(velarx_types::ImageError::Io(e))) => Err(e.into()),
         Err(ImageFailure::Image(e)) => Err(invalid(e.to_string())),
     }
 }
@@ -680,6 +586,7 @@ pub async fn unpack_layer<R: Read + Send + 'static>(
 /// What failed in the unpacking of a layer.
 enum ImageFailure {
     Invalid(String),
+    Fetch(FetcherError),
     Io(std::io::Error),
     Image(velarx_types::ImageError),
 }
@@ -719,6 +626,9 @@ impl<R: Read> Read for LimitedRead<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::MAX_METADATA;
+    use crate::fetcher::fetch::FileKind;
+    use crate::serve_fetch::StagingFetcher;
 
     fn image(n: u8, names: &[&str]) -> ArchiveImage {
         let manifest = vec![n];
@@ -934,7 +844,9 @@ mod tests {
             idle: std::time::Duration::from_secs(30),
             kept: Arc::default(),
         };
-        let (index, _) = origin.get_manifest(&scope, "", MAX_METADATA).await?;
+        let (index, _) = origin
+            .get_file(&scope, FileKind::Manifest, "", MAX_METADATA)
+            .await?;
         let mut bytes = vec![0u8; index.metadata().unwrap().len() as usize];
         std::os::unix::fs::FileExt::read_exact_at(&index, &mut bytes, 0).unwrap();
         Ok(serde_json::from_slice(&bytes).unwrap())
@@ -955,5 +867,33 @@ mod tests {
         }
         let e = rootfs_index("md5").await.unwrap_err();
         assert!(matches!(e, FetcherError::InvalidArgument { .. }), "{e}");
+    }
+
+    /// An origin without the image it names is not found, which the engine
+    /// tells from a blob the origin lacks (unavailable).
+    #[test]
+    fn an_origin_without_its_image_is_not_found() {
+        let (empty, staging) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let origin = DirOrigin {
+            confine: Box::new(|_, _| Ok(())),
+            settings: HelperSettings::of(&velarx_config::Config::default()),
+            staging: Arc::new(File::open(staging.path()).unwrap()),
+            read: Mutex::new(None),
+        };
+        let scope = Scope {
+            verity: false,
+            source: Some("dir:".into()),
+            tls_verify: None,
+            target: Some(Arc::new(File::open(empty.path()).unwrap())),
+            access: None,
+            idle: std::time::Duration::from_secs(30),
+            kept: Arc::default(),
+        };
+        let e = origin.resolve(&scope, MAX_METADATA).unwrap_err();
+        assert_eq!(
+            e.failure().map(|f| f.class),
+            Some(FailureClass::NotFound),
+            "{e}"
+        );
     }
 }

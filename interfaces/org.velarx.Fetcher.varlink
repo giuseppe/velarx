@@ -54,9 +54,9 @@
 # TRUST.  A fetcher is not trusted.  A name it made is a claim; the engine opens
 # it and takes the kernel's measure.  A file it hands over is a claim too: the
 # engine copies it, or takes the kernel's measure of it, and knows it by the
-# digest of the bytes it read.  What it returns with GetManifest,
-# GetBlob, GetProfile and Probe is hashed by the engine before it is used,
-# and the signatures of GetSignatures are judged by the engine's policy.
+# digest of the bytes it read.  What it returns with GetFile (a manifest),
+# GetBlob and Probe is hashed by the engine before it is used,
+# and the signatures of GetFile are judged by the engine's policy.
 #
 # CAPABILITIES.  What a fetcher can do is a word of capabilities in GetInfo; a
 # client ignores the words it does not know; what it cannot do without is a
@@ -89,6 +89,16 @@
 # accepted peer may make every call.
 
 interface org.velarx.Fetcher
+
+# What a `GetFile` asks for.
+type FileKind (
+	# A manifest or an index, by tag or digest
+	manifest,
+	# The startup profile of an image
+	profile,
+	# The signatures of a manifest or a tag
+	signatures
+)
 
 # How much a request is waited for.  It orders a fetcher's work.
 type Urgency (
@@ -281,10 +291,18 @@ method Layer(layer: string, staging: int, blob: ?Blob, toc: ?int) -> ()
 # probed too).
 method Forget(layer: string) -> ()
 
-# The manifest or index `reference` names (a tag or a digest), at
-# most `max` bytes: `file` a sealed memory file in the reply.  The
-# engine hashes it.
-method GetManifest(reference: string, max: int) -> (file: int, media_type: ?string)
+# A small file of the origin, at most `max` bytes, in `file`, a
+# sealed memory file in the reply.  `kind` says which: the manifest
+# or index `reference` names (a tag or a digest), with its media
+# type, which the engine hashes; the startup profile of the image
+# `reference` (its id), digests of files, one a line, in the order
+# the image read them; the signatures of the manifest or tag
+# `reference` names (a `repository:tag`, or a manifest digest), a
+# JSON array of records, `{"digest": "sha256:...", "signatures":
+# ["<base64 of a signature blob>", ...]}`, which the engine judges
+# itself.  What the fetcher has none of is `Failed` of class
+# `unavailable`.
+method GetFile(kind: FileKind, reference: string, max: int) -> (file: int, media_type: ?string)
 
 # A blob, its bytes written into `file`, a file with no name the
 # engine made, open for writing, among the descriptors of the call:
@@ -292,22 +310,6 @@ method GetManifest(reference: string, max: int) -> (file: int, media_type: ?stri
 # writes and the engine checks again.  Nothing holds the blob in
 # memory.
 method GetBlob(blob: Blob, file: int) -> ()
-
-# The startup profile of the image `image` (its id): digests of
-# files, one a line, in the order the image read them, at most
-# `max` bytes, in `file`, a sealed memory file in the reply.  A
-# fetcher that does not keep profiles answers `Failed` of class
-# `unavailable`.
-method GetProfile(image: string, max: int) -> (file: int)
-
-# The signatures of the manifest or tag `reference` names (a
-# `repository:tag`, or a manifest digest), at most `max` bytes: a
-# JSON array of records, `{"digest": "sha256:...", "signatures":
-# ["<base64 of a signature blob>", ...]}`, in `file`, a sealed
-# memory file in the reply.  What the fetcher has none of is
-# `unavailable`.  A client trusts nothing in it: it judges the
-# signatures itself.
-method GetSignatures(reference: string, max: int) -> (file: int)
 
 # What can this fetcher do for `layers`?  Called with `more`: one
 # `probed` a reply, in any order, then a last reply without one.
@@ -355,7 +357,7 @@ error Refused (reason: string)
 # A word of `requires` that is not known
 error NotSupported (feature: string)
 
-# The answer of a `GetManifest` or `GetProfile` is larger
+# The answer of a `GetFile` is larger
 # than `max`
 error TooLarge (max: int)
 

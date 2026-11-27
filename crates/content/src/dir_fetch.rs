@@ -16,8 +16,8 @@
 //! socket.
 
 use crate::fetcher::fetch::{
-    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, NotLazy, Parts,
-    Probed, TocSource,
+    sealed, Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, FileKind,
+    NotLazy, Parts, Probed, TocSource,
 };
 use crate::serve_fetch::{BlobFile, Described, FetchCall, LayerScope, Out, Scope, StagingFetcher};
 use crate::stager::{self, content_of, name_of, LayerToc, Unnamed};
@@ -229,8 +229,7 @@ impl<I: Items + 'static> ItemFetch<I> {
             .await
             .map_err(|e| failed(e.to_string()))?
             .ok_or_else(|| FetcherError::unavailable(format!("{name}: not here")))?;
-        let fd = velarx_base::sealed::sealed_memory(&bytes).map_err(|e| failed(e.to_string()))?;
-        Ok(fd.into())
+        sealed(&bytes)
     }
 }
 
@@ -281,12 +280,7 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
             };
             let (toc_z, tarsplit_z) =
                 crate::pull::index::split(&index).map_err(FetcherError::failed)?;
-            let fds = vec![
-                velarx_base::sealed::sealed_memory(toc_z)
-                    .map_err(|e| FetcherError::failed(e.to_string()))?,
-                velarx_base::sealed::sealed_memory(tarsplit_z)
-                    .map_err(|e| FetcherError::failed(e.to_string()))?,
-            ];
+            let fds = vec![sealed(toc_z)?.into(), sealed(tarsplit_z)?.into()];
             let reply = Probed {
                 toc: TocSource::Carried,
                 reason: Some(NotLazy::NoToc),
@@ -321,14 +315,18 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
         .map_err(|e| FetcherError::failed(e.to_string()))?
     }
 
-    /// The startup profile of an image.
-    async fn get_profile(
+    /// The startup profile of an image: it has no other file.
+    async fn get_file(
         &self,
         _scope: &Scope,
-        image: &str,
+        kind: FileKind,
+        reference: &str,
         max: u64,
-    ) -> Result<std::fs::File, FetcherError> {
-        self.item_file(image, None, max).await
+    ) -> Result<(std::fs::File, Option<String>), FetcherError> {
+        if kind != FileKind::Profile {
+            return Err(FetcherError::unavailable(format!("{reference}: not here")));
+        }
+        Ok((self.item_file(reference, None, max).await?, None))
     }
 
     async fn fetch(

@@ -53,7 +53,7 @@ impl Net {
     }
 
     /// The index of the images of the origin of a path, as it serves it
-    /// (`GetManifest("")`): untrusted bytes.
+    /// (`GetFile("")`): untrusted bytes.
     pub async fn path_index(&self) -> ImageResult<Bytes> {
         self.origin()?.path_index().await
     }

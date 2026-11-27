@@ -72,7 +72,7 @@
 //!   [`velarx_content::fetcher::Kind::Profile`]): as an index, by the image's id as a
 //!   digest, at most [`velarx_content::fetcher::fetch::PROFILE_MAX_BYTES`].
 //! * the signatures of a manifest or a name ([`OP_SIGNATURES`], the records of
-//!   `GetSignatures`): as an index, with the reference as text in place of the
+//!   a `GetFile` of signatures): as an index, with the reference as text in place of the
 //!   digest (the count of the request is its length in bytes, at most
 //!   [`MAX_REFERENCE`]).
 //!

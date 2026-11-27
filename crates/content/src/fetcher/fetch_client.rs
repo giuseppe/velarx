@@ -7,12 +7,12 @@
 //! [`FetchConn::connect`].
 //!
 //! Nothing of what a fetcher answers is trusted here: the caller hashes what
-//! `GetManifest`, `GetProfile` and `Probe` return and measures what `GetBlob`
+//! `GetFile` and `Probe` return and measures what `GetBlob`
 //! wrote and what `Fetch` staged.
 
 use super::fetch::{
-    Blob, FetchEvent, FetchReply, FetcherError, FetcherProxy, Parts, ProbeReply, Probed, Reuse,
-    UnpackReply, Urgency, INTERFACE, MAX_FDS, PROTO,
+    Blob, FetchEvent, FetchReply, FetcherError, FetcherProxy, FileKind, Parts, ProbeReply, Probed,
+    Reuse, UnpackReply, Urgency, INTERFACE, MAX_FDS, PROTO,
 };
 use super::proto::{
     Downloaded, Found, Hit, RegistryError, RegistryProxy, Remote, Tagged, MAX_ANSWER,
@@ -481,18 +481,19 @@ impl FetchConn {
         done(got).map(|_| ())
     }
 
-    /// The manifest or index `reference` names, at most `max` bytes: the
+    /// The small file `kind` names, of `reference`, at most `max` bytes: the
     /// sealed memory file of the reply, and its media type.
-    pub async fn get_manifest(
+    pub async fn get_file(
         &mut self,
+        kind: FileKind,
         reference: &str,
         max: u64,
     ) -> Result<(File, Option<String>), CallError> {
         let (conn, busy) = self.begin().await?;
-        let got = conn.get_manifest(reference, max).await;
+        let got = conn.get_file(kind, reference, max).await;
         busy.store(false, Ordering::Release);
-        let (manifest, fds) = done_fds(got)?;
-        Ok((file_at(fds, manifest.file, reference)?, manifest.media_type))
+        let (answer, fds) = done_fds(got)?;
+        Ok((file_at(fds, answer.file, reference)?, answer.media_type))
     }
 
     /// The blob, written by the fetcher into `dest` (a file of the engine,
@@ -504,25 +505,6 @@ impl FetchConn {
         let got = conn.get_blob(fds, blob, 0).await;
         busy.store(false, Ordering::Release);
         done(got).map(|_| ())
-    }
-
-    /// The startup profile of `image`: the sealed memory file of the reply.
-    pub async fn get_profile(&mut self, image: &str, max: u64) -> Result<File, CallError> {
-        let (conn, busy) = self.begin().await?;
-        let got = conn.get_profile(image, max).await;
-        busy.store(false, Ordering::Release);
-        let (item, fds) = done_fds(got)?;
-        file_at(fds, item.file, image)
-    }
-
-    /// The signatures of `reference` (a tag or a digest): the sealed memory
-    /// file of the reply.
-    pub async fn get_signatures(&mut self, reference: &str, max: u64) -> Result<File, CallError> {
-        let (conn, busy) = self.begin().await?;
-        let got = conn.get_signatures(reference, max).await;
-        busy.store(false, Ordering::Release);
-        let (item, fds) = done_fds(got)?;
-        file_at(fds, item.file, reference)
     }
 
     /// What the fetcher can do for `layers` (`again`: the index it carried

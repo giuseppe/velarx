@@ -4,6 +4,7 @@
 
 use super::*;
 use std::path::{Path, PathBuf};
+use velarx_content::fetcher::fetch::FileKind;
 use velarx_content::pull::commit::ImageStep;
 use velarx_content::pull::staged::{StagedPull, Staging};
 use velarx_content::pull::{layer_commit, LayerDone};
@@ -118,7 +119,10 @@ impl ImageService {
                         link.idle,
                     ))
                     .await?;
-                link.conn.get_profile(&name, max_bytes).await
+                link.conn
+                    .get_file(FileKind::Profile, &name, max_bytes)
+                    .await
+                    .map(|(file, _)| file)
             })
             .await;
             let Ok(file) = got else {

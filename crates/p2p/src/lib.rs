@@ -103,7 +103,7 @@ pub trait ChunkProvider: Send + Sync + 'static {
         Ok(None)
     }
     /// The records of the signatures of `reference` (a `repository:tag` or a
-    /// manifest digest) (`GetSignatures`)
+    /// manifest digest) (`GetFile` of signatures)
     fn get_signatures(&self, _reference: &str) -> std::io::Result<Option<Vec<u8>>> {
         Ok(None)
     }

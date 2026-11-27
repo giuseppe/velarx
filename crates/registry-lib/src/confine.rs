@@ -70,7 +70,7 @@ pub fn reach(
         read.extend(REGISTRY_FILES.iter().map(|f| dir.join(f)));
     }
     read.push("/etc/docker/certs.d".into());
-    // registries.d, where the signatures are (`GetSignatures`)
+    // registries.d, where the signatures are (`GetFile` of signatures)
     match &config.pull.registries_d {
         Some(dir) => read.push(dir.clone()),
         None => read.extend(velarx_signature::registries_d::default_dirs()?),

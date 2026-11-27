@@ -23,11 +23,11 @@ pub const MAX_FDS: usize = 16;
 /// The most bytes of the credentials in a sealed memory file.
 pub const MAX_ACCESS: u64 = 1 << 20;
 
-/// The largest startup profile a node gives or takes (`GetProfile`):
+/// The largest startup profile a node gives or takes (`GetFile`):
 /// thousands of digests, small next to the files they name.
 pub const PROFILE_MAX_BYTES: u64 = 512 * 1024;
 
-/// The most bytes of the records `GetSignatures` gives or takes.
+/// The most bytes of the records `GetFile` gives or takes.
 pub const SIGNATURES_MAX_BYTES: u64 = 1 << 20;
 
 /// The capability words.
@@ -223,8 +223,8 @@ pub struct ProbeReply {
     pub probed: Option<Probed>,
 }
 
-/// A record of `GetSignatures`: the signatures made for the manifest
-/// `digest`, each the base64 of a signature blob (the blob of a lookaside
+/// A record of a `GetFile` of signatures: the signatures made for the
+/// manifest `digest`, each the base64 of a signature blob (the blob of a lookaside
 /// storage).  Untrusted: the engine judges the signatures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedRecord {
@@ -267,19 +267,25 @@ impl SignedRecord {
     }
 }
 
-/// What `GetManifest` answers: the manifest is in the sealed memory file
-/// `file` of the reply.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::Type)]
-pub struct Manifest {
-    pub file: u32,
-    pub media_type: Option<String>,
+/// What a `GetFile` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, introspect::CustomType)]
+#[serde(rename_all = "snake_case")]
+#[zlink(rename_all = "snake_case")]
+pub enum FileKind {
+    /// A manifest or an index, by tag or digest
+    Manifest,
+    /// The startup profile of an image
+    Profile,
+    /// The signatures of a manifest or a tag
+    Signatures,
 }
 
-/// What `GetProfile` and `GetSignatures` answer: the item is in the sealed memory
-/// file `file` of the reply.
+/// What `GetFile` answers: the file is in the sealed memory file `file` of
+/// the reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::Type)]
-pub struct Item {
+pub struct Answer {
     pub file: u32,
+    pub media_type: Option<String>,
 }
 
 /// What an event of a `Fetch` carries.
@@ -374,7 +380,7 @@ pub enum FetcherError {
     NotSupported {
         feature: String,
     },
-    /// The answer of a `GetManifest` or `GetProfile` is larger
+    /// The answer of a `GetFile` is larger
     /// than `max`
     TooLarge {
         max: u64,
@@ -446,6 +452,33 @@ impl FetcherError {
     }
 }
 
+/// What an I/O error is to the engine: a file that is not there is
+/// unavailable, one that is refused is unauthorized, a full disk is no
+/// space, a Docker format is not supported, content that is not what it
+/// claims is invalid; the rest failed.
+impl From<std::io::Error> for FetcherError {
+    fn from(e: std::io::Error) -> Self {
+        use std::io::ErrorKind::*;
+        let reason = e.to_string();
+        match e.kind() {
+            NotFound => Self::unavailable(reason),
+            PermissionDenied => Self::unauthorized(reason),
+            StorageFull | QuotaExceeded => Self::no_space(reason),
+            Unsupported => Self::NotSupported { feature: reason },
+            InvalidData | UnexpectedEof => Self::invalid(reason),
+            _ => Self::failed(reason),
+        }
+    }
+}
+
+/// A sealed memory file with `bytes`: what a call that answers with a small
+/// file gives.
+pub fn sealed(bytes: &[u8]) -> Result<std::fs::File, FetcherError> {
+    Ok(std::fs::File::from(velarx_base::sealed::sealed_memory(
+        bytes,
+    )?))
+}
+
 impl std::fmt::Display for FetcherError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -511,13 +544,14 @@ mod proxy {
         /// Forget the layer.
         async fn forget(&mut self, layer: &str) -> zlink::Result<Result<Ack, FetcherError>>;
 
-        /// The manifest or index `reference` names.
+        /// A small file of the origin: `kind` of `reference`.
         #[zlink(return_fds)]
-        async fn get_manifest(
+        async fn get_file(
             &mut self,
+            kind: FileKind,
             reference: &str,
             max: u64,
-        ) -> zlink::Result<(Result<Manifest, FetcherError>, Vec<OwnedFd>)>;
+        ) -> zlink::Result<(Result<Answer, FetcherError>, Vec<OwnedFd>)>;
 
         /// A blob, written into the file at position `file`.
         async fn get_blob(
@@ -526,22 +560,6 @@ mod proxy {
             blob: &Blob,
             file: u32,
         ) -> zlink::Result<Result<Ack, FetcherError>>;
-
-        /// The startup profile of the image `image`.
-        #[zlink(return_fds)]
-        async fn get_profile(
-            &mut self,
-            image: &str,
-            max: u64,
-        ) -> zlink::Result<(Result<Item, FetcherError>, Vec<OwnedFd>)>;
-
-        /// The signatures of the manifest or tag `reference` names.
-        #[zlink(return_fds)]
-        async fn get_signatures(
-            &mut self,
-            reference: &str,
-            max: u64,
-        ) -> zlink::Result<(Result<Item, FetcherError>, Vec<OwnedFd>)>;
 
         /// What can this fetcher do for `layers`?
         #[zlink(more, return_fds)]

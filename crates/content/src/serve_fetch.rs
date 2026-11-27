@@ -2,7 +2,7 @@
 //! The serving end of the fetcher interface:
 //! the scope of a connection (`Open`, `Layer`, `Renew`, `Forget`), the
 //! connections for other calls (`Connect`), and the calls that bring
-//! content (`GetManifest`, `GetBlob`, `GetProfile`, `Probe`, `Unpack`,
+//! content (`GetFile`, `GetBlob`, `Probe`, `Unpack`,
 //! `Fetch`), which a [`StagingFetcher`] implements.  What
 //! a fetcher does not implement is `unavailable`: a [`StagingFetcher`] with
 //! none of the methods is a valid fetcher that has nothing.
@@ -13,8 +13,8 @@
 
 use crate::activation;
 use crate::fetcher::fetch::{
-    Ack, Blob, EventKind, Failure, FailureClass, FetchEvent, FetchReply, FetcherError, Item,
-    Manifest, NotLazy, Parts, ProbeReply, Probed, Reuse, TocSource, UnpackReply, Urgency,
+    Ack, Answer, Blob, EventKind, Failure, FailureClass, FetchEvent, FetchReply, FetcherError,
+    FileKind, NotLazy, Parts, ProbeReply, Probed, Reuse, TocSource, UnpackReply, Urgency,
     MAX_ACCESS, MAX_FDS, PROTO,
 };
 use crate::fetcher::proto::{
@@ -51,7 +51,7 @@ pub struct Described {
 }
 
 /// What `Open` gave the connection.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Scope {
     /// fs-verity is enabled on a file before it has its name
     pub verity: bool,
@@ -143,14 +143,14 @@ impl BlobFile {
             )));
         }
         self.hasher.update(data);
-        self.out.write(data).map_err(write_error)?;
+        self.out.write(data)?;
         // (a hole does not lengthen the file, and the engine sees the
         // progress of a call by its length: a long run of zeros is not a
         // fetcher that stopped)
         // (the bytes up to the block in progress are written or holes)
         if self.written / LENGTHENED != before / LENGTHENED {
             let whole = self.written - self.written % velarx_storage::HOLE_BLOCK as u64;
-            self.file.set_len(whole).map_err(write_error)?;
+            self.file.set_len(whole)?;
         }
         Ok(())
     }
@@ -163,7 +163,7 @@ impl BlobFile {
                 self.digest, self.written, self.size
             )));
         }
-        self.out.finish().map_err(write_error)?;
+        self.out.finish()?;
         let got = self.hasher.finalize();
         if got != self.digest {
             return Err(FetcherError::invalid(format!(
@@ -179,14 +179,6 @@ impl BlobFile {
         let mut out = Self::new(file, blob)?;
         out.write(bytes)?;
         out.finish()
-    }
-}
-
-/// A write of a [`BlobFile`] that failed.
-fn write_error(e: std::io::Error) -> FetcherError {
-    match e.raw_os_error() {
-        Some(libc::ENOSPC) => FetcherError::no_space(e.to_string()),
-        _ => FetcherError::failed(e.to_string()),
     }
 }
 
@@ -331,10 +323,14 @@ pub trait StagingFetcher: Send + Sync + 'static {
         Ok(())
     }
 
-    /// The manifest or index `reference` names, at most `max` bytes.
-    async fn get_manifest(
+    /// The small file `kind` names, of `reference`, at most `max` bytes: the
+    /// manifest or index a tag or digest names (and its media type, when it
+    /// is known), the startup profile of an image, or the signatures of a
+    /// manifest or tag (a JSON array of [`SignedRecord`]).
+    async fn get_file(
         &self,
         _scope: &Scope,
+        _kind: FileKind,
         reference: &str,
         _max: u64,
     ) -> Result<(File, Option<String>), FetcherError> {
@@ -351,29 +347,6 @@ pub trait StagingFetcher: Send + Sync + 'static {
         Err(FetcherError::unavailable(format!(
             "{}: nobody has it",
             blob.digest
-        )))
-    }
-
-    /// The startup profile of the image `image`, at most `max` bytes.
-    async fn get_profile(
-        &self,
-        _scope: &Scope,
-        image: &str,
-        _max: u64,
-    ) -> Result<File, FetcherError> {
-        Err(FetcherError::unavailable(format!("{image}: nobody has it")))
-    }
-
-    /// The signatures of the manifest or tag `reference` names, at most
-    /// `max` bytes: a JSON array of [`SignedRecord`].
-    async fn get_signatures(
-        &self,
-        _scope: &Scope,
-        reference: &str,
-        _max: u64,
-    ) -> Result<File, FetcherError> {
-        Err(FetcherError::unavailable(format!(
-            "{reference}: nobody has a signature"
         )))
     }
 
@@ -657,6 +630,16 @@ pub fn run_one_blocking(
     limits: activation::Limits,
 ) -> std::io::Result<()> {
     run_one(stream, move || endpoint, idle, limits)
+}
+
+/// The `main` of a fetcher program that serves what `make` gives on
+/// descriptor 3 ([`run_descriptor_3`]) with the default limits.  `make` runs
+/// after the descriptors the process was passed are noted.  Call it before
+/// `main` opens any file: descriptor 3 must be the one passed.
+pub fn main(make: impl FnOnce() -> Arc<dyn StagingFetcher>) -> std::io::Result<()> {
+    let startup = velarx_sys::fd::Startup::take()
+        .ok_or_else(|| std::io::Error::other("the descriptors of the start were taken"))?;
+    run_descriptor_3(&startup, make(), activation::Limits::default())
 }
 
 /// Serve `api` on descriptor 3, which the process that started this passed:
@@ -1115,7 +1098,7 @@ mod service {
         /// Who the fetcher is and what it can do.
         #[zlink(
             interface = "org.velarx.Fetcher",
-            types = [Urgency, Blob, Reuse, TocSource, Parts, NotLazy, FailureClass, Failure, EventKind, FetchEvent, Probed]
+            types = [FileKind, Urgency, Blob, Reuse, TocSource, Parts, NotLazy, FailureClass, Failure, EventKind, FetchEvent, Probed]
         )]
         pub async fn get_info(&self) -> Info {
             info_of(self.api.described(), PROTO)
@@ -1285,15 +1268,24 @@ mod service {
             }
         }
 
-        /// The manifest or index `reference` names (a tag or a digest), at
-        /// most `max` bytes: `file` a sealed memory file in the reply.  The
-        /// engine hashes it.
+        /// A small file of the origin, at most `max` bytes, in `file`, a
+        /// sealed memory file in the reply.  `kind` says which: the manifest
+        /// or index `reference` names (a tag or a digest), with its media
+        /// type, which the engine hashes; the startup profile of the image
+        /// `reference` (its id), digests of files, one a line, in the order
+        /// the image read them; the signatures of the manifest or tag
+        /// `reference` names (a `repository:tag`, or a manifest digest), a
+        /// JSON array of records, `{"digest": "sha256:...", "signatures":
+        /// ["<base64 of a signature blob>", ...]}`, which the engine judges
+        /// itself.  What the fetcher has none of is `Failed` of class
+        /// `unavailable`.
         #[zlink(return_fds)]
-        pub async fn get_manifest(
+        pub async fn get_file(
             &self,
+            kind: FileKind,
             reference: String,
             max: u64,
-        ) -> (Result<Manifest, FetcherError>, Vec<OwnedFd>) {
+        ) -> (Result<Answer, FetcherError>, Vec<OwnedFd>) {
             let scope = match self.scope() {
                 Ok(s) if max > 0 => s,
                 Ok(_) => {
@@ -1304,13 +1296,13 @@ mod service {
             let api = self.api.clone();
             // (the asker went: what is being read is dropped with the call)
             let got = owned(&self.runtime, async move {
-                api.get_manifest(&scope, &reference, max).await
+                api.get_file(&scope, kind, &reference, max).await
             })
             .await
             .unwrap_or_else(|e| Err(stopped(e)));
             match got {
                 Ok((file, media_type)) => (
-                    Ok(Manifest {
+                    Ok(Answer {
                         file: 0,
                         media_type,
                     }),
@@ -1345,68 +1337,6 @@ mod service {
             .await
             .unwrap_or_else(|e| Err(stopped(e)))?;
             Ok(Ack {})
-        }
-
-        /// The startup profile of the image `image` (its id): digests of
-        /// files, one a line, in the order the image read them, at most
-        /// `max` bytes, in `file`, a sealed memory file in the reply.  A
-        /// fetcher that does not keep profiles answers `Failed` of class
-        /// `unavailable`.
-        #[zlink(return_fds)]
-        pub async fn get_profile(
-            &self,
-            image: String,
-            max: u64,
-        ) -> (Result<Item, FetcherError>, Vec<OwnedFd>) {
-            let scope = match self.scope() {
-                Ok(s) if max > 0 => s,
-                Ok(_) => {
-                    return (Err(maximum()), Vec::new());
-                }
-                Err(e) => return (Err(e), Vec::new()),
-            };
-            let api = self.api.clone();
-            let got = owned(&self.runtime, async move {
-                api.get_profile(&scope, &image, max).await
-            })
-            .await
-            .unwrap_or_else(|e| Err(stopped(e)));
-            match got {
-                Ok(file) => (Ok(Item { file: 0 }), vec![file.into()]),
-                Err(e) => (Err(e), Vec::new()),
-            }
-        }
-
-        /// The signatures of the manifest or tag `reference` names (a
-        /// `repository:tag`, or a manifest digest), at most `max` bytes: a
-        /// JSON array of records, `{"digest": "sha256:...", "signatures":
-        /// ["<base64 of a signature blob>", ...]}`, in `file`, a sealed
-        /// memory file in the reply.  What the fetcher has none of is
-        /// `unavailable`.  A client trusts nothing in it: it judges the
-        /// signatures itself.
-        #[zlink(return_fds)]
-        pub async fn get_signatures(
-            &self,
-            reference: String,
-            max: u64,
-        ) -> (Result<Item, FetcherError>, Vec<OwnedFd>) {
-            let scope = match self.scope() {
-                Ok(s) if max > 0 => s,
-                Ok(_) => {
-                    return (Err(maximum()), Vec::new());
-                }
-                Err(e) => return (Err(e), Vec::new()),
-            };
-            let api = self.api.clone();
-            let got = owned(&self.runtime, async move {
-                api.get_signatures(&scope, &reference, max).await
-            })
-            .await
-            .unwrap_or_else(|e| Err(stopped(e)));
-            match got {
-                Ok(file) => (Ok(Item { file: 0 }), vec![file.into()]),
-                Err(e) => (Err(e), Vec::new()),
-            }
         }
 
         /// What can this fetcher do for `layers`?  Called with `more`: one
@@ -2324,9 +2254,9 @@ pub fn definition() -> String {
          # TRUST.  A fetcher is not trusted.  A name it made is a claim; the engine opens\n\
          # it and takes the kernel's measure.  A file it hands over is a claim too: the\n\
          # engine copies it, or takes the kernel's measure of it, and knows it by the\n\
-         # digest of the bytes it read.  What it returns with GetManifest,\n\
-         # GetBlob, GetProfile and Probe is hashed by the engine before it is used,\n\
-         # and the signatures of GetSignatures are judged by the engine's policy.\n\
+         # digest of the bytes it read.  What it returns with GetFile (a manifest),\n\
+         # GetBlob and Probe is hashed by the engine before it is used,\n\
+         # and the signatures of GetFile are judged by the engine's policy.\n\
          #\n\
          # CAPABILITIES.  What a fetcher can do is a word of capabilities in GetInfo; a\n\
          # client ignores the words it does not know; what it cannot do without is a\n\
@@ -2424,19 +2354,8 @@ mod tests {
         let text = definition();
         velarx_base::testing::assert_interface_file("interfaces/org.velarx.Fetcher.varlink", &text);
         for method in [
-            "GetInfo",
-            "Open",
-            "Connect",
-            "Renew",
-            "Layer",
-            "Forget",
-            "GetManifest",
-            "GetBlob",
-            "GetProfile",
-            "GetSignatures",
-            "Probe",
-            "Unpack",
-            "Fetch",
+            "GetInfo", "Open", "Connect", "Renew", "Layer", "Forget", "GetFile", "GetBlob",
+            "Probe", "Unpack", "Fetch",
         ] {
             assert!(text.contains(&format!("method {method}(")), "{method}");
         }
@@ -2756,16 +2675,14 @@ mod tests {
             p.toc == TocSource::None && p.reason == Some(NotLazy::Unreachable)
         }));
         // an item: nobody has it
-        let got = e.get_manifest("latest".into(), 100).await;
-        assert!(matches!(got.0, Err(FetcherError::Failed { .. })));
+        for kind in [FileKind::Manifest, FileKind::Profile, FileKind::Signatures] {
+            let got = e.get_file(kind, "latest".into(), 100).await;
+            assert!(matches!(got.0, Err(FetcherError::Failed { .. })));
+        }
         let got = e.get_blob(vec![dir()], blob("sha256:aa"), 0).await;
         assert!(matches!(got, Err(FetcherError::Failed { .. })));
-        let got = e.get_profile("sha256:aa".into(), 100).await;
-        assert!(matches!(got.0, Err(FetcherError::Failed { .. })));
-        let got = e.get_signatures("a/b:c".into(), 100).await;
-        assert!(matches!(got.0, Err(FetcherError::Failed { .. })));
         // (an item is asked for with a maximum)
-        let got = e.get_manifest("latest".into(), 0).await;
+        let got = e.get_file(FileKind::Manifest, "latest".into(), 0).await;
         assert!(matches!(got.0, Err(FetcherError::InvalidArgument { .. })));
     }
 }

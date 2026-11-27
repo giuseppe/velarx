@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The signatures of an image as the registry has them, for `GetSignatures`:
+//! The signatures of an image as the registry has them, for a `GetFile` of signatures:
 //! where registries.d says (a lookaside storage on the network, the layers
 //! of the sigstore attachment of the manifest).  A lookaside storage in a
 //! directory (`file:`) is not reached from here: the engine reads it.

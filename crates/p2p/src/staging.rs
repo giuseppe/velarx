@@ -27,8 +27,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsFd;
 use velarx_content::fetcher::fetch::{
-    Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, Parts, SignedRecord,
-    Urgency,
+    sealed, Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, FileKind,
+    Parts, SignedRecord, Urgency,
 };
 use velarx_content::serve_fetch::{
     BlobFile, Described, FetchCall, LayerScope, Out, Scope, StagingFetcher,
@@ -478,9 +478,7 @@ impl PeerSource {
                 self.nobody(&format!("{name}: no peer has it")).await,
             ));
         };
-        Ok(velarx_base::sealed::sealed_memory(&bytes)
-            .map_err(failed)?
-            .into())
+        sealed(&bytes)
     }
 }
 
@@ -583,9 +581,9 @@ impl StagingFetcher for PeerSource {
                 out.send(none).await.map_err(gone)?;
                 continue;
             };
-            let mut fds = vec![velarx_base::sealed::sealed_memory(&toc).map_err(failed)?];
+            let mut fds = vec![sealed(&toc)?.into()];
             if !tarsplit.is_empty() {
-                fds.push(velarx_base::sealed::sealed_memory(&tarsplit).map_err(failed)?);
+                fds.push(sealed(&tarsplit)?.into());
             }
             let reply = Probed {
                 toc: TocSource::Carried,
@@ -600,71 +598,60 @@ impl StagingFetcher for PeerSource {
         Ok(())
     }
 
-    /// The manifest a digest names: what the peers send is checked against
-    /// it (a tag is not one: nobody here says what it names).
-    async fn get_manifest(
+    /// What the peers have of `reference`.  A manifest is by its digest:
+    /// what the peers send is checked against it (a tag is not one: nobody
+    /// here says what it names).  The signatures are the records of
+    /// `reference` (a name with a tag, or a manifest digest) the peers have,
+    /// together (those of one digest one record): untrusted, the engine
+    /// judges them.  The profile is the startup profile of the image.
+    async fn get_file(
         &self,
         _scope: &Scope,
+        kind: FileKind,
         reference: &str,
         max: u64,
     ) -> Result<(std::fs::File, Option<String>), FetcherError> {
         let mut one = One(None);
-        let item = [Item {
-            digest: reference.to_string(),
-            size: None,
-        }];
-        if crate::limits::is_digest(reference) {
-            self.fetch_group(&item, None, &mut one)
-                .await
-                .map_err(failed)?;
-        }
-        if one.0.as_ref().is_some_and(|b| b.len() as u64 > max) {
-            return Err(FetcherError::unavailable(format!("{reference}: too large")));
+        match kind {
+            FileKind::Manifest => {
+                let item = [Item {
+                    digest: reference.to_string(),
+                    size: None,
+                }];
+                if crate::limits::is_digest(reference) {
+                    self.fetch_group(&item, None, &mut one)
+                        .await
+                        .map_err(failed)?;
+                }
+                if one.0.as_ref().is_some_and(|b| b.len() as u64 > max) {
+                    return Err(FetcherError::unavailable(format!("{reference}: too large")));
+                }
+            }
+            FileKind::Signatures => {
+                // (an answer that is not records is nobody's)
+                let answers = self.signatures(reference, max).await;
+                let records = answers.iter().flat_map(|answer| {
+                    serde_json::from_slice::<Vec<SignedRecord>>(answer).unwrap_or_default()
+                });
+                let Some(bytes) = SignedRecord::encoded(records, max) else {
+                    return Err(FetcherError::unavailable(
+                        self.nobody(&format!("{reference}: no peer has a signature"))
+                            .await,
+                    ));
+                };
+                return Ok((sealed(&bytes)?, None));
+            }
+            FileKind::Profile => {
+                let item = [Item {
+                    digest: reference.to_string(),
+                    size: Some(max),
+                }];
+                self.fetch_profiles(&item, None, &mut one)
+                    .await
+                    .map_err(failed)?;
+            }
         }
         Ok((self.given(one, reference).await?, None))
-    }
-
-    /// The records of the signatures of `reference` (a name with a tag, or
-    /// a manifest digest) the peers have, together (those of one digest one
-    /// record): untrusted, the engine judges them.
-    async fn get_signatures(
-        &self,
-        _scope: &Scope,
-        reference: &str,
-        max: u64,
-    ) -> Result<std::fs::File, FetcherError> {
-        // (an answer that is not records is nobody's)
-        let answers = self.signatures(reference, max).await;
-        let records = answers.iter().flat_map(|answer| {
-            serde_json::from_slice::<Vec<SignedRecord>>(answer).unwrap_or_default()
-        });
-        let Some(bytes) = SignedRecord::encoded(records, max) else {
-            return Err(FetcherError::unavailable(
-                self.nobody(&format!("{reference}: no peer has a signature"))
-                    .await,
-            ));
-        };
-        Ok(velarx_base::sealed::sealed_memory(&bytes)
-            .map_err(failed)?
-            .into())
-    }
-
-    /// The startup profile of the image `image`.
-    async fn get_profile(
-        &self,
-        _scope: &Scope,
-        image: &str,
-        max: u64,
-    ) -> Result<std::fs::File, FetcherError> {
-        let mut one = One(None);
-        let item = [Item {
-            digest: image.to_string(),
-            size: Some(max),
-        }];
-        self.fetch_profiles(&item, None, &mut one)
-            .await
-            .map_err(failed)?;
-        self.given(one, image).await
     }
 
     async fn fetch(

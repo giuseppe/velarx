@@ -3,7 +3,7 @@
 //! stage one file on the interface of the real fetchers, with the bytes its
 //! name says or with other ones.
 
-use crate::fetcher::fetch::{EventKind, FetchEvent as Event, FetcherError};
+use crate::fetcher::fetch::{sealed, EventKind, FetchEvent as Event, FetcherError, FileKind};
 use crate::serve_fetch::{Described, FetchCall, LayerScope, Out, Scope, StagingFetcher};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -118,15 +118,19 @@ impl StagingFetcher for Metadata {
         }
     }
 
-    async fn get_manifest(
+    async fn get_file(
         &self,
         _scope: &Scope,
-        _reference: &str,
+        kind: FileKind,
+        reference: &str,
         _max: u64,
     ) -> Result<(std::fs::File, Option<String>), FetcherError> {
-        let file = velarx_base::sealed::sealed_memory(&self.0)
-            .map_err(|e| FetcherError::failed(e.to_string()))?;
-        Ok((file.into(), None))
+        if kind == FileKind::Profile {
+            return Err(FetcherError::unavailable(format!(
+                "{reference}: nobody has it"
+            )));
+        }
+        Ok((sealed(&self.0)?, None))
     }
 
     async fn get_blob(
@@ -138,16 +142,5 @@ impl StagingFetcher for Metadata {
         // (as it is: the engine checks what a fetcher wrote)
         std::io::Write::write_all(&mut file, &self.0)
             .map_err(|e| FetcherError::failed(e.to_string()))
-    }
-
-    async fn get_signatures(
-        &self,
-        _scope: &Scope,
-        _reference: &str,
-        _max: u64,
-    ) -> Result<std::fs::File, FetcherError> {
-        let file = velarx_base::sealed::sealed_memory(&self.0)
-            .map_err(|e| FetcherError::failed(e.to_string()))?;
-        Ok(file.into())
     }
 }

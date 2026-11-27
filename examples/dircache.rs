@@ -34,23 +34,44 @@
 //! each named by the hex of its sha256, with or without the `sha256:`
 //! prefix.  The engine checks everything this stages; the interface
 //! (`org.velarx.Fetcher`) is `interfaces/org.velarx.Fetcher.varlink`.
+//!
+//! The least an origin of pulls (a `[[transports]]` command) is: the blob
+//! of a digest and the manifest its location names.  Here a directory of
+//! blobs named by their hex, with the digest of the manifest in `top`:
+//!
+//! ```ignore
+//! struct Here(PathBuf);
+//! impl Blobs for Here {
+//!     fn open(&self, _: &Scope, digest: &Digest) -> Result<(Box<dyn Read + Send>, u64), FetcherError> {
+//!         let file = File::open(self.0.join(digest.hex()))?;
+//!         let size = file.metadata()?.len();
+//!         Ok((Box::new(file), size))
+//!     }
+//!     fn resolve(&self, _: &Scope, _max: u64) -> Result<(Digest, Option<String>), FetcherError> {
+//!         let top = std::fs::read_to_string(self.0.join("top"))?;
+//!         Ok((top.trim().parse().map_err(|_| FetcherError::invalid("top"))?, None))
+//!     }
+//! }
+//! fn main() -> std::io::Result<()> {
+//!     let settings = HelperSettings::of(&velarx_config::Config::default());
+//!     serve_fetch::main(|| BlobFetch::new("here", settings, Here("/srv/blobs".into())))
+//! }
+//! ```
 
 use std::path::PathBuf;
 use velarx_content::dir_fetch::DirFetch;
 
 fn main() -> std::io::Result<()> {
-    // (first thing: it notes the descriptors it was passed)
-    let startup = velarx_sys::fd::Startup::take().expect("the first call");
-    let mut args = std::env::args_os().skip(1);
-    let (Some(dir), None) = (args.next().map(PathBuf::from), args.next()) else {
-        eprintln!("usage: dircache <directory>");
-        std::process::exit(2);
-    };
-    if !dir.is_dir() {
-        eprintln!("{} is not a directory", dir.display());
-        std::process::exit(2);
-    }
-    let api = DirFetch::new("dircache", dir);
-    let limits = velarx_content::activation::Limits::default();
-    velarx_content::serve_fetch::run_descriptor_3(&startup, api, limits)
+    velarx_content::serve_fetch::main(|| {
+        let mut args = std::env::args_os().skip(1);
+        let (Some(dir), None) = (args.next().map(PathBuf::from), args.next()) else {
+            eprintln!("usage: dircache <directory>");
+            std::process::exit(2);
+        };
+        if !dir.is_dir() {
+            eprintln!("{} is not a directory", dir.display());
+            std::process::exit(2);
+        }
+        DirFetch::new("dircache", dir)
+    })
 }

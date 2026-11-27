@@ -548,75 +548,34 @@ async fn test_malformed_archives_are_typed_errors_of_the_helper_and_the_engine_g
 }
 
 /// A transport of `[[transports]]` that serves the one image of an archive
-/// as what its location names: the fetcher side of a `s3://bucket/name`.
+/// as what its location names: the fetcher side of a `s3://bucket/name`,
+/// as a third party writes it.
 struct ArchiveTransport {
-    inner: std::sync::Arc<velarx_content::dir_origin::DirOrigin>,
-    archive: std::sync::Arc<std::fs::File>,
+    archive: velarx_content::archive::Archive,
+    image: velarx_content::archive::ArchiveImage,
 }
 
-impl ArchiveTransport {
-    /// The scope of the origin of the archive, as the helper of a path gets it.
-    fn scope(&self, of: &velarx_content::serve_fetch::Scope) -> velarx_content::serve_fetch::Scope {
-        velarx_content::serve_fetch::Scope {
-            verity: of.verity,
-            source: Some("oci-archive:".into()),
-            tls_verify: None,
-            target: Some(self.archive.clone()),
-            access: None,
-            idle: of.idle,
-            kept: Default::default(),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl velarx_content::serve_fetch::StagingFetcher for ArchiveTransport {
-    fn described(&self) -> velarx_content::serve_fetch::Described {
-        velarx_content::serve_fetch::Described {
-            name: "s3".into(),
-            capabilities: vec!["metadata".into(), "origin".into()],
-            max_objects: 1,
-        }
-    }
-
-    async fn get_manifest(
+impl velarx_content::blob_fetch::Blobs for ArchiveTransport {
+    fn open(
         &self,
-        scope: &velarx_content::serve_fetch::Scope,
-        reference: &str,
-        max: u64,
-    ) -> Result<(std::fs::File, Option<String>), velarx_content::fetcher::fetch::FetcherError> {
-        let scope = self.scope(scope);
-        if !reference.is_empty() {
-            return self.inner.get_manifest(&scope, reference, max).await;
-        }
-        // (the image the location names: the first of the archive)
-        let (index, _) = self.inner.get_manifest(&scope, "", max).await.unwrap();
-        let bytes =
-            velarx_base::sealed::read_sealed(&index, index.metadata().unwrap().len(), max).unwrap();
-        let index: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let digest = index["manifests"][0]["digest"].as_str().unwrap();
-        self.inner.get_manifest(&scope, digest, max).await
+        _: &velarx_content::serve_fetch::Scope,
+        digest: &velarx_types::digest::Digest,
+    ) -> Result<(Box<dyn Read + Send>, u64), velarx_content::fetcher::fetch::FetcherError> {
+        let blob = self.archive.blob_reader(digest)?;
+        let size = blob.size();
+        Ok((Box::new(blob), size))
     }
 
-    async fn get_blob(
+    /// (the image the location names: the one of the archive)
+    fn resolve(
         &self,
-        scope: &velarx_content::serve_fetch::Scope,
-        blob: &velarx_content::fetcher::fetch::Blob,
-        file: std::fs::File,
-    ) -> Result<(), velarx_content::fetcher::fetch::FetcherError> {
-        self.inner.get_blob(&self.scope(scope), blob, file).await
-    }
-
-    async fn unpack(
-        &self,
-        scope: &velarx_content::serve_fetch::Scope,
-        layer: &velarx_content::serve_fetch::LayerScope,
-        call: velarx_content::serve_fetch::UnpackCall,
-        out: &velarx_content::serve_fetch::Out<velarx_content::fetcher::fetch::FetchEvent>,
-    ) -> Result<(), velarx_content::fetcher::fetch::FetcherError> {
-        self.inner
-            .unpack(&self.scope(scope), layer, call, out)
-            .await
+        _: &velarx_content::serve_fetch::Scope,
+        _max: u64,
+    ) -> Result<
+        (velarx_types::digest::Digest, Option<String>),
+        velarx_content::fetcher::fetch::FetcherError,
+    > {
+        Ok((self.image.digest, Some(self.image.media_type.clone())))
     }
 }
 
@@ -630,20 +589,18 @@ async fn test_a_transport_is_an_origin_of_pulls() {
     let oci = save(&a.service, &[&format!("{}/test:latest", a.host)]).await;
     let dir = tempfile::tempdir().unwrap();
     let staging = std::fs::File::open(dir.path()).unwrap();
-    let archive = std::sync::Arc::new(spooled(&oci));
-    let settings = velarx_content::list::HelperSettings::of(&velarx_config::Config::default());
-    let transport = ArchiveTransport {
-        inner: velarx_content::dir_origin::DirOrigin::new(
-            Box::new(|_, _| Ok(())),
-            settings,
-            std::sync::Arc::new(staging),
-        ),
-        archive,
-    };
+    let archive =
+        velarx_content::archive::Archive::open(spooled(&oci), &staging, |_| 1 << 30).unwrap();
+    let image = archive.images().unwrap().remove(0);
+    let transport = velarx_content::blob_fetch::BlobFetch::new(
+        "s3",
+        velarx_content::list::HelperSettings::of(&velarx_config::Config::default()),
+        ArchiveTransport { archive, image },
+    );
     let socket = dir.path().join("s3.sock");
     let _served = velarx_content::serve_fetch::serve_in_thread(
         std::os::unix::net::UnixListener::bind(&socket).unwrap(),
-        std::sync::Arc::new(transport),
+        transport,
         velarx_content::activation::Limits::default(),
     )
     .unwrap();

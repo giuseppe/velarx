@@ -101,7 +101,7 @@ is answered: it reads what it was handed, writes beneath the staging
 directory (\fB\-\-staging\-fd\fR), has no network and executes nothing.  Only then
 does it read the archive: the tar, its compression, the index and the
 manifests of a docker\-archive.  It serves the index of the images the selector
-takes (\fBGetManifest("")\fR), their manifests and blobs, and
+takes (\fBGetFile("")\fR), their manifests and blobs, and
 .B Unpack
 of every layer.  What it says is a claim: the engine checks the digests of
 the manifests and the configurations, and replays the layers against the

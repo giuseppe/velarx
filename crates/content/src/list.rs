@@ -829,9 +829,10 @@ mod tests {
             }
         }
 
-        async fn get_manifest(
+        async fn get_file(
             &self,
             _scope: &crate::serve_fetch::Scope,
+            _kind: crate::fetcher::fetch::FileKind,
             _reference: &str,
             _max: u64,
         ) -> Result<(std::fs::File, Option<String>), crate::fetcher::fetch::FetcherError> {
@@ -862,9 +863,12 @@ mod tests {
         let scope = crate::fetcher::fetch_client::Scoping::bare(idle);
         conn.open(scope).await.unwrap();
         let mut handed = conn.connect().await.unwrap();
-        let e = crate::idle::within(idle, handed.get_manifest("a", 1))
-            .await
-            .unwrap_err();
+        let e = crate::idle::within(
+            idle,
+            handed.get_file(crate::fetcher::fetch::FileKind::Manifest, "a", 1),
+        )
+        .await
+        .unwrap_err();
         assert!(crate::idle::is_silent(&e));
         drop(handed);
         assert!(velarx_base::testing::wait_exit(pid, GONE));

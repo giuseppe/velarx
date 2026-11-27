@@ -2034,7 +2034,7 @@ mod tests {
         let mut conn = FetchConn::new(f.connect().unwrap()).unwrap();
         conn.open(Scoping::bare(TEST_IDLE)).await.unwrap();
         // (dropped before any reply is read)
-        let call = conn.get_manifest("latest", 100);
+        let call = conn.get_file(crate::fetcher::fetch::FileKind::Manifest, "latest", 100);
         let polled = futures::FutureExt::now_or_never(Box::pin(call));
         assert!(polled.is_none(), "the reply came at once");
         let info = conn.get_info().await.unwrap();

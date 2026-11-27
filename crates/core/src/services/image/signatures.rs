@@ -490,7 +490,7 @@ impl ImageService {
     /// The signatures of `digest` in the lookaside storage of `reference`
     /// when it is a directory (`file:`): `signature-1`, `signature-2`... up
     /// to the first that is missing.  A storage on the network is read by
-    /// the registry fetcher (`GetSignatures`).
+    /// the registry fetcher (`GetFile`).
     fn local_lookaside_signatures(
         config: &RegistriesD,
         reference: &DockerRef,

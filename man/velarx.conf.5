@@ -225,6 +225,12 @@ it pulls an OCI image layout published as static files, with
 .BR "velarx pull oci+https://HOST/PATH:TAG" .
 It sends no credentials, asks for no ranges (its layers are pulled
 whole) and does not confine itself.
+It is the example of a transport written in Rust: the program gives the blob
+of a digest and the manifest its location names (the
+.B Blobs
+of velarx-content), and
+.B serve_fetch::main
+serves them on descriptor 3.
 A pull from a transport is always whole, never lazy: a lazy image has to
 open its origin again when a file is first read, and no transport asks for
 ranges of a layer.

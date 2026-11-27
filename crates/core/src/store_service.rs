@@ -822,7 +822,7 @@ impl StoreService {
 
     /// The records of the signatures kept with the pulls of `reference` (a
     /// manifest digest, or a `repository:tag`) in a file with no name, as
-    /// `GetSignatures` carries them (at most [`MAX_RECORDS`], and the file
+    /// `GetFile` of signatures carries them (at most [`MAX_RECORDS`], and the file
     /// at most `max` bytes).
     pub async fn signatures_of(
         &self,
