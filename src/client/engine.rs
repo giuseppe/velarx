@@ -216,11 +216,12 @@ fn client_error(e: CallError) -> ClientError {
     }
 }
 
-/// How many times a call the engine refused because it restarts is asked
-/// again, and how long before each time: the refusal comes before any work,
-/// on a connection the engine took before it began to restart; the next
+/// How many times a call the engine refused because it restarts, or
+/// because a burst of clients has all its connections, is asked again, and
+/// how long before each time: the refusal comes before any work, on a
+/// connection the engine took before it began to restart; the next
 /// connection waits in the queue of the socket for the engine that follows.
-const RESTART_RETRIES: u32 = 5;
+const RESTART_RETRIES: u32 = 8;
 
 fn restart_backoff(n: u32) -> std::time::Duration {
     std::time::Duration::from_millis(50 << n.saturating_sub(1).min(5))
@@ -255,13 +256,18 @@ type WrittenCall<'a> = dyn FnMut(&mut Proxy, Vec<OwnedFd>) -> Result<(), CallErr
 /// A reply that is not an `InfoReply` is of another version too (one whose
 /// `GetInfo` answers other members), asked to start again as the others.
 fn check(conn: &mut Proxy) -> ClientResult<Result<(), String>> {
-    let info = match ready(conn.get_info()).map_err(client_error)? {
+    check_call(conn).map_err(client_error)
+}
+
+/// [`check`], with the error of the call as it came.
+fn check_call(conn: &mut Proxy) -> Result<Result<(), String>, CallError> {
+    let info = match ready(conn.get_info())? {
         Err(
             velarx_proto::zlink::Error::Json(_) | velarx_proto::zlink::Error::MissingParameters,
         ) => {
             return Ok(Err("of another version".into()));
         }
-        reply => answered(reply).map_err(client_error)?,
+        reply => answered(reply)?,
     };
     if info.interface != velarx_proto::PROTO
         || info.version != env!("CARGO_PKG_VERSION")
@@ -325,12 +331,26 @@ impl EngineClient {
         if let Some(link) = kept.filter(Link::still_open) {
             return Ok(link);
         }
-        let mut link = self.open()?;
-        // (the engine of the process is of its own version)
-        if matches!(self.endpoint, Endpoint::InProcess(_)) {
-            return Ok(link);
-        }
-        let Err(theirs) = check(&mut link.conn)? else {
+        let mut refused = 0;
+        let (mut link, checked) = loop {
+            let mut link = self.open()?;
+            // (the engine of the process is of its own version)
+            if matches!(self.endpoint, Endpoint::InProcess(_)) {
+                return Ok(link);
+            }
+            match check_call(&mut link.conn) {
+                // (a burst of clients is over the engine's limit of
+                // connections for a moment: the connection is made again
+                // when one is free)
+                Err(e) if refused < RESTART_RETRIES && restarting(&e) => {
+                    refused += 1;
+                    drop(link);
+                    std::thread::sleep(refusal_backoff(&e, refused));
+                }
+                checked => break (link, checked.map_err(client_error)?),
+            }
+        };
+        let Err(theirs) = checked else {
             return Ok(link);
         };
         let restarted = ask(link.conn.restart(None)).ok().map(|r| r.restarted);
@@ -3622,6 +3642,49 @@ mod tests {
                 "ContainerStart"
             ]
         );
+    }
+
+    /// A connection the engine refuses at its first call, because a burst
+    /// of clients has all its connections, is made again until one is free.
+    #[test]
+    fn a_refused_connection_is_made_again() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            for (n, stream) in listener.incoming().enumerate() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut message = Vec::new();
+                    if reader.read_until(0, &mut message).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let reply = if n < 3 {
+                        json!({"error": "org.velarx.Engine.Unavailable", "parameters": {
+                            "cause": "too many connections",
+                            "message": "too many connections (256)",
+                        }})
+                    } else if String::from_utf8_lossy(&message).contains("GetInfo") {
+                        json!({"parameters": {
+                            "name": "mock",
+                            "interface": velarx_proto::PROTO,
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "digest": velarx_proto::DIGEST,
+                            "rootful": false,
+                        }})
+                    } else {
+                        json!({"parameters": {"changed": true}})
+                    };
+                    let mut bytes = serde_json::to_vec(&reply).unwrap();
+                    bytes.push(0);
+                    stream.write_all(&bytes).unwrap();
+                }
+            }
+        });
+        let client = EngineClient::new(&socket).unwrap();
+        client.start_container("web", Verify::Service).unwrap();
     }
 
     /// A call the engine refuses because it restarts (on a connection it

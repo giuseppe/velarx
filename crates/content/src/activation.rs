@@ -354,7 +354,9 @@ impl Busy {
             per_client,
             ..
         } = activity.limits;
-        if activity.active() >= connections {
+        // (the connections, not what else keeps the service busy: the call
+        // a connection runs, a stream, a hold)
+        if clients.values().sum::<usize>() >= connections {
             return Err(format!("too many connections ({connections})"));
         }
         let mine = clients.entry(client).or_default();
@@ -1400,6 +1402,23 @@ mod tests {
                 assert_eq!(activity.active(), PER_CLIENT);
             })
             .await;
+    }
+
+    /// The limit of connections counts the connections only: the call
+    /// each one runs (busy work of its own) takes no slot of another.
+    #[test]
+    fn the_busy_work_of_a_connection_is_no_connection() {
+        let activity = Activity::new(Limits {
+            connections: 2,
+            ..Limits::default()
+        });
+        let one = Busy::for_client(&activity, Client::Process(1)).unwrap();
+        let call = Busy::new(&activity);
+        let two = Busy::for_client(&activity, Client::Process(2)).unwrap();
+        let e = Busy::for_client(&activity, Client::Process(3)).err();
+        assert_eq!(e.as_deref(), Some("too many connections (2)"));
+        drop((one, call, two));
+        assert_eq!(activity.active(), 0);
     }
 
     /// A client that does not read has a few replies with descriptors
