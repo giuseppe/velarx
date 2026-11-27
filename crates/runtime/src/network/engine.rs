@@ -2409,6 +2409,12 @@ impl ContainerNetworks {
             Some(opts) => tokio::task::spawn_blocking(move || remove(&opts))
                 .await
                 .map_err(|e| NetworkError::Netlink(e.to_string()))?
+                .or_else(|e| match e {
+                    // (released with the last bridge by another removal:
+                    // the bridges of the network went with it)
+                    NetworkError::RootlessNetnsGone => Ok(()),
+                    e => Err(e),
+                })
                 .map_err(|e| NetworkError::Netlink(format!("remove the network {name}: {e}"))),
             None => Ok(()),
         };
