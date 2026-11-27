@@ -1851,9 +1851,8 @@ pub async fn an_interrupted_pull_is_pulled_again(f: &Factory) {
     assert_eq!(s.driver.usage().unwrap(), before, "nothing was stored");
     let stale = no_staging_left(&s).await;
     assert!(stale.is_empty(), "a staging area was left: {stale:?}");
-    // the same pull, the feed whole: every layer comes (a feed is of one pull:
-    // what the driver released of the first is not kept for the next)
-    let o = offer(&s, &[&base, &top]).await;
+    // the same pull with the same offer, the feed whole: every layer comes
+    *o.meddle().fail_at.lock().unwrap() = None;
     let pulled = o.pull(&s, engine_check()).await.expect("pulled again");
     assert_eq!(pulled.layers.len(), 2);
     assert_eq!(pulled.artifacts.len(), 2);

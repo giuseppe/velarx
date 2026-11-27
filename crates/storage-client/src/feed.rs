@@ -109,6 +109,9 @@ pub struct Feed {
     checked: Mutex<HashMap<String, HashSet<String>>>,
     layers: Vec<Layer>,
     live: AtomicU32,
+    /// The threads that serve the connections: the end of the pull waits for
+    /// them ([`Feed::join`]).
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// The connections served, by a number of their own, to close at the
     /// end; each leaves when its thread ends, so a driver that connects and
     /// closes over and over holds no descriptor of the engine's.
@@ -199,6 +202,7 @@ impl Feed {
             checked: Mutex::default(),
             layers: out,
             live: AtomicU32::new(0),
+            threads: Mutex::default(),
             open: Mutex::default(),
         }))
     }
@@ -228,10 +232,18 @@ impl Feed {
                 feed.run(Conn::from_stream(stream));
                 feed.forget(id);
             });
-        if spawned.is_err() {
-            self.forget(id);
+        match spawned {
+            Ok(thread) => {
+                let mut threads = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+                threads.retain(|t| !t.is_finished());
+                threads.push(thread);
+                Ok(())
+            }
+            Err(e) => {
+                self.forget(id);
+                Err(e)
+            }
         }
-        spawned.map(drop)
     }
 
     /// The files and bytes the engine fetched for a layer so far.
@@ -299,6 +311,24 @@ impl Feed {
         }
         for f in open.fetches.values() {
             f.abort();
+        }
+    }
+
+    /// Wait until the threads that serve the connections are gone, with
+    /// what they held (call it after [`Feed::shutdown`], not from a task of
+    /// the runtime the fetches run on: a thread may wait for one of them).
+    pub fn join(&self) {
+        // (a thread in a `Connect` that began before the shutdown adds the
+        // thread of its connection: it is joined in the next round)
+        loop {
+            let threads =
+                std::mem::take(&mut *self.threads.lock().unwrap_or_else(|e| e.into_inner()));
+            if threads.is_empty() {
+                return;
+            }
+            for t in threads {
+                let _ = t.join();
+            }
         }
     }
 

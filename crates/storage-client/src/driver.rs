@@ -1592,6 +1592,9 @@ impl VarlinkDriver {
             let _ = tokio::task::spawn_blocking(move || inner.abort(&id)).await;
         }
         served.shutdown();
+        // (a thread of the feed that outlived the pull could release a layer
+        // of the next one, or keep a staging that it removes)
+        let _ = tokio::task::spawn_blocking(move || served.join()).await;
         result
     }
 

@@ -47,6 +47,43 @@ use velarx_types::digest::Digest;
 /// copy of its descriptor.
 pub type Lease = velarx_sys::flock::Held;
 
+/// The lease of the layer `key` of an eager pull, held by the pull and by
+/// every staging of the layer that is open (`StagedFetch::open_layer_as`):
+/// it is let go with the last of them, so a staging that a thread outlives
+/// is removed before another pull can take the lease and stage the layer
+/// again.  The metadata of the layer goes with its lease unless the layer
+/// is staged by a lazy pull (a waiter on a lease that is removed takes the
+/// one of the path again).
+pub struct LayerLease {
+    area: Staging,
+    key: LayerKey,
+    _held: Lease,
+}
+
+impl LayerLease {
+    /// `held` is the lease of the layer `key` of `area` ([`Staging::lease_layer`]).
+    pub fn new(area: Staging, key: LayerKey, held: Lease) -> Self {
+        Self {
+            area,
+            key,
+            _held: held,
+        }
+    }
+
+    /// The layer the lease is of.
+    pub fn key(&self) -> &LayerKey {
+        &self.key
+    }
+}
+
+impl Drop for LayerLease {
+    fn drop(&mut self) {
+        if !matches!(self.area.layer(&self.key), Ok(Some(_))) {
+            let _ = velarx_base::tree::remove_dir_all(self.area.layer_dir(&self.key));
+        }
+    }
+}
+
 /// The directory of the pulls under the staging directory of the store:
 /// `pulls/<id>`.
 pub const PULLS: &str = "pulls";

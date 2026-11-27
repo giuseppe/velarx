@@ -90,6 +90,8 @@ struct TestFeed {
     copy_from: Mutex<Option<String>>,
     /// What the sink answered to that question.
     held: Mutex<Vec<bool>>,
+    /// Run by `release`, before it counts: a call that stays in it.
+    in_release: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 #[async_trait]
@@ -184,6 +186,9 @@ impl PullFeed for TestFeed {
     }
 
     fn release(&self, _layer: &FeedLayer) {
+        if let Some(hook) = &*self.in_release.lock().unwrap() {
+            hook();
+        }
         self.released.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -238,6 +243,7 @@ fn feed_of(built: &Built, keys: &[u8]) -> Arc<TestFeed> {
         finished: AtomicBool::new(false),
         copy_from: Mutex::default(),
         held: Mutex::default(),
+        in_release: Mutex::default(),
     })
 }
 
@@ -258,6 +264,9 @@ enum Behavior {
     NewKind,
     /// Says progress and waits for the engine to hang up.
     Hangs,
+    /// Sends `Release` on the feed, says staged once the engine is in it,
+    /// and tells when the feed is closed.
+    ReleasesLate,
 }
 
 struct Script {
@@ -272,6 +281,10 @@ struct Script {
     content: Vec<u8>,
     /// The other objects the driver holds, by key.
     others: Mutex<HashMap<String, Vec<u8>>>,
+    /// Told when the engine is in the `Release` of `ReleasesLate`.
+    in_release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// Told when the feed of `ReleasesLate` is closed.
+    feed_closed: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 fn feed_call(
@@ -356,6 +369,8 @@ fn start_script(e: &Env, built: &Built, behavior: Behavior) -> Arc<Script> {
         object: built.object.clone(),
         content: built.content.clone(),
         others: Mutex::default(),
+        in_release: Mutex::default(),
+        feed_closed: Mutex::default(),
     });
     let s = script.clone();
     e.fake.handle(move |c: Call, conn| {
@@ -535,6 +550,23 @@ fn begin_pull(s: &Script, mut c: Call, conn: &mut Conn) {
             while conn.message().is_ok() {}
             s.log.lock().unwrap().push("closed".into());
             return;
+        }
+        Behavior::ReleasesLate => {
+            let layer = first.as_deref().unwrap();
+            feed.call_raw(
+                "org.velarx.StorageFeed.Release",
+                Some(json!({"layer": layer}).to_string().as_bytes()),
+                false,
+                &[],
+            )
+            .unwrap();
+            let in_release = s.in_release.lock().unwrap().take().unwrap();
+            in_release.recv().unwrap();
+            let closed = s.feed_closed.lock().unwrap().take().unwrap();
+            std::thread::spawn(move || {
+                while feed.message().is_ok() {}
+                closed.send(()).unwrap();
+            });
         }
         _ => {}
     }
@@ -1163,6 +1195,107 @@ fn feed_connections_are_forgotten_when_they_end() {
     served.shutdown();
     let (mine, _theirs) = UnixStream::pair().unwrap();
     assert!(served.serve(mine).is_err());
+}
+
+/// The end of a pull waits for the threads that serve the feed: one that is
+/// in a `Release` when the pull ends has finished it, and holds nothing, when
+/// `join` returns.
+#[test]
+fn the_threads_of_the_feed_are_gone_when_the_pull_ends() {
+    let b = built();
+    let index = LayerIndex {
+        key: key(1),
+        toc: Arc::new(b.toc.clone()),
+        tarsplit: b.tarsplit.clone().into(),
+        toc_z: velarx_content::pull::stored::json_z(&b.toc),
+    };
+    let indexed = vec![(feed_layer(1, &b, false), index)];
+    let feed = feed_of(&b, &[1]);
+    // (the call of the driver stays in `release` until the test lets it go)
+    let (inside, in_release) = std::sync::mpsc::channel::<()>();
+    let (go, gate) = std::sync::mpsc::channel::<()>();
+    let (inside, gate) = (Mutex::new(inside), Mutex::new(gate));
+    *feed.in_release.lock().unwrap() = Some(Box::new(move || {
+        inside.lock().unwrap().send(()).unwrap();
+        gate.lock().unwrap().recv().unwrap();
+    }));
+    let engine = crate::feed::Engine {
+        feed: feed.clone(),
+        runtime: tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .handle()
+            .clone(),
+        scratch: std::env::temp_dir(),
+        holds: None,
+    };
+    let served =
+        crate::feed::Feed::new("0123456789abcdef0123456789abcdef", engine, indexed).unwrap();
+    let (mine, theirs) = UnixStream::pair().unwrap();
+    served.serve(mine).unwrap();
+    let mut c = Conn::from_stream(theirs);
+    c.call_raw(
+        "org.velarx.StorageFeed.Release",
+        Some(json!({"layer": key(1).to_string()}).to_string().as_bytes()),
+        false,
+        &[],
+    )
+    .unwrap();
+    in_release.recv().unwrap();
+    served.shutdown();
+    go.send(()).unwrap();
+    served.join();
+    assert_eq!(feed.released.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        Arc::strong_count(&served),
+        1,
+        "a thread still holds the feed"
+    );
+}
+
+/// The same through a pull: the engine is in a `Release` of the driver when
+/// the pull fails, and has finished it, and let the feed go, when the pull
+/// returns.
+#[test]
+fn a_pull_returns_after_the_threads_of_its_feed() {
+    let e = env();
+    let b = built();
+    let script = start_script(&e, &b, Behavior::ReleasesLate);
+    // (the proof fails: the feed is shut down at the end of the pull)
+    script.garble.store(true, Ordering::SeqCst);
+    let feed = feed_of(&b, &[1]);
+    // (the call stays in `release` until the driver sees the feed closed)
+    let (inside, in_release) = std::sync::mpsc::channel::<()>();
+    let (closed, gate) = std::sync::mpsc::channel::<()>();
+    *script.in_release.lock().unwrap() = Some(in_release);
+    *script.feed_closed.lock().unwrap() = Some(closed);
+    let (inside, gate) = (Mutex::new(inside), Mutex::new(gate));
+    *feed.in_release.lock().unwrap() = Some(Box::new(move || {
+        inside.lock().unwrap().send(()).unwrap();
+        gate.lock().unwrap().recv().unwrap();
+    }));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let err = expect_err(
+        run_pull(
+            &e,
+            &feed,
+            &[feed_layer(1, &b, false)],
+            settled_ok(checks, script.clone()),
+        )
+        .map(|_| ()),
+        "garbled",
+    );
+    assert!(
+        matches!(
+            err.kind,
+            DriverErrorKind::Corrupt {
+                remedy: Remedy::PullAgain
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(feed.released.load(Ordering::SeqCst), 1);
+    assert_eq!(Arc::strong_count(&feed), 1, "a thread still holds the feed");
 }
 
 /// A driver that goes away is asked once more with the same pull id: it

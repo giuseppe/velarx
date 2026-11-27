@@ -174,8 +174,8 @@ pub(super) struct PullNames<'a> {
 pub(super) struct LayerLocks {
     held: Vec<(Digest, tokio::sync::OwnedMutexGuard<()>)>,
     all: Arc<LayerLockMap>,
-    /// The leases, by the stem of the staging of their layer
-    leases: Vec<(LayerKey, velarx_content::pull::staged::Lease)>,
+    /// The leases, shared with the open stagings of their layers
+    leases: Vec<Arc<velarx_content::pull::staged::LayerLease>>,
     area: velarx_content::pull::staged::Staging,
 }
 
@@ -185,15 +185,6 @@ pub(super) type LayerLockMap = std::sync::Mutex<HashMap<Digest, Arc<tokio::sync:
 
 impl Drop for LayerLocks {
     fn drop(&mut self) {
-        // (the metadata of a layer the pull staged goes with its lease, but
-        // that of a layer a lazy pull keeps: a waiter on a lease that is
-        // removed takes the one of the path again)
-        for (key, lease) in self.leases.drain(..) {
-            if !matches!(self.area.layer(&key), Ok(Some(_))) {
-                let _ = velarx_base::tree::remove_dir_all(self.area.layer_dir(&key));
-            }
-            drop(lease);
-        }
         for (key, guard) in self.held.drain(..) {
             drop(guard);
             // Nobody else waits for it: forget the lock.
@@ -392,7 +383,13 @@ impl ImageService {
                 let file = tokio::task::spawn_blocking(move || area.lease_layer(&key))
                     .await
                     .map_err(|e| ImageError::Storage(e.to_string()))??;
-                locks.leases.push((key, file));
+                locks
+                    .leases
+                    .push(Arc::new(velarx_content::pull::staged::LayerLease::new(
+                        locks.area.clone(),
+                        key,
+                        file,
+                    )));
             }
         }
         Ok(locks)
@@ -1441,7 +1438,7 @@ impl ImageService {
         // (an eager pull of a registry fetches into the staging of each
         // layer, under its lease: another engine of the store that pulls
         // them now is waited for)
-        let _locks = self
+        let locks = self
             .lock_layers(&missing, !lazy && (registry_ref.is_some() || via.is_some()))
             .await?;
         let store = self.lock_store().await?;
@@ -1523,6 +1520,11 @@ impl ImageService {
             ),
             _ => None,
         };
+        // (the staging of a layer keeps its lease, so that a thread that
+        // outlives the pull cannot remove the staging of the next one)
+        if let Some(staged) = &staged {
+            staged.leased(&locks.leases);
+        }
         // A lazy pull is accepted before anything of it exists, or refused
         // (`ImageNotLazy`): every layer the store lacks must have a table of
         // contents with the fs-verity digest of each file, which a fetcher

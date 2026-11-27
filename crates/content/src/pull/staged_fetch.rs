@@ -14,6 +14,7 @@
 
 use super::chunked::{self, Intake};
 use super::sink::Sink;
+use super::staged::LayerLease;
 use crate::fetcher::fetch::{
     Blob, EventKind, FetchEvent, Parts, Probed, Reuse, TocSource, Urgency,
 };
@@ -403,6 +404,10 @@ pub struct StagedFetch {
     /// opened twice while it is open is one staging (whoever drops the
     /// last takes it away)
     open: Arc<Mutex<HashMap<String, std::sync::Weak<LayerStaging>>>>,
+    /// The lease of each layer the pull holds, by the stem of its staging
+    /// ([`StagedFetch::leased`]): an open staging keeps it, this map does
+    /// not (the pull holds it)
+    leases: Mutex<HashMap<String, std::sync::Weak<LayerLease>>>,
 }
 
 impl StagedFetch {
@@ -569,7 +574,22 @@ impl StagedFetch {
             telling: Mutex::default(),
             unwilling,
             open: Arc::default(),
+            leases: Mutex::default(),
         }))
+    }
+
+    /// The pull holds `leases` until it is over: the staging of each of
+    /// these layers keeps its lease until it is removed, whatever thread
+    /// drops it last.
+    pub fn leased(&self, leases: &[Arc<LayerLease>]) {
+        self.leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(
+                leases
+                    .iter()
+                    .map(|l| (l.key().file_stem(), Arc::downgrade(l))),
+            );
     }
 
     /// Whether the fetcher at `at` is left out of the pull: a `Layer` of it
@@ -796,7 +816,7 @@ impl StagedFetch {
     /// The staging of `layer`, open, for an eager pull: the engine holds
     /// the lease of the layer (`meta/<stem>/lease`, taken with the lock of
     /// the layer before it planned what the store lacks, and let go once
-    /// the layer is recorded), so that another engine that pulls the layer
+    /// the layer is recorded and its staging is gone), so that another engine that pulls the layer
     /// waits for it and finds the layer in the store.  The staging goes
     /// with the result, unless a lazy pull keeps the layer.
     pub async fn open_layer(&self, layer: &OciDescriptor) -> ImageResult<Arc<LayerStaging>> {
@@ -814,6 +834,12 @@ impl StagedFetch {
         let stem = key.file_stem();
         let root = self.root.clone();
         let open = self.open.clone();
+        let lease = self
+            .leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&stem)
+            .and_then(std::sync::Weak::upgrade);
         tokio::task::spawn_blocking(move || {
             // (looked up and made under one lock: a staging that is made
             // twice would be removed by the drop of the second)
@@ -834,6 +860,7 @@ impl StagedFetch {
                 keep,
                 dir,
                 placed: Mutex::default(),
+                _lease: lease,
             });
             open.insert(stem, Arc::downgrade(&made));
             Ok::<_, ImageError>(made)
@@ -1735,6 +1762,10 @@ pub struct LayerStaging {
     dir: File,
     /// The fetcher that staged each file, by key
     placed: Mutex<HashMap<String, String>>,
+    /// The lease of the layer, when the pull holds it: let go after the
+    /// staging is removed (a field is dropped after the `Drop` of its
+    /// struct)
+    _lease: Option<Arc<LayerLease>>,
 }
 
 impl LayerStaging {
@@ -1749,6 +1780,7 @@ impl LayerStaging {
             keep: false,
             dir: File::open(&path).unwrap(),
             placed: Mutex::default(),
+            _lease: None,
         })
     }
 
@@ -3665,6 +3697,49 @@ mod tests {
             .await
             .unwrap();
         (intake, staging, desc)
+    }
+
+    /// A pull that is cancelled lets go of its lease while a thread of its
+    /// still holds the staging of a layer: the lease is held until the
+    /// thread drops the staging, which is removed first, so that the pull
+    /// that takes the lease next does not have its staging removed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_staging_a_thread_outlives_keeps_its_lease_until_it_is_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let hands = Hands {
+            give: Vec::new,
+            at: vec![],
+        };
+        let (staged, _keep) = walk_of(vec![], Arc::new(hands), root.path()).await;
+        let area = crate::pull::staged::Staging::new(root.path());
+        let key = velarx_types::LayerKey::Whole(layer_and_toc().0.digest);
+        let lease = Arc::new(LayerLease::new(
+            area.clone(),
+            key,
+            area.lease_layer(&key).unwrap(),
+        ));
+        staged.leased(std::slice::from_ref(&lease));
+        let staging = staged.open_layer_as(key).await.unwrap();
+        let path = staging.path();
+        assert!(path.is_dir());
+        // (the cancelled pull lets go of its own: a thread holds the rest)
+        drop(lease);
+        let (late, drop_it) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            drop_it.recv().unwrap();
+            drop(staging);
+        });
+        let busy = rustix::fs::flock(
+            std::fs::File::open(area.layer_dir(&key).join("lease")).unwrap(),
+            FlockOperation::NonBlockingLockExclusive,
+        );
+        assert_eq!(busy, Err(rustix::io::Errno::WOULDBLOCK));
+        assert!(path.is_dir());
+        late.send(()).unwrap();
+        thread.join().unwrap();
+        // (the next pull of the layer takes the lease: nothing is left)
+        let _next = area.lease_layer(&key).unwrap();
+        assert!(!path.exists());
     }
 
     /// The files an unpack hands over in its replies are taken in by the
