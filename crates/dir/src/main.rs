@@ -29,7 +29,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use velarx_content::activation::IdleExit;
+use velarx_content::activation::{IdleExit, Limits};
+
+use velarx_content::list::HelperSettings;
 
 fn main() -> anyhow::Result<()> {
     let startup = velarx_sys::fd::Startup::take().expect("main is the first to take it");
@@ -42,14 +44,124 @@ fn main() -> anyhow::Result<()> {
     }
     velarx_wire::proctitle::set("velarx-dir");
     velarx_wire::logging::init("warn", "text");
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.iter().any(|a| a == "--push") {
-        return serve_push(args.into_iter(), &startup);
+    let args = Args::parse(std::env::args_os().skip(1))?;
+    match args.mode {
+        Mode::Push => serve_push(&args, &startup),
+        Mode::Origin => serve_origin(&args, &startup),
+        Mode::Dir => serve(&args, &startup),
     }
-    if args.iter().any(|a| a == "--origin") {
-        return serve_origin(args.into_iter(), &startup);
+}
+
+/// What a process of velarx-dir is: the fetcher of a directory, the origin
+/// of a path or the pusher of a path.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Dir,
+    Origin,
+    Push,
+}
+
+/// The arguments of the three modes.
+struct Args {
+    mode: Mode,
+    name: Option<String>,
+    dir: Option<PathBuf>,
+    varlink: Option<i32>,
+    config: Option<i32>,
+    staging: Option<i32>,
+    /// `--self-test`: the scheme to confine for (none in the dir mode)
+    self_test: Option<String>,
+}
+
+impl Args {
+    fn parse(args: impl Iterator<Item = std::ffi::OsString>) -> anyhow::Result<Self> {
+        let mut parsed = Self {
+            mode: Mode::Dir,
+            name: None,
+            dir: None,
+            varlink: None,
+            config: None,
+            staging: None,
+            self_test: None,
+        };
+        let mut args = args;
+        while let Some(arg) = args.next() {
+            let mut value = || {
+                args.next()
+                    .ok_or_else(|| anyhow::anyhow!("{} needs a value", arg.to_string_lossy()))
+            };
+            let mut number =
+                || -> anyhow::Result<Option<i32>> { Ok(Some(value()?.to_string_lossy().parse()?)) };
+            match arg.to_str() {
+                Some("--push") => parsed.mode = Mode::Push,
+                Some("--origin") => parsed.mode = Mode::Origin,
+                Some("--name") => parsed.name = Some(value()?.to_string_lossy().into_owned()),
+                Some("--dir") => parsed.dir = Some(PathBuf::from(value()?)),
+                Some("--varlink-fd") => parsed.varlink = number()?,
+                Some("--config-fd") => parsed.config = number()?,
+                Some("--staging-fd") => parsed.staging = number()?,
+                Some("--self-test") if parsed.mode == Mode::Dir => {
+                    parsed.self_test = Some(String::new())
+                }
+                Some("--self-test") => {
+                    parsed.self_test = Some(value()?.to_string_lossy().into_owned())
+                }
+                _ => anyhow::bail!("unknown argument {}", arg.to_string_lossy()),
+            }
+        }
+        Ok(parsed)
     }
-    serve(args.into_iter(), &startup)
+
+    /// The descriptor `what` (`fd`, which the arguments gave) this process
+    /// was started with.
+    fn adopt(
+        &self,
+        startup: &velarx_sys::fd::Startup,
+        what: &str,
+        fd: Option<i32>,
+    ) -> anyhow::Result<std::os::fd::OwnedFd> {
+        let mode = match self.mode {
+            Mode::Dir => "dir",
+            Mode::Origin => "origin",
+            Mode::Push => "push",
+        };
+        let fd = fd.ok_or_else(|| anyhow::anyhow!("{mode} needs --{what}-fd"))?;
+        startup
+            .adopt(fd)
+            .ok_or_else(|| anyhow::anyhow!("the {what} descriptor {fd} is not open"))
+    }
+
+    /// The process is for one connection: the descriptors it was handed are
+    /// claimed, the others closed and the process hardened.
+    fn start(&self, startup: &velarx_sys::fd::Startup) -> anyhow::Result<Started> {
+        let stream =
+            std::os::unix::net::UnixStream::from(self.adopt(startup, "varlink", self.varlink)?);
+        let config = self.adopt(startup, "config", self.config)?;
+        startup.close_range(3, u32::MAX);
+        velarx_base::hardening::harden()?;
+        let settings = velarx_content::list::settings_from_fd(config)?;
+        let idle = IdleExit {
+            after: Duration::from_secs(settings.services.first_call_secs),
+            socket: None,
+            last: true,
+            lock: None,
+        };
+        let limits = Limits::of(&settings.services);
+        Ok(Started {
+            stream,
+            settings,
+            idle,
+            limits,
+        })
+    }
+}
+
+/// What a process serves with.
+struct Started {
+    stream: std::os::unix::net::UnixStream,
+    settings: HelperSettings,
+    idle: IdleExit,
+    limits: Limits,
 }
 
 /// What confines the pusher of `mode` to its destination `dest`: the
@@ -69,64 +181,28 @@ fn push_reach(
 /// `--push`: serve the pusher of one destination.  The destination is what
 /// `Open` says (the scheme of `destination` and the `target` descriptor),
 /// and the process confines itself there, the only thread it has.
-fn serve_push(
-    args: impl Iterator<Item = std::ffi::OsString>,
-    startup: &velarx_sys::fd::Startup,
-) -> anyhow::Result<()> {
+fn serve_push(args: &Args, startup: &velarx_sys::fd::Startup) -> anyhow::Result<()> {
     use velarx_content::dir_push::{DirPush, Mode};
-    let (mut varlink, mut config) = (None, None);
-    let mut self_test = None;
-    let mut args = args;
-    while let Some(arg) = args.next() {
-        let mut value = || {
-            args.next()
-                .ok_or_else(|| anyhow::anyhow!("{} needs a value", arg.to_string_lossy()))
-        };
-        match arg.to_str() {
-            Some("--push") => {}
-            Some("--varlink-fd") => varlink = Some(value()?.to_string_lossy().parse::<i32>()?),
-            Some("--config-fd") => config = Some(value()?.to_string_lossy().parse::<i32>()?),
-            Some("--self-test") => self_test = Some(value()?.to_string_lossy().into_owned()),
-            _ => anyhow::bail!("unknown argument {}", arg.to_string_lossy()),
-        }
-    }
-    let adopt = |what: &str, fd: Option<i32>| {
-        let fd = fd.ok_or_else(|| anyhow::anyhow!("push needs --{what}-fd"))?;
-        startup
-            .adopt(fd)
-            .ok_or_else(|| anyhow::anyhow!("the {what} descriptor {fd} is not open"))
-    };
-    if let Some(scheme) = self_test {
+    if let Some(scheme) = &args.self_test {
         // (the test hook: the destination of the scheme is the descriptor 5)
-        let mode = Mode::of_scheme(&scheme)
+        let mode = Mode::of_scheme(scheme)
             .ok_or_else(|| anyhow::anyhow!("--self-test needs oci:, dir: or oci-archive:"))?;
-        let dest = adopt("target", Some(5))?;
+        let dest = args.adopt(startup, "target", Some(5))?;
         startup.close_range(3, u32::MAX);
         return try_push_confinement(mode, dest);
     }
-    let stream = std::os::unix::net::UnixStream::from(adopt("varlink", varlink)?);
-    let config_file = adopt("config", config)?;
-    startup.close_range(3, u32::MAX);
-    velarx_base::hardening::harden()?;
-    let settings = velarx_content::list::settings_from_fd(config_file)?;
+    let started = args.start(startup)?;
     let pusher = DirPush::new(Box::new(|mode, dest| {
         let reach = push_reach(mode, dest).map_err(|e| e.to_string())?;
         velarx_sandbox::fetch::enter(&reach, velarx_sandbox::fetch::Role::DirPush)
             .map(|_| ())
             .map_err(|e| format!("the directory pusher cannot confine itself: {e}"))
     }));
-    let idle = IdleExit {
-        after: Duration::from_secs(settings.services.first_call_secs),
-        socket: None,
-        last: true,
-        lock: None,
-    };
-    let limits = velarx_content::activation::Limits::of(&settings.services);
     Ok(velarx_content::serve_fetch::run_one_single_thread(
-        stream,
+        started.stream,
         Arc::new(pusher),
-        idle,
-        limits,
+        started.idle,
+        started.limits,
     )?)
 }
 
@@ -212,60 +288,22 @@ fn origin_reach(
 /// `--origin`: serve the origin of one path.  The path is what `Open` says
 /// (the scheme and the selector of the source, the `target` descriptor), and
 /// the process confines itself there, the only thread it has.
-fn serve_origin(
-    args: impl Iterator<Item = std::ffi::OsString>,
-    startup: &velarx_sys::fd::Startup,
-) -> anyhow::Result<()> {
+fn serve_origin(args: &Args, startup: &velarx_sys::fd::Startup) -> anyhow::Result<()> {
     use velarx_content::origin::PathScheme;
-    let (mut varlink, mut config, mut staging) = (None, None, None);
-    let mut self_test = None;
-    let mut args = args;
-    while let Some(arg) = args.next() {
-        let mut value = || {
-            args.next()
-                .ok_or_else(|| anyhow::anyhow!("{} needs a value", arg.to_string_lossy()))
-        };
-        match arg.to_str() {
-            Some("--origin") => {}
-            Some("--varlink-fd") => varlink = Some(value()?.to_string_lossy().parse::<i32>()?),
-            Some("--config-fd") => config = Some(value()?.to_string_lossy().parse::<i32>()?),
-            Some("--staging-fd") => staging = Some(value()?.to_string_lossy().parse::<i32>()?),
-            Some("--self-test") => self_test = Some(value()?.to_string_lossy().into_owned()),
-            _ => anyhow::bail!("unknown argument {}", arg.to_string_lossy()),
-        }
-    }
-    let adopt = |what: &str, fd: Option<i32>| {
-        let fd = fd.ok_or_else(|| anyhow::anyhow!("origin needs --{what}-fd"))?;
-        startup
-            .adopt(fd)
-            .ok_or_else(|| anyhow::anyhow!("the {what} descriptor {fd} is not open"))
-    };
-    if let Some(scheme) = self_test {
+    let staging = Arc::new(args.adopt(startup, "staging", args.staging)?);
+    if let Some(scheme) = &args.self_test {
         // (the test hook: the origin of the scheme is the descriptor 5)
         let scheme = PathScheme::of(scheme.trim_end_matches(':')).ok_or_else(|| {
             anyhow::anyhow!(
                 "--self-test needs a scheme: oci, dir, oci-archive, docker-archive, docker-daemon, rootfs or archive"
             )
         })?;
-        let target = adopt("target", Some(5))?;
-        let staging = Arc::new(adopt("staging", staging)?);
+        let target = args.adopt(startup, "target", Some(5))?;
         startup.close_range(3, u32::MAX);
         return try_origin_confinement(scheme, target, staging);
     }
-    let stream = std::os::unix::net::UnixStream::from(adopt("varlink", varlink)?);
-    let config_file = adopt("config", config)?;
-    let staging = Arc::new(adopt("staging", staging)?);
-    startup.close_range(3, u32::MAX);
-    velarx_base::hardening::harden()?;
-    let settings = velarx_content::list::settings_from_fd(config_file)?;
-    velarx_base::hardening::limit_file_size(settings.max_file_bytes)?;
-    let idle = IdleExit {
-        after: Duration::from_secs(settings.services.first_call_secs),
-        socket: None,
-        last: true,
-        lock: None,
-    };
-    let limits = velarx_content::activation::Limits::of(&settings.services);
+    let started = args.start(startup)?;
+    velarx_base::hardening::limit_file_size(started.settings.max_file_bytes)?;
     let origin = velarx_content::dir_origin::DirOrigin::new(
         Box::new({
             let staging = staging.clone();
@@ -277,11 +315,14 @@ fn serve_origin(
                     .map_err(|e| format!("the directory origin cannot confine itself: {e}"))
             }
         }),
-        settings,
+        started.settings,
         Arc::new(std::fs::File::from(rustix::io::dup(&*staging)?)),
     );
     Ok(velarx_content::serve_fetch::run_one_single_thread(
-        stream, origin, idle, limits,
+        started.stream,
+        origin,
+        started.idle,
+        started.limits,
     )?)
 }
 
@@ -331,51 +372,17 @@ fn try_origin_confinement(
     Ok(())
 }
 
-fn serve(
-    args: impl Iterator<Item = std::ffi::OsString>,
-    startup: &velarx_sys::fd::Startup,
-) -> anyhow::Result<()> {
-    let (mut name, mut dir) = (None, None::<PathBuf>);
-    let (mut varlink, mut config, mut staging) = (None, None, None);
-    let mut self_test = false;
-    let mut args = args;
-    while let Some(arg) = args.next() {
-        let mut value = || {
-            args.next()
-                .ok_or_else(|| anyhow::anyhow!("{} needs a value", arg.to_string_lossy()))
-        };
-        match arg.to_str() {
-            Some("--name") => name = Some(value()?.to_string_lossy().into_owned()),
-            Some("--dir") => dir = Some(PathBuf::from(value()?)),
-            Some("--varlink-fd") => varlink = Some(value()?.to_string_lossy().parse::<i32>()?),
-            Some("--config-fd") => config = Some(value()?.to_string_lossy().parse::<i32>()?),
-            Some("--staging-fd") => staging = Some(value()?.to_string_lossy().parse::<i32>()?),
-            Some("--self-test") => self_test = true,
-            _ => anyhow::bail!("unknown argument {}", arg.to_string_lossy()),
-        }
-    }
-    let (Some(name), Some(dir)) = (name, dir) else {
+fn serve(args: &Args, startup: &velarx_sys::fd::Startup) -> anyhow::Result<()> {
+    let (Some(name), Some(dir)) = (&args.name, args.dir.clone()) else {
         anyhow::bail!("dir needs --name and --dir");
     };
-    let adopt = |what: &str, fd: Option<i32>| {
-        let fd = fd.ok_or_else(|| anyhow::anyhow!("dir needs --{what}-fd"))?;
-        startup
-            .adopt(fd)
-            .ok_or_else(|| anyhow::anyhow!("the {what} descriptor {fd} is not open"))
-    };
-    if self_test {
-        let staging = Arc::new(adopt("staging", staging)?);
+    let staging = Arc::new(args.adopt(startup, "staging", args.staging)?);
+    if args.self_test.is_some() {
         startup.close_range(3, u32::MAX);
         return try_confinement(&dir, staging);
     }
-    let stream = std::os::unix::net::UnixStream::from(adopt("varlink", varlink)?);
-    let config_file = adopt("config", config)?;
-    let staging = Arc::new(adopt("staging", staging)?);
-    // (what the starter passed that this does not use goes)
-    startup.close_range(3, u32::MAX);
-    velarx_base::hardening::harden()?;
-    let settings = velarx_content::list::settings_from_fd(config_file)?;
-    velarx_base::hardening::limit_file_size(settings.max_file_bytes)?;
+    let started = args.start(startup)?;
+    velarx_base::hardening::limit_file_size(started.settings.max_file_bytes)?;
     let mut reach = velarx_sandbox::fetch::dir_reach(&dir);
     reach.staging = Some(staging);
     velarx_sandbox::fetch::enter(&reach, velarx_sandbox::fetch::Role::Dir)
@@ -390,18 +397,14 @@ fn serve(
     let endpoint = {
         let _on = runtime.enter();
         velarx_content::serve_fetch::FetchEndpoint::new(velarx_content::dir_fetch::DirFetch::new(
-            &name, dir,
+            name, dir,
         ))
     };
-    let idle = IdleExit {
-        after: Duration::from_secs(settings.services.first_call_secs),
-        socket: None,
-        last: true,
-        lock: None,
-    };
-    let limits = velarx_content::activation::Limits::of(&settings.services);
     Ok(velarx_content::serve_fetch::run_one_blocking(
-        stream, endpoint, idle, limits,
+        started.stream,
+        endpoint,
+        started.idle,
+        started.limits,
     )?)
 }
 
