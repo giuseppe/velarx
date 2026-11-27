@@ -33,7 +33,7 @@ pub const CONTAINER_CGROUP: &str = "container";
 
 /// The leaf of a container cgroup with the processes of its monitor (the
 /// runtime side of it, as the `runtime` of a command's split cgroup).
-pub const RUNTIME_CGROUP: &str = "runtime";
+pub const RUNTIME_CGROUP: &str = velarx_base::cgroup::RUNTIME_LEAF;
 
 /// Cgroup manager for container resource isolation (`cgroup_manager =
 /// "cgroupfs"`, the default of the server): the layout of `--cgroups=split`,

@@ -2502,9 +2502,12 @@ pub fn in_unit() -> bool {
             && std::fs::read_to_string("/proc/self/cgroup").is_ok_and(|c| in_service_cgroup(&c)))
 }
 
-/// Whether the cgroup v2 line of a `/proc/self/cgroup` text is a service's.
+/// Whether the cgroup v2 line of a `/proc/self/cgroup` text is a service's,
+/// or the `runtime` leaf the split of a service made (where its processes
+/// wait: a second command of the service runs there).
 fn in_service_cgroup(proc_cgroup: &str) -> bool {
     velarx_base::cgroup::path_in(proc_cgroup)
+        .map(|path| velarx_base::cgroup::split_parent(path).unwrap_or(path))
         .and_then(|path| path.rsplit('/').next())
         .is_some_and(|leaf| leaf.ends_with(".service"))
 }
@@ -3635,6 +3638,11 @@ mod tests {
             "/user.slice/user-1000.slice/session-3.scope"
         )));
         assert!(!in_service_cgroup("12:pids:/system.slice/web.service\n"));
+        // The leaf the split of a service made is the service's.
+        assert!(in_service_cgroup(&cg("/system.slice/web.service/runtime")));
+        assert!(!in_service_cgroup(&cg(
+            "/user.slice/session-3.scope/runtime"
+        )));
     }
 
     #[test]

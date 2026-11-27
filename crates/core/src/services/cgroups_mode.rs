@@ -763,9 +763,21 @@ pub fn split_own_cgroup() -> io::Result<String> {
     )
 }
 
+/// How many times the processes are moved and the controllers enabled.
+const SPLIT_ATTEMPTS: u32 = 5;
+
 fn split_cgroup(root: &Path, own: &str) -> io::Result<String> {
+    split_cgroup_with(root, own, velarx_base::cgroup::enable_controllers)
+}
+
+/// [`split_cgroup`] with the enabling of the controllers (what
+/// `enable_controllers` does) given.
+fn split_cgroup_with<F>(root: &Path, own: &str, mut enable: F) -> io::Result<String>
+where
+    F: FnMut(&Path) -> io::Result<Vec<(&'static str, io::Result<()>)>>,
+{
     let own = own.trim_end_matches('/');
-    let parent = match own.strip_suffix("/runtime") {
+    let parent = match velarx_base::cgroup::split_parent(own) {
         Some(p)
             if root
                 .join(p.trim_start_matches('/'))
@@ -780,12 +792,39 @@ fn split_cgroup(root: &Path, own: &str) -> io::Result<String> {
         return Err(io::Error::other("the root cgroup is not split"));
     }
     let dir: PathBuf = root.join(parent.trim_start_matches('/'));
-    let runtime = dir.join("runtime");
+    let runtime = dir.join(velarx_base::cgroup::RUNTIME_LEAF);
     match std::fs::create_dir(&runtime) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
+    // A process may fork into the cgroup after it was emptied, and then
+    // the kernel refuses the controllers with EBUSY: move it and retry.
+    for attempt in 1.. {
+        move_processes(&dir, &runtime)?;
+        let mut busy = None;
+        for (c, r) in enable(&dir)? {
+            match r {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => busy = Some((c, e)),
+                Err(e) => {
+                    tracing::warn!("Cannot enable the {c} controller of {}: {e}", dir.display());
+                }
+            }
+        }
+        match busy {
+            None => return Ok(parent),
+            Some((c, e)) if attempt == SPLIT_ATTEMPTS => {
+                return Err(io::Error::new(e.kind(), format!("enable {c}: {e}")));
+            }
+            Some(_) => {}
+        }
+    }
+    unreachable!()
+}
+
+/// Move every process of the cgroup `dir` to its child `runtime`.
+fn move_processes(dir: &Path, runtime: &Path) -> io::Result<()> {
     let procs = std::fs::read_to_string(dir.join("cgroup.procs"))?;
     for pid in procs.split_whitespace() {
         match std::fs::write(runtime.join("cgroup.procs"), pid) {
@@ -795,12 +834,7 @@ fn split_cgroup(root: &Path, own: &str) -> io::Result<String> {
             Err(e) => return Err(io::Error::new(e.kind(), format!("move {pid}: {e}"))),
         }
     }
-    for (c, r) in velarx_base::cgroup::enable_controllers(&dir)? {
-        if let Err(e) = r {
-            tracing::warn!("Cannot enable the {c} controller of {}: {e}", dir.display());
-        }
-    }
-    Ok(parent)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1189,5 +1223,55 @@ mod tests {
         let again = split_cgroup(root.path(), "/app.slice/web.service/runtime").unwrap();
         assert_eq!(again, "/app.slice/web.service");
         assert!(split_cgroup(root.path(), "/").is_err());
+    }
+
+    /// A fake hierarchy with a unit, whose `cgroup.procs` the fake kernel
+    /// and the test read and write.
+    fn fake_unit() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let unit = root.path().join("web.service");
+        std::fs::create_dir_all(&unit).unwrap();
+        std::fs::write(unit.join("cgroup.procs"), "").unwrap();
+        (root, unit)
+    }
+
+    #[test]
+    fn a_process_that_arrives_before_the_controllers_is_moved() {
+        let (root, unit) = fake_unit();
+        let mut calls = 0;
+        let got = split_cgroup_with(root.path(), "/web.service", |dir| {
+            calls += 1;
+            // The kernel refuses once, as a process forked in meanwhile.
+            let busy = if calls == 1 {
+                std::fs::write(dir.join("cgroup.procs"), "4242").unwrap();
+                Err(io::Error::from_raw_os_error(libc::EBUSY))
+            } else {
+                Ok(())
+            };
+            Ok(vec![("memory", busy)])
+        })
+        .unwrap();
+        assert_eq!(got, "/web.service");
+        assert_eq!(calls, 2);
+        // The fake file keeps the last write: the late process was moved.
+        let moved = std::fs::read_to_string(unit.join("runtime/cgroup.procs")).unwrap();
+        assert_eq!(moved, "4242");
+    }
+
+    #[test]
+    fn a_cgroup_that_stays_busy_fails_with_the_error() {
+        let (root, _) = fake_unit();
+        let mut calls = 0;
+        let e = split_cgroup_with(root.path(), "/web.service", |_| {
+            calls += 1;
+            Ok(vec![(
+                "pids",
+                Err(io::Error::from_raw_os_error(libc::EBUSY)),
+            )])
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::ResourceBusy);
+        assert!(e.to_string().contains("enable pids"), "{e}");
+        assert_eq!(calls, SPLIT_ATTEMPTS);
     }
 }

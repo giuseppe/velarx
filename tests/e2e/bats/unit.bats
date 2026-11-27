@@ -420,6 +420,19 @@ else:
     check "T9 no row is left" "" "$(row t9)"
 }
 
+@test "--cgroups=split works for every command of a unit, not once" {
+    # The first split moves the shell of the unit to <unit>/runtime; the
+    # commands after it still run in a unit.
+    echo "$P-t9b" >> "$WORKDIR/units.list"
+    out=$(timeout 120 "${SRUN[@]}" --quiet --wait --pipe --unit="$P-t9b" -p Type=exec -p Delegate=yes \
+        "${ENVP[@]}" bash -c '
+        for i in 1 2 3; do
+            "$@" container run --rm --tls-verify=false --network none --cgroups=split --memory 64m \
+                '"$IMAGE"' cat /sys/fs/cgroup/memory.max 2> /dev/null || echo "rc=$?"
+        done' bash "${SH[@]}")
+    check "T9b three splits in one unit" "$(printf '67108864\n67108864\n67108864')" "$out"
+}
+
 @test "a container of a pod is split too" {
     # A container of a pod is split too (Quadlet's .container with Pod=): in its
     # unit's cgroup, in the namespaces of the pod.

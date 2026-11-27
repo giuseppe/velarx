@@ -54,6 +54,20 @@ pub fn require_v2() -> Result<(), String> {
 /// them get from their parent (the list the OCI runtimes ask for).
 pub const CONTROLLERS: [&str; 7] = ["cpu", "cpuset", "io", "memory", "pids", "hugetlb", "misc"];
 
+/// The leaf of a cgroup split by `--cgroups=split` with the processes the
+/// cgroup had (the caller, monitors): a cgroup that gives controllers to
+/// its children may have no process of its own.  A container cgroup keeps
+/// its monitor in a leaf of the same name.
+pub const RUNTIME_LEAF: &str = "runtime";
+
+/// The split cgroup a process in its [`RUNTIME_LEAF`] belongs to: `path`
+/// without that last component, if it is the last one.
+pub fn split_parent(path: &str) -> Option<&str> {
+    path.rsplit_once('/')
+        .filter(|(_, leaf)| *leaf == RUNTIME_LEAF)
+        .map(|(parent, _)| parent)
+}
+
 /// The cgroup v2 path in the text of a `/proc/PID/cgroup` (the `0::` entry,
 /// `/user.slice/...`).
 pub fn path_in(text: &str) -> Option<&str> {
@@ -157,5 +171,13 @@ mod tests {
         let done = enable_controllers(d.path()).unwrap();
         let names: Vec<&str> = done.iter().map(|(c, _)| *c).collect();
         assert_eq!(names, ["cpuset"]);
+    }
+
+    #[test]
+    fn only_a_last_runtime_leaf_is_the_split_parent() {
+        assert_eq!(split_parent("/a/x.service/runtime"), Some("/a/x.service"));
+        assert_eq!(split_parent("/a/x.service"), None);
+        assert_eq!(split_parent("/a/runtime/x.service"), None);
+        assert_eq!(split_parent("/a/x.service/myruntime"), None);
     }
 }
