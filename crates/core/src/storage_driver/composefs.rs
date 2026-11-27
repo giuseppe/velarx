@@ -521,6 +521,12 @@ fn write_layer_images_in(
     objects: &Path,
     mut durable: Durable<'_>,
 ) -> std::io::Result<HashMap<LayerKey, LayerArtifact>> {
+    // (a layer of a pull holds its lease, and each of its two files the lock
+    // it has until it has its name: `OPEN_FILES_PER_LAYER`, all at once)
+    velarx_base::hardening::ensure_open_files(velarx_base::hardening::open_files_needed(
+        built.0.len(),
+    ))
+    .map_err(std::io::Error::other)?;
     let mut out = HashMap::new();
     for (digest, image, erofs) in built.0 {
         durable.replace(
@@ -1809,6 +1815,12 @@ impl StorageDriver for ComposefsDriver {
                         })?;
                     built.0.push((key, image, erofs));
                 }
+                // (the leases of all the layers are held while each part is
+                // written: room for all of them, before the first part)
+                velarx_base::hardening::ensure_open_files(
+                    velarx_base::hardening::open_files_needed(built.0.len()),
+                )
+                .map_err(|e| storage_error(std::io::Error::other(e)))?;
                 // the images of the layers of a lazy pull wait in the staging
                 // area (not synced: the layer is in progress), the others are
                 // the store's
@@ -2548,6 +2560,40 @@ mod tests {
         assert_eq!(mode & 0o777, 0o444);
         // no temporary file is left
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    /// The images of more layers than the soft limit of open files has room
+    /// for are written: a layer holds its lease (taken before, under the
+    /// soft limit) and the locks of its files until they have their names.
+    #[test]
+    fn the_images_of_more_layers_than_the_soft_limit_are_written() {
+        velarx_base::testing::in_child(|| {
+            rustix::process::setrlimit(
+                rustix::process::Resource::Nofile,
+                rustix::process::Rlimit {
+                    current: Some(512),
+                    maximum: Some(4096),
+                },
+            )
+            .unwrap();
+            // (a descriptor for the lease of each layer)
+            let _leases: Vec<_> = (0..400)
+                .map(|_| std::fs::File::open("/dev/null").unwrap())
+                .collect();
+            let tmp = tempfile::tempdir().unwrap();
+            let store = FileStore::new(tmp.path().join("objects")).unwrap();
+            let toc = Toc {
+                version: 1,
+                entries: vec![file("f", 1)],
+                tar_split_digest: None,
+            };
+            let keys: Vec<_> = (0..400u32)
+                .map(|i| LayerKey::Toc(format!("sha256:{i:064x}").parse().unwrap()))
+                .collect();
+            let layers: Vec<_> = keys.iter().map(|k| (*k, &toc)).collect();
+            let made = make_layer_images(&layers, &store).unwrap();
+            assert_eq!(made.len(), 400);
+        });
     }
 
     /// The image of a layer is recorded with its digest and owners, and

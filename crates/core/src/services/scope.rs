@@ -28,6 +28,8 @@ use tracing::warn;
 
 /// How long the manager has to put the holder in its scope.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// The pause between looks when there is no event to wait for.
+const JOIN_POLL: Duration = Duration::from_millis(2);
 
 /// How long a unit of the same name may take to go.
 const UNIT_GONE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -362,10 +364,28 @@ fn cgroup_of_holder(holder: i32, want: &str) -> io::Result<Option<String>> {
         .map(str::to_string))
 }
 
+/// The watch of the events of the scope `dir`: its parent gets the
+/// cgroup, then it gets the process.
+fn watch_scope(dir: &Path) -> io::Result<velarx_sys::watch::Watch> {
+    let watch = velarx_sys::watch::Watch::new()?;
+    if let Some(parent) = dir.parent() {
+        watch.creations_in(parent)?;
+    }
+    Ok(watch)
+}
+
 /// Wait until the manager has put `holder` in the scope: the cgroup of the
 /// scope is created (an event of its parent directory), then a process
-/// joins it (an event of its `cgroup.events`).
-fn wait_holder_joined(dir: &std::path::Path, holder: i32, want: &str) -> io::Result<String> {
+/// joins it (an event of its `cgroup.events`).  The wait is short, so a
+/// user with no inotify instance left (the limit is shared by all the
+/// processes of the user) polls instead, as the holder does.
+fn wait_holder_joined(
+    watch: Option<velarx_sys::watch::Watch>,
+    dir: &Path,
+    holder: i32,
+    want: &str,
+    limit: Duration,
+) -> io::Result<String> {
     let timed_out = || {
         io::Error::new(
             io::ErrorKind::TimedOut,
@@ -373,21 +393,22 @@ fn wait_holder_joined(dir: &std::path::Path, holder: i32, want: &str) -> io::Res
         )
     };
     let start = Instant::now();
-    let watch = velarx_sys::watch::Watch::new()?;
-    if let Some(parent) = dir.parent() {
-        watch.creations_in(parent)?;
-    }
     loop {
-        // (watched before it is looked at: no change falls between)
-        let _ = watch.changes_of(&dir.join("cgroup.events"));
+        if let Some(watch) = &watch {
+            // (watched before it is looked at: no change falls between)
+            let _ = watch.changes_of(&dir.join("cgroup.events"));
+        }
         if let Some(cgroup) = cgroup_of_holder(holder, want)? {
             return Ok(cgroup);
         }
-        let left = JOIN_TIMEOUT
-            .checked_sub(start.elapsed())
-            .ok_or_else(timed_out)?;
-        if !watch.wait(left)? && cgroup_of_holder(holder, want)?.is_none() {
-            return Err(timed_out());
+        let left = limit.checked_sub(start.elapsed()).ok_or_else(timed_out)?;
+        match &watch {
+            Some(watch) => {
+                if !watch.wait(left)? && cgroup_of_holder(holder, want)?.is_none() {
+                    return Err(timed_out());
+                }
+            }
+            None => std::thread::sleep(left.min(JOIN_POLL)),
         }
     }
 }
@@ -455,7 +476,15 @@ fn make(system: bool, name: &str, holder: i32) -> io::Result<PathBuf> {
     let want = format!("/{name}.scope");
     let cgroup = match (cgroup_of_holder(holder, &want)?, &known) {
         (Some(cgroup), _) => cgroup,
-        (None, Some(dir)) => wait_holder_joined(dir, holder, &want)?,
+        (None, Some(dir)) => {
+            let watch = match watch_scope(dir) {
+                Ok(watch) => Some(watch),
+                // (no inotify instance or watch left: the user's limit)
+                Err(e) if e.kind() == io::ErrorKind::QuotaExceeded => None,
+                Err(e) => return Err(e),
+            };
+            wait_holder_joined(watch, dir, holder, &want, JOIN_TIMEOUT)?
+        }
         (None, None) => {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -526,6 +555,27 @@ mod tests {
             thread: Some(thread),
         });
         assert!(ends_within(&fd, 10_000), "the holder ended");
+    }
+
+    /// A start that cannot get an inotify instance still finds the holder
+    /// in its scope, and times out when it never gets there.
+    #[test]
+    fn the_holder_is_waited_for_without_a_watch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let me = std::process::id() as i32;
+        let text = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        let own = velarx_base::cgroup::path_in(&text).unwrap().to_string();
+        let found = wait_holder_joined(None, tmp.path(), me, &own, Duration::from_secs(5));
+        assert_eq!(found.unwrap(), own);
+        let e = wait_holder_joined(
+            None,
+            tmp.path(),
+            me,
+            "/no-such.scope",
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
     }
 
     /// The empty cgroups an older start left go; one that is not empty
