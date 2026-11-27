@@ -60,7 +60,7 @@ stop_daemon () {
 }
 # Everything a power cut takes: the processes, the mounts, the tmpfs.
 reboot () {
-    local p c mons pids=()
+    local f p c mons pids=()
     # the processes of the containers, while the daemon answers
     for c in alw unl unl2 norestart rmme madeinit; do
         p=$(pid_of "$c")
@@ -87,6 +87,17 @@ reboot () {
     mons=$(e2e_monitors "$STATE")
     for p in $mons; do kill -9 "$p" 2> /dev/null; done
     for p in $mons; do e2e_wait_exit "$p" 10 || e2e_die "the killed monitor $p is still there"; done
+    # the pasta of the network of the pod (rootless), by its pid file: no
+    # engine knows of it once the state is gone
+    for f in $(find "$STATE/networks/pasta" -name '*.pid' 2> /dev/null); do
+        p=$(cat "$f" 2> /dev/null)
+        case "$(cat "/proc/${p:-0}/comm" 2> /dev/null)" in
+        pasta*) ;;
+        *) continue ;;
+        esac
+        kill -9 "$p" 2> /dev/null
+        e2e_wait_exit "$p" 10 || e2e_die "the killed pasta $p is still there"
+    done
     if [ "$(id -u)" = 0 ]; then
         findmnt -rn -o TARGET | grep "^$WORKDIR/" | sort -r | while read -r m; do umount -l "$m"; done
     fi

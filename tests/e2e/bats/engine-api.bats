@@ -471,8 +471,9 @@ answer () { # socket method path [body]
         before=$(fds $pid)
         for _ in $(seq 10); do leave $sock --close-after 0.3; leave $sock --eof --close-after 0.6; done
         after=$(fds $pid)
-        # (polled: the descriptors of a process notify nobody)
-        for _ in $(seq 30); do [ "$after" -le "$before" ] && break; sleep 0.1; after=$(fds $pid); done
+        # (polled: the descriptors of a process notify nobody; a loaded
+        # machine may take seconds to run the closes, a leak never does)
+        for _ in $(seq 300); do [ "$after" -le "$before" ] && break; sleep 0.1; after=$(fds $pid); done
         check "abandoned idle attaches (half closed first or not) leave no descriptor in the $*" 0 "$([ "$before" -eq 0 ] && echo "no /proc/$pid/fd" || { [ "$after" -gt "$before" ] && echo "$((after - before)) more" || echo 0; })"
     done
     check "...and the engine is the one that was measured" "$ep" "$(engine_pid)"

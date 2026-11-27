@@ -371,11 +371,12 @@ test-fuzz-corpus: ## replay and mutate the fuzz corpora without cargo-fuzz (the 
 	$(CARGO) test -p velarx-p2p --test p2p fuzz_corpus_tests:: $(CARGOFLAGS)
 
 # The tests that need a directory on a file system with fs-verity (ext4,
-# btrfs or f2fs, the feature on, blocks of 4096 bytes): #[ignore]d in the other targets, run here
-# with --ignored; without VELARX_VERITY_DIR the target fails.
-test-verity: ## the tests that need fs-verity: VELARX_VERITY_DIR=dir make test-verity
+# btrfs or f2fs, the feature on, blocks of 4096 bytes): they skip their
+# fs-verity part when VELARX_VERITY_DIR is not set, so this runs the tests of
+# `make test` with it set; without the directory the target fails.
+test-verity: ## the fast tier with fs-verity: VELARX_VERITY_DIR=dir make test-verity (TESTARGS=filter)
 	@test -d "$(VELARX_VERITY_DIR)" || { echo "make test-verity: VELARX_VERITY_DIR must name a directory on a file system with fs-verity" >&2; exit 2; }
-	VELARX_VERITY_DIR=$(abspath $(VELARX_VERITY_DIR)) $(CARGO) test -p velarx-runtime --lib $(CARGOFLAGS) monitor::lazy:: -- --ignored
+	VELARX_VERITY_DIR=$(abspath $(VELARX_VERITY_DIR)) $(CARGO) test --features fuzzing $(CARGOFLAGS) $(TESTARGS)
 
 test-workspace: ## cargo test --workspace: every package, p2p, api and cri included
 	$(CARGO) test --workspace $(CARGOFLAGS) $(TESTARGS)
@@ -418,6 +419,7 @@ test-all: ## slow tier: slow tests, workspace, thin client, every e2e file (abou
 	$(MAKE) build-client PROFILE=debug
 	$(CARGO) build --workspace --bins $(CARGOFLAGS)
 	$(MAKE) docs-commands
+	$(MAKE) e2e-man VELARX_BINDIR=$(DEBUGDIR)
 	VELARX_BINDIR=$(DEBUGDIR) tests/e2e/run-all.sh
 
 # ---- coverage ----
@@ -434,10 +436,14 @@ coverage: ## line coverage of the fast tier (cargo-llvm-cov): lcov, HTML, per-pa
 # ---- end to end (bats) ----
 
 # They run the binaries of VELARX_BINDIR (default: the debug build, see
-# build-debug); make e2e does not build.  The install tests need the man
-# pages and completions that make man writes: it is run when they are missing.
+# build-debug); make e2e does not build.  The install tests (make
+# install-files) need the man pages and completions that make man writes and
+# the THIRD-PARTY-LICENSES that make licenses-binary writes, of the binaries
+# of VELARX_BINDIR: the man pages are made when missing, the licenses (a
+# second) always.
 e2e-man:
 	@test -e $(GENMANDIR)/velarx.conf.5 || $(MAKE) man PROFILE=debug
+	@$(MAKE) --no-print-directory licenses-binary TARGETDIR=$(VELARX_BINDIR)
 
 e2e: e2e-man ## bats suites side by side: make e2e [T="run-lifecycle kube"] [BATS_ARGS=...] [E2E_JOBS=n]
 	$(RUNALL)

@@ -203,10 +203,15 @@ e2e_make_image () {
 
 # e2e_teardown_file: stop the daemon of the file (the pid in
 # $WORKDIR/daemon.pid) and remove the work directory (kept when E2E_KEEP is
-# set).  The containers are the file's business (its teardown_file).
+# set).  The containers are the file's business (its teardown_file).  A
+# rootless podman of the file (`podman unshare`) has left its pause process,
+# whose pid is in the run directory of the file ($WORKDIR/run, never the
+# one of the session): it ends with it.
 e2e_teardown_file () {
     [ -n "${WORKDIR:-}" ] || return 0
     local pid
+    pid=$(cat "$WORKDIR/run/libpod/tmp/pause.pid" 2> /dev/null)
+    [ -z "$pid" ] || kill "$pid" 2> /dev/null
     # (the engine services a command started for its lazy pulls outlive it)
     e2e_stop_services "$WORKDIR"
     pid=$(cat "$WORKDIR/api.pid" 2> /dev/null)
@@ -417,17 +422,22 @@ skip_unless_systemd_user () {
     esac
 }
 
-# e2e_need_api: skip, saying so, without velarx-api in $BIN: it is not a
-# default member of the workspace (a plain `cargo build` leaves it out);
-# `make build-debug` builds it with the other binaries of the e2e tests.
+# e2e_need_api, e2e_need_cri: skip, saying so, without velarx-api (or
+# velarx-cri) in $BIN: they are not default members of the workspace (a plain
+# `cargo build` leaves them out); `make build-debug` builds them with the
+# other binaries of the e2e tests.  Every test that starts one calls it first.
 e2e_need_api () {
-    [ -x "$BIN/velarx-api" ] || skip "no $BIN/velarx-api (make build-debug, or cargo build -p velarx-api-bin)"
+    [ -x "$BIN/velarx-api" ] || skip "velarx-api is not built: cargo build -p velarx-api-bin (make build-debug)"
+}
+e2e_need_cri () {
+    [ -x "$BIN/velarx-cri" ] || skip "velarx-cri is not built: cargo build -p velarx-cri-bin (make build-debug)"
 }
 
 # e2e_start_api: velarx-api on $SOCK, in front of the engine that answers on
 # $ESOCK (for the files that drive the REST API with curl or podman); stopped
 # by e2e_teardown_file.
 e2e_start_api () {
+    e2e_need_api
     "$BIN/velarx-api" --config "$XDG_CONFIG_HOME/velarx/config.toml" --no-start-engine --idle-exit 0 \
         --listen "unix://$SOCK" > "$WORKDIR/api.log" 2>&1 3>&- &
     echo $! > "$WORKDIR/api.pid"

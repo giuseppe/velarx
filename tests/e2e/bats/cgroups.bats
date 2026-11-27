@@ -126,6 +126,7 @@ unit_env () { # MANAGER [need [FILES]]
 setup_file () {
     local rc=0
     e2e_setup_file
+    e2e_need_api
     e2e_system_bin
     export IMAGE=${IMAGE:-$E2E_REGISTRY/alpine:chunked}
     init_arrays

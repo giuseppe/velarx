@@ -286,11 +286,14 @@ teardown_file () {
 }
 
 # a file system whose blocks are smaller than 4096 bytes: its fs-verity
-# digests are not those that name the files
+# digests are not those that name the files (without the orphan file, which
+# a kernel refuses to mount on blocks this small)
 small_fs () {
-    [ -d "$WORKDIR/small" ] && return 0
+    mountpoint -q "$WORKDIR/small" 2> /dev/null && return 0
     truncate -s 600M "$WORKDIR/small.img"
-    mkfs.ext4 -q -b 1024 -N 131072 -O verity "$WORKDIR/small.img" || skip "cannot make an ext4 of 1 KiB blocks with verity"
+    # (a mkfs.ext4 older than the orphan file does not know its name)
+    mkfs.ext4 -q -b 1024 -N 131072 -O verity,^orphan_file "$WORKDIR/small.img" 2> /dev/null ||
+        mkfs.ext4 -q -b 1024 -N 131072 -O verity "$WORKDIR/small.img" || skip "cannot make an ext4 of 1 KiB blocks with verity"
     mkdir -p "$WORKDIR/small"
     mount -o loop "$WORKDIR/small.img" "$WORKDIR/small" || skip "cannot mount the loop device"
 }

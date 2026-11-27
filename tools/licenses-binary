@@ -27,6 +27,14 @@ root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(root)
 cargo = shlex.split(os.environ.get("CARGO", "cargo"))
 flags = shlex.split(os.environ.get("CARGOFLAGS", ""))
+# metadata and tree do not build: they take no -jN, -j N, --jobs=N, --jobs N
+nojobs, it = [], iter(flags)
+for f in it:
+    if f in ("-j", "--jobs"):
+        next(it, None)
+    elif not re.match(r"-j-?\d+$|--jobs=", f):
+        nojobs.append(f)
+flags = nojobs
 # always the versions of Cargo.lock (cargo refuses a repeated --locked)
 if "--locked" not in flags:
     flags.append("--locked")

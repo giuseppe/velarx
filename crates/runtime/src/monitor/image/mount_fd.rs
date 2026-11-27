@@ -522,7 +522,7 @@ fn idmap_clone(tree: std::os::fd::BorrowedFd<'_>, userns: &Idmap<'_>) -> io::Res
     crate::userns::idmap_mount(tree, userns.as_fd()).map_err(|e| {
         let why = match e.raw_os_error() {
             Some(libc::EPERM) => "the mount is idmapped already (an idmapped mount cannot be idmapped again: hand over a plain mount) or this file system refuses idmapped mounts",
-            Some(libc::EINVAL) => "this file system does not take idmapped mounts (an overlay as a whole does not: map its lower layers)",
+            Some(libc::EINVAL) => "this file system does not take idmapped mounts",
             Some(libc::ENOSYS) => "the kernel has no idmapped mounts",
             _ => "unexpected",
         };
@@ -1549,10 +1549,10 @@ mod tests {
         });
     }
 
-    /// An overlay as a whole cannot be idmapped (EINVAL): the message says
-    /// that file system does not take it.
+    /// An overlay as a whole takes the id mapping: the owners of the files
+    /// of its lower layers show as the host ids of the mapping.
     #[test]
-    fn an_overlay_is_refused_an_idmap_with_its_reason() {
+    fn an_overlay_takes_an_idmap_and_shows_the_mapped_owners() {
         velarx_base::testing::in_child(|| {
             if !rustix::process::geteuid().is_root() || !private_namespace() {
                 eprintln!("SKIPPED: an overlay needs root here");
@@ -1562,6 +1562,9 @@ mod tests {
             for n in ["a", "b"] {
                 std::fs::create_dir(d.path().join(n)).unwrap();
             }
+            let marker = d.path().join("a/marker");
+            std::fs::write(&marker, "lower").unwrap();
+            std::os::unix::fs::chown(&marker, Some(1000), Some(1000)).unwrap();
             let fs = rustix::mount::fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC).unwrap();
             rustix::mount::fsconfig_set_string(
                 fs.as_fd(),
@@ -1587,14 +1590,8 @@ mod tests {
                 ..VOLUME
             };
             let target = d.path().join("ov");
-            let e = attach_held(&held(vec![Some(fd)]), 0, &target, &mapped)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                e.contains("overlay") && e.contains("does not take idmapped mounts"),
-                "{e}"
-            );
-            assert!(mount_at(&target).is_none(), "{e}");
+            attach_held(&held(vec![Some(fd)]), 0, &target, &mapped).unwrap();
+            assert_eq!(owner(&target.join("marker")), (101_000, 101_000));
         });
     }
 

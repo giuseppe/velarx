@@ -82,6 +82,7 @@ EOT
 # [engine] in the configuration), which stops with it.
 api_start_daemon () {
     local i
+    e2e_need_api
     setsid "$BIN/velarx-api" --config "$XDG_CONFIG_HOME/velarx/config.toml" --log-level "${E2E_LOG_LEVEL:-info}" --idle-exit 0 --listen "unix://$SOCK" > "$WORKDIR/daemon.log" 2>&1 3>&- &
     echo $! > "$WORKDIR/daemon.pgid"
     e2e_wait_path "$SOCK" 10 && e2e_wait_path "$ESOCK" 10 && return 0

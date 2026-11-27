@@ -70,6 +70,7 @@ setup_file () {
     fi
     export E2E_DIR; E2E_DIR=$(cd "$BATS_TEST_DIRNAME/.." && pwd)
     export BIN; BIN=$(realpath "${BIN:-${VELARX_BINDIR:-target/debug}}")
+    e2e_need_api
     export IMAGE=${IMAGE:-$E2E_REGISTRY/alpine:chunked}
     export WORKDIR; WORKDIR=$(realpath "$(mktemp -d "${E2E_TMPDIR:-/var/tmp}/velarx-e2e-pidfile.XXXXXX")")
     export P=shp-$$

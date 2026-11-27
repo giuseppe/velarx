@@ -24,9 +24,10 @@ IMG=$E2E_REGISTRY/alpine:chunked
 setup_file () {
     local b c
     BIN=$(realpath "${BIN:-${VELARX_BINDIR:-target/debug}}")
-    for b in velarx velarx-api velarx-client velarx-monitor; do
+    for b in velarx velarx-client velarx-monitor; do
         [ -x "$BIN/$b" ] || skip "no $BIN/$b"
     done
+    e2e_need_api
     for c in crun curl python3; do
         command -v $c > /dev/null || skip "no $c"
     done

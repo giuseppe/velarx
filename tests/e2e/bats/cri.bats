@@ -47,7 +47,7 @@ setup_file () {
     [ "$(id -u)" = 0 ] || skip "the CRI is tested as root"
     command -v crictl > /dev/null || skip "crictl is not installed"
     e2e_setup_file
-    test -x "$BIN/velarx-cri" || skip "$BIN/velarx-cri is not built"
+    e2e_need_cri
     export IMAGE=${IMAGE:-$E2E_REGISTRY/alpine:chunked}
     export CRISOCK=$WORKDIR/cri.sock
     mkdir -p "$WORKDIR/logs"

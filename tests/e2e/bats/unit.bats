@@ -637,6 +637,7 @@ except socket.timeout: print("nothing")
 }
 
 @test "a unit of generate systemd starts and stops its container" {
+    e2e_need_api
     # T17: a unit of `generate systemd` starts and stops its container:
     # Type=forking, the monitor's pid file.
     "${ENGINE[@]}" container create --name tg --tls-verify=false "$IMAGE" sleep inf > /dev/null 2>&1

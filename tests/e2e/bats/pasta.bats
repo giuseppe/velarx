@@ -64,6 +64,7 @@ setup_file () {
     fi
     export E2E_DIR; E2E_DIR=$(cd "$BATS_TEST_DIRNAME/.." && pwd)
     export BIN; BIN=$(realpath "${BIN:-${VELARX_BINDIR:-target/debug}}")
+    e2e_need_api
     export DAEMON=${VELARX_DAEMON:-$BIN/velarx}
     export CLI=${VELARX:-$(dirname "$DAEMON")/velarx}
     export IMG=${E2E_IMAGE:-$E2E_REGISTRY/alpine:chunked}

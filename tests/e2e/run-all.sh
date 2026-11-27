@@ -47,7 +47,7 @@ while [ $# -gt 0 ] && [ "$1" != -- ]; do names+=("${1%.bats}"); shift; done
 BATS_ARGS=("$@")
 
 BINDIR=$(realpath "${VELARX_BINDIR:-${CARGO_TARGET_DIR:-$top_srcdir/target}/debug}")
-[ -x "$BINDIR/velarx" ] || { echo "no $BINDIR/velarx (cargo build)" >&2; exit 2; }
+[ -x "$BINDIR/velarx" ] || { echo "no $BINDIR/velarx (make build-debug: velarx-api and velarx-cri are built by it, not by cargo build)" >&2; exit 2; }
 export VELARX_BINDIR=$BINDIR BIN=$BINDIR VELARX_DAEMON=$BINDIR/velarx
 command -v bats > /dev/null || { echo "bats is not installed" >&2; exit 2; }
 BATSDIR=$top_srcdir/tests/e2e/bats

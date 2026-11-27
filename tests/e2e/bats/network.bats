@@ -669,8 +669,10 @@ from-hot1" "$out"
 
 @test "the DNS server forwards the queries of a TCP client over TCP, more than one per connection" {
     # An upstream that has a short answer over UDP (TC set) and the whole one
-    # over TCP, for as many queries as a connection brings.
-    nse python3 -I -c '
+    # over TCP, for as many queries as a connection brings.  (Not through
+    # nse: $! would be the subshell of the function, and the teardown would
+    # kill it and leave the server.)
+    $NSE python3 -I -c '
 import socket, struct, threading
 def reply(q, tc):
     r = bytearray(q); r[2] |= 0x80
@@ -731,6 +733,7 @@ while True:
 @test "subnet_pools of the configuration" {
     # `[network] subnet_pools`: the subnets of new networks, and the compat
     # info.
+    e2e_need_api
     { cat "$CONF"; cat <<'EOT'
 [[network.subnet_pools]]
 base = "10.213.32.0/24"

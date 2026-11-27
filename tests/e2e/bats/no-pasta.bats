@@ -18,6 +18,7 @@ setup_file () {
         skip "no-pasta.bats runs rootless (a rootful engine has bridges, not pasta)"
     fi
     e2e_setup_file
+    e2e_need_api
     # every executable of $PATH but pasta (and its package's other programs)
     export NOPASTA=$WORKDIR/nopasta
     mkdir -p "$NOPASTA"

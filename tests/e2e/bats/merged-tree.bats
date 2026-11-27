@@ -10,8 +10,8 @@
 #
 # MERGED_TREE_IMAGES: the images, separated by spaces (default
 # $E2E_REGISTRY/alpine:chunked); MERGED_TREE_TEST: the test binary of
-# `cargo test --test integration --no-run` (default: the newest of
-# $BIN/deps/integration-*).
+# `cargo test --test integration --no-run` (default: the one cargo says it
+# builds, wherever its build layout puts it).
 #
 # With CFSCTL (the `cfsctl` of composefs-rs) and skopeo, the digest of the
 # merged EROFS velarx computes for a sealed manifest is also compared with
@@ -110,8 +110,9 @@ setup_file () {
         command -v $t > /dev/null || skip "no $t"
     done
     BIN=$(realpath "${BIN:-${VELARX_BINDIR:-target/debug}}")
-    export MERGED_TREE_TEST=${MERGED_TREE_TEST:-$(ls -t "$BIN"/deps/integration-* 2> /dev/null | grep -v '\.d$' | head -1)}
-    [ -x "$MERGED_TREE_TEST" ] || skip "no test binary (cargo test --test integration --no-run)"
+    export MERGED_TREE_TEST=${MERGED_TREE_TEST:-$(cd "$BATS_TEST_DIRNAME/../../.." && cargo test --offline --test integration --no-run --message-format=json 2> /dev/null |
+        python3 -I -c 'import json, sys; print([m["executable"] for m in map(json.loads, sys.stdin) if m.get("executable")][-1])')}
+    [ -x "$MERGED_TREE_TEST" ] || skip "cannot build the test binary (cargo test --test integration --no-run)"
     curl -sf -m 5 "http://$E2E_REGISTRY/v2/" > /dev/null || skip "no registry at $E2E_REGISTRY"
     e2e_setup_file
     mkdir -p "$XDG_DATA_HOME"
@@ -199,7 +200,7 @@ PY
 
 teardown_file () {
     [ -n "${WORKDIR:-}" ] || return 0
-    local pid i
+    local pid i pause
     pid=$(cat "$WORKDIR/daemon.pid" 2> /dev/null)
     if test -n "$pid"; then
         kill -INT "$pid" 2> /dev/null
@@ -207,8 +208,11 @@ teardown_file () {
         kill -KILL "$pid" 2> /dev/null
     fi
     if test -z "${E2E_KEEP:-}"; then
-        # (podman's files belong to its user namespace)
+        # (podman's files belong to its user namespace; its pause process
+        # is named in the run directory that goes with them)
+        pause=$(cat "$WORKDIR/run/libpod/tmp/pause.pid" 2> /dev/null)
         podman --root "$WORKDIR/podman/root" --runroot "$WORKDIR/podman/run" unshare rm -rf "$WORKDIR" 2> /dev/null
+        [ -z "$pause" ] || kill "$pause" 2> /dev/null
     fi
     e2e_teardown_file
 }

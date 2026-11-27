@@ -64,7 +64,11 @@ EOT
     check "its bundle is gone" no "$(test -e "$XDG_DATA_HOME/velarx/bundles/$id2" && echo yes || echo no)"
     start_daemon
     # (what the monitors wrote, in the journal or the file of the events)
-    timeout 8 "$SH" events --since 5m --stream > "$WORKDIR/kill.ev" 2>&1 3>&- || true
+    "$SH" events --since 5m --stream > "$WORKDIR/kill.ev" 2>&1 3>&- &
+    evpid=$!
+    e2e_wait_line "$WORKDIR/kill.ev" "container (died|remove) .*name=kill2" 60 2 || true
+    kill "$evpid" 2> /dev/null || true
+    wait "$evpid" 2> /dev/null || true
     check "the events say died and remove" 2 "$(grep -c -E "container (died|remove) .*name=kill2" "$WORKDIR/kill.ev" || true)"
     sh_ container rm kill1 > /dev/null
 }

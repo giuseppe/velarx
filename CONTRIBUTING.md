@@ -52,8 +52,10 @@ no bare issue numbers: name the fact, not `#NNN`; upstream issues are
 temporary directory (`tempdir().keep()`, `into_path`, `mem::forget`).
 `make test-leaks` runs the library tests of every package (`PKG=name` of one)
 in a private `TMPDIR` and fails on the `.tmp*` directories they leave.
-`make test-verity VELARX_VERITY_DIR=dir` runs the tests the other targets
-ignore because they need a directory on a file system with fs-verity; it
+`make test-verity VELARX_VERITY_DIR=dir` runs the cargo tests of `make test`
+(minutes; `TESTARGS=filter` for fewer) with that directory on a file system
+with fs-verity: the tests that need one, spread over several packages and
+named for what they check, skip their fs-verity part without it.  The target
 fails when `VELARX_VERITY_DIR` is not a directory.
 Binaries and dependency counts are kept small on purpose; there is no size
 limit that fails a build: `make bench-startup` prints the stripped sizes, and a
