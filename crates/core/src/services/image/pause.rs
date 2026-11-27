@@ -16,9 +16,6 @@ const CATATONIT: &[&str] = &[
     "/usr/local/bin/catatonit",
 ];
 
-/// Serializes the builds of the image in this process.
-static BUILD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// The name of the local pause image of this version.
 pub fn pause_image_name() -> String {
     format!("localhost/velarx-pause:{}", env!("CARGO_PKG_VERSION"))
@@ -104,7 +101,19 @@ impl ImageService {
         if built(self.get(&name).await)? {
             return Ok(name);
         }
-        let _build = BUILD.lock().await;
+        // (one build at a time in the store, across processes)
+        let path = self
+            .file_store
+            .root()
+            .with_file_name("locks")
+            .join("pause-image");
+        let _build = tokio::task::spawn_blocking(move || {
+            velarx_storage::locks::lock(&path, true)
+                .map(|f| f.expect("a wait gives the lock or an error"))
+        })
+        .await
+        .map_err(|e| ImageError::Storage(e.to_string()))?
+        .map_err(ImageError::Io)?;
         if built(self.get(&name).await)? {
             return Ok(name);
         }
