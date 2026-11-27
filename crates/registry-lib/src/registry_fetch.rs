@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use velarx_content::fetcher::fetch::{
     Blob, EventKind, Failure, FetchEvent as Event, FetcherError, NotLazy, Parts, Probed,
-    SignedRecord, TocSource, MAX_FDS,
+    SignedRecord, TocSource, CAPABILITIES, MAX_FDS,
 };
 use velarx_content::pull::chunked::{
     self, fetch_with_tries, make_batches, Batch, MAX_METADATA_COMPRESSED,
@@ -971,12 +971,7 @@ impl StagingFetcher for RegistryFetch {
     fn described(&self) -> Described {
         Described {
             name: "registry".into(),
-            capabilities: [
-                "objects", "unpack", "metadata", "lazy", "sha512", "reuse", "origin", "handover",
-                "table",
-            ]
-            .map(String::from)
-            .to_vec(),
+            capabilities: CAPABILITIES.map(String::from).to_vec(),
             max_objects: MAX_OBJECTS,
         }
     }
@@ -1415,6 +1410,20 @@ mod tests {
         assert_eq!(
             registry_failure(&cut).class,
             velarx_proto::transfer::FailureClass::Transient
+        );
+    }
+
+    /// The words the fetcher announces are those a client reads; a method it
+    /// has is no word.
+    #[test]
+    fn the_fetcher_announces_only_the_words_a_client_reads() {
+        let fetch = RegistryFetch::new(
+            crate::registry::pool_tests::service(),
+            Arc::new(OwnedFd::from(File::open("/").unwrap())),
+        );
+        assert_eq!(
+            fetch.described().capabilities,
+            ["objects", "metadata", "reuse", "origin", "handover", "table"]
         );
     }
 

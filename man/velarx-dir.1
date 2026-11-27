@@ -87,7 +87,7 @@ as the origin of a pull whose source is a path (\fBoci:DIR[:REF]\fR,
 \fBoci\-archive:FILE[:REF]\fR, \fBdocker\-archive:FILE[:REF]\fR,
 \fBdir:DIR\fR, or \fBarchive:FILE\fR of
 .BR "velarx load" ),
-of a root file system (\fBrootfs:DIR\fR) or of a Docker daemon
+of a root file system (\fBrootfs:PATH\fR) or of a Docker daemon
 (\fBdocker\-daemon:IMAGE\fR), one process for each pull.  The
 .I source
 of
@@ -106,15 +106,26 @@ takes (\fBGetManifest("")\fR), their manifests and blobs, and
 of every layer.  What it says is a claim: the engine checks the digests of
 the manifests and the configurations, and replays the layers against the
 diff ids.
+A pull from a path is always whole, never lazy: a lazy image has to open its
+origin again when a file is first read, and a path cannot be opened again
+(the process was given it once, as a descriptor).
 .PP
 For \fBrootfs:\fR the
 .I target
-is the directory: its files, read beneath it, are written as the tar of one
-layer, which with a configuration that has no time in it is an image that
-is the same whenever the directory is the same.  The files keep the owners,
+is a directory or a tar.  The files of a directory, read beneath it, are
+written as the tar of one layer, which with a configuration that has no time
+in it is an image that is the same whenever the directory is the same.  The
+files keep the owners,
 modes, times and attributes (not the SELinux label) they have, as the
 engine's user namespace sees them (a file of an id it does not map is
-owned by the overflow id).  For
+owned by the overflow id).  A tar, plain or compressed with gzip or zstd,
+is the blob of the layer as it is, and its diff id is the digest of what it
+inflates to (within the inflate limits of
+.BR [pull] ); an empty file is an empty tar, and a tar with a sparse entry is written
+again, uncompressed, with the entry whole.  The selector is the algorithm of
+every digest of the image (the layer, its diff id, the configuration and the
+manifest): \fBrootfs:\fR is sha256, \fBrootfs:sha512\fR is sha512, and any
+other is refused.  For
 \fBdocker\-daemon:\fR the selector is the image to save and the
 .I target
 is the connection that the engine made to the socket of

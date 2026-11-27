@@ -498,6 +498,10 @@ pub struct PullConfig {
     pub min_speed_kib: u64,
     #[serde(default = "default_min_speed_secs")]
     pub min_speed_secs: u64,
+    /// How long a built-in fetcher (the registry's, the directory's) may be
+    /// silent in a call before the call fails; not 0
+    #[serde(default = "default_pull_idle_secs")]
+    pub idle_timeout_secs: u64,
     /// Memory the workers of a pull may use before they are slowed down
     /// (cgroup `memory.high`), in MiB; 0: no limit
     #[serde(default = "default_memory_high_mib")]
@@ -702,6 +706,10 @@ fn default_min_speed_secs() -> u64 {
     120
 }
 
+fn default_pull_idle_secs() -> u64 {
+    120
+}
+
 fn default_max_archive_gib() -> u64 {
     256
 }
@@ -722,6 +730,7 @@ impl Default for PullConfig {
             inflate_floor_mib: default_inflate_floor_mib(),
             min_speed_kib: default_min_speed_kib(),
             min_speed_secs: default_min_speed_secs(),
+            idle_timeout_secs: default_pull_idle_secs(),
             memory_high_mib: default_memory_high_mib(),
             memory_max_mib: default_memory_max_mib(),
             pids_max: default_pids_max(),
@@ -1781,6 +1790,11 @@ impl Config {
                 "[build] insecure_entitlements: `{e}` is listed twice"
             )));
         }
+        if self.pull.idle_timeout_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "[pull] idle_timeout_secs must not be 0".into(),
+            ));
+        }
         self.validate_network_providers()?;
         self.validate_cni()?;
         self.validate_sources()?;
@@ -2611,6 +2625,16 @@ mod tests {
         assert!(e.contains("idle_timeout_secs"), "{e}");
         let e = err(&format!("{SINK}{SINK}"));
         assert!(e.contains("twice"), "{e}");
+        assert_eq!(parse("").unwrap().pull.idle_timeout_secs, 120);
+        assert_eq!(
+            parse("[pull]\nidle_timeout_secs = 9\n")
+                .unwrap()
+                .pull
+                .idle_timeout_secs,
+            9
+        );
+        let e = err("[pull]\nidle_timeout_secs = 0\n");
+        assert!(e.contains("idle_timeout_secs"), "{e}");
         let e = err("[push]\ncompression = \"lz4\"\n");
         assert!(e.contains("compression"), "{e}");
         assert!(parse("[push]\ncompression = \"zstd:chunked\"\ncompression_level = 5\n").is_ok());

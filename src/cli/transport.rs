@@ -50,9 +50,11 @@ pub fn pull(client: &EngineClient, spec: &str, platform: Option<&str>) -> anyhow
         ImageLocation::Registry(name) => return Ok(Source::Name(name)),
         ImageLocation::Storage(name) => return Ok(Source::Local(name)),
         ImageLocation::DockerDaemon { .. } => return Ok(Source::Name(spec.to_string())),
-        ImageLocation::OciLayout { path, .. }
-        | ImageLocation::Dir { path }
-        | ImageLocation::Rootfs { path } => (path, true),
+        ImageLocation::OciLayout { path, .. } | ImageLocation::Dir { path } => (path, true),
+        ImageLocation::Rootfs { path } => {
+            let directory = Path::new(&path).is_dir();
+            (path, directory)
+        }
         ImageLocation::OciArchive { path, .. } | ImageLocation::DockerArchive { path, .. } => {
             (path, false)
         }

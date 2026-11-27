@@ -300,6 +300,33 @@ PY
     check "import of an invalid tar fails" 125 $?
 }
 
+# a root file system is a directory or a tar, plain or compressed, and the
+# layer of its image is the tar (the diff id is the digest of what it holds)
+@test "pull rootfs: of a directory and of a tar" {
+    d=$WORKDIR/rootfs-pull
+    mkdir -p "$d/etc"
+    echo hello > "$d/etc/hello"
+    out=$($SH image pull "rootfs:$d" 2>&1)
+    check_match "pull rootfs: of a directory" "^[0-9a-f]{64}$" "$out"
+    tar -C "$d" -cf "$WORKDIR/rootfs-pull.tar" etc
+    want=$(sha256sum < "$WORKDIR/rootfs-pull.tar" | cut -d' ' -f1)
+    out=$($SH image pull "rootfs:$WORKDIR/rootfs-pull.tar" 2>&1)
+    check_match "pull rootfs: of a tar" "^[0-9a-f]{64}$" "$out"
+    check "the diff id is the digest of the tar" "sha256:$want" \
+        "$($SH image inspect --format '{{index .RootFS.Layers 0}}' "$out")"
+    check "the same tar is the same image" "$out" "$($SH image pull "rootfs:$WORKDIR/rootfs-pull.tar" 2>&1)"
+    gzip -c "$WORKDIR/rootfs-pull.tar" > "$WORKDIR/rootfs-pull.tar.gz"
+    out=$($SH image pull "rootfs:$WORKDIR/rootfs-pull.tar.gz" 2>&1)
+    check "a compressed tar has the diff id of the tar" "sha256:$want" \
+        "$($SH image inspect --format '{{index .RootFS.Layers 0}}' "$out")"
+    : > "$WORKDIR/rootfs-empty.tar"
+    out=$($SH image pull "rootfs:$WORKDIR/rootfs-empty.tar" 2>&1)
+    check_match "an empty file is an empty root file system" "^[0-9a-f]{64}$" "$out"
+    printf junk > "$WORKDIR/rootfs-junk.tar"
+    $SH image pull "rootfs:$WORKDIR/rootfs-junk.tar" > /dev/null 2>&1
+    check "a file that is no tar is refused" 125 $?
+}
+
 # a file with holes in the tar of an import (GNU tar --sparse, in each of its
 # formats) is a regular file of the layer, as with podman
 @test "import of a tar with sparse files" {

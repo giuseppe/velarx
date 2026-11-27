@@ -574,7 +574,7 @@ impl velarx_content::serve_fetch::StagingFetcher for ArchiveTransport {
     fn described(&self) -> velarx_content::serve_fetch::Described {
         velarx_content::serve_fetch::Described {
             name: "s3".into(),
-            capabilities: vec!["metadata".into(), "unpack".into(), "origin".into()],
+            capabilities: vec!["metadata".into(), "origin".into()],
             max_objects: 1,
         }
     }
@@ -970,7 +970,8 @@ async fn test_a_root_file_system_directory_is_an_image_of_one_layer() {
     assert_eq!(twice[0].id, loaded[0].id);
     assert_eq!(b.db.list_images().await.unwrap().len(), 1);
 
-    // another directory is another image; a file is no root file system
+    // another directory is another image; a file that is no tar is no root
+    // file system
     std::fs::write(at("etc/hello"), b"hello!\n").unwrap();
     let other = pull_from(&b.service, "rootfs:/x", open(root.path()))
         .await
@@ -1094,6 +1095,34 @@ async fn test_saving_an_unknown_image_or_an_incomplete_store_fails() {
 
 fn rootfs_tar() -> Vec<u8> {
     tar_of(&items())
+}
+
+/// A tar, plain or compressed, is a root file system too: the image of
+/// `rootfs:` of the file is of one layer whose diff id is the digest of the
+/// tar, and the same image whenever it is pulled.
+#[tokio::test]
+async fn test_a_root_file_system_tar_is_an_image_of_one_layer() {
+    let tar = rootfs_tar();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&tar).unwrap();
+    let gz = gz.finish().unwrap();
+    let a = side().await;
+    let mut ids = Vec::new();
+    for bytes in [&tar, &gz] {
+        let loaded = pull_from(&a.service, "rootfs:/x", spooled(bytes))
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        let image = a.service.get(&loaded[0].id).await.unwrap();
+        let config: serde_json::Value = serde_json::from_str(&image.config).unwrap();
+        assert_eq!(config["rootfs"]["diff_ids"], serde_json::json!([sha(&tar)]));
+        let manifest: velarx_types::OciManifest = serde_json::from_str(&image.manifest).unwrap();
+        assert_eq!(manifest.layers[0].digest, sha(bytes));
+        assert!(a.store.contains(&vid(b"hello\n")));
+        ids.push(loaded[0].id.clone());
+    }
+    // (another blob of the same layer is another image)
+    assert_ne!(ids[0], ids[1]);
 }
 
 #[tokio::test]

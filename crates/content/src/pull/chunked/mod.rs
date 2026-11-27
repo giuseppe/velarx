@@ -37,7 +37,6 @@ use tracing::debug;
 use velarx_chunk_core::{check, comp_range, Caps, Chunk, File as CoreFile, Refusal, Totals};
 use velarx_db::ChunkLocation as ChunkLocationRecord;
 use velarx_proto::transfer::FailureClass;
-use velarx_registry::target::Target;
 use velarx_storage::{canonical, table, Toc, TocEntry, TocEntryType, TOC_VERSION};
 use velarx_types::digest::{Algorithm, Digest, DigestWriter, Offloaded};
 use velarx_types::{ImageError, ImageResult, LayerKey, OciDescriptor};
@@ -213,7 +212,7 @@ pub(super) async fn metadata(
     staged
         .probe(layer, false, parts)
         .await?
-        .ok_or_else(|| fail("no fetcher gave its table of contents"))
+        .ok_or_else(|| no_table_given(layer))
 }
 
 /// The verified table of contents and tar-split of a layer pulled by ranges
@@ -1753,20 +1752,18 @@ fn replay_of(
 /// the ranges: the files are still those of the table.)
 pub async fn pull(
     ctx: &PullCtx,
-    target: &Target,
     layer: &OciDescriptor,
     info: &Info,
     expected_diff_id: &Digest,
     progress: impl Fn(u64) + Send + Sync + 'static,
 ) -> ImageResult<Pulled> {
-    pull_by_table(ctx, target, layer, info, expected_diff_id, progress)
+    pull_by_table(ctx, layer, info, expected_diff_id, progress)
         .await
         .map_err(|e| naming(&layer.digest, e))
 }
 
 async fn pull_by_table(
     ctx: &PullCtx,
-    target: &Target,
     layer: &OciDescriptor,
     info: &Info,
     expected_diff_id: &Digest,
@@ -1797,16 +1794,7 @@ async fn pull_by_table(
         layer.digest,
         started.elapsed()
     );
-    complete_layer(
-        ctx,
-        Some(target),
-        layer,
-        meta,
-        metadata_bytes,
-        expected_diff_id,
-        progress,
-    )
-    .await
+    complete_layer(ctx, layer, meta, metadata_bytes, expected_diff_id, progress).await
 }
 
 /// Fetch what the store lacks of a layer whose metadata is known and check
@@ -1814,7 +1802,6 @@ async fn pull_by_table(
 /// what ends a lazy pull too: the files fetched on demand are in the store.
 pub async fn complete_layer(
     ctx: &PullCtx,
-    target: Option<&Target>,
     layer: &OciDescriptor,
     meta: Metadata,
     metadata_bytes: u64,
@@ -1832,7 +1819,7 @@ pub async fn complete_layer(
     let mut ctx = std::borrow::Cow::Borrowed(ctx);
     let mut sourced = super::staged_fetch::Walked::default();
     let mut staged_files = (0u64, 0u64);
-    if let (Some(staged), Some(_), true) = (&ctx.staged, target, staged_sink) {
+    if let (Some(staged), true) = (&ctx.staged, staged_sink) {
         // (an eager pull holds the lease of the layer since before its plan of
         // what the store has, so that another engine that pulled it is
         // waited for; a lazy pull holds none: the staging it keeps is the
@@ -1923,7 +1910,7 @@ pub async fn complete_layer(
     )
     .await;
     // (the layer's staging goes with this call: its fetchers forget it)
-    if let (Some(staged), Some(_), true) = (&ctx.staged, target, staged_sink) {
+    if let (Some(staged), true) = (&ctx.staged, staged_sink) {
         staged.forget(&layer.digest.to_string()).await;
     }
     let mut pulled = verified?;
@@ -2090,12 +2077,18 @@ pub struct Whole {
 /// may describe another filesystem than the table the manifest vouches for.
 pub fn no_table(layer: &OciDescriptor) -> ImageResult<()> {
     match parse_info(layer)? {
-        Some(_) => Err(ImageError::Contradicted(format!(
-            "layer {}: it is zstd:chunked, which is pulled by its table of contents or not at all, and the source gives none",
-            layer.digest
-        ))),
+        Some(_) => Err(no_table_given(layer)),
         None => Ok(()),
     }
+}
+
+/// The refusal of `layer`, which has a table of contents, when the source
+/// gives none.
+fn no_table_given(layer: &OciDescriptor) -> ImageError {
+    ImageError::Contradicted(format!(
+        "layer {}: it is zstd:chunked, which is pulled by its table of contents or not at all, and the source gives none",
+        layer.digest
+    ))
 }
 
 /// Pull `layer`, which has no table of contents, from the origin and

@@ -15,8 +15,9 @@ mod chunked {
     conformance_suite!(factory(true));
 }
 
-/// The layers come as archives read whole: the engine makes their tables of
-/// contents and gives the service the files it lacks from a spool.
+/// The layers come as tars of a registry that its fetcher unpacks whole: the
+/// engine makes their tables of contents and gives the service the files it
+/// lacks from the staging of the fetcher.
 mod whole {
     use super::*;
     conformance_suite!(factory(false));

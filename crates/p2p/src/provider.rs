@@ -2398,6 +2398,14 @@ mod tests {
             .collect()
     }
 
+    /// The peers serve manifests, blobs, profiles and signatures: they say so.
+    #[test]
+    fn the_peers_announce_the_metadata_they_serve() {
+        use velarx_content::serve_fetch::StagingFetcher;
+        let s = source(&Arc::new(Fake::default()), None);
+        assert!(s.described().capabilities.contains(&"metadata".to_string()));
+    }
+
     fn source(fake: &Arc<Fake>, hedge_ms: Option<u64>) -> PeerSource {
         PeerSource::with_peers(Arc::new(fake.clone())).with_policy(Policy {
             hedge: hedge_ms.is_some(),

@@ -1358,7 +1358,7 @@ pub fn fetcher_spawner_with(
 ) {
     let registries = dir.join("registries.conf");
     std::fs::write(&registries, conf).unwrap();
-    let json = serde_json::to_vec(config).unwrap();
+    let json = serde_json::to_vec(&velarx_content::list::RegistrySettings::of(config)).unwrap();
     let incoming = dir.join("incoming");
     velarx_base::ipc::ensure_private_dir(&incoming).unwrap();
     let config = velarx_content::pull::unnamed::read_only_unnamed(&incoming, &json).unwrap();

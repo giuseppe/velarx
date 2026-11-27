@@ -20,14 +20,13 @@
 pub mod guard;
 
 use crate::pull::tar::{Kind, TarReader};
-use bytes::Bytes;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use velarx_types::digest::{Algorithm, Digest, DigestWriter};
 
 /// Members of an archive accepted.
@@ -118,6 +117,8 @@ enum Backing {
     /// A directory (an OCI layout, a `dir:`): a member is the file of its
     /// name, opened beneath the directory
     Tree(File),
+    /// Blobs that are parts of files, each member with its file ([`Archive::blobs`])
+    Blobs(HashMap<String, Arc<File>>),
 }
 
 /// The content of one member, read at positions of it.
@@ -371,6 +372,11 @@ impl Archive {
                 offset: f.offset,
                 size: f.size,
             }),
+            Backing::Blobs(files) => Ok(Section {
+                file: files[f.name].clone(),
+                offset: f.offset,
+                size: f.size,
+            }),
             Backing::Tree(dir) => {
                 use rustix::fs::{Mode, OFlags, ResolveFlags};
                 let fd = velarx_sys::fs::openat2_retry(
@@ -397,30 +403,27 @@ impl Archive {
         }
     }
 
-    /// An archive of one file: the blob `digest` is the content of `file`.
-    pub fn single(file: File, digest: Digest, size: u64) -> Self {
-        Self::blobs(file, &[(digest, 0, size)])
-    }
-
-    /// An archive of blobs that are parts of `file`, each with its digest,
-    /// where it starts and its size.
-    pub fn blobs(file: File, blobs: &[(Digest, u64, u64)]) -> Self {
-        Self {
-            backing: Backing::Tar(Arc::new(file)),
-            members: blobs
-                .iter()
-                .map(|&(digest, offset, size)| {
-                    (
-                        format!("blobs/{}/{}", digest.alg(), digest.hex()),
-                        Member::Regular {
-                            offset,
-                            size,
-                            digest: Some(digest),
-                        },
-                    )
-                })
-                .collect(),
+    /// An archive of blobs that are parts of files, each with its file, its
+    /// digest, where it starts and its size.
+    pub fn blobs(blobs: &[(&File, Digest, u64, u64)]) -> io::Result<Self> {
+        let mut members = Vec::new();
+        let mut files = HashMap::new();
+        for &(file, digest, offset, size) in blobs {
+            let name = format!("blobs/{}/{}", digest.alg(), digest.hex());
+            files.insert(name.clone(), Arc::new(file.try_clone()?));
+            members.push((
+                name,
+                Member::Regular {
+                    offset,
+                    size,
+                    digest: Some(digest),
+                },
+            ));
         }
+        Ok(Self {
+            backing: Backing::Blobs(files),
+            members,
+        })
     }
 
     fn index(&mut self) -> io::Result<()> {
@@ -563,36 +566,6 @@ impl Archive {
             .find_blob(wanted)
             .ok_or_else(|| not_found(format!("the blob {wanted} is not in the archive")))?;
         Ok(self.section(&f)?.reader())
-    }
-
-    /// The content of a blob as a stream of pieces.
-    pub fn blob_stream(
-        &self,
-        wanted: &Digest,
-    ) -> io::Result<impl futures::Stream<Item = velarx_types::ImageResult<Bytes>>> {
-        let f = self
-            .find_blob(wanted)
-            .ok_or_else(|| not_found(format!("the blob {wanted} is not in the archive")))?;
-        let section = self.section(&f)?;
-        let size = section.size();
-        let (tx, rx) = mpsc::channel(2);
-        tokio::task::spawn_blocking(move || {
-            let mut done = 0u64;
-            while done < size {
-                let want = (size - done).min(IO_SIZE as u64) as usize;
-                let mut buf = vec![0u8; want];
-                let piece = section
-                    .read_exact_at(&mut buf, done)
-                    .map(|_| Bytes::from(buf))
-                    .map_err(velarx_types::ImageError::Io);
-                let failed = piece.is_err();
-                if tx.blocking_send(piece).is_err() || failed {
-                    return;
-                }
-                done += want as u64;
-            }
-        });
-        Ok(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
 
     /// The images of the archive.

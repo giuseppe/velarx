@@ -1880,9 +1880,12 @@ mod tests {
                     vec![Link {
                         name: "first".into(),
                         conn: FetchConn::new(first.connect().unwrap()).unwrap(),
-                        idle: velarx_content::pull::staged_fetch::REGISTRY_IDLE,
+                        idle: std::time::Duration::from_secs(120),
                     }],
-                    Some(FetchConn::new(end.connect().unwrap()).unwrap()),
+                    Some((
+                        FetchConn::new(end.connect().unwrap()).unwrap(),
+                        std::time::Duration::from_secs(120),
+                    )),
                     Vec::new(),
                 ),
                 &service.staging_dir,
@@ -1996,7 +1999,10 @@ mod tests {
         let walker = StagedFetch::open(
             (
                 Vec::new(),
-                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Some((
+                    FetchConn::new(registry.connect().unwrap()).unwrap(),
+                    std::time::Duration::from_secs(120),
+                )),
                 Vec::new(),
             ),
             &service.staging_dir,

@@ -6,9 +6,10 @@
 //! worker it starts) is `velarx_registry_lib::confine`; the directory fetcher
 //! uses this module only and links no registry or HTTP code.
 //!
-//! The front never parses what the registries send (the frames of the
-//! workers are bounds-checked), but it is the process to protect, so before
-//! it serves anything it gives up what it does not need:
+//! The workers download and inflate what the registries send; the front
+//! reads the frames of the workers (bounds-checked) and parses the tar stream
+//! of a layer.  It is the process to protect, so before it serves anything
+//! it gives up what it does not need:
 //!
 //! * Landlock: it reads the libraries, `/proc`, the registries configuration,
 //!   the certificates and the auth files, executes nothing, writes no file

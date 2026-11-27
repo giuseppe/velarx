@@ -128,6 +128,10 @@ The pulls: what is shared with the peers, the layers fetched at the same
 time, the memory and the cgroups of the workers, the limits that stop a
 runaway layer or archive
 .RB ( max_layer_gib ", " max_inflate_ratio ", " min_speed_kib ),
+how long a built\-in fetcher (the registry's, the directory's) may be silent
+in a call before the call fails
+.RB ( idle_timeout_secs ,
+default 120, not 0),
 the signature policy, the lazily pulled images and the background process that
 completes their pull
 .RB ( lazy_complete_fetches ", " lazy_completers ", " lazy_retry_max_secs ),
@@ -221,6 +225,9 @@ it pulls an OCI image layout published as static files, with
 .BR "velarx pull oci+https://HOST/PATH:TAG" .
 It sends no credentials, asks for no ranges (its layers are pulled
 whole) and does not confine itself.
+A pull from a transport is always whole, never lazy: a lazy image has to
+open its origin again when a file is first read, and no transport asks for
+ranges of a layer.
 .TP
 .B build
 The builds: what an extraction may write, the builds that run or wait at

@@ -68,7 +68,7 @@ impl Drop for Served {
 
 /// The factory of subjects whose driver is `wrap` of a client of a server of
 /// their own; `chunked_only`: the layers come as zstd:chunked blobs of a
-/// registry, else as archives read whole.
+/// registry, else as tars of a registry read whole.
 pub fn factory(chunked_only: bool, wrap: Wrap) -> Factory {
     Box::new(move |dir| {
         Box::pin(async move {

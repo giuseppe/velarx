@@ -444,7 +444,7 @@ async fn pull_origin_of(
         None => {
             if let Origin::Path { path, scheme, .. } = origin {
                 if scheme.is_path() {
-                    local_path(path, scheme.is_directory())?;
+                    local_path(path, (!scheme.is_either()).then_some(scheme.is_directory()))?;
                 }
             }
             None
@@ -469,7 +469,7 @@ async fn pull_origin_of(
 
 /// The path of a pull the engine opens itself (podman's local routes): an
 /// absolute one, with no `..`, that exists.
-fn local_path(path: &std::path::Path, directory: bool) -> ApiResult<()> {
+fn local_path(path: &std::path::Path, directory: Option<bool>) -> ApiResult<()> {
     if path.as_os_str().is_empty() {
         return Err(ApiError::bad_request("path query parameter is required"));
     }
@@ -484,11 +484,15 @@ fn local_path(path: &std::path::Path, directory: bool) -> ApiResult<()> {
         )));
     }
     match std::fs::metadata(path) {
-        Ok(m) if m.is_dir() == directory => Ok(()),
+        Ok(m) if directory.is_none_or(|d| m.is_dir() == d) => Ok(()),
         Ok(_) => Err(ApiError::bad_request(format!(
             "{:?} is not a {}",
             path.display().to_string(),
-            if directory { "directory" } else { "file" }
+            if directory == Some(true) {
+                "directory"
+            } else {
+                "file"
+            }
         ))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ApiError::not_found(format!(
             "file does not exist: {:?}",

@@ -967,6 +967,64 @@ fn a_file_that_is_not_what_a_claim_says_fails_the_replay() {
     }
 }
 
+/// The digests of a layer unpacked are checked with the algorithm of each: the
+/// files with that of the layer, the stream with that of the diff id, any
+/// pair, and the digest of another algorithm for the same bytes is no pass.
+#[test]
+fn the_replay_hashes_with_the_algorithms_of_its_digests() {
+    use crate::pull::tarsplit::{decoder, Recorder, MAX_SIZE};
+    use std::io::Cursor;
+
+    struct Claimed(Option<Opened>, String);
+    impl Opens for Claimed {
+        fn opened(&mut self) -> &mut Option<Opened> {
+            &mut self.0
+        }
+    }
+    impl Contents for Claimed {
+        fn open(&mut self, name: &str, size: u64) -> io::Result<Box<dyn Read + Send>> {
+            self.0 = Some(Opened {
+                name: name.into(),
+                size,
+                digest: self.1.clone(),
+                copy: None,
+                verified: false,
+            });
+            Ok(Box::new(Cursor::new(b"data".to_vec())))
+        }
+    }
+
+    let mut b = tar::Builder::new(Vec::new());
+    let mut h = tar::Header::new_gnu();
+    h.set_size(4);
+    h.set_mode(0o644);
+    b.append_data(&mut h, "f", &b"data"[..]).unwrap();
+    let stream = b.into_inner().unwrap();
+    let mut r = TarReader::with_sink(Cursor::new(stream.clone()), Recorder::new().unwrap());
+    while r.next_entry().unwrap().is_some() {}
+    let (_, recorder) = r.finish().unwrap();
+    let tarsplit = recorder.finish().unwrap().compressed;
+    let other = |alg| match alg {
+        Algorithm::Sha256 => Algorithm::Sha512,
+        Algorithm::Sha512 => Algorithm::Sha256,
+    };
+    for alg in [Algorithm::Sha256, Algorithm::Sha512] {
+        for diff in [Algorithm::Sha256, Algorithm::Sha512] {
+            let replay = |claim: String| {
+                let input = decoder(tarsplit.clone(), MAX_SIZE).unwrap();
+                replay_of(input, Claimed(None, claim), alg, diff)
+            };
+            let right = Digest::of(alg, b"data").to_string();
+            let replayed = replay(right.clone()).unwrap();
+            assert_eq!(replayed.diff_id, Digest::of(diff, &stream), "{alg} {diff}");
+            assert_eq!(replayed.entries[0].digest.as_deref(), Some(right.as_str()));
+            // the bytes under the other algorithm are not the claim
+            let across = Digest::of(other(alg), b"data").to_string();
+            assert!(replay(across).is_err(), "{alg} {diff}");
+        }
+    }
+}
+
 /// A file is known by the digest of its content, never by an object: a key
 /// that is an fs-verity digest fails the replay, of a copy the origin handed
 /// over (which the replay does not hash) too.
@@ -1913,7 +1971,7 @@ fn a_full_disk_is_no_fault_of_the_index() {
 
 /// A layer of a root, a directory, two files and a hard link written with
 /// `alg` (a canonical tar or one with a tar-split), and its descriptor.
-fn written(alg: Algorithm, canonical: bool) -> (Vec<u8>, OciDescriptor) {
+pub(super) fn written(alg: Algorithm, canonical: bool) -> (Vec<u8>, OciDescriptor) {
     use crate::layer::writer::{write_canonical_layer, write_layer, Compression};
     let mut entries = vec![
         canonical_entry("./", TocEntryType::Dir, 0),
@@ -1948,7 +2006,7 @@ fn written(alg: Algorithm, canonical: bool) -> (Vec<u8>, OciDescriptor) {
 
 /// The metadata of `desc` as a pull verifies it, from the ranges of
 /// `blob` its annotations name.
-fn pulled(blob: &[u8], desc: &OciDescriptor, lazy: bool) -> ImageResult<Metadata> {
+pub(super) fn pulled(blob: &[u8], desc: &OciDescriptor, lazy: bool) -> ImageResult<Metadata> {
     let info = parse_info(desc)?.unwrap();
     let range = |(off, len, _): (u64, u64, u64)| blob[off as usize..(off + len) as usize].to_vec();
     let ts = info.tarsplit.map(range).unwrap_or_default();
@@ -1966,7 +2024,7 @@ fn pulled(blob: &[u8], desc: &OciDescriptor, lazy: bool) -> ImageResult<Metadata
 
 /// A descriptor without the annotations of the binary table: what a reader
 /// that does not know it sees.
-fn without_table(desc: &OciDescriptor) -> OciDescriptor {
+pub(super) fn without_table(desc: &OciDescriptor) -> OciDescriptor {
     let mut old = desc.clone();
     old.annotations.retain(|k, _| !k.contains("table-"));
     old

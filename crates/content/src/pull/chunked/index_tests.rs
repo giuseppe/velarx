@@ -7,8 +7,8 @@ use crate::activation::Limits;
 use crate::fetcher::fetch::{Blob, EventKind, FetchEvent as Event, FetcherError, NotLazy};
 use crate::fetcher::fetch::{Parts, Probed, TocSource};
 use crate::fetcher::fetch_client::FetchConn;
-use crate::pull::staged_fetch::{Link, StagedFetch, REGISTRY_IDLE};
-use crate::pull::{Limits as PullLimits, PullCtx, Source};
+use crate::pull::staged_fetch::{Link, StagedFetch, TEST_IDLE};
+use crate::pull::{Limits as PullLimits, PullCtx};
 use crate::serve_fetch::{
     Described, FetchCall, LayerScope, LocalFetcher, Out, Scope, StagingFetcher, UnpackCall,
 };
@@ -228,7 +228,7 @@ impl StagingFetcher for Origin {
     fn described(&self) -> Described {
         Described {
             name: "registry".into(),
-            capabilities: vec!["objects".into(), "metadata".into(), "unpack".into()],
+            capabilities: vec!["objects".into(), "metadata".into()],
             max_objects: 8,
         }
     }
@@ -312,7 +312,7 @@ async fn rig_with(
     let links = vec![Link {
         name: "peers".into(),
         conn: FetchConn::new(peer_fetcher.connect().unwrap()).unwrap(),
-        idle: REGISTRY_IDLE,
+        idle: TEST_IDLE,
     }];
     let manifest = format!(
         r#"{{"schemaVersion":2,"config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{}","size":2}},"layers":[{}]}}"#,
@@ -323,7 +323,10 @@ async fn rig_with(
     let staged = StagedFetch::open(
         (
             links,
-            Some(FetchConn::new(origin_fetcher.connect().unwrap()).unwrap()),
+            Some((
+                FetchConn::new(origin_fetcher.connect().unwrap()).unwrap(),
+                TEST_IDLE,
+            )),
             Vec::new(),
         ),
         &staging_root,
@@ -362,14 +365,7 @@ fn made_again(layer: &Made) -> Made {
 
 impl Rig {
     async fn pull(&self, layer: &Made) -> ImageResult<crate::pull::LayerDone> {
-        crate::pull::pull_layer(
-            &self.ctx,
-            &Source::Path,
-            &layer.desc,
-            &layer.diff,
-            Arc::new(|_| {}),
-        )
-        .await
+        crate::pull::pull_layer(&self.ctx, &layer.desc, &layer.diff, Arc::new(|_| {})).await
     }
 
     fn session(&self) -> Arc<crate::pull::session::Session> {
@@ -742,4 +738,39 @@ fn the_pieces_of_a_table_without_a_blob_are_given_to_the_fetchers() {
         [(0, 4 << 20), (4 << 20, 4 << 20), (8 << 20, 2 << 20)]
     );
     assert!(file_chunks(&toc, Algorithm::Sha256, 0, Some(1 << 30), 16 << 20).is_err());
+}
+
+/// A layer with a table of contents is pulled by it from whatever origin
+/// the fetchers reach, when they carry the table and the files: its source
+/// is not a registry.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_layer_with_a_table_is_pulled_by_it_from_any_origin() {
+    use super::tests::{pulled, without_table, written};
+    let (blob, desc) = written(Algorithm::Sha256, false);
+    // (a table in JSON: the fetchers of the rig read no other)
+    let desc = without_table(&desc);
+    let info = parse_info(&desc).unwrap().unwrap();
+    let range = |(off, len, _): (u64, u64, u64)| blob[off as usize..(off + len) as usize].to_vec();
+    let tarsplit = info.tarsplit.map(range).unwrap_or_default();
+    let index = crate::pull::index::encode_compressed(&range(info.toc), &tarsplit).unwrap();
+    let bodies = pulled(&blob, &desc, false)
+        .unwrap()
+        .toc
+        .entries
+        .iter()
+        .filter(|e| e.entry_type == TocEntryType::Reg)
+        .map(|e| {
+            let data: Vec<u8> = (0..e.size).map(|i| (i * 7 % 251) as u8).collect();
+            (verity(&data), data)
+        })
+        .collect();
+    let layer = Made {
+        desc,
+        ..made(&files())
+    };
+    let rig = rig(&layer, Some(index), bodies).await;
+    let done = rig.pull(&layer).await.unwrap();
+    assert_eq!(done.key, velarx_types::LayerKey::Toc(info.checksum));
+    assert_eq!(rig.origin.unpacked.load(Ordering::SeqCst), 0);
+    assert_eq!(done.report.fetched_files, 2);
 }

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use velarx_content::pull::holds::{self, Hold};
 use velarx_content::pull::net::Net;
-use velarx_content::pull::{self, layer_commit, LayerDone, Limits, Source};
+use velarx_content::pull::{self, layer_commit, LayerDone, Limits};
 use velarx_db::{BlobSource, ImageRecord, ImageTag, LayerKey, LayerReach, PullCommit};
 use velarx_graph::feed::{
     CheckId, Checked, ContentFeed, FeedLayer, Identities, Incoming as DriverIncoming, LayerIndex,
@@ -228,8 +228,6 @@ pub(super) struct Incoming {
     pub manifest_digest: Digest,
     pub config: OciConfig,
     pub config_bytes: Bytes,
-    /// Where the blobs come from; none: the layers were made here
-    pub source: Option<Source>,
     /// The origin that unpacks the layers of a pull of a path or a
     /// transport
     pub via: Option<super::pull_origin::Via>,
@@ -677,13 +675,17 @@ impl ImageService {
         // (the registry fetcher process, when `registry` is one of the
         // sources: nothing of a pull is fetched by this one)
         let end = match rest {
-            Some(_) => Some(self.origin()?.connect().await.map_err(|e| {
-                ImageError::transfer(
-                    "registry",
-                    velarx_proto::transfer::FailureClass::Transient,
-                    e.to_string(),
-                )
-            })?),
+            Some(_) => {
+                let origin = self.origin()?;
+                let conn = origin.connect().await.map_err(|e| {
+                    ImageError::transfer(
+                        "registry",
+                        velarx_proto::transfer::FailureClass::Transient,
+                        e.to_string(),
+                    )
+                })?;
+                Some((conn, origin.idle()))
+            }
             None => None,
         };
         let after = self.source_links(rest.unwrap_or_default()).await;
@@ -1171,7 +1173,6 @@ impl ImageService {
             digest: pinned.or(image_ref.digest),
             ..image_ref.clone()
         };
-        let target = client.target(&image_ref)?;
         let access = client.request_access().cloned().unwrap_or_default();
         let mut net = self.inspect_net(&image_ref, reach.tls_verify, &access)?;
         // (the sources are asked in their order; a digest vouches for the
@@ -1299,7 +1300,6 @@ impl ImageService {
             manifest_digest,
             config,
             config_bytes,
-            source: Some(Source::Registry(Box::new(target))),
             via: None,
             made: Vec::new(),
             registry_ref: Some(image_ref.full_name()),
@@ -1350,7 +1350,6 @@ impl ImageService {
             mut manifest_digest,
             config,
             config_bytes,
-            source,
             via,
             made,
             registry_ref,
@@ -1508,12 +1507,12 @@ impl ImageService {
         // The tables of contents of the layers of a pull from a registry
         // (`Probe`), the files of those of an eager pull, and the layers
         // without one (unpacked whole) come from the fetchers.
-        let staged = match (&source, &registry_ref, &via) {
-            (Some(Source::Path), _, Some(via)) => Some(
+        let staged = match (&registry_ref, &via) {
+            (_, Some(via)) => Some(
                 self.staged_origin(via, sources.as_deref(), &manifest_bytes)
                     .await?,
             ),
-            (Some(Source::Registry(_)), Some(repository), _) => Some(
+            (Some(repository), _) => Some(
                 self.staged_fetch(
                     (repository, sources.as_deref()),
                     reach.tls_verify,
@@ -1576,8 +1575,10 @@ impl ImageService {
             found: lazy_found,
             made: made_early,
         } = accepted;
-        let mut content = match source {
-            Some(source) => ContentFeed::new(net, source, self.db.clone(), limits),
+        // (the layers of a pull come from its fetchers, the ones a build made
+        // are given)
+        let content = match staged {
+            Some(staged) => ContentFeed::new(net, self.db.clone(), limits).with_staged(staged),
             None => ContentFeed::made(self.db.clone(), limits, &made),
         }
         .with_lazy_found(lazy_found)
@@ -1603,9 +1604,6 @@ impl ImageService {
                 })
             },
         );
-        if let Some(staged) = staged {
-            content = content.with_staged(staged);
-        }
         let feed = Arc::new(EngineFeed {
             inner: content,
             staging_dir: self.staging_dir.clone(),

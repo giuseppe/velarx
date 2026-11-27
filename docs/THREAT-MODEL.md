@@ -63,8 +63,10 @@ lengths before allocating and verifies every digest.
 ## Adversaries
 
 * **A malicious image** controls the layers, the configuration and the
-  annotations. Layers are parsed in a confined pull worker (Landlock and
-  seccomp, no access to the store), not in the engine: names, extension
+  annotations. A confined pull worker (Landlock and seccomp, no access to
+  the store) downloads and inflates the layers; the tar stream is parsed
+  by the front of the fetcher, which is confined too and writes only in the
+  staging it was handed, not by the engine: names, extension
   headers, extended attributes and entry counts are bounded; `..`, NUL and
   sparse files are refused; the attributes of the overlay file system
   (`overlay.*` in any namespace) and values over 64 KiB are dropped, and

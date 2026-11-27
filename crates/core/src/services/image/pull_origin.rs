@@ -14,7 +14,6 @@ use super::*;
 use velarx_content::origin::{transport_of, Origin};
 use velarx_content::pull::net::origin::{OriginNet, PathOrigin};
 use velarx_content::pull::net::Net;
-use velarx_content::pull::Source;
 
 /// The most descriptors an origin's index may have.
 const MAX_INDEX: usize = 4096;
@@ -49,7 +48,7 @@ impl Via {
 
 /// The images of an origin's index, by the digest of their manifests, each
 /// with its names.
-fn images_of(index: &[u8]) -> ImageResult<Vec<(Digest, Vec<String>)>> {
+pub(super) fn images_of(index: &[u8]) -> ImageResult<Vec<(Digest, Vec<String>)>> {
     let value: serde_json::Value = serde_json::from_slice(index)
         .map_err(|e| ImageError::Manifest(format!("the index of the origin: {e}")))?;
     let manifests = value
@@ -124,7 +123,10 @@ impl ImageService {
         let before = self.source_links(&names).await;
         let verity = self.staging_verity();
         let (end, name) = match via {
-            Via::Path(path) => (path.connect().await?, via.party().to_string()),
+            Via::Path(path) => (
+                (path.connect().await?, self.origin()?.idle()),
+                via.party().to_string(),
+            ),
             Via::Transport {
                 reach,
                 location,
@@ -156,7 +158,7 @@ impl ImageService {
                 })
                 .await
                 .map_err(|e| image_error_of(scheme, e))?;
-                (conn, scheme.clone())
+                ((conn, *idle), scheme.clone())
             }
         };
         StagedFetch::open_scoped(before, end, &name, &self.staging_dir, verity, manifest).await
@@ -335,7 +337,6 @@ impl ImageService {
                         manifest_digest,
                         config,
                         config_bytes,
-                        source: Some(Source::Path),
                         via: Some(via.clone()),
                         made: Vec::new(),
                         registry_ref: None,

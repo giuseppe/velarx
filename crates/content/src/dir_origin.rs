@@ -13,7 +13,8 @@
 //!
 //! * `GetManifest("")`: the index of the images the selector of the source
 //!   (`Open(source)`: the scheme and the selector, `oci-archive:NAME`, never
-//!   the path) takes, as an OCI index; each name an image has in the archive
+//!   the path) takes, as an OCI index (`rootfs:` has the algorithm of the
+//!   digests of its image for selector: `rootfs:sha512`); each name an image has in the archive
 //!   is the annotation `org.opencontainers.image.ref.name` of a descriptor
 //!   (a docker-archive's manifests are made of its `manifest.json`);
 //! * `GetManifest(digest)` and `GetBlob`;
@@ -36,7 +37,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
-use velarx_types::digest::{Digest, DigestWriter};
+use velarx_types::digest::{Algorithm, Digest, DigestWriter};
 use velarx_types::ImageReference;
 
 const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
@@ -258,19 +259,14 @@ impl DirOrigin {
                     .try_clone()
                     .map_err(|e| FetcherError::failed(e.to_string()))?;
                 let (staging, s) = (self.staging.clone(), &self.settings);
-                let (ratio, floor, max) = (
-                    s.max_inflate_ratio.max(1),
-                    s.inflate_floor_mib * 1024 * 1024,
-                    s.max_archive_gib.max(1) * 1024 * 1024 * 1024,
-                );
+                let caps = Caps {
+                    ratio: s.max_inflate_ratio.max(1),
+                    floor: s.inflate_floor_mib * 1024 * 1024,
+                    archive: s.max_archive_gib.max(1) * 1024 * 1024 * 1024,
+                    layer: s.max_file_bytes,
+                };
                 tokio::task::spawn_blocking(move || {
-                    read_origin(
-                        scheme,
-                        selector.as_deref(),
-                        target,
-                        &staging,
-                        (ratio, floor, max),
-                    )
+                    read_origin(scheme, selector.as_deref(), target, &staging, caps)
                 })
                 .await
                 .map_err(|e| FetcherError::failed(e.to_string()))?
@@ -281,6 +277,19 @@ impl DirOrigin {
     }
 }
 
+/// What an origin may read of what it was handed (`[pull]`).
+#[derive(Clone, Copy)]
+struct Caps {
+    /// What a compressed one inflates to at most: this many times its size,
+    /// or the floor if that is less
+    ratio: u64,
+    floor: u64,
+    /// The most an archive may inflate to
+    archive: u64,
+    /// The most a layer may be, a file of it too
+    layer: u64,
+}
+
 /// Read the origin: the archive, and the index of the images the selector
 /// takes.
 fn read_origin(
@@ -288,7 +297,12 @@ fn read_origin(
     selector: Option<&str>,
     target: File,
     staging: &File,
-    (ratio, floor, max): (u64, u64, u64),
+    Caps {
+        ratio,
+        floor,
+        archive: max,
+        layer,
+    }: Caps,
 ) -> Result<Read_, FetcherError> {
     let target = if scheme == PathScheme::DockerDaemon {
         // (the archive the daemon saves is spooled, a tar to index as any)
@@ -302,8 +316,12 @@ fn read_origin(
     let meta = target
         .metadata()
         .map_err(|e| FetcherError::failed(e.to_string()))?;
-    // (`archive:` is either kind: a load of a layout directory or of a tar)
-    if scheme != PathScheme::Archive && meta.is_dir() != scheme.is_directory() {
+    // (`archive:` and `rootfs:` are of either kind: a load of a layout
+    // directory or of a tar, a directory or a tar that is the layer)
+    if scheme != PathScheme::Archive
+        && !scheme.is_either()
+        && meta.is_dir() != scheme.is_directory()
+    {
         return Err(FetcherError::InvalidArgument {
             reason: format!(
                 "the origin of {}: is {}",
@@ -317,7 +335,21 @@ fn read_origin(
         });
     }
     let (archive, images) = if scheme == PathScheme::Rootfs {
-        let (archive, image) = crate::rootfs::image(&target, staging).map_err(read_error)?;
+        // (the selector of `rootfs:` is the algorithm of the digests)
+        let alg = selector
+            .unwrap_or("sha256")
+            .parse::<Algorithm>()
+            .map_err(|_| FetcherError::InvalidArgument {
+                reason: format!(
+                    "rootfs:{}: the selector is the algorithm, sha256 or sha512",
+                    selector.unwrap_or_default()
+                ),
+            })?;
+        let inflate = |size: u64| {
+            crate::pull::inflate_limit(i64::try_from(size).unwrap_or(i64::MAX), ratio, floor, layer)
+        };
+        let (archive, image) =
+            crate::rootfs::image(&target, staging, alg, inflate, layer).map_err(read_error)?;
         (archive, vec![image])
     } else {
         let archive = if meta.is_dir() {
@@ -425,7 +457,7 @@ impl StagingFetcher for DirOrigin {
     fn described(&self) -> Described {
         Described {
             name: "dir".into(),
-            capabilities: vec!["metadata".into(), "unpack".into(), "origin".into()],
+            capabilities: vec!["metadata".into(), "origin".into()],
             max_objects: 1,
         }
     }
@@ -881,5 +913,47 @@ mod tests {
         };
         let got = origin.get_blob(&scope, &absent, tempfile::tempfile().unwrap());
         assert_eq!(class(got.await), FailureClass::Unavailable);
+    }
+
+    /// The index of `rootfs:SELECTOR` of a directory, or the refusal.
+    async fn rootfs_index(selector: &str) -> Result<serde_json::Value, FetcherError> {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("f"), b"x").unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let origin = DirOrigin::new(
+            Box::new(|_, _| Ok(())),
+            HelperSettings::of(&velarx_config::Config::default()),
+            Arc::new(File::open(staging.path()).unwrap()),
+        );
+        let scope = Scope {
+            verity: false,
+            source: Some(format!("rootfs:{selector}")),
+            tls_verify: None,
+            target: Some(Arc::new(File::open(root.path()).unwrap())),
+            access: None,
+            idle: std::time::Duration::from_secs(30),
+            kept: Arc::default(),
+        };
+        let (index, _) = origin.get_manifest(&scope, "", MAX_METADATA).await?;
+        let mut bytes = vec![0u8; index.metadata().unwrap().len() as usize];
+        std::os::unix::fs::FileExt::read_exact_at(&index, &mut bytes, 0).unwrap();
+        Ok(serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// The selector of `rootfs:` is the algorithm of every digest of its
+    /// image (its manifest, its configuration and its layer, the layer being
+    /// the one tar): none is sha256, anything else is refused.
+    #[tokio::test]
+    async fn the_selector_of_rootfs_is_the_algorithm_of_its_digests() {
+        for (selector, alg) in [("", "sha256"), ("sha256", "sha256"), ("sha512", "sha512")] {
+            let index = rootfs_index(selector).await.unwrap();
+            let digest = index["manifests"][0]["digest"].as_str().unwrap();
+            assert!(
+                digest.starts_with(&format!("{alg}:")),
+                "{selector}: {digest}"
+            );
+        }
+        let e = rootfs_index("md5").await.unwrap_err();
+        assert!(matches!(e, FetcherError::InvalidArgument { .. }), "{e}");
     }
 }

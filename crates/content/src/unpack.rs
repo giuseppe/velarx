@@ -155,3 +155,95 @@ pub fn put_claim(staging: &File, toc: &Toc, tarsplit: &[u8]) -> Result<(), Image
         .and_then(|()| put_named(staging.as_fd(), TARSPLIT, tarsplit))
         .map_err(|e| stage_error("the index of the layer", e))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pull::testnames::{digest_names, is_digest_name, Names};
+    use tokio::sync::mpsc;
+
+    /// A tar of the files `files` (name, content).
+    fn tar_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            tar.append_data(&mut header, name, *data).unwrap();
+        }
+        tar.into_inner().unwrap()
+    }
+
+    /// Unpack `tar` into `staging`: the claim, and the number of files handed
+    /// over.
+    async fn unpacked(tar: Vec<u8>, staging: &std::path::Path) -> Result<(Toc, usize), ImageError> {
+        let (tx, mut rx) = mpsc::channel(64);
+        let staging = File::open(staging).unwrap();
+        let work = tokio::task::spawn_blocking(move || {
+            let mut files = Files::new(Out::new(tx));
+            unpack_tar(&tar[..], &staging, (Algorithm::Sha256, false), &mut files)
+        });
+        let mut handed = 0;
+        while let Some((_, fds)) = rx.recv().await {
+            handed += fds.len();
+        }
+        work.await.unwrap().map(|(toc, _)| (toc, handed))
+    }
+
+    /// A plain tar keeps the order of its entries and has no rule of order
+    /// (the table of a layer unpacked is the one of version 1): a file and a
+    /// path below it, in either order, is read, and it is the image of the
+    /// layer that refuses it, at the pull, naming the path.
+    #[tokio::test]
+    async fn a_path_below_a_file_of_a_tar_is_read_and_refused_by_its_image() {
+        for files in [
+            [("a", &b"x"[..]), ("a/b", &b"y"[..])],
+            [("a/b", &b"y"[..]), ("a", &b"x"[..])],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (toc, handed) = unpacked(tar_of(&files), dir.path()).await.unwrap();
+            assert_eq!((toc.entries.len(), handed), (2, 2));
+            let e = velarx_fuse::layer_erofs::layer_image(&toc.entries)
+                .err()
+                .unwrap();
+            assert!(e.contains("`a`"), "{files:?}: {e}");
+        }
+    }
+
+    /// A content that is twice in a layer is handed over once, and an empty
+    /// file is none.
+    #[tokio::test]
+    async fn a_content_is_handed_over_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: [(&str, &[u8]); 4] =
+            [("a", b"same"), ("b", b"same"), ("c", b""), ("d", b"other")];
+        let (toc, handed) = unpacked(tar_of(&files), dir.path()).await.unwrap();
+        assert_eq!((toc.entries.len(), handed), (4, 2));
+    }
+
+    /// While a layer is unpacked nothing in the staging appears under a name
+    /// made of a digest, one that stops included: a process that looks a file
+    /// up by its digest finds nothing it cannot trust; the names are given by
+    /// the engine, after the replay.
+    #[tokio::test]
+    async fn no_name_of_a_digest_appears_while_a_layer_is_unpacked() {
+        let big: Vec<u8> = (0..300 * 1024u32).map(|i| (i * 7 + 3) as u8).collect();
+        let tar = tar_of(&[("big", &big), ("small", b"a small file"), ("again", &big)]);
+        for cut in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let names = Names::watching(&[dir.path()]);
+            let tar = if cut {
+                tar[..tar.len() * 3 / 4].to_vec()
+            } else {
+                tar.clone()
+            };
+            let done = unpacked(tar, dir.path()).await;
+            assert_eq!(done.is_err(), cut);
+            let (seen, _) = names.finish();
+            let named: Vec<&String> = seen.iter().filter(|n| is_digest_name(n)).collect();
+            assert!(named.is_empty(), "named by a digest: {named:?}");
+            assert_eq!(digest_names(dir.path()), Vec::<std::path::PathBuf>::new());
+        }
+    }
+}

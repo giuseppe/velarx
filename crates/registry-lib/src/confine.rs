@@ -7,7 +7,7 @@
 //! as well.
 
 use std::path::{Path, PathBuf};
-use velarx_config::Config;
+use velarx_content::list::RegistrySettings;
 use velarx_sandbox::fetch::{runtime_files, Reach, LOADERS};
 use velarx_sys::spawner::Spawner;
 
@@ -55,7 +55,7 @@ pub fn spawner_reach(worker: &Path) -> Reach {
 /// the socket, where files may be removed (and nothing created) when this
 /// process bound the socket itself (it takes it away as it leaves).
 pub fn reach(
-    config: &Config,
+    config: &RegistrySettings,
     worker: &Path,
     services: Option<&Path>,
 ) -> Result<Reach, velarx_base::ids::IdsError> {
@@ -229,14 +229,14 @@ mod tests {
 
     #[test]
     fn the_access_follows_the_environment_and_the_configuration() {
-        let config = Config::default();
+        let config = RegistrySettings::default();
         let a = reach(&config, Path::new("/usr/bin/velarx"), None).unwrap();
         assert!(a.remove.is_empty());
         assert_eq!(
             a.state,
             vec![velarx_registry::hints::HintStore::default_dir().unwrap()]
         );
-        let mut off = Config::default();
+        let mut off = RegistrySettings::default();
         off.pull.registry_hints = false;
         assert!(reach(&off, Path::new("/x"), None).unwrap().state.is_empty());
         assert!(a.execute.contains(&PathBuf::from("/usr/bin/velarx")));

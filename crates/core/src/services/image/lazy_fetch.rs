@@ -1299,7 +1299,10 @@ mod tests {
         let walker = StagedFetch::open(
             (
                 Vec::new(),
-                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Some((
+                    FetchConn::new(registry.connect().unwrap()).unwrap(),
+                    std::time::Duration::from_secs(120),
+                )),
                 Vec::new(),
             ),
             &service.staging_dir,
@@ -1382,7 +1385,10 @@ mod tests {
         let walker = StagedFetch::open(
             (
                 Vec::new(),
-                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Some((
+                    FetchConn::new(registry.connect().unwrap()).unwrap(),
+                    std::time::Duration::from_secs(120),
+                )),
                 Vec::new(),
             ),
             &service.staging_dir,

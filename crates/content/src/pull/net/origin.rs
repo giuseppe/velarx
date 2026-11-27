@@ -22,6 +22,9 @@ use velarx_types::{ImageError, ImageResult};
 /// The party of the origin of a pull: the registry fetcher.
 const REGISTRY: &str = "registry";
 
+/// The party of the origin of a path: the directory fetcher.
+const PATH: &str = "dir";
+
 /// The process of the origin of a path (`velarx-dir --origin`) and the
 /// connection that holds its scope: the metadata comes on a connection it
 /// hands out (`Connect`), and so do the layers.
@@ -39,7 +42,7 @@ impl PathOrigin {
         target: std::os::fd::OwnedFd,
         verity: bool,
     ) -> ImageResult<Arc<Self>> {
-        let party = "dir";
+        let party = PATH;
         let mut conn = origin
             .connect_dir_origin(crate::list::Direction::Pull)
             .await
@@ -50,10 +53,7 @@ impl PathOrigin {
                     format!("the directory origin: {e}"),
                 )
             })?;
-        let info = conn
-            .get_info()
-            .await
-            .map_err(|e| image_error_of(party, e))?;
+        let info = conn.get_info().await.map_err(path_error)?;
         if !info.can("origin") {
             return Err(ImageError::transfer(
                 party,
@@ -67,11 +67,11 @@ impl PathOrigin {
             tls_verify: None,
             target: Some(target),
             access: None,
-            idle: crate::pull::staged_fetch::REGISTRY_IDLE,
+            idle: origin.idle(),
             requires: &["metadata".to_string()],
         })
         .await
-        .map_err(|e| image_error_of(party, e))?;
+        .map_err(path_error)?;
         Ok(Arc::new(Self {
             scoped: tokio::sync::Mutex::new(conn),
         }))
@@ -79,12 +79,18 @@ impl PathOrigin {
 
     /// Another connection with the scope of the origin.
     pub async fn connect(&self) -> ImageResult<FetchConn> {
-        self.scoped
-            .lock()
-            .await
-            .connect()
-            .await
-            .map_err(|e| image_error_of("dir", e))
+        self.scoped.lock().await.connect().await.map_err(path_error)
+    }
+}
+
+/// What the origin process of a path answered, as an error of the image: a
+/// Docker format it refuses by name is the image's.
+fn path_error(e: CallError) -> ImageError {
+    match e {
+        CallError::Fetcher(FetcherError::NotSupported { feature }) => {
+            ImageError::DockerFormat(feature)
+        }
+        e => image_error_of(PATH, e),
     }
 }
 
@@ -95,11 +101,6 @@ pub(super) fn image_error(e: CallError) -> ImageError {
 
 /// What the fetcher `party` answered, as an error of the image.
 pub fn image_error_of(party: &str, e: CallError) -> ImageError {
-    // (what the origin of a path refuses by name: a Docker format)
-    if let (true, CallError::Fetcher(FetcherError::NotSupported { feature })) = (party == "dir", &e)
-    {
-        return ImageError::DockerFormat(feature.clone());
-    }
     let (class, reason) = match e {
         CallError::Fetcher(FetcherError::Failed { failure })
         | CallError::Registry(RegistryError::Failed { failure }) => (failure.class, failure.reason),
@@ -227,13 +228,16 @@ impl OriginNet {
     pub(crate) fn party(&self) -> &str {
         match &self.via {
             Via::Registry(_) => REGISTRY,
-            Via::Path(_) => "dir",
+            Via::Path(_) => PATH,
             Via::Transport(..) => self.repository.split("://").next().unwrap_or("transport"),
         }
     }
 
     fn failed(&self, e: CallError) -> ImageError {
-        image_error_of(self.party(), e)
+        match &self.via {
+            Via::Path(_) => path_error(e),
+            _ => image_error_of(self.party(), e),
+        }
     }
 
     /// The scope has the credentials and certificates of `access` (a sealed
@@ -251,15 +255,18 @@ impl OriginNet {
     /// first call.
     async fn scoped<'a>(&self, slot: &'a mut Option<FetchConn>) -> ImageResult<&'a mut FetchConn> {
         if slot.is_none() {
-            let mut conn = match &self.via {
+            let (mut conn, idle) = match &self.via {
                 Via::Path(path) => {
                     *slot = Some(path.connect().await?);
                     return Ok(slot.as_mut().expect("made above"));
                 }
-                Via::Registry(origin) => origin.connect().await.map_err(|e| {
-                    ImageError::transfer(REGISTRY, FailureClass::Transient, e.to_string())
-                })?,
-                Via::Transport(reach, _) => {
+                Via::Registry(origin) => {
+                    let conn = origin.connect().await.map_err(|e| {
+                        ImageError::transfer(REGISTRY, FailureClass::Transient, e.to_string())
+                    })?;
+                    (conn, origin.idle())
+                }
+                Via::Transport(reach, idle) => {
                     let mut conn = crate::list::connect_reach(reach).await.map_err(|e| {
                         ImageError::transfer(self.party(), FailureClass::Unavailable, e.to_string())
                     })?;
@@ -272,7 +279,7 @@ impl OriginNet {
                             format!("the transport `{}` does not pull", self.party()),
                         ));
                     }
-                    conn
+                    (conn, *idle)
                 }
             };
             conn.open(Scoping {
@@ -281,10 +288,7 @@ impl OriginNet {
                 tls_verify: Some(self.tls_verify),
                 target: None,
                 access: Access::fds(self.access.as_ref()).into_iter().next(),
-                idle: match &self.via {
-                    Via::Transport(_, idle) => *idle,
-                    _ => crate::pull::staged_fetch::REGISTRY_IDLE,
-                },
+                idle,
                 requires: &["metadata".to_string()],
             })
             .await
@@ -734,7 +738,7 @@ impl OriginRemote {
         // (a call of the registry fetcher is bounded as those of a pull)
         let mut conn = self.conn().await?;
         crate::idle::within(
-            crate::pull::staged_fetch::REGISTRY_IDLE,
+            self.origin.idle(),
             conn.tags(&self.remote, self.access.as_ref()),
         )
         .await
@@ -745,7 +749,7 @@ impl OriginRemote {
     pub async fn search(&self, needle: &str, n: usize) -> ImageResult<Vec<Hit>> {
         let mut conn = self.conn().await?;
         crate::idle::within(
-            crate::pull::staged_fetch::REGISTRY_IDLE,
+            self.origin.idle(),
             conn.search(
                 &self.remote,
                 self.access.as_ref(),
@@ -767,12 +771,7 @@ impl OriginRemote {
             ));
         };
         let mut conn = self.conn().await?;
-        match crate::idle::within(
-            crate::pull::staged_fetch::REGISTRY_IDLE,
-            conn.login(&self.remote, access),
-        )
-        .await
-        {
+        match crate::idle::within(self.origin.idle(), conn.login(&self.remote, access)).await {
             Ok(()) => Ok(()),
             Err(e) => Err(image_error(e)),
         }
@@ -783,6 +782,25 @@ impl OriginRemote {
 mod tests {
     use super::*;
     use velarx_proto::transfer::Failure;
+
+    /// A Docker format that the origin of a path refuses by name is the
+    /// image's; what another fetcher refuses is that fetcher's.
+    #[test]
+    fn only_the_origin_of_a_path_refuses_a_docker_format() {
+        let refused = || {
+            CallError::Fetcher(FetcherError::NotSupported {
+                feature: "v1".into(),
+            })
+        };
+        assert!(matches!(
+            path_error(refused()),
+            ImageError::DockerFormat(f) if f == "v1"
+        ));
+        assert!(!matches!(
+            image_error_of("dir", refused()),
+            ImageError::DockerFormat(_)
+        ));
+    }
 
     /// Without `registry` among the sources a digest comes from the
     /// fetchers alone, and what they lack is said to be nobody's.
@@ -810,7 +828,7 @@ mod tests {
     /// record with each signature once; what is not records is nobody's.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_signatures_of_the_fetchers_are_together() {
-        use crate::pull::staged_fetch::{Link, REGISTRY_IDLE};
+        use crate::pull::staged_fetch::Link;
         let mut links = Vec::new();
         let mut keep = Vec::new();
         for (name, body) in [
@@ -829,7 +847,7 @@ mod tests {
             links.push(Link {
                 name: name.into(),
                 conn: FetchConn::new(fetcher.connect().unwrap()).unwrap(),
-                idle: REGISTRY_IDLE,
+                idle: crate::pull::staged_fetch::TEST_IDLE,
             });
             keep.push(fetcher);
         }
@@ -849,7 +867,7 @@ mod tests {
     }
 
     async fn sources_of(bytes: &[u8]) -> (Arc<MetadataSources>, crate::serve_fetch::LocalFetcher) {
-        use crate::pull::staged_fetch::{Link, REGISTRY_IDLE};
+        use crate::pull::staged_fetch::Link;
         let fetcher = crate::serve_fetch::LocalFetcher::start(
             Arc::new(crate::fakes::Metadata(bytes.to_vec())),
             crate::activation::Limits::default(),
@@ -859,7 +877,7 @@ mod tests {
         let link = Link {
             name: "peer".into(),
             conn,
-            idle: REGISTRY_IDLE,
+            idle: crate::pull::staged_fetch::TEST_IDLE,
         };
         (MetadataSources::open(vec![link]).await, fetcher)
     }

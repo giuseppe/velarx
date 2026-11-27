@@ -71,6 +71,26 @@ impl HelperSettings {
     }
 }
 
+/// What the registry fetcher takes of the configuration: the sections it
+/// reads, `[pull]`, `[push]` and `[services]`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrySettings {
+    pub pull: velarx_config::PullConfig,
+    pub push: velarx_config::PushConfig,
+    pub services: velarx_config::ServicesConfig,
+}
+
+impl RegistrySettings {
+    pub fn of(config: &Config) -> Self {
+        Self {
+            pull: config.pull.clone(),
+            push: config.push.clone(),
+            services: config.services.clone(),
+        }
+    }
+}
+
 /// The text of the file with no name that a starter gave a process: a
 /// regular file that nobody can write to, read from its start.
 fn text_from_fd(file: OwnedFd) -> io::Result<String> {
@@ -95,9 +115,9 @@ fn json_error(e: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
-/// The configuration a starter gave a fetcher in a file with no name (the
-/// one [`Private`] and the shared fetcher are started with).
-pub fn config_from_fd(file: OwnedFd) -> io::Result<Config> {
+/// The settings a starter gave the registry fetcher in a file with no name
+/// (the one [`Private`] and the shared fetcher are started with).
+pub fn registry_settings_from_fd(file: OwnedFd) -> io::Result<RegistrySettings> {
     serde_json::from_str(&text_from_fd(file)?).map_err(json_error)
 }
 
@@ -155,7 +175,8 @@ impl Inputs {
             .join(crate::pull::staged::LAYERS);
         velarx_base::ipc::ensure_private_dir(&staging)
             .map_err(|e| no_fetcher(&staging.display().to_string(), e))?;
-        let json = serde_json::to_vec(&config).map_err(|e| no_fetcher("the configuration", e))?;
+        let json = serde_json::to_vec(&RegistrySettings::of(&config))
+            .map_err(|e| no_fetcher("the configuration", e))?;
         let services = std::path::absolute(config.services_dir())
             .map_err(|e| no_fetcher("the services directory", e))?;
         Ok(Self {
@@ -601,6 +622,12 @@ impl RegistryOrigin {
         Arc::new(made)
     }
 
+    /// How long the built-in fetchers may be silent in a call
+    /// (`[pull] idle_timeout_secs`).
+    pub fn idle(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.config.pull.idle_timeout_secs)
+    }
+
     /// A connection to a fetcher of the directory `dir` (`[[sources.external]]`
     /// with a `dir`), a confined process of its own for this connection
     /// ([`private_dir`]).
@@ -648,6 +675,31 @@ impl RegistryOrigin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How long the built-in fetchers may be silent is `[pull]
+    /// idle_timeout_secs`.
+    #[test]
+    fn the_built_in_fetchers_may_be_silent_as_long_as_the_configuration_says() {
+        let mut config = Config::default();
+        assert_eq!(RegistryOrigin::new(&config).idle().as_secs(), 120);
+        config.pull.idle_timeout_secs = 7;
+        assert_eq!(RegistryOrigin::private(&config).idle().as_secs(), 7);
+    }
+
+    /// The registry fetcher is given the sections it reads and no other.
+    #[test]
+    fn the_registry_fetcher_is_given_three_sections_of_the_configuration() {
+        let mut config = Config::default();
+        config.pull.max_workers += 1;
+        let json = serde_json::to_value(RegistrySettings::of(&config)).unwrap();
+        let mut sections: Vec<_> = json.as_object().unwrap().keys().collect();
+        sections.sort();
+        assert_eq!(sections, ["pull", "push", "services"]);
+        assert_eq!(json["pull"]["max_workers"], config.pull.max_workers);
+        // (a whole configuration is not settings)
+        let whole = serde_json::to_string(&config).unwrap();
+        assert!(serde_json::from_str::<RegistrySettings>(&whole).is_err());
+    }
 
     /// The fetcher's socket is named by everything that makes what it does,
     /// and is short enough to bind wherever the configuration is.

@@ -489,7 +489,7 @@ impl StagingFetcher for PeerSource {
     fn described(&self) -> Described {
         Described {
             name: "p2p".into(),
-            capabilities: vec!["objects".into(), "table".into()],
+            capabilities: vec!["objects".into(), "metadata".into(), "table".into()],
             max_objects: MAX_OBJECTS,
         }
     }

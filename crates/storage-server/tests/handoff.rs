@@ -157,7 +157,7 @@ fn settled() -> Settled {
 }
 
 async fn feed(s: &Setup, name: &str) -> Arc<dyn PullFeed> {
-    let (staged, source) = s
+    let staged = s
         .reg
         .staged(
             &s.dir.path().join(name),
@@ -170,7 +170,6 @@ async fn feed(s: &Setup, name: &str) -> Arc<dyn PullFeed> {
     Arc::new(
         ContentFeed::new(
             velarx_content::pull::net::Net::Offline,
-            source,
             db,
             Limits::from_config(&velarx_config::PullConfig::default()),
         )

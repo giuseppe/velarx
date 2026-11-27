@@ -975,7 +975,7 @@ mod tests {
         conformance_suite!(factory(true, lazy));
     }
 
-    /// The layers come as archives read whole.
+    /// The layers come as tars of a registry read whole.
     mod whole {
         use super::*;
         conformance_suite!(factory(false, lazy));

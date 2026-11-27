@@ -61,9 +61,9 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 use velarx_content::pull::net::Net;
 use velarx_content::pull::session::Session;
-use velarx_content::pull::sink::{FilesSink, Finished, Sink, Spool};
+use velarx_content::pull::sink::{FilesSink, Finished, Sink};
 pub use velarx_content::pull::LayerDone;
-use velarx_content::pull::{self, Have, ImageBudget, Limits, PullCtx, Source};
+use velarx_content::pull::{self, Have, ImageBudget, Limits, PullCtx};
 use velarx_db::Database;
 use velarx_fuse::layer_erofs::LayerImage;
 use velarx_storage::{FileStore, Toc, VerityMode};
@@ -483,12 +483,11 @@ pub type ProgressFn = Arc<dyn Fn(&FeedLayer, u64) + Send + Sync>;
 pub type CompleteFn = Arc<dyn Fn(&FeedLayer, &LayerDone) + Send + Sync>;
 
 /// The feed of the engine's pull code (`velarx_content::pull`): the layers
-/// come from `source`, by the registry's ranges when they are chunked.
+/// come from the fetchers of the pull, by the registry's ranges when they are
+/// chunked, or were made here (a build) and are given with
+/// [`ContentFeed::made`].
 pub struct ContentFeed {
     net: Net,
-    /// Where the blobs come from; none: the layers were made here (a build)
-    /// and are given with [`ContentFeed::made`]
-    source: Option<Source>,
     db: Database,
     limits: Limits,
     /// The fetcher that brings the files of layers with a table
@@ -590,8 +589,8 @@ impl Drop for Stop {
 }
 
 impl ContentFeed {
-    pub fn new(net: Net, source: Source, db: Database, limits: Limits) -> Self {
-        Self::with_source(net, Some(source), db, limits, HashMap::new())
+    pub fn new(net: Net, db: Database, limits: Limits) -> Self {
+        Self::with_spooled(net, db, limits, HashMap::new())
     }
 
     /// A feed of the layers a build made, each read once as it was made
@@ -610,19 +609,17 @@ impl ContentFeed {
                 )
             })
             .collect();
-        Self::with_source(Net::offline(), None, db, limits, spooled)
+        Self::with_spooled(Net::offline(), db, limits, spooled)
     }
 
-    fn with_source(
+    fn with_spooled(
         net: Net,
-        source: Option<Source>,
         db: Database,
         limits: Limits,
         spooled: HashMap<String, Arc<Spooled>>,
     ) -> Self {
         Self {
             net,
-            source,
             db,
             limits,
             staged: None,
@@ -698,11 +695,6 @@ impl ContentFeed {
         layer: &FeedLayer,
         report: Arc<dyn Fn(u64) + Send + Sync>,
     ) -> ImageResult<LayerDone> {
-        let Some(Source::Registry(target)) = &self.source else {
-            return Err(ImageError::Storage(
-                "an archive is read whole: it has no ranges to fetch into the files of a storage driver".into(),
-            ));
-        };
         if self.lazy {
             return Err(ImageError::Storage(
                 "a lazy image is not pulled into the files of a storage driver".into(),
@@ -728,71 +720,35 @@ impl ContentFeed {
         // (the files of a call are written at the places the driver chose for
         // it: a file another call fetches is not in them)
         let ctx = ctx.clone().with_own_fetching();
-        pull::pull_layer_files(
-            &ctx,
-            target,
-            &layer.descriptor,
-            meta,
-            &layer.diff_id,
-            report,
-        )
-        .await
+        pull::pull_layer_files(&ctx, &layer.descriptor, meta, &layer.diff_id, report).await
     }
 
-    /// Read a layer that has no table of contents whole, into a spool of the
-    /// engine's: the blob is checked against its digest and the tar stream
-    /// against the diff id, the table of contents and the tar-split are made
-    /// from the headers, and the files wait for the driver to ask for the
-    /// ones it lacks.
+    /// Read a layer that has no table of contents whole: a fetcher of the
+    /// pull unpacks it into its staging and the blob is checked there, the
+    /// tar stream is replayed against the diff id, and the table of contents
+    /// and the tar-split are made from the headers; the files wait for the
+    /// driver to ask for the ones it lacks.
     async fn spool_whole(&self, ctx: &PullCtx, layer: &FeedLayer) -> ImageResult<LayerIndex> {
         let report = self.reporter(layer);
-        // (a layer of a registry is unpacked by a fetcher into its staging,
-        // and checked there; an archive is read here)
-        let (spool, ingested, blob_checked): (Arc<dyn LocalContent>, _, _) =
-            match (&self.source, &ctx.staged) {
-                (Some(Source::Registry(_) | Source::Path), Some(_)) => {
-                    // (the origin hands over every file: a driver copies
-                    // the ones it lacks from the staging)
-                    let unpacked = pull::chunked::unpack_whole(
-                        ctx,
-                        &layer.descriptor,
-                        &layer.diff_id,
-                        move |n| report(n),
-                    )
-                    .await?;
-                    let w = unpacked.ingested;
-                    let ingested = pull::stream::Ingested {
-                        toc: w.toc,
-                        files: w.files,
-                        report: w.report,
-                        diff_id: w.diff_id,
-                        tarsplit: w.tarsplit,
-                    };
-                    (
-                        Arc::new(HandedContent {
-                            copies: w.copies,
-                            _staging: unpacked.staging,
-                        }),
-                        ingested,
-                        // (the workers of the origin hashed the blob)
-                        true,
-                    )
-                }
-                _ => {
-                    let spool = Spool::new(&ctx.sink.name(), ctx.sink.dir())?;
-                    let ctx = ctx.clone().with_sink(spool.clone());
-                    let ingested = pull::stream::ingest(
-                        &ctx,
-                        self.source.as_ref(),
-                        &layer.descriptor,
-                        &layer.diff_id,
-                        move |n| report(n),
-                    )
-                    .await?;
-                    (spool, ingested, true)
-                }
-            };
-        let spooled = Spooled::of(spool, ingested, blob_checked);
+        // (the origin hands over every file: a driver copies the ones it
+        // lacks from the staging)
+        let unpacked =
+            pull::chunked::unpack_whole(ctx, &layer.descriptor, &layer.diff_id, move |n| report(n))
+                .await?;
+        let w = unpacked.ingested;
+        let ingested = pull::stream::Ingested {
+            toc: w.toc,
+            files: w.files,
+            report: w.report,
+            diff_id: w.diff_id,
+            tarsplit: w.tarsplit,
+        };
+        let spool: Arc<dyn LocalContent> = Arc::new(HandedContent {
+            copies: w.copies,
+            _staging: unpacked.staging,
+        });
+        // (the workers of the origin hashed the blob)
+        let spooled = Spooled::of(spool, ingested, true);
         let index = LayerIndex {
             key: LayerKey::Whole(layer.descriptor.digest),
             toc: spooled.ingested.toc.clone(),
@@ -924,11 +880,6 @@ impl PullFeed for ContentFeed {
 
     async fn why_not_lazy(&self, layer: &FeedLayer) -> ImageResult<Option<String>> {
         let ctx = self.context()?;
-        let Some(Source::Registry(_)) = &self.source else {
-            return Ok(Some(
-                "an archive has no table of contents to fetch from".into(),
-            ));
-        };
         let digest = layer.descriptor.digest.to_string();
         if self
             .lazy_found
@@ -967,13 +918,7 @@ impl PullFeed for ContentFeed {
                 toc_z: held.toc_z.clone(),
             }));
         }
-        let chunked = match &self.source {
-            Some(Source::Registry(_)) => {
-                pull::chunked::layer_index(&ctx, &layer.descriptor).await?
-            }
-            Some(Source::Path | Source::Archive(_)) | None => None,
-        };
-        let Some(m) = chunked else {
+        let Some(m) = pull::chunked::layer_index(&ctx, &layer.descriptor).await? else {
             if self.lazy {
                 return Ok(None);
             }
@@ -1019,15 +964,6 @@ impl PullFeed for ContentFeed {
             self.index(layer).await?;
             held = spooled();
         }
-        // (a layer a build made is always held: it is not read again)
-        let blobs = || {
-            self.source.as_ref().ok_or_else(|| {
-                ImageError::Layer(format!(
-                    "the layer {} was made here: it is not read again",
-                    layer.descriptor.digest
-                ))
-            })
-        };
         let done = if let Some(held) = held {
             self.fetch_spooled(&ctx, layer, held, into.clone()).await?
         } else if !ctx.sink.proves_in_fetch() {
@@ -1038,17 +974,9 @@ impl PullFeed for ContentFeed {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&layer.descriptor.digest.to_string());
-            pull::pull_layer_lazy(
-                &ctx,
-                blobs()?,
-                &layer.descriptor,
-                &layer.diff_id,
-                report,
-                found,
-            )
-            .await?
+            pull::pull_layer_lazy(&ctx, &layer.descriptor, &layer.diff_id, found).await?
         } else {
-            pull::pull_layer(&ctx, blobs()?, &layer.descriptor, &layer.diff_id, report).await?
+            pull::pull_layer(&ctx, &layer.descriptor, &layer.diff_id, report).await?
         };
         if let Some(complete) = &self.complete {
             complete(layer, &done);
@@ -1114,19 +1042,6 @@ pub trait LocalContent: Send + Sync {
         step: &mut dyn FnMut() -> std::io::Result<()>,
         hole: &mut dyn FnMut(u64, u64),
     ) -> std::io::Result<()>;
-}
-
-impl LocalContent for Spool {
-    fn copy_to(
-        &self,
-        key: &str,
-        to: &std::fs::File,
-        to_at: u64,
-        step: &mut dyn FnMut() -> std::io::Result<()>,
-        hole: &mut dyn FnMut(u64, u64),
-    ) -> std::io::Result<()> {
-        self.copy_to_holes(key, to, to_at, step, hole)
-    }
 }
 
 /// The files a fetcher handed over for a layer read whole, as the engine holds

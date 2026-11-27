@@ -7,7 +7,8 @@
 //! * `oci:DIR[:REF]`, `oci-archive:FILE[:REF]`, `docker-archive:FILE[:REF]`,
 //!   `dir:DIR` and `archive:FILE` (a load: every image of an archive of
 //!   either kind): `velarx-dir` as the origin of a path;
-//! * `rootfs:DIR` (a root file system, the one layer of an image) and
+//! * `rootfs:PATH` (a root file system, a directory or a tar: the one layer of
+//!   an image) and
 //!   `docker-daemon:IMAGE` (the archive of `docker save`, read from the
 //!   socket of the daemon the engine connects to): `velarx-dir` as well;
 //! * `SCHEME://...` of a `[[transports]]`: the transport process on its
@@ -31,7 +32,7 @@ pub enum PathScheme {
     DockerArchive,
     /// `archive:FILE`: a load, either kind, every image
     Archive,
-    /// `rootfs:DIR`: a directory that is the one layer of an image
+    /// `rootfs:PATH`: a directory or a tar that is the one layer of an image
     Rootfs,
     /// `docker-daemon:IMAGE`: the archive a Docker daemon saves, read from
     /// the connection to its socket
@@ -67,7 +68,13 @@ impl PathScheme {
 
     /// A directory (a layout), not a file.
     pub fn is_directory(self) -> bool {
-        matches!(self, PathScheme::Oci | PathScheme::Dir | PathScheme::Rootfs)
+        matches!(self, PathScheme::Oci | PathScheme::Dir)
+    }
+
+    /// Either a directory or a file, as the command line or the engine
+    /// opens it (the path of an `archive:` is a file).
+    pub fn is_either(self) -> bool {
+        self == PathScheme::Rootfs
     }
 
     /// A path of this host, which the client opens or the engine opens for

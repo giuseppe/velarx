@@ -6140,6 +6140,9 @@ mod tests {
         config.server.socket = dir.join("run/velarx.sock");
         config.storage.root = dir.join("storage");
         config.storage.gc_interval_secs = 0;
+        // (an import reads its tar through the origin of a path, which is
+        // not next to the test executable)
+        config.pull.dir_path = velarx_base::testing::built_binary("velarx-dir");
         let state = build_services(Arc::new(config), &dir.join("config.toml"), &Role::Server)
             .await
             .unwrap();

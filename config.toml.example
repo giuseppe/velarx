@@ -328,6 +328,9 @@ inflate_floor_mib = 64
 # build, signatures) have the same minimum
 min_speed_kib = 1
 min_speed_secs = 120
+# How long a built-in fetcher (registry, dir) may be silent in a call before
+# the call fails (not 0)
+idle_timeout_secs = 120
 # The workers of a pull (network, decompression) and its job (the process that
 # handles the zstd:chunked layers) are put in a cgroup of their
 # own (the job has pids_max only: its memory is bounded by memory_max_mib as

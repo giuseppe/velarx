@@ -104,8 +104,10 @@ pub struct Link {
     pub idle: std::time::Duration,
 }
 
-/// How long the registry fetcher may be silent in a call.
-pub const REGISTRY_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long a fetcher of a test may be silent in a call (the default of
+/// `[pull] idle_timeout_secs`).
+#[cfg(test)]
+pub(crate) const TEST_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// One fetcher of the list of a pull: the connection that has its scope.
 struct Fetcher {
@@ -457,7 +459,11 @@ impl StagedFetch {
     /// scope is left out.
     #[allow(clippy::type_complexity)]
     pub async fn open(
-        (before, end, after): (Vec<Link>, Option<FetchConn>, Vec<Link>),
+        (before, end, after): (
+            Vec<Link>,
+            Option<(FetchConn, std::time::Duration)>,
+            Vec<Link>,
+        ),
         root: &Path,
         verity: bool,
         (repository, tls_verify): (&str, bool),
@@ -466,7 +472,7 @@ impl StagedFetch {
     ) -> ImageResult<Arc<Self>> {
         let mut fetchers = Self::open_links(before, verity).await;
         let mut origin = None;
-        if let Some(mut end) = end {
+        if let Some((mut end, idle)) = end {
             let info = end
                 .get_info()
                 .await
@@ -475,7 +481,7 @@ impl StagedFetch {
             fetchers.push(Fetcher {
                 name: "registry".into(),
                 control: tokio::sync::Mutex::new(end),
-                idle: REGISTRY_IDLE,
+                idle,
                 max_objects: info.limit("max_objects").unwrap_or(1).max(1) as usize,
                 reuse: info.can("reuse"),
                 origin: info.can("origin"),
@@ -496,10 +502,11 @@ impl StagedFetch {
 
     /// [`StagedFetch::open`] for a pull whose origin is a path: `end` is a
     /// connection of the origin process that has its scope already
-    /// (`Connect`), the name of its fetcher is `name`.
+    /// (`Connect`) and how long it may be silent in a call, the name of its
+    /// fetcher is `name`.
     pub async fn open_scoped(
         before: Vec<Link>,
-        mut end: FetchConn,
+        (mut end, idle): (FetchConn, std::time::Duration),
         name: &str,
         root: &Path,
         verity: bool,
@@ -511,7 +518,7 @@ impl StagedFetch {
         fetchers.push(Fetcher {
             name: name.into(),
             control: tokio::sync::Mutex::new(end),
-            idle: REGISTRY_IDLE,
+            idle,
             max_objects: info.limit("max_objects").unwrap_or(1).max(1) as usize,
             reuse: info.can("reuse"),
             origin: info.can("origin"),
@@ -1993,7 +2000,7 @@ mod tests {
     async fn a_dropped_call_leaves_the_connection_usable() {
         let f = LocalFetcher::start(Arc::new(Stages), Limits::default()).unwrap();
         let mut conn = FetchConn::new(f.connect().unwrap()).unwrap();
-        conn.open(Scoping::bare(REGISTRY_IDLE)).await.unwrap();
+        conn.open(Scoping::bare(TEST_IDLE)).await.unwrap();
         // (dropped before any reply is read)
         let call = conn.get_manifest("latest", 100);
         let polled = futures::FutureExt::now_or_never(Box::pin(call));
@@ -2128,14 +2135,14 @@ mod tests {
             .map(|(name, f)| Link {
                 name: name.to_string(),
                 conn: FetchConn::new(f.connect().unwrap()).unwrap(),
-                idle: REGISTRY_IDLE,
+                idle: TEST_IDLE,
             })
             .collect();
         let staging = tempfile::tempdir().unwrap();
         StagedFetch::open(
             (
                 links,
-                Some(FetchConn::new(end.connect().unwrap()).unwrap()),
+                Some((FetchConn::new(end.connect().unwrap()).unwrap(), TEST_IDLE)),
                 Vec::new(),
             ),
             staging.path(),
@@ -2254,13 +2261,16 @@ mod tests {
         let link = |name: &str, f: &LocalFetcher| Link {
             name: name.to_string(),
             conn: FetchConn::new(f.connect().unwrap()).unwrap(),
-            idle: REGISTRY_IDLE,
+            idle: TEST_IDLE,
         };
         let staging = tempfile::tempdir().unwrap();
         let staged = StagedFetch::open(
             (
                 vec![link("peers", &peers)],
-                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Some((
+                    FetchConn::new(registry.connect().unwrap()).unwrap(),
+                    TEST_IDLE,
+                )),
                 vec![link("cache", &cache)],
             ),
             staging.path(),
@@ -2363,14 +2373,14 @@ mod tests {
         let link = |name: &str, f: &LocalFetcher| Link {
             name: name.to_string(),
             conn: FetchConn::new(f.connect().unwrap()).unwrap(),
-            idle: REGISTRY_IDLE,
+            idle: TEST_IDLE,
         };
         let staging = tempfile::tempdir().unwrap();
         for end in [Some(&registry), None] {
             let staged = StagedFetch::open(
                 (
                     vec![link("peers", &peers)],
-                    end.map(|f| FetchConn::new(f.connect().unwrap()).unwrap()),
+                    end.map(|f| (FetchConn::new(f.connect().unwrap()).unwrap(), TEST_IDLE)),
                     vec![link("cache", &cache)],
                 ),
                 staging.path(),
@@ -2653,7 +2663,10 @@ mod tests {
         let staged = StagedFetch::open(
             (
                 vec![link],
-                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Some((
+                    FetchConn::new(registry.connect().unwrap()).unwrap(),
+                    TEST_IDLE,
+                )),
                 Vec::new(),
             ),
             root.path(),
@@ -2685,7 +2698,10 @@ mod tests {
         let staged = StagedFetch::open(
             (
                 vec![link],
-                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Some((
+                    FetchConn::new(registry.connect().unwrap()).unwrap(),
+                    TEST_IDLE,
+                )),
                 Vec::new(),
             ),
             root.path(),
@@ -2739,7 +2755,10 @@ mod tests {
         let staged = StagedFetch::open(
             (
                 Vec::new(),
-                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Some((
+                    FetchConn::new(registry.connect().unwrap()).unwrap(),
+                    TEST_IDLE,
+                )),
                 vec![link],
             ),
             root.path(),
@@ -2816,7 +2835,7 @@ mod tests {
                     let link = Link {
                         name: name.into(),
                         conn: FetchConn::new(f.connect().unwrap()).unwrap(),
-                        idle: REGISTRY_IDLE,
+                        idle: TEST_IDLE,
                     };
                     keep.push(f);
                     link
@@ -2828,7 +2847,7 @@ mod tests {
             let f = LocalFetcher::start(api, Limits::default()).unwrap();
             let conn = FetchConn::new(f.connect().unwrap()).unwrap();
             keep.push(f);
-            conn
+            (conn, TEST_IDLE)
         });
         let staged = StagedFetch::open(
             (before, registry, after),
@@ -2906,7 +2925,10 @@ mod tests {
         let staged = StagedFetch::open(
             (
                 Vec::new(),
-                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Some((
+                    FetchConn::new(registry.connect().unwrap()).unwrap(),
+                    TEST_IDLE,
+                )),
                 Vec::new(),
             ),
             root.path(),
@@ -2956,7 +2978,10 @@ mod tests {
         let staged = StagedFetch::open(
             (
                 Vec::new(),
-                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Some((
+                    FetchConn::new(registry.connect().unwrap()).unwrap(),
+                    TEST_IDLE,
+                )),
                 Vec::new(),
             ),
             root.path(),
@@ -2999,7 +3024,10 @@ mod tests {
         let staged = StagedFetch::open(
             (
                 Vec::new(),
-                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Some((
+                    FetchConn::new(registry.connect().unwrap()).unwrap(),
+                    TEST_IDLE,
+                )),
                 Vec::new(),
             ),
             root.path(),
@@ -3080,7 +3108,7 @@ mod tests {
         end: Arc<dyn StagingFetcher>,
         root: &Path,
     ) -> (Arc<StagedFetch>, Vec<LocalFetcher>) {
-        walk_idle(before, end, root, REGISTRY_IDLE).await
+        walk_idle(before, end, root, TEST_IDLE).await
     }
 
     /// [`walk_of`], the fetchers of `before` silent for at most `idle`.
@@ -3105,7 +3133,10 @@ mod tests {
         let staged = StagedFetch::open(
             (
                 links,
-                Some(FetchConn::new(registry.connect().unwrap()).unwrap()),
+                Some((
+                    FetchConn::new(registry.connect().unwrap()).unwrap(),
+                    TEST_IDLE,
+                )),
                 Vec::new(),
             ),
             root,
@@ -3590,7 +3621,7 @@ mod tests {
         fn described(&self) -> Described {
             Described {
                 name: "hands".into(),
-                capabilities: vec!["objects".into(), "metadata".into(), "unpack".into()],
+                capabilities: vec!["objects".into(), "metadata".into()],
                 max_objects: 8,
             }
         }

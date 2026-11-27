@@ -97,9 +97,8 @@ use registry::Registry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
-use velarx_content::archive::{Archive, LAYER};
 use velarx_content::pull::net::Net;
-use velarx_content::pull::{layer_commit, LayerDone, Limits, Source};
+use velarx_content::pull::{layer_commit, LayerDone, Limits};
 use velarx_db::Database;
 use velarx_fuse::view::VIEW_ROOT;
 use velarx_storage::{FileStore, TocEntryType};
@@ -146,8 +145,7 @@ pub struct Subject {
     /// The cases offer every layer as a zstd:chunked blob of a registry of
     /// their own, which the engine fetches by ranges (a storage service in
     /// another process asks for the files it lacks by their keys), and not as
-    /// an archive read whole, which the engine reads into a spool of its own
-    /// and gives the files of from there (the cases of the layers read whole
+    /// a tar the registry fetcher unpacks (the cases of the layers read whole
     /// offer those whatever this says).
     pub chunked_only: bool,
     /// The driver is in another process, over a socket: its roots are made at
@@ -348,7 +346,7 @@ struct Stored {
     objects: HashSet<String>,
 }
 
-/// The layer of `tar`: pulled from an archive of it through the feed (the
+/// The layer of `tar`: pulled from a registry through the feed (the
 /// pull engine makes the table of contents, the tar-split and the files of
 /// the store), stored by the driver, recorded in the database.
 async fn store_layer(s: &Subject, tar: Vec<u8>) -> Stored {
@@ -392,9 +390,9 @@ struct Meddle {
     pull_ids: Mutex<Vec<String>>,
 }
 
-/// The feed of the cases: each layer is an archive of its own, pulled by the
-/// engine's pull code (`ContentFeed`); what the driver asks is counted.
-struct ArchiveFeed {
+/// The feed of the cases: each layer is a blob of a registry of its own, pulled
+/// by the engine's pull code (`ContentFeed`); what the driver asks is counted.
+struct OfferFeed {
     layers: Vec<(Digest, ContentFeed)>,
     meddle: Arc<Meddle>,
 }
@@ -431,7 +429,7 @@ impl Incoming for Noting {
 }
 
 #[async_trait::async_trait]
-impl PullFeed for ArchiveFeed {
+impl PullFeed for OfferFeed {
     async fn begin(&self, into: &Arc<dyn Incoming>) -> ImageResult<()> {
         self.meddle.pull_ids.lock().unwrap().push(into.pull_id());
         for (_, feed) in &self.layers {
@@ -499,7 +497,7 @@ impl PullFeed for ArchiveFeed {
     }
 }
 
-impl ArchiveFeed {
+impl OfferFeed {
     fn inner(&self, layer: &FeedLayer) -> &ContentFeed {
         &self
             .layers
@@ -523,15 +521,15 @@ fn set_chains(layers: &mut [FeedLayer]) {
 
 /// Layers as the engine offers them to a pull.
 struct Offer {
-    feed: Arc<ArchiveFeed>,
+    feed: Arc<OfferFeed>,
     layers: Vec<FeedLayer>,
     /// The registry the layers of a driver that takes only chunked ones are
     /// served by.
     _registry: Option<Registry>,
 }
 
-/// The layers `tars` as an offer: the archive of each in the directory of
-/// the subject, the diff id the tar has.
+/// The layers `tars` as an offer: the blob of each in a registry, the diff id
+/// the tar has.
 async fn offer(s: &Subject, tars: &[&[u8]]) -> Offer {
     offer_with(s, tars, |_, diff_id| diff_id, |_, tar| tar.to_vec()).await
 }
@@ -545,63 +543,34 @@ async fn offer_with(
     diff_id: impl Fn(usize, Digest) -> Digest,
     bytes: impl Fn(usize, &[u8]) -> Vec<u8>,
 ) -> Offer {
-    if s.chunked_only {
-        let reg = Registry::start_blocking();
-        let (mut layers, mut feeds) = (Vec::new(), Vec::new());
-        for (i, tar) in tars.iter().enumerate() {
-            let layer = chunked_layer_with(&reg, tar, |d| diff_id(i, d), |blob| bytes(i, blob));
-            let feed = registry_feed(&reg, &s.db, &s.dir, &layer.0.descriptor, false).await;
-            feeds.push((layer.0.descriptor.digest, feed));
-            layers.push(layer.0);
-        }
-        set_chains(&mut layers);
-        return Offer {
-            feed: Arc::new(ArchiveFeed {
-                layers: feeds,
-                meddle: Arc::default(),
-            }),
-            layers,
-            _registry: Some(reg),
-        };
-    }
+    let reg = Registry::start_blocking();
     let (mut layers, mut feeds) = (Vec::new(), Vec::new());
     for (i, tar) in tars.iter().enumerate() {
-        let blob = Digest::of(velarx_types::digest::Algorithm::Sha256, tar);
-        let path = s.dir.join(format!("blob-{}-{i}", blob.hex()));
-        std::fs::write(&path, bytes(i, tar)).unwrap();
-        let desc = OciDescriptor {
-            media_type: LAYER.to_string(),
-            digest: blob,
-            size: tar.len() as i64,
-            annotations: Default::default(),
+        let layer = if s.chunked_only {
+            chunked_layer_with(&reg, tar, |d| diff_id(i, d), |blob| bytes(i, blob)).0
+        } else {
+            registry_layer(
+                &reg,
+                tar,
+                velarx_content::layer::writer::Compression::None,
+                true,
+                |d| diff_id(i, d),
+                |blob| bytes(i, blob),
+            )
+            .0
         };
-        let archive = Archive::single(std::fs::File::open(&path).unwrap(), blob, tar.len() as u64);
-        feeds.push((
-            blob,
-            ContentFeed::new(
-                Net::offline(),
-                Source::Archive(Arc::new(archive)),
-                s.db.clone(),
-                Limits::from_config(&velarx_config::PullConfig::default()),
-            ),
-        ));
-        layers.push(FeedLayer {
-            key: LayerKey::expected(&desc),
-            descriptor: desc,
-            diff_id: diff_id(i, blob),
-            chain_id: diff_id(i, blob),
-            parent: None,
-            stored: false,
-        });
+        let feed = registry_feed(&reg, &s.db, &s.dir, &layer.descriptor, false).await;
+        feeds.push((layer.descriptor.digest, feed));
+        layers.push(layer);
     }
     set_chains(&mut layers);
     Offer {
-        feed: Arc::new(ArchiveFeed {
+        feed: Arc::new(OfferFeed {
             layers: feeds,
             meddle: Arc::default(),
         }),
         layers,
-        _registry: None,
+        _registry: Some(reg),
     }
 }
 
@@ -1309,7 +1278,8 @@ fn registry_layer(
 
 /// The feed of the pull code of the layer `layer` of the registry `reg`,
 /// through its registry fetcher (the staging of the layer beneath
-/// `staging`).
+/// `staging`, in a directory of its own: pulls at the same time of one layer
+/// do not share it).
 async fn registry_feed(
     reg: &Registry,
     db: &Database,
@@ -1317,10 +1287,12 @@ async fn registry_feed(
     layer: &OciDescriptor,
     lazy: bool,
 ) -> ContentFeed {
-    let (staged, source) = reg.staged(staging, std::slice::from_ref(layer)).await;
+    static FEEDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let own = FEEDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staging = staging.join(format!("feed-{own}"));
+    let staged = reg.staged(&staging, std::slice::from_ref(layer)).await;
     ContentFeed::new(
         Net::Offline,
-        source,
         db.clone(),
         Limits::from_config(&velarx_config::PullConfig::default()),
     )
@@ -1341,7 +1313,7 @@ async fn chunked_offer(s: &Subject, reg: &Registry, tars: &[&[u8]]) -> (Offer, V
     }
     (
         Offer {
-            feed: Arc::new(ArchiveFeed {
+            feed: Arc::new(OfferFeed {
                 layers: feeds,
                 meddle: Arc::default(),
             }),
@@ -1534,7 +1506,7 @@ pub async fn a_chunk_the_driver_holds_is_not_fetched_again(f: &Factory) {
 pub async fn a_driver_is_handed_the_table_a_layer_keeps(f: &Factory) {
     let (_tmp, s) = begin!(f, "a_driver_is_handed_the_table_a_layer_keeps");
     if !s.chunked_only {
-        eprintln!("SKIPPED conformance::a_driver_is_handed_the_table_a_layer_keeps: the layers are archives");
+        eprintln!("SKIPPED conformance::a_driver_is_handed_the_table_a_layer_keeps: the layers have no table");
         return;
     }
     let reg = Registry::start().await;
@@ -1555,7 +1527,7 @@ pub async fn a_driver_is_handed_the_table_a_layer_keeps(f: &Factory) {
     set_chains(&mut layers);
     let feed = registry_feed(&reg, &s.db, &s.dir, &layers[0].descriptor, false).await;
     let offer = Offer {
-        feed: Arc::new(ArchiveFeed {
+        feed: Arc::new(OfferFeed {
             layers: vec![(layers[0].descriptor.digest, feed)],
             meddle: Arc::default(),
         }),
@@ -1879,8 +1851,9 @@ pub async fn an_interrupted_pull_is_pulled_again(f: &Factory) {
     assert_eq!(s.driver.usage().unwrap(), before, "nothing was stored");
     let stale = no_staging_left(&s).await;
     assert!(stale.is_empty(), "a staging area was left: {stale:?}");
-    // the same pull, the feed whole: every layer comes
-    *o.meddle().fail_at.lock().unwrap() = None;
+    // the same pull, the feed whole: every layer comes (a feed is of one pull:
+    // what the driver released of the first is not kept for the next)
+    let o = offer(&s, &[&base, &top]).await;
     let pulled = o.pull(&s, engine_check()).await.expect("pulled again");
     assert_eq!(pulled.layers.len(), 2);
     assert_eq!(pulled.artifacts.len(), 2);
@@ -2354,48 +2327,17 @@ pub async fn a_feed_with_wrong_bytes_is_refused(f: &Factory) {
     // (c) a blob that is not the descriptor's but inflates to the layer of the
     // right diff id (another time in its gzip header): the blob's digest is
     // checked too, not only the diff id
-    let mut blob = Vec::new();
-    let w = velarx_content::layer::writer::write_layer(
-        &base[..],
-        velarx_types::digest::Algorithm::Sha256,
+    let o = blob_offer_with(
+        &s,
+        &[&base],
         velarx_content::layer::writer::Compression::Gzip,
-        &mut blob,
+        |_, blob| {
+            let mut other = blob.to_vec();
+            other[4] ^= 1;
+            other
+        },
     )
-    .expect("a gzip layer");
-    let mut other = blob.clone();
-    other[4] ^= 1;
-    let path = s.dir.join("blob-other-gzip");
-    std::fs::write(&path, &other).unwrap();
-    let desc = OciDescriptor {
-        media_type: w.media_type.to_string(),
-        digest: w.digest,
-        size: w.size as i64,
-        annotations: Default::default(),
-    };
-    let archive = Archive::single(std::fs::File::open(&path).unwrap(), w.digest, w.size);
-    let o = Offer {
-        feed: Arc::new(ArchiveFeed {
-            layers: vec![(
-                w.digest,
-                ContentFeed::new(
-                    Net::offline(),
-                    Source::Archive(Arc::new(archive)),
-                    s.db.clone(),
-                    Limits::from_config(&velarx_config::PullConfig::default()),
-                ),
-            )],
-            meddle: Arc::default(),
-        }),
-        layers: vec![FeedLayer {
-            key: LayerKey::expected(&desc),
-            descriptor: desc,
-            diff_id: w.diff_id,
-            chain_id: w.diff_id,
-            parent: None,
-            stored: false,
-        }],
-        _registry: None,
-    };
+    .await;
     let e = expect_err(
         o.pull(&s, engine_check()).await.map(|_| ()),
         "a blob that is not the descriptor's",
@@ -2403,113 +2345,58 @@ pub async fn a_feed_with_wrong_bytes_is_refused(f: &Factory) {
     of_driver(&s, &e);
     assert!(
         matches!(&e.kind, DriverErrorKind::Refused(r)
-            if matches!(**r, ImageError::DigestMismatch { ref actual, .. } if *actual != w.diff_id.to_string())),
+            if matches!(&**r, ImageError::Transfer { failure, .. }
+                if failure.class == velarx_proto::transfer::FailureClass::Invalid && failure.reason.contains("digest mismatch"))),
         "{e:?}"
     );
     assert_eq!(s.driver.usage().unwrap(), before, "nothing was stored");
 }
 
-/// The layers `tars` as blobs of `compression`, offered as archives read
-/// whole: what a commit, a build step or an import makes, and a layer of a
-/// registry that has no table of contents.
-fn blob_offer(
+/// The layers `tars` as blobs of `compression` of a registry that has no
+/// table of contents for them: what a commit, a build step or an import makes,
+/// and a gzip layer of a registry, unpacked by its fetcher.
+async fn blob_offer(
     s: &Subject,
     tars: &[&[u8]],
     compression: velarx_content::layer::writer::Compression,
 ) -> Offer {
-    blob_offer_with(s, tars, compression, |_, blob| blob.to_vec())
+    blob_offer_with(s, tars, compression, |_, blob| blob.to_vec()).await
 }
 
 /// The same, with the bytes of each blob (index, the true ones) made by
-/// `bytes`: the descriptor names the digest and size of what `bytes` gives.
-fn blob_offer_with(
+/// `bytes`: the descriptor names the digest and size of the true ones.
+async fn blob_offer_with(
     s: &Subject,
     tars: &[&[u8]],
     compression: velarx_content::layer::writer::Compression,
     bytes: impl Fn(usize, &[u8]) -> Vec<u8>,
 ) -> Offer {
-    blob_offer_limited(
-        s,
-        tars,
-        compression,
-        Limits::from_config(&velarx_config::PullConfig::default()),
-        bytes,
-    )
-}
-
-/// The same, read with the limits `limits` of `[pull]`.
-fn blob_offer_limited(
-    s: &Subject,
-    tars: &[&[u8]],
-    compression: velarx_content::layer::writer::Compression,
-    limits: Limits,
-    bytes: impl Fn(usize, &[u8]) -> Vec<u8>,
-) -> Offer {
-    use velarx_content::layer::writer::write_layer;
+    let reg = Registry::start_blocking();
     let (mut layers, mut feeds) = (Vec::new(), Vec::new());
     for (i, tar) in tars.iter().enumerate() {
-        let mut blob = Vec::new();
-        let w = write_layer(
-            *tar,
-            velarx_types::digest::Algorithm::Sha256,
-            compression,
-            &mut blob,
-        )
-        .expect("a layer");
-        let blob = bytes(i, &blob);
-        let digest = Digest::of(velarx_types::digest::Algorithm::Sha256, &blob);
-        let path = s.dir.join(format!("blob-{}-{i}", digest.hex()));
-        std::fs::write(&path, &blob).unwrap();
-        let desc = OciDescriptor {
-            media_type: w.media_type.to_string(),
-            digest,
-            size: blob.len() as i64,
-            annotations: w.annotations.into_iter().collect(),
-        };
-        let archive = Archive::single(
-            std::fs::File::open(&path).unwrap(),
-            digest,
-            blob.len() as u64,
-        );
+        let (layer, _) = registry_layer(&reg, tar, compression, true, |d| d, |blob| bytes(i, blob));
+        let digest = layer.descriptor.digest;
         feeds.push((
             digest,
-            ContentFeed::new(
-                Net::offline(),
-                Source::Archive(Arc::new(archive)),
-                s.db.clone(),
-                limits.clone(),
-            ),
+            registry_feed(&reg, &s.db, &s.dir, &layer.descriptor, false).await,
         ));
-        layers.push(FeedLayer {
-            key: LayerKey::expected(&desc),
-            descriptor: desc,
-            diff_id: w.diff_id,
-            chain_id: w.diff_id,
-            parent: None,
-            stored: false,
-        });
+        layers.push(layer);
     }
     set_chains(&mut layers);
     Offer {
-        feed: Arc::new(ArchiveFeed {
+        feed: Arc::new(OfferFeed {
             layers: feeds,
             meddle: Arc::default(),
         }),
         layers,
-        _registry: None,
+        _registry: Some(reg),
     }
 }
 
-/// The compressions a layer the engine reads whole comes in: a tar, gzip, and
-/// zstd:chunked, which an archive cannot give by its table of contents and is
-/// refused.
-fn compressions() -> [velarx_content::layer::writer::Compression; 3] {
+/// The compressions of a layer without a table of contents: a tar, and gzip.
+fn compressions() -> [velarx_content::layer::writer::Compression; 2] {
     use velarx_content::layer::writer::Compression;
-    [
-        Compression::None,
-        Compression::Gzip,
-        Compression::ZstdChunked,
-    ]
+    [Compression::None, Compression::Gzip]
 }
 
 /// A layer the engine reads whole (a commit, a build step, an import, a gzip
@@ -2534,20 +2421,7 @@ pub async fn a_layer_read_whole_is_stored_and_read_back(f: &Factory) {
     };
     for (n, compression) in compressions().into_iter().enumerate() {
         let own = second(f, &s, &format!("blobs-{n}")).await;
-        let o = blob_offer(&own, &[&base, &top], compression);
-        if compression == velarx_content::layer::writer::Compression::ZstdChunked {
-            // (a layer with a table of contents is never read as a stream)
-            let refused = o.pull(&own, engine_check()).await.err().expect("refused");
-            let digests: Vec<String> = o
-                .layers
-                .iter()
-                .map(|l| l.descriptor.digest.to_string())
-                .collect();
-            let text = refused.to_string();
-            assert!(digests.iter().any(|d| text.contains(d)), "{text}");
-            assert!(text.contains("zstd:chunked"), "{text}");
-            continue;
-        }
+        let o = blob_offer(&own, &[&base, &top], compression).await;
         let pulled = o
             .pull(&own, engine_check())
             .await
@@ -2601,7 +2475,7 @@ pub async fn a_layer_read_whole_is_stored_and_read_back(f: &Factory) {
             );
         }
         // the pull again of what is there fetches nothing
-        let again = blob_offer(&own, &[&base, &top], compression);
+        let again = blob_offer(&own, &[&base, &top], compression).await;
         let pulled = again.pull(&own, engine_check()).await.unwrap();
         if own.remote {
             assert!(pulled.layers.iter().all(|l| l.report.fetched_files == 0));
@@ -2624,12 +2498,14 @@ pub async fn a_layer_read_whole_asks_only_for_what_the_store_lacks(f: &Factory) 
         // the store has is recognised by it as the layer is read, not written
         // again, and counted as reused.
         let first = blob_offer(&s, &[&one], Compression::Gzip)
+            .await
             .pull(&s, engine_check())
             .await
             .expect("the first layer");
         let r = &first.layers[0].report;
         assert_eq!((r.fetched_files, r.reused_files), (3, 0), "{r:?}");
         let sharing = blob_offer(&s, &[&two], Compression::Gzip)
+            .await
             .pull(&s, engine_check())
             .await
             .expect("a layer that shares a file with it");
@@ -2638,6 +2514,7 @@ pub async fn a_layer_read_whole_asks_only_for_what_the_store_lacks(f: &Factory) 
         // a store of its own has neither
         let cold_store = second(f, &s, "cold").await;
         let cold = blob_offer(&cold_store, &[&two], Compression::Gzip)
+            .await
             .pull(&cold_store, engine_check())
             .await
             .expect("a cold pull");
@@ -2656,7 +2533,7 @@ pub async fn a_layer_read_whole_asks_only_for_what_the_store_lacks(f: &Factory) 
     };
     // the second layer in a store of its own: both its files
     let cold_store = second(f, &s, "cold").await;
-    let cold_offer = blob_offer(&cold_store, &[&two], Compression::Gzip);
+    let cold_offer = blob_offer(&cold_store, &[&two], Compression::Gzip).await;
     let cold = cold_offer
         .pull(&cold_store, engine_check())
         .await
@@ -2666,14 +2543,16 @@ pub async fn a_layer_read_whole_asks_only_for_what_the_store_lacks(f: &Factory) 
     assert_eq!(wanted(&cold_offer), [2], "the driver wants both files");
     // the layers, which the store has now: nothing is asked for
     blob_offer(&s, &[&one], Compression::Gzip)
+        .await
         .pull(&s, engine_check())
         .await
         .expect("the first layer");
     blob_offer(&s, &[&two], Compression::Gzip)
+        .await
         .pull(&s, engine_check())
         .await
         .expect("the second layer");
-    let all = blob_offer(&s, &[&one, &two], Compression::Gzip);
+    let all = blob_offer(&s, &[&one, &two], Compression::Gzip).await;
     let again = all.pull(&s, engine_check()).await.expect("what is there");
     assert!(again.layers.iter().all(|l| l.report.fetched_files == 0));
     assert!(wanted(&all).iter().all(|n| *n == 0), "nothing is asked for");
@@ -2687,7 +2566,7 @@ pub async fn a_layer_read_whole_asks_only_for_what_the_store_lacks(f: &Factory) 
         .file("d/c", &content, 0o644)
         .hardlink("d/h", "d/a")
         .done();
-    let o = blob_offer(&s, &[&shared], Compression::Gzip);
+    let o = blob_offer(&s, &[&shared], Compression::Gzip).await;
     let pulled = o.pull(&s, engine_check()).await.expect("shared files");
     assert_eq!(pulled.layers[0].report.fetched_files, 1);
     assert_eq!(wanted(&o), [1], "the object is asked for once");
@@ -2724,13 +2603,14 @@ pub async fn a_layer_read_whole_that_is_not_sound_stores_nothing(f: &Factory) {
     // bytes are what a registry or a disk gave)
     let o = blob_offer_with(&s, &[&base], Compression::Gzip, |_, b| {
         b[..b.len() / 2].to_vec()
-    });
+    })
+    .await;
     refused("a cut blob", o.pull(&s, engine_check()).await);
     assert_eq!(s.driver.usage().unwrap(), before, "nothing was stored");
     // a tar whose last file ends before its size says (the blob is the cut
     // tar, and so is the diff id)
     let cut = base[..base.len() - 4096].to_vec();
-    let mut o = blob_offer_with(&s, &[&base], Compression::None, |_, _| cut.clone());
+    let mut o = blob_offer_with(&s, &[&base], Compression::None, |_, _| cut.clone()).await;
     o.layers[0].diff_id = Digest::of(velarx_types::digest::Algorithm::Sha256, &cut);
     set_chains(&mut o.layers);
     refused("a cut tar", o.pull(&s, engine_check()).await);
@@ -2747,7 +2627,7 @@ pub async fn a_layer_read_whole_that_is_not_sound_stores_nothing(f: &Factory) {
         hostile.0.append(&h, &b"abc"[..]).unwrap();
     }
     let hostile = hostile.file("d/ok", b"fine", 0o644).done();
-    let mut o = blob_offer_with(&s, &[&base], Compression::None, |_, _| hostile.clone());
+    let mut o = blob_offer_with(&s, &[&base], Compression::None, |_, _| hostile.clone()).await;
     o.layers[0].diff_id = Digest::of(velarx_types::digest::Algorithm::Sha256, &hostile);
     set_chains(&mut o.layers);
     refused(
@@ -2763,10 +2643,8 @@ pub async fn a_layer_read_whole_that_is_not_sound_stores_nothing(f: &Factory) {
     }
     // a layer that inflates beyond the limits of `[pull]` (a small blob of
     // many zeros): refused as it is read, whatever the driver
-    let bomb = Tar::new().file("zeros", &vec![0u8; 8 << 20], 0o644).done();
-    let mut limits = Limits::from_config(&velarx_config::PullConfig::default());
-    limits.max_layer_bytes = 1 << 20;
-    let o = blob_offer_limited(&s, &[&bomb], Compression::Gzip, limits, |_, b| b.to_vec());
+    let bomb = Tar::new().file("zeros", &vec![0u8; 80 << 20], 0o644).done();
+    let o = blob_offer(&s, &[&bomb], Compression::Gzip).await;
     let e = refused(
         "a layer that inflates too much",
         o.pull(&s, engine_check()).await,
@@ -2788,7 +2666,7 @@ pub async fn a_feed_writes_a_layer_read_whole_into_the_files_a_driver_hands_over
         "a_feed_writes_a_layer_read_whole_into_the_files_a_driver_hands_over"
     );
     let (one, _) = chunked_layers();
-    let o = blob_offer(&s, &[&one], Compression::Gzip);
+    let o = blob_offer(&s, &[&one], Compression::Gzip).await;
     let feed: &dyn PullFeed = &*o.feed;
     let layer = &o.layers[0];
     let scratch = s.dir.join("scratch");
@@ -2887,7 +2765,7 @@ pub async fn a_feed_writes_a_layer_read_whole_into_the_files_a_driver_hands_over
     feed.end();
     // a driver that fetches without having asked for the index: the layer is
     // read when it is fetched
-    let again = blob_offer(&s, &[&one], Compression::Gzip);
+    let again = blob_offer(&s, &[&one], Compression::Gzip).await;
     let feed: &dyn PullFeed = &*again.feed;
     feed.begin(&begun).await.expect("a feed begins");
     let told: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -2917,19 +2795,7 @@ pub async fn a_feed_writes_a_layer_read_whole_into_the_files_a_driver_hands_over
         .await
         .expect("a fetch without an index");
     assert_eq!(*told.lock().unwrap(), [entries[2].0.clone()]);
-    // the spool of the layer is a file with no name in the engine's directory
-    // of the pull, open while the layer waits for its fetches, and gone with
-    // the end of the pull
-    let spools = || {
-        std::fs::read_dir("/proc/self/fd")
-            .unwrap()
-            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
-            .filter(|l| l.starts_with(&scratch))
-            .count()
-    };
-    assert!(spools() >= 1, "the spool of the layer is open");
     feed.end();
-    assert_eq!(spools(), 0, "the spool went with the end of the pull");
     // a place that is not zeros where the file has a hole: the copy keeps the
     // hole a hole, so the place reads back as other bytes than the key names;
     // the file is refused, not told whole
@@ -2937,7 +2803,7 @@ pub async fn a_feed_writes_a_layer_read_whole_into_the_files_a_driver_hands_over
     sparse[0] = 1;
     sparse[3 * 4096 - 1] = 2;
     let holey = Tar::new().file("h", &sparse, 0o644).done();
-    let third = blob_offer(&s, &[&holey], Compression::Gzip);
+    let third = blob_offer(&s, &[&holey], Compression::Gzip).await;
     let feed: &dyn PullFeed = &*third.feed;
     feed.begin(&begun).await.expect("a feed begins");
     let index = feed
@@ -2988,21 +2854,20 @@ pub async fn a_feed_writes_a_layer_read_whole_into_the_files_a_driver_hands_over
     feed.end();
 }
 
-/// A file copied from the spool of a layer read whole keeps its holes, and
-/// the driver is told of them (`zeros`) as it is for a layer fetched by
-/// ranges; the spool goes when the driver releases the layer (it has every
-/// file it lacks), before the pull ends, and a layer released twice is not an
-/// error.
-pub async fn a_layer_read_whole_tells_its_holes_and_frees_its_spool(f: &Factory) {
+/// A file copied from the files a layer read whole was unpacked to keeps its
+/// holes, and the driver is told of them (`zeros`) as it is for a layer
+/// fetched by ranges; a layer released is not read again, and a layer
+/// released twice is not an error.
+pub async fn a_layer_read_whole_tells_its_holes_and_is_released(f: &Factory) {
     use std::os::unix::fs::FileExt;
     use velarx_content::layer::writer::Compression;
     use velarx_content::pull::sink::{FilesSink, Slot, Written};
-    let (_tmp, s) = begin!(f, "a_layer_read_whole_tells_its_holes_and_frees_its_spool");
+    let (_tmp, s) = begin!(f, "a_layer_read_whole_tells_its_holes_and_is_released");
     let mut sparse = vec![0u8; 4 * 4096];
     sparse[0] = 1;
     sparse[4 * 4096 - 1] = 2;
     let holey = Tar::new().file("h", &sparse, 0o644).done();
-    let o = blob_offer(&s, &[&holey], Compression::Gzip);
+    let o = blob_offer(&s, &[&holey], Compression::Gzip).await;
     let feed: &dyn PullFeed = &*o.feed;
     let layer = &o.layers[0];
     let scratch = s.dir.join("scratch");
@@ -3017,14 +2882,6 @@ pub async fn a_layer_read_whole_tells_its_holes_and_frees_its_spool(f: &Factory)
         .find(|e| e.has_content())
         .and_then(|e| e.content_key())
         .expect("the key of the file");
-    let spools = || {
-        std::fs::read_dir("/proc/self/fd")
-            .unwrap()
-            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
-            .filter(|l| l.starts_with(&scratch))
-            .count()
-    };
-    assert!(spools() >= 1, "the spool of the layer is open");
     let place = tempfile::tempfile().unwrap();
     let events: Arc<Mutex<Vec<(String, u64, u64)>>> = Arc::default();
     let whole: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -3066,9 +2923,9 @@ pub async fn a_layer_read_whole_tells_its_holes_and_frees_its_spool(f: &Factory)
             "the hole of the file"
         );
     }
-    // released: the spool goes now, not with the end of the pull
+    // released: what is held of the layer goes now, not with the end of the
+    // pull, and a layer released twice is no error
     feed.release(layer);
-    assert_eq!(spools(), 0, "the spool went with the release");
     feed.release(layer);
     // what is asked of a released layer is refused, not read whole again
     match feed.fetch(layer, &into).await {
@@ -3079,7 +2936,6 @@ pub async fn a_layer_read_whole_tells_its_holes_and_frees_its_spool(f: &Factory)
         Err(e) => assert!(e.to_string().contains("released"), "{e}"),
         Ok(_) => panic!("an index of a released layer"),
     }
-    assert_eq!(spools(), 0, "nothing was read again");
     feed.end();
 }
 
@@ -3123,7 +2979,7 @@ pub async fn a_layer_keyed_by_sha256_only_is_refused(f: &Factory) {
     let mut layers = vec![layer];
     set_chains(&mut layers);
     let offer = Offer {
-        feed: Arc::new(ArchiveFeed {
+        feed: Arc::new(OfferFeed {
             layers: vec![(
                 digest,
                 registry_feed(&reg, &s.db, &s.dir, &layers[0].descriptor, false).await,
@@ -3157,7 +3013,7 @@ pub async fn a_gzip_layer_of_a_registry_is_pulled_and_read_back(f: &Factory) {
         set_chains(&mut layers);
         async {
             Offer {
-                feed: Arc::new(ArchiveFeed {
+                feed: Arc::new(OfferFeed {
                     layers: vec![(
                         layers[0].descriptor.digest,
                         registry_feed(&reg, &s.db, &s.dir, &layers[0].descriptor, false).await,
@@ -4145,9 +4001,7 @@ pub async fn a_lazy_image_has_a_plan_if_the_driver_is_lazy(f: &Factory) {
 fn lazy_phase(s: &Subject, case: &str) -> bool {
     let lazy = s.driver.capabilities().lazy && !s.driver.holds_objects();
     if lazy && !s.chunked_only {
-        eprintln!(
-            "SKIPPED conformance::{case}: the layers are archives, a lazy pull needs a registry"
-        );
+        eprintln!("SKIPPED conformance::{case}: the layers have no table, a lazy pull needs one");
         return false;
     }
     if !lazy {
@@ -4167,7 +4021,7 @@ async fn lazy_offer(s: &Subject, reg: &Registry, tar: &[u8], verity: bool) -> Of
     set_chains(&mut layers);
     let feed = registry_feed(reg, &s.db, &s.dir, &layers[0].descriptor, true).await;
     Offer {
-        feed: Arc::new(ArchiveFeed {
+        feed: Arc::new(OfferFeed {
             layers: vec![(layers[0].descriptor.digest, feed)],
             meddle: Arc::default(),
         }),
@@ -6847,7 +6701,7 @@ macro_rules! conformance_suite_with {
             a_layer_read_whole_asks_only_for_what_the_store_lacks,
             a_layer_read_whole_that_is_not_sound_stores_nothing,
             a_feed_writes_a_layer_read_whole_into_the_files_a_driver_hands_over,
-            a_layer_read_whole_tells_its_holes_and_frees_its_spool,
+            a_layer_read_whole_tells_its_holes_and_is_released,
             pull_reads_back_byte_for_byte,
             a_layer_keyed_by_sha256_only_is_refused,
             a_gzip_layer_of_a_registry_is_pulled_and_read_back,

@@ -25,6 +25,7 @@ use tracing::debug;
 use velarx_config::{Config, PullConfig, PushConfig};
 use velarx_content::activation::{self, IdleExit};
 use velarx_content::fetcher::proto::{Downloaded, Hit, RegistryError, Remote};
+use velarx_content::list::RegistrySettings;
 use velarx_content::pull::Limits;
 use velarx_content::serve_fetch::Out;
 use velarx_content::serve_registry::{RegistryCalls, RemoteCall};
@@ -562,12 +563,17 @@ fn hits_of(v1: bool, body: &[u8], needle: &str) -> Result<Vec<Hit>, serde_json::
     Ok(found)
 }
 
-/// The configuration the starter gave in a file with no name (`file`), else
-/// the one at `path`.
-fn load_config(file: Option<std::os::fd::OwnedFd>, path: &Path) -> anyhow::Result<Config> {
+/// The settings the starter gave in a file with no name (`file`), else
+/// those of the configuration at `path`.
+fn load_settings(
+    file: Option<std::os::fd::OwnedFd>,
+    path: &Path,
+) -> anyhow::Result<RegistrySettings> {
     match file {
-        Some(config_file) => Ok(velarx_content::list::config_from_fd(config_file)?),
-        None => Ok(Config::load_or_default(path)?),
+        Some(config_file) => Ok(velarx_content::list::registry_settings_from_fd(
+            config_file,
+        )?),
+        None => Ok(RegistrySettings::of(&Config::load_or_default(path)?)),
     }
 }
 
@@ -675,7 +681,7 @@ pub fn main(
     // that outlives its purpose is a right nobody granted)
     startup.close_range(3, u32::MAX);
     velarx_base::hardening::harden()?;
-    let config = load_config(config_file, &config_path)?;
+    let config = load_settings(config_file, &config_path)?;
     let worker = config
         .pull
         .worker_path

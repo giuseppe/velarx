@@ -2,11 +2,10 @@
 //! Image archives and imports on top of the pull engine.
 
 use super::pull::Incoming;
+use super::pull_origin::{images_of, Via};
 use super::*;
-use velarx_content::archive::Archive;
+use velarx_content::pull::net::origin::{OriginNet, PathOrigin};
 use velarx_content::pull::net::Net;
-use velarx_content::pull::Source;
-use velarx_types::digest::DigestWriter;
 
 /// An image that was loaded.
 #[derive(Debug, Clone, Serialize)]
@@ -163,67 +162,18 @@ impl ImageService {
             Some(n) => Some(local_reference(n)?),
             None => None,
         };
-        let max = self.pull_config.max_layer_gib.max(1) * 1024 * 1024 * 1024;
-        let staging = self.staging_dir.clone();
-        let (archive, layer, diff_id) = tokio::task::spawn_blocking(move || -> ImageResult<_> {
-            std::fs::create_dir_all(&staging)?;
-            let mut input = input;
-            let mut size = input.metadata()?.len();
-            // nothing is an empty file system, as for Docker: the end of a
-            // tar archive alone
-            if size == 0 {
-                let mut empty = velarx_content::pull::unnamed::unnamed_file(&staging)?;
-                std::io::Write::write_all(&mut empty, &[0u8; 1024])?;
-                input = empty;
-                size = 1024;
-            }
-            let mut head = [0u8; 4];
-            let n = std::os::unix::fs::FileExt::read_at(&input, &mut head, 0)?;
-            let mut media_type = velarx_content::archive::sniff_layer_media_type(&head[..n]);
-            // The blob digest, and the diff id once it is decompressed.
-            let mut blob = Digest::of_file_at(alg, &input, size)?.0;
-            // (a tar is its own diff id)
-            let (mut diff_id, sparse) =
-                if media_type == velarx_content::archive::LAYER && size <= max {
-                    let mut ar = tar::Archive::new(std::io::BufReader::new(at_start(&input)?));
-                    // (an archive the tar crate cannot read is the layer's
-                    // to refuse)
-                    let sparse = ar
-                        .entries_with_seek()
-                        .and_then(velarx_wire::sparse::any_sparse)
-                        .unwrap_or(false);
-                    (blob, sparse)
-                } else {
-                    diff_id(&input, media_type, max, alg)?
-                };
-            // A layer has no sparse file: the tar of the import, its sparse
-            // files written whole (as podman's import does), the zeros of
-            // the holes holes of the file that holds the tar.
-            if sparse {
-                let (expanded, digest) =
-                    expand_sparse(decoded(&input, media_type)?, &staging, max, alg)
-                        .map_err(|e| ImageError::Layer(format!("the archive: {e}")))?;
-                input = expanded;
-                size = input.metadata()?.len();
-                media_type = velarx_content::archive::LAYER;
-                blob = digest;
-                diff_id = digest;
-            }
-            let archive = Archive::single(input, blob, size);
-            Ok((
-                archive,
-                OciDescriptor {
-                    media_type: media_type.to_string(),
-                    digest: blob,
-                    size: size as i64,
-                    annotations: HashMap::new(),
-                },
-                diff_id,
-            ))
-        })
-        .await
-        .map_err(|e| ImageError::Layer(e.to_string()))??;
-
+        // The tar is read by the origin of a path, confined, as any other
+        // path is: the image of one layer that it serves has the blob (the
+        // file as given), the diff id and nothing else of what is made here.
+        let started = PathOrigin::start(
+            self.origin()?,
+            &format!("rootfs:{alg}"),
+            input.into(),
+            self.staging_verity(),
+        )
+        .await?;
+        let net = Net::Origin(OriginNet::of_path(started.clone()));
+        let (layer, diff_id) = one_layer(&net).await?;
         let now = chrono::Utc::now().to_rfc3339();
         let host = velarx_registry::target::Platform::host();
         let p = platform.unwrap_or(&host);
@@ -278,8 +228,7 @@ impl ImageService {
             manifest_bytes: Bytes::from(manifest_bytes),
             manifest_digest,
             config_bytes: Bytes::from(config_bytes),
-            source: Some(Source::Archive(Arc::new(archive))),
-            via: None,
+            via: Some(Via::Path(started)),
             made: Vec::new(),
             registry_ref: None,
             tags,
@@ -297,7 +246,6 @@ impl ImageService {
         };
         let (progress, mut rx) = mpsc::channel(8);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let net = Net::offline();
         let result = self
             .install(net, incoming, progress, std::time::Instant::now())
             .await?;
@@ -305,108 +253,31 @@ impl ImageService {
     }
 }
 
-/// `file` from its start.
-fn at_start(file: &File) -> std::io::Result<File> {
-    use std::io::{Seek, SeekFrom};
-    let mut input = file.try_clone()?;
-    input.seek(SeekFrom::Start(0))?;
-    Ok(input)
-}
-
-/// The tar in `file`, decompressed.
-fn decoded(file: &File, media_type: &str) -> std::io::Result<Box<dyn std::io::Read>> {
-    let reader = std::io::BufReader::new(at_start(file)?);
-    use velarx_content::decompress::{Decoder, Kind};
-    let kind = if media_type.ends_with("gzip") {
-        Kind::Gzip
-    } else if media_type.ends_with("zstd") {
-        Kind::Zstd
-    } else {
-        Kind::None
+/// The layer of the one image the origin of an import serves, and its diff
+/// id.
+async fn one_layer(net: &Net) -> ImageResult<(OciDescriptor, Digest)> {
+    let refuse = |what: &str| {
+        ImageError::transfer_of(
+            "dir",
+            "the index",
+            velarx_proto::transfer::FailureClass::Invalid,
+            what.to_string(),
+        )
     };
-    Ok(Box::new(Decoder::new(kind, reader)?))
-}
-
-/// The tar `input` with its sparse entries made regular files, in a file
-/// without a name in `dir` whose zeros are holes, and its digest.
-fn expand_sparse(
-    input: impl std::io::Read,
-    dir: &std::path::Path,
-    max: u64,
-    alg: Algorithm,
-) -> std::io::Result<(File, Digest)> {
-    let file = velarx_content::pull::unnamed::unnamed_file(dir)?;
-    let out = HashedOut {
-        out: velarx_storage::SparseWriter::new(&file),
-        hasher: DigestWriter::new(alg),
+    let images = images_of(&net.path_index().await?)?;
+    let [(digest, _)] = images.as_slice() else {
+        return Err(refuse("the origin of an import has not one image"));
     };
-    let out = velarx_wire::sparse::expand(input, out, max)?;
-    out.out.finish()?;
-    let digest = out.hasher.finalize();
-    Ok((file, digest))
-}
-
-/// What is written, hashed.
-struct HashedOut<W> {
-    out: W,
-    hasher: DigestWriter,
-}
-
-impl<W: std::io::Write> std::io::Write for HashedOut<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.hasher.update(buf);
-        self.out.write(buf)
+    let image_ref = ImageReference::parse(&format!("localhost/image@{digest}"))?;
+    let (manifest, _, _, _) = net.manifest_raw(&image_ref, None, None).await?;
+    let (config, _) = net.config_raw(&manifest.config).await?;
+    match (
+        manifest.layers.as_slice(),
+        config.rootfs.diff_ids.as_slice(),
+    ) {
+        ([layer], [diff_id]) => Ok((layer.clone(), *diff_id)),
+        _ => Err(refuse("the image of an import has not one layer")),
     }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.out.flush()
-    }
-}
-
-/// The digest of the tar in `file` once decompressed, at most `max` bytes,
-/// and whether it has a sparse entry (seen in the same pass).
-fn diff_id(file: &File, media_type: &str, max: u64, alg: Algorithm) -> ImageResult<(Digest, bool)> {
-    use std::io::Read;
-    /// The bytes read, hashed and counted.
-    struct Hashed<R> {
-        inner: R,
-        hasher: DigestWriter,
-        total: u64,
-        max: u64,
-    }
-    impl<R: Read> Read for Hashed<R> {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if self.total > self.max {
-                return Err(std::io::Error::other("too large"));
-            }
-            let n = self.inner.read(buf)?;
-            self.total += n as u64;
-            if self.total > self.max {
-                return Err(std::io::Error::other("too large"));
-            }
-            self.hasher.update(&buf[..n]);
-            Ok(n)
-        }
-    }
-    let mut hashed = Hashed {
-        inner: decoded(file, media_type)?,
-        hasher: DigestWriter::new(alg),
-        total: 0,
-        max,
-    };
-    // (an archive the tar crate cannot read is the layer's to refuse)
-    let sparse = tar::Archive::new(&mut hashed)
-        .entries()
-        .and_then(velarx_wire::sparse::any_sparse)
-        .unwrap_or(false);
-    let rest = std::io::copy(&mut hashed, &mut std::io::sink());
-    if hashed.total > max {
-        return Err(ImageError::Layer(format!(
-            "the archive is larger than {max} bytes once uncompressed"
-        )));
-    }
-    rest?;
-    Ok((hashed.hasher.finalize(), sparse))
 }
 
 /// A name for an imported image: without a registry it is `localhost/`.
@@ -464,78 +335,6 @@ mod tests {
             tag: tag.into(),
             image_id: "abcdef012345".into(),
         }
-    }
-
-    /// The tar of an import with a sparse entry (old GNU format) whose file
-    /// has `real` bytes: a few at the start and the end, a hole between.
-    fn sparse_tar(real: u64) -> Vec<u8> {
-        let octal = |v: u64| {
-            let mut b = [0u8; 12];
-            b[..11].copy_from_slice(format!("{v:011o}").as_bytes());
-            b
-        };
-        let mut h = tar::Header::new_gnu();
-        h.set_path("hole").unwrap();
-        h.set_entry_type(tar::EntryType::GNUSparse);
-        h.set_size(1024);
-        h.set_mode(0o644);
-        {
-            let g = h.as_gnu_mut().unwrap();
-            g.realsize = octal(real);
-            for (i, (off, len)) in [(0, 512), (real - 512, 512), (real, 0)].iter().enumerate() {
-                g.sparse[i].offset = octal(*off);
-                g.sparse[i].numbytes = octal(*len);
-            }
-        }
-        h.set_cksum();
-        let mut out = h.as_bytes().to_vec();
-        out.extend([b'h'; 512]);
-        out.extend([b't'; 512]);
-        out.extend([0u8; 1024]);
-        out
-    }
-
-    /// The tar of an import with a hole of 256 MiB takes the blocks of its
-    /// data, not of its zeros, and its digest is that of the tar with the
-    /// zeros.
-    #[test]
-    fn the_tar_of_an_import_keeps_the_holes_of_a_sparse_entry() {
-        use std::os::unix::fs::{FileExt, MetadataExt};
-        let real = 256 << 20;
-        let dir = tempfile::tempdir().unwrap();
-        let tar = sparse_tar(real);
-        assert!(tar.len() < 4096);
-        let (file, digest) =
-            expand_sparse(&tar[..], dir.path(), real * 2, Algorithm::Sha256).unwrap();
-        let size = file.metadata().unwrap().len();
-        assert!(size > real);
-        // (a file system that has no holes is not tested)
-        let probe = tempfile::tempfile_in(dir.path()).unwrap();
-        probe.set_len(1 << 20).unwrap();
-        if probe.metadata().unwrap().blocks() == 0 {
-            let blocks = file.metadata().unwrap().blocks();
-            assert!(blocks * 512 < 1 << 20, "{blocks} blocks of 512 bytes");
-        }
-        // the content is that of a regular file
-        let mut head = [0u8; 4];
-        file.read_exact_at(&mut head, 512).unwrap();
-        assert_eq!(&head, b"hhhh");
-        let mut tail = [0u8; 4];
-        file.read_exact_at(&mut tail, 512 + real - 4).unwrap();
-        assert_eq!(&tail, b"tttt");
-        let mut middle = [1u8; 4];
-        file.read_exact_at(&mut middle, 512 + real / 2).unwrap();
-        assert_eq!(middle, [0; 4]);
-        // (the digest of what a reader gives)
-        let mut hasher = DigestWriter::new(Algorithm::Sha256);
-        let mut at = 0;
-        let mut buf = vec![0u8; 1 << 20];
-        while at < size {
-            let n = file.read_at(&mut buf, at).unwrap();
-            hasher.update(&buf[..n]);
-            at += n as u64;
-        }
-        assert_eq!(digest, hasher.finalize());
     }
 
     #[test]

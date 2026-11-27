@@ -809,7 +809,6 @@ impl ImageService {
             manifest_bytes: Bytes::from(manifest_bytes),
             manifest_digest,
             config_bytes: Bytes::from(config_bytes),
-            source: None,
             via: None,
             made,
             registry_ref: None,

@@ -220,7 +220,7 @@ impl StagingFetcher for HttpLayout {
     fn described(&self) -> Described {
         Described {
             name: "httplayout".into(),
-            capabilities: vec!["metadata".into(), "unpack".into(), "origin".into()],
+            capabilities: vec!["metadata".into(), "origin".into()],
             max_objects: 1,
         }
     }

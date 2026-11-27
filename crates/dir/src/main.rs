@@ -199,8 +199,8 @@ fn origin_reach(
 ) -> anyhow::Result<velarx_sandbox::fetch::Reach> {
     let mut reach = velarx_sandbox::fetch::dir_origin_reach();
     reach.staging = Some(staging.clone());
-    // (`archive:` is either kind: a directory is read beneath, a file is read
-    // from the descriptor)
+    // (`archive:` and `rootfs:` are either kind: a directory is read beneath,
+    // a file is read from the descriptor)
     let is_directory = rustix::fs::FileType::from_raw_mode(rustix::fs::fstat(target)?.st_mode)
         == rustix::fs::FileType::Directory;
     if is_directory {

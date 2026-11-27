@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use velarx_content::pull::staged_fetch::StagedFetch;
-use velarx_content::pull::Source;
 use velarx_content::serve_fetch::LocalFetcher;
 use velarx_registry::client::RegistryClient;
 use velarx_registry::target::EndpointSpec;
@@ -294,13 +293,12 @@ impl Registry {
     }
 
     /// The registry fetcher of a pull of the layers `layers` from this
-    /// registry, with the staging of the layers beneath
-    /// `staging`, and where the layers are pulled from.
+    /// registry, with the staging of the layers beneath `staging`.
     pub async fn staged(
         &self,
         staging: &std::path::Path,
         layers: &[OciDescriptor],
-    ) -> (Arc<StagedFetch>, Source) {
+    ) -> Arc<StagedFetch> {
         let spec = EndpointSpec {
             host: self.host.clone(),
             repository: "r".into(),
@@ -314,7 +312,7 @@ impl Registry {
             min_speed: Default::default(),
             scheme: None,
         };
-        let (fetch_client, target) = RegistryClient::from_specs(&[spec]).unwrap();
+        let (fetch_client, _) = RegistryClient::from_specs(&[spec]).unwrap();
         let pull = velarx_config::PullConfig {
             worker_path: Some(registry_binary()),
             ..Default::default()
@@ -380,7 +378,11 @@ impl Registry {
         };
         let manifest = serde_json::to_vec(&manifest).unwrap();
         let staged = StagedFetch::open(
-            (Vec::new(), Some(conn), Vec::new()),
+            (
+                Vec::new(),
+                Some((conn, std::time::Duration::from_secs(120))),
+                Vec::new(),
+            ),
             staging,
             false,
             (&format!("{}/r", self.host), false),
@@ -389,6 +391,6 @@ impl Registry {
         )
         .await
         .expect("the list of the pull");
-        (staged, Source::Registry(Box::new(target)))
+        staged
     }
 }

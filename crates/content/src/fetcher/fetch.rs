@@ -31,8 +31,8 @@ pub const PROFILE_MAX_BYTES: u64 = 512 * 1024;
 pub const SIGNATURES_MAX_BYTES: u64 = 1 << 20;
 
 /// The capability words.
-pub const CAPABILITIES: [&str; 9] = [
-    "objects", "unpack", "metadata", "lazy", "sha512", "reuse", "origin", "handover", "table",
+pub const CAPABILITIES: [&str; 6] = [
+    "objects", "metadata", "reuse", "origin", "handover", "table",
 ];
 
 /// How much a request is waited for.  It orders a fetcher's work.

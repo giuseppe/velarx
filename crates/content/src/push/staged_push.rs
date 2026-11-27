@@ -62,12 +62,14 @@ pub struct Destinations {
     pub helpers: String,
     pub origin: String,
     pub tls_verify: Option<bool>,
+    /// How long the origin may be silent in a call
+    pub idle: std::time::Duration,
     /// The origin is a pusher of the configuration that the push does not
     /// start (`[[transports]]`): the name the configuration gives it
-    /// (what the errors name, not what it says of itself) and how long it
-    /// may be silent in a call.  None: the origin is the registry's or the
-    /// directory's, which the engine runs and whose transport waits
-    pub external_origin: Option<(String, std::time::Duration)>,
+    /// (what the errors name, not what it says of itself).  None: the
+    /// origin is the registry's or the directory's, which the engine runs
+    /// and whose transport waits
+    pub external_origin: Option<String>,
 }
 
 /// One pusher of the list of a push: the connection that has its scope.
@@ -222,10 +224,6 @@ impl StagedPush {
             }
         }
         let access = sealed()?;
-        let origin_idle = destinations
-            .external_origin
-            .as_ref()
-            .map_or(crate::pull::staged_fetch::REGISTRY_IDLE, |(_, idle)| *idle);
         let opening = async {
             let info = end.push_get_info().await?;
             end.push_open(PushScoping {
@@ -233,19 +231,20 @@ impl StagedPush {
                 tls_verify: destinations.tls_verify,
                 target,
                 access,
-                idle: origin_idle,
+                idle: destinations.idle,
                 requires: &["origin".to_string()],
             })
             .await?;
             Ok::<_, CallError>(info)
         };
         let (info, name, idle) = match &destinations.external_origin {
-            Some((name, idle)) => {
-                let opened = tokio::time::timeout(*idle, opening)
+            Some(name) => {
+                let idle = destinations.idle;
+                let opened = tokio::time::timeout(idle, opening)
                     .await
-                    .unwrap_or_else(|_| Err(silent(*idle)));
+                    .unwrap_or_else(|_| Err(silent(idle)));
                 let info = opened.map_err(|e| origin_error(name, true, e))?;
-                (info, name.clone(), Some(*idle))
+                (info, name.clone(), Some(idle))
             }
             None => {
                 let info = opening.await.map_err(|e| image_error("registry", e))?;
@@ -959,6 +958,7 @@ mod tests {
                 helpers: "registry.example/name".into(),
                 origin: "registry.example/name".into(),
                 tls_verify: None,
+                idle: crate::pull::staged_fetch::TEST_IDLE,
                 external_origin: None,
             },
             Some(b"{}"),
