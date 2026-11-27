@@ -618,7 +618,7 @@ fn releasing_of(plan: &SettlePlan) -> confine::Releasing {
         pods_dir: plan.pod.as_ref().map(|p| p.pods_dir.clone()),
         recording: recording_of(plan),
         state_dir,
-        network_lock: PathBuf::from("/run/velarx-networks.lock"),
+        network_lock: velarx_netkernel::bridge::shared_lock(),
         unix_dirs,
     }
 }

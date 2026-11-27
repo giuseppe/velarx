@@ -30,6 +30,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use velarx_base::dirs::DefaultDirs;
 use velarx_wire::addr::{valid_ifname, PortSpec, Route, Subnet, Subnet6};
 
 pub const NETWORK_LOCK: &str = "network.lock";
@@ -259,7 +260,7 @@ fn where_bridges<T: Send + 'static>(
     // that deletes it with the last bridge must not race with another that
     // makes a bridge.
     let _shared = if opts.netns.is_none() && rustix::process::geteuid().is_root() {
-        Some(lock_file(Path::new(SHARED_LOCK))?)
+        Some(lock_in(&shared_lock())?)
     } else {
         None
     };
@@ -284,16 +285,28 @@ pub fn is_nsfs(path: &Path) -> bool {
 }
 
 /// The lock of the root engines that set up bridges in their namespace:
-/// all of them, whatever their roots.
-const SHARED_LOCK: &str = "/run/velarx-networks.lock";
+/// all of them, whatever their roots.  It lives in the run directory of
+/// root.
+pub fn shared_lock() -> PathBuf {
+    DefaultDirs::resolve(true, |_| None)
+        .run
+        .join("networks.lock")
+}
 
 /// Lock the networks of the run root: released when the file is dropped.
 pub fn lock_networks(state: &Path) -> io::Result<File> {
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(state)?;
-    lock_file(&state.join(NETWORK_LOCK))
+    lock_in(&state.join(NETWORK_LOCK))
+}
+
+/// Lock PATH, in a directory made if it is not there.
+fn lock_in(path: &Path) -> io::Result<File> {
+    if let Some(dir) = path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    lock_file(path)
 }
 
 /// Lock PATH (created): released when the file is dropped.
@@ -974,6 +987,13 @@ pub fn unpin_netns(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lock of the root engines is in the run directory of root, not
+    /// beside it in `/run`.
+    #[test]
+    fn the_shared_lock_is_in_the_run_directory_of_root() {
+        assert_eq!(shared_lock(), Path::new("/run/velarx/networks.lock"));
+    }
 
     /// The purge of a setup keeps the rules of a bridge of velarx that has
     /// no port (another engine's, being set up), and removes those of a

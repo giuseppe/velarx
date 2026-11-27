@@ -180,6 +180,10 @@ teardown_file () {
     check_match "the name of the bridge is not a name of the network" "[1-9]" "$?"
 }
 
+@test "the lock of the root engines is in the run directory of root" {
+    check "the lock is in /run/velarx" yes "$([ -f /run/velarx/networks.lock ] && echo yes)"
+}
+
 @test "network create, an overlapping subnet" {
     sh_ network create --subnet 10.213.4.0/24 brnet > /dev/null
     check "network create" 0 $?

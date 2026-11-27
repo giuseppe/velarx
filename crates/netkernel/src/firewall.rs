@@ -669,8 +669,8 @@ impl Firewall {
     /// chains, and the chains.  LIVE tells whether a bridge is in use.
     ///
     /// Engines of the host share the table, and not all of them take the
-    /// lock of the root engines (`/run/velarx-networks.lock`: an engine with
-    /// a `/run` of its own, in a container), so another one can add or
+    /// lock of the root engines (`/run/velarx/networks.lock`: an engine
+    /// with a `/run` of its own, in a container), so another one can add or
     /// delete the same elements and chains between the read and the delete
     /// (EBUSY: a chain a new element still jumps to; not found: already
     /// gone, or the table taken down): the pass is read again and retried,
