@@ -483,7 +483,8 @@ lazy_profile_peers = true
 # digests are verified and a source that fails, sends wrong bytes or is too
 # slow is skipped and the next one is asked.
 # interfaces/org.velarx.Fetcher.varlink is the interface to write one.  A
-# list of several: ["dircache", "p2p", "registry"].
+# list of several: ["dircache", "p2p", "registry"].  A registry that cannot be
+# reached is left out of the signatures when a source before it gave some.
 # sources = ["registry"]
 # Where a tag is resolved to the digest of its manifest, in the order written:
 # "registry" (the registry says what a tag names), or the name of a source that

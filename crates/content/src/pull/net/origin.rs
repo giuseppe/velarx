@@ -332,7 +332,9 @@ impl OriginNet {
     /// with the digest (`@DIGEST`).  The registry fetcher reads the
     /// lookaside storage on the network and the sigstore attachments; an
     /// error of it is the pull's, as the fetchers of `[pull] sources` have
-    /// none (what they cannot give is left out).
+    /// none (what they cannot give is left out), unless it cannot be
+    /// reached and a source before it gave records: fewer signatures can
+    /// only make the policy refuse more.
     pub async fn fetched_signatures(
         &self,
         reference: &str,
@@ -344,7 +346,19 @@ impl OriginNet {
                 Source::Fetchers(fetchers) => {
                     records.extend(fetchers.signatures(&digest.to_string()).await);
                 }
-                Source::Registry => records.extend(self.registry_signatures(reference).await?),
+                Source::Registry => match self.registry_signatures(reference).await {
+                    Ok(given) => records.extend(given),
+                    Err(e)
+                        if !records.is_empty()
+                            && matches!(
+                                e.class(),
+                                Some(FailureClass::Transient | FailureClass::Unavailable)
+                            ) =>
+                    {
+                        tracing::debug!("The registry gives no signatures: {e}");
+                    }
+                    Err(e) => return Err(e),
+                },
             }
         }
         Ok(records)
@@ -874,6 +888,30 @@ mod tests {
                 ("sha256:bb", &["c".to_string()][..])
             ]
         );
+    }
+
+    /// The registry cannot be reached: the records of a fetcher before it
+    /// are judged, and with no record before it the pull has the error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_signatures_of_a_fetcher_are_judged_when_the_registry_is_not_reached() {
+        let body = br#"[{"digest":"sha256:aa","signatures":["a"]}]"#;
+        let (fetchers, _keep) = sources_of(body).await;
+        let digest = Digest::of(velarx_types::digest::Algorithm::Sha256, b"manifest");
+        let net = |sources: Vec<Source>| {
+            OriginNet::of_transport(
+                velarx_config::Reach::Socket("/nonexistent/velarx-registry.sock".into()),
+                std::time::Duration::from_secs(5),
+                "docker://example.com/a".into(),
+                true,
+            )
+            .with_sources(sources)
+        };
+        let after = net(vec![Source::Fetchers(fetchers), Source::Registry]);
+        let got = after.fetched_signatures("example.com/a", &digest).await;
+        assert_eq!(got.unwrap()[0].signatures, ["a"]);
+        let alone = net(vec![Source::Registry]);
+        let refused = alone.fetched_signatures("example.com/a", &digest).await;
+        assert!(refused.is_err());
     }
 
     async fn sources_of(bytes: &[u8]) -> (Arc<MetadataSources>, crate::serve_fetch::LocalFetcher) {
