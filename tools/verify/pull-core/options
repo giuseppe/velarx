@@ -1,5 +1,0 @@
-# SPDX-License-Identifier: Apache-2.0
-# What ../run passes to Charon and Aeneas for this crate, besides what
-# every crate gets.
-CHARON_FLAGS=
-AENEAS_FLAGS=

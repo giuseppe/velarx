@@ -1,6 +1,6 @@
 -- SPDX-License-Identifier: Apache-2.0
 -- What this file is: the one notion the proofs of the crates are written in
--- (lazy-core and pull-core; ./run copies it next to Proved.lean).
+-- (lazy-core; ./run copies it next to Proved.lean).
 --
 -- Aeneas turns each Rust function into a Lean function that returns a
 -- `Result`: either `ok x` (the function returned `x`) or `fail e` (it
@@ -14,8 +14,7 @@
 -- panic or of a loop that does not end.  This is on purpose: the
 -- functions of the standard library that have no model (Models.lean) may
 -- do either, and the statements of Spec.lean only speak of runs that
--- return (`step c now event out = ok (c', out')` for lazy-core,
--- `Core.end c p published = ok c'` for pull-core).
+-- return (`step c now event out = ok (c', out')` for lazy-core).
 --
 -- Why it is needed: the proofs follow a Rust function line by line, and
 -- a line is a `bind` (`let x <- m; rest`).  `Ok.bind` is the rule to go

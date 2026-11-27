@@ -551,27 +551,6 @@ forward_storage_driver! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use velarx_graph::conformance::conformance_suite;
-    use velarx_storage_client::VarlinkDriver;
-    use velarx_storage_server::conformance::factory;
-
-    /// The service behind the lazy phase, over the files of the subject.
-    fn lazy(
-        client: Arc<VarlinkDriver>,
-        db: &velarx_db::Database,
-        store: &Arc<velarx_storage::FileStore>,
-        staging: &std::path::Path,
-    ) -> Arc<dyn StorageDriver> {
-        let dir = staging.parent().expect("a directory of the subject");
-        let local = ComposefsDriver::new(
-            db.clone(),
-            store.clone(),
-            staging.to_path_buf(),
-            velarx_storage::VerityMode::Off,
-            composefs::options_for_tests(dir),
-        );
-        Arc::new(LazyPhase::new(client, Arc::new(local)))
-    }
 
     /// The engine's copy of a lazy image: the pins of the containers whose
     /// root the engine serves, and what a release drops.
@@ -967,17 +946,5 @@ mod tests {
             assert!(!c.phase.pin_path(&w).unwrap().exists(), "unpinned");
             assert!(!c.local.writable_exists(&w).unwrap());
         }
-    }
-
-    /// The layers come as zstd:chunked blobs of a registry.
-    mod chunked {
-        use super::*;
-        conformance_suite!(factory(true, lazy));
-    }
-
-    /// The layers come as tars of a registry read whole.
-    mod whole {
-        use super::*;
-        conformance_suite!(factory(false, lazy));
     }
 }

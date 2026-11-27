@@ -86,7 +86,6 @@ velarx-wire = { path = "../wire", features = ["test-support"] }
 velarx-storage = { path = "../storage", features = ["test-support"] }
 velarx-db = { path = "../db", features = ["test-support"] }
 velarx-content = { path = "../content", features = ["test-support"] }
-velarx-storage-server = { path = "../storage-server", features = ["conformance"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
