@@ -1116,3 +1116,17 @@ cidr = "10.192.0.0/10"
 # started for each pull or push, exactly one of the two)
 # idle_timeout_secs = 15
 # credentials = false
+#
+# An OCI image layout published as static files over HTTP(S) (a bucket of S3,
+# GCS or Azure, or any web server) is an origin of pulls with
+# examples/httplayout.rs: `velarx pull oci+https://host/path/layout:TAG` (TAG:
+# the `org.opencontainers.image.ref.name` of its entry of index.json, or its
+# tag; a layout of one image needs none).  It sends no credentials, asks for
+# no ranges (its layers are pulled whole) and does not confine itself.  One
+# entry for each of the two protocols:
+# [[transports]]
+# scheme = "oci+https"
+# command = ["/usr/local/bin/httplayout"]
+# [[transports]]
+# scheme = "oci+http"
+# command = ["/usr/local/bin/httplayout"]

@@ -211,6 +211,16 @@ user of the engine; the program leaves at the end of the connection, and the
 engine kills it when it is silent for
 .BR idle_timeout_secs .
 It is for a program that keeps nothing between uses.
+The example
+.B httplayout
+(examples/httplayout.rs) is such a transport for the schemes
+.B oci+https
+and
+.BR oci+http :
+it pulls an OCI image layout published as static files, with
+.BR "velarx pull oci+https://HOST/PATH:TAG" .
+It sends no credentials, asks for no ranges (its layers are pulled
+whole) and does not confine itself.
 .TP
 .B build
 The builds: what an extraction may write, the builds that run or wait at

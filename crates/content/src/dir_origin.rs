@@ -521,109 +521,127 @@ impl StagingFetcher for DirOrigin {
         call: UnpackCall,
         out: &Out<Event>,
     ) -> Result<(), FetcherError> {
-        let read = self.read(scope).await?;
-        let Some(blob) = &layer.blob else {
-            return Err(FetcherError::unavailable(
-                "the blob of the layer is not known",
-            ));
-        };
-        let digest: Digest = blob
-            .digest
-            .parse()
-            .map_err(|_| FetcherError::InvalidArgument {
-                reason: "not the digest of a blob".into(),
-            })?;
-        if digest.to_string() != layer.layer {
-            return Err(FetcherError::InvalidArgument {
-                reason: "the blob is not the layer's".into(),
-            });
-        }
-        let staging = layer
-            .staging
-            .try_clone()
-            .map_err(|e| FetcherError::failed(e.to_string()))?;
-        let s = &self.settings;
-        let cap = crate::pull::inflate_limit(
-            i64::try_from(blob.size).unwrap_or(i64::MAX),
-            s.max_inflate_ratio.max(1),
-            s.inflate_floor_mib * 1024 * 1024,
-            s.max_file_bytes,
-        );
-        let (archive, verity, size) = (read.archive.clone(), scope.verity, blob.size);
-        let mut handing = crate::unpack::Files::new(out.clone());
-        let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let counted = count.clone();
-        let work = tokio::task::spawn_blocking(move || {
-            let section = archive.blob_reader(&digest)?;
-            if section.size() != size {
-                return Err(ImageFailure::Invalid(format!(
-                    "layer {digest} has {} bytes, its descriptor says {size}",
-                    section.size()
-                )));
-            }
-            let mut hashing = Hashing {
-                inner: section,
-                hasher: DigestWriter::for_digest(&digest),
-                bytes: 0,
-                count: counted,
-            };
-            let mut head = [0u8; 4];
-            let mut got = 0;
-            while got < head.len() {
-                let n = hashing.read(&mut head[got..]).map_err(ImageFailure::Io)?;
-                if n == 0 {
-                    break;
-                }
-                got += n;
-            }
-            let kind = velarx_tarsplit::decompress::sniff(&head[..got]);
-            let input = std::io::Cursor::new(head[..got].to_vec()).chain(&mut hashing);
-            let decoder =
-                velarx_tarsplit::decompress::Decoder::new(kind, std::io::BufReader::new(input))
-                    .map_err(ImageFailure::Io)?;
-            // (what inflates past the cap is cut: a bomb ends the layer)
-            let limited = LimitedRead::new(decoder, cap);
-            let (toc, tarsplit) =
-                crate::unpack::unpack_tar(limited, &staging, (digest.alg(), verity), &mut handing)
-                    .map_err(ImageFailure::Image)?;
-            // (the tar ends before the blob does: the rest is read, for the
-            // hash of the blob)
-            std::io::copy(&mut hashing, &mut std::io::sink()).map_err(ImageFailure::Io)?;
-            let read = hashing.hasher.finalize();
-            if read != digest {
-                return Err(ImageFailure::Image(
-                    velarx_types::ImageError::DigestMismatch {
-                        expected: digest.to_string(),
-                        actual: read.to_string(),
-                    },
-                ));
-            }
-            crate::unpack::put_claim(&staging, &toc, &tarsplit).map_err(ImageFailure::Image)
+        let archive = self.read(scope).await?.archive.clone();
+        unpack_layer(&self.settings, scope, layer, call, out, move |digest| {
+            let section = archive.blob_reader(digest)?;
+            let size = section.size();
+            Ok((section, size))
+        })
+        .await
+    }
+}
+
+/// `Unpack` of the layer `layer`: `open` gives its blob and its length (an
+/// error of kind `NotFound` when the origin lacks it).  The files of the
+/// layer are staged by the object contract, with the claim of the table and
+/// the tar-split; the blob is checked against its digest as it is read.
+pub async fn unpack_layer<R: Read + Send + 'static>(
+    settings: &HelperSettings,
+    scope: &Scope,
+    layer: &LayerScope,
+    call: UnpackCall,
+    out: &Out<Event>,
+    open: impl FnOnce(&Digest) -> std::io::Result<(R, u64)> + Send + 'static,
+) -> Result<(), FetcherError> {
+    let Some(blob) = &layer.blob else {
+        return Err(FetcherError::unavailable(
+            "the blob of the layer is not known",
+        ));
+    };
+    let digest: Digest = blob
+        .digest
+        .parse()
+        .map_err(|_| FetcherError::InvalidArgument {
+            reason: "not the digest of a blob".into(),
+        })?;
+    if digest.to_string() != layer.layer {
+        return Err(FetcherError::InvalidArgument {
+            reason: "the blob is not the layer's".into(),
         });
-        tokio::pin!(work);
-        let idle = scope.idle;
-        let beat = || Event::progress(None, count.load(std::sync::atomic::Ordering::Relaxed));
-        let done = tokio::select! {
-            d = beating(out, idle, beat, &mut work) => d,
-            _ = call.cancel.cancelled() => return Ok(()),
-        };
-        let unpacked = done.map_err(|e| FetcherError::failed(e.to_string()))?;
-        match unpacked {
-            Ok(()) => {
-                let _ = out.send(Event::progress(None, size)).await;
-                Ok(())
-            }
-            Err(ImageFailure::Invalid(reason)) => Err(invalid(reason)),
-            // (a layer its manifest names that the archive lacks: what the
-            // archive holds is not what it claims)
-            Err(ImageFailure::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(invalid(e.to_string()))
-            }
-            Err(ImageFailure::Io(e)) => Err(read_error(e)),
-            // (the staging cannot be written: not what the archive holds)
-            Err(ImageFailure::Image(velarx_types::ImageError::Io(e))) => Err(read_error(e)),
-            Err(ImageFailure::Image(e)) => Err(invalid(e.to_string())),
+    }
+    let staging = layer
+        .staging
+        .try_clone()
+        .map_err(|e| FetcherError::failed(e.to_string()))?;
+    let cap = crate::pull::inflate_limit(
+        i64::try_from(blob.size).unwrap_or(i64::MAX),
+        settings.max_inflate_ratio.max(1),
+        settings.inflate_floor_mib * 1024 * 1024,
+        settings.max_file_bytes,
+    );
+    let (verity, size) = (scope.verity, blob.size);
+    let mut handing = crate::unpack::Files::new(out.clone());
+    let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = count.clone();
+    let work = tokio::task::spawn_blocking(move || {
+        let (section, length) = open(&digest)?;
+        if length != size {
+            return Err(ImageFailure::Invalid(format!(
+                "layer {digest} has {length} bytes, its descriptor says {size}"
+            )));
         }
+        let mut hashing = Hashing {
+            inner: section,
+            hasher: DigestWriter::for_digest(&digest),
+            bytes: 0,
+            count: counted,
+        };
+        let mut head = [0u8; 4];
+        let mut got = 0;
+        while got < head.len() {
+            let n = hashing.read(&mut head[got..]).map_err(ImageFailure::Io)?;
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        let kind = velarx_tarsplit::decompress::sniff(&head[..got]);
+        let input = std::io::Cursor::new(head[..got].to_vec()).chain(&mut hashing);
+        let decoder =
+            velarx_tarsplit::decompress::Decoder::new(kind, std::io::BufReader::new(input))
+                .map_err(ImageFailure::Io)?;
+        // (what inflates past the cap is cut: a bomb ends the layer)
+        let limited = LimitedRead::new(decoder, cap);
+        let (toc, tarsplit) =
+            crate::unpack::unpack_tar(limited, &staging, (digest.alg(), verity), &mut handing)
+                .map_err(ImageFailure::Image)?;
+        // (the tar ends before the blob does: the rest is read, for the
+        // hash of the blob)
+        std::io::copy(&mut hashing, &mut std::io::sink()).map_err(ImageFailure::Io)?;
+        let read = hashing.hasher.finalize();
+        if read != digest {
+            return Err(ImageFailure::Image(
+                velarx_types::ImageError::DigestMismatch {
+                    expected: digest.to_string(),
+                    actual: read.to_string(),
+                },
+            ));
+        }
+        crate::unpack::put_claim(&staging, &toc, &tarsplit).map_err(ImageFailure::Image)
+    });
+    tokio::pin!(work);
+    let idle = scope.idle;
+    let beat = || Event::progress(None, count.load(std::sync::atomic::Ordering::Relaxed));
+    let done = tokio::select! {
+        d = beating(out, idle, beat, &mut work) => d,
+        _ = call.cancel.cancelled() => return Ok(()),
+    };
+    let unpacked = done.map_err(|e| FetcherError::failed(e.to_string()))?;
+    match unpacked {
+        Ok(()) => {
+            let _ = out.send(Event::progress(None, size)).await;
+            Ok(())
+        }
+        Err(ImageFailure::Invalid(reason)) => Err(invalid(reason)),
+        // (a layer its manifest names that the origin lacks: what the
+        // origin holds is not what it claims)
+        Err(ImageFailure::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(invalid(e.to_string()))
+        }
+        Err(ImageFailure::Io(e)) => Err(read_error(e)),
+        // (the staging cannot be written: not what the origin holds)
+        Err(ImageFailure::Image(velarx_types::ImageError::Io(e))) => Err(read_error(e)),
+        Err(ImageFailure::Image(e)) => Err(invalid(e.to_string())),
     }
 }
 

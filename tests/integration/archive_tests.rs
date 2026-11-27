@@ -696,6 +696,154 @@ async fn test_a_transport_is_an_origin_of_pulls() {
     drain.abort();
 }
 
+/// The files of `dir` over HTTP, as a bucket or a web server serves them;
+/// the paths asked for are logged.
+async fn serve_static(
+    dir: std::path::PathBuf,
+) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = asked.clone();
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let (dir, log) = (dir.clone(), log.clone());
+        async move {
+            log.lock().unwrap().push(uri.path().to_string());
+            match std::fs::read(dir.join(uri.path().trim_start_matches('/'))) {
+                Ok(bytes) => (axum::http::StatusCode::OK, bytes),
+                Err(_) => (axum::http::StatusCode::NOT_FOUND, Vec::new()),
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (port, asked)
+}
+
+/// An image layout published as static files over HTTP is an origin of pulls
+/// by `oci+http://` of the example `httplayout`, a `command` of
+/// `[[transports]]`: it serves the pull and is gone when the pull ended.
+#[tokio::test]
+async fn test_a_layout_over_http_is_pulled_by_a_one_off_command() {
+    let bin = built_binary("httplayout")
+        .expect("no httplayout example: cargo build --example httplayout");
+    let a = source().await;
+    let oci = save(&a.service, &[&format!("{}/test:latest", a.host)]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let layout = dir.path().join("layout");
+    tar::Archive::new(&oci[..]).unpack(&layout).unwrap();
+    // (the entry is named by a whole name, which `:v1` takes by its tag)
+    let mut index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(layout.join("index.json")).unwrap()).unwrap();
+    index["manifests"][0]["annotations"] =
+        serde_json::json!({"org.opencontainers.image.ref.name": "example.com/test:v1"});
+    std::fs::write(
+        layout.join("index.json"),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
+    let (port, asked) = serve_static(dir.path().to_path_buf()).await;
+
+    // the command is a script that notes its start, runs the example as its
+    // child and then writes to a fifo, which the test reads: a line comes
+    // when an example ended (the pull starts one for its metadata and one
+    // for its layers).  Both ends open the fifo to read and write, so that
+    // neither waits for the other to open it.
+    let (fifo, starts) = (dir.path().join("gone"), dir.path().join("starts"));
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let ended = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .unwrap();
+    let script = dir.path().join("once");
+    velarx_base::testing::write_script(&script, "echo >> \"$3\"\n\"$1\"\necho gone 1<> \"$2\"");
+    let transport = |command: Vec<String>| velarx_config::TransportConfig {
+        scheme: "oci+http".into(),
+        socket: None,
+        command,
+        idle_timeout_secs: 15,
+        credentials: false,
+    };
+    let path = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let b = env_transports(vec![transport(vec![
+        path(&script),
+        path(&bin),
+        path(&fifo),
+        path(&starts),
+    ])])
+    .await;
+    let url = format!("oci+http://127.0.0.1:{port}/layout");
+    let loaded = pull_origin_of(&b.service, &format!("{url}:v1"), None)
+        .await
+        .unwrap();
+    assert_eq!(loaded.len(), 1);
+    let original = a
+        .service
+        .get(&format!("{}/test:latest", a.host))
+        .await
+        .unwrap();
+    assert_eq!(
+        original.config_digest,
+        b.service.get(&loaded[0].id).await.unwrap().config_digest
+    );
+    let asked = asked.lock().unwrap().clone();
+    assert!(
+        asked.contains(&"/layout/index.json".to_string()),
+        "{asked:?}"
+    );
+    assert!(
+        asked.iter().any(|p| p.starts_with("/layout/blobs/sha256/")),
+        "{asked:?}"
+    );
+    // every process of the pull is gone
+    let started = std::fs::read_to_string(&starts).unwrap().lines().count();
+    assert!(started >= 1);
+    let gone = tokio::task::spawn_blocking(move || {
+        std::io::BufRead::lines(std::io::BufReader::new(ended))
+            .take(started)
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap();
+    assert_eq!(gone, vec!["gone"; started]);
+
+    // the manifest named by its digest, and the only image of the layout
+    let manifest_digest = index["manifests"][0]["digest"].as_str().unwrap();
+    let d = env_transports(vec![transport(vec![path(&bin)])]).await;
+    for location in [format!("{url}@{manifest_digest}"), url.clone()] {
+        let loaded = pull_origin_of(&d.service, &location, None).await.unwrap();
+        assert_eq!(
+            original.config_digest,
+            d.service.get(&loaded[0].id).await.unwrap().config_digest
+        );
+    }
+
+    // an image the layout does not have, and a layer it lacks, fail the pull
+    let c = env_transports(vec![transport(vec![path(&bin)])]).await;
+    let e = pull_origin_of(&c.service, &format!("{url}:nope"), None)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("0 images"), "{e}");
+    let blob = |digest: &serde_json::Value| {
+        layout
+            .join("blobs/sha256")
+            .join(digest.as_str().unwrap().trim_start_matches("sha256:"))
+    };
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(blob(&index["manifests"][0]["digest"])).unwrap())
+            .unwrap();
+    std::fs::remove_file(blob(&manifest["layers"][0]["digest"])).unwrap();
+    pull_origin_of(&c.service, &format!("{url}:v1"), None)
+        .await
+        .unwrap_err();
+    assert!(c.db.list_images().await.unwrap().is_empty());
+}
+
 /// A layout directory, and a `dir:`, are read where they are.
 #[tokio::test]
 async fn test_a_layout_directory_and_a_dir_are_pulled_by_their_scheme() {
