@@ -14,6 +14,6 @@ pub use db::{DbError, DbResult};
 pub use error::{
     not_lazy_text, printable, HttpError, ImageError, ImageResult, NotLazyLayer, TlsError,
 };
-pub use layer::{chain_ids, LayerKey};
+pub use layer::{chain_ids, holds_inline, LayerKey};
 pub use oci::*;
 pub use reference::ImageReference;

@@ -26,8 +26,18 @@
 //! The format is EROFS with 4096 bytes blocks, extended inodes, the
 //! attributes in the inodes, the directories and symbolic links inline where
 //! they fit, and the stubs as a single chunk that is a hole.
+//!
+//! An image may hold files itself (`Inline`): a regular file of at most the
+//! threshold of bytes (every one with -1) is not a stub but a file of the
+//! image, its content in the block of its inode when it is under a block and
+//! fits there, else in blocks of its own: one extent of the image, which
+//! `write_layer_image` gives back.  With the threshold 0 the image is made
+//! from the table alone, and it is the same bytes as without the
+//! threshold.  The image is written in order, once, the content of the
+//! files copied as it is reached.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{Read, Write};
 use velarx_overlay_core::{class, rdev, Class};
 use velarx_storage::canonical::MAX_ENTRIES;
 use velarx_storage::{FsVerityHashAlgorithm, TocEntry, TocEntryType};
@@ -117,7 +127,13 @@ pub struct LayerImage {
 #[derive(Clone, Debug)]
 enum Kind {
     Dir(BTreeMap<Vec<u8>, usize>),
-    Reg { size: u64, digest: Option<Digest> },
+    /// A regular file: a stub of the object of its digest, or, when the
+    /// image `held`s it, its content.
+    Reg {
+        size: u64,
+        digest: Option<Digest>,
+        held: bool,
+    },
     Symlink(Vec<u8>),
     Char(u32),
     Block(u32),
@@ -257,7 +273,7 @@ const ROOT: usize = 0;
 pub const LINK_BELOW: &str = "which the layer does not have before it";
 
 /// The node an entry is.
-fn node_of(e: &TocEntry) -> Result<Node, String> {
+fn node_of(e: &TocEntry, inline: &Inline) -> Result<Node, String> {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut node = Node {
@@ -282,18 +298,13 @@ fn node_of(e: &TocEntry) -> Result<Node, String> {
         TocEntryType::Reg if e.size == 0 => Kind::Reg {
             size: 0,
             digest: None,
+            held: false,
         },
-        TocEntryType::Reg => {
-            let digest = digest_of(e)?;
-            node.xattrs
-                .insert(XATTR_METACOPY.as_bytes().to_vec(), metacopy(&digest));
-            node.xattrs
-                .insert(XATTR_REDIRECT.as_bytes().to_vec(), redirect(&digest));
-            Kind::Reg {
-                size: e.size,
-                digest: Some(digest),
-            }
-        }
+        TocEntryType::Reg => Kind::Reg {
+            size: e.size,
+            digest: Some(digest_of(e)?),
+            held: velarx_types::holds_inline(inline.threshold, e.size),
+        },
         TocEntryType::Symlink => match &e.link_name {
             Some(target) => Kind::Symlink(target.clone().into_bytes()),
             None => return Err(format!("`{}` is a symlink with no target", e.name)),
@@ -469,7 +480,7 @@ impl<'a> Resolved<'a> {
 }
 
 impl Tree {
-    fn build(entries: &[TocEntry]) -> Result<Self, String> {
+    fn build(entries: &[TocEntry], inline: &Inline) -> Result<Self, String> {
         let layer = resolve_entries(entries)?;
         let mut tree = Tree { nodes: Vec::new() };
         // (the node of each path, the root first: a file with several names
@@ -482,7 +493,7 @@ impl Tree {
                 Some(i) => match made.get(&i) {
                     Some(&n) => n,
                     None => {
-                        let n = tree.push(node_of(&entries[i])?);
+                        let n = tree.push(node_of(&entries[i], inline)?);
                         made.insert(i, n);
                         n
                     }
@@ -558,7 +569,6 @@ impl Tree {
 struct Placed {
     /// The order of the inode, from the root: its nid comes from `offset`.
     offset: usize,
-    xattrs: Vec<u8>,
     layout: u16,
     /// The bytes after the inode and its attributes.
     inline: usize,
@@ -620,7 +630,31 @@ fn split_name(name: &[u8]) -> Result<(&[u8], u8), String> {
     }
 }
 
-fn xattr_body(xattrs: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<Vec<u8>, String> {
+/// The attributes of the inode of `node`, as its record has them: those of
+/// its entry and, for a stub, the overlay ones that name its object (made
+/// here, not kept in the tree for each stub).
+fn xattrs_of(node: &Node) -> Result<Vec<u8>, String> {
+    let mut all: BTreeMap<&[u8], &[u8]> = node
+        .xattrs
+        .iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect();
+    let stub = match &node.kind {
+        Kind::Reg {
+            digest: Some(d),
+            held: false,
+            ..
+        } => Some((metacopy(d), redirect(d))),
+        _ => None,
+    };
+    if let Some((m, r)) = &stub {
+        all.insert(XATTR_METACOPY.as_bytes(), m);
+        all.insert(XATTR_REDIRECT.as_bytes(), r);
+    }
+    xattr_body(&all)
+}
+
+fn xattr_body(xattrs: &BTreeMap<&[u8], &[u8]>) -> Result<Vec<u8>, String> {
     if xattrs.is_empty() {
         return Ok(Vec::new());
     }
@@ -647,9 +681,145 @@ fn xattr_body(xattrs: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// The image of the layer whose table of contents has `entries`.
+/// Which regular files an image holds itself, and where their content is
+/// read from while it is written.
+pub struct Inline<'a> {
+    /// The files held, as `velarx_types::holds_inline` says: `-1` every
+    /// regular file with content; `0` none (the image of a layer is its
+    /// table of contents alone); `N` the files of at most `N` bytes.
+    pub threshold: i64,
+    /// The content of the file with this fs-verity digest: asked for the
+    /// files the image holds only.
+    pub open: &'a (dyn Fn(&Digest) -> std::io::Result<std::fs::File> + Sync),
+}
+
+fn no_files(_: &Digest) -> std::io::Result<std::fs::File> {
+    Err(std::io::ErrorKind::NotFound.into())
+}
+
+impl Inline<'static> {
+    /// Nothing held: the image is made from the table alone.
+    pub const NONE: Inline<'static> = Inline {
+        threshold: 0,
+        open: &no_files,
+    };
+}
+
+/// A file the image holds: its content is `size` bytes at `offset` of the
+/// image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extent {
+    pub digest: Digest,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// What is known of an image that has been written.
+pub struct Written {
+    /// The owners of its entries, sorted (uids, gids).
+    pub owners: (Vec<u32>, Vec<u32>),
+    /// Its stubs, by fs-verity digest (`erofs_tree::write_index`).
+    pub index: Vec<u8>,
+    /// The files it holds, one extent per digest (the first in the image),
+    /// sorted by digest.
+    pub extents: Vec<Extent>,
+}
+
+/// The sink of an image: what is written, in order, with the zeros between.
+struct Sink<W> {
+    out: W,
+    pos: usize,
+}
+
+impl<W: Write> Write for Sink<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let n = self.out.write(bytes)?;
+        self.pos += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+impl<W: Write> Sink<W> {
+    /// Zeros up to `at`, which is not behind.
+    fn pad_to(&mut self, at: usize) -> Result<(), String> {
+        const ZEROS: [u8; BLOCK] = [0; BLOCK];
+        while self.pos < at {
+            let n = (at - self.pos).min(BLOCK);
+            self.write_all(&ZEROS[..n]).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn put(&mut self, at: usize, bytes: &[u8]) -> Result<(), String> {
+        self.pad_to(at)?;
+        self.write_all(bytes).map_err(|e| e.to_string())
+    }
+
+    /// The `size` bytes of the file `digest`, as `inline` gives it.
+    fn copy(&mut self, inline: &Inline, digest: &Digest, size: u64) -> Result<(), String> {
+        let file = (inline.open)(digest).map_err(|e| format!("the file {digest}: {e}"))?;
+        let copied = std::io::copy(&mut file.take(size), self)
+            .map_err(|e| format!("the file {digest}: {e}"))?;
+        match copied == size {
+            true => Ok(()),
+            false => Err(format!(
+                "the file {digest} has {copied} bytes, its table says {size}"
+            )),
+        }
+    }
+}
+
+/// The entries of a directory in one of its blocks, as the image has them:
+/// the headers, then the names.
+fn dir_block(
+    names: &[(Vec<u8>, Option<usize>)],
+    nids: &[(u64, u8)],
+    range: std::ops::Range<usize>,
+) -> Vec<u8> {
+    let mut out = vec![0u8; dir_block_len(&names[range.clone()])];
+    let mut name_at = 12 * range.len();
+    for (k, j) in range.enumerate() {
+        let d = 12 * k;
+        out[d..d + 8].copy_from_slice(&nids[j].0.to_le_bytes());
+        out[d + 8..d + 10].copy_from_slice(&(name_at as u16).to_le_bytes());
+        out[d + 10] = nids[j].1;
+        let name = &names[j].0;
+        out[name_at..name_at + name.len()].copy_from_slice(name);
+        name_at += name.len();
+    }
+    out
+}
+
+/// The image of the layer whose table of contents has `entries`, made from
+/// the table alone (`Inline::NONE`), in memory.
 pub fn layer_image(entries: &[TocEntry]) -> Result<LayerImage, String> {
-    let tree = Tree::build(entries)?;
+    let mut image = Vec::new();
+    let written = write_layer_image(entries, &Inline::NONE, &mut image)?;
+    Ok(LayerImage {
+        image,
+        owners: written.owners,
+        index: written.index,
+    })
+}
+
+/// Write the image of the layer whose table of contents has `entries` to
+/// `out`, in order and once: what the memory holds is the tree of the layer
+/// and a block at a time, never the content of the files, which is copied
+/// from `inline.open` as it is reached.  A file the image holds has no
+/// overlay attributes and no stub: its content is the one of its inode, in
+/// the inode's block when it is under a block and fits there, else in whole
+/// blocks of its own, so each is one extent (`Written::extents`).  `out`
+/// is given small pieces: a file wants a `BufWriter`.
+pub fn write_layer_image(
+    entries: &[TocEntry],
+    inline: &Inline,
+    out: impl Write,
+) -> Result<Written, String> {
+    let tree = Tree::build(entries, inline)?;
     let owners = tree.owners();
     let mut index = Vec::new();
     // the inodes in the order they are reached from the root, a directory's
@@ -684,9 +854,10 @@ pub fn layer_image(entries: &[TocEntry]) -> Result<LayerImage, String> {
     let mut placed: Vec<Option<Placed>> = (0..tree.nodes.len()).map(|_| None).collect();
     let mut cursor = SUPERBLOCK_OFFSET + SUPERBLOCK_SIZE;
     let mut chunked = false;
+    let too_big = || "the image is too big".to_string();
     for &n in &order {
         let node = &tree.nodes[n];
-        let xattrs = xattr_body(&node.xattrs)?;
+        let xattrs = xattrs_of(node)?.len();
         let (layout, size, tail, blocks) = match &node.kind {
             Kind::Dir(_) => {
                 let names = dir_names(node);
@@ -694,7 +865,7 @@ pub fn layer_image(entries: &[TocEntry]) -> Result<LayerImage, String> {
                 let last = dir_block_len(&names[split.last().unwrap().clone()]);
                 let full = split.len() - 1;
                 let size = (full * BLOCK + last) as u64;
-                if INODE_SIZE + xattrs.len() + last <= BLOCK && last < BLOCK {
+                if INODE_SIZE + xattrs + last <= BLOCK && last < BLOCK {
                     (LAYOUT_FLAT_INLINE, size, last, full)
                 } else {
                     (LAYOUT_FLAT_PLAIN, size, 0, split.len())
@@ -704,15 +875,27 @@ pub fn layer_image(entries: &[TocEntry]) -> Result<LayerImage, String> {
                 if target.len() > BLOCK {
                     return Err("a symbolic link longer than a block".into());
                 }
-                if INODE_SIZE + xattrs.len() + target.len() <= BLOCK && target.len() < BLOCK {
+                if INODE_SIZE + xattrs + target.len() <= BLOCK && target.len() < BLOCK {
                     (LAYOUT_FLAT_INLINE, target.len() as u64, target.len(), 0)
                 } else {
                     (LAYOUT_FLAT_PLAIN, target.len() as u64, 0, 1)
                 }
             }
             Kind::Reg {
+                size, held: true, ..
+            } => {
+                if *size < BLOCK as u64 && INODE_SIZE + xattrs + *size as usize <= BLOCK {
+                    (LAYOUT_FLAT_INLINE, *size, *size as usize, 0)
+                } else {
+                    let blocks =
+                        usize::try_from(size.div_ceil(BLOCK as u64)).map_err(|_| too_big())?;
+                    (LAYOUT_FLAT_PLAIN, *size, 0, blocks)
+                }
+            }
+            Kind::Reg {
                 size,
                 digest: Some(d),
+                held: false,
             } => {
                 chunked = true;
                 if index
@@ -728,14 +911,13 @@ pub fn layer_image(entries: &[TocEntry]) -> Result<LayerImage, String> {
             }
             _ => (LAYOUT_FLAT_PLAIN, 0, 0, 0),
         };
-        let record = INODE_SIZE + xattrs.len() + tail;
+        let record = INODE_SIZE + xattrs + tail;
         cursor = cursor.next_multiple_of(SLOT);
         if record <= BLOCK && cursor % BLOCK + record > BLOCK {
             cursor = cursor.next_multiple_of(BLOCK);
         }
         placed[n] = Some(Placed {
             offset: cursor,
-            xattrs,
             layout,
             inline: tail,
             blocks,
@@ -749,46 +931,70 @@ pub fn layer_image(entries: &[TocEntry]) -> Result<LayerImage, String> {
     for &n in &order {
         let p = placed[n].as_mut().unwrap();
         if p.blocks > 0 {
-            p.blkaddr = u32::try_from(block).map_err(|_| "the image is too big".to_string())?;
-            block += p.blocks;
+            p.blkaddr = u32::try_from(block).map_err(|_| too_big())?;
+            block = block.checked_add(p.blocks).ok_or_else(too_big)?;
         }
     }
     let total = block.max(1);
+    let total_blocks = u32::try_from(total).map_err(|_| too_big())?;
     let nid = |n: usize| (placed[n].as_ref().unwrap().offset / SLOT) as u64;
     let root_nid = u16::try_from(nid(ROOT)).map_err(|_| "the root is too far".to_string())?;
-    let mut image = vec![0u8; total * BLOCK];
-    {
-        let sb = &mut image[SUPERBLOCK_OFFSET..SUPERBLOCK_OFFSET + SUPERBLOCK_SIZE];
-        sb[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        sb[12] = 12; // blkszbits
-        sb[14..16].copy_from_slice(&root_nid.to_le_bytes());
-        sb[16..24].copy_from_slice(&(order.len() as u64).to_le_bytes());
-        sb[36..40].copy_from_slice(&(total as u32).to_le_bytes());
-        let incompat = if chunked {
-            FEATURE_INCOMPAT_CHUNKED_FILE
-        } else {
-            0
-        };
-        sb[80..84].copy_from_slice(&incompat.to_le_bytes());
-    }
+    let mut out = Sink { out, pos: 0 };
+    let mut sb = [0u8; SUPERBLOCK_SIZE];
+    sb[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    sb[12] = 12; // blkszbits
+    sb[14..16].copy_from_slice(&root_nid.to_le_bytes());
+    sb[16..24].copy_from_slice(&(order.len() as u64).to_le_bytes());
+    sb[36..40].copy_from_slice(&total_blocks.to_le_bytes());
+    let incompat = if chunked {
+        FEATURE_INCOMPAT_CHUNKED_FILE
+    } else {
+        0
+    };
+    sb[80..84].copy_from_slice(&incompat.to_le_bytes());
+    out.put(SUPERBLOCK_OFFSET, &sb)?;
+    // the entries of the directory `n`: the names and what each is
+    let entries_of = |n: usize| {
+        let names = dir_names(&tree.nodes[n]);
+        let nids: Vec<(u64, u8)> = names
+            .iter()
+            .map(|(name, c)| match (name.as_slice(), c) {
+                (_, Some(c)) => (nid(*c), tree.nodes[*c].file_type()),
+                (b".", None) => (nid(n), 2),
+                _ => (nid(parent[n]), 2),
+            })
+            .collect();
+        let split = dir_blocks(&names);
+        (names, nids, split)
+    };
+    let mut extents: Vec<Extent> = Vec::new();
+    let mut extent = |digest: &Digest, offset: usize, size: u64| {
+        extents.push(Extent {
+            digest: *digest,
+            offset: offset as u64,
+            size,
+        })
+    };
     for (ino, &n) in order.iter().enumerate() {
         let node = &tree.nodes[n];
         let p = placed[n].as_ref().unwrap();
         let u: u32 = match &node.kind {
             Kind::Char(d) | Kind::Block(d) => *d,
             Kind::Reg {
-                digest: Some(_), ..
+                digest: Some(_),
+                held: false,
+                ..
             } => CHUNK_FORMAT_SINGLE,
             _ => p.blkaddr,
         };
-        let icount: u16 = if p.xattrs.is_empty() {
+        let xattrs = xattrs_of(node)?;
+        let icount: u16 = if xattrs.is_empty() {
             0
         } else {
-            u16::try_from((p.xattrs.len() - 12) / 4 + 1)
+            u16::try_from((xattrs.len() - 12) / 4 + 1)
                 .map_err(|_| "too many attributes".to_string())?
         };
-        let at = p.offset;
-        let h = &mut image[at..at + INODE_SIZE];
+        let mut h = [0u8; INODE_SIZE];
         h[0..2].copy_from_slice(&(1 | (p.layout << 1)).to_le_bytes());
         h[2..4].copy_from_slice(&icount.to_le_bytes());
         h[4..6].copy_from_slice(&node.mode().to_le_bytes());
@@ -800,62 +1006,82 @@ pub fn layer_image(entries: &[TocEntry]) -> Result<LayerImage, String> {
         h[32..40].copy_from_slice(&node.mtime.0.to_le_bytes());
         h[40..44].copy_from_slice(&node.mtime.1.to_le_bytes());
         h[44..48].copy_from_slice(&nlink[n].to_le_bytes());
-        let mut pos = at + INODE_SIZE;
-        image[pos..pos + p.xattrs.len()].copy_from_slice(&p.xattrs);
-        pos += p.xattrs.len();
+        out.put(p.offset, &h)?;
+        out.put(p.offset + INODE_SIZE, &xattrs)?;
         match &node.kind {
-            Kind::Dir(_) => {
-                let names = dir_names(node);
-                let split = dir_blocks(&names);
-                let nids: Vec<(u64, u8)> = names
-                    .iter()
-                    .map(|(name, c)| match (name.as_slice(), c) {
-                        (_, Some(c)) => (nid(*c), tree.nodes[*c].file_type()),
-                        (b".", None) => (nid(n), 2),
-                        _ => (nid(parent[n]), 2),
-                    })
-                    .collect();
-                for (i, range) in split.iter().enumerate() {
-                    let start = match (p.inline > 0, i + 1 == split.len()) {
-                        (true, true) => pos,
-                        _ => (p.blkaddr as usize + i) * BLOCK,
-                    };
-                    let mut name_at = 12 * range.len();
-                    for (k, j) in range.clone().enumerate() {
-                        let d = start + 12 * k;
-                        image[d..d + 8].copy_from_slice(&nids[j].0.to_le_bytes());
-                        image[d + 8..d + 10].copy_from_slice(&(name_at as u16).to_le_bytes());
-                        image[d + 10] = nids[j].1;
-                        let name = &names[j].0;
-                        image[start + name_at..start + name_at + name.len()].copy_from_slice(name);
-                        name_at += name.len();
-                    }
-                }
+            Kind::Dir(_) if p.inline > 0 => {
+                let (names, nids, split) = entries_of(n);
+                let last = split.last().unwrap().clone();
+                out.write_all(&dir_block(&names, &nids, last))
+                    .map_err(|e| e.to_string())?;
             }
-            Kind::Symlink(target) => {
-                let at = if p.inline > 0 {
-                    pos
-                } else {
-                    p.blkaddr as usize * BLOCK
-                };
-                image[at..at + target.len()].copy_from_slice(target);
+            Kind::Symlink(target) if p.inline > 0 => {
+                out.write_all(target).map_err(|e| e.to_string())?;
             }
             Kind::Reg {
-                digest: Some(_), ..
-            } => image[pos..pos + 4].copy_from_slice(&NULL_ADDR.to_le_bytes()),
+                digest: Some(_),
+                held: false,
+                ..
+            } => out
+                .write_all(&NULL_ADDR.to_le_bytes())
+                .map_err(|e| e.to_string())?,
+            Kind::Reg {
+                size,
+                digest: Some(d),
+                held: true,
+            } if p.inline > 0 => {
+                extent(d, out.pos, *size);
+                out.copy(inline, d, *size)?;
+            }
             _ => {}
         }
     }
+    // the blocks of data after the inodes, in the order of their addresses
+    for &n in &order {
+        let node = &tree.nodes[n];
+        let p = placed[n].as_ref().unwrap();
+        if p.blocks == 0 {
+            continue;
+        }
+        out.pad_to(p.blkaddr as usize * BLOCK)?;
+        match &node.kind {
+            Kind::Dir(_) => {
+                let (names, nids, split) = entries_of(n);
+                for range in &split[..p.blocks] {
+                    out.write_all(&dir_block(&names, &nids, range.clone()))
+                        .map_err(|e| e.to_string())?;
+                    out.pad_to(out.pos.next_multiple_of(BLOCK))?;
+                }
+            }
+            Kind::Symlink(target) => {
+                out.write_all(target).map_err(|e| e.to_string())?;
+            }
+            Kind::Reg {
+                size,
+                digest: Some(d),
+                ..
+            } => {
+                extent(d, out.pos, *size);
+                out.copy(inline, d, *size)?;
+            }
+            _ => {}
+        }
+        out.pad_to(out.pos.next_multiple_of(BLOCK))?;
+    }
+    out.pad_to(total * BLOCK)?;
+    out.flush().map_err(|e| e.to_string())?;
     // (a layer has the digests of one algorithm: the one of its index)
     let alg = index
         .first()
         .map_or(velarx_types::digest::Algorithm::Sha256, |(d, _)| d.alg());
     index.sort_unstable();
     index.dedup_by(|b, a| a.0 == b.0);
-    Ok(LayerImage {
-        image,
+    extents.sort_unstable_by_key(|e| (e.digest, e.offset));
+    extents.dedup_by_key(|e| e.digest);
+    Ok(Written {
         owners,
         index: super::erofs_tree::write_index(alg, index.into_iter().map(|(d, size)| (d, size, 0))),
+        extents,
     })
 }
 
@@ -981,8 +1207,7 @@ pub(crate) mod tests {
             let e = split(n).unwrap_err();
             assert!(e.contains(n) && e.contains("nothing after"), "{e}");
         }
-        let mut x = BTreeMap::new();
-        x.insert(b"lustre.".to_vec(), b"v".to_vec());
+        let x = BTreeMap::from([(&b"lustre."[..], &b"v"[..])]);
         assert!(xattr_body(&x).is_err());
     }
 
@@ -1052,7 +1277,7 @@ pub(crate) mod tests {
     #[test]
     fn a_symlink_with_no_target_is_refused() {
         let link = entry("usr/l", TocEntryType::Symlink);
-        let e = node_of(&link).err().unwrap();
+        let e = node_of(&link, &Inline::NONE).err().unwrap();
         assert!(e.contains("usr/l") && e.contains("no target"), "{e}");
     }
 

@@ -228,9 +228,29 @@ pub fn chunked_checksum(desc: &OciDescriptor) -> Option<Digest> {
         .flatten()
 }
 
+/// Whether the EROFS image of a layer made with the inline threshold
+/// `threshold` holds a regular file of `size` bytes itself instead of
+/// naming its object: never an empty file, none with 0, every other one
+/// with -1, else one of at most `threshold` bytes.
+pub fn holds_inline(threshold: i64, size: u64) -> bool {
+    size > 0 && (threshold == -1 || (threshold > 0 && size <= threshold as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_inline_threshold_is_inclusive_and_never_holds_an_empty_file() {
+        for t in [-1, 0, 1, 4096] {
+            assert!(!holds_inline(t, 0), "{t}");
+        }
+        assert!(!holds_inline(0, 1));
+        assert!(holds_inline(-1, u64::MAX));
+        assert!(holds_inline(4096, 4096));
+        assert!(!holds_inline(4096, 4097));
+        assert!(holds_inline(1, 1));
+    }
 
     const D: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     const T: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
