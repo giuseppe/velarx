@@ -11,10 +11,11 @@ root-only file, a kernel feature your machine lacks).
 
 - [ ] `make fmt` and `make fmt-check`
 - [ ] `make clippy` (no warnings)
-- [ ] `make test` (the fast tier)
-- [ ] `make e2e T="..."` (which files, `make e2e-list` has the names)
-- [ ] `make test-all` (the slow tier), for a change of the runtime, the
-  monitor, the storage, the networking or the systemd integration
+- [ ] the tests of the area: `cargo test -p` of the touched packages and
+  `make e2e T="..."` (`tools/tests-for-diff origin/main` prints them)
+- [ ] `make test` (the quick tier), once on the final tree
+- [ ] `make test-full` (everything, root bats files included), before a
+  push to GitHub
 
 `git diff --stat origin/main...HEAD` shows only the files of the change.
 

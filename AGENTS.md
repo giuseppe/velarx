@@ -7,7 +7,7 @@
 - **Sign-off**: every commit needs a `Signed-off-by: Name <email>` line (the DCO, `git commit -s`; `make check-dco BASE=<revision>`); an AI assistant's `Co-Authored-By` line does not replace it
 - **Licensing**: every source file starts with `SPDX-License-Identifier: Apache-2.0`, the documentation (`*.md`) as an HTML comment on its first line; a unit test of `src/testing.rs` fails without it. Do not copy code under a license that is not compatible with Apache-2.0 (GPL, LGPL); code of another origin keeps its notice and is listed in NOTICE
 - **Must build**: Every commit must compile with `cargo build`
-- **Must pass tests**: Run `make test` (the fast tier, `cargo test`) before committing. All tests must pass. `make test-all` (the slow tier: waiting tests, the P2P package, thin client, e2e scripts) before merging changes to the runtime, the monitor, storage, networking or the systemd integration
+- **Must pass tests**: each commit passes the tests of its area (`cargo test -p` of the touched packages, the bats files of the area: `tools/tests-for-diff BASE` prints them); the series passes `make test` (the quick tier: fmt-check, clippy, check, unit tests, rootless bats) once, on its final tree, and `make test-full` (everything, root bats and Lean included) before a push to GitHub. After a rebase, fixup or amend only what `tools/tests-for-diff VERIFIED` asks for runs again, nothing when the tree hash is the one that passed (CONTRIBUTING.md, "One verification per series")
 - **Tests**: integration tests are modules of `tests/integration/main.rs` (one binary, all tests in parallel in one process): no process-wide state (environment, cwd, signals: such a test runs its body in a child process, in the library with `testing::in_child` of src/testing.rs, which also holds the test that enforces the rule in src/ and tests/), no fixed sleeps or polling, wait for an event (a pidfd, a notification socket, a channel); a test that must wait long runs only with `VELARX_SLOW_TESTS=1`
 
 # Rules
@@ -18,7 +18,7 @@
 - All the configuration knobs must end up in the config.toml.example file.
 - Do not leave any warning or unused symbols, first check why they are not used and if really sure not needed, delete them.
 - Do not add test generated data to git.
-- Run `make fmt` and `make test` before committing. No warnings allowed.
+- Run `make fmt` before committing, and the tests above. No warnings allowed.
 - Add only necessary .md files to the repo.
 - Never use polling.
 - Backward compatibility with older velarx versions (stores, databases, wire formats, TOC and image formats, peers, config) is NOT a goal: change formats and protocols freely, no migration or compatibility code (a database has one schema version, which stays 1 for now: never raise `SCHEMA_VERSION` or the namespaces' `VERSION` again until a release starts versioning; a breaking schema change edits the schema in place, with no bump, and a store of an older build becomes unusable (it fails at the first statement that needs the new shape: delete it); a database of another version is refused; the lint of `src/testing.rs` fails on `migrate`, `legacy`, `backward compat` and `old format` in the sources, with a list of the lines that are interoperability with other tools). buildah and podman can be changed too (to use the fs-verity digest, for example) when that works better.

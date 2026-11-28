@@ -37,14 +37,15 @@ cache when it is installed.
 | Command | What it runs | When |
 | --- | --- | --- |
 | `make fmt-check` | `cargo fmt --check` (`make fmt` formats) | every change |
-| `make test` | the fast tier: `cargo test`, the unit tests and the one integration binary, and the tests of velarx-api | every change, before every commit |
-| `make test-all` | the slow tier: also the tests that wait (`VELARX_SLOW_TESTS=1`), the whole workspace, the thin client, every end to end file; about 7 minutes | before a change to the runtime, the monitor, the storage, the networking or the systemd integration |
+| `cargo test -p PKG`, `make e2e T="..."` | the tests of the area: the packages you touched and the bats files of the area (`tools/tests-for-diff BASE` prints them) | while you write a series, each commit |
+| `make test` | the quick tier: `fmt-check`, `clippy`, `check` (every target of the workspace, also with `--features fuzzing`), the debug build, then side by side `test-unit` (`cargo test`, velarx-api's tests) and `e2e-rootless` (every bats file but the p2p ones, as your user) | once per series, on its final tree |
+| `make test-full` | everything: the lint tools, `clippy`, `check`, one build, then side by side the cargo tests of every package with the tests that wait (`VELARX_SLOW_TESTS=1`) and fs-verity (`VELARX_VERITY_DIR`), the fuzz corpora, the rootless bats files, the p2p ones (`e2e-p2p`, under `P2P_LOCK`) and the Lean proofs (`test-lean`, `LEAN=0` leaves them out); then the root bats files (`e2e-root`) | before a push to GitHub, and nightly |
 | `make e2e T="..."` | some end to end (bats) files | a change in the area they cover |
 | `make licenses-binary` | `THIRD-PARTY-LICENSES.<binary>`: the crates each binary links, with their license texts | a change to the dependencies, a release |
 | `make audit` | advisories and licenses of the dependencies (needs `cargo-deny`) | a change to the dependencies |
 | `make fuzz FUZZ=name` | one fuzz target (needs `cargo-fuzz`) | a change to a parser |
 
-Useful variants: `make test TESTARGS=pull_tests::` runs one area of the
+Useful variants: `make test-unit TESTARGS=pull_tests::` runs one area of the
 integration tests, `make test-pkg PKG=velarx-core` one package,
 `make test-lint` the lint tests of the sources (licenses, forbidden calls,
 no bare issue numbers: name the fact, not `#NNN`; upstream issues are
@@ -52,14 +53,38 @@ no bare issue numbers: name the fact, not `#NNN`; upstream issues are
 temporary directory (`tempdir().keep()`, `into_path`, `mem::forget`).
 `make test-leaks` runs the library tests of every package (`PKG=name` of one)
 in a private `TMPDIR` and fails on the `.tmp*` directories they leave.
-`make test-verity VELARX_VERITY_DIR=dir` runs the cargo tests of `make test`
+`make test-verity VELARX_VERITY_DIR=dir` runs the cargo tests of `make test-unit`
 (minutes; `TESTARGS=filter` for fewer) with that directory on a file system
 with fs-verity: the tests that need one, spread over several packages and
 named for what they check, skip their fs-verity part without it.  The target
 fails when `VELARX_VERITY_DIR` is not a directory.
+`make test-all` is the old name of `make test-full`.
 Binaries and dependency counts are kept small on purpose; there is no size
 limit that fails a build: `make bench-startup` prints the stripped sizes, and a
 change that is expected to move them says by how much in its commit message.
+
+## One verification per series
+
+A full run takes long, so it is done once per series of commits, on the
+tree that is sent, and not again for what did not change:
+
+* While you write the series, run the tests of what you touch: `cargo test
+  -p` of the packages and the bats files of the area (`make e2e T="..."`, as
+  root `make e2e-root T="..."` for the root ones).  `tools/tests-for-diff
+  BASE` prints them for the files changed since BASE; it is a floor, add
+  what you know the change touches.  A reviewer runs the same, for the diff
+  under review.
+* On the final tree of the series, once: `make test`, and `make test-full`
+  before a push to GitHub.  Note the tree that passed: `git rev-parse
+  HEAD^{tree}`.
+* After a rebase, a fixup or an amend, compare the new tree with the one
+  that passed.  The same tree hash (a reworded message, a squash, a
+  reordering that ends on the same files): nothing runs again.  Otherwise
+  `tools/tests-for-diff VERIFIED` (VERIFIED: the commit that passed) gives
+  what the difference asks for, and only that runs again; when it says
+  `make test` (the difference is in code every bats file runs, or a
+  rebase brought in such changes), the quick tier runs again, and
+  `make test-full` again only before a push to GitHub.
 
 ## The checks before a pull request
 
@@ -69,7 +94,7 @@ before you push (a GitHub workflow checks only the DCO sign-offs):
 ```sh
 make fmt-check reuse issue-refs docs-check clippy   # format, licenses, bare issue numbers, documents, lints
 make build-default PROFILE=debug                    # the build
-make test build-client PROFILE=debug                # the fast tier and the thin client
+make test                                           # the quick tier (the thin client too)
 make audit                                          # advisories, bans, licenses (needs cargo-deny)
 make check-dco BASE=origin/main                     # every commit signed off
 ```
@@ -115,9 +140,20 @@ Rootless needs sub ids in `/etc/subuid` and `/etc/subgid`, `newuidmap` and
 `newgidmap`, a systemd user session for the files that test the units, and
 `/dev/fuse`.  `make e2e-root` also runs the files that need root (mounts,
 fs-verity, cgroups of the system manager); `SUDO=` changes how root is
-reached, and it is empty when you already are root.  The files that pull
-images use a registry that has an `alpine:chunked` image whose TOCs give the
-fs-verity digest of every file (what `velarx image push --compression-format
+reached, and it is empty when you already are root.  Without `T` it runs
+the files with root tests (`tools/run-bats root`; `tools/run-bats list
+root` names them) six at a time: as root a file shares the host, so each
+has a default bridge and subnets of its own (`e2e_bridge_toml` of
+`tests/e2e/bats/helpers.bash`, in every configuration a root file writes),
+units and ports with names and numbers of its own, and
+`tests/e2e/run-all.sh` runs the files that cannot share the host (`ALONE`)
+with no other file.  A root file that needs a fixed port, unit name or
+subnet takes one no other file uses; one that looks at the whole host
+(every process of root, every unit) goes in `ALONE`.  `make e2e-rootless`
+runs every file but the p2p ones as your user, five at a time, and `make
+e2e-p2p` the p2p ones one at a time, holding the lock file `P2P_LOCK`.
+The files that pull images use a registry that has an `alpine:chunked`
+image whose TOCs give the fs-verity digest of every file (what `velarx image push --compression-format
 zstd:chunked` writes; a zstd:chunked layer without those digests, as
 containers/storage writes it, is refused) and, for the tests of that refusal,
 an `alpine-plain:chunked` image made by containers/storage (they skip without
@@ -163,8 +199,10 @@ events, not for time; each file says in its header what it needs.
 ## Commits and sign-off
 
 * One logical change per commit, committed when it is complete.  Do not
-  batch unrelated changes.  Every commit builds and passes `make test`.
-* Run `make fmt` and `make test` before you commit.
+  batch unrelated changes.  Every commit builds and passes the tests of
+  its area; the series passes `make test` on its final tree (see "One
+  verification per series").
+* Run `make fmt` before you commit.
 * A short subject that says what the commit does, and a body that says why.
 * Velarx has no contributor license agreement.  It uses the [Developer
   Certificate of Origin, version 1.1](https://developercertificate.org/):
