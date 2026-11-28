@@ -793,6 +793,66 @@ pub struct ComposefsDriver {
     store_verity: std::sync::OnceLock<bool>,
 }
 
+/// The files the EROFS images of the layers of the store hold themselves
+/// (`layers.inline`): where each is, found by its digest.
+struct Extents {
+    db: Database,
+    store: Arc<FileStore>,
+}
+
+impl Extents {
+    /// The image of the layer that holds the file `key`, opened, with the
+    /// offset of the file in it and its size; none when no layer does.  The
+    /// extent lies in the image, which is `Corrupt` else.
+    fn find(&self, key: &str) -> DriverResult<Option<(std::fs::File, u64, u64)>> {
+        let found =
+            velarx_graph::blocking(|| futures::executor::block_on(self.db.inlined_file(key)))
+                .map_err(|e| DriverError::storage(NAME, format!("the file {key}: {e}")))?;
+        let Some((layer, file)) = found else {
+            return Ok(None);
+        };
+        let dirs = objects::objects_dirs(&self.store);
+        let dirs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        let (path, _) = cfs::find_layer_image(&dirs, &layer.file_stem()).ok_or_else(|| {
+            DriverError::missing(
+                NAME,
+                Some(&layer),
+                format!("the image of the layer that holds the file {key} is not there"),
+                Remedy::PullAgain,
+            )
+        })?;
+        let image = cfs::open_layer_image(&path).map_err(|e| DriverError::io(NAME, e))?;
+        let len = image
+            .metadata()
+            .map_err(|e| DriverError::io(NAME, e))?
+            .len();
+        if file
+            .offset
+            .checked_add(file.size)
+            .is_none_or(|end| end > len)
+        {
+            return Err(DriverError::corrupt(
+                NAME,
+                format!(
+                    "the file {key} is {} bytes from {} of the image of layer {layer}, which has {len} bytes",
+                    file.size, file.offset
+                ),
+                Remedy::PullAgain,
+            ));
+        }
+        Ok(Some((image, file.offset, file.size)))
+    }
+}
+
+impl velarx_content::pull::session::Inlined for Extents {
+    fn extent(&self, digest: &str) -> Option<(std::fs::File, u64, u64)> {
+        self.find(digest)
+            .inspect_err(|e| warn!("The file {digest} of the image of a layer: {e}"))
+            .ok()
+            .flatten()
+    }
+}
+
 /// The `verity=` of the overlay: what the store requires, else what its file
 /// system has (`store`), never what an image of a layer happens to have.  The
 /// overlay checks the fs-verity digests of the files where the store has
@@ -907,6 +967,37 @@ impl ComposefsDriver {
         *self
             .store_verity
             .get_or_init(|| velarx_storage::probe(self.store.root()).is_ok())
+    }
+
+    /// The file `key` of `size` bytes as an unnamed file of the staging
+    /// directory with a copy of what the image of the layer that holds it
+    /// has in its extent; none when no layer does.
+    fn copy_of_extent(&self, key: &str, size: u64) -> DriverResult<Option<std::fs::File>> {
+        let Some((image, offset, held)) = self.extents().find(key)? else {
+            return Ok(None);
+        };
+        if held != size {
+            return Err(DriverError::corrupt(
+                NAME,
+                format!(
+                    "the file {key} is {held} bytes in the image of a layer, its index says {size}"
+                ),
+                Remedy::PullAgain,
+            ));
+        }
+        let copy = velarx_content::pull::unnamed::unnamed_file(&self.staging_dir)
+            .map_err(|e| DriverError::io(NAME, e))?;
+        velarx_storage::copy_region(&image, offset, &copy, 0, size, || Ok(()))
+            .map_err(|e| DriverError::io(NAME, e))?;
+        Ok(Some(copy))
+    }
+
+    /// Where the files are that the images of the layers hold.
+    fn extents(&self) -> Extents {
+        Extents {
+            db: self.db.clone(),
+            store: self.store.clone(),
+        }
     }
 
     /// The objects of this store and of the read-only image stores there are.
@@ -1645,11 +1736,18 @@ impl StorageDriver for ComposefsDriver {
         layers: &[FeedLayer],
         settled: Settled,
     ) -> DriverResult<Pulled> {
+        // (a store that has no such file is not asked about each file of the
+        // pull)
+        let inlined =
+            self.db.has_inlined_files().await.map_err(|e| {
+                DriverError::storage(NAME, format!("the files the images hold: {e}"))
+            })?;
         let parts = InProcess {
             driver: NAME,
             store: self.store.clone(),
             staging_dir: self.staging_dir.clone(),
             fsverity: self.fsverity,
+            inlined: inlined.then(|| Arc::new(self.extents()) as _),
         };
         let (store, area) = (self.store.clone(), self.staging());
         // (what the engine made in `settled` is what is written: the images
@@ -1774,8 +1872,16 @@ impl StorageDriver for ComposefsDriver {
         objects::read_objects(NAME, &self.store, ranges, sink)
     }
 
+    /// The object, else a temporary copy of the extent of the EROFS image
+    /// that holds the file (`layers.inline`): what reads a file by its
+    /// digest does not see the difference.
     fn open_object(&self, key: &str, size: u64) -> DriverResult<std::fs::File> {
-        objects::open_object(NAME, &self.store, key, size)
+        match objects::open_object(NAME, &self.store, key, size) {
+            Err(e) if matches!(e.kind, DriverErrorKind::Missing { .. }) => {
+                self.copy_of_extent(key, size)?.ok_or(e)
+            }
+            found => found,
+        }
     }
 
     fn remove_image(&self, image_id: &str) -> DriverResult<()> {
@@ -2594,6 +2700,100 @@ mod tests {
 
     async fn driver(dir: &Path) -> ComposefsDriver {
         driver_for_tests(dir).await
+    }
+
+    /// The content of a file that is no object is its extent of the image of
+    /// the layer that holds it: read back as an object by `open_object`, and
+    /// not fetched again by a pull (`Session::have`, `holds`).
+    #[tokio::test]
+    async fn a_file_an_image_holds_is_read_as_an_object_and_not_fetched() {
+        use velarx_content::pull::session::Session;
+        let tmp = tempfile::tempdir().unwrap();
+        let d = driver(tmp.path()).await;
+        std::fs::create_dir_all(&d.staging_dir).unwrap();
+        let sha = |b: &[u8]| Digest::of(Algorithm::Sha256, b);
+        let key = |name: &[u8]| {
+            let mut h = velarx_storage::VerityHasher::new(Algorithm::Sha256);
+            h.update(name);
+            h.finish()
+        };
+        let layer = LayerKey::Whole(sha(b"layer"));
+        let image = cfs::layer_image_path(d.store.root(), &layer.file_stem());
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        let mut bytes = vec![b'.'; 100];
+        bytes[40..43].copy_from_slice(b"abc");
+        std::fs::write(&image, &bytes).unwrap();
+        let held = |digest: String, offset, size| velarx_db::InlinedFile {
+            digest,
+            offset,
+            size,
+        };
+        d.db.commit_layers(
+            vec![velarx_db::LayerCommit {
+                record: LayerRecord {
+                    stream_size: Some(0),
+                    inline: 4096,
+                    key: layer,
+                    blob: None,
+                    diff_id: Some(sha(b"diff")),
+                    other_diff_id: None,
+                    size: 1,
+                    status: "ready".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    registry_ref: None,
+                    erofs: Some("sha256:a".into()),
+                    owners: Some("[]".into()),
+                },
+                files: vec![],
+                refs: vec![],
+                chunks: vec![],
+                toc_digest: sha(b"toc"),
+                tarsplit: None,
+                blob_checked: false,
+                sealed: false,
+                inlined: vec![
+                    held(key(b"abc"), 40, 3),
+                    held(key(b"far"), 99, 3),
+                    held(key(b"xyz"), 0, 3),
+                ],
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+        let mut got = String::new();
+        std::io::Read::read_to_string(&mut d.open_object(&key(b"abc"), 3).unwrap(), &mut got)
+            .unwrap();
+        assert_eq!(got, "abc");
+        // (its size is the one the index says, and the extent is in the image)
+        for (what, key, size) in [("size", key(b"abc"), 4), ("end", key(b"far"), 3)] {
+            let e = d.open_object(&key, size).unwrap_err();
+            assert!(
+                matches!(e.kind, DriverErrorKind::Corrupt { .. }),
+                "{what}: {e}"
+            );
+        }
+        let e = d.open_object(&key(b"none"), 3).unwrap_err();
+        assert!(matches!(e.kind, DriverErrorKind::Missing { .. }), "{e}");
+        // an object of the store is read as one
+        let object = d.store.put(Algorithm::Sha256, b"obj").unwrap();
+        assert_eq!(
+            d.open_object(&object, 3).unwrap().metadata().unwrap().len(),
+            3
+        );
+        // a pull does not fetch what the image holds: it takes a copy
+        let session = Session::create(&tmp.path().join("pulls"), d.store.clone())
+            .unwrap()
+            .with_inlined(Arc::new(d.extents()));
+        assert!(session.holds(&key(b"abc"), 3));
+        assert_eq!(
+            std::fs::read(session.content_path(&key(b"abc")).unwrap()).unwrap(),
+            b"abc"
+        );
+        // (a file whose extent holds other bytes than its name says is
+        // fetched)
+        assert!(!session.have(&key(b"xyz")));
+        assert!(!session.have(&key(b"none")));
     }
 
     /// What the driver says it can do, through the trait: the engine

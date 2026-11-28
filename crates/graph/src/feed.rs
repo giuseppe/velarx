@@ -1297,6 +1297,9 @@ pub struct InProcess<'a> {
     pub store: Arc<FileStore>,
     pub staging_dir: PathBuf,
     pub fsverity: VerityMode,
+    /// Where the files are that the store holds in the images of its
+    /// layers: a pull does not fetch them again.
+    pub inlined: Option<Arc<dyn velarx_content::pull::session::Inlined>>,
 }
 
 /// The layers of the list that a content keyed driver fetches: those it does
@@ -1354,8 +1357,11 @@ async fn pull_session<R: Send + 'static>(
     write: Written<R>,
 ) -> DriverResult<(Vec<LayerDone>, Settlement, R)> {
     let name = parts.driver;
-    let session = Session::create(&parts.staging_dir, parts.store.clone())
+    let mut session = Session::create(&parts.staging_dir, parts.store.clone())
         .map_err(|e| DriverError::io(name, e))?;
+    if let Some(inlined) = &parts.inlined {
+        session = session.with_inlined(inlined.clone());
+    }
     let into = SessionIncoming::of(session.clone());
     feed.begin(&into).await.map_err(|e| refused(name, e))?;
 
@@ -1548,6 +1554,7 @@ mod tests {
             store: Arc::new(FileStore::new(dir.path().join("files")).unwrap()),
             staging_dir: staging.clone(),
             fsverity: VerityMode::Off,
+            inlined: None,
         };
         let layer = |n: u8| {
             let d: Digest = format!("sha256:{}", format!("{n:02x}").repeat(32))
