@@ -103,6 +103,30 @@ the merged image a sealed manifest states, the mode of `composefs_digests`, and
 what is served to peers (the store service serves the objects when the driver
 says `serve_content`, and nothing otherwise).
 
+## Files inside the image
+
+`[storage] inline_threshold` (`velarx pull --inline-threshold=N` for one
+pull) makes the EROFS image of a layer hold the regular files of 1 to N bytes
+itself (-1: every file, 0, the default: none).  The layers a pull, a load, a
+build, a commit or an import make take the configured value; the layers a
+store has keep the one they were made with, silently (`velarx rmi` and a
+pull again make them with another).  `layers.inline` records the value and
+the table `inlined_files` where each file is in the image (`offset`, `size`);
+those files are not in `files` and `file_refs`, so they are no objects and
+collection needs nothing of them.  "The content of the file with digest d" is
+the object when the store has it, else its extent of the image of a layer
+(`Database::inlined_file`); what reads a file by its digest (push, save,
+commit, copy) finds it either way, and an extent is read back as a temporary
+copy of it.
+
+The image of such a layer is not the one its table of contents alone makes,
+so the digest of it that a manifest states can never be the recorded one:
+`composefs_digests = "require"` and `verity=enforce` fail for it as for any
+other mismatch.  A manifest that velarx writes states the digest of the image
+made from the table of contents alone.  `system check` does not fetch what
+an inlined layer lacks: a layer to be made again with another threshold is
+removed with `velarx rmi` and pulled again.
+
 ## Between versions
 
 Nothing is compatible between versions (README).  A database of another
