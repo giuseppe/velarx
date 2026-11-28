@@ -73,11 +73,12 @@ teardown_file () {
             bare="$bare $(cat "$t/comm")"
     done
     check "no thread of the server is unconfined" "" "$bare"
-    # it holds its socket, /dev/null, its FUSE device and its log (the file the
-    # engine opened for it: its standard error), nothing it inherited
+    # it holds its socket, /dev/null, its FUSE device, its log (the file the
+    # engine opened for it: its standard error) and the EROFS images of the
+    # layers (the files they hold are read from them), nothing it inherited
     local fds
     fds=$(for t in /proc/"$srv"/fd/*; do readlink "$t"; done | sed 's/^socket:.*/socket/' | sort -u | tr '\n' ' ')
-    check_match "the descriptors of the server" "^/dev/fuse /dev/null socket [^ ]*/bundles/[0-9a-f]{64}/image-server.log $" "$fds"
+    check_match "the descriptors of the server" "^/dev/fuse /dev/null socket [^ ]*/bundles/[0-9a-f]{64}/image-server.log ([^ ]*/composefs/layer-[^ ]*\\.erofs )*$" "$fds"
     sc container exec s1 sh -c 'echo w > /etc/written && cat /etc/written' > "$WORKDIR/written" 2>&1
     check "the container writes in its upper layer" w "$(cat "$WORKDIR/written")"
     echo "$srv" > "$WORKDIR/server.pid"

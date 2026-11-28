@@ -1825,7 +1825,16 @@ impl StorageDriver for ComposefsDriver {
             .into_iter()
             .map(|(image, _)| image)
             .collect();
+        // (the view holds the image of each layer open, whose files it reads:
+        // the limit is raised before the first is opened, or the view is
+        // refused with nothing opened)
+        let needed = velarx_base::hardening::open_files_needed(layers.len());
+        velarx_base::hardening::ensure_open_files(needed)
+            .map_err(|_| no_open_files(image_id, needed))?;
         let view = ImageView::open(&paths).map_err(|e| {
+            if velarx_runtime::imagemount::out_of_descriptors(&e) {
+                return no_open_files(image_id, needed);
+            }
             DriverError::corrupt(
                 NAME,
                 format!("the EROFS images of the layers cannot be read: {e}"),

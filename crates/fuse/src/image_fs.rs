@@ -30,7 +30,8 @@ use velarx_storage::FileStore;
 /// Attributes never change: the kernel can keep them for good.
 const TTL: Duration = Duration::from_secs(24 * 3600);
 
-/// The handle of a file whose bytes are in the tree (`FileRef::inline`).
+/// The handle of a file the image holds itself (`FileRef::inline`): read from
+/// the image file (`Tree::read_held`).
 const INLINE_FH: u64 = u64::MAX;
 
 /// Threads that wait for fetches: misses of different files proceed at the
@@ -160,7 +161,7 @@ impl ImageFs {
         if a.kind != FileType::RegularFile || a.size <= SPARSE_MIN {
             return None;
         }
-        let f = self.tree.file(ino).filter(|f| f.inline.is_none())?;
+        let f = self.tree.file(ino).filter(|f| !f.inline)?;
         let path = self.shared.find(f.digest.as_deref()?)?;
         std::fs::symlink_metadata(path).ok().map(|m| m.blocks())
     }
@@ -768,7 +769,7 @@ impl Filesystem for ImageFs {
             // Nothing to read: the content of an empty file is not needed.
             return reply.opened(0, consts::FOPEN_KEEP_CACHE);
         }
-        if file.inline.is_some() {
+        if file.inline {
             return reply.opened(INLINE_FH, consts::FOPEN_KEEP_CACHE);
         }
         let Some(digest) = file.digest else {
@@ -799,16 +800,15 @@ impl Filesystem for ImageFs {
         reply: ReplyData,
     ) {
         if fh == INLINE_FH {
-            // a file the image holds: its bytes are the tree's
-            let Some(data) = self.tree.file(ino).and_then(|f| f.inline) else {
-                return reply.error(libc::ENOENT);
-            };
-            let Ok(start) = usize::try_from(offset) else {
+            // a file the image holds: its bytes are in the image file
+            let Ok(offset) = u64::try_from(offset) else {
                 return reply.error(libc::EINVAL);
             };
-            let start = start.min(data.len());
-            let end = start.saturating_add(size as usize).min(data.len());
-            return reply.data(&data[start..end]);
+            return match self.tree.read_held(ino, offset, size as usize) {
+                Some(Ok(data)) => reply.data(&data),
+                Some(Err(e)) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+                None => reply.error(libc::ENOENT),
+            };
         }
         let Some(handle) = self.shared.handle(fh) else {
             return reply.data(&[]);

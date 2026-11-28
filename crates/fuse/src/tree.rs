@@ -44,9 +44,9 @@ pub struct FileRef {
     /// The index of the layer that has it, for the fetch of what the store
     /// lacks.
     pub layer: usize,
-    /// The bytes of a file that the image holds itself (composefs-rs puts
-    /// the small ones in it): nothing to fetch.
-    pub inline: Option<Vec<u8>>,
+    /// The image holds the content itself (`Tree::held`): nothing to
+    /// fetch.
+    pub inline: bool,
 }
 
 pub trait Tree: Send + Sync + 'static {
@@ -63,6 +63,10 @@ pub trait Tree: Send + Sync + 'static {
 
     /// What a regular file holds.
     fn file(&self, ino: u64) -> Option<FileRef>;
+
+    /// At most `len` bytes from `offset` of a regular file the image holds
+    /// itself; None when it holds no such file.
+    fn read_held(&self, ino: u64, offset: u64, len: usize) -> Option<std::io::Result<Vec<u8>>>;
 
     /// The entries of a directory but the first `skip`, in order, until `f`
     /// (given the inode, the kind and the name) says the reply is full.  An

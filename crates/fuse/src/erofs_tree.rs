@@ -19,10 +19,15 @@
 //! namespace that follows the stubs of its lowest layer only (`Stubs`) has
 //! the regular files of the layers above served whole here, their content
 //! read from the store; with the digests enforced each is opened and
-//! measured as the kernel would (`verity::Verity`, `enforced`).
+//! measured as the kernel would (`verity::Verity`, `enforced`).  A regular
+//! file that an image holds itself (`layer_erofs::Inline`) is read from the
+//! image file, at the place its inode gives, not through the mapping: an
+//! error of the file system of the image (NFS) fails that read, where a
+//! fault in the mapping would end the server.
 
 use super::erofs_read::xattrs;
 use super::tree::{Attr, FileRef, Tree};
+use composefs::erofs::format::DataLayout;
 use composefs::erofs::format::{
     FileType as ErofsFileType, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
     S_IFSOCK,
@@ -238,6 +243,9 @@ fn plain_dir(perm: u16) -> Attr {
 /// The image of one layer, mapped.  Its nodes are known by their nid.
 pub struct Layer {
     bytes: Bytes,
+    /// The image file that is mapped, when it is one: the content of the
+    /// files the image holds is read from it (`read_held`).
+    file: Option<std::fs::File>,
     root: u64,
     inos: u64,
 }
@@ -267,16 +275,27 @@ impl Layer {
         image
             .inode(root)
             .map_err(|e| format!("the root of the image: {e}"))?;
-        Ok(Self { bytes, root, inos })
+        Ok(Self {
+            bytes,
+            file: None,
+            root,
+            inos,
+        })
     }
 
     /// The image at `path`, mapped.
     pub fn map(path: &Path) -> io::Result<Self> {
-        Self::open(map_file(path)?).map_err(|e| {
+        let file = crate::composefs::open_layer_image(path)?;
+        let map = velarx_sys::mmap::map_file(&file)?;
+        let layer = Self::open(Box::new(map)).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{}: {e}", path.display()),
             )
+        })?;
+        Ok(Self {
+            file: Some(file),
+            ..layer
         })
     }
 
@@ -287,11 +306,15 @@ impl Layer {
     /// from that mapping, never from its path.
     pub fn of_checked_file(file: std::fs::File, path: &Path) -> io::Result<Self> {
         let map = velarx_sys::mmap::map_file(&file)?;
-        Self::open(Box::new(map)).map_err(|e| {
+        let layer = Self::open(Box::new(map)).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("the EROFS image {}: {e}", path.display()),
             )
+        })?;
+        Ok(Self {
+            file: Some(file),
+            ..layer
         })
     }
 
@@ -441,6 +464,74 @@ impl Layer {
             .ok_or_else(|| damaged("a link without a target"))?;
         let block = img.block(first).map_err(|e| damaged(&e.to_string()))?;
         Ok(block[..(inode.size() as usize).min(block.len())].to_vec())
+    }
+
+    /// The content of the regular file `nid` that the image holds itself:
+    /// its place in the image, in the block after its inode (a file under a
+    /// block) or in blocks of its own.  None for a stub, and for a file
+    /// that is not where its inode says it is.
+    fn held_range(&self, nid: u64) -> Option<std::ops::Range<usize>> {
+        let img = self.image();
+        let inode = img.inode(nid).ok()?;
+        if inode.mode().0.get() & S_IFMT != S_IFREG {
+            return None;
+        }
+        let size = usize::try_from(inode.size()).ok()?;
+        let start = match inode.data_layout().ok()? {
+            DataLayout::FlatPlain => {
+                usize::try_from(img.inode_blocks(&inode).ok()?.start).ok()? * img.block_size
+            }
+            DataLayout::FlatInline if size < img.block_size => {
+                let tail = inode.inline()?;
+                tail.as_ptr() as usize - img.image.as_ptr() as usize
+            }
+            _ => return None,
+        };
+        let end = start.checked_add(size)?;
+        (end <= img.image.len()).then_some(start..end)
+    }
+
+    /// At most `len` bytes from `offset` of the file `nid` the image holds
+    /// itself (none past its end): read from the image file when there is
+    /// one, so that an error of its file system is the error of the read,
+    /// else from the bytes of the image.  None for a stub, and for a file
+    /// that is not where its inode says it is.
+    pub fn read_held(&self, nid: u64, offset: u64, len: usize) -> Option<io::Result<Vec<u8>>> {
+        let range = self.held_range(nid)?;
+        let skip = usize::try_from(offset).map_or(range.len(), |o| o.min(range.len()));
+        let start = range.start + skip;
+        let end = start + len.min(range.end - start);
+        Some(match &self.file {
+            Some(file) => {
+                use std::os::unix::fs::FileExt;
+                let mut buf = vec![0; end - start];
+                file.read_exact_at(&mut buf, start as u64).map(|()| buf)
+            }
+            None => Ok((*self.bytes).as_ref()[start..end].to_vec()),
+        })
+    }
+
+    /// The content of the file `nid` the image holds itself, as a file of
+    /// its own with no name, in memory: for what reads a file whole by its
+    /// content, there being no digest to read it back by (the view of an
+    /// image).  None for a stub, and for a file that is not where its inode
+    /// says it is.
+    pub fn open_held(&self, nid: u64) -> Option<io::Result<std::fs::File>> {
+        let range = self.held_range(nid)?;
+        let copy = || {
+            use std::os::unix::fs::FileExt;
+            let flags = rustix::fs::MemfdFlags::CLOEXEC;
+            let copy = std::fs::File::from(rustix::fs::memfd_create("velarx-held", flags)?);
+            let len = range.len() as u64;
+            match &self.file {
+                Some(file) => {
+                    velarx_storage::copy_region(file, range.start as u64, &copy, 0, len, || Ok(()))?
+                }
+                None => copy.write_all_at(&(*self.bytes).as_ref()[range.clone()], 0)?,
+            }
+            Ok(copy)
+        };
+        Some(copy())
     }
 
     /// The digest of the file of the store a stub redirects to, and its size.
@@ -712,7 +803,7 @@ impl Tree for Layers {
                 digest: Some(digest.to_string()),
                 size,
                 layer: l,
-                inline: None,
+                inline: false,
             });
         }
         let (i, nid) = self.split(ino)?;
@@ -721,8 +812,13 @@ impl Tree for Layers {
             digest,
             size,
             layer: i,
-            inline: None,
+            inline: self.layers[i].held_range(nid).is_some(),
         })
+    }
+
+    fn read_held(&self, ino: u64, offset: u64, len: usize) -> Option<io::Result<Vec<u8>>> {
+        let (i, nid) = self.split(ino)?;
+        self.layers[i].read_held(nid, offset, len)
     }
 
     fn readdir(

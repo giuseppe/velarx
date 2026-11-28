@@ -127,9 +127,9 @@ pub trait ImageTree: Send + Sync {
     /// the store only then.
     fn has_verity(&self) -> bool;
 
-    /// The content of a regular file, opened, for a tree that reads a mount
-    /// (the files are the mount's, with no digest to read them back by):
-    /// none for a tree whose content is read by the digest of its entries.
+    /// The content of a regular file, opened, for a file with no digest to
+    /// read it back by (the files of a mount, the files an image holds):
+    /// none for one whose content is read by the digest of its entry.
     fn open_content(&self, _node: &ViewNode) -> Option<std::io::Result<std::fs::File>> {
         None
     }
@@ -333,6 +333,13 @@ impl ImageTree for ImageView {
 
     fn has_verity(&self) -> bool {
         self.verity
+    }
+
+    /// A file the image of its layer holds has no digest: its content is
+    /// the one of the image.
+    fn open_content(&self, node: &ViewNode) -> Option<std::io::Result<std::fs::File>> {
+        let (layer, nid) = node.key;
+        self.layers.get(layer)?.open_held(nid)
     }
 }
 
