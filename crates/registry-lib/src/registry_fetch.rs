@@ -199,10 +199,8 @@ impl Handing {
 /// a layer).
 const WORKERS: &str = "workers";
 
-/// The workers of a scope, with the access they were made for: a `Renew`
-/// of the scope has new ones made.
+/// The workers of a scope.
 struct Workers {
-    access: Option<zeroize::Zeroizing<Vec<u8>>>,
     pool: Arc<Pool>,
     host: String,
 }
@@ -273,9 +271,8 @@ impl RegistryFetch {
     }
 
     /// The workers for the repository of the scope: the same for all its
-    /// calls with the same access, so that their connections to the
-    /// registry are reused.  (A scope that brings credentials of its own has
-    /// workers of its own; they are let go with it.)
+    /// calls, so that their connections to the registry are reused.  (They
+    /// are let go with the scope.)
     fn pool(&self, scope: &Scope) -> Result<(Arc<Pool>, String), FetcherError> {
         let repository = scope
             .source
@@ -287,7 +284,6 @@ impl RegistryFetch {
         if let Some(w) = kept
             .get(WORKERS)
             .and_then(|w| w.clone().downcast::<Workers>().ok())
-            .filter(|w| w.access == scope.access)
         {
             return Ok((w.pool.clone(), w.host.clone()));
         }
@@ -303,7 +299,6 @@ impl RegistryFetch {
         kept.insert(
             WORKERS.into(),
             Arc::new(Workers {
-                access: scope.access.clone(),
                 pool: pool.clone(),
                 host: host.clone(),
             }),
@@ -1453,16 +1448,6 @@ mod tests {
             let (second, _) = fetch.pool(&scope).unwrap();
             assert!(Arc::ptr_eq(&first, &second));
         }
-        // a scope renewed with other credentials has other workers
-        let scope = scope(creds);
-        let (first, _) = fetch.pool(&scope).unwrap();
-        let renewed = Scope {
-            access: Some(br#"{"creds":{"username":"v","password":"q"}}"#.to_vec().into()),
-            kept: scope.kept.clone(),
-            ..scope
-        };
-        let (second, _) = fetch.pool(&renewed).unwrap();
-        assert!(!Arc::ptr_eq(&first, &second));
     }
 
     /// The files with no name beneath `dir` that this process has open.
@@ -1594,7 +1579,6 @@ mod tests {
         scope.kept.lock().unwrap().insert(
             WORKERS.into(),
             Arc::new(Workers {
-                access: None,
                 pool,
                 host: "registry.invalid".into(),
             }),
@@ -1710,7 +1694,6 @@ mod tests {
         scope.kept.lock().unwrap().insert(
             WORKERS.into(),
             Arc::new(Workers {
-                access: None,
                 pool,
                 host: "registry.invalid".into(),
             }),

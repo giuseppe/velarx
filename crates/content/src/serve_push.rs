@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The serving end of the pusher interface (`org.velarx.Pusher`): what a
 //! pusher implements ([`Pushing`]) and the checks of the calls that are the
-//! same for every pusher.  The scope of a connection (`Open`, `Renew`) and
+//! same for every pusher.  The scope of a connection (`Open`) and
 //! the connections for other calls (`Connect`) are served by the endpoint of
 //! [`crate::serve_fetch`], on the same socket: a process that serves a
 //! fetcher serves a pusher with it, and a pusher that is not one answers

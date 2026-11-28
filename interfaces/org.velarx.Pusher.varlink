@@ -115,7 +115,7 @@ type FailureClass (
 	# The origin says the item does not exist; from a party that is not
 	# the origin it is read as `unavailable`
 	not_found,
-	# Credentials missing or refused: the engine may `Renew` and ask again
+	# Credentials missing or refused
 	unauthorized,
 	# The credentials were taken and do not allow it
 	forbidden,
@@ -198,9 +198,6 @@ method Open(destination: string, tls_verify: ?bool, target: ?int, access: ?int, 
 # Another connection with the scope of this one: the reply carries
 # its descriptor.
 method Connect() -> ()
-
-# Replace the credentials of the scope.
-method Renew(access: int) -> ()
 
 # What do you have, or what can you link, of these objects?  Called
 # with `more`: one `probed` a reply, in any order, then a last

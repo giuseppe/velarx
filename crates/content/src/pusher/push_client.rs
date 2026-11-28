@@ -117,14 +117,6 @@ impl FetchConn {
         Ok(self.handed(fd)?)
     }
 
-    /// Replace the credentials of the scope.
-    pub async fn push_renew(&mut self, access: OwnedFd) -> Result<(), CallError> {
-        let (conn, busy) = self.begin().await?;
-        let got = PusherProxy::renew(conn, vec![access], 0).await;
-        busy.store(false, Ordering::Release);
-        done(got).map(|_| ())
-    }
-
     /// What the pusher has of `objects`: a reply for each.
     pub async fn push_probe(
         &mut self,
@@ -600,24 +592,6 @@ mod tests {
         let mut shared = conn.push_connect().await.unwrap();
         let objects = [object(b"a", "present")];
         assert_eq!(probed(&mut shared, &objects).await, [Have::Present]);
-    }
-
-    #[tokio::test]
-    async fn new_credentials_replace_those_of_the_scope() {
-        let fake = Arc::new(Fake::default());
-        let (_local, mut conn) = started(Arc::new(WithPusher(fake.clone())));
-        opened(&mut conn, "registry.example/name", Some(access()), &[])
-            .await
-            .unwrap();
-        let objects = [object(b"a", "present")];
-        probed(&mut conn, &objects).await;
-        let new = velarx_base::sealed::sealed_memory(br#"{"credentials":"y"}"#).unwrap();
-        conn.push_renew(new).await.unwrap();
-        probed(&mut conn, &objects).await;
-        assert_eq!(
-            fake.access.lock().unwrap().as_deref(),
-            Some(&br#"{"credentials":"y"}"#[..])
-        );
     }
 
     #[tokio::test]

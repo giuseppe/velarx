@@ -27,7 +27,7 @@ pub enum FailureClass {
     /// The origin says the item does not exist; from a party that is not
     /// the origin it is read as `unavailable`
     NotFound,
-    /// Credentials missing or refused: the engine may `Renew` and ask again
+    /// Credentials missing or refused
     Unauthorized,
     /// The credentials were taken and do not allow it
     Forbidden,

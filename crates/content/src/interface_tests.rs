@@ -77,7 +77,6 @@ fn the_pusher_interface_file_is_current() {
         "GetInfo",
         "Open",
         "Connect",
-        "Renew",
         "Probe",
         "Put",
         "Commit",

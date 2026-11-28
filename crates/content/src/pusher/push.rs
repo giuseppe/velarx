@@ -290,13 +290,6 @@ mod proxy {
         #[zlink(return_fds)]
         async fn connect(&mut self) -> zlink::Result<(Result<Ack, PusherError>, Vec<OwnedFd>)>;
 
-        /// Replace the credentials of the scope.
-        async fn renew(
-            &mut self,
-            #[zlink(fds)] fds: Vec<OwnedFd>,
-            access: u32,
-        ) -> zlink::Result<Result<Ack, PusherError>>;
-
         /// What do you have, or what can you link, of these objects?
         #[zlink(more)]
         async fn probe(

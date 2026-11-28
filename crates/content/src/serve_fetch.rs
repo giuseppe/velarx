@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The serving end of the fetcher interface:
-//! the scope of a connection (`Open`, `Layer`, `Renew`, `Forget`), the
+//! the scope of a connection (`Open`, `Layer`, `Forget`), the
 //! connections for other calls (`Connect`), and the calls that bring
 //! content (`GetFile`, `GetBlob`, `Probe`, `Unpack`,
 //! `Fetch`), which a [`StagingFetcher`] implements.  What
@@ -867,7 +867,7 @@ fn read_access(fd: OwnedFd, max: u64) -> Result<zeroize::Zeroizing<Vec<u8>>, Str
 
 /// What the two interfaces that open a scope have apart: the scope, the
 /// words of their errors and where the endpoint keeps the scope.  `Scoped`
-/// does the rest, once: `Open` once, `Connect`, `Renew`.
+/// does the rest, once: `Open` once, `Connect`.
 trait ScopeKind {
     type Scope: Send + Sync + 'static;
     type Error;
@@ -881,12 +881,6 @@ trait ScopeKind {
     fn not_supported(feature: String) -> Self::Error;
     /// A refusal of a new connection, as this interface says it.
     fn refused(e: FetcherError) -> Self::Error;
-    /// The scope with other credentials (what it holds of the old one that
-    /// cannot be had again is an error, never a scope without it).
-    fn renewed(
-        old: &Self::Scope,
-        access: zeroize::Zeroizing<Vec<u8>>,
-    ) -> std::io::Result<Self::Scope>;
 }
 
 struct FetcherScope;
@@ -915,18 +909,6 @@ impl ScopeKind for FetcherScope {
 
     fn refused(e: FetcherError) -> FetcherError {
         e
-    }
-
-    fn renewed(old: &Scope, access: zeroize::Zeroizing<Vec<u8>>) -> std::io::Result<Scope> {
-        Ok(Scope {
-            verity: old.verity,
-            source: old.source.clone(),
-            tls_verify: old.tls_verify,
-            target: old.target.clone(),
-            access: Some(access),
-            idle: old.idle,
-            kept: old.kept.clone(),
-        })
     }
 }
 
@@ -957,21 +939,10 @@ impl ScopeKind for PusherScope {
             e => PusherError::unavailable(e.to_string()),
         }
     }
-
-    fn renewed(old: &PushScope, access: zeroize::Zeroizing<Vec<u8>>) -> std::io::Result<PushScope> {
-        Ok(PushScope {
-            destination: old.destination.clone(),
-            tls_verify: old.tls_verify,
-            access: Some(access),
-            target: old.target.as_ref().map(|t| t.try_clone()).transpose()?,
-            idle: old.idle,
-            kept: std::sync::OnceLock::new(),
-        })
-    }
 }
 
 /// The scope of one interface of an endpoint: what `GetInfo`, `Open`,
-/// `Connect` and `Renew` of the fetcher and of the pusher share.
+/// and `Connect` of the fetcher and of the pusher share.
 struct Scoped<'a, S: ScopeKind> {
     endpoint: &'a FetchEndpoint,
     kind: std::marker::PhantomData<S>,
@@ -1053,20 +1024,6 @@ impl<'a, S: ScopeKind> Scoped<'a, S> {
             Ok(fd) => (Ok(()), vec![fd]),
             Err(e) => (Err(S::refused(e)), Vec::new()),
         }
-    }
-
-    /// Replace the credentials of the scope with those of the descriptor
-    /// `access` of `fds`.
-    fn renew(&self, fds: Vec<OwnedFd>, access: u32) -> Result<(), S::Error> {
-        let old = self.get()?;
-        let mut fds = Descriptors::new(fds);
-        let fd = fds.take("the access file", access).map_err(S::invalid)?;
-        fds.finish().map_err(S::invalid)?;
-        let access = Self::access(fd)?;
-        let renewed = S::renewed(&old, access)
-            .map_err(|e| S::refused(FetcherError::failed(format!("the scope: {e}"))))?;
-        *S::slot(&mut self.state()) = Some(Arc::new(renewed));
-        Ok(())
     }
 }
 
@@ -1162,16 +1119,6 @@ mod service {
         pub async fn connect(&self) -> (Result<Ack, FetcherError>, Vec<OwnedFd>) {
             let (result, fds) = Scoped::<FetcherScope>::of(self).connect();
             (result.map(|()| Ack {}), fds)
-        }
-
-        /// Replace the credentials of the scope.
-        pub async fn renew(
-            &self,
-            #[zlink(fds)] fds: Vec<OwnedFd>,
-            access: u32,
-        ) -> Result<Ack, FetcherError> {
-            Scoped::<FetcherScope>::of(self).renew(fds, access)?;
-            Ok(Ack {})
         }
 
         /// Tell this fetcher of a layer: `staging` its staging directory,
@@ -1816,17 +1763,6 @@ mod service {
             (result.map(|()| PushAck {}), fds)
         }
 
-        /// Replace the credentials of the scope.
-        #[zlink(rename = "Renew")]
-        pub async fn push_renew(
-            &self,
-            #[zlink(fds)] fds: Vec<OwnedFd>,
-            access: u32,
-        ) -> Result<PushAck, PusherError> {
-            Scoped::<PusherScope>::of(self).renew(fds, access)?;
-            Ok(PushAck {})
-        }
-
         /// What do you have, or what can you link, of these objects?  Called
         /// with `more`: one `probed` a reply, in any order, then a last
         /// reply without one.
@@ -2354,7 +2290,7 @@ mod tests {
         let text = definition();
         velarx_base::testing::assert_interface_file("interfaces/org.velarx.Fetcher.varlink", &text);
         for method in [
-            "GetInfo", "Open", "Connect", "Renew", "Layer", "Forget", "GetFile", "GetBlob",
+            "GetInfo", "Open", "Connect", "Layer", "Forget", "GetFile", "GetBlob",
             "Probe", "Unpack", "Fetch",
         ] {
             assert!(text.contains(&format!("method {method}(")), "{method}");
