@@ -4,7 +4,7 @@
 #
 #   make                                  # build everything (release)
 #   make build PROFILE=debug              # the same, debug (also: make build-debug)
-#   make fmt-check clippy test            # what every change passes
+#   make test                             # the quick tier: once per series of changes
 #   make e2e T=run-lifecycle              # one end to end file
 #   make install DESTDIR=/tmp/root PREFIX=/usr
 #
@@ -13,7 +13,7 @@
 #. PROFILE      release (default) or debug: the cargo profile of the build targets
 #. CARGO        the cargo command (default cargo; a wrapper or `cargo +nightly`)
 #. CARGOFLAGS   extra flags for every cargo call of this file
-#. TESTARGS     arguments of `cargo test`, e.g. TESTARGS=pull_tests:: (test, test-slow, test-all)
+#. TESTARGS     arguments of `cargo test`, e.g. TESTARGS=pull_tests:: (test-unit, test-slow, test-full)
 #. COVERAGE_OUT  where `make coverage` puts its report (default target/coverage)
 #. PKG          the package of `make test-pkg` and `make build-pkg` (velarx-core, ...)
 #. TARGETDIR    where the built binaries are: $CARGO_TARGET_DIR (else target/) + PROFILE
@@ -21,7 +21,12 @@
 #. VELARX_BINDIR  the binaries the end to end tests run (default DEBUGDIR); point it at
 #.              a copy of the binaries when another build may replace them meanwhile
 #. T            e2e: the bats files to run, space separated (T="run-lifecycle kube"); all if empty
-#. E2E_JOBS     e2e: files run side by side (default 6)
+#. E2E_JOBS     e2e: files run side by side (default 6; e2e-rootless 5)
+#. E2E_BINDIR   test, test-full: the copy of the debug binaries the bats files run while cargo
+#.              builds again (default $CARGO_TARGET_DIR/e2e-bin, else target/e2e-bin)
+#. P2P_LOCK     e2e-p2p: the lock file held by every peer-to-peer run of the machine (/var/tmp/p2p-rig.lock)
+#. LEAN         test-full: LEAN=0 leaves out the Lean proofs (test-lean)
+#. VERIFY_CRATES  test-lean: the crates of tools/verify to check (default all)
 #. BATS_ARGS    e2e: arguments for bats, e.g. BATS_ARGS="--filter pull"
 #. E2E_TIMEOUT  e2e: seconds a file may take (default 1800); E2E_LOGDIR keeps the logs
 #. SUDO         e2e-root: how to become root (default sudo; nothing when already root)
@@ -63,16 +68,20 @@
 # share/man the generated ones: nothing generated is in git); `make list`
 # prints what install lays out.
 #
-# The tests, in two tiers:
+# The tests, in two tiers (CONTRIBUTING.md says when each runs):
 #
-#   make test        # the fast tier, what every change passes: cargo test
-#                    # (the unit tests and the one integration binary),
-#                    # and the tests of velarx-api (the size of the
-#                    # arguments of the calls of the frontends, the pumps)
-#   make test-all    # and the slow tier: the tests that wait
-#                    # (VELARX_SLOW_TESTS), the p2p feature, the thin
-#                    # client, and the end to end bats tests side by side
-#                    # (tests/e2e/run-all.sh; as root, the root-only ones)
+#   make test        # the quick tier, once per series of changes: fmt-check,
+#                    # clippy, check (also with --features fuzzing), the
+#                    # debug build, then side by side the unit tests
+#                    # (test-unit: cargo test, velarx-api's) and the
+#                    # rootless bats files (e2e-rootless)
+#   make test-full   # everything, before a push to GitHub or nightly: the
+#                    # lint tools (no build), clippy, check, one build,
+#                    # then side by side the cargo tests of every package
+#                    # with the waiting ones and fs-verity (VELARX_VERITY_DIR),
+#                    # the fuzz corpora, the rootless bats files, the p2p
+#                    # ones under P2P_LOCK and the Lean proofs; then the
+#                    # root bats files (e2e-root, through SUDO)
 
 PROFILE ?= release
 PREFIX ?= /usr/local
@@ -112,6 +121,13 @@ export VELARX_BINDIR
 INSTALL ?= install
 T ?=
 BATS_ARGS ?=
+E2E_BINDIR ?= $(TARGETBASE)/e2e-bin
+P2P_LOCK ?= /var/tmp/p2p-rig.lock
+export P2P_LOCK
+LEAN ?=
+VERIFY_CRATES ?= $(sort $(patsubst tools/verify/%/lean,%,$(wildcard tools/verify/*/lean)))
+# every binary the bats files may run, copied to E2E_BINDIR when built
+E2E_BINARIES = velarx velarx-client velarx-monitor velarx-registry velarx-dir velarx-kube velarx-api velarx-cri velarx-p2p
 SUDO ?= $(if $(filter 0,$(shell id -u)),,sudo)
 FUZZ ?=
 FUZZ_TIME ?= 60
@@ -143,8 +159,8 @@ USER_UNITS = $(filter-out $(if $(P2P),,velarx-p2p.service) $(if $(API),,velarx-a
 .PHONY: all help reuse licenses-binary issue-refs features-check patches-check deps-check docs-check docs-commands build build-debug build-default build-engine build-kube build-client build-p2p \
 	build-api build-cri build-pkg man \
 	fmt fmt-check clippy check install install-files uninstall list \
-	test test-leaks test-slow test-lint test-pkg test-p2p test-api test-cri cri-tests critest-root cri-kubelet test-workspace test-all \
-	test-fuzz-corpus e2e e2e-root p2p-rig e2e-list fuzz fuzz-list fuzz-all \
+	test test-unit test-full test-full-cargo test-lean test-leaks test-slow test-lint test-pkg test-p2p test-api test-cri cri-tests critest-root cri-kubelet test-workspace test-all \
+	test-fuzz-corpus e2e e2e-bin e2e-rootless e2e-root e2e-p2p p2p-rig e2e-list fuzz fuzz-list fuzz-all \
 	coverage \
 	check-dco audit licenses ci bench-startup perf-compare test-perf-compare dist clean setup-env unsetup-env
 
@@ -259,8 +275,9 @@ clippy: ## cargo clippy of the workspace with the tests, and of the thin client;
 	$(CARGO) clippy --workspace --all-targets $(CARGOFLAGS) -- -D warnings
 	$(CARGO) clippy -p velarx-bin --no-default-features --bin velarx-client $(CARGOFLAGS) -- -D warnings
 
-check: ## cargo check of the whole workspace with the tests, and of the thin client
-	$(CARGO) check --workspace --tests $(CARGOFLAGS)
+check: ## cargo check of every target of the workspace, also with --features fuzzing, and of the thin client
+	$(CARGO) check --workspace --all-targets $(CARGOFLAGS)
+	$(CARGO) check --workspace --all-targets --features fuzzing $(CARGOFLAGS)
 	$(CARGO) check -p velarx-bin --no-default-features --bin velarx-client $(CARGOFLAGS)
 
 # ---- install ----
@@ -331,10 +348,52 @@ uninstall: ## remove what install laid out (DESTDIR/PREFIX as for install)
 
 # ---- tests ----
 
-test: ## fast tier: cargo test (fuzz corpora replayed), unit tests and the integration binary, velarx-api's, and a check of the thin client (TESTARGS=filter)
-	$(CARGO) test --features fuzzing $(CARGOFLAGS) $(TESTARGS)
+# The bats files run a copy of the binaries (E2E_BINDIR): the cargo tests
+# that run beside them build the binaries again, with the features of the
+# workspace.
+test: ## quick tier, once per series: fmt-check, clippy, check, debug build (and the examples bats files run), then test-unit and e2e-rootless side by side
+	$(MAKE) fmt-check
+	$(MAKE) clippy
+	$(MAKE) check
+	$(MAKE) build-debug
+	$(CARGO) build --examples $(CARGOFLAGS)
+	$(MAKE) e2e-bin
+	$(MAKE) e2e-man VELARX_BINDIR=$(E2E_BINDIR)
+	$(MAKE) -O -j2 test-unit e2e-rootless VELARX_BINDIR=$(E2E_BINDIR)
+
+test-unit: ## the unit tests and the integration binary (cargo test of the default members) and velarx-api's (TESTARGS=filter)
+	$(CARGO) test $(CARGOFLAGS) $(TESTARGS)
 	$(CARGO) test -p velarx-api $(CARGOFLAGS) $(TESTARGS)
-	$(CARGO) check -p velarx-bin --no-default-features --bin velarx-client $(CARGOFLAGS)
+
+# Phases: the lint tools (no build); clippy, check and one build (the
+# binaries, the examples some bats files run, the test executables); then
+# side by side the cargo tests, the rootless and the p2p bats files and the
+# Lean proofs; then the root bats files, also when something of the phase
+# before failed (the target fails at the end).  The cargo tests take
+# RUST_TEST_THREADS (default 8) threads: the bats files beside them wait
+# for events with timeouts.
+test-full: ## everything, before a push to GitHub or nightly (LEAN=0 leaves out the Lean proofs; VELARX_VERITY_DIR for fs-verity)
+	$(MAKE) -O -j fmt-check reuse issue-refs features-check patches-check deps-check docs-check
+	$(MAKE) clippy
+	$(MAKE) check
+	$(MAKE) build-debug
+	$(CARGO) build --examples $(CARGOFLAGS)
+	$(MAKE) e2e-bin
+	$(MAKE) e2e-man docs-commands VELARX_BINDIR=$(E2E_BINDIR)
+	$(CARGO) test --workspace --no-run $(CARGOFLAGS)
+	$(CARGO) test --features fuzzing --test integration --no-run $(CARGOFLAGS)
+	@s=0; \
+	$(MAKE) -O -j test-full-cargo e2e-rootless e2e-p2p $(if $(filter 0,$(LEAN)),,test-lean) VELARX_BINDIR=$(E2E_BINDIR) || s=1; \
+	$(MAKE) e2e-root VELARX_BINDIR=$(E2E_BINDIR) || s=1; \
+	exit $$s
+
+test-full-cargo: # the cargo tests of test-full: every package, the waiting tests too, fs-verity with VELARX_VERITY_DIR; the fuzz corpora
+	VELARX_SLOW_TESTS=1 RUST_TEST_THREADS=$(or $(RUST_TEST_THREADS),8) $(if $(VELARX_VERITY_DIR),VELARX_VERITY_DIR=$(abspath $(VELARX_VERITY_DIR))) \
+		$(CARGO) test --workspace $(CARGOFLAGS) $(TESTARGS)
+	$(MAKE) test-fuzz-corpus
+
+test-lean: ## the Lean proofs of the crates of tools/verify (VERIFY_CRATES), in a container (tools/verify/run: RUNTIME, VERIFY_CACHE)
+	for c in $(VERIFY_CRATES); do tools/verify/run $$c || exit 1; done
 
 test-leaks: ## fail when the library tests of a package leave a .tmp* directory in TMPDIR (PKG="velarx-core ..." for some; slow: every package, about 5 min)
 	CARGO="$(CARGO)" CARGOFLAGS="$(CARGOFLAGS)" tools/check-test-leaks $(PKG)
@@ -373,10 +432,10 @@ test-fuzz-corpus: ## replay and mutate the fuzz corpora without cargo-fuzz (the 
 # The tests that need a directory on a file system with fs-verity (ext4,
 # btrfs or f2fs, the feature on, blocks of 4096 bytes): they skip their
 # fs-verity part when VELARX_VERITY_DIR is not set, so this runs the tests of
-# `make test` with it set; without the directory the target fails.
-test-verity: ## the fast tier with fs-verity: VELARX_VERITY_DIR=dir make test-verity (TESTARGS=filter)
+# `make test-unit` with it set; without the directory the target fails.
+test-verity: ## test-unit with fs-verity: VELARX_VERITY_DIR=dir make test-verity (TESTARGS=filter)
 	@test -d "$(VELARX_VERITY_DIR)" || { echo "make test-verity: VELARX_VERITY_DIR must name a directory on a file system with fs-verity" >&2; exit 2; }
-	VELARX_VERITY_DIR=$(abspath $(VELARX_VERITY_DIR)) $(CARGO) test --features fuzzing $(CARGOFLAGS) $(TESTARGS)
+	VELARX_VERITY_DIR=$(abspath $(VELARX_VERITY_DIR)) $(MAKE) test-unit
 
 test-workspace: ## cargo test --workspace: every package, p2p, api and cri included
 	$(CARGO) test --workspace $(CARGOFLAGS) $(TESTARGS)
@@ -411,16 +470,7 @@ critest-root: ## critest as root, in a mount namespace of its own (SUDO=... to c
 cri-kubelet: ## a kubelet (KUBELET=path) runs a static pod on velarx-cri, as root (tests/cri/kubelet.sh)
 	$(SUDO) env PATH="$$PATH" $(if $(KUBELET),KUBELET=$(KUBELET)) $(if $(IMAGE),IMAGE=$(IMAGE)) $(if $(REGISTRY_INSECURE),REGISTRY_INSECURE=$(REGISTRY_INSECURE)) $(if $(KUBELET_LOGS),KUBELET_LOGS=$(KUBELET_LOGS)) tests/cri/kubelet.sh $(abspath $(VELARX_BINDIR))
 
-# --workspace adds the tests of the P2P service (crates/p2p); the binaries
-# it leaves include velarx-p2p, which lazy-peers.bats needs.
-test-all: ## slow tier: slow tests, workspace, thin client, every e2e file (about 7 min)
-	VELARX_SLOW_TESTS=1 $(CARGO) test --workspace $(CARGOFLAGS)
-	VELARX_BINDIR=$(DEBUGDIR) tests/e2e/run-all.sh lazy-peers
-	$(MAKE) build-client PROFILE=debug
-	$(CARGO) build --workspace --bins $(CARGOFLAGS)
-	$(MAKE) docs-commands
-	$(MAKE) e2e-man VELARX_BINDIR=$(DEBUGDIR)
-	VELARX_BINDIR=$(DEBUGDIR) tests/e2e/run-all.sh
+test-all: test-full ## the old name of test-full
 
 # ---- coverage ----
 
@@ -448,8 +498,21 @@ e2e-man:
 e2e: e2e-man ## bats suites side by side: make e2e [T="run-lifecycle kube"] [BATS_ARGS=...] [E2E_JOBS=n]
 	$(RUNALL)
 
-e2e-root: e2e-man ## e2e as root, which runs the root-only files too (SUDO=... to change how)
-	$(SUDO) env VELARX_BINDIR=$(abspath $(VELARX_BINDIR)) $(if $(E2E_JOBS),E2E_JOBS=$(E2E_JOBS)) $(if $(E2E_TIMEOUT),E2E_TIMEOUT=$(E2E_TIMEOUT)) $(if $(E2E_LOGDIR),E2E_LOGDIR=$(E2E_LOGDIR)) $(RUNALL)
+e2e-root: e2e-man ## as root (SUDO=... to change how): T's files, else the files with root tests side by side (tools/run-bats root)
+	$(SUDO) env VELARX_BINDIR=$(abspath $(VELARX_BINDIR)) $(if $(E2E_JOBS),E2E_JOBS=$(E2E_JOBS)) $(if $(E2E_TIMEOUT),E2E_TIMEOUT=$(E2E_TIMEOUT)) $(if $(E2E_LOGDIR),E2E_LOGDIR=$(E2E_LOGDIR)) \
+		$(if $(T),$(RUNALL),tools/run-bats root $(if $(BATS_ARGS),-- $(BATS_ARGS)))
+
+e2e-rootless: ## every bats file but the p2p ones, as your user, 5 at a time (tools/run-bats rootless)
+	tools/run-bats rootless $(if $(BATS_ARGS),-- $(BATS_ARGS))
+
+e2e-p2p: ## the p2p bats files, one at a time, holding P2P_LOCK (tools/run-bats p2p)
+	tools/run-bats p2p $(if $(BATS_ARGS),-- $(BATS_ARGS))
+
+e2e-bin: ## copy the debug binaries (and the examples) to E2E_BINDIR, for bats files that run while cargo builds again
+	rm -rf $(E2E_BINDIR)
+	mkdir -p $(E2E_BINDIR)
+	cp -p --reflink=auto $(wildcard $(addprefix $(DEBUGDIR)/,$(E2E_BINARIES))) $(E2E_BINDIR)/
+	$(if $(wildcard $(DEBUGDIR)/examples),cp -a --reflink=auto $(DEBUGDIR)/examples $(E2E_BINDIR)/)
 
 p2p-rig: ## real-process swarm in network namespaces, as root: make p2p-rig [SCENARIO=rollout|holder-loss|certificates|netem|overlay|repull|mute-member|inline] [RIG_ARGS="-n 20"] (tests/p2p-rig)
 	$(SUDO) env VELARX_BINDIR=$(abspath $(VELARX_BINDIR)) tests/p2p-rig/$(or $(SCENARIO),rollout).sh $(RIG_ARGS)
@@ -493,11 +556,9 @@ audit: ## advisories, bans, sources and licenses of the dependencies (needs carg
 licenses: ## only the licenses of the dependencies against deny.toml (needs cargo-deny)
 	$(CARGO) deny --workspace check licenses
 
-ci: fmt-check issue-refs features-check patches-check deps-check docs-check clippy ## the checks of a change before a merge: fmt-check, issue-refs, features-check, docs-check, clippy, debug build, docs-commands, make test, thin client
-	$(MAKE) build-default PROFILE=debug
-	$(MAKE) docs-commands
+ci: reuse issue-refs features-check patches-check deps-check docs-check ## the checks of a change before a merge: the lint tools, make test (fmt-check, clippy, check, debug build, unit tests, rootless bats), docs-commands
 	$(MAKE) test
-	$(MAKE) build-client PROFILE=debug
+	$(MAKE) docs-commands VELARX_BINDIR=$(E2E_BINDIR)
 
 # ---- size ----
 

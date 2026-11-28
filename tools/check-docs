@@ -231,8 +231,8 @@ def commands(bindir):
     internal commands not at all.  The binaries see a scratch home, no
     variable of the caller's environment and BINDIR as PATH, so that
     `velarx kube` runs the velarx-kube of BINDIR, never an older one
-    installed; one that is not built (`make ci` builds the default members
-    only) is not checked (`make test-all` builds every program)."""
+    installed; one that is not built is not checked (`make test` and
+    `make test-full` build every program)."""
     helps, refused, absent = {}, set(), set()
     scratch = tempfile.mkdtemp(prefix="check-docs-")
     env = {
