@@ -30,10 +30,6 @@ const EXEMPT: &[(&str, &str)] = &[
         "the command line, not this frontend, calls it",
     ),
     (
-        "SystemStores",
-        "the command line, not this frontend, calls it",
-    ),
-    (
         "ContainerStartAttached",
         "the command line, not this frontend, calls it",
     ),

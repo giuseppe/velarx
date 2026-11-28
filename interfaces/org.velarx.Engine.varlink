@@ -2306,27 +2306,6 @@ type GcReport (
 	dry_run: bool
 )
 
-# A store of the storage service (`[storage] driver = "varlink"`) of the
-# engine's user.
-type ServiceStore (
-	# The id of the store (32 hex digits)
-	store: string,
-	# What the store takes on the service's disk
-	size: int,
-	# When an engine last opened it (0: the service does not know)
-	last_open_ns: int,
-	# The store of this engine, which is not dropped
-	current: bool
-)
-
-# `SystemStores` answers.
-type StoresReport (
-	# The stores the service holds for the engine's user, after the drop
-	stores: []ServiceStore,
-	# The store this call dropped
-	dropped: ?string
-)
-
 # The health of a part of the engine.
 type ComponentStatus (healthy, degraded, unhealthy)
 
@@ -3614,10 +3593,6 @@ method SystemCheck(spec: CheckSpec) -> (report: CheckReport)
 # layers (`layers`) no image and no container uses, the leftovers
 # of pulls that are gone; with `dry_run`, only what would go.
 method SystemCollect(dry_run: bool, files: bool, layers: bool) -> (report: GcReport)
-
-# The stores the storage service holds for the engine's user, with
-# `drop` one of them dropped first (not the engine's own).
-method SystemStores(drop: ?string) -> (report: StoresReport)
 
 # Log in to a registry.  The credentials are one descriptor, the
 # sealed memory file `access` names.

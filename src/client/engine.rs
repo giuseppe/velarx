@@ -2632,18 +2632,6 @@ impl EngineClient {
         Ok(collected.report)
     }
 
-    /// The stores the storage service holds for the user, after `drop` (one
-    /// that is not this engine's) was dropped.
-    pub fn system_stores(
-        &self,
-        drop: Option<&str>,
-    ) -> ClientResult<velarx_proto::system::StoresReport> {
-        let listed = self.typed("SystemStores", |conn| {
-            ask(conn.system_stores(drop.map(str::to_string)))
-        })?;
-        Ok(listed.report)
-    }
-
     pub fn system_check(
         &self,
         spec: &velarx_proto::system::CheckSpec,

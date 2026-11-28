@@ -5,8 +5,7 @@
 //! (`SystemInspect`), what the store uses
 //! (`DiskUsageInspect`), what a prune removed (`SystemPrune`), what a check
 //! of the store found (`SystemCheck`), what a collection freed
-//! (`SystemCollect`), the stores of a storage service (`SystemStores`) and
-//! its health (`Health`).  They are types of the
+//! (`SystemCollect`) and its health (`Health`).  They are types of the
 //! interface definition; times are nanoseconds since the epoch, 0 for a
 //! time that is not set; sizes are bytes.
 
@@ -523,40 +522,6 @@ pub struct GcReport {
 #[cfg_attr(feature = "proxy", derive(zlink::introspect::Type))]
 pub struct Collected {
     pub report: GcReport,
-}
-
-/// A store of the storage service (`[storage] driver = "varlink"`) of the
-/// engine's user.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "proxy", derive(zlink::introspect::CustomType))]
-#[serde(default)]
-pub struct ServiceStore {
-    /// The id of the store (32 hex digits)
-    pub store: String,
-    /// What the store takes on the service's disk
-    pub size: u64,
-    /// When an engine last opened it (0: the service does not know)
-    pub last_open_ns: i64,
-    /// The store of this engine, which is not dropped
-    pub current: bool,
-}
-
-/// `SystemStores` answers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "proxy", derive(zlink::introspect::CustomType))]
-#[serde(default)]
-pub struct StoresReport {
-    /// The stores the service holds for the engine's user, after the drop
-    pub stores: Vec<ServiceStore>,
-    /// The store this call dropped
-    pub dropped: Option<String>,
-}
-
-/// `SystemStores` answers.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "proxy", derive(zlink::introspect::Type))]
-pub struct StoresListed {
-    pub report: StoresReport,
 }
 
 /// The health of a part of the engine.

@@ -272,25 +272,6 @@ pub(super) fn run_system_command(cmd: SystemCommands, inv: &Invocation<'_>) -> a
                 }
             }
         }
-        SystemCommands::Stores { drop } => {
-            let report = client.system_stores(drop.as_deref())?;
-            if let Some(id) = &report.dropped {
-                println!("Dropped the store {id}");
-            }
-            println!("{:<34}{:>12}  LAST OPENED", "STORE", "SIZE");
-            for s in &report.stores {
-                let last = match s.last_open_ns {
-                    0 => "unknown".to_string(),
-                    t => velarx_wire::monitor::logfmt::format_rfc3339_ns(t),
-                };
-                println!(
-                    "{:<34}{:>12}  {last}{}",
-                    s.store,
-                    format_bytes(s.size),
-                    if s.current { "  (this engine)" } else { "" }
-                );
-            }
-        }
         SystemCommands::Info { format } => {
             drop(client);
             run_info(inv, format.as_deref())?

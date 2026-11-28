@@ -16,8 +16,8 @@ use velarx_db::{ContainerRecord, RecordState};
 use velarx_proto::system::{
     CgroupManager, CheckReport, CheckSpec, ContainerUsage, CpuUtilization, DiskUsageRecord,
     GcReport, HostRecord, HostTool, ImageUsage, OciRuntimeRecord, PrunedVolume, RuntimePath,
-    ServiceStore, StoreRecord, StoreUsage, StoresReport, SubnetPool, SystemPruneReport,
-    SystemRecord, SystemdRecord, VersionRecord, VolumeUsage,
+    StoreRecord, StoreUsage, SubnetPool, SystemPruneReport, SystemRecord, SystemdRecord,
+    VersionRecord, VolumeUsage,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1039,23 +1039,6 @@ pub(crate) async fn prune_of(
     let reclaimed = out
         .reclaimed
         .saturating_add(i64::try_from(gc.layers_size).unwrap_or(i64::MAX));
-    // Everything removed, with nothing selected: the storage service of the
-    // `varlink` driver drops the store (`system reset` does not exist: this is
-    // the command that removes it all, after which the graph root is deleted
-    // by hand).
-    if all
-        && with_volumes
-        && filters.0.is_empty()
-        && state.config.storage.driver_kind() == velarx_config::StorageDriverKind::Varlink
-    {
-        let id = velarx_core::storage_driver::StoreId::of_root(&state.config.storage.root)
-            .map_err(|e| ApiError::internal(format!("the id of the store: {e}")))?;
-        if collector.drop_emptied_store(&id).await.map_err(|e| {
-            ApiError::internal(format!("the storage service keeps the store {id}: {e}"))
-        })? {
-            tracing::info!("The storage service dropped the store {id}");
-        }
-    }
     let size = |v: i64| v.max(0) as u64;
     Ok(SystemPruneReport {
         pods: out.pods,
@@ -1149,50 +1132,6 @@ pub(crate) async fn collect_of(
         bytes_freed: report.bytes_freed,
         errors: report.errors,
         dry_run,
-    })
-}
-
-/// `SystemStores`: the stores the storage service holds for the engine's
-/// user, after `drop` (a store that is not this engine's) was dropped.
-pub(crate) async fn stores_of(state: &AppState, drop: Option<&str>) -> ApiResult<StoresReport> {
-    if state.config.storage.driver_kind() != velarx_config::StorageDriverKind::Varlink {
-        return Err(ApiError::not_implemented(
-            "the storage driver keeps one store: only [storage] driver = \"varlink\" has a service with several",
-        ));
-    }
-    // (the id the engine opened its store with, read and never made here: a
-    // listing must not make a new id, and with the file gone the store of
-    // this engine cannot be told from the others, so nothing is dropped)
-    let own = velarx_core::storage_driver::StoreId::of_root_as_made(&state.config.storage.root);
-    let collector = collector(state)?;
-    if let Some(id) = drop {
-        let own = own.as_ref().map_err(|e| {
-            ApiError::internal(format!(
-                "cannot drop the store {id}: the id of the store of this engine is not known ({}: {e})",
-                velarx_core::storage_driver::StoreId::path(&state.config.storage.root).display()
-            ))
-        })?;
-        collector
-            .drop_other_store(own, id)
-            .await
-            .map_err(|e| ApiError::internal(format!("cannot drop the store {id}: {e}")))?;
-    }
-    let mut stores: Vec<ServiceStore> = collector
-        .stores()
-        .await
-        .map_err(|e| ApiError::internal(format!("cannot list the stores: {e}")))?
-        .into_iter()
-        .map(|s| ServiceStore {
-            current: own.as_ref().is_ok_and(|o| s.store == o.as_str()),
-            store: s.store,
-            size: s.bytes,
-            last_open_ns: s.last_open.map_or(0, |t| t.saturating_mul(1_000_000_000)),
-        })
-        .collect();
-    stores.sort_by(|a, b| a.store.cmp(&b.store));
-    Ok(StoresReport {
-        stores,
-        dropped: drop.map(str::to_string),
     })
 }
 

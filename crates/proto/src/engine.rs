@@ -52,8 +52,8 @@ use crate::health::OnFailure;
 use crate::pod::{PodAction, PodResources, RestartPolicy};
 use crate::retry::Retry;
 use crate::system::{
-    CgroupManager, CheckSpec, Collected, DiskUsageInspected, HealthReport, StoresListed,
-    SystemChecked, SystemInspected, SystemPruned, VersionInspected,
+    CgroupManager, CheckSpec, Collected, DiskUsageInspected, HealthReport, SystemChecked,
+    SystemInspected, SystemPruned, VersionInspected,
 };
 use crate::wait::WaitCondition;
 use crate::workload::{
@@ -1714,13 +1714,6 @@ pub trait EngineProxy {
         files: bool,
         layers: bool,
     ) -> zlink::Result<Result<Collected, EngineError>>;
-
-    /// The stores the storage service holds for the engine's user, and with
-    /// `drop` one of them dropped first (not the engine's own).
-    async fn system_stores(
-        &mut self,
-        drop: Option<String>,
-    ) -> zlink::Result<Result<StoresListed, EngineError>>;
 
     /// The engine a frontend started (no service manager does) lives while
     /// the other end of the socket this call carries is open, besides the

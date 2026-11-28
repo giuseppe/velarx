@@ -67,9 +67,9 @@ use velarx_proto::system::{
     CgroupManager, CheckAction, CheckProblem, CheckRemovedContainer, CheckReport, CheckSpec,
     Collected, ComponentHealth, ComponentStatus, ContainerUsage, CpuUtilization,
     DiskUsageInspected, DiskUsageRecord, GcReport, HealthReport, HostRecord, HostTool, ImageUsage,
-    OciRuntimeRecord, PrunedVolume, RuntimePath, ServiceStore, StoreRecord, StoreUsage,
-    StoresListed, StoresReport, SubnetPool, SystemChecked, SystemInspected, SystemPruneReport,
-    SystemPruned, SystemRecord, SystemdRecord, VersionInspected, VersionRecord, VolumeUsage,
+    OciRuntimeRecord, PrunedVolume, RuntimePath, StoreRecord, StoreUsage, SubnetPool,
+    SystemChecked, SystemInspected, SystemPruneReport, SystemPruned, SystemRecord, SystemdRecord,
+    VersionInspected, VersionRecord, VolumeUsage,
 };
 use velarx_proto::transfer::{NotLazy, Placed};
 use velarx_proto::wait::WaitCondition;
@@ -1819,7 +1819,7 @@ mod service {
         url = env!("CARGO_PKG_REPOSITORY"),
         types = [
             Filter, RemovedContainer, LeaseRange, NetworkRoute, NetworkSpec, NetworkDriver, NetworkSubnet, NetworkMember, NetworkRecord, SecretRecord, LogOptions, PodLogOptions, PodLogLine, LogStream, ImagePlatform, InstanceSpec, ManifestArtifactSpec, ManifestDescriptor, ManifestInstance, ArtifactRecord,
-            AttachOptions, SessionPhase, SessionOpened, SessionStreams, SessionReply, CheckpointFlags, CriuStatistics, PodResources, PodDeviceLimit, RestoreFlags, FileChange, SearchHit, PlatformSpec, PullSpec, NotLazyLayer, PushSpec, CommitSpec, ImportSpec, ArtifactAddSpec, Retry, SystemdSpec, UpdateSpec, UpdateDevice, UpdateBlockIo, UpdateHealth, Compression, PodAction, DeviceSpec, Resources, HugepageLimit, MountKind, ContainerMount, HealthStatus, HealthResult, Health, StartupHealthcheck, Healthcheck, OnFailure, CheckpointState, ProcessConfig, ProcessUser, Ulimit, HostSettings, DeviceLimit, ContainerPort, ContainerInterface, ContainerNetwork, ContainerPaths, ContainerRecord, RunState, PodStatus, PodMember, DeviceNode, PodRecord, PodSpec, PodExitPolicy, PodDnsConfig, PodSecurityContext, PodPortMapping, IdMapping, RestartPolicy, ImageConfigRecord, ImageHealthcheck, ImageHistoryEntry, ComposefsLayer, ImageRecord, PrunedImage, ImageTreeLayer, ImageTreeChild, ImageTreeRecord, PulledImage, BySource, TransferStats, PushedTag, PushedImage, Placed, PullState, NotLazy, StatsRecord, InterfaceStats, Pressure, Psi, PsiData, ExecSpec, ExecRecord, MetricDescriptor, MetricSample, ContainerMetrics, PodUsage, PodMetrics, TransferProgress, EventRecord, WaitCondition, VolumeSpec, VolumeRecord, ChangeKind, DiffType, CgroupManager, PullPolicy, ManifestFormat, LayerCompression, TransferStatus, EventKind, VersionRecord, HostTool, RuntimePath, OciRuntimeRecord, SystemdRecord, SubnetPool, CpuUtilization, HostRecord, StoreRecord, SystemRecord, ImageUsage, ContainerUsage, VolumeUsage, StoreUsage, DiskUsageRecord, PrunedVolume, SystemPruneReport, CheckSpec, CheckAction, CheckProblem, CheckRemovedContainer, CheckReport, GcReport, ServiceStore, StoresReport, ComponentStatus, ComponentHealth, BuildSpec, BuildEvent, BuildEventKind, BuildStream, BuildClient, BuildPair, BuildEntitlement, BuildPull, BuildSecretKind, BuildSecretSpec, BuildContextKind, BuildContextSpec, BuildOutputKind, BuildOutput, BuildFlags, SbomFlags, req::BuildRun, req::CreateContainerRequest, req::SecurityOptions, req::ResourceLimits, req::HugepageLimit, req::WeightDevice, req::ThrottleDevice, req::PortMapping, req::Ulimit, req::LogConfig, req::DeviceMapping, req::MountConfig, req::BindMountRequest, req::ImageMountRequest, req::OverlayMountConfig, req::ImageMountConfig, req::SecretRef, req::DeviceNumbers, req::DeviceRule, req::Owner
+            AttachOptions, SessionPhase, SessionOpened, SessionStreams, SessionReply, CheckpointFlags, CriuStatistics, PodResources, PodDeviceLimit, RestoreFlags, FileChange, SearchHit, PlatformSpec, PullSpec, NotLazyLayer, PushSpec, CommitSpec, ImportSpec, ArtifactAddSpec, Retry, SystemdSpec, UpdateSpec, UpdateDevice, UpdateBlockIo, UpdateHealth, Compression, PodAction, DeviceSpec, Resources, HugepageLimit, MountKind, ContainerMount, HealthStatus, HealthResult, Health, StartupHealthcheck, Healthcheck, OnFailure, CheckpointState, ProcessConfig, ProcessUser, Ulimit, HostSettings, DeviceLimit, ContainerPort, ContainerInterface, ContainerNetwork, ContainerPaths, ContainerRecord, RunState, PodStatus, PodMember, DeviceNode, PodRecord, PodSpec, PodExitPolicy, PodDnsConfig, PodSecurityContext, PodPortMapping, IdMapping, RestartPolicy, ImageConfigRecord, ImageHealthcheck, ImageHistoryEntry, ComposefsLayer, ImageRecord, PrunedImage, ImageTreeLayer, ImageTreeChild, ImageTreeRecord, PulledImage, BySource, TransferStats, PushedTag, PushedImage, Placed, PullState, NotLazy, StatsRecord, InterfaceStats, Pressure, Psi, PsiData, ExecSpec, ExecRecord, MetricDescriptor, MetricSample, ContainerMetrics, PodUsage, PodMetrics, TransferProgress, EventRecord, WaitCondition, VolumeSpec, VolumeRecord, ChangeKind, DiffType, CgroupManager, PullPolicy, ManifestFormat, LayerCompression, TransferStatus, EventKind, VersionRecord, HostTool, RuntimePath, OciRuntimeRecord, SystemdRecord, SubnetPool, CpuUtilization, HostRecord, StoreRecord, SystemRecord, ImageUsage, ContainerUsage, VolumeUsage, StoreUsage, DiskUsageRecord, PrunedVolume, SystemPruneReport, CheckSpec, CheckAction, CheckProblem, CheckRemovedContainer, CheckReport, GcReport, ComponentStatus, ComponentHealth, BuildSpec, BuildEvent, BuildEventKind, BuildStream, BuildClient, BuildPair, BuildEntitlement, BuildPull, BuildSecretKind, BuildSecretSpec, BuildContextKind, BuildContextSpec, BuildOutputKind, BuildOutput, BuildFlags, SbomFlags, req::BuildRun, req::CreateContainerRequest, req::SecurityOptions, req::ResourceLimits, req::HugepageLimit, req::WeightDevice, req::ThrottleDevice, req::PortMapping, req::Ulimit, req::LogConfig, req::DeviceMapping, req::MountConfig, req::BindMountRequest, req::ImageMountRequest, req::OverlayMountConfig, req::ImageMountConfig, req::SecretRef, req::DeviceNumbers, req::DeviceRule, req::Owner
         ]
     )]
     impl Engine {
@@ -3410,16 +3410,6 @@ mod service {
             })
             .await
             .map(|report| Collected { report })
-        }
-
-        /// The stores the storage service holds for the engine's user, with
-        /// `drop` one of them dropped first (not the engine's own).
-        async fn system_stores(&self, drop: Option<String>) -> Result<StoresListed, EngineError> {
-            self.api(ErrorKind::None, |state| async move {
-                podman::system::stores_of(&state, drop.as_deref()).await
-            })
-            .await
-            .map(|report| StoresListed { report })
         }
 
         /// Log in to a registry.  The credentials are one descriptor, the

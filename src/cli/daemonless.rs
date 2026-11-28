@@ -42,7 +42,6 @@ pub fn daemonless(cmd: &Commands) -> Daemonless {
             SystemCommands::Df { .. }
             | SystemCommands::Prune { .. }
             | SystemCommands::Gc { .. }
-            | SystemCommands::Stores { .. }
             | SystemCommands::Info { .. }
             | SystemCommands::Inspect { .. }
             | SystemCommands::Check { .. } => InProcess,
@@ -409,7 +408,6 @@ mod daemonless_tests {
         "system inspect",
         "system prune",
         "system restart",
-        "system stores",
         "unshare",
         "varlink",
         "version",

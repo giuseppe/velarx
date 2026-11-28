@@ -900,18 +900,6 @@ pub enum SystemCommands {
         layers: bool,
     },
 
-    /// The stores the storage service holds for the user ([storage]
-    /// driver = "varlink"), also those of an engine whose store-id file was
-    /// lost: they are named by nobody and never collected until they are
-    /// dropped.
-    #[command(about = "List the stores of the storage service, or drop one")]
-    Stores {
-        /// Drop the store with this id and everything it holds (the store of
-        /// this engine and a store with a container or a pull are refused)
-        #[arg(long, value_name = "ID")]
-        drop: Option<String>,
-    },
-
     #[command(about = "Display system-wide information")]
     Info {
         /// Go template of the information, or `json`
