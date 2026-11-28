@@ -395,3 +395,13 @@ object name.
   by, is refused too (`load` of such an image is not supported yet), and so
   is a layer whose tar-split does not describe the entries of its TOC.
 * Only the main store is written; additional stores are read-only.
+  A store whose database has a write-ahead log or a journal with content is
+  skipped with a warning: another velarx is running on it, or one ended and
+  left its log (one that was killed, or one whose writes were all volatile,
+  such as a daemon or a `container run --rm`, which does not write the log
+  back at its end).  The log holds changes that are not in the database file, which is
+  all that is read, so the store would show an old state.  Any command that
+  writes nothing, run by its owner when no other velarx runs on the store,
+  writes the log back and removes it.  A store that is absent, of another
+  schema version or made with another storage driver than composefs fails
+  the start.

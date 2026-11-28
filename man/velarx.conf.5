@@ -119,7 +119,9 @@ system has fs\-verity and every layer was pulled with it
 or
 .BR require ),
 the read\-only stores of other instances
-.RB ( additional_image_stores ),
+.RB ( additional_image_stores ;
+one that another velarx runs on, or that has a leftover write\-ahead log, is
+skipped with a warning),
 the garbage collection and how a
 pull makes its files durable.
 .TP

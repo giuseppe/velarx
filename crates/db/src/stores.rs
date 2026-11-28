@@ -39,12 +39,17 @@ fn other(msg: String) -> DbError {
     DbError::Sqlite(tokio_rusqlite::Error::Other(msg.into()))
 }
 
-/// Whether `path` plus `suffix` (the `-wal` or `-journal` of a database) is
-/// a file with content.
-fn side_file_has_content(path: &Path, suffix: &str) -> bool {
-    let mut side = path.as_os_str().to_os_string();
-    side.push(suffix);
-    std::fs::metadata(side).is_ok_and(|m| m.len() > 0)
+/// What the database at `path` has outside its main file: a `-wal` or a
+/// `-journal` with content, named for a message.
+fn side_file(path: &Path) -> Option<&'static str> {
+    [("-wal", "a write-ahead log"), ("-journal", "a journal")]
+        .into_iter()
+        .find(|(suffix, _)| {
+            let mut side = path.as_os_str().to_os_string();
+            side.push(suffix);
+            std::fs::metadata(side).is_ok_and(|m| m.len() > 0)
+        })
+        .map(|(_, what)| what)
 }
 
 impl Database {
@@ -74,17 +79,14 @@ impl Database {
                 path.display()
             )));
         }
-        for (suffix, what) in [("-wal", "a write-ahead log"), ("-journal", "a journal")] {
-            if side_file_has_content(path, suffix) {
-                return Err(other(format!(
-                    "{}: has {what} with changes that are not in the database file \
-                     (a velarx uses the store, or one was killed while it did): \
-                     a read-only store must be closed by its owner, who stops the \
-                     velarx that uses it (a daemon: `velarx varlink`), or, after a kill, \
-                     runs any velarx command on the store and lets it end",
-                    path.display()
-                )));
-            }
+        if let Some(what) = side_file(path) {
+            return Err(other(format!(
+                "{}: has {what} with changes that are not in the database file \
+                 (a velarx runs on the store, or one ended and left its log): \
+                 once none runs on it, its owner runs a command that writes \
+                 nothing on it, such as `velarx image list`",
+                path.display()
+            )));
         }
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
@@ -113,18 +115,17 @@ impl Database {
     }
 
     /// The database of the store `storage`, with those of its additional
-    /// image stores under it.  A store that cannot be used is skipped, and
-    /// the log says why.
-    /// An additional store of another storage driver than this store's
-    /// (what is asked for, else what the store records) is skipped too: its
-    /// content is in that driver's form.
+    /// image stores under it.  An additional store that is busy (its
+    /// database has a write-ahead log or a journal: another velarx runs on
+    /// it, or one ended and left it) is skipped with a warning; one that
+    /// cannot be used otherwise (absent, of another schema version, or
+    /// made with another storage driver than composefs, the only one
+    /// whose content this velarx reads) fails the open and the error
+    /// names it.
     pub async fn open_store(storage: &velarx_config::StorageConfig) -> DbResult<Self> {
         let main = Database::open(storage.database_path()).await?;
         let own = std::fs::canonicalize(&storage.root).ok();
-        let driver = match &storage.driver {
-            Some(d) => d.clone(),
-            None => main.recorded_driver().await?,
-        };
+        let composefs = velarx_config::StorageDriverKind::Composefs.name();
         let mut more = Vec::new();
         for root in &storage.additional_image_stores {
             if own.is_some() && std::fs::canonicalize(root).ok() == own {
@@ -134,24 +135,37 @@ impl Database {
                 );
                 continue;
             }
-            match Database::open_read_only(&root.join("db.sqlite")).await {
-                Ok(db) => match db.recorded_driver().await {
-                    Ok(theirs) if theirs == driver => more.push(db),
-                    Ok(theirs) => tracing::warn!(
-                        "The additional image store {} was made with the storage driver \
-                         {theirs:?}, this store has {driver:?}: not used",
-                        root.display()
-                    ),
-                    Err(e) => tracing::warn!(
-                        "The additional image store {}: {e}: not used",
-                        root.display()
-                    ),
-                },
-                Err(e) => tracing::warn!(
-                    "The additional image store {}: {e}: not used",
+            if let Some(what) = side_file(&root.join("db.sqlite")) {
+                tracing::warn!(
+                    "additional image store {} is not used: it has {what} (another \
+                     velarx is running on it, or one ended and left its log: once \
+                     none runs on it, its owner runs a command that writes nothing \
+                     on it, such as `velarx image list`)",
                     root.display()
-                ),
+                );
+                continue;
             }
+            let refuse = |cause: String| {
+                other(format!(
+                    "additional image store {}: {cause} (to start without it, \
+                     remove it from [storage] additional_image_stores)",
+                    root.display()
+                ))
+            };
+            let db = Database::open_read_only(&root.join("db.sqlite"))
+                .await
+                .map_err(|e| refuse(e.to_string()))?;
+            let theirs = db
+                .recorded_driver()
+                .await
+                .map_err(|e| refuse(e.to_string()))?;
+            if theirs != composefs {
+                return Err(refuse(format!(
+                    "it was made with the storage driver {theirs:?}; this velarx \
+                     reads composefs stores only"
+                )));
+            }
+            more.push(db);
         }
         Ok(main.with_additional(more))
     }
@@ -653,10 +667,12 @@ mod tests {
         assert_eq!(both.get_own_layer_states(&[key(1)]).await.unwrap().len(), 1);
     }
 
-    /// An additional store is used only when it was made with the
-    /// store's driver; one that records none was made with composefs.
+    /// An additional store is used only when it was made with composefs
+    /// (one that records no driver was); any other fails the open, as does
+    /// one that cannot be opened, and the error names it.  A busy one is
+    /// skipped and the others are still used.
     #[tokio::test]
-    async fn an_additional_store_of_another_driver_is_not_used() {
+    async fn an_unusable_additional_store_is_refused_a_busy_one_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let store = |name: &str| dir.path().join(name);
         for (name, driver) in [
@@ -672,24 +688,44 @@ mod tests {
             }
             db.checkpoint().await.unwrap();
         }
-        let storage = |driver: Option<&str>| velarx_config::StorageConfig {
+        std::fs::create_dir_all(store("main")).unwrap();
+        let storage = |stores: &[&str]| velarx_config::StorageConfig {
             root: store("main"),
-            driver: driver.map(String::from),
-            additional_image_stores: vec![store("old"), store("same"), store("other")],
+            additional_image_stores: stores.iter().map(|n| store(n)).collect(),
             ..Default::default()
         };
-        std::fs::create_dir_all(store("main")).unwrap();
-        for asked in [None, Some("composefs")] {
-            let db = Database::open_store(&storage(asked)).await.unwrap();
-            assert!(db.get_image("old").await.is_ok(), "{asked:?}");
-            assert!(db.get_image("same").await.is_ok(), "{asked:?}");
-            assert!(db.get_image("other").await.is_err(), "{asked:?}");
-            assert_eq!(db.recorded_driver().await.unwrap(), "composefs");
-        }
-        // (a store of the other driver uses the stores of that one)
-        let db = Database::open_store(&storage(Some("vfs"))).await.unwrap();
-        assert!(db.get_image("other").await.is_ok());
+        let db = Database::open_store(&storage(&["old", "same"]))
+            .await
+            .unwrap();
+        assert!(db.get_image("old").await.is_ok());
+        assert!(db.get_image("same").await.is_ok());
+        let e = Database::open_store(&storage(&["same", "other"]))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("other") && e.contains("\"vfs\""), "{e}");
+        assert!(
+            e.contains("remove it from [storage] additional_image_stores"),
+            "{e}"
+        );
+        let e = Database::open_store(&storage(&["nowhere"]))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("nowhere"), "{e}");
+        // A busy store (its owner has changes in the log) is skipped.
+        let owner = Database::open(store("same").join("db.sqlite"))
+            .await
+            .unwrap();
+        owner.insert_image(&image("late")).await.unwrap();
+        let db = Database::open_store(&storage(&["same", "old"]))
+            .await
+            .unwrap();
         assert!(db.get_image("same").await.is_err());
+        assert!(db.get_image("late").await.is_err());
+        assert!(db.get_image("old").await.is_ok());
     }
 
     #[tokio::test]
@@ -930,7 +966,7 @@ mod tests {
         owner.insert_image(&image("bbb")).await.unwrap();
         let e = Database::open_read_only(&path).await.err().unwrap();
         assert!(e.to_string().contains("write-ahead log"), "{e}");
-        assert!(e.to_string().contains("velarx varlink"), "{e}");
+        assert!(e.to_string().contains("its owner runs a command"), "{e}");
         owner.checkpoint().await.unwrap();
         assert!(Database::open_read_only(&path).await.is_ok());
     }

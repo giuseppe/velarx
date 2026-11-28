@@ -265,7 +265,7 @@ db_side_files () { # store root
     check "nothing in the other store changed" "$before" "$(tree_sum "$WORKDIR/ro" "$WORKDIR/ro.after")"
 }
 
-@test "a store whose owner was killed is not used, and says what to do" {
+@test "a store whose owner was killed is skipped with a warning" {
     # a daemon that is killed leaves the log of its database
     config owner "$WORKDIR/unclean" ""
     start_daemon owner || { echo "the daemon does not start"; cat "$WORKDIR/owner.log"; exit 1; }
@@ -279,9 +279,9 @@ db_side_files () { # store root
     before=$(tree_sum "$WORKDIR/unclean" "$WORKDIR/unclean.before")
     config reader "$WORKDIR/reader" "additional_image_stores = [\"$WORKDIR/unclean\"]"
     start_daemon reader || { echo "the daemon does not start"; cat "$WORKDIR/reader.log"; exit 1; }
-    check_match "the log says why and what its owner does" \
-        "unclean: .*write-ahead log.*stop.*not used" "$(cat "$WORKDIR/reader.log")"
-    check "without its images" "" "$(sh_ image list --format '{{.Repository}}' 2>&1)"
+    check_match "the log names the store, says why and what to do" \
+        "additional image store .*unclean is not used: it has a write-ahead log.*its owner runs a command that writes nothing" "$(cat "$WORKDIR/reader.log")"
+    check "its images are not listed" "" "$(sh_ image list --format '{{.Repository}}:{{.Tag}}' 2>&1)"
     stop_daemon
     check "nothing in it changed" "$before" "$(tree_sum "$WORKDIR/unclean" "$WORKDIR/unclean.after")"
     # any command of the owner recovers the log and closes the store
