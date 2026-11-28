@@ -56,8 +56,10 @@ store with no service need nothing else, and a hold left by a process that
 died is reported by `system check` as `stale_staging` and removed by
 `--repair` and by the next collection.
 
-The EROFS image of a layer is made from its table of contents alone, so it
-is the same file in every image that has the layer, whatever is below it.
+The EROFS image of a layer is made from its table of contents alone (and,
+for a layer that holds small files, those files: see "Files inside the
+image"), so it is the same file in every image that has the layer, whatever is
+below it.
 The root of a layer is its `./` entry, or a plain directory (0755, owned by
 root, no time, no attributes) when it has none, and so is a directory it has
 entries in but does not list: its attributes replace those of the directory
@@ -107,37 +109,70 @@ says `serve_content`, and nothing otherwise).
 
 `[storage] inline_threshold` (`velarx pull --inline-threshold=N` for one
 pull) makes the EROFS image of a layer hold the regular files of 1 to N bytes
-itself (-1: every file, 0, the default: none).  The layers a pull, a load, a
-build, a commit or an import make take the configured value; the layers a
-store has keep the one they were made with, silently (`velarx rmi` and a
-pull again make them with another).  `layers.inline` records the value and
-the table `inlined_files` where each file is in the image (`offset`, `size`);
-those files are not in `files` and `file_refs`, so they are no objects and
-collection needs nothing of them.  "The content of the file with digest d" is
-asked store by store (this one, then the read-only ones, in their order): the
-first store that has it answers, with its object, else its extent of the image
-of a layer of that store (`Database::inlined_file_in`; the image is the one of
-that store, whatever another store has under the layer's id).  What reads a
-file by its digest (push, save, commit, copy) finds it either way, and an
-extent is read back as a temporary copy of it.  A peer is served the same way:
-an extent is a range of the image, as a chunk is a range of an object.
+itself (-1: every file with content, 0, the default: none), as data of the
+image: they have no object, no `files` row and no stub.  With -1 a layer is
+one self-contained image, plus its table of contents and tar-split.  Files
+above N are objects, stubs and lazy as before: `pull --lazy` with a
+threshold fetches the files of at most N bytes before it makes the image of a
+layer, keeps them staged with the layer until its completion commits it, and
+the rest comes on demand (with -1 nothing is left to come and the pull is
+complete at once).  The layers a pull, a load, a build, a commit or an import
+make take the configured value; only `pull` has the flag.  A layer the store
+has, or has staged, keeps the value it was made with, silently, even when the
+command line says another; an image can have layers of different values
+(`velarx rmi` and a pull again make a layer with another).  A file the store
+already has, as an object or inside the image of a layer, is copied, not
+fetched.
+
+`layers.inline` records the value and the table `inlined_files` where each
+file is in the image (`offset`, `size`); those files are not in `files` and
+`file_refs`, so they are no objects and collection needs nothing of them.
+"The content of the file with digest d" is asked store by store (this one,
+then the read-only ones, in their order): the first store that has it
+answers, with its object, else its extent of the image of a layer of that
+store (`Database::inlined_file_in`; the image is the one of that store,
+whatever another store has under the layer's id).  What reads a file by its
+digest (push, save, commit, squash, `cp`, `COPY --from`) finds it either way,
+and an extent is read back as a temporary copy of it, hashed against its
+digest as any object without fs-verity is.  A peer is served the same way:
+an extent is a range of the image, as a chunk is a range of an object.  At
+run time a held file is read from the image: by the overlay of the kernel as
+any lower file, by the image server with `pread` of the descriptor of the
+image (an error of the file system under it is `EIO`).  Two layers that hold
+one file each have its bytes: that is what holding is.
 
 The image of such a layer is not the one its table of contents alone makes,
 so the digest of it that a manifest states can never be the recorded one:
 `composefs_digests = "require"` and `verity=enforce` fail for it as for any
 other mismatch.  A manifest that velarx writes states the digest of the image
-made from the table of contents alone.  A full `system check` reads the
-image in pieces against its record and each held file against its digest.
-A check never fetches: a damaged image of a stored layer is the only copy of
-its small files, so `--repair` leaves the layer as it is and says in the
-debug log that it is removed with `velarx rmi` and pulled again (as is a
-layer to be made with another threshold).
+made from the table of contents alone.  A full `system check` reads the image
+in pieces against its record and each held file against its digest.  A check
+never fetches: a damaged image of a stored layer is the only copy of its
+small files, so `--repair` leaves the layer as it is and says in the debug
+log that it is removed with `velarx rmi` and pulled again (as is a layer to
+be made with another threshold).  A damaged image of a staged lazy layer is
+made again offline from its staged files.
 
-A lazy pull (`pull --lazy`) with N other than 0 fetches the files of at most
-N bytes before it makes the image of a layer, keeps them staged with the
-layer until its completion commits it, and fetches the bigger ones on demand
-as before; with -1 nothing is left to fetch and the pull is complete when it
-ends.  A staged layer keeps the N it was made with, as a stored one does.
+### An additional image store on NFS
+
+A store filled with -1 has everything a container needs in its layer
+images, so a read-only NFS export of it works as an additional image store
+of other machines, rootful or rootless:
+
+    # on the machine that fills it (the store is the one of --root)
+    [storage]
+    inline_threshold = -1
+
+    # on the others, after mounting the export read-only
+    [storage]
+    additional_image_stores = ["/mnt/images/store"]
+
+Fill it with `pull` (or `build`, `commit`, `load`) while the setting is on,
+then export it.  The readers write nothing to it.  With N larger than 0 the
+objects of the files above N are read from the export too.  NFS has no
+fs-verity: the files and the images there are held to nothing (see below),
+and an unmounted export under a read is an `EIO` of the file.  A reader can
+pull a lazy image into its own store whose base layers are in the export.
 
 ## Between versions
 
@@ -254,11 +289,17 @@ object name.
   `[storage] verity_chain = "require"` makes a start whose image cannot be
   held (any of the reasons above) an error with the reason, and refuses
   `verity=off`; an image that states no digest is fine, it is held to the
-  record.
+  record.  A layer that holds small files is held to its record: its image
+  differs from the one a manifest declares (see "Files inside the image"),
+  so a manifest's digests never match it.
   A container with an image mount holds the chain for all of its images or
   for none (the monitor enforces for the container).  Rootless, on a kernel
   without `redirect_dir=followdata`, the files of the layers above the lowest
-  are checked on open by the image server.
+  are checked on open by the image server.  The files a layer holds in its
+  image are covered by the digest of the image: the kernel checks the pages
+  of the image as they are read, and the file-by-file digest of an object is
+  not lost, since a held file is checked against its digest whenever it is
+  read back as an object.
 * **The images of the layers are held to the manifest at every start by the
   engine.**  The stored manifest is hashed against the image id, and each
   layer image is opened once, measured (fs-verity, constant time) and held to
@@ -287,12 +328,12 @@ object name.
   the images of the layers redirect to them, and the merged EROFS digest
   is not what `cfsctl` computes.  Such a store also cannot share objects with
   a repository of composefs-rs.
-* **mmap and SIGBUS.**  The image server maps its EROFS images and the index into
+* **mmap and SIGBUS.**  The image server maps (never loads) its EROFS images and the index into
   memory for its lifetime.  They are read-only; with fs-verity they cannot be
   truncated.  Without it, a file truncated or lost under the mapping kills the
   image server with `SIGBUS` (there is no handler); the container loses its root
-  file system.  The files served from `objects` are read with `pread`, not
-  mapped, and a file that is shorter than the image says is an `EIO`.  This
+  file system.  The files served from `objects` and the files a layer holds in its
+  image are read with `pread`, not mapped, and a file that is shorter than the image says is an `EIO`.  This
   is not guarded on purpose: reading the image into memory instead would
   cost its size in resident memory per container and time at every start
   (a run of a big image must cost what a run of alpine does), to protect
