@@ -841,6 +841,7 @@ mod tests {
             .zip([sha("aa"), sha("bb")])
             .map(|(erofs, digest)| LayerRecord {
                 stream_size: Some(0),
+                inline: 0,
                 key: velarx_db::LayerKey::Whole(digest),
                 blob: Some(digest),
                 diff_id: None,

@@ -870,6 +870,7 @@ mod tests {
         let key = velarx_db::LayerKey::Whole(digest_of(3));
         db.insert_layer(&velarx_db::LayerRecord {
             stream_size: Some(1234),
+            inline: 0,
             key,
             blob: Some(digest_of(3)),
             diff_id: Some(digest_of(4)),

@@ -782,6 +782,7 @@ mod tests {
             },
             layers: vec![LayerRecord {
                 stream_size: Some(0),
+                inline: 0,
                 key: velarx_db::LayerKey::Whole(
                     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         .parse()
@@ -1225,6 +1226,7 @@ mod tests {
             },
             layers: vec![LayerRecord {
                 stream_size: Some(0),
+                inline: 0,
                 key: velarx_db::LayerKey::Whole(layer),
                 blob: Some(layer),
                 diff_id: Some(sha(b"tar")),

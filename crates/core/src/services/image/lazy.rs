@@ -2116,6 +2116,7 @@ mod tests {
             vec![velarx_db::LayerCommit {
                 record: velarx_db::LayerRecord {
                     stream_size: Some(0),
+                    inline: 0,
                     key,
                     blob: None,
                     diff_id: Some(sha("diff")),
@@ -2132,6 +2133,7 @@ mod tests {
                 chunks: vec![],
                 toc_digest: sha("{}"),
                 sealed: false,
+                inlined: Vec::new(),
                 tarsplit: Some(sha("ts")),
                 blob_checked: false,
             }],

@@ -325,6 +325,7 @@ async fn test_layer_operations() {
     let key = LayerKey::Whole(digest_of(1));
     let layer = LayerRecord {
         stream_size: Some(0),
+        inline: 0,
         key,
         blob: Some(digest_of(1)),
         diff_id: Some(digest_of(0xd)),
@@ -431,6 +432,7 @@ async fn test_a_stored_layer_is_not_replaced() {
     let key = LayerKey::Toc(digest_of(3));
     let layer = |size: i64| LayerRecord {
         stream_size: Some(0),
+        inline: 0,
         key,
         blob: Some(digest_of(4)),
         diff_id: Some(digest_of(0xd)),
@@ -707,6 +709,7 @@ async fn test_a_layer_is_found_by_its_key_only() {
     let blob = digest_of(1);
     let record = |key: LayerKey, status: &str, diff_id: Option<Digest>| LayerRecord {
         stream_size: Some(0),
+        inline: 0,
         key,
         blob: Some(blob),
         diff_id,
@@ -728,6 +731,7 @@ async fn test_a_layer_is_found_by_its_key_only() {
             tarsplit: None,
             blob_checked,
             sealed: false,
+            inlined: Vec::new(),
         }],
         image: ImageRecord {
             id: "i".into(),

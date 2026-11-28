@@ -15,7 +15,8 @@ use rusqlite::{OpenFlags, OptionalExtension};
 use tokio_rusqlite::Connection;
 
 use super::{
-    layer_files, Database, ImageRecord, ImageTag, LayerRecord, LayerState, SCHEMA_VERSION,
+    layer_files, Database, ImageRecord, ImageTag, InlinedFile, LayerRecord, LayerState,
+    SCHEMA_VERSION,
 };
 use velarx_storage::Object;
 use velarx_types::digest::Digest;
@@ -505,6 +506,36 @@ impl Database {
         }
         Ok(found)
     }
+
+    /// Whether an image of this store or of a read-only one holds any file
+    /// itself: when none does, [`Self::inlined_file`] has nothing to find.
+    pub async fn has_inlined_files(&self) -> DbResult<bool> {
+        if self.has_inlined_files_here().await? {
+            return Ok(true);
+        }
+        for db in self.more.iter() {
+            if db.has_inlined_files_here().await.unwrap_or(false) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Where the content of the file `digest` is when no object of the
+    /// stores has it: the layer whose EROFS image holds it and the extent,
+    /// from this store, then the read-only ones.  (An object, which
+    /// [`Self::file_objects`] answers, is the other place a file is.)
+    pub async fn inlined_file(&self, digest: &str) -> DbResult<Option<(LayerKey, InlinedFile)>> {
+        if let Some(found) = self.inlined_file_here(digest).await? {
+            return Ok(Some(found));
+        }
+        for db in self.more.iter() {
+            if let Ok(Some(found)) = db.inlined_file_here(digest).await {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// An SQL identifier as one token, whatever characters it has.
@@ -525,6 +556,7 @@ mod tests {
     use super::*;
     use crate::layer_files;
     use crate::ImageTag;
+    use crate::InlinedFile;
 
     fn image(id: &str) -> ImageRecord {
         ImageRecord {
@@ -576,6 +608,7 @@ mod tests {
             LayerCommit {
                 record: LayerRecord {
                     stream_size: Some(i64::from(n) * 10),
+                    inline: 0,
                     key: key(n),
                     blob: None,
                     diff_id: Some(diff(n)),
@@ -594,6 +627,7 @@ mod tests {
                 tarsplit: Some(sha(tarsplit)),
                 blob_checked: false,
                 sealed: false,
+                inlined: Vec::new(),
             }
         };
         db.commit_layers(
@@ -783,6 +817,84 @@ mod tests {
         assert_eq!(std::fs::read(&ro_path).unwrap(), before);
     }
 
+    /// What an image of a read-only store holds itself is found through this
+    /// store, after what its own images hold.
+    #[tokio::test]
+    async fn the_files_images_hold_are_found_in_read_only_stores_too() {
+        use crate::LayerCommit;
+        let dir = tempfile::tempdir().unwrap();
+        let sha = |b: &[u8]| Digest::of(velarx_types::digest::Algorithm::Sha256, b);
+        let file = |d: &[u8], offset| InlinedFile {
+            digest: format!("fsverity-sha256-12:{}", sha(d).hex()),
+            offset,
+            size: 3,
+        };
+        let commit = |key: LayerKey, files: Vec<InlinedFile>| LayerCommit {
+            record: LayerRecord {
+                stream_size: Some(0),
+                inline: -1,
+                key,
+                blob: None,
+                diff_id: Some(sha(b"diff")),
+                other_diff_id: None,
+                size: 1,
+                status: "ready".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                registry_ref: None,
+                erofs: Some("sha256:a".into()),
+                owners: Some("[]".into()),
+            },
+            files: vec![],
+            refs: vec![],
+            chunks: vec![],
+            toc_digest: sha(b"toc"),
+            tarsplit: None,
+            blob_checked: false,
+            sealed: false,
+            inlined: files,
+        };
+        let (own, theirs) = (
+            LayerKey::Whole(sha(b"own")),
+            LayerKey::Whole(sha(b"theirs")),
+        );
+        let ro_path = dir.path().join("ro.sqlite");
+        {
+            let ro = Database::open(&ro_path).await.unwrap();
+            ro.commit_layers(
+                vec![commit(theirs, vec![file(b"a", 8), file(b"b", 16)])],
+                vec![],
+            )
+            .await
+            .unwrap();
+            ro.checkpoint().await.unwrap();
+        }
+        let main = Database::open(dir.path().join("main.sqlite"))
+            .await
+            .unwrap();
+        assert!(!main.has_inlined_files().await.unwrap());
+        main.commit_layers(vec![commit(own, vec![file(b"a", 0)])], vec![])
+            .await
+            .unwrap();
+        let db = main.with_additional(vec![Database::open_read_only(&ro_path).await.unwrap()]);
+        let (layer, f) = db
+            .inlined_file(&file(b"a", 0).digest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((layer, f.offset), (own, 0));
+        let (layer, f) = db
+            .inlined_file(&file(b"b", 0).digest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((layer, f.offset), (theirs, 16));
+        assert!(db
+            .inlined_file(&file(b"c", 0).digest)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     const L1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     const D1: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 
@@ -804,6 +916,7 @@ mod tests {
             ro.insert_image(&image("aaa")).await.unwrap();
             ro.insert_layer(&LayerRecord {
                 stream_size: Some(0),
+                inline: 0,
                 key: LayerKey::Whole(L1.parse().unwrap()),
                 blob: Some(L1.parse().unwrap()),
                 diff_id: Some(D1.parse().unwrap()),

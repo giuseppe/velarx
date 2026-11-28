@@ -730,6 +730,7 @@ pub fn layer_commit(done: &LayerDone, registry_ref: Option<&str>) -> ImageResult
             erofs: None,
             owners: None,
             stream_size: Some(stream_size),
+            inline: 0,
         },
         files,
         refs,
@@ -738,6 +739,7 @@ pub fn layer_commit(done: &LayerDone, registry_ref: Option<&str>) -> ImageResult
         tarsplit: done.tarsplit_digest(),
         blob_checked: done.blob_checked && proven,
         sealed: false,
+        inlined: Vec::new(),
     })
 }
 

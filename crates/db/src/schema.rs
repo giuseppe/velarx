@@ -191,6 +191,11 @@ CREATE TABLE IF NOT EXISTS layers (
     -- error, never a layer without fs-verity.  NULL on a file system without
     -- fs-verity.
     sealed INTEGER,
+    -- the threshold the EROFS image was made with (`[storage]
+    -- inline_threshold`, `pull --inline-threshold`): the regular files of 1
+    -- to `inline` bytes are in the image itself, -1 every file, 0 none; they
+    -- are listed in `inlined_files`, not in `files`
+    inline INTEGER NOT NULL DEFAULT 0,
     -- the size of the uncompressed tar of the layer, from its tar-split, kept
     -- at the pull so that a listing never decodes it (it stays when the
     -- tar-split of a layer marked incomplete is dropped)
@@ -241,6 +246,17 @@ CREATE TABLE IF NOT EXISTS file_refs (
     file_digest TEXT NOT NULL REFERENCES files(digest) ON DELETE CASCADE,
     ref_count INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (layer_id, file_digest)
+);
+
+-- The files a layer holds in its EROFS image (`layers.inline`): each is one
+-- extent of the image, `size` bytes from `offset`.  Written with the erofs
+-- of the layer and gone with it.
+CREATE TABLE IF NOT EXISTS inlined_files (
+    layer_id TEXT NOT NULL REFERENCES layers(id) ON DELETE CASCADE,
+    file_digest TEXT NOT NULL,
+    offset INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    PRIMARY KEY (file_digest, layer_id)
 );
 
 -- Chunk location index: where a chunk can be found, in which file and at
@@ -450,12 +466,15 @@ pub struct LayerRecord {
     /// has it); None only for a layer of a lazy pull in progress, which has
     /// no row yet.
     pub stream_size: Option<i64>,
+    /// The threshold the EROFS image was made with: see
+    /// `layers.inline` (0: none of its files is in the image).
+    pub inline: i64,
 }
 
 impl LayerRecord {
     /// The columns `from_row` reads, of the table `layers` as `l`.
     pub const COLUMNS: &'static str =
-        "l.id, l.diff_id, l.size, l.created_at, l.registry_ref, l.erofs, l.owners, l.blob, l.diff_id_other, l.stream_size";
+        "l.id, l.diff_id, l.size, l.created_at, l.registry_ref, l.erofs, l.owners, l.blob, l.diff_id_other, l.stream_size, l.inline";
 
     /// The diff id the layer was verified against in `alg`, if it was.
     pub fn diff_id_in(&self, alg: velarx_types::digest::Algorithm) -> Option<&Digest> {
@@ -506,6 +525,7 @@ impl LayerRecord {
             },
             other_diff_id: row.get(8)?,
             stream_size: row.get(9)?,
+            inline: row.get(10)?,
         })
     }
 }
@@ -601,6 +621,18 @@ pub struct LayerCommit {
     /// The EROFS image and the objects of the layer have fs-verity
     /// (`layers.sealed`).
     pub sealed: bool,
+    /// The files the EROFS image of the layer holds (`inlined_files`), with
+    /// the record's `erofs`.
+    pub inlined: Vec<InlinedFile>,
+}
+
+/// A file a layer holds in its EROFS image: `size` bytes from `offset`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlinedFile {
+    /// The fs-verity digest of the content, as an object is named.
+    pub digest: String,
+    pub offset: u64,
+    pub size: u64,
 }
 
 /// What the pull of a lazy layer needed to reach its registry: the later

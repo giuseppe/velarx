@@ -2792,6 +2792,7 @@ mod tests {
         let key = LayerKey::Whole(format!("sha256:{}", "ab".repeat(32)).parse().unwrap());
         let record = LayerRecord {
             stream_size: Some(0),
+            inline: 0,
             key,
             blob: None,
             diff_id: None,
@@ -2860,6 +2861,7 @@ mod tests {
         std::fs::write(&image, bytes).unwrap();
         let record = LayerRecord {
             stream_size: Some(0),
+            inline: 0,
             key,
             blob: None,
             diff_id: None,
@@ -3010,6 +3012,7 @@ mod tests {
         let key = LayerKey::Whole(format!("sha256:{}", "ab".repeat(32)).parse().unwrap());
         let layer = |erofs: Option<String>| LayerRecord {
             stream_size: Some(0),
+            inline: 0,
             key,
             blob: None,
             diff_id: None,

@@ -1946,6 +1946,52 @@ impl Database {
             .await?)
     }
 
+    /// Whether an image of this store holds any file itself.
+    pub(crate) async fn has_inlined_files_here(&self) -> DbResult<bool> {
+        Ok(self
+            .conn
+            .call(|conn| {
+                Ok(
+                    conn.query_row("SELECT EXISTS (SELECT 1 FROM inlined_files)", [], |r| {
+                        r.get(0)
+                    })?,
+                )
+            })
+            .await?)
+    }
+
+    /// The layer of this store whose EROFS image holds the file `digest`,
+    /// and where in the image: of several, always the same one (the first
+    /// by its id).
+    pub(crate) async fn inlined_file_here(
+        &self,
+        digest: &str,
+    ) -> DbResult<Option<(LayerKey, InlinedFile)>> {
+        let digest = digest.to_string();
+        Ok(self
+            .conn
+            .call(move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT layer_id, offset, size FROM inlined_files
+                         WHERE file_digest = ?1 ORDER BY layer_id LIMIT 1",
+                        [&digest],
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                InlinedFile {
+                                    digest: digest.clone(),
+                                    offset: r.get::<_, i64>(1)? as u64,
+                                    size: r.get::<_, i64>(2)? as u64,
+                                },
+                            ))
+                        },
+                    )
+                    .optional()?)
+            })
+            .await?)
+    }
+
     /// The first of the files `(digest, size)` that the store records with
     /// another size: its digest, the size the store has and the one given.
     /// A digest names one content, which has one size.
@@ -2440,8 +2486,9 @@ fn commit_layer(tx: &rusqlite::Transaction, layer: &LayerCommit) -> rusqlite::Re
     }
     tx.execute(
         "INSERT INTO layers (id, diff_id, size, toc_digest, created_at, registry_ref,
-                             tarsplit_digest, erofs, owners, blob, blob_checked, stream_size, sealed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                             tarsplit_digest, erofs, owners, blob, blob_checked, stream_size, sealed,
+                             inline)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(id) DO UPDATE SET
              diff_id = COALESCE(layers.diff_id, excluded.diff_id),
              blob_checked = MAX(layers.blob_checked, excluded.blob_checked),
@@ -2458,7 +2505,8 @@ fn commit_layer(tx: &rusqlite::Transaction, layer: &LayerCommit) -> rusqlite::Re
              -- (an EROFS image made again says whether it has fs-verity, the
              -- one it replaces had it or not; a record without one says
              -- nothing of it)
-             sealed = CASE WHEN excluded.erofs IS NULL THEN layers.sealed ELSE excluded.sealed END",
+             sealed = CASE WHEN excluded.erofs IS NULL THEN layers.sealed ELSE excluded.sealed END,
+             inline = CASE WHEN excluded.erofs IS NULL THEN layers.inline ELSE excluded.inline END",
         rusqlite::params![
             key,
             layer.record.diff_id,
@@ -2474,8 +2522,26 @@ fn commit_layer(tx: &rusqlite::Transaction, layer: &LayerCommit) -> rusqlite::Re
             layer.blob_checked,
             layer.record.stream_size,
             layer.sealed,
+            layer.record.inline,
         ],
     )?;
+    if layer.record.erofs.is_some() {
+        // (the files of the image that was made now: the ones of an image it
+        // replaces are not in it)
+        tx.execute("DELETE FROM inlined_files WHERE layer_id = ?1", [&key])?;
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR IGNORE INTO inlined_files (layer_id, file_digest, offset, size)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for f in &layer.inlined {
+            stmt.execute(rusqlite::params![
+                key,
+                f.digest,
+                f.offset as i64,
+                f.size as i64
+            ])?;
+        }
+    }
     if let Some(other) = other {
         tx.execute(
             "UPDATE layers SET diff_id_other = ?2 WHERE id = ?1",
@@ -3148,6 +3214,7 @@ mod tests {
         LayerCommit {
             record: LayerRecord {
                 stream_size: Some(0),
+                inline: 0,
                 key,
                 blob: None,
                 diff_id: Some(Digest::of(Algorithm::Sha256, b"diff")),
@@ -3166,6 +3233,7 @@ mod tests {
             tarsplit,
             blob_checked: false,
             sealed: false,
+            inlined: Vec::new(),
         }
     }
 
@@ -3300,6 +3368,7 @@ mod tests {
         let commit = |n: &str, file: &str, chunks: &[&str]| LayerCommit {
             record: LayerRecord {
                 stream_size: Some(1),
+                inline: 0,
                 key: LayerKey::Whole(sha(n)),
                 blob: None,
                 diff_id: Some(sha(n)),
@@ -3332,6 +3401,7 @@ mod tests {
             tarsplit: None,
             blob_checked: false,
             sealed: false,
+            inlined: Vec::new(),
         };
         // the old file is c1 c2; the new one c1 c3, committed after it
         db.commit_layers(
@@ -4127,6 +4197,93 @@ mod tests {
         db.set_layer_sealed(&old, true).await.unwrap();
         assert!(db.layers_sealed(&[old, new]).await.unwrap());
         assert!(!db.layers_sealed(&[other]).await.unwrap());
+    }
+
+    fn inlined(n: u8, offset: u64, size: u64) -> InlinedFile {
+        InlinedFile {
+            digest: format!("fsverity-sha256-12:{}", format!("{n:02x}").repeat(32)),
+            offset,
+            size,
+        }
+    }
+
+    /// A layer records the threshold its image was made with and where the
+    /// files it holds are; a commit that makes the image again replaces
+    /// them, one without an image leaves them, and they go with the layer.
+    #[tokio::test]
+    async fn a_layer_records_the_files_its_image_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("db.sqlite")).await.unwrap();
+        let sha = |b: &[u8]| Digest::of(Algorithm::Sha256, b);
+        let (one, two) = (LayerKey::Whole(sha(b"one")), LayerKey::Whole(sha(b"two")));
+        let commit = |key, inline, files: Vec<InlinedFile>| {
+            let mut c = layer_commit(key, sha(b"t"), None);
+            c.record.erofs = Some("sha256:a".into());
+            c.record.owners = Some("[]".into());
+            c.record.inline = inline;
+            c.inlined = files;
+            c
+        };
+        // (the same content twice in an image has one row)
+        db.commit_layers(
+            vec![
+                commit(
+                    one,
+                    4096,
+                    vec![inlined(1, 0, 10), inlined(1, 4096, 10), inlined(2, 8192, 5)],
+                ),
+                commit(two, -1, vec![inlined(2, 0, 5)]),
+            ],
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.get_layer(&one).await.unwrap().inline, 4096);
+        assert_eq!(db.get_layer(&two).await.unwrap().inline, -1);
+        let (layer, found) = db
+            .inlined_file(&inlined(1, 0, 0).digest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((layer, found.size), (one, 10));
+        assert!(db
+            .inlined_file(&inlined(3, 0, 0).digest)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db.has_inlined_files().await.unwrap());
+        // a record that says nothing of the image keeps what it had
+        let mut again = layer_commit(one, sha(b"t"), None);
+        again.record.inline = 7;
+        db.commit_layers(vec![again], vec![]).await.unwrap();
+        assert_eq!(db.get_layer(&one).await.unwrap().inline, 4096);
+        assert!(db
+            .inlined_file(&inlined(1, 0, 0).digest)
+            .await
+            .unwrap()
+            .is_some());
+        // an image made again replaces them
+        db.commit_layers(vec![commit(one, 0, vec![])], vec![])
+            .await
+            .unwrap();
+        assert_eq!(db.get_layer(&one).await.unwrap().inline, 0);
+        assert!(db
+            .inlined_file(&inlined(1, 0, 0).digest)
+            .await
+            .unwrap()
+            .is_none());
+        // the layer takes its files with it
+        let (layer, found) = db
+            .inlined_file(&inlined(2, 0, 0).digest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((layer, found.offset), (two, 0));
+        db.conn()
+            .call(move |c| Ok(c.execute("DELETE FROM layers WHERE id = ?1", [&two])?))
+            .await
+            .unwrap();
+        assert!(!db.has_inlined_files().await.unwrap());
     }
 
     /// An EROFS image made again says whether it has fs-verity: one without

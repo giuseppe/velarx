@@ -1018,6 +1018,7 @@ mod tests {
             dir.path(),
             &velarx_db::LayerRecord {
                 stream_size: Some(0),
+                inline: 0,
                 key,
                 blob: Some(digest),
                 diff_id: Some(digest),
@@ -1082,6 +1083,7 @@ mod tests {
         let (named, orphan) = (layer(1), layer(2));
         let record = |key: velarx_types::LayerKey| velarx_db::LayerRecord {
             stream_size: Some(0),
+            inline: 0,
             key,
             blob: Some(*key.digest()),
             diff_id: Some(*key.digest()),
@@ -1168,6 +1170,7 @@ mod layer_tests {
             dir.path(),
             &velarx_db::LayerRecord {
                 stream_size: Some(0),
+                inline: 0,
                 key,
                 blob: Some(format!("sha256:{}", "ef".repeat(32)).parse().unwrap()),
                 diff_id: None,
@@ -1364,6 +1367,7 @@ mod layer_tests {
         let key = velarx_db::LayerKey::Toc(format!("sha256:{i:064x}").parse().unwrap());
         db.insert_layer(&velarx_db::LayerRecord {
             stream_size: Some(0),
+            inline: 0,
             key,
             blob: Some(format!("sha256:{}", "ef".repeat(32)).parse().unwrap()),
             diff_id: None,
@@ -1510,6 +1514,7 @@ mod freed_tests {
             self.db
                 .insert_layer(&velarx_db::LayerRecord {
                     stream_size: Some(stream),
+                    inline: 0,
                     key,
                     blob: Some(format!("sha256:{}", "ef".repeat(32)).parse().unwrap()),
                     diff_id: None,

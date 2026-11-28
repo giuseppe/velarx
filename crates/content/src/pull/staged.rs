@@ -301,6 +301,7 @@ impl StagedLayer {
             erofs: Some(self.meta.erofs.clone()),
             owners: Some(self.meta.owners.clone()),
             stream_size: None,
+            inline: 0,
         }
     }
 

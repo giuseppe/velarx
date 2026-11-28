@@ -2307,6 +2307,7 @@ mod stored_tests {
         LayerCommit {
             record: velarx_db::LayerRecord {
                 stream_size: Some(0),
+                inline: 0,
                 key: LayerKey::Whole(digest(&format!("blob{n}"))),
                 blob: None,
                 diff_id: Some(digest(&format!("diff{n}"))),
@@ -2324,6 +2325,7 @@ mod stored_tests {
             toc_digest: digest(toc),
             tarsplit: Some(Digest::of(Algorithm::Sha256, tarsplit)),
             sealed: false,
+            inlined: Vec::new(),
             blob_checked: false,
         }
     }
