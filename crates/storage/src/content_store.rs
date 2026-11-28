@@ -343,32 +343,35 @@ impl FileStore {
     /// it cannot be opened.  What is measured on the descriptor is what is
     /// read from it.
     pub fn open_object(&self, id: &str) -> Option<io::Result<File>> {
+        Object::new(id, false)?;
+        std::iter::once(&self.root)
+            .chain(&self.more)
+            .find_map(|root| Self::open_in(root, id))
+    }
+
+    /// [`Self::open_object`] in the store whose objects are `root` alone.
+    pub fn open_in(root: &Path, id: &str) -> Option<io::Result<File>> {
         use rustix::fs::{Mode, OFlags};
         use std::os::fd::AsFd;
         use velarx_sys::fs::{open_beneath, Beneath, BeneathError};
         let rel = Object::new(id, false)?.rel();
-        for root in std::iter::once(&self.root).chain(&self.more) {
-            let dir = match rustix::fs::open(
-                root,
-                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            ) {
-                Ok(dir) => dir,
-                Err(rustix::io::Errno::NOENT) => continue,
-                Err(e) => return Some(Err(e.into())),
-            };
-            return Some(
-                match open_beneath(dir.as_fd(), Path::new(&rel), Beneath::File) {
-                    Ok(fd) => Ok(File::from(fd)),
-                    Err(BeneathError::Errno(rustix::io::Errno::NOENT)) => continue,
-                    Err(BeneathError::NotRegular) => {
-                        Err(io::Error::other(format!("{id} is not a regular file")))
-                    }
-                    Err(e) => Err(e.into()),
-                },
-            );
+        let dir = match rustix::fs::open(
+            root,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(dir) => dir,
+            Err(rustix::io::Errno::NOENT) => return None,
+            Err(e) => return Some(Err(e.into())),
+        };
+        match open_beneath(dir.as_fd(), Path::new(&rel), Beneath::File) {
+            Ok(fd) => Some(Ok(File::from(fd))),
+            Err(BeneathError::Errno(rustix::io::Errno::NOENT)) => None,
+            Err(BeneathError::NotRegular) => {
+                Some(Err(io::Error::other(format!("{id} is not a regular file"))))
+            }
+            Err(e) => Some(Err(e.into())),
         }
-        None
     }
 
     /// Store a file whose id is its fs-verity digest in `alg`; returns it.

@@ -23,7 +23,7 @@ doctest = false
 
 [features]
 # the conformance suite (`velarx_graph::conformance`): every driver's tests
-conformance = ["dep:futures", "dep:zstd", "dep:velarx-registry", "velarx-registry/net", "dep:velarx-registry-lib"]
+conformance = ["dep:zstd", "dep:velarx-registry", "velarx-registry/net", "dep:velarx-registry-lib"]
 
 [dependencies]
 bytes.workspace = true
@@ -42,7 +42,7 @@ velarx-registry = { path = "../registry", optional = true }
 velarx-fuse = { path = "../fuse" }
 async-trait.workspace = true
 base64.workspace = true
-futures = { workspace = true, optional = true }
+futures.workspace = true
 hex.workspace = true
 libc.workspace = true
 rustix = { workspace = true, features = ["fs", "process", "mount", "event", "pipe", "time"] }

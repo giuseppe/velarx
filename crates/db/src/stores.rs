@@ -521,20 +521,23 @@ impl Database {
         Ok(false)
     }
 
-    /// Where the content of the file `digest` is when no object of the
-    /// stores has it: the layer whose EROFS image holds it and the extent,
-    /// from this store, then the read-only ones.  (An object, which
-    /// [`Self::file_objects`] answers, is the other place a file is.)
-    pub async fn inlined_file(&self, digest: &str) -> DbResult<Option<(LayerKey, InlinedFile)>> {
-        if let Some(found) = self.inlined_file_here(digest).await? {
-            return Ok(Some(found));
+    /// Where the content of the file `digest` is in the store whose objects
+    /// are `objects` when it has no object of it: the layer whose EROFS
+    /// image there holds it and the extent.  Only that store answers (this
+    /// one or a read-only one): the image to open is the one of its layer in
+    /// the same store, whatever the others hold under that layer's id.
+    pub async fn inlined_file_in(
+        &self,
+        objects: &Path,
+        digest: &str,
+    ) -> DbResult<Option<(LayerKey, InlinedFile)>> {
+        let store = std::iter::once(self)
+            .chain(self.more.iter())
+            .find(|db| db.path().map(|p| p.with_file_name("objects")).as_deref() == Some(objects));
+        match store {
+            Some(db) => db.inlined_file_here(digest).await,
+            None => Ok(None),
         }
-        for db in self.more.iter() {
-            if let Ok(Some(found)) = db.inlined_file_here(digest).await {
-                return Ok(Some(found));
-            }
-        }
-        Ok(None)
     }
 }
 
@@ -817,8 +820,8 @@ mod tests {
         assert_eq!(std::fs::read(&ro_path).unwrap(), before);
     }
 
-    /// What an image of a read-only store holds itself is found through this
-    /// store, after what its own images hold.
+    /// What an image holds itself is found in the store of that image, and in
+    /// no other.
     #[tokio::test]
     async fn the_files_images_hold_are_found_in_read_only_stores_too() {
         use crate::LayerCommit;
@@ -857,7 +860,8 @@ mod tests {
             LayerKey::Whole(sha(b"own")),
             LayerKey::Whole(sha(b"theirs")),
         );
-        let ro_path = dir.path().join("ro.sqlite");
+        let ro_path = dir.path().join("ro").join("db.sqlite");
+        std::fs::create_dir_all(ro_path.parent().unwrap()).unwrap();
         {
             let ro = Database::open(&ro_path).await.unwrap();
             ro.commit_layers(
@@ -868,31 +872,31 @@ mod tests {
             .unwrap();
             ro.checkpoint().await.unwrap();
         }
-        let main = Database::open(dir.path().join("main.sqlite"))
-            .await
-            .unwrap();
+        let main = Database::open(dir.path().join("db.sqlite")).await.unwrap();
         assert!(!main.has_inlined_files().await.unwrap());
         main.commit_layers(vec![commit(own, vec![file(b"a", 0)])], vec![])
             .await
             .unwrap();
         let db = main.with_additional(vec![Database::open_read_only(&ro_path).await.unwrap()]);
-        let (layer, f) = db
-            .inlined_file(&file(b"a", 0).digest)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!((layer, f.offset), (own, 0));
-        let (layer, f) = db
-            .inlined_file(&file(b"b", 0).digest)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!((layer, f.offset), (theirs, 16));
-        assert!(db
-            .inlined_file(&file(b"c", 0).digest)
-            .await
-            .unwrap()
-            .is_none());
+        let (own_objects, ro_objects) = (dir.path().join("objects"), dir.path().join("ro/objects"));
+        let found = |objects: &Path, d: &[u8]| {
+            let db = db.clone();
+            let (objects, digest) = (objects.to_path_buf(), file(d, 0).digest);
+            async move {
+                db.inlined_file_in(&objects, &digest)
+                    .await
+                    .unwrap()
+                    .map(|(layer, f)| (layer, f.offset))
+            }
+        };
+        // (each store answers for itself, with the layer and the offset of
+        // its own row: the same file is in both)
+        assert_eq!(found(&own_objects, b"a").await, Some((own, 0)));
+        assert_eq!(found(&ro_objects, b"a").await, Some((theirs, 8)));
+        assert_eq!(found(&own_objects, b"b").await, None);
+        assert_eq!(found(&ro_objects, b"b").await, Some((theirs, 16)));
+        assert_eq!(found(&ro_objects, b"c").await, None);
+        assert_eq!(found(&dir.path().join("elsewhere"), b"a").await, None);
     }
 
     const L1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";

@@ -4241,13 +4241,13 @@ mod tests {
         assert_eq!(db.get_layer(&one).await.unwrap().inline, 4096);
         assert_eq!(db.get_layer(&two).await.unwrap().inline, -1);
         let (layer, found) = db
-            .inlined_file(&inlined(1, 0, 0).digest)
+            .inlined_file_here(&inlined(1, 0, 0).digest)
             .await
             .unwrap()
             .unwrap();
         assert_eq!((layer, found.size), (one, 10));
         assert!(db
-            .inlined_file(&inlined(3, 0, 0).digest)
+            .inlined_file_here(&inlined(3, 0, 0).digest)
             .await
             .unwrap()
             .is_none());
@@ -4258,7 +4258,7 @@ mod tests {
         db.commit_layers(vec![again], vec![]).await.unwrap();
         assert_eq!(db.get_layer(&one).await.unwrap().inline, 4096);
         assert!(db
-            .inlined_file(&inlined(1, 0, 0).digest)
+            .inlined_file_here(&inlined(1, 0, 0).digest)
             .await
             .unwrap()
             .is_some());
@@ -4268,13 +4268,13 @@ mod tests {
             .unwrap();
         assert_eq!(db.get_layer(&one).await.unwrap().inline, 0);
         assert!(db
-            .inlined_file(&inlined(1, 0, 0).digest)
+            .inlined_file_here(&inlined(1, 0, 0).digest)
             .await
             .unwrap()
             .is_none());
         // the layer takes its files with it
         let (layer, found) = db
-            .inlined_file(&inlined(2, 0, 0).digest)
+            .inlined_file_here(&inlined(2, 0, 0).digest)
             .await
             .unwrap()
             .unwrap();

@@ -28,9 +28,9 @@ use velarx_storage::{FileStore, FsVerityManager, Object};
 /// Where the store holds a file that is no object of it: in the EROFS image
 /// of a layer (`layers.inline`).
 pub trait Inlined: Send + Sync {
-    /// The image that holds the file `digest`, opened, with the offset of
-    /// the file in it and its size.
-    fn extent(&self, digest: &str) -> Option<(File, u64, u64)>;
+    /// The image of the store whose objects are `objects` that holds the file
+    /// `digest`, opened, with the offset of the file in it and its size.
+    fn extent(&self, objects: &Path, digest: &str) -> Option<velarx_storage::ChunkFile>;
 }
 
 pub struct Session {
@@ -259,7 +259,9 @@ impl Session {
     /// Whether the content is in the store or already staged.  What only
     /// a read-only store has is staged from there, checked: the
     /// images of this store keep only files of their own.  What the image
-    /// of a layer holds is staged from there, checked.
+    /// of a layer holds is staged from there, checked.  The stores are asked
+    /// one by one (this one, then the read-only ones): a store gives its
+    /// object, else the file in the image of one of its layers.
     pub fn have(&self, digest: &str) -> bool {
         if self.staged.lock().unwrap().contains_key(digest) || self.store.contains_local(digest) {
             return true;
@@ -267,20 +269,34 @@ impl Session {
         if self.parent.get().is_some_and(|p| p.has_staged(digest)) {
             return true;
         }
-        self.stage_additional(digest) || self.stage_inlined(digest)
+        self.stage_held(digest)
     }
 
-    /// Stage the copy of the file of a read-only store that has it.
-    fn stage_additional(&self, digest: &str) -> bool {
-        match self.store.find_additional(digest) {
-            Some(src) => match self.stage_copy(&src, digest) {
-                Ok(()) => true,
-                Err(e) => {
-                    warn!("{digest} of {}: {e}: fetched", src.display());
-                    false
-                }
-            },
-            None => false,
+    /// Stage the copy of the file of the first store that has it, other
+    /// than as an object of this store (what [`Session::have`] and
+    /// [`Session::holds`] looked at): its object in a read-only store, else
+    /// the file in the image of a layer of that store.
+    fn stage_held(&self, digest: &str) -> bool {
+        let Some(object) = Object::new(digest, false) else {
+            return false;
+        };
+        let own = std::iter::once(self.store.root());
+        let roots = own.chain(self.store.additional().iter().map(PathBuf::as_path));
+        roots.enumerate().any(|(i, root)| {
+            let src = root.join(object.rel());
+            (i > 0 && src.exists() && self.stage_object(&src, digest))
+                || self.stage_inlined(root, digest)
+        })
+    }
+
+    /// Stage the copy of the file of a read-only store.
+    fn stage_object(&self, src: &Path, digest: &str) -> bool {
+        match self.stage_copy(src, digest) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("{digest} of {}: {e}: fetched", src.display());
+                false
+            }
         }
     }
 
@@ -290,11 +306,7 @@ impl Session {
     pub fn holds(&self, digest: &str, size: u64) -> bool {
         match self.staged_size(digest) {
             Some(staged) => staged == size,
-            None => {
-                self.store.holds(digest, size)
-                    || self.stage_additional(digest)
-                    || self.stage_inlined(digest)
-            }
+            None => self.store.holds(digest, size) || self.stage_held(digest),
         }
     }
 
@@ -304,14 +316,19 @@ impl Session {
         own.or_else(|| self.parent.get()?.staged_size(digest))
     }
 
-    /// Stage the copy of the file of the image of a layer that holds it.
-    fn stage_inlined(&self, digest: &str) -> bool {
-        let Some((mut image, offset, size)) = self.inlined.get().and_then(|i| i.extent(digest))
+    /// Stage the copy of the file of the image of a layer of the store whose
+    /// objects are `objects`, that holds it.
+    fn stage_inlined(&self, objects: &Path, digest: &str) -> bool {
+        let Some(velarx_storage::ChunkFile {
+            mut file,
+            offset,
+            len,
+        }) = self.inlined.get().and_then(|i| i.extent(objects, digest))
         else {
             return false;
         };
-        let staged = io::Seek::seek(&mut image, io::SeekFrom::Start(offset))
-            .and_then(|_| self.stage_from(io::Read::take(image, size), digest));
+        let staged = io::Seek::seek(&mut file, io::SeekFrom::Start(offset))
+            .and_then(|_| self.stage_from(io::Read::take(file, len), digest));
         match staged {
             Ok(()) => true,
             Err(e) => {

@@ -114,10 +114,13 @@ pull again make them with another).  `layers.inline` records the value and
 the table `inlined_files` where each file is in the image (`offset`, `size`);
 those files are not in `files` and `file_refs`, so they are no objects and
 collection needs nothing of them.  "The content of the file with digest d" is
-the object when the store has it, else its extent of the image of a layer
-(`Database::inlined_file`); what reads a file by its digest (push, save,
-commit, copy) finds it either way, and an extent is read back as a temporary
-copy of it.
+asked store by store (this one, then the read-only ones, in their order): the
+first store that has it answers, with its object, else its extent of the image
+of a layer of that store (`Database::inlined_file_in`; the image is the one of
+that store, whatever another store has under the layer's id).  What reads a
+file by its digest (push, save, commit, copy) finds it either way, and an
+extent is read back as a temporary copy of it.  A peer is served the same way:
+an extent is a range of the image, as a chunk is a range of an object.
 
 The image of such a layer is not the one its table of contents alone makes,
 so the digest of it that a manifest states can never be the recorded one:

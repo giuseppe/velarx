@@ -797,56 +797,11 @@ pub struct ComposefsDriver {
 /// (`layers.inline`): where each is, found by its digest.
 struct Extents {
     db: Database,
-    store: Arc<FileStore>,
-}
-
-impl Extents {
-    /// The image of the layer that holds the file `key`, opened, with the
-    /// offset of the file in it and its size; none when no layer does.  The
-    /// extent lies in the image, which is `Corrupt` else.
-    fn find(&self, key: &str) -> DriverResult<Option<(std::fs::File, u64, u64)>> {
-        let found =
-            velarx_graph::blocking(|| futures::executor::block_on(self.db.inlined_file(key)))
-                .map_err(|e| DriverError::storage(NAME, format!("the file {key}: {e}")))?;
-        let Some((layer, file)) = found else {
-            return Ok(None);
-        };
-        let dirs = objects::objects_dirs(&self.store);
-        let dirs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
-        let (path, _) = cfs::find_layer_image(&dirs, &layer.file_stem()).ok_or_else(|| {
-            DriverError::missing(
-                NAME,
-                Some(&layer),
-                format!("the image of the layer that holds the file {key} is not there"),
-                Remedy::PullAgain,
-            )
-        })?;
-        let image = cfs::open_layer_image(&path).map_err(|e| DriverError::io(NAME, e))?;
-        let len = image
-            .metadata()
-            .map_err(|e| DriverError::io(NAME, e))?
-            .len();
-        if file
-            .offset
-            .checked_add(file.size)
-            .is_none_or(|end| end > len)
-        {
-            return Err(DriverError::corrupt(
-                NAME,
-                format!(
-                    "the file {key} is {} bytes from {} of the image of layer {layer}, which has {len} bytes",
-                    file.size, file.offset
-                ),
-                Remedy::PullAgain,
-            ));
-        }
-        Ok(Some((image, file.offset, file.size)))
-    }
 }
 
 impl velarx_content::pull::session::Inlined for Extents {
-    fn extent(&self, digest: &str) -> Option<(std::fs::File, u64, u64)> {
-        self.find(digest)
+    fn extent(&self, objects: &Path, digest: &str) -> Option<velarx_storage::ChunkFile> {
+        objects::extent_in(NAME, &self.db, objects, digest)
             .inspect_err(|e| warn!("The file {digest} of the image of a layer: {e}"))
             .ok()
             .flatten()
@@ -969,40 +924,23 @@ impl ComposefsDriver {
             .get_or_init(|| velarx_storage::probe(self.store.root()).is_ok())
     }
 
-    /// The file `key` of `size` bytes as an unnamed file of the staging
-    /// directory with a copy of what the image of the layer that holds it
-    /// has in its extent; none when no layer does.
-    fn copy_of_extent(&self, key: &str, size: u64) -> DriverResult<Option<std::fs::File>> {
-        let Some((image, offset, held)) = self.extents().find(key)? else {
-            return Ok(None);
-        };
-        if held != size {
-            return Err(DriverError::corrupt(
-                NAME,
-                format!(
-                    "the file {key} is {held} bytes in the image of a layer, its index says {size}"
-                ),
-                Remedy::PullAgain,
-            ));
-        }
-        let copy = velarx_content::pull::unnamed::unnamed_file(&self.staging_dir)
-            .map_err(|e| DriverError::io(NAME, e))?;
-        velarx_storage::copy_region(&image, offset, &copy, 0, size, || Ok(()))
-            .map_err(|e| DriverError::io(NAME, e))?;
-        Ok(Some(copy))
-    }
-
     /// Where the files are that the images of the layers hold.
     fn extents(&self) -> Extents {
         Extents {
             db: self.db.clone(),
-            store: self.store.clone(),
         }
     }
 
     /// The objects of this store and of the read-only image stores there are.
     fn objects_dirs(&self) -> Vec<PathBuf> {
         objects::objects_dirs(&self.store)
+    }
+
+    /// The objects of this store and of every read-only one, whether they
+    /// exist or not ([`objects::stores`]): where the images of the layers
+    /// are.
+    fn stores(&self) -> Vec<PathBuf> {
+        objects::stores(&self.store)
     }
 
     /// The images of the layers of `image_id` (the image, its index), from
@@ -1014,7 +952,7 @@ impl ComposefsDriver {
     ) -> DriverResult<Vec<ImageFiles>> {
         // (the images of the layers of an image being pulled are in the
         // staging area until their layer is committed)
-        let mut dirs = self.objects_dirs();
+        let mut dirs = self.stores();
         dirs.push(self.staging().objects_stand_in());
         let dirs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
         layers
@@ -1895,19 +1833,14 @@ impl StorageDriver for ComposefsDriver {
     }
 
     fn read_objects(&self, ranges: &[ObjectRange], sink: &mut dyn ObjectSink) -> DriverResult<()> {
-        objects::read_objects(NAME, &self.store, ranges, sink)
+        objects::read_objects(NAME, &self.db, &self.store, ranges, sink)
     }
 
     /// The object, else a temporary copy of the extent of the EROFS image
     /// that holds the file (`layers.inline`): what reads a file by its
     /// digest does not see the difference.
     fn open_object(&self, key: &str, size: u64) -> DriverResult<std::fs::File> {
-        match objects::open_object(NAME, &self.store, key, size) {
-            Err(e) if matches!(e.kind, DriverErrorKind::Missing { .. }) => {
-                self.copy_of_extent(key, size)?.ok_or(e)
-            }
-            found => found,
-        }
+        objects::open_object(NAME, &self.db, &self.store, &self.staging_dir, key, size)
     }
 
     fn remove_image(&self, image_id: &str) -> DriverResult<()> {
@@ -2007,7 +1940,7 @@ impl StorageDriver for ComposefsDriver {
             };
             tocs.push(toc);
         }
-        let mut dirs = self.objects_dirs();
+        let mut dirs = self.stores();
         // (the images of the layers of a pull in progress are in the
         // staging area)
         dirs.push(self.staging().objects_stand_in());
