@@ -225,6 +225,7 @@ teardown_file () {
     local pause
     remove_leftovers
     e2e_detach_mounts "$WORKDIR"
+    e2e_bridge_release "$WORKDIR"
     if test -n "${E2E_KEEP:-}"; then
         echo "# kept $WORKDIR" >&3
     else

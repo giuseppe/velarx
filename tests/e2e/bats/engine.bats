@@ -51,6 +51,7 @@ setup_file () {
     export RUN=$XDG_RUNTIME_DIR/velarx
     export CONF=$XDG_CONFIG_HOME/velarx/config.toml
     cat > "$CONF" <<TOML
+$(e2e_bridge_toml)
 [server]
 socket = "$RUN/velarx.sock"
 state_dir = "$RUN"

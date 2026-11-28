@@ -108,6 +108,7 @@ daemon_case () { # manager
     mkdir -p "$d"
     chmod 700 "$d"
     cat > "$d/config.toml" <<TOML
+$(e2e_bridge_toml)
 [engine]
 socket = "$d/api.sock"
 [server]
@@ -188,6 +189,7 @@ setup_file () {
     fi
     # (everything in the work directory: as root the defaults are the system's)
     cat > "$WORKDIR/config.toml" <<TOML
+$(e2e_bridge_toml)
 [engine]
 socket = "$WORKDIR/none.sock"
 [server]

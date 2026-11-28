@@ -135,6 +135,7 @@ teardown_file () {
         ln -sfn "$REAL_RUNTIME_DIR/systemd" "$WORKDIR/run/systemd"
     fi
     cat > "$CONF" <<TOML
+$(e2e_bridge_toml)
 [engine]
 socket = "$SOCK"
 idle_exit = 2

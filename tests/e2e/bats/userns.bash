@@ -32,6 +32,7 @@ userns_setup_file () {
     export ME; ME=$(id -u)
     mkdir -p "$XDG_CONFIG_HOME/velarx"
     cat > "$XDG_CONFIG_HOME/velarx/config.toml" <<EOT
+$(e2e_bridge_toml)
 [engine]
 socket = "$ESOCK"
 [server]

@@ -92,8 +92,8 @@ api_start_daemon () {
 }
 
 # api_teardown_file: the containers, the daemon and its processes group, the
-# mounts left, the work directory (kept when E2E_KEEP is set); fails when
-# processes of the store are left.
+# mounts left, the bridge slot (root), the work directory (kept when
+# E2E_KEEP is set); fails when processes of the store are left.
 api_teardown_file () {
     [ -n "${WORKDIR:-}" ] || return 0
     . "$E2E_DIR/cleanup.sh"
@@ -106,6 +106,7 @@ api_teardown_file () {
         kill -KILL -- "-$pgid" 2> /dev/null
     fi
     e2e_detach_mounts "$WORKDIR"
+    e2e_bridge_release "$WORKDIR"
     if [ -n "${E2E_KEEP:-}" ]; then
         echo "# kept $WORKDIR" >&3
         return 0

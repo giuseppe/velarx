@@ -69,6 +69,7 @@ setup_file () {
     mkdir -p "$WORKDIR/home" "$WORKDIR/run" "$WORKDIR/quadlet" "$WORKDIR/gen"
     chmod 700 "$WORKDIR/run"
     cat > "$WORKDIR/config.toml" <<TOML
+$(e2e_bridge_toml)
 [engine]
 socket = "$WORKDIR/api.sock"
 [server]

@@ -55,6 +55,7 @@ EOF
     cat > "$CONFIG" << EOF
 storage.root = "$XDG_DATA_HOME/velarx"
 ${E2E_STORAGE_LINES:-}
+$(e2e_bridge_toml)
 [engine]
 socket = "$ESOCK"
 [server]

@@ -126,6 +126,7 @@ setup_file () {
     [ "$(id -u)" = 0 ] || ln -sfn "$REAL_RUNTIME_DIR/systemd" "$WORKDIR/run/systemd"
     export HOME=$WORKDIR/home XDG_RUNTIME_DIR=$WORKDIR/run
     cat > "$WORKDIR/config.toml" <<TOML
+$(e2e_bridge_toml)
 [engine]
 socket = "$WORKDIR/api.sock"
 [server]

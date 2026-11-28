@@ -160,6 +160,7 @@ ${#mark}
     mkdir -p "$t"
     cat > "$t/config.toml" <<EOT
 storage.root = "$t/store"
+$(e2e_bridge_toml)
 [engine]
 socket = "$t/engine.sock"
 [server]

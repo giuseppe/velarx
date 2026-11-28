@@ -152,6 +152,7 @@ inline_stop () {
 # only: `lazy_completers = 0` is added)
 inline_config () {
     cat > "$WORKDIR/$1.toml" <<EOT
+$(e2e_bridge_toml)
 [engine]
 socket = "$WORKDIR/$1.sock"
 [server]

@@ -111,6 +111,7 @@ setup_file () {
     chmod 700 "$WORKDIR/run"
     # (the events go to a file the tests read, empty at the start)
     cat > "$WORKDIR/config.toml" <<TOML
+$(e2e_bridge_toml)
 [engine]
 socket = "$WORKDIR/api.sock"
 [server]

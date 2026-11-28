@@ -91,6 +91,7 @@ lf () {
     mkdir -p -m 700 "$WORKDIR/lf" "$WORKDIR/lf-store"
     printf '[[registry]]\nlocation = "%s"\ninsecure = true\n' "$E2E_REGISTRY" > "$WORKDIR/lf-registries.conf"
     cat > "$WORKDIR/lf.toml" <<EOF
+$(e2e_bridge_toml)
 [engine]
 socket = "$WORKDIR/lf/lf.sock"
 idle_exit = 2

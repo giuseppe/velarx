@@ -42,6 +42,7 @@ exec $CRUN "\$@"
 EOT
     chmod +x "$WORKDIR/flagged-runtime"
     cat > "$CONF" <<EOT
+$(e2e_bridge_toml)
 [engine]
 socket = "$ESOCK"
 [server]

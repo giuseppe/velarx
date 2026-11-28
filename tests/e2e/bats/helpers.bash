@@ -48,6 +48,76 @@ else:
 EOT
 }
 
+# As root the bridges, the addresses and the published ports of every engine
+# are the host's, and the default network of every store is the bridge
+# velarx0 on 10.90.0.0/24 with addresses given by the database of the store:
+# two files at once would give a container the address of the other's.  So a
+# root file has a default bridge and subnets of its own: the slot N of
+# E2E_BRIDGE_DIR (1 to 40), a directory that names the work directory of the
+# file, free again when that work directory is gone.  The slot N is the
+# bridge vxeN on 10.(160+N).0.0/24, and the pool 10.(160+N).0.0/16 of the
+# networks made without a subnet (the subnets the tests give are in
+# 10.213.0.0/16 and 10.90.0.0/16).  Rootless, the networks of a store are in
+# a namespace of their own: nothing to do.
+E2E_BRIDGE_DIR=/run/velarx-e2e-bridges
+
+# e2e_bridge_slot: the slot of the file of WORKDIR, claimed if it has none.
+e2e_bridge_slot () {
+    local d n w
+    mkdir -p "$E2E_BRIDGE_DIR"
+    for d in "$E2E_BRIDGE_DIR"/*; do
+        [ "$(cat "$d/workdir" 2> /dev/null)" = "$WORKDIR" ] && { basename "$d"; return 0; }
+    done
+    for n in $(seq 40); do
+        d=$E2E_BRIDGE_DIR/$n
+        w=$(cat "$d/workdir" 2> /dev/null)
+        # (a slot whose file is gone: whoever renames it first frees it)
+        if [ -n "$w" ] && [ ! -d "$w" ] && mv "$d" "$d.gone.$$" 2> /dev/null; then
+            e2e_bridge_free "$n" "$d.gone.$$"
+        fi
+        mkdir "$d" 2> /dev/null || continue
+        echo "$WORKDIR" > "$d/.workdir" && mv "$d/.workdir" "$d/workdir"
+        echo "$n"
+        return 0
+    done
+    echo "no free bridge slot in $E2E_BRIDGE_DIR" >&2
+    return 1
+}
+
+# e2e_bridge_toml: the lines of the configuration of a store of the file
+# that give it its own bridge and subnets as root (nothing rootless).  They
+# go before the first table of the configuration.
+e2e_bridge_toml () {
+    [ "$(id -u)" = 0 ] || return 0
+    local n
+    n=$(e2e_bridge_slot) || return 1
+    printf '[network.bridge]\ndefault_bridge = "vxe%s"\nsubnet = "10.%s.0.0/24"\ngateway = "10.%s.0.1"\n' \
+        "$n" $((160 + n)) $((160 + n))
+    printf '[[network.subnet_pools]]\nbase = "10.%s.0.0/16"\nsize = 24\n' $((160 + n))
+}
+
+# e2e_bridge_free N SLOTDIR: the bridges on the subnets of the slot N are
+# gone (vxeN and those of the networks its file made and did not remove),
+# and so is its directory SLOTDIR.
+e2e_bridge_free () {
+    local b
+    for b in $(ip -o -4 addr show | awk -v p="10.$((160 + $1))." 'index($4, p) == 1 { print $2 }' | sort -u); do
+        ip link del "$b" 2> /dev/null
+    done
+    rm -rf "$2"
+}
+
+# e2e_bridge_release DIR: the slot of the file of the work directory DIR is
+# free, its bridges gone (the containers of the file are gone already).
+e2e_bridge_release () {
+    local d
+    [ "$(id -u)" = 0 ] || return 0
+    for d in "$E2E_BRIDGE_DIR"/*; do
+        [ "$(cat "$d/workdir" 2> /dev/null)" = "$1" ] && e2e_bridge_free "$(basename "$d")" "$d"
+    done
+    return 0
+}
+
 # e2e_registry_up: true when a registry answers at E2E_REGISTRY.
 e2e_registry_up () {
     curl -s -m 2 "http://$E2E_REGISTRY/v2/" > /dev/null
@@ -132,8 +202,10 @@ e2e_setup_file () {
     export HOME=$WORKDIR/home XDG_RUNTIME_DIR=$WORKDIR/run
     export XDG_CONFIG_HOME=$HOME/.config XDG_DATA_HOME=$HOME/data
     mkdir -p "$XDG_CONFIG_HOME/velarx" "$XDG_RUNTIME_DIR"
+    [ "$(id -u)" != 0 ] || e2e_bridge_slot > /dev/null || exit 1
     cat > "$XDG_CONFIG_HOME/velarx/config.toml" <<TOML
 storage.root = "$XDG_DATA_HOME/velarx"
+$(e2e_bridge_toml)
 [engine]
 socket = "$ESOCK"
 [server]
@@ -202,11 +274,11 @@ e2e_make_image () {
 }
 
 # e2e_teardown_file: stop the daemon of the file (the pid in
-# $WORKDIR/daemon.pid) and remove the work directory (kept when E2E_KEEP is
-# set).  The containers are the file's business (its teardown_file).  A
-# rootless podman of the file (`podman unshare`) has left its pause process,
-# whose pid is in the run directory of the file ($WORKDIR/run, never the
-# one of the session): it ends with it.
+# $WORKDIR/daemon.pid), free the bridge slot (root) and remove the work
+# directory (kept when E2E_KEEP is set).  The containers are the file's
+# business (its teardown_file).  A rootless podman of the file (`podman
+# unshare`) has left its pause process, whose pid is in the run directory of
+# the file ($WORKDIR/run, never the one of the session): it ends with it.
 e2e_teardown_file () {
     [ -n "${WORKDIR:-}" ] || return 0
     local pid
@@ -221,6 +293,7 @@ e2e_teardown_file () {
         kill -INT "$pid" 2> /dev/null
         e2e_wait_exit "$pid" 10 || kill -KILL "$pid" 2> /dev/null
     fi
+    e2e_bridge_release "$WORKDIR"
     if [ -z "${E2E_KEEP:-}" ]; then
         chmod -R u+rwX "$WORKDIR" 2> /dev/null
         rm -rf "$WORKDIR"

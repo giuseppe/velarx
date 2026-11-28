@@ -75,10 +75,12 @@ e2e_check_left () {
 # e2e_remove_workdir DIR [VELARX...]: remove the work directory DIR of a
 # script, the files of the containers' sub ids too: what the user cannot
 # remove is removed in the rootless namespaces (`VELARX... unshare`,
-# the command line of the script's store).
+# the command line of the script's store); as root its bridge slot is freed
+# (e2e_bridge_release of helpers.bash).
 e2e_remove_workdir () {
     local dir=$1 i api
     shift
+    e2e_bridge_release "$dir"
     # (the velarx-api of the file, started by e2e_start_api, goes first)
     api=$(cat "$dir/api.pid" 2> /dev/null)
     [ -z "$api" ] || kill "$api" 2> /dev/null

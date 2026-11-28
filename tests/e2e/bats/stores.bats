@@ -21,6 +21,7 @@ stop_daemon () {
 
 config () { # name, store root, extra lines of [storage]
     cat > "$WORKDIR/$1.toml" <<EOT
+$(e2e_bridge_toml)
 [engine]
 socket = "$WORKDIR/$1.sock"
 [server]

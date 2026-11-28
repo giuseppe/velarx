@@ -40,6 +40,7 @@ setup_file () {
         ln -s "$RUNDIR/systemd" "$XDG_RUNTIME_DIR/systemd"
     fi
     cat > "$CONF" <<EOT
+$(e2e_bridge_toml)
 [engine]
 socket = "$ESOCK"
 [server]

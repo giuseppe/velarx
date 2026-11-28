@@ -136,6 +136,7 @@ setup_file () {
     mkdir -p "$HOME/.config/velarx"
     chmod 700 "$XDG_RUNTIME_DIR"
     cat > "$WORKDIR/config.toml" <<TOML
+$(e2e_bridge_toml)
 [engine]
 socket = "$WORKDIR/engine.sock"
 [server]
@@ -212,6 +213,7 @@ unit_start () { # MANAGER [DELEGATE]: a daemon in a unit; MANAGER scope*: --cgro
     mkdir -p "$WORKDIR/u-$UMGR"
     chmod 700 "$WORKDIR/u-$UMGR"
     cat > "$WORKDIR/u-$UMGR/config.toml" <<TOML
+$(e2e_bridge_toml)
 [engine]
 socket = "$WORKDIR/u-$UMGR/api.sock"
 [containers]
@@ -773,6 +775,7 @@ unit_default () {
     mkdir -p "$WORKDIR/n/run"
     chmod 700 "$WORKDIR/n/run"
     cat > "$WORKDIR/n/config.toml" <<TOML
+$(e2e_bridge_toml)
 [engine]
 socket = "$WORKDIR/n/api.sock"
 [server]

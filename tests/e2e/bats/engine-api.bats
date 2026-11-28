@@ -35,6 +35,7 @@ setup_file () {
     chmod 700 "$XDG_RUNTIME_DIR"
     local run=$XDG_RUNTIME_DIR/velarx
     cat > "$XDG_CONFIG_HOME/velarx/config.toml" <<TOML
+$(e2e_bridge_toml)
 [server]
 socket = "$run/velarx.sock"
 state_dir = "$run"

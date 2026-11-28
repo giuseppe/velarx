@@ -62,6 +62,7 @@ setup_file () {
         "$E2E_REGISTRY" "$E2E_PUSH_REGISTRY" > "$WORKDIR/registries.conf"
     export VELARX_REGISTRIES_CONF=$WORKDIR/registries.conf
     cat > "$WORKDIR/sh.toml" <<EOT
+$(e2e_bridge_toml)
 [engine]
 socket = "$SOCKDIR/sh.sock"
 [server]
@@ -371,6 +372,7 @@ descends () { # pid
         cp "$BIN/$b" "$PRIV/bin/$b" && chown 65534:65534 "$PRIV/bin/$b"
     done
     cat > "$WORKDIR/sh-cli.toml" <<EOT
+$(e2e_bridge_toml)
 [engine]
 socket = "$WORKDIR/state-cli/velarx.sock"
 [server]
