@@ -690,8 +690,10 @@ $(echo "$want" | sed -n 2p) unpacked/dir/data-hole
         new_empty () { comm -13 <(echo "$before") <(empty_scopes); }
         # (polled: the manager tells nobody that it collected a unit)
         no_new_empty () { [ -z "$(new_empty)" ]; }
+        # (the result of the wait, not a look after it: the files beside this
+        # one make and collect scopes of their own all along)
         wait_for 10 no_new_empty
-        check "no server: a run that fails before its start leaves no scope" "" "$(new_empty)"
+        check "no server: a run that fails before its start leaves no scope" 0 $?
         # --no-monitor: the command monitors the container, in its scope
         "$SH" run --no-monitor --name dlnm --network none "$IMAGE" sleep 100 > /dev/null 2>&1 3>&- &
         nm=$!
