@@ -204,6 +204,7 @@ impl PullHandOff for PullService {
             tls_verify: options.tls_verify,
             lazy: true,
             sources: options.sources.clone(),
+            inline_threshold: options.inline_threshold,
             ..Default::default()
         };
         let (access, fds) = sealed_access(&options.access)?;

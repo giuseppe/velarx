@@ -52,6 +52,17 @@ pub enum ImageCommands {
         /// sources`)
         #[arg(long, value_name = "NAME,...", value_delimiter = ',')]
         sources: Option<Vec<String>>,
+        /// Keep the regular files of up to this many bytes in the EROFS image
+        /// of the layers this pull adds instead of as objects of the store: 0
+        /// none, -1 every file; the default is `[storage] inline_threshold`.
+        /// A layer the store has keeps the value it was made with
+        #[arg(
+            long,
+            value_name = "BYTES",
+            allow_negative_numbers = true,
+            value_parser = clap::value_parser!(i64).range(-1..)
+        )]
+        inline_threshold: Option<i64>,
         /// Verify the TLS certificates of the registry; `--tls-verify=false`
         /// also accepts plain HTTP
         #[arg(

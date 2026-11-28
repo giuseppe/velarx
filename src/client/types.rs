@@ -17,6 +17,9 @@ pub struct PullOptions<'a> {
     /// The fetchers of the pull, in the order they are asked (`--sources`);
     /// none: `[pull] sources`
     pub sources: Option<&'a [String]>,
+    /// What the layers the pull adds are made with (`--inline-threshold`);
+    /// none: `[storage] inline_threshold`
+    pub inline_threshold: Option<i64>,
 }
 
 /// How the engine pushes an image.

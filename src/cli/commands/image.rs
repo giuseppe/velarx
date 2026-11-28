@@ -594,6 +594,7 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
             disable_content_trust: _,
             lazy,
             sources,
+            inline_threshold,
             tls_verify,
             access,
             image,
@@ -632,6 +633,7 @@ pub(super) fn run_image_command(cmd: ImageCommands, inv: &Invocation<'_>) -> any
                 access: &access,
                 retry,
                 sources: sources.as_deref(),
+                inline_threshold,
             };
             if policy != cli::PullPolicy::Always {
                 let present = match client.inspect_image(&image) {
@@ -2505,6 +2507,48 @@ mod push_format_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pull --inline-threshold` takes -1 (every file) or a size, nothing
+    /// less; the other commands that make layers have no such option (they
+    /// go by `[storage] inline_threshold`).
+    #[test]
+    fn only_pull_has_an_inline_threshold_and_it_is_not_below_minus_one() {
+        let threshold = |value: &str| {
+            let cli = crate::cli::parse_for_test([
+                "velarx",
+                "image",
+                "pull",
+                &format!("--inline-threshold={value}"),
+                "--lazy",
+                "alpine",
+            ])?;
+            let crate::cli::Commands::Image(ImageCommands::Pull {
+                inline_threshold, ..
+            }) = cli.command
+            else {
+                panic!("not the pull command");
+            };
+            Ok::<_, clap::Error>(inline_threshold)
+        };
+        assert_eq!(threshold("4096").unwrap(), Some(4096));
+        assert_eq!(threshold("-1").unwrap(), Some(-1));
+        assert_eq!(threshold("0").unwrap(), Some(0));
+        assert!(threshold("-2").is_err());
+        assert!(threshold("big").is_err());
+        for command in ["build", "commit", "load", "import"] {
+            assert!(
+                crate::cli::parse_for_test([
+                    "velarx",
+                    "image",
+                    command,
+                    "--inline-threshold=1",
+                    "x"
+                ])
+                .is_err(),
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn the_metadata_of_a_build_has_buildx_keys() {

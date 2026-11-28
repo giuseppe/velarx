@@ -369,6 +369,7 @@ impl Updater for System<'_> {
                     access: &access,
                     retry: Default::default(),
                     sources: None,
+                    inline_threshold: None,
                 },
             )
             .map_err(|e: ClientError| e.to_string())?;

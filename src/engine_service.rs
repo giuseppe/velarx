@@ -7532,6 +7532,7 @@ mod tests {
                         access: &Default::default(),
                         retry: Default::default(),
                         sources: None,
+                        inline_threshold: None,
                     },
                     &mut |_| {},
                 )

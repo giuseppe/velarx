@@ -904,6 +904,7 @@ pub fn run_container(
             access: &access,
             retry,
             sources: None,
+            inline_threshold: None,
         },
         quiet: args.quiet,
         show: shown.as_deref(),

@@ -1215,6 +1215,7 @@ impl EngineClient {
             retry: ask.retry,
             lazy,
             sources: ask.sources.map(<[String]>::to_vec),
+            inline_threshold: ask.inline_threshold,
             ..Default::default()
         };
         let (access, fds) = sealed_access(ask.access)?;
@@ -3533,6 +3534,7 @@ mod tests {
                 access: &access,
                 retry: Default::default(),
                 sources: None,
+                inline_threshold: None,
             },
             quiet: true,
             show: None,
@@ -3540,6 +3542,33 @@ mod tests {
         };
         assert!(pull_with(&client, &ask).is_err());
         assert_eq!(*asked.lock().unwrap(), ["ImagePull"]);
+    }
+
+    /// The threshold of a pull is in the `PullSpec` the engine is called
+    /// with, and absent when it is not given (the engine's `[storage]
+    /// inline_threshold` is used then).
+    #[test]
+    fn the_inline_threshold_of_a_pull_reaches_the_engine() {
+        for threshold in [Some(4096), Some(-1), None] {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let served = seen.clone();
+            let (_dir, client) = mock_engine(move |_, parameters| {
+                *served.lock().unwrap() = Some(parameters["spec"].clone());
+                json!({"parameters": {"id": "i"}})
+            });
+            let access = Default::default();
+            let ask = PullOptions {
+                tls_verify: true,
+                platform: None,
+                access: &access,
+                retry: Default::default(),
+                sources: None,
+                inline_threshold: threshold,
+            };
+            client.pull_image("localhost/image", &ask).unwrap();
+            let spec = seen.lock().unwrap().take().unwrap();
+            assert_eq!(spec["inline_threshold"], json!(threshold), "{spec}");
+        }
     }
 
     /// `prune --filter label` (no `=`) is refused through the engine as it
