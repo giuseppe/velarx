@@ -1,0 +1,102 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# The tests of a change: what the files changed since BASE (default
+# origin/main; the work tree included) ask to run, printed as commands.
+#
+#   tools/tests-for-diff [BASE]
+#
+# * the cargo packages that own a changed file (the nearest Cargo.toml):
+#   `cargo test -p ...`;
+# * the bats files of the area: a changed bats file, the files that load a
+#   changed helper or name a changed script of tests/e2e, and the files of
+#   the area of a crate or a directory (AREAS below); the root ones again as
+#   root.
+# A change to code everything runs (the engine, the runtime, the command
+# line, the shared helpers of the bats files) prints "make test" instead of
+# a list of bats files.  The list is a floor: add what the change is known
+# to touch.  The full run (make test, make test-full) is once per series,
+# on its final tree (CONTRIBUTING.md).
+set -eu
+
+top=$(cd "$(dirname "$0")/.." && pwd)
+cd "$top"
+base=${1:-origin/main}
+bats=tests/e2e/bats
+
+# path prefix -> bats files (globs of names under tests/e2e/bats)
+AREAS=(
+    "crates/api/:api/* engine-api podman-apiv2 podman-system"
+    "crates/cri/:cri cri-checkpoint"
+    "contrib/velarx-kubeadm:kubeadm-script"
+    "crates/kube/:kube"
+    "crates/p2p/:lazy-peers lazy-peers-nodaemon names-peers"
+    "crates/netkernel/:network pasta no-pasta"
+    "crates/netdetach/:network pasta no-pasta"
+    "crates/dns-core/:network"
+    "crates/fuse/:lazy-* image-server"
+    "crates/lazy-core/:lazy-* image-server"
+    "crates/chunk-core/:lazy-* layer-digests zstd-table"
+    "crates/signature/:signature signing verity-default verity-start"
+    "crates/sigparse-core/:signature signing"
+    "crates/policy-core/:signature signing"
+    "crates/registry/:images fetcher-* sha512-* many-layers"
+    "crates/registry-lib/:images fetcher-* sha512-* many-layers"
+    "crates/auth-core/:images fetcher-confine"
+    "crates/confine-core/:fetcher-confine"
+    "crates/storage/:stores storage-driver composefs verity verity-* images system-check rmi-store"
+    "crates/content/:stores composefs verity verity-* system-check"
+    "crates/overlay-core/:composefs merged-tree verity"
+    "crates/tarsplit/:images layer-digests sha512-*"
+    "crates/tarsplit-header/:images layer-digests"
+    "systemd/:unit units quadlet engine engine-api reboot"
+)
+# prefixes whose code every file runs: the whole tier
+EVERYTHING="src/ crates/bin/ crates/core/ crates/runtime/ crates/config/ crates/db/ crates/wire/ crates/base/ crates/sys/
+$bats/helpers.bash $bats/wait.bash tests/e2e/cleanup.sh tests/e2e/run-all.sh"
+
+# the package of FILE: the name in the nearest Cargo.toml above it
+package_of () {
+    local d
+    d=$(dirname "$1")
+    while [ "$d" != . ] && [ ! -f "$d/Cargo.toml" ]; do d=$(dirname "$d"); done
+    [ -f "$d/Cargo.toml" ] || return 0
+    case $d in vendor | vendor/*) return 0 ;; esac
+    sed -n '/^\[package\]/,/^\[/s/^name *= *"\(.*\)"/\1/p' "$d/Cargo.toml" | head -1
+}
+
+mapfile -t files < <(git diff --name-only "$base" -- && git ls-files --others --exclude-standard)
+[ ${#files[@]} -gt 0 ] || { echo "no change since $base"; exit 0; }
+
+declare -A pkgs=() names=()
+all=
+for f in "${files[@]}"; do
+    case $f in *.rs | *Cargo.toml) p=$(package_of "$f"); [ -z "$p" ] || pkgs[$p]=1 ;; esac
+    for e in $EVERYTHING; do
+        case $f in "$e"*) all=yes ;; esac
+    done
+    case $f in
+    "$bats"/*.bats) names[${f#"$bats"/}]=1 ;;
+    "$bats"/*.bash)
+        while read -r g; do names[${g#"$bats"/}]=1; done < <(grep -rlE "^load (\.\./)?$(basename "$f" .bash)$" "$bats" --include='*.bats') ;;
+    tests/e2e/*.py)
+        while read -r g; do names[${g#"$bats"/}]=1; done < <(grep -rlF "$(basename "$f")" "$bats" --include='*.bats') ;;
+    esac
+    for a in "${AREAS[@]}"; do
+        case $f in
+        "${a%%:*}"*)
+            for pat in ${a#*:}; do
+                for g in "$bats"/$pat.bats; do [ -f "$g" ] && names[${g#"$bats"/}]=1; done
+            done ;;
+        esac
+    done
+done
+
+[ ${#pkgs[@]} -eq 0 ] || echo "cargo test $(printf '%s\n' "${!pkgs[@]}" | sort | sed 's/^/-p /' | paste -sd' ')"
+if [ -n "$all" ]; then
+    echo "make test        # code every bats file runs changed: the quick tier"
+elif [ ${#names[@]} -gt 0 ]; then
+    list=$(printf '%s\n' "${!names[@]}" | sed 's/\.bats$//' | sort)
+    echo "make e2e T=\"$(paste -sd' ' <<< "$list")\""
+    root=$(grep -xF -f <(tools/run-bats list root) <<< "$list" || true)
+    [ -z "$root" ] || echo "make e2e-root T=\"$(paste -sd' ' <<< "$root")\""
+fi
