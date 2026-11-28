@@ -330,7 +330,6 @@ fn test_the_directory_pusher_confines_itself_at_open() {
                 target,
                 access: None,
                 idle: std::time::Duration::from_secs(30),
-                requires: &[],
             };
         let target: std::os::fd::OwnedFd = std::fs::File::open(&dest).unwrap().into();
         // (a destination that names no path: refused, still unconfined)
@@ -1227,8 +1226,7 @@ fn test_the_fetcher_serves_the_connection_it_was_handed() {
         .unwrap();
     runtime.block_on(async {
         let mut conn = velarx_content::fetcher::fetch_client::FetchConn::new(ours).unwrap();
-        let info = conn.get_info().await.unwrap();
-        assert!(info.capabilities.iter().any(|c| c == "origin"));
+        conn.get_info().await.unwrap();
     });
     // (the connection is closed: the fetcher has nothing left to serve)
     assert!(child.wait().unwrap().success());
@@ -1261,8 +1259,7 @@ fn test_the_engine_starts_a_fetcher_with_a_connection_of_its_own() {
         .unwrap();
     runtime.block_on(async {
         let mut conn = velarx_content::fetcher::fetch_client::FetchConn::new(stream).unwrap();
-        let info = conn.get_info().await.unwrap();
-        assert!(info.capabilities.iter().any(|c| c == "origin"));
+        conn.get_info().await.unwrap();
         // (the services directory has no socket of it: it is nobody else's)
         assert_eq!(sockets(), before);
     });

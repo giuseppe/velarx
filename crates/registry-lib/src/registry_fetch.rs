@@ -675,11 +675,7 @@ impl RegistryFetch {
         call: UnpackCall,
         out: &Out<Event>,
     ) -> Result<(), FetcherError> {
-        let Some(blob) = &layer.blob else {
-            return Err(FetcherError::unavailable(
-                "the blob of the layer is not known",
-            ));
-        };
+        let blob = &layer.blob;
         let digest: Digest = blob
             .digest
             .parse()
@@ -1127,15 +1123,7 @@ impl StagingFetcher for RegistryFetch {
         out: &Out<Event>,
     ) -> Result<(), FetcherError> {
         let gone = |_| failed("the asker is gone");
-        let Some(blob) = &layer.blob else {
-            out.send(Event {
-                objects: (0..call.objects.len() as u32).collect(),
-                ..Event::of(EventKind::Unavailable)
-            })
-            .await
-            .map_err(gone)?;
-            return Ok(());
-        };
+        let blob = &layer.blob;
         let digest: Digest = blob
             .digest
             .parse()
@@ -1420,7 +1408,7 @@ mod tests {
         );
         assert_eq!(
             fetch.described().capabilities,
-            ["objects", "metadata", "reuse", "origin", "handover", "table"]
+            ["reuse", "handover", "table"]
         );
     }
 

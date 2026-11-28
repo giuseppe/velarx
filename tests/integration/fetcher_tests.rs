@@ -447,7 +447,6 @@ async fn test_the_fetcher_refuses_what_it_cannot_serve() {
     conn.open(velarx_content::fetcher::fetch_client::Scoping {
         source: Some(&format!("{}/test", s.env.host)),
         tls_verify: Some(false),
-        requires: &["objects".to_string()],
         ..velarx_content::fetcher::fetch_client::Scoping::bare(std::time::Duration::from_secs(60))
     })
     .await

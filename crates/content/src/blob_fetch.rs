@@ -82,7 +82,7 @@ impl<B: Blobs> StagingFetcher for BlobFetch<B> {
     fn described(&self) -> Described {
         Described {
             name: self.name.into(),
-            capabilities: vec!["metadata".into(), "origin".into()],
+            capabilities: Vec::new(),
             max_objects: 1,
         }
     }

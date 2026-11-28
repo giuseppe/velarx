@@ -2049,7 +2049,6 @@ fn tls_bridge(acceptor: &openssl::ssl::SslAcceptor, client: std::net::TcpStream,
 pub async fn push_scope(
     conn: &mut velarx_content::fetcher::fetch_client::FetchConn,
     destination: &str,
-    requires: &[String],
 ) -> Result<(), velarx_content::fetcher::fetch_client::CallError> {
     conn.push_open(velarx_content::pusher::push_client::PushScoping {
         destination,
@@ -2057,7 +2056,6 @@ pub async fn push_scope(
         target: None,
         access: None,
         idle: std::time::Duration::from_secs(60),
-        requires,
     })
     .await
 }

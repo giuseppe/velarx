@@ -554,9 +554,7 @@ async fn manifest_registry(
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let origin = origin_for(dir, &conf_for(&[&host]), &Default::default());
     let mut conn = origin.connect().await.unwrap();
-    push_scope(&mut conn, &format!("{host}/r"), &[])
-        .await
-        .unwrap();
+    push_scope(&mut conn, &format!("{host}/r")).await.unwrap();
     (conn, puts)
 }
 

@@ -154,7 +154,6 @@ impl ImageService {
                     target: None,
                     access: Access::fds(access.as_ref()).into_iter().next(),
                     idle: *idle,
-                    requires: &["metadata".to_string()],
                 })
                 .await
                 .map_err(|e| image_error_of(scheme, e))?;

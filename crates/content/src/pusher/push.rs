@@ -32,12 +32,6 @@ pub const MAX_MANIFEST: u64 = 4 * 1024 * 1024;
 /// The most repositories a hint names for one object.
 pub const MAX_KNOWN_AT: usize = 16;
 
-/// The capability words: `origin` it owns its destination (it can `Commit`
-/// and `Finish`), `link` it uses `known_at`, `parallel` it serves more than
-/// one connection of a scope, `sha512` it places objects named by a sha512
-/// digest.
-pub const CAPABILITIES: [&str; 4] = ["origin", "link", "parallel", "sha512"];
-
 /// What an object is for the image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, introspect::CustomType)]
 #[serde(rename_all = "snake_case")]
@@ -196,7 +190,7 @@ pub enum PusherError {
     Refused {
         reason: String,
     },
-    /// A word of `requires` that is not known
+    /// A destination of a kind this pusher does not do
     NotSupported {
         feature: String,
     },
@@ -283,7 +277,6 @@ mod proxy {
             target: Option<u32>,
             access: Option<u32>,
             idle_ms: u64,
-            requires: &[String],
         ) -> zlink::Result<Result<Ack, PusherError>>;
 
         /// Another connection with the scope of this one.

@@ -17,13 +17,9 @@ const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 async fn scoped(dir: &std::path::Path, host: &str, repo: &str) -> FetchConn {
     let origin = origin_for(dir, &conf_for(&[host]), &Default::default());
     let mut conn = origin.connect().await.unwrap();
-    push_scope(
-        &mut conn,
-        &format!("{host}/{repo}"),
-        &["origin".to_string()],
-    )
-    .await
-    .unwrap();
+    push_scope(&mut conn, &format!("{host}/{repo}"))
+        .await
+        .unwrap();
     conn
 }
 

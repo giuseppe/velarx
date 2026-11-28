@@ -44,7 +44,7 @@ impl StagingFetcher for Fake {
     fn described(&self) -> Described {
         Described {
             name: "fake".into(),
-            capabilities: vec!["objects".into(), "metadata".into()],
+            capabilities: Vec::new(),
             max_objects: 8,
         }
     }
@@ -113,7 +113,7 @@ impl StagingFetcher for Metadata {
     fn described(&self) -> Described {
         Described {
             name: "metadata".into(),
-            capabilities: vec!["metadata".into()],
+            capabilities: Vec::new(),
             max_objects: 1,
         }
     }

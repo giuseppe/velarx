@@ -31,9 +31,7 @@ pub const PROFILE_MAX_BYTES: u64 = 512 * 1024;
 pub const SIGNATURES_MAX_BYTES: u64 = 1 << 20;
 
 /// The capability words.
-pub const CAPABILITIES: [&str; 6] = [
-    "objects", "metadata", "reuse", "origin", "handover", "table",
-];
+pub const CAPABILITIES: [&str; 3] = ["reuse", "handover", "table"];
 
 /// How much a request is waited for.  It orders a fetcher's work.
 #[derive(
@@ -376,7 +374,7 @@ pub enum FetcherError {
     Refused {
         reason: String,
     },
-    /// A word of `requires` that is not known
+    /// This fetcher does not do what was asked (a format, a kind of layer)
     NotSupported {
         feature: String,
     },
@@ -517,7 +515,6 @@ mod proxy {
             target: Option<u32>,
             access: Option<u32>,
             idle_ms: u64,
-            requires: &[String],
         ) -> zlink::Result<Result<Ack, FetcherError>>;
 
         /// Another connection with the scope of this one.
@@ -530,7 +527,7 @@ mod proxy {
             #[zlink(fds)] fds: Vec<OwnedFd>,
             layer: &str,
             staging: u32,
-            blob: Option<&Blob>,
+            blob: &Blob,
             toc: Option<u32>,
         ) -> zlink::Result<Result<Ack, FetcherError>>;
 

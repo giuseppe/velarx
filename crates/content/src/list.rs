@@ -824,7 +824,7 @@ mod tests {
         fn described(&self) -> crate::serve_fetch::Described {
             crate::serve_fetch::Described {
                 name: "silent".into(),
-                capabilities: vec!["metadata".into()],
+                capabilities: Vec::new(),
                 max_objects: 1,
             }
         }

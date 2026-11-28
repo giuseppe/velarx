@@ -191,7 +191,8 @@ pub struct LayerScope {
     /// Its table of contents as the engine verified it (compressed with
     /// zstd)
     pub toc: Option<File>,
-    pub blob: Option<Blob>,
+    /// The blob of the layer, as the manifest describes it
+    pub blob: Blob,
     /// Cancelled by `Forget`
     pub cancel: Cancel,
     /// What the fetcher derived from the layer as this scope told it (its
@@ -878,7 +879,6 @@ trait ScopeKind {
     const MAX_ACCESS: u64;
     fn invalid(reason: String) -> Self::Error;
     fn not_scoped(reason: String) -> Self::Error;
-    fn not_supported(feature: String) -> Self::Error;
     /// A refusal of a new connection, as this interface says it.
     fn refused(e: FetcherError) -> Self::Error;
 }
@@ -903,10 +903,6 @@ impl ScopeKind for FetcherScope {
         FetcherError::NotScoped { reason }
     }
 
-    fn not_supported(feature: String) -> FetcherError {
-        FetcherError::NotSupported { feature }
-    }
-
     fn refused(e: FetcherError) -> FetcherError {
         e
     }
@@ -927,10 +923,6 @@ impl ScopeKind for PusherScope {
 
     fn not_scoped(reason: String) -> PusherError {
         PusherError::NotScoped { reason }
-    }
-
-    fn not_supported(feature: String) -> PusherError {
-        PusherError::NotSupported { feature }
     }
 
     fn refused(e: FetcherError) -> PusherError {
@@ -970,18 +962,10 @@ impl<'a, S: ScopeKind> Scoped<'a, S> {
             .ok_or_else(|| S::not_scoped("a call before Open".into()))
     }
 
-    /// The idle time of `Open`, once the words it requires are known to be
-    /// what the interface announces.
-    fn checked(
-        idle_ms: u64,
-        requires: &[String],
-        capabilities: &[String],
-    ) -> Result<std::time::Duration, S::Error> {
+    /// The idle time of `Open`.
+    fn idle(idle_ms: u64) -> Result<std::time::Duration, S::Error> {
         if idle_ms == 0 {
             return Err(S::invalid("idle_ms is not 0".into()));
-        }
-        if let Some(word) = requires.iter().find(|w| !capabilities.contains(w)) {
-            return Err(S::not_supported(word.clone()));
         }
         Ok(std::time::Duration::from_millis(idle_ms))
     }
@@ -1079,13 +1063,8 @@ mod service {
             target: Option<u32>,
             access: Option<u32>,
             idle_ms: u64,
-            requires: Vec<String>,
         ) -> Result<Ack, FetcherError> {
-            let idle = Scoped::<FetcherScope>::checked(
-                idle_ms,
-                &requires,
-                &self.api.described().capabilities,
-            )?;
+            let idle = Scoped::<FetcherScope>::idle(idle_ms)?;
             let invalid = FetcherScope::invalid;
             let mut fds = Descriptors::new(fds);
             let access = fds
@@ -1132,7 +1111,7 @@ mod service {
             #[zlink(fds)] fds: Vec<OwnedFd>,
             layer: String,
             staging: u32,
-            blob: Option<Blob>,
+            blob: Blob,
             toc: Option<u32>,
         ) -> Result<Ack, FetcherError> {
             self.scope()?;
@@ -1721,14 +1700,9 @@ mod service {
             target: Option<u32>,
             access: Option<u32>,
             idle_ms: u64,
-            requires: Vec<String>,
         ) -> Result<PushAck, PusherError> {
             let pusher = self.pusher()?;
-            let idle = Scoped::<PusherScope>::checked(
-                idle_ms,
-                &requires,
-                &pusher.described().capabilities,
-            )?;
+            let idle = Scoped::<PusherScope>::idle(idle_ms)?;
             push::checked_text("the destination", &destination)?;
             let mut fds = Descriptors::new(fds);
             let target = fds
@@ -1885,8 +1859,8 @@ mod service {
             )
         }
 
-        /// Only to the pusher that owns its destination (the word
-        /// `origin`): put the manifest in `file` (among the descriptors of
+        /// Only to the pusher that owns its destination (the last of the
+        /// list): put the manifest in `file` (among the descriptors of
         /// the call) as each of `names` (tags; none: by its digest only).
         /// `digest`: the digest the destination says it has; `placed`: one
         /// for each name and one for the digest.
@@ -2049,7 +2023,7 @@ pub fn pusher_definition() -> String {
          # of other pushers; the engine walks its ordered list of them, the destination's own\n\
          # pusher last, and is the one that asks the next.\n\
          # Every object of a call is answered exactly once.  Only the pusher that owns\n\
-         # its destination (the word `origin`) takes a Commit.\n\
+         # its destination, the last of the list, takes a Commit.\n\
          #\n\
          # THE OBJECTS.  The engine made every digest it names, and compresses and\n\
          # recreates every layer itself: a pusher places the bytes it is handed and\n\
@@ -2061,12 +2035,12 @@ pub fn pusher_definition() -> String {
          # destination says it placed is confirmed by the one that does before the\n\
          # manifest is committed.\n\
          #\n\
-         # CAPABILITIES.  What a pusher can do is a word of capabilities in GetInfo\n\
-         # (origin, link, parallel, sha512); a client ignores the words it does not\n\
-         # know; what it cannot do without is a word of requires in Open, refused with\n\
-         # NotSupported when unknown.  The interface grows only so: a new parameter or\n\
-         # reply field is optional, and a value of an enum of a reply that a client\n\
-         # does not know is read as the most general one (other, unknown) or ignored.\n\
+         # CAPABILITIES.  A pusher announces no word: a word exists only where the\n\
+         # engine must do work, or choose what to send, before the call; a client\n\
+         # ignores the words it does not know.  The interface grows only so: a new\n\
+         # parameter or reply field is optional, and a value of an enum that the\n\
+         # receiver does not know is read as the most general one (other, unknown)\n\
+         # or ignored.\n\
          #\n\
          # DESCRIPTORS.  A descriptor is a field of type `int` (or `?int` when it may\n\
          # be absent), named after what it is, whose value is its position among the\n\
@@ -2195,8 +2169,7 @@ pub fn definition() -> String {
          # and the signatures of GetFile are judged by the engine's policy.\n\
          #\n\
          # CAPABILITIES.  What a fetcher can do is a word of capabilities in GetInfo; a\n\
-         # client ignores the words it does not know; what it cannot do without is a\n\
-         # word of requires in Open, refused with NotSupported when unknown.  The\n\
+         # client ignores the words it does not know.  The\n\
          # interface grows only so: a new parameter or reply field is optional, a new\n\
          # value of an enum of a call is sent only to a fetcher that announces its word,\n\
          # and a value of an enum of a reply that a client does not know is read as\n\
@@ -2241,7 +2214,7 @@ mod tests {
         fn described(&self) -> Described {
             Described {
                 name: "last".into(),
-                capabilities: vec!["objects".into()],
+                capabilities: Vec::new(),
                 max_objects: 4,
             }
         }
@@ -2256,8 +2229,7 @@ mod tests {
     }
 
     async fn open(e: &FetchEndpoint) -> Result<Ack, FetcherError> {
-        e.open(Vec::new(), true, None, None, None, None, 1000, Vec::new())
-            .await
+        e.open(Vec::new(), true, None, None, None, None, 1000).await
     }
 
     /// The drop of a fetcher served by a thread of this process returns
@@ -2290,8 +2262,8 @@ mod tests {
         let text = definition();
         velarx_base::testing::assert_interface_file("interfaces/org.velarx.Fetcher.varlink", &text);
         for method in [
-            "GetInfo", "Open", "Connect", "Layer", "Forget", "GetFile", "GetBlob",
-            "Probe", "Unpack", "Fetch",
+            "GetInfo", "Open", "Connect", "Layer", "Forget", "GetFile", "GetBlob", "Probe",
+            "Unpack", "Fetch",
         ] {
             assert!(text.contains(&format!("method {method}(")), "{method}");
         }
@@ -2306,7 +2278,7 @@ mod tests {
         fn described(&self) -> Described {
             Described {
                 name: "has".into(),
-                capabilities: vec!["objects".into()],
+                capabilities: Vec::new(),
                 max_objects: 4,
             }
         }
@@ -2414,7 +2386,13 @@ mod tests {
     async fn a_connection_has_a_scope_once_and_only_then() {
         let e = endpoint();
         let early = e
-            .layer(vec![dir()], "sha256:aa".into(), 0, None, None)
+            .layer(
+                vec![dir()],
+                "sha256:aa".into(),
+                0,
+                described_blob(b"a"),
+                None,
+            )
             .await;
         assert!(matches!(early, Err(FetcherError::NotScoped { .. })));
         open(&e).await.unwrap();
@@ -2422,31 +2400,6 @@ mod tests {
             open(&e).await,
             Err(FetcherError::NotScoped { .. })
         ));
-    }
-
-    #[tokio::test]
-    async fn a_word_that_is_not_known_is_refused_by_name() {
-        let e = endpoint();
-        let r = e
-            .open(
-                Vec::new(),
-                true,
-                None,
-                None,
-                None,
-                None,
-                1000,
-                vec!["objects".into(), "teleport".into()],
-            )
-            .await;
-        assert_eq!(
-            r,
-            Err(FetcherError::NotSupported {
-                feature: "teleport".into()
-            })
-        );
-        // (the scope was not given)
-        assert!(open(&e).await.is_ok());
     }
 
     #[tokio::test]
@@ -2460,15 +2413,35 @@ mod tests {
         )
         .unwrap();
         let r = e
-            .layer(vec![o_path], "sha256:aa".into(), 0, None, None)
+            .layer(
+                vec![o_path],
+                "sha256:aa".into(),
+                0,
+                described_blob(b"a"),
+                None,
+            )
             .await;
         assert!(matches!(r, Err(FetcherError::BadStaging { .. })), "{r:?}");
         let file: OwnedFd = tempfile::tempfile().unwrap().into();
-        let r = e.layer(vec![file], "sha256:aa".into(), 0, None, None).await;
+        let r = e
+            .layer(
+                vec![file],
+                "sha256:aa".into(),
+                0,
+                described_blob(b"a"),
+                None,
+            )
+            .await;
         assert!(matches!(r, Err(FetcherError::BadStaging { .. })), "{r:?}");
-        e.layer(vec![dir()], "sha256:aa".into(), 0, None, None)
-            .await
-            .unwrap();
+        e.layer(
+            vec![dir()],
+            "sha256:aa".into(),
+            0,
+            described_blob(b"a"),
+            None,
+        )
+        .await
+        .unwrap();
         // what the fetcher kept for the blob goes with the layer
         let kept = Arc::new(());
         let scope = e.scope().unwrap();
@@ -2499,8 +2472,7 @@ mod tests {
     #[tokio::test]
     async fn a_descriptor_is_named_by_position_and_nothing_else_is_taken() {
         let e = endpoint();
-        let open =
-            |fds, target, access| e.open(fds, true, None, None, target, access, 1000, Vec::new());
+        let open = |fds, target, access| e.open(fds, true, None, None, target, access, 1000);
         let nobody = open(vec![dir()], None, None).await;
         assert!(
             matches!(nobody, Err(FetcherError::InvalidArgument { .. })),
@@ -2538,9 +2510,15 @@ mod tests {
             .await;
         let (first, _) = s.next().await.unwrap();
         assert!(matches!(first, Err(FetcherError::Refused { .. })));
-        e.layer(vec![dir()], "sha256:aa".into(), 0, None, None)
-            .await
-            .unwrap();
+        e.layer(
+            vec![dir()],
+            "sha256:aa".into(),
+            0,
+            described_blob(b"a"),
+            None,
+        )
+        .await
+        .unwrap();
         let objects: Vec<String> = (0..3).map(|i| format!("sha256:{i:064}")).collect();
         let s = e
             .fetch(

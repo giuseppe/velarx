@@ -120,9 +120,6 @@ struct Fetcher {
     max_objects: usize,
     /// It announces `reuse`: it is given the chunks of the store
     reuse: bool,
-    /// It announces `origin`: it reaches the origin of a layer, and is
-    /// given its blob
-    origin: bool,
     /// It announces `handover`: it hands the small files it fetches over as
     /// descriptors when the pull keeps them in the engine
     handover: bool,
@@ -235,7 +232,6 @@ impl Fetcher {
                 .as_ref()
                 .map(|a| velarx_base::sealed::sealed_memory(a))
                 .transpose()?;
-            let requires = ["objects".to_string(), "metadata".to_string()];
             let opened = control.open(Scoping {
                 verity: scope.verity,
                 source: Some(&scope.repository),
@@ -243,7 +239,6 @@ impl Fetcher {
                 target: None,
                 access,
                 idle: self.idle,
-                requires: &requires,
             });
             crate::idle::within(self.idle, opened).await
         };
@@ -430,7 +425,6 @@ impl StagedFetch {
                     target: None,
                     access: None,
                     idle,
-                    requires: &["objects".to_string()],
                 })
                 .await?;
                 Ok::<_, CallError>(info)
@@ -442,7 +436,6 @@ impl StagedFetch {
                     idle,
                     max_objects: info.limit("max_objects").unwrap_or(1).max(1) as usize,
                     reuse: info.can("reuse"),
-                    origin: info.can("origin"),
                     handover: info.can("handover"),
                     table: info.can("table"),
                     lost: Default::default(),
@@ -489,7 +482,6 @@ impl StagedFetch {
                 idle,
                 max_objects: info.limit("max_objects").unwrap_or(1).max(1) as usize,
                 reuse: info.can("reuse"),
-                origin: info.can("origin"),
                 handover: info.can("handover"),
                 table: info.can("table"),
                 lost: Default::default(),
@@ -526,7 +518,6 @@ impl StagedFetch {
             idle,
             max_objects: info.limit("max_objects").unwrap_or(1).max(1) as usize,
             reuse: info.can("reuse"),
-            origin: info.can("origin"),
             handover: info.can("handover"),
             table: info.can("table"),
             lost: Default::default(),
@@ -1181,8 +1172,7 @@ impl StagedFetch {
                         .collect()
                 }),
             };
-            // (every fetcher is told, by the engine: the blob only to the
-            // registry fetcher)
+            // (every fetcher is told, by the engine)
             for (i, fetcher) in self.fetchers.iter().enumerate() {
                 if !missed[i] || !breaker.usable(i) || (!with_origin && Some(i) == self.origin) {
                     continue;
@@ -1195,12 +1185,10 @@ impl StagedFetch {
                     .map(OwnedFd::try_clone)
                     .transpose()
                     .map_err(ImageError::Io)?;
-                // (the blob of the layer only to a fetcher that reaches an
-                // origin: the word `origin`)
-                let blob = fetcher.origin.then_some(&described);
                 let said = async {
                     let mut control = fetcher.control().await?;
-                    crate::idle::within(fetcher.idle, control.layer(&name, blob, dir, toc)).await
+                    crate::idle::within(fetcher.idle, control.layer(&name, &described, dir, toc))
+                        .await
                 }
                 .await;
                 match said {
@@ -2091,7 +2079,7 @@ mod tests {
         fn described(&self) -> Described {
             Described {
                 name: "probed".into(),
-                capabilities: vec!["objects".into(), "metadata".into()],
+                capabilities: Vec::new(),
                 max_objects: 8,
             }
         }
@@ -2328,7 +2316,7 @@ mod tests {
         fn described(&self) -> Described {
             Described {
                 name: "carries".into(),
-                capabilities: vec!["objects".into(), "metadata".into()],
+                capabilities: Vec::new(),
                 max_objects: 8,
             }
         }
@@ -2540,7 +2528,7 @@ mod tests {
     fn described_for_tests() -> Described {
         Described {
             name: "stages".into(),
-            capabilities: vec!["objects".into(), "metadata".into()],
+            capabilities: Vec::new(),
             max_objects: 8,
         }
     }
@@ -3302,7 +3290,7 @@ mod tests {
     #[async_trait]
     impl StagingFetcher for HandsOver {
         fn described(&self) -> Described {
-            let mut capabilities = vec!["objects".into(), "metadata".into()];
+            let mut capabilities = Vec::new();
             if !self.silent {
                 capabilities.push("handover".into());
             }
@@ -3653,7 +3641,7 @@ mod tests {
         fn described(&self) -> Described {
             Described {
                 name: "hands".into(),
-                capabilities: vec!["objects".into(), "metadata".into()],
+                capabilities: Vec::new(),
                 max_objects: 8,
             }
         }

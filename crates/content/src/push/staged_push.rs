@@ -199,7 +199,6 @@ impl StagedPush {
                     target: None,
                     access: fd,
                     idle,
-                    requires: &[],
                 })
                 .await?;
                 Ok::<_, CallError>(info)
@@ -232,7 +231,6 @@ impl StagedPush {
                 target,
                 access,
                 idle: destinations.idle,
-                requires: &["origin".to_string()],
             })
             .await?;
             Ok::<_, CallError>(info)
@@ -778,11 +776,7 @@ mod tests {
         fn described(&self) -> Described {
             Described {
                 name: if self.origin { "origin" } else { "sink" }.into(),
-                capabilities: if self.origin {
-                    vec!["origin".into()]
-                } else {
-                    Vec::new()
-                },
+                capabilities: Vec::new(),
                 max_objects: 2,
             }
         }
@@ -1156,11 +1150,11 @@ mod tests {
         assert!(staged.broken(0).is_some());
     }
 
-    /// Rule 1 holds for every pusher but the last, whatever it announces:
-    /// one that says `origin` and is placed before the destination's own is
-    /// a helper, and its failure goes to the next.
+    /// Rule 1 holds for every pusher but the last, whatever it is: one that
+    /// can commit and is placed before the destination's own is a helper,
+    /// and its failure goes to the next.
     #[tokio::test]
-    async fn a_helper_that_announces_origin_is_no_more_than_a_helper() {
+    async fn a_helper_that_can_commit_is_no_more_than_a_helper() {
         let helper = Script::new(true).putting(b"a", Put::Fail(FailureClass::Failed));
         let origin = Script::new(true);
         let (staged, _keep) = push_over(&[&helper], &origin).await;
@@ -1179,8 +1173,8 @@ mod tests {
     }
 
     /// Every pusher that is not the origin is told of the commit (`Committed`)
-    /// and of the end, after the origin put the manifest: one that announces
-    /// `origin` is no more than a helper.
+    /// and of the end, after the origin put the manifest: one that can
+    /// commit is no more than a helper.
     #[tokio::test]
     async fn the_helpers_are_told_of_the_commit_and_the_end() {
         let helper = Script::new(false);

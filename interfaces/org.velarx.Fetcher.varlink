@@ -59,8 +59,7 @@
 # and the signatures of GetFile are judged by the engine's policy.
 #
 # CAPABILITIES.  What a fetcher can do is a word of capabilities in GetInfo; a
-# client ignores the words it does not know; what it cannot do without is a
-# word of requires in Open, refused with NotSupported when unknown.  The
+# client ignores the words it does not know.  The
 # interface grows only so: a new parameter or reply field is optional, a new
 # value of an enum of a call is sent only to a fetcher that announces its word,
 # and a value of an enum of a reply that a client does not know is read as
@@ -269,7 +268,7 @@ method GetInfo() -> (
 # directory, or a file open for reading).  `access`: the
 # credentials, a sealed memory file.  `idle_ms`: the most this
 # connection's calls stay silent.
-method Open(verity: bool, source: ?string, tls_verify: ?bool, target: ?int, access: ?int, idle_ms: int, requires: []string) -> ()
+method Open(verity: bool, source: ?string, tls_verify: ?bool, target: ?int, access: ?int, idle_ms: int) -> ()
 
 # Another connection with the scope of this one: the reply carries
 # its descriptor.
@@ -281,7 +280,7 @@ method Connect() -> ()
 # memory file).  `Layer` again replaces it; the calls in flight on the
 # one before end as with `Forget`.  A scope keeps at most 1024 layers
 # (`Busy`).
-method Layer(layer: string, staging: int, blob: ?Blob, toc: ?int) -> ()
+method Layer(layer: string, staging: int, blob: Blob, toc: ?int) -> ()
 
 # Forget the layer: its calls end, later ones are `Refused`, and what
 # the fetcher kept for its blob is let go (of a layer that was only
@@ -351,7 +350,7 @@ error NotScoped (reason: string)
 # a layer that was not told (`Layer`) or was forgotten (`Forget`)
 error Refused (reason: string)
 
-# A word of `requires` that is not known
+# This fetcher does not do what was asked (a format, a kind of layer)
 error NotSupported (feature: string)
 
 # The answer of a `GetFile` is larger

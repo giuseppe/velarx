@@ -45,9 +45,7 @@ A connection is given its scope once, by
 .B Open
 (a second one is refused, so is any other call before it), and
 .B Connect
-and
-.B Renew
-act on that scope only, for both interfaces alike: the credentials of a
+acts on that scope only, for both interfaces alike: the credentials of a
 connection are never those of another client.
 .PP
 It confines itself before it serves anything (Landlock, seccomp, no

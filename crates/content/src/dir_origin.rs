@@ -478,11 +478,7 @@ pub async fn unpack_layer<R: Read + Send + 'static>(
     out: &Out<Event>,
     open: impl FnOnce(&Digest) -> Result<(R, u64), FetcherError> + Send + 'static,
 ) -> Result<(), FetcherError> {
-    let Some(blob) = &layer.blob else {
-        return Err(FetcherError::unavailable(
-            "the blob of the layer is not known",
-        ));
-    };
+    let blob = &layer.blob;
     let digest: Digest = blob
         .digest
         .parse()

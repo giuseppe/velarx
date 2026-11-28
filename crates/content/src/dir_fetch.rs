@@ -238,7 +238,7 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
     fn described(&self) -> Described {
         Described {
             name: self.name.clone(),
-            capabilities: vec!["objects".into()],
+            capabilities: Vec::new(),
             max_objects: MAX_OBJECTS,
         }
     }

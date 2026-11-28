@@ -507,7 +507,7 @@ impl Pushing for DirPush {
     fn described(&self) -> Described {
         Described {
             name: "dir".into(),
-            capabilities: vec!["origin".into()],
+            capabilities: Vec::new(),
             max_objects: crate::pusher::push::MAX_OBJECTS as u32,
         }
     }

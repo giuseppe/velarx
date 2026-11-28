@@ -117,7 +117,7 @@ pub trait Pushing: Send + Sync + 'static {
     }
 
     /// Put the manifest, as each of the names and by its digest: only the
-    /// pusher that owns its destination (the word `origin`) does.
+    /// pusher that owns its destination (the last of the list) does.
     async fn commit(
         &self,
         _scope: &PushScope,

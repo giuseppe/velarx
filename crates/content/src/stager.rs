@@ -746,7 +746,12 @@ mod tests {
             layer: "sha256:aa".into(),
             staging: dir,
             toc: Some(toc.into()),
-            blob: None,
+            blob: crate::fetcher::fetch::Blob {
+                digest: "sha256:aa".into(),
+                size: 0,
+                media_type: "application/octet-stream".into(),
+                annotations: None,
+            },
             cancel: Default::default(),
             kept: Default::default(),
         };

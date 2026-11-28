@@ -67,8 +67,6 @@ pub struct Scoping<'a> {
     pub access: Option<OwnedFd>,
     /// The most a call stays silent
     pub idle: std::time::Duration,
-    /// Words the fetcher has to announce
-    pub requires: &'a [String],
 }
 
 impl Scoping<'static> {
@@ -82,7 +80,6 @@ impl Scoping<'static> {
             target: None,
             access: None,
             idle,
-            requires: &[],
         }
     }
 }
@@ -413,7 +410,6 @@ impl FetchConn {
             target,
             access,
             idle,
-            requires,
         } = scope;
         let mut fds = Vec::new();
         let mut position = |fd: Option<OwnedFd>| {
@@ -433,7 +429,6 @@ impl FetchConn {
                 target,
                 access,
                 idle.as_millis() as u64,
-                requires,
             )
             .await;
         busy.store(false, Ordering::Release);
@@ -458,7 +453,7 @@ impl FetchConn {
     pub async fn layer(
         &mut self,
         layer: &str,
-        blob: Option<&Blob>,
+        blob: &Blob,
         staging: &File,
         toc: Option<OwnedFd>,
     ) -> Result<(), CallError> {

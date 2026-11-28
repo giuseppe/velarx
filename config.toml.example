@@ -1042,10 +1042,10 @@ cidr = "10.192.0.0/10"
 #
 # A process that is the origin of a scheme of its own, for both directions:
 # `velarx push IMAGE s3://bucket/name` is put there by the pusher on the socket
-# and `velarx pull s3://bucket/name` is served by its fetcher (it announces the
-# capability `origin` in the `GetInfo` of each interface it serves).  The scheme is none of velarx's transports.  The pusher
-# and the helpers are told the destination as written (`s3://bucket/name:1`) and
-# the commit names the tag it has (`1`; none: the manifest by its digest);
+# and `velarx pull s3://bucket/name` is served by its fetcher.  The scheme is
+# none of velarx's transports.  The pusher and the helpers are told the
+# destination as written (`s3://bucket/name:1`) and the commit names the tag
+# it has (`1`; none: the manifest by its digest);
 # `velarx manifest push LIST s3://bucket/name:1` goes there too (the images by
 # their digests to `s3://bucket/name`).  No more than 15 seconds of silence in
 # a call (a long Put must send Progress events, each reply restarts the time;

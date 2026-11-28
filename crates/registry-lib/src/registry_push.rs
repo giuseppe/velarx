@@ -20,9 +20,6 @@ use velarx_content::serve_push::{CommitCall, PushScope, Pushing, PutCall};
 use velarx_types::digest::{Algorithm, Digest};
 use velarx_types::ImageError;
 
-/// The words of its `GetInfo`.
-const CAPABILITIES: [&str; 4] = ["origin", "link", "parallel", "sha512"];
-
 /// The objects of one `Put` or `Probe` of the registry.
 const MAX_OBJECTS: u32 = 15;
 
@@ -128,7 +125,7 @@ impl Pushing for RegistryPush {
     fn described(&self) -> Described {
         Described {
             name: "registry".into(),
-            capabilities: CAPABILITIES.map(String::from).to_vec(),
+            capabilities: Vec::new(),
             max_objects: MAX_OBJECTS,
         }
     }

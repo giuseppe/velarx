@@ -53,14 +53,7 @@ impl PathOrigin {
                     format!("the directory origin: {e}"),
                 )
             })?;
-        let info = conn.get_info().await.map_err(path_error)?;
-        if !info.can("origin") {
-            return Err(ImageError::transfer(
-                party,
-                FailureClass::Failed,
-                "the process is no origin",
-            ));
-        }
+        conn.get_info().await.map_err(path_error)?;
         conn.open(Scoping {
             verity,
             source: Some(source),
@@ -68,7 +61,6 @@ impl PathOrigin {
             target: Some(target),
             access: None,
             idle: origin.idle(),
-            requires: &["metadata".to_string()],
         })
         .await
         .map_err(path_error)?;
@@ -270,15 +262,7 @@ impl OriginNet {
                     let mut conn = crate::list::connect_reach(reach).await.map_err(|e| {
                         ImageError::transfer(self.party(), FailureClass::Unavailable, e.to_string())
                     })?;
-                    // (a transport that does not serve a pull says so)
-                    let info = conn.get_info().await.map_err(|e| self.failed(e))?;
-                    if !info.can("origin") {
-                        return Err(ImageError::transfer(
-                            self.party(),
-                            FailureClass::Failed,
-                            format!("the transport `{}` does not pull", self.party()),
-                        ));
-                    }
+                    conn.get_info().await.map_err(|e| self.failed(e))?;
                     (conn, *idle)
                 }
             };
@@ -289,7 +273,6 @@ impl OriginNet {
                 target: None,
                 access: Access::fds(self.access.as_ref()).into_iter().next(),
                 idle,
-                requires: &["metadata".to_string()],
             })
             .await
             .map_err(|e| self.failed(e))?;

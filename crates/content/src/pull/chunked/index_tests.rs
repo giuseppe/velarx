@@ -118,7 +118,7 @@ impl StagingFetcher for Source_ {
     fn described(&self) -> Described {
         Described {
             name: "peers".into(),
-            capabilities: vec!["objects".into(), "metadata".into()],
+            capabilities: Vec::new(),
             max_objects: 8,
         }
     }
@@ -228,7 +228,7 @@ impl StagingFetcher for Origin {
     fn described(&self) -> Described {
         Described {
             name: "registry".into(),
-            capabilities: vec!["objects".into(), "metadata".into()],
+            capabilities: Vec::new(),
             max_objects: 8,
         }
     }

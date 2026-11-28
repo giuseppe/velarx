@@ -28,8 +28,6 @@ pub struct PushScoping<'a> {
     pub access: Option<OwnedFd>,
     /// The most a call stays silent
     pub idle: std::time::Duration,
-    /// Words the pusher has to announce
-    pub requires: &'a [String],
 }
 
 impl Replies<'_, ProbeReply> {
@@ -78,7 +76,6 @@ impl FetchConn {
             target,
             access,
             idle,
-            requires,
         } = scope;
         let mut fds = Vec::new();
         let mut position = |fd: Option<OwnedFd>| {
@@ -97,7 +94,6 @@ impl FetchConn {
             target,
             access,
             idle.as_millis() as u64,
-            requires,
         )
         .await;
         busy.store(false, Ordering::Release);
@@ -218,7 +214,7 @@ mod tests {
         fn described(&self) -> Described {
             Described {
                 name: "fake".into(),
-                capabilities: vec!["origin".into(), "link".into()],
+                capabilities: Vec::new(),
                 max_objects: 4,
             }
         }
@@ -391,7 +387,6 @@ mod tests {
         conn: &mut FetchConn,
         destination: &str,
         access: Option<OwnedFd>,
-        requires: &[String],
     ) -> Result<(), CallError> {
         conn.push_open(PushScoping {
             destination,
@@ -399,7 +394,6 @@ mod tests {
             target: None,
             access,
             idle: std::time::Duration::from_secs(60),
-            requires,
         })
         .await
     }
@@ -422,14 +416,9 @@ mod tests {
         assert_eq!(info.name, "fake");
         assert_eq!(info.proto, 1);
         assert_eq!(info.limit("max_objects"), Some(4));
-        opened(
-            &mut conn,
-            "registry.example/name",
-            Some(access()),
-            &["origin".to_string()],
-        )
-        .await
-        .unwrap();
+        opened(&mut conn, "registry.example/name", Some(access()))
+            .await
+            .unwrap();
         let objects = [
             object(b"a", "present"),
             object(b"b", "needed"),
@@ -498,7 +487,7 @@ mod tests {
     #[tokio::test]
     async fn a_commit_that_the_destination_cannot_take_says_which_blobs_it_lacks() {
         let (_local, mut conn) = started(Arc::new(WithPusher(Arc::default())));
-        opened(&mut conn, "registry.example/name", None, &[])
+        opened(&mut conn, "registry.example/name", None)
             .await
             .unwrap();
         let manifest = object(b"{}", "unknown-blob");
@@ -518,21 +507,13 @@ mod tests {
             refusal(conn.push_finish().await),
             PusherError::NotScoped { .. }
         ));
-        opened(&mut conn, "registry.example/name", None, &[])
+        opened(&mut conn, "registry.example/name", None)
             .await
             .unwrap();
         assert!(matches!(
-            refusal(opened(&mut conn, "registry.example/name", None, &[]).await),
+            refusal(opened(&mut conn, "registry.example/name", None).await),
             PusherError::NotScoped { .. }
         ));
-        // (a word that is not known)
-        let (_local, mut other) = started(Arc::new(WithPusher(Arc::default())));
-        assert_eq!(
-            refusal(opened(&mut other, "x/y", None, &["teleport".to_string()]).await),
-            PusherError::NotSupported {
-                feature: "teleport".into()
-            }
-        );
     }
 
     #[tokio::test]
@@ -541,10 +522,10 @@ mod tests {
         // credentials that something else can still change are refused
         let loose = OwnedFd::from(file_of(b"{}"));
         assert!(matches!(
-            refusal(opened(&mut conn, "registry.example/name", Some(loose), &[]).await),
+            refusal(opened(&mut conn, "registry.example/name", Some(loose)).await),
             PusherError::InvalidArgument { .. }
         ));
-        opened(&mut conn, "registry.example/name", None, &[])
+        opened(&mut conn, "registry.example/name", None)
             .await
             .unwrap();
         let objects = [object(b"a", "needed"), object(b"b", "needed")];
@@ -586,7 +567,7 @@ mod tests {
     async fn another_connection_has_the_scope() {
         let fake = Arc::new(Fake::default());
         let (_local, mut conn) = started(Arc::new(WithPusher(fake)));
-        opened(&mut conn, "registry.example/name", Some(access()), &[])
+        opened(&mut conn, "registry.example/name", Some(access()))
             .await
             .unwrap();
         let mut shared = conn.push_connect().await.unwrap();
@@ -602,7 +583,7 @@ mod tests {
             PusherError::Failed { .. }
         ));
         assert!(matches!(
-            refusal(opened(&mut conn, "x/y", None, &[]).await),
+            refusal(opened(&mut conn, "x/y", None).await),
             PusherError::Failed { .. }
         ));
     }
@@ -657,7 +638,7 @@ mod tests {
             cancelled: Arc::new(tokio::sync::Notify::new()),
         });
         let (_local, mut conn) = started(Arc::new(Api(waits.clone())));
-        opened(&mut conn, "x/y", None, &[]).await.unwrap();
+        opened(&mut conn, "x/y", None).await.unwrap();
         let o = object(b"a", "needed");
         let data = file_of(b"a");
         let mut other = conn.push_connect().await.unwrap();
@@ -702,7 +683,7 @@ mod tests {
             }
         }
         let (_local, mut conn) = started(Arc::new(Api));
-        opened(&mut conn, "x/y", None, &[]).await.unwrap();
+        opened(&mut conn, "x/y", None).await.unwrap();
         let objects = [object(b"a", "needed"), object(b"b", "needed")];
         assert_eq!(
             probed(&mut conn, &objects).await,

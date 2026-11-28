@@ -1233,7 +1233,7 @@ mod transport {
         fn described(&self) -> Described {
             Described {
                 name: "fake".into(),
-                capabilities: vec!["origin".into()],
+                capabilities: Vec::new(),
                 max_objects: 4,
             }
         }

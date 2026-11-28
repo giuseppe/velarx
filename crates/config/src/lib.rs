@@ -377,9 +377,8 @@ pub struct TransportConfig {
     /// lowercase, and none of the transports velarx has
     pub scheme: String,
     /// The unix socket of the process, an absolute path: it serves
-    /// `org.velarx.Fetcher` and/or `org.velarx.Pusher` and announces the
-    /// capability `origin` in the `GetInfo` of each it is the origin for.  It
-    /// must run as the user of the process that asks, or as root.
+    /// `org.velarx.Fetcher` and/or `org.velarx.Pusher`.  It must run as the
+    /// user of the process that asks, or as root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket: Option<PathBuf>,
     /// Or a program started for each use ([`Reach::Command`]): its absolute
