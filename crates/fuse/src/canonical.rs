@@ -234,14 +234,19 @@ pub fn image<H: FsVerityHashValue>(
     Ok((image, id))
 }
 
-/// The objects of a store as the tree of composefs-rs wants them: where the
-/// bytes of each are, by its fs-verity digest.
+/// How the content of a file is read: the object by its fs-verity digest
+/// and its size, as a file.
+type Open<'a> = &'a dyn Fn(&str, u64) -> std::io::Result<std::fs::File>;
+
+/// The files of a store as the tree of composefs-rs wants them: the content of
+/// the small ones, the digest of the others.
 struct StoreFiles<'a> {
-    objects: &'a dyn Fn(&str) -> Option<std::path::PathBuf>,
+    open: Open<'a>,
 }
 
 impl<H: FsVerityHashValue> Files<H> for StoreFiles<'_> {
     fn regular(&mut self, e: &velarx_storage::TocEntry) -> std::io::Result<RegularFile<H>> {
+        use std::os::unix::fs::FileExt;
         let other = |m: String| std::io::Error::other(m);
         if e.size == 0 {
             return Ok(RegularFile::Inline(Box::new([])));
@@ -249,16 +254,10 @@ impl<H: FsVerityHashValue> Files<H> for StoreFiles<'_> {
         let digest = e
             .verity()
             .ok_or_else(|| other(format!("`{}` has no fs-verity digest", e.name)))?;
-        let path = (self.objects)(&digest)
-            .ok_or_else(|| other(format!("`{}` is not in the store", e.name)))?;
-        let len = std::fs::metadata(&path)?.len();
-        if len != e.size {
-            return Err(other(format!("`{}` is not of the size it has", e.name)));
-        }
         if e.size as usize <= INLINE_MAX {
-            return Ok(RegularFile::Inline(
-                std::fs::read(&path)?.into_boxed_slice(),
-            ));
+            let mut bytes = vec![0; e.size as usize];
+            (self.open)(&digest, e.size)?.read_exact_at(&mut bytes, 0)?;
+            return Ok(RegularFile::Inline(bytes.into_boxed_slice()));
         }
         // (the digits of the object name: 64 for SHA-256, 128 for SHA-512)
         let hex = velarx_types::digest::Digest::parse_fsverity(&digest)
@@ -270,43 +269,44 @@ impl<H: FsVerityHashValue> Files<H> for StoreFiles<'_> {
 }
 
 /// The image of the root file system as composefs-rs makes it of the layers
-/// `tocs`, whose files are the objects of `store` (by their fs-verity digest
-/// in `alg`, the algorithm of the digests of the image), and its id: the
-/// merged EROFS a sealed manifest states.  It needs the tables of contents
-/// and the objects only, so every driver that keeps the objects of the pull
-/// answers it the same (the image is not kept).
+/// `tocs`, whose files of up to 64 bytes are read from `store` (by their
+/// fs-verity digest in `alg`, the algorithm of the digests of the image), and
+/// its id: the merged EROFS a sealed manifest states.  It needs the tables of
+/// contents and those files only, so every driver answers it the same (the
+/// image is not kept).  The opener of a driver gives a file of a layer whose
+/// EROFS image holds it as it gives an object.
 pub fn image_of_store(
     alg: velarx_types::digest::Algorithm,
     tocs: &[&velarx_storage::Toc],
-    store: &velarx_storage::FileStore,
+    store: &dyn velarx_storage::ObjectOpener,
 ) -> std::io::Result<(Box<[u8]>, String)> {
-    image_of(alg, tocs, &|d| store.get_path(d))
+    image_of(alg, tocs, &|d, size| store.object_file(d, size))
 }
 
-/// [`image_of_store`] of objects that are where `objects` says (by their
-/// fs-verity digest): the files a pull verified are read before they are
-/// named in the store.
+/// [`image_of_store`] of files that `open` gives (by their fs-verity digest
+/// and size): the files a pull verified are read before they are named in the
+/// store.
 pub fn image_of(
     alg: velarx_types::digest::Algorithm,
     tocs: &[&velarx_storage::Toc],
-    objects: &dyn Fn(&str) -> Option<std::path::PathBuf>,
+    open: Open<'_>,
 ) -> std::io::Result<(Box<[u8]>, String)> {
     use composefs::fsverity::{Sha256HashValue, Sha512HashValue};
     fn made<H: FsVerityHashValue>(
         tocs: &[&velarx_storage::Toc],
-        objects: &dyn Fn(&str) -> Option<std::path::PathBuf>,
+        open: Open<'_>,
     ) -> std::io::Result<(Box<[u8]>, String)> {
         let io = |e: String| std::io::Error::other(e);
         let layers: Vec<&[velarx_storage::TocEntry]> =
             tocs.iter().map(|t| t.entries.as_slice()).collect();
-        let mut files = StoreFiles { objects };
+        let mut files = StoreFiles { open };
         let tree = merge::<H>(&layers, &mut files).map_err(io)?;
         let (image, id) = image(tree, Default::default()).map_err(io)?;
         Ok((image, id.to_hex()))
     }
     match alg {
-        velarx_types::digest::Algorithm::Sha256 => made::<Sha256HashValue>(tocs, objects),
-        velarx_types::digest::Algorithm::Sha512 => made::<Sha512HashValue>(tocs, objects),
+        velarx_types::digest::Algorithm::Sha256 => made::<Sha256HashValue>(tocs, open),
+        velarx_types::digest::Algorithm::Sha512 => made::<Sha512HashValue>(tocs, open),
     }
 }
 
@@ -515,5 +515,52 @@ mod tests {
         let layer256 = vec![d("usr"), d("etc"), f("etc/a", 'a', 5000)];
         let tree256 = merge::<Sha256HashValue>(&[&layer256], &mut Fake).unwrap();
         assert_ne!(image(tree256, FormatVersion::default()).unwrap().0, bytes);
+    }
+
+    /// The files of up to 64 bytes are read through the opener, whatever
+    /// holds them (an object, or the EROFS image of a layer); the bigger ones
+    /// are named by their digest and never opened.
+    #[test]
+    fn the_small_files_are_read_through_the_opener() {
+        let key = |c: &[u8]| {
+            let mut h = velarx_storage::VerityHasher::new(velarx_types::digest::Algorithm::Sha256);
+            h.update(c);
+            h.finish()
+        };
+        let reg = |name: &str, c: &[u8], size: u64| {
+            entry(
+                serde_json::json!({"name": name, "type": "reg", "mode": 0o644, "size": size,
+                "fsverity": key(c).replacen("fsverity-", "", 1)}),
+            )
+        };
+        let layer = vec![
+            d("etc"),
+            reg("etc/a", b"abc", 3),
+            reg("etc/big", b"big", 5000),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let opened = std::cell::RefCell::new(Vec::new());
+        let image_with = |bytes: &'static [u8]| {
+            let open = |k: &str, size: u64| {
+                opened.borrow_mut().push((k.to_string(), size));
+                let path = dir.path().join("f");
+                std::fs::write(&path, bytes)?;
+                std::fs::File::open(path)
+            };
+            image_of(
+                velarx_types::digest::Algorithm::Sha256,
+                &[&velarx_storage::Toc {
+                    version: 1,
+                    entries: layer.clone(),
+                    tar_split_digest: None,
+                }],
+                &open,
+            )
+        };
+        let (_, id) = image_with(b"abc").unwrap();
+        assert_eq!(*opened.borrow(), [(key(b"abc"), 3)]);
+        // (the content is what the image holds, so another content is
+        // another image)
+        assert_ne!(image_with(b"abd").unwrap().1, id);
     }
 }

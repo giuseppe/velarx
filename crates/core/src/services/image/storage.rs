@@ -352,10 +352,10 @@ impl ImageService {
             };
             tocs.push(toc);
         }
-        let store = self.file_store.clone();
+        let objects = self.objects();
         let id = tokio::task::spawn_blocking(move || {
             let tocs: Vec<&Toc> = tocs.iter().collect();
-            velarx_fuse::canonical::image_of_store(alg, &tocs, &store)
+            velarx_fuse::canonical::image_of_store(alg, &tocs, &objects)
                 .ok()
                 .map(|(_, id)| id)
         })

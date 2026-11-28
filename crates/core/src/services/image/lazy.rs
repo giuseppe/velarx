@@ -832,13 +832,14 @@ impl ImageService {
             self.db.get_image_by_digest(&read.manifest_digest).await?;
         } else if !super::seal::expected(manifest)?.is_empty() {
             let tocs = velarx_content::pull::stored::stored_tocs(&self.db, layers).await?;
-            let (store, want) = (self.file_store.clone(), manifest.clone());
+            let (objects, want) = (self.objects(), manifest.clone());
             let alg = read.manifest_digest.alg();
             let algs: Vec<Algorithm> = layers.iter().map(|k| k.digest().alg()).collect();
             tokio::task::spawn_blocking(move || {
                 let tocs: Vec<&Toc> = tocs.iter().collect();
-                super::seal::merged_erofs(alg, &algs, &tocs, &|d| store.get_path(d), Some(&want))
-                    .map(|_| ())
+                let open =
+                    |d: &str, size| velarx_storage::ObjectOpener::object_file(&objects, d, size);
+                super::seal::merged_erofs(alg, &algs, &tocs, &open, Some(&want)).map(|_| ())
             })
             .await
             .map_err(|e| ImageError::Storage(e.to_string()))??;

@@ -2131,11 +2131,17 @@ impl ImageService {
                         .ok_or_else(|| ImageError::Layer("a layer has no TOC".into()))?;
                     let algs: Vec<Algorithm> =
                         layer_keys.iter().map(|k| k.digest().alg()).collect();
+                    let open = |d: &str, _| {
+                        let path = objects(d).ok_or_else(|| {
+                            std::io::Error::new(std::io::ErrorKind::NotFound, "not in the pull")
+                        })?;
+                        std::fs::File::open(path)
+                    };
                     merged_id = seal::merged_erofs(
                         manifest_alg,
                         &algs,
                         &tocs,
-                        objects,
+                        &open,
                         (!seal).then_some(&manifest),
                     )?;
                 }

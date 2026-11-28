@@ -439,8 +439,8 @@ pub fn check_statable(manifest: &OciManifest, layers: &[Algorithm]) -> ImageResu
 }
 
 /// The digest of the merged EROFS of the layers whose TOCs are `tocs`, in
-/// order, whose files are where `objects` says (by their fs-verity digest):
-/// an error if it is not the one
+/// order, whose files of up to 64 bytes `open` gives (by their fs-verity
+/// digest and size): an error if it is not the one
 /// `want` states (when given).  The merged EROFS is made of the objects of
 /// the layers, in one algorithm, so a digest the manifest states (in the
 /// algorithm `A` of its annotation) is checked when every layer has `A`
@@ -453,12 +453,12 @@ pub(super) fn merged_erofs(
     alg: Algorithm,
     layers: &[Algorithm],
     tocs: &[&Toc],
-    objects: &dyn Fn(&str) -> Option<std::path::PathBuf>,
+    open: &dyn Fn(&str, u64) -> std::io::Result<std::fs::File>,
     want: Option<&OciManifest>,
 ) -> ImageResult<Option<(Algorithm, String)>> {
     let stated = want.map(expected).transpose()?.unwrap_or_default();
     let made = |a: Algorithm| {
-        crate::storage_driver::composefs::canonical_image_of(a, tocs, objects)
+        crate::storage_driver::composefs::canonical_image_of(a, tocs, open)
             .map(|(_, id)| id)
             .map_err(|e| ImageError::Storage(format!("cannot make the merged EROFS: {e}")))
     };
@@ -767,7 +767,7 @@ mod tests {
         use Algorithm::{Sha256, Sha512};
         let dir = tempfile::tempdir().unwrap();
         let store = velarx_storage::FileStore::new(dir.path()).unwrap();
-        let in_store = |d: &str| store.get_path(d);
+        let in_store = |d: &str, size| velarx_storage::ObjectOpener::object_file(&store, d, size);
         let none = Toc {
             version: 1,
             entries: Vec::new(),

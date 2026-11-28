@@ -2013,7 +2013,11 @@ impl StorageDriver for ComposefsDriver {
                     .into_iter()
                     .find(|(a, _)| recorded_algs.iter().all(|r| r == a))
             });
-        let store = self.store.clone();
+        let (store, db, staging) = (
+            self.store.clone(),
+            self.db.clone(),
+            self.staging_dir.clone(),
+        );
         tokio::task::spawn_blocking(move || {
             let mut found = Vec::new();
             let refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
@@ -2033,7 +2037,11 @@ impl StorageDriver for ComposefsDriver {
             if let (Some((alg, want)), true) = (&sealed, full) {
                 let all: Option<Vec<&Toc>> = tocs.iter().map(Option::as_ref).collect();
                 if let Some(all) = all {
-                    if let Ok((_, id)) = velarx_fuse::canonical::image_of_store(*alg, &all, &store) {
+                    let open = |key: &str, size| {
+                        objects::open_object(NAME, &db, &store, &staging, key, size)
+                            .map_err(DriverError::into_io)
+                    };
+                    if let Ok((_, id)) = velarx_fuse::canonical::image_of(*alg, &all, &open) {
                         if id != *want {
                             found.push(problem(
                                 ProblemKind::ArtifactSealMismatch,
@@ -2310,14 +2318,14 @@ impl StorageDriver for ComposefsDriver {
     }
 }
 
-/// The image of composefs-rs of the layers `tocs`, whose files are where
-/// `objects` says (by their fs-verity digest), and its id.
+/// The image of composefs-rs of the layers `tocs`, whose files `open` gives
+/// (by their fs-verity digest and size), and its id.
 pub(crate) fn canonical_image_of(
     alg: Algorithm,
     tocs: &[&velarx_storage::Toc],
-    objects: &dyn Fn(&str) -> Option<std::path::PathBuf>,
+    open: &dyn Fn(&str, u64) -> std::io::Result<std::fs::File>,
 ) -> std::io::Result<(Box<[u8]>, String)> {
-    velarx_fuse::canonical::image_of(alg, tocs, objects)
+    velarx_fuse::canonical::image_of(alg, tocs, open)
 }
 
 /// Give the directory `upper` the mode, owner, time and attributes of the
