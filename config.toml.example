@@ -245,6 +245,16 @@ composefs_digests = "check"
 #           digest and no accepted signature) is refused with the reason, and
 #           `--security-opt verity=off` is refused
 verity_chain = "auto"
+# The regular files of 1 to this many bytes that a layer made here (a pull,
+# a load, a build, a commit, an import) holds inside its EROFS image instead
+# of as objects of the store: 0 none (the default), -1 every file.  A layer
+# that is in the store keeps the value it was made with (`velarx rmi` and a
+# pull again make it with another).  `velarx pull --inline-threshold=N`
+# sets it for one pull.  The EROFS image then differs from the one of the
+# table of contents alone, so the digest a manifest states for it never
+# matches: `composefs_digests = "require"` refuses such a layer, and one
+# that is held to its record is checked against it
+inline_threshold = 0
 
 [pull]
 # Layers fetched at the same time

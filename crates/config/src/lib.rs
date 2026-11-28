@@ -1024,6 +1024,12 @@ pub struct StorageConfig {
     /// cannot hold the chain is refused, and `--security-opt verity=off` too).
     #[serde(default)]
     pub verity_chain: VerityChain,
+    /// The regular files of 1 to this many bytes that a layer made here
+    /// (a pull, a load, a build, a commit, an import) holds in its EROFS
+    /// image instead of as objects of the store: 0 (the default) none, -1
+    /// every file.  `velarx pull --inline-threshold` sets it for one pull.
+    #[serde(default)]
+    pub inline_threshold: i64,
 }
 
 /// The `[storage] verity_chain` setting.
@@ -1384,6 +1390,7 @@ impl Default for StorageConfig {
             sync: SyncMode::default(),
             composefs_digests: ComposefsDigests::default(),
             verity_chain: VerityChain::default(),
+            inline_threshold: 0,
         }
     }
 }
@@ -1540,6 +1547,12 @@ impl Config {
             }
         }
         self.storage.check_driver()?;
+        let t = self.storage.inline_threshold;
+        if t < -1 {
+            return Err(ConfigError::Invalid(format!(
+                "[storage] inline_threshold = {t}: -1 (every file), 0 (none) or a size in bytes"
+            )));
+        }
         let c = &self.containers.cgroups;
         if !c.is_empty() && !CGROUPS_MODES.contains(&c.as_str()) {
             return Err(ConfigError::Invalid(format!(
@@ -2153,6 +2166,17 @@ mod tests {
             );
         }
         assert_eq!(ComposefsDigests::Require.to_string(), "require");
+    }
+
+    #[test]
+    fn inline_threshold_is_zero_unless_the_storage_says_otherwise() {
+        assert_eq!(parse("").unwrap().storage.inline_threshold, 0);
+        let get = |v: &str| parse(&format!("[storage]\ninline_threshold = {v}\n"));
+        assert_eq!(get("4096").unwrap().storage.inline_threshold, 4096);
+        assert_eq!(get("-1").unwrap().storage.inline_threshold, -1);
+        let err = get("-2").unwrap_err().to_string();
+        assert!(err.contains("inline_threshold"), "{err}");
+        assert!(get("\"4k\"").is_err());
     }
 
     #[test]

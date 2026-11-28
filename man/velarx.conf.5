@@ -89,6 +89,16 @@ system has fs\-verity and every layer was pulled with it
 .B off
 or
 .BR require ),
+the size up to which the regular files of a layer made here are kept in its
+EROFS image instead of as objects of the store
+.RB ( inline_threshold :
+0, the default, none;
+.BR \-1 ,
+every file; the layer keeps the value it was made with, and the EROFS image
+of a layer with files in it is not the one of its table of contents alone, so
+the digest a manifest states for it never matches and
+.B composefs_digests = require
+refuses it),
 the read\-only stores of other instances
 .RB ( additional_image_stores ;
 one that another velarx runs on, or that has a leftover write\-ahead log, is
