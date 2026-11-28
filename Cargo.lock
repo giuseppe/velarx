@@ -5126,6 +5126,7 @@ dependencies = [
  "tokio",
  "url",
  "velarx-base",
+ "velarx-config",
  "velarx-proto",
  "velarx-registry",
  "yaml-rust2",

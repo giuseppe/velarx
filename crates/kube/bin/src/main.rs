@@ -77,12 +77,8 @@ fn main() -> std::process::ExitCode {
 
 /// The socket of the engine service.
 fn engine_socket(cli: &Cli) -> anyhow::Result<PathBuf> {
-    match &cli.engine_socket {
-        Some(s) => Ok(std::path::absolute(s)?),
-        None => Ok(velarx_base::dirs::DefaultDirs::current()?
-            .run
-            .join("engine/engine.sock")),
-    }
+    velarx_kube::engine::socket(cli.engine_socket.as_deref(), &cli.config)
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Make sure the engine serves its socket, for as long as the command
@@ -104,9 +100,7 @@ async fn keep_engine(
         )?;
     let command = || {
         let mut cmd = std::process::Command::new(&exe);
-        if let Some(config) = &cli.config {
-            cmd.arg("--config").arg(config);
-        }
+        cmd.arg("--config").arg(&cli.config);
         cmd.args(["varlink", "--listen-fd", "3", "--time", "0"]);
         cmd
     };

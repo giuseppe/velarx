@@ -21,6 +21,7 @@ doctest = false
 
 [dependencies]
 velarx-base = { path = "../base" }
+velarx-config = { path = "../config" }
 velarx-proto = { path = "../proto" }
 velarx-registry = { path = "../registry", default-features = false }
 serde_json.workspace = true

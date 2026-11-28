@@ -4,6 +4,15 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+/// The configuration file of the user (of the system, for root).
+fn default_config() -> PathBuf {
+    // (a default of the command line, asked for by the parser: an unreadable
+    // map is reported and ends the command)
+    velarx_base::dirs::DefaultDirs::current()
+        .unwrap_or_else(|e| e.exit())
+        .config_file
+}
+
 #[derive(Parser)]
 #[command(
     name = "velarx-kube",
@@ -11,12 +20,11 @@ use std::path::PathBuf;
     disable_version_flag = true
 )]
 pub struct Cli {
-    /// The configuration file of the engine this command starts when none
-    /// answers
-    #[arg(long, global = true)]
-    pub config: Option<PathBuf>,
-    /// The socket of the engine service (default: engine/engine.sock in the
-    /// runtime directory)
+    /// The configuration file: the engine socket is its `[engine] socket`,
+    /// and the engine this command starts when none answers reads it
+    #[arg(long, global = true, default_value_os_t = default_config())]
+    pub config: PathBuf,
+    /// The socket of the engine service (default: that of the configuration)
     #[arg(long, global = true, value_name = "PATH")]
     pub engine_socket: Option<PathBuf>,
     /// Do not start the engine when none answers (something else does)

@@ -4,7 +4,7 @@
 //! links the interface and nothing of the engine.
 
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use velarx_proto::connect::{self, filled_pipe, Conn};
 use velarx_proto::engine::{EngineError, EngineProxy, PullSpec};
 use velarx_proto::pod::PodAction;
@@ -96,6 +96,19 @@ macro_rules! call {
         let mut conn = $engine.conn().await?;
         conn.$method($($arg),*).await?.map_err(Error::from)
     }};
+}
+
+/// The socket of the engine service: `explicit` (`--engine-socket`), else the
+/// one of the configuration file `config`, as for every front end.
+pub fn socket(
+    explicit: Option<&Path>,
+    config: &Path,
+) -> std::result::Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let socket = match explicit {
+        Some(socket) => socket.to_path_buf(),
+        None => velarx_config::Config::load_or_default(config)?.engine_socket(),
+    };
+    Ok(std::path::absolute(socket)?)
 }
 
 /// The engine service.
@@ -367,4 +380,24 @@ fn upload_pipe(archive: Vec<u8>) -> Result<OwnedFd> {
     }
     framed.extend_from_slice(&0u32.to_be_bytes());
     Ok(filled_pipe(framed)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_socket_is_the_one_of_the_configuration_unless_one_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "[engine]\nsocket = \"/run/own/engine.sock\"\n").unwrap();
+        assert_eq!(
+            socket(None, &config).unwrap(),
+            Path::new("/run/own/engine.sock")
+        );
+        assert_eq!(
+            socket(Some(Path::new("/run/given.sock")), &config).unwrap(),
+            Path::new("/run/given.sock")
+        );
+    }
 }
