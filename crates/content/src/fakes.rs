@@ -135,10 +135,9 @@ impl StagingFetcher for Metadata {
         &self,
         _scope: &Scope,
         _blob: &crate::fetcher::fetch::Blob,
-        mut file: std::fs::File,
+        mut out: crate::serve_fetch::BlobFile,
     ) -> Result<(), FetcherError> {
-        // (as it is: the engine checks what a fetcher wrote)
-        std::io::Write::write_all(&mut file, &self.0)
-            .map_err(|e| FetcherError::failed(e.to_string()))
+        out.write(&self.0)?;
+        out.finish()
     }
 }

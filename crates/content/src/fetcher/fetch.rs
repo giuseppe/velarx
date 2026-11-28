@@ -348,6 +348,13 @@ pub struct FetchReply {
     pub event: Option<FetchEvent>,
 }
 
+/// What a `GetBlob` answers: the bytes of the blob written so far, none in
+/// the last reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::Type)]
+pub struct BlobReply {
+    pub bytes: Option<u64>,
+}
+
 /// What an `Unpack` answers: the bytes of the blob read so far, or files of
 /// the layer, or nothing in the last reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::Type)]
@@ -523,12 +530,15 @@ mod proxy {
         ) -> zlink::Result<(Result<Answer, FetcherError>, Vec<OwnedFd>)>;
 
         /// A blob, written into the file at position `file`.
+        #[zlink(more, return_fds)]
         async fn get_blob(
             &mut self,
             #[zlink(fds)] fds: Vec<OwnedFd>,
             blob: &Blob,
             file: u32,
-        ) -> zlink::Result<Result<Ack, FetcherError>>;
+        ) -> zlink::Result<
+            impl futures::Stream<Item = zlink::Result<(Result<BlobReply, FetcherError>, Vec<OwnedFd>)>>,
+        >;
 
         /// What can this fetcher do for `layers`?
         #[zlink(more, return_fds)]

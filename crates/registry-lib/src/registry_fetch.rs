@@ -1009,13 +1009,17 @@ impl StagingFetcher for RegistryFetch {
 
     // (`blob.size` is the size of the descriptor: a blob of another size is
     // not the one asked for)
-    async fn get_blob(&self, scope: &Scope, blob: &Blob, file: File) -> Result<(), FetcherError> {
+    async fn get_blob(
+        &self,
+        scope: &Scope,
+        blob: &Blob,
+        mut out: BlobFile,
+    ) -> Result<(), FetcherError> {
         let (pool, _) = self.pool(scope)?;
         let digest: Digest = blob
             .digest
             .parse()
             .map_err(|_| bad("not the digest of a blob"))?;
-        let mut out = BlobFile::new(file, blob)?;
         let mut wrong = None;
         let got = pool
             .blob(&digest, blob.size, &mut |data| {
@@ -1583,7 +1587,11 @@ mod tests {
         };
         let file = tempfile::tempfile().unwrap();
         let got = fetch
-            .get_blob(&scope, &described, file.try_clone().unwrap())
+            .get_blob(
+                &scope,
+                &described,
+                BlobFile::new(file.try_clone().unwrap(), &described).unwrap(),
+            )
             .await;
         // (written at their offsets: the file is still at its start)
         let mut written = Vec::new();

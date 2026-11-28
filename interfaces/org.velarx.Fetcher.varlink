@@ -308,8 +308,10 @@ method GetFile(kind: FileKind, reference: ?string, max: int) -> (file: int, medi
 # engine made, open for writing, among the descriptors of the call:
 # exactly `blob.size` bytes of the digest, which the fetcher checks as it
 # writes and the engine checks again.  Nothing holds the blob in
-# memory.
-method GetBlob(blob: Blob, file: int) -> ()
+# memory.  Called with `more`: one reply with the `bytes` written so
+# far at least every half of `idle_ms`, then a last reply without
+# them once the blob is complete.
+method GetBlob(blob: Blob, file: int) -> (bytes: ?int)
 
 # What can this fetcher do for `layers`?  Called with `more`: one
 # `probed` a reply, in any order, then a last reply without one.

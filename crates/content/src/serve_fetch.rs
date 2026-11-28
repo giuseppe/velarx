@@ -13,9 +13,9 @@
 
 use crate::activation;
 use crate::fetcher::fetch::{
-    Ack, Answer, Blob, EventKind, Failure, FailureClass, FetchEvent, FetchReply, FetcherError,
-    FileKind, NotLazy, Parts, ProbeReply, Probed, Reuse, TocSource, UnpackReply, Urgency,
-    MAX_ACCESS, MAX_FDS, PROTO,
+    Ack, Answer, Blob, BlobReply, EventKind, Failure, FailureClass, FetchEvent, FetchReply,
+    FetcherError, FileKind, NotLazy, Parts, ProbeReply, Probed, Reuse, TocSource, UnpackReply,
+    Urgency, MAX_ACCESS, MAX_FDS, PROTO,
 };
 use crate::fetcher::proto::{
     Ack as RegistryAck, Downloaded, Found, Hit, RegistryError, Remote, Tagged, MAX_ANSWER,
@@ -102,16 +102,13 @@ pub async fn beating<T, F: std::future::Future>(
 /// fetcher streams a blob of any size and holds none of it.  Whole blocks
 /// of zeros are holes of the file.
 pub struct BlobFile {
-    file: Arc<File>,
-    out: velarx_storage::SparseWriter<Arc<File>>,
+    out: velarx_storage::SparseWriter<File>,
     hasher: velarx_types::digest::DigestWriter,
     digest: velarx_types::digest::Digest,
     size: u64,
-    written: u64,
+    /// The bytes given so far, which the call tells the engine
+    written: Arc<std::sync::atomic::AtomicU64>,
 }
-
-/// How often [`BlobFile`] gives the file the length of what it was given.
-const LENGTHENED: u64 = 1 << 20;
 
 impl BlobFile {
     pub fn new(file: File, blob: &Blob) -> Result<Self, FetcherError> {
@@ -121,22 +118,20 @@ impl BlobFile {
                 .map_err(|_| FetcherError::InvalidArgument {
                     reason: "not the digest of a blob".into(),
                 })?;
-        let file = Arc::new(file);
         Ok(Self {
-            out: velarx_storage::SparseWriter::new(file.clone()),
-            file,
+            out: velarx_storage::SparseWriter::new(file),
             hasher: velarx_types::digest::DigestWriter::for_digest(&digest),
             digest,
             size: blob.size,
-            written: 0,
+            written: Arc::default(),
         })
     }
 
     /// The next bytes of the blob; more than its size is an error.
     pub fn write(&mut self, data: &[u8]) -> Result<(), FetcherError> {
-        let before = self.written;
-        self.written += data.len() as u64;
-        if self.written > self.size {
+        use std::sync::atomic::Ordering::Relaxed;
+        let written = self.written.fetch_add(data.len() as u64, Relaxed) + data.len() as u64;
+        if written > self.size {
             return Err(FetcherError::invalid(format!(
                 "the blob {} is longer than the {} bytes of its descriptor",
                 self.digest, self.size
@@ -144,23 +139,21 @@ impl BlobFile {
         }
         self.hasher.update(data);
         self.out.write(data)?;
-        // (a hole does not lengthen the file, and the engine sees the
-        // progress of a call by its length: a long run of zeros is not a
-        // fetcher that stopped)
-        // (the bytes up to the block in progress are written or holes)
-        if self.written / LENGTHENED != before / LENGTHENED {
-            let whole = self.written - self.written % velarx_storage::HOLE_BLOCK as u64;
-            self.file.set_len(whole)?;
-        }
         Ok(())
+    }
+
+    /// The bytes given so far, as the call that wrote them tells them.
+    pub fn progress(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.written.clone()
     }
 
     /// The blob is complete: it has all its bytes and its digest.
     pub fn finish(self) -> Result<(), FetcherError> {
-        if self.written != self.size {
+        let written = self.written.load(std::sync::atomic::Ordering::Relaxed);
+        if written != self.size {
             return Err(FetcherError::invalid(format!(
-                "the blob {} has {} bytes, the descriptor says {}",
-                self.digest, self.written, self.size
+                "the blob {} has {written} bytes, the descriptor says {}",
+                self.digest, self.size
             )));
         }
         self.out.finish()?;
@@ -172,13 +165,6 @@ impl BlobFile {
             )));
         }
         Ok(())
-    }
-
-    /// A blob a fetcher has in memory (its items are small), written whole.
-    pub fn put(file: File, blob: &Blob, bytes: &[u8]) -> Result<(), FetcherError> {
-        let mut out = Self::new(file, blob)?;
-        out.write(bytes)?;
-        out.finish()
     }
 }
 
@@ -339,11 +325,16 @@ pub trait StagingFetcher: Send + Sync + 'static {
         Err(FetcherError::unavailable("nobody has it"))
     }
 
-    /// The blob the descriptor names, written from the start of `file`
-    /// (empty, open for writing, the engine's): exactly the bytes the
-    /// descriptor says, of its digest.  A fetcher streams it through a
-    /// [`BlobFile`]; it never holds the blob.
-    async fn get_blob(&self, _scope: &Scope, blob: &Blob, _file: File) -> Result<(), FetcherError> {
+    /// The blob the descriptor names, written into `out` (the file is
+    /// empty, open for writing, the engine's): exactly the bytes the
+    /// descriptor say, of its digest, and `out.finish()` at the end.  A
+    /// fetcher streams it; it never holds the blob.
+    async fn get_blob(
+        &self,
+        _scope: &Scope,
+        blob: &Blob,
+        _out: BlobFile,
+    ) -> Result<(), FetcherError> {
         Err(FetcherError::unavailable(format!(
             "{}: nobody has it",
             blob.digest
@@ -1238,27 +1229,59 @@ mod service {
         /// engine made, open for writing, among the descriptors of the call:
         /// exactly `blob.size` bytes of the digest, which the fetcher checks as it
         /// writes and the engine checks again.  Nothing holds the blob in
-        /// memory.
+        /// memory.  Called with `more`: one reply with the `bytes` written so
+        /// far at least every half of `idle_ms`, then a last reply without
+        /// them once the blob is complete.
+        #[zlink(more, return_fds)]
         pub async fn get_blob(
             &self,
+            more: bool,
             #[zlink(fds)] fds: Vec<OwnedFd>,
             blob: Blob,
             file: u32,
-        ) -> Result<Ack, FetcherError> {
-            let scope = self.scope()?;
-            let mut fds = Descriptors::new(fds);
-            let file = File::from(
-                fds.take("the file of the blob", file)
-                    .map_err(FetcherScope::invalid)?,
-            );
-            fds.finish().map_err(FetcherScope::invalid)?;
-            let api = self.api.clone();
-            owned(&self.runtime, async move {
-                api.get_blob(&scope, &blob, file).await
-            })
-            .await
-            .unwrap_or_else(|e| Err(stopped(e)))?;
-            Ok(Ack {})
+        ) -> impl Stream<Item = (Result<Reply<BlobReply>, FetcherError>, Vec<OwnedFd>)> + Unpin
+        {
+            let prepared = (|| {
+                if !more {
+                    return Err(FetcherError::InvalidArgument {
+                        reason: "a blob is asked for with more".into(),
+                    });
+                }
+                let scope = self.scope()?;
+                let mut fds = Descriptors::new(fds);
+                let file = File::from(
+                    fds.take("the file of the blob", file)
+                        .map_err(FetcherScope::invalid)?,
+                );
+                fds.finish().map_err(FetcherScope::invalid)?;
+                Ok((scope, BlobFile::new(file, &blob)?))
+            })();
+            let (scope, out) = match prepared {
+                Ok(p) => p,
+                Err(e) => return Self::failure(e),
+            };
+            let (tx, rx) = mpsc::channel(1);
+            let (api, cancel) = (self.api.clone(), Cancel::default());
+            let gone = cancel.clone();
+            let task = self.runtime.spawn(async move {
+                let (tx, written, idle) = (Out { tx }, out.progress(), scope.idle);
+                let beat = || written.load(std::sync::atomic::Ordering::Relaxed);
+                tokio::select! {
+                    got = beating(&tx, idle, beat, api.get_blob(&scope, &blob, out)) => got,
+                    () = gone.cancelled() => Ok(()),
+                }
+            });
+            Self::answers(
+                cancel,
+                rx,
+                task,
+                None,
+                (
+                    |bytes| Some(BlobReply { bytes: Some(bytes) }),
+                    |reason| FetcherError::failed(reason),
+                    Some(|| BlobReply { bytes: None }),
+                ),
+            )
         }
 
         /// What can this fetcher do for `layers`?  Called with `more`: one
@@ -2280,9 +2303,13 @@ mod tests {
             }
         }
 
-        async fn get_blob(&self, _: &Scope, blob: &Blob, file: File) -> Result<(), FetcherError> {
+        async fn get_blob(
+            &self,
+            _: &Scope,
+            _: &Blob,
+            mut out: BlobFile,
+        ) -> Result<(), FetcherError> {
             // (in pieces: no more than a piece is ever held)
-            let mut out = BlobFile::new(file, blob)?;
             for piece in self.0.chunks(3) {
                 out.write(piece)?;
             }
@@ -2303,8 +2330,16 @@ mod tests {
         }
     }
 
-    /// `GetBlob` writes the blob into the file the call carries: the reply
-    /// has no bytes, and the file has them all.
+    /// The first answer of a `GetBlob` that is an error.
+    async fn refused_blob(e: &FetchEndpoint, fds: Vec<OwnedFd>, more: bool) -> FetcherError {
+        let mut replies = e
+            .get_blob(more, fds, described_blob(b"0123456789"), 0)
+            .await;
+        replies.next().await.unwrap().0.err().unwrap()
+    }
+
+    /// `GetBlob` writes the blob into the file the call carries, says how
+    /// many bytes it wrote so far, and ends with a reply that has none.
     #[tokio::test]
     async fn a_blob_is_written_into_the_file_of_the_call() {
         use std::os::unix::fs::FileExt;
@@ -2312,20 +2347,25 @@ mod tests {
         open(&e).await.unwrap();
         let file = tempfile::tempfile().unwrap();
         let sent = vec![OwnedFd::from(file.try_clone().unwrap())];
-        e.get_blob(sent, described_blob(b"0123456789"), 0)
+        let replies: Vec<BlobReply> = e
+            .get_blob(true, sent, described_blob(b"0123456789"), 0)
             .await
-            .unwrap();
+            .map(|(r, _)| r.unwrap().into_parameters().unwrap())
+            .collect()
+            .await;
+        assert_eq!(replies.last().unwrap().bytes, None);
+        assert!(replies[..replies.len() - 1]
+            .iter()
+            .all(|r| r.bytes.is_some()));
         let mut got = vec![0u8; 10];
         file.read_exact_at(&mut got, 0).unwrap();
         assert_eq!(got, b"0123456789");
-        // (a file the call does not carry, and a descriptor nobody names)
-        let none = e
-            .get_blob(Vec::new(), described_blob(b"0123456789"), 0)
-            .await;
-        assert!(matches!(none, Err(FetcherError::InvalidArgument { .. })));
-        let extra = vec![dir(), dir()];
-        let extra = e.get_blob(extra, described_blob(b"0123456789"), 0).await;
-        assert!(matches!(extra, Err(FetcherError::InvalidArgument { .. })));
+        // (a file the call does not carry, a descriptor nobody names, and
+        // a call without more)
+        let invalid = |e: FetcherError| matches!(e, FetcherError::InvalidArgument { .. });
+        assert!(invalid(refused_blob(&e, Vec::new(), true).await));
+        assert!(invalid(refused_blob(&e, vec![dir(), dir()], true).await));
+        assert!(invalid(refused_blob(&e, vec![dir()], false).await));
     }
 
     /// What does not have the size or the digest of its descriptor is
@@ -2335,25 +2375,24 @@ mod tests {
         let blob = described_blob(b"abcdef");
         let invalid = |e: FetcherError| e.failure().unwrap().class == FailureClass::Invalid;
         let file = || tempfile::tempfile().unwrap();
-        BlobFile::put(file(), &blob, b"abcdef").unwrap();
-        assert!(invalid(
-            BlobFile::put(file(), &blob, b"abcdefg").unwrap_err()
-        ));
-        assert!(invalid(BlobFile::put(file(), &blob, b"abcde").unwrap_err()));
-        assert!(invalid(
-            BlobFile::put(file(), &blob, b"abcdeX").unwrap_err()
-        ));
+        let put = |bytes: &[u8]| {
+            let mut out = BlobFile::new(file(), &blob)?;
+            out.write(bytes)?;
+            out.finish()
+        };
+        put(b"abcdef").unwrap();
+        assert!(invalid(put(b"abcdefg").unwrap_err()));
+        assert!(invalid(put(b"abcde").unwrap_err()));
+        assert!(invalid(put(b"abcdeX").unwrap_err()));
         // (the first byte past the size is refused, without waiting for the end)
         let mut out = BlobFile::new(file(), &blob).unwrap();
         out.write(b"abcdef").unwrap();
         assert!(invalid(out.write(b"g").unwrap_err()));
     }
 
-    /// The zeros of a blob are holes of its file, and the file grows
-    /// through them as they are given (the engine sees the progress of a
-    /// call by its length).
+    /// The zeros of a blob are holes of its file.
     #[test]
-    fn the_zeros_of_a_blob_are_holes_and_the_file_grows() {
+    fn the_zeros_of_a_blob_are_holes() {
         use std::os::unix::fs::MetadataExt;
         let mut data = vec![7u8; 100];
         data.extend(vec![0u8; 4 << 20]);
@@ -2363,13 +2402,7 @@ mod tests {
         let path = dir.path().join("blob");
         let file = std::fs::File::create(&path).unwrap();
         let mut out = BlobFile::new(file.try_clone().unwrap(), &blob).unwrap();
-        let (head, tail) = data.split_at(3 << 20);
-        for piece in head.chunks(1000) {
-            out.write(piece).unwrap();
-        }
-        let len = file.metadata().unwrap().len();
-        assert!(len >= (3 << 20) - (1 << 20), "{len}");
-        for piece in tail.chunks(1000) {
+        for piece in data.chunks(1000) {
             out.write(piece).unwrap();
         }
         out.finish().unwrap();
@@ -2596,7 +2629,8 @@ mod tests {
             let got = e.get_file(kind, Some("latest".into()), 100).await;
             assert!(matches!(got.0, Err(FetcherError::Failed { .. })));
         }
-        let got = e.get_blob(vec![dir()], blob("sha256:aa"), 0).await;
+        let mut replies = e.get_blob(true, vec![dir()], described_blob(b"x"), 0).await;
+        let got = replies.next().await.unwrap().0;
         assert!(matches!(got, Err(FetcherError::Failed { .. })));
         // (an item is asked for with a maximum)
         let got = e

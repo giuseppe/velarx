@@ -30,6 +30,8 @@ const PATH: &str = "dir";
 /// hands out (`Connect`), and so do the layers.
 pub struct PathOrigin {
     scoped: tokio::sync::Mutex<FetchConn>,
+    /// How long it may be silent in a call
+    idle: std::time::Duration,
 }
 
 impl PathOrigin {
@@ -66,6 +68,7 @@ impl PathOrigin {
         .map_err(path_error)?;
         Ok(Arc::new(Self {
             scoped: tokio::sync::Mutex::new(conn),
+            idle: origin.idle(),
         }))
     }
 
@@ -215,6 +218,15 @@ impl OriginNet {
             access: None,
             conn: Arc::default(),
             sources: vec![Source::Registry],
+        }
+    }
+
+    /// How long the fetcher may be silent in a call.
+    fn idle(&self) -> std::time::Duration {
+        match &self.via {
+            Via::Registry(origin) => origin.idle(),
+            Via::Path(path) => path.idle,
+            Via::Transport(_, idle) => *idle,
         }
     }
 
@@ -516,7 +528,7 @@ impl OriginNet {
         let mut slot = self.conn.lock().await;
         let conn = self.scoped(&mut slot).await?;
         reset(file)?;
-        let got = conn.get_blob(blob, file).await;
+        let got = conn.get_blob(blob, file, self.idle()).await;
         self.answered(&mut slot, got)?.ok_or_else(|| {
             ImageError::transfer_of(
                 self.party(),
@@ -684,7 +696,7 @@ impl MetadataSources {
             if reset(file).is_err() {
                 return false;
             }
-            let got = crate::idle::writing(link.idle, file, link.conn.get_blob(blob, file)).await;
+            let got = link.conn.get_blob(blob, file, link.idle).await;
             if got.is_ok() && measure(&link.name, blob, file).await.is_ok() {
                 return true;
             }
@@ -937,7 +949,8 @@ mod tests {
         };
         let file = tempfile::tempfile().unwrap();
         assert!(sources.blob(&blob, &file).await);
-        // (a descriptor that says another size is not the blob sent)
+        // (a descriptor that says another size is not the blob sent, and
+        // the fetcher itself says so)
         let bigger = Blob {
             size: blob.size + 1,
             ..blob.clone()
@@ -950,6 +963,32 @@ mod tests {
             ..blob
         };
         assert!(!sources.blob(&other, &file).await);
+    }
+
+    /// What a fetcher wrote is measured by the engine, whatever the fetcher
+    /// checked: a file of another size or of other bytes is not the blob.
+    #[tokio::test]
+    async fn a_blob_a_fetcher_wrote_is_measured() {
+        let blob = Blob {
+            digest: crate::sha256(b"abcdef").to_string(),
+            size: 6,
+            media_type: "x".into(),
+            annotations: None,
+        };
+        let written = |bytes: &[u8]| {
+            let mut file = tempfile::tempfile().unwrap();
+            std::io::Write::write_all(&mut file, bytes).unwrap();
+            file
+        };
+        let class = |e: ImageError| match e {
+            ImageError::Transfer { failure, .. } => failure.class,
+            e => panic!("{e}"),
+        };
+        measure("peer", &blob, &written(b"abcdef")).await.unwrap();
+        for wrong in [&b"abcdefg"[..], b"abcde", b"abcdeX"] {
+            let got = measure("peer", &blob, &written(wrong)).await;
+            assert_eq!(class(got.unwrap_err()), FailureClass::Invalid);
+        }
     }
 
     /// The refusals and the absences the fetcher tells keep their class: the

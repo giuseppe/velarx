@@ -624,7 +624,7 @@ mod tests {
     use super::*;
     use crate::archive::MAX_METADATA;
     use crate::fetcher::fetch::FileKind;
-    use crate::serve_fetch::StagingFetcher;
+    use crate::serve_fetch::{BlobFile, StagingFetcher};
 
     fn image(n: u8, names: &[&str]) -> ArchiveImage {
         let manifest = vec![n];
@@ -801,7 +801,11 @@ mod tests {
         };
         let file = tempfile::tempfile().unwrap();
         origin
-            .get_blob(&scope, &blob, file.try_clone().unwrap())
+            .get_blob(
+                &scope,
+                &blob,
+                BlobFile::new(file.try_clone().unwrap(), &blob).unwrap(),
+            )
             .await
             .unwrap();
         let mut written = Vec::new();
@@ -811,13 +815,21 @@ mod tests {
             size: blob.size - 1,
             ..blob.clone()
         };
-        let got = origin.get_blob(&scope, &shorter, tempfile::tempfile().unwrap());
+        let got = origin.get_blob(
+            &scope,
+            &shorter,
+            BlobFile::new(tempfile::tempfile().unwrap(), &shorter).unwrap(),
+        );
         assert_eq!(class(got.await), FailureClass::Invalid);
         let absent = crate::fetcher::fetch::Blob {
             digest: crate::sha256(b"absent").to_string(),
             ..blob
         };
-        let got = origin.get_blob(&scope, &absent, tempfile::tempfile().unwrap());
+        let got = origin.get_blob(
+            &scope,
+            &absent,
+            BlobFile::new(tempfile::tempfile().unwrap(), &absent).unwrap(),
+        );
         assert_eq!(class(got.await), FailureClass::Unavailable);
     }
 

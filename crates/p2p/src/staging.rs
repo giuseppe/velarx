@@ -498,7 +498,7 @@ impl StagingFetcher for PeerSource {
         &self,
         _scope: &Scope,
         blob: &Blob,
-        file: std::fs::File,
+        mut out: BlobFile,
     ) -> Result<(), FetcherError> {
         let mut one = One(None);
         let item = [Item {
@@ -517,7 +517,8 @@ impl StagingFetcher for PeerSource {
                     .await,
             ));
         };
-        BlobFile::put(file, blob, &bytes)
+        out.write(&bytes)?;
+        out.finish()
     }
 
     /// The table of contents and tar-split of the zstd:chunked layers whose

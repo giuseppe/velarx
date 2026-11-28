@@ -30,31 +30,6 @@ pub async fn within<T>(
         .unwrap_or_else(|_| Err(silent(idle)))
 }
 
-/// [`within`] for a call that writes into `file` and has one reply at its
-/// end (`GetBlob`): the bytes it writes are what it says, so it is silent
-/// when the file did not grow for `idle`, and a blob that takes longer
-/// than that is not cut.
-pub async fn writing<T>(
-    idle: Duration,
-    file: &std::fs::File,
-    call: impl std::future::Future<Output = Result<T, CallError>>,
-) -> Result<T, CallError> {
-    tokio::pin!(call);
-    let mut seen = 0;
-    loop {
-        match tokio::time::timeout(idle, &mut call).await {
-            Ok(done) => return done,
-            Err(_) => {
-                let now = file.metadata()?.len();
-                if now == seen {
-                    return Err(silent(idle));
-                }
-                seen = now;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,25 +42,5 @@ mod tests {
         let late = within::<()>(idle, std::future::pending()).await;
         assert!(is_silent(&late.unwrap_err()));
         assert_eq!(within(idle, async { Ok(7) }).await.unwrap(), 7);
-    }
-
-    /// A call that writes is not silent while its file grows, and is when
-    /// it stops.
-    #[tokio::test(start_paused = true)]
-    async fn a_call_that_writes_is_not_silent() {
-        use std::io::Write;
-        let idle = Duration::from_secs(5);
-        let mut file = tempfile::tempfile().unwrap();
-        let reader = file.try_clone().unwrap();
-        let slow = async {
-            for _ in 0..4 {
-                tokio::time::sleep(idle).await;
-                file.write_all(b"x").unwrap();
-            }
-            Ok(7)
-        };
-        assert_eq!(writing(idle, &reader, slow).await.unwrap(), 7);
-        let stuck = writing::<()>(idle, &reader, std::future::pending()).await;
-        assert!(is_silent(&stuck.unwrap_err()));
     }
 }

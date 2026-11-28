@@ -300,11 +300,10 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
         &self,
         _scope: &Scope,
         blob: &Blob,
-        file: std::fs::File,
+        mut out: BlobFile,
     ) -> Result<(), FetcherError> {
         let (items, wanted) = (self.items.clone(), blob.clone());
         tokio::task::spawn_blocking(move || {
-            let mut out = BlobFile::new(file, &wanted)?;
             if !items.copy(&wanted.digest, wanted.size, &mut |data| out.write(data))? {
                 return Err(FetcherError::unavailable(format!(
                     "{}: not here",
@@ -445,7 +444,11 @@ mod tests {
         };
         let file = tempfile::tempfile().unwrap();
         fetcher
-            .get_blob(&scope, &blob, file.try_clone().unwrap())
+            .get_blob(
+                &scope,
+                &blob,
+                BlobFile::new(file.try_clone().unwrap(), &blob).unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(file.metadata().unwrap().len(), size);
@@ -459,7 +462,11 @@ mod tests {
         };
         let empty = tempfile::tempfile().unwrap();
         let got = fetcher
-            .get_blob(&scope, &other, empty.try_clone().unwrap())
+            .get_blob(
+                &scope,
+                &other,
+                BlobFile::new(empty.try_clone().unwrap(), &other).unwrap(),
+            )
             .await;
         assert!(matches!(got, Err(FetcherError::Failed { .. })));
         assert_eq!(empty.metadata().unwrap().len(), 0);

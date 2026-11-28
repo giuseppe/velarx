@@ -758,8 +758,7 @@ impl ImageService {
             let asked = async {
                 let scope = velarx_content::fetcher::fetch_client::Scoping::bare(link.idle);
                 velarx_content::idle::within(link.idle, link.conn.open(scope)).await?;
-                velarx_content::idle::writing(link.idle, &file, link.conn.get_blob(&blob, &file))
-                    .await
+                link.conn.get_blob(&blob, &file, link.idle).await
             }
             .await;
             if asked.is_ok() {

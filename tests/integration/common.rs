@@ -1790,7 +1790,9 @@ pub async fn blob_from(socket: &std::path::Path, digest: &str, size: u64) -> Opt
         annotations: None,
     };
     let file = tempfile::tempfile().ok()?;
-    conn.get_blob(&blob, &file).await.ok()?;
+    conn.get_blob(&blob, &file, std::time::Duration::from_secs(60))
+        .await
+        .ok()?;
     let length = file.metadata().ok()?.len();
     if length != size {
         return None;

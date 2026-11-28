@@ -2,7 +2,7 @@
 //! The typed client of the fetcher interface ([`super::fetch`]):
 //! one connection, one call at a time, made with the proxies of the
 //! interfaces ([`FetcherProxy`], [`RegistryProxy`]).  A call made with `more`
-//! (`Probe`, `Unpack`, `Fetch`, `Tags`, `Search`) holds the connection until
+//! (`GetBlob`, `Probe`, `Unpack`, `Fetch`, `Tags`, `Search`) holds the connection until
 //! its last reply; another connection with the same scope comes from
 //! [`FetchConn::connect`].
 //!
@@ -11,8 +11,8 @@
 //! wrote and what `Fetch` staged.
 
 use super::fetch::{
-    Blob, FetchEvent, FetchReply, FetcherError, FetcherProxy, FileKind, Parts, ProbeReply, Probed,
-    Reuse, UnpackReply, Urgency, INTERFACE, MAX_FDS, PROTO,
+    Blob, BlobReply, FetchEvent, FetchReply, FetcherError, FetcherProxy, FileKind, Parts,
+    ProbeReply, Probed, Reuse, UnpackReply, Urgency, INTERFACE, MAX_FDS, PROTO,
 };
 use super::proto::{
     Downloaded, Found, Hit, RegistryError, RegistryProxy, Remote, Tagged, MAX_ANSWER,
@@ -172,6 +172,17 @@ impl Replies<'_, FetchReply> {
             .next_with(|r| r.event.is_none())
             .await?
             .and_then(|(r, fds)| r.event.map(|e| (e, fds))))
+    }
+}
+
+impl Replies<'_, BlobReply> {
+    /// The bytes of the blob written so far, with each reply; none after the
+    /// last reply, which has none.
+    pub async fn bytes(&mut self) -> Result<Option<u64>, CallError> {
+        Ok(self
+            .next_with(|r| r.bytes.is_none())
+            .await?
+            .and_then(|(r, _)| r.bytes))
     }
 }
 
@@ -505,14 +516,26 @@ impl FetchConn {
     }
 
     /// The blob, written by the fetcher into `dest` (a file of the engine,
-    /// with no name, empty, open for writing).  What it wrote is a claim:
-    /// the caller checks its size and digest.
-    pub async fn get_blob(&mut self, blob: &Blob, dest: &File) -> Result<(), CallError> {
+    /// with no name, empty, open for writing), which says how far it is at
+    /// least every half of `idle`.  What it wrote is a claim: the caller
+    /// checks its size and digest.
+    pub async fn get_blob(
+        &mut self,
+        blob: &Blob,
+        dest: &File,
+        idle: std::time::Duration,
+    ) -> Result<(), CallError> {
         let fds = vec![OwnedFd::from(dest.try_clone()?)];
         let (conn, busy) = self.begin().await?;
-        let got = conn.get_blob(fds, blob, 0).await;
-        busy.store(false, Ordering::Release);
-        done(got).map(|_| ())
+        let mut replies = match conn.get_blob(fds, blob, 0).await {
+            Ok(stream) => replies_fds(stream, &busy),
+            Err(e) => {
+                busy.store(false, Ordering::Release);
+                return Err(zerr(e));
+            }
+        };
+        while crate::idle::within(idle, replies.bytes()).await?.is_some() {}
+        Ok(())
     }
 
     /// What the fetcher can do for `layers` (`again`: the index it carried

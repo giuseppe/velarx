@@ -127,8 +127,12 @@ impl<B: Blobs> StagingFetcher for BlobFetch<B> {
         Ok((sealed(&bytes)?, media_type))
     }
 
-    async fn get_blob(&self, scope: &Scope, blob: &Blob, file: File) -> Result<(), FetcherError> {
-        let mut out = BlobFile::new(file, blob)?;
+    async fn get_blob(
+        &self,
+        scope: &Scope,
+        blob: &Blob,
+        mut out: BlobFile,
+    ) -> Result<(), FetcherError> {
         let digest = blob_digest(blob)?;
         let (blobs, scope) = (self.blobs.clone(), scope.clone());
         blocking(move || {
@@ -245,7 +249,11 @@ mod tests {
         };
         let file = tempfile::tempfile().unwrap();
         fetcher
-            .get_blob(&scope(), &blob, file.try_clone().unwrap())
+            .get_blob(
+                &scope(),
+                &blob,
+                BlobFile::new(file.try_clone().unwrap(), &blob).unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(read(&file), data);
@@ -254,7 +262,11 @@ mod tests {
             ..blob
         };
         let e = fetcher
-            .get_blob(&scope(), &absent, tempfile::tempfile().unwrap())
+            .get_blob(
+                &scope(),
+                &absent,
+                BlobFile::new(tempfile::tempfile().unwrap(), &absent).unwrap(),
+            )
             .await
             .unwrap_err();
         assert_eq!(
