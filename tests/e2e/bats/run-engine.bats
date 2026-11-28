@@ -32,7 +32,10 @@ foreground_checks () {
     check "$tag: stdin with -i" "from-stdin" "$out"
     sh_ container run --rm $mode --network none "$IMAGE" sh -c 'exit 7'
     check "$tag: the exit code" 7 $?
-    big=$(sh_ container run --rm $mode --network none "$IMAGE" sh -c 'i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i+1)); done' | md5sum)
+    # (its log in a file: 20000 lines in the journal take the rate limit of
+    # journald for every process of the user, and the files that run beside
+    # this one and read the journal lose their lines)
+    big=$(sh_ container run --rm $mode --network none --log-driver k8s-file "$IMAGE" sh -c 'i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i+1)); done' | md5sum)
     check "$tag: a lot of output" "$(i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i+1)); done | md5sum)" "$big"
 
     # while it runs: other clients see it, exec into it, attach to it, its
