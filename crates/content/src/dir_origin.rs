@@ -207,7 +207,7 @@ impl DirOrigin {
         settings: HelperSettings,
         staging: Arc<File>,
     ) -> Arc<BlobFetch<Self>> {
-        BlobFetch::new(
+        BlobFetch::with_settings(
             "dir",
             settings.clone(),
             Self {

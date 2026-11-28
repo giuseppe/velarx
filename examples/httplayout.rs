@@ -42,7 +42,6 @@ use std::io::Read;
 use std::sync::OnceLock;
 use velarx_content::blob_fetch::{BlobFetch, Blobs};
 use velarx_content::fetcher::fetch::FetcherError;
-use velarx_content::list::HelperSettings;
 use velarx_content::serve_fetch::Scope;
 use velarx_types::digest::Digest;
 use velarx_types::transport::ImageLocation;
@@ -173,8 +172,7 @@ impl Blobs for HttpLayout {
 
 fn main() -> std::io::Result<()> {
     velarx_content::serve_fetch::main(|| {
-        let settings = HelperSettings::of(&velarx_config::Config::default());
         let client = OnceLock::new();
-        BlobFetch::new("httplayout", settings, HttpLayout { client })
+        BlobFetch::new("httplayout", HttpLayout { client })
     })
 }

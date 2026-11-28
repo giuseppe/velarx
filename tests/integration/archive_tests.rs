@@ -592,11 +592,8 @@ async fn test_a_transport_is_an_origin_of_pulls() {
     let archive =
         velarx_content::archive::Archive::open(spooled(&oci), &staging, |_| 1 << 30).unwrap();
     let image = archive.images().unwrap().remove(0);
-    let transport = velarx_content::blob_fetch::BlobFetch::new(
-        "s3",
-        velarx_content::list::HelperSettings::of(&velarx_config::Config::default()),
-        ArchiveTransport { archive, image },
-    );
+    let transport =
+        velarx_content::blob_fetch::BlobFetch::new("s3", ArchiveTransport { archive, image });
     let socket = dir.path().join("s3.sock");
     let _served = velarx_content::serve_fetch::serve_in_thread(
         std::os::unix::net::UnixListener::bind(&socket).unwrap(),
@@ -702,9 +699,9 @@ async fn test_a_layout_over_http_is_pulled_by_a_one_off_command() {
 
     // the command is a script that notes its start, runs the example as its
     // child and then writes to a fifo, which the test reads: a line comes
-    // when an example ended (the pull starts one for its metadata and one
-    // for its layers).  Both ends open the fifo to read and write, so that
-    // neither waits for the other to open it.
+    // when an example ended (the pull starts one, whose connections the
+    // metadata and the layers share).  Both ends open the fifo to read and
+    // write, so that neither waits for the other to open it.
     let (fifo, starts) = (dir.path().join("gone"), dir.path().join("starts"));
     assert!(std::process::Command::new("mkfifo")
         .arg(&fifo)
@@ -758,7 +755,7 @@ async fn test_a_layout_over_http_is_pulled_by_a_one_off_command() {
     );
     // every process of the pull is gone
     let started = std::fs::read_to_string(&starts).unwrap().lines().count();
-    assert!(started >= 1);
+    assert_eq!(started, 1, "the pull starts the command once");
     let gone = tokio::task::spawn_blocking(move || {
         std::io::BufRead::lines(std::io::BufReader::new(ended))
             .take(started)

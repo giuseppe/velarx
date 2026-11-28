@@ -23,16 +23,9 @@ const MAX_INDEX: usize = 4096;
 pub(super) enum Via {
     /// `velarx-dir --origin`
     Path(Arc<velarx_content::pull::net::origin::PathOrigin>),
-    /// A transport's process, scoped to the location of the pull
-    Transport {
-        reach: velarx_config::Reach,
-        location: String,
-        tls_verify: bool,
-        access: Option<velarx_content::fetcher::fetch_client::Access>,
-        scheme: String,
-        /// How long it may be silent in a call (`idle_timeout_secs`)
-        idle: std::time::Duration,
-    },
+    /// A transport's process, scoped to the location of the pull: its
+    /// metadata connection hands out the one of the walker
+    Transport { net: OriginNet, scheme: String },
 }
 
 impl Via {
@@ -116,8 +109,6 @@ impl ImageService {
         sources: Option<&[String]>,
         manifest: &[u8],
     ) -> ImageResult<Arc<velarx_content::pull::staged_fetch::StagedFetch>> {
-        use velarx_content::fetcher::fetch_client::{Access, Scoping};
-        use velarx_content::pull::net::origin::image_error_of;
         use velarx_content::pull::staged_fetch::StagedFetch;
         let names = self.origin_sources(sources)?;
         let before = self.source_links(&names).await;
@@ -127,38 +118,7 @@ impl ImageService {
                 (path.connect().await?, self.origin()?.idle()),
                 via.party().to_string(),
             ),
-            Via::Transport {
-                reach,
-                location,
-                tls_verify,
-                access,
-                scheme,
-                idle,
-            } => {
-                let mut conn = velarx_content::list::connect_reach(reach)
-                    .await
-                    .map_err(|e| {
-                        ImageError::transfer(
-                            scheme.clone(),
-                            velarx_proto::transfer::FailureClass::Unavailable,
-                            e.to_string(),
-                        )
-                    })?;
-                conn.get_info()
-                    .await
-                    .map_err(|e| image_error_of(scheme, e))?;
-                conn.open(Scoping {
-                    verity,
-                    source: Some(location),
-                    tls_verify: Some(*tls_verify),
-                    target: None,
-                    access: Access::fds(access.as_ref()).into_iter().next(),
-                    idle: *idle,
-                })
-                .await
-                .map_err(|e| image_error_of(scheme, e))?;
-                ((conn, *idle), scheme.clone())
-            }
+            Via::Transport { net, scheme } => ((net.connect().await?, net.idle()), scheme.clone()),
         };
         StagedFetch::open_scoped(before, end, &name, &self.staging_dir, verity, manifest).await
     }
@@ -255,23 +215,19 @@ impl ImageService {
                     .transpose()
                     .map_err(ImageError::Io)?
                     .flatten();
+                let net = OriginNet::of_transport(
+                    def.reach(),
+                    std::time::Duration::from_secs(def.idle_timeout_secs),
+                    location.clone(),
+                    options.tls_verify,
+                )
+                .with_access(access)
+                .with_verity(self.staging_verity());
                 (
-                    Net::Origin(
-                        OriginNet::of_transport(
-                            def.reach(),
-                            std::time::Duration::from_secs(def.idle_timeout_secs),
-                            location.clone(),
-                            options.tls_verify,
-                        )
-                        .with_access(access.clone()),
-                    ),
+                    Net::Origin(net.clone()),
                     Via::Transport {
-                        reach: def.reach(),
-                        location: location.clone(),
-                        tls_verify: options.tls_verify,
-                        access,
+                        net,
                         scheme: scheme.clone(),
-                        idle: std::time::Duration::from_secs(def.idle_timeout_secs),
                     },
                     Some(scheme.clone()),
                 )

@@ -49,9 +49,19 @@ pub struct BlobFetch<B> {
 }
 
 impl<B: Blobs> BlobFetch<B> {
-    /// The fetcher `name` of `blobs`; `settings` are the limits of the layers
+    /// The fetcher `name` of `blobs`, with the default limits for the layers
     /// it unpacks.
-    pub fn new(name: &'static str, settings: HelperSettings, blobs: B) -> Arc<Self> {
+    pub fn new(name: &'static str, blobs: B) -> Arc<Self> {
+        Self::with_settings(
+            name,
+            HelperSettings::of(&velarx_config::Config::default()),
+            blobs,
+        )
+    }
+
+    /// [`BlobFetch::new`] with the limits `settings` for the layers it
+    /// unpacks.
+    pub fn with_settings(name: &'static str, settings: HelperSettings, blobs: B) -> Arc<Self> {
         Arc::new(Self {
             name,
             settings,
@@ -214,8 +224,7 @@ mod tests {
     async fn a_fetcher_of_blobs_gives_the_manifest_and_the_blobs_of_the_origin() {
         let data = b"the manifest".to_vec();
         let digest = crate::sha256(&data);
-        let settings = HelperSettings::of(&velarx_config::Config::default());
-        let fetcher = BlobFetch::new("one", settings, One(data.clone()));
+        let fetcher = BlobFetch::new("one", One(data.clone()));
         let (file, media_type) = fetcher
             .get_file(&scope(), FileKind::Manifest, None, 1 << 20)
             .await

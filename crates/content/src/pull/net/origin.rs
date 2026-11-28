@@ -154,6 +154,9 @@ pub struct OriginNet {
     tls_verify: bool,
     /// The credentials and certificates of the command, for the scope
     access: Option<Access>,
+    /// fs-verity is enabled on the files of the process before they have
+    /// their name
+    verity: bool,
     conn: Arc<tokio::sync::Mutex<Option<FetchConn>>>,
     /// Asked in order: the registry, and fetchers for what a digest names
     sources: Vec<Source>,
@@ -184,6 +187,7 @@ impl OriginNet {
             repository,
             tls_verify,
             access: None,
+            verity: false,
             conn: Arc::default(),
             sources: vec![Source::Registry],
         }
@@ -197,6 +201,7 @@ impl OriginNet {
             repository: String::new(),
             tls_verify: false,
             access: None,
+            verity: false,
             conn: Arc::default(),
             sources: vec![Source::Registry],
         }
@@ -216,13 +221,22 @@ impl OriginNet {
             repository: location,
             tls_verify,
             access: None,
+            verity: false,
             conn: Arc::default(),
             sources: vec![Source::Registry],
         }
     }
 
+    /// Another connection with the scope of the origin (`Connect`), for the
+    /// calls with replies to come.
+    pub async fn connect(&self) -> ImageResult<FetchConn> {
+        let mut slot = self.conn.lock().await;
+        let conn = self.scoped(&mut slot).await?;
+        conn.connect().await.map_err(|e| self.failed(e))
+    }
+
     /// How long the fetcher may be silent in a call.
-    fn idle(&self) -> std::time::Duration {
+    pub fn idle(&self) -> std::time::Duration {
         match &self.via {
             Via::Registry(origin) => origin.idle(),
             Via::Path(path) => path.idle,
@@ -250,6 +264,13 @@ impl OriginNet {
     /// memory file the fetcher reads; none: it uses its own).
     pub fn with_access(mut self, access: Option<Access>) -> Self {
         self.access = access;
+        self
+    }
+
+    /// The scope has fs-verity enabled on the files the process writes
+    /// before they have their name.
+    pub fn with_verity(mut self, verity: bool) -> Self {
+        self.verity = verity;
         self
     }
 
@@ -281,7 +302,7 @@ impl OriginNet {
                 }
             };
             conn.open(Scoping {
-                verity: false,
+                verity: self.verity,
                 source: Some(&self.repository),
                 tls_verify: Some(self.tls_verify),
                 target: None,

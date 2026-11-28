@@ -53,8 +53,7 @@
 //!     }
 //! }
 //! fn main() -> std::io::Result<()> {
-//!     let settings = HelperSettings::of(&velarx_config::Config::default());
-//!     serve_fetch::main(|| BlobFetch::new("here", settings, Here("/srv/blobs".into())))
+//!     serve_fetch::main(|| BlobFetch::new("here", Here("/srv/blobs".into())))
 //! }
 //! ```
 
