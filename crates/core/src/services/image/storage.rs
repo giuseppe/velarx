@@ -266,7 +266,7 @@ impl ImageService {
             return Ok(());
         };
         if let Some(held) = layers.iter().find(|l| l.key == key && l.inline != 0) {
-            leave_inlined(held);
+            leave_inlined(&held.key, held.inline);
             return Err(ImageError::Storage(format!(
                 "image {}: the layer {key}: {}; it holds files in its image: remove the image and pull it again",
                 image.id, lost.message
@@ -426,7 +426,7 @@ impl ImageService {
         let image = self.db.get_image(image_id).await?;
         let layers = self.db.get_image_layers(image_id).await?;
         if let Some(held) = layers.iter().find(|l| l.inline != 0) {
-            leave_inlined(held);
+            leave_inlined(&held.key, held.inline);
             return Err(ImageError::Storage(format!(
                 "the layer {} holds files in its EROFS image, which cannot be made again from the table of contents",
                 held.key
@@ -451,12 +451,14 @@ impl ImageService {
     }
 }
 
-/// Say that `layer`, which holds files in its EROFS image, is left as it is:
-/// nothing is fetched for it, and it stays recorded as it is.
-fn leave_inlined(layer: &LayerRecord) {
+/// Say that the layer `key`, whose EROFS image holds files (`inline` is its
+/// threshold), is left as it is: a repair makes it again from its table of
+/// contents alone, which has not these files, and fetches nothing.  Damage to
+/// the image, or another threshold, is mended by removing the image with
+/// `velarx rmi` and pulling it again.
+pub(crate) fn leave_inlined(key: &LayerKey, inline: i64) {
     debug!(
-        "Layer {} holds files in its EROFS image (inline threshold {}): it stays as it is, nothing is fetched for it; to make it again, with another threshold too, remove its image with `velarx rmi` and pull it again",
-        layer.key, layer.inline
+        "Layer {key} holds files in its EROFS image (inline threshold {inline}): a repair does not make it again and fetches nothing, it stays as it is; to mend a damaged image, or to pull it with another threshold, remove the image with `velarx rmi` and pull it again"
     );
 }
 

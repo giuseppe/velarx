@@ -126,9 +126,12 @@ The image of such a layer is not the one its table of contents alone makes,
 so the digest of it that a manifest states can never be the recorded one:
 `composefs_digests = "require"` and `verity=enforce` fail for it as for any
 other mismatch.  A manifest that velarx writes states the digest of the image
-made from the table of contents alone.  `system check` does not fetch what
-an inlined layer lacks: a layer to be made again with another threshold is
-removed with `velarx rmi` and pulled again.
+made from the table of contents alone.  A full `system check` reads the
+image in pieces against its record and each held file against its digest.
+A check never fetches: a damaged image of a stored layer is the only copy of
+its small files, so `--repair` leaves the layer as it is and says in the
+debug log that it is removed with `velarx rmi` and pulled again (as is a
+layer to be made with another threshold).
 
 A lazy pull (`pull --lazy`) with N other than 0 fetches the files of at most
 N bytes before it makes the image of a layer, keeps them staged with the

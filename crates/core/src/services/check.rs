@@ -70,6 +70,10 @@ enum Fix {
     DropRows(Vec<String>),
     /// Make the composefs images of the image again.
     Remake,
+    /// Nothing: the image of this layer holds files itself (`inline` is its
+    /// threshold), which no table of contents makes again and a check does
+    /// not fetch.
+    Held(velarx_db::LayerKey, i64),
     /// Make the images of the staged layers of the pull again.
     RemakeStaged(String),
     /// Finish the pull `id`: nothing completes it.
@@ -625,7 +629,14 @@ impl CheckService {
                         message: p.message,
                         path: p.path,
                         // (made again once the objects are known to be whole)
-                        fix: if p.repair { Fix::Remake } else { Fix::None },
+                        fix: match layers
+                            .iter()
+                            .find(|l| Some(l.key) == p.layer && l.inline != 0)
+                        {
+                            Some(l) => Fix::Held(l.key, l.inline),
+                            None if p.repair => Fix::Remake,
+                            None => Fix::None,
+                        },
                         damaged: content_damaged,
                     });
                 }
@@ -1098,7 +1109,7 @@ impl CheckService {
                         completing.push(id.clone());
                         true
                     }
-                    Fix::None | Fix::Remake | Fix::EnableVerity(..) => false,
+                    Fix::None | Fix::Remake | Fix::Held(..) | Fix::EnableVerity(..) => false,
                 };
                 done_store.push(f.into_problem(if action {
                     CheckAction::Repaired
@@ -1123,6 +1134,17 @@ impl CheckService {
             let damaged = c.findings.iter().any(|f| f.damaged);
             let mut action = CheckAction::Repaired;
             let mut note = None;
+            let held: HashSet<_> = c
+                .findings
+                .iter()
+                .filter_map(|f| match f.fix {
+                    Fix::Held(key, inline) => Some((key, inline)),
+                    _ => None,
+                })
+                .collect();
+            for (key, inline) in held {
+                crate::services::image::leave_inlined(&key, inline);
+            }
             if damaged {
                 let mut users = self.db.containers_using_image(&c.image.id).await?;
                 if lossy && !users.is_empty() {

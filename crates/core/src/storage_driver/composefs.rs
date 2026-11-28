@@ -566,11 +566,15 @@ fn make_layer_images(
 
 /// What is wrong with the image of a layer at `path`, recorded with the
 /// fs-verity digest `recorded`; `full` reads it, and compares it with the
-/// image its table of contents makes.
+/// image its table of contents makes.  A layer whose image holds files
+/// itself (`held`: its threshold and where each file is) has no image its
+/// table alone makes: `full` reads it in pieces, never whole in memory, and
+/// hashes each file it holds against the digest the table gives.
 fn layer_problems(
     path: &Path,
     recorded: Option<&str>,
     toc: Option<&velarx_storage::Toc>,
+    held: Option<(i64, &[velarx_db::InlinedFile])>,
     full: bool,
 ) -> Vec<Problem> {
     use std::os::unix::fs::PermissionsExt;
@@ -633,6 +637,16 @@ fn layer_problems(
     if !full {
         return found;
     }
+    // (in the algorithm of the digest the layer records)
+    let alg = recorded
+        .parse::<Digest>()
+        .map_or(Algorithm::Sha256, |d| d.alg());
+    if let Some((threshold, extents)) = held {
+        found.extend(held_problems(
+            path, &file, alg, recorded, threshold, toc, extents,
+        ));
+        return found;
+    }
     let mut bytes = Vec::new();
     if let Err(e) = std::io::Read::read_to_end(&mut file, &mut bytes) {
         found.push(problem(
@@ -642,10 +656,6 @@ fn layer_problems(
         ));
         return found;
     }
-    // (in the algorithm of the digest the layer records)
-    let alg = recorded
-        .parse::<Digest>()
-        .map_or(Algorithm::Sha256, |d| d.alg());
     let digest = velarx_storage::composefs_digest_of(alg, &bytes);
     if digest != recorded {
         found.push(problem(
@@ -669,6 +679,94 @@ fn layer_problems(
                 path,
                 format!("the table of contents of the layer makes no image: {e}"),
             )),
+        }
+    }
+    found
+}
+
+/// The fs-verity digest of `len` bytes of `file` from `offset`, read in
+/// pieces of a MiB.
+fn verity_of_range(
+    file: &std::fs::File,
+    alg: Algorithm,
+    offset: u64,
+    len: u64,
+) -> std::io::Result<Digest> {
+    use std::os::unix::fs::FileExt;
+    let mut hasher = velarx_storage::VerityHasher::new(alg);
+    let mut piece = vec![0; 1 << 20];
+    let mut done = 0;
+    while done < len {
+        let n = piece.len().min((len - done) as usize);
+        file.read_exact_at(&mut piece[..n], offset + done)?;
+        hasher.update(&piece[..n]);
+        done += n as u64;
+    }
+    Digest::parse_fsverity(&hasher.finish()).map_err(std::io::Error::other)
+}
+
+/// What is wrong with the image `file` (at `path`, recorded as `recorded`)
+/// of a layer that holds the files of its table of contents up to
+/// `threshold` itself, at `extents`: the image, then each of those files,
+/// against its digest.
+fn held_problems(
+    path: &Path,
+    file: &std::fs::File,
+    alg: Algorithm,
+    recorded: &str,
+    threshold: i64,
+    toc: Option<&Toc>,
+    extents: &[velarx_db::InlinedFile],
+) -> Vec<Problem> {
+    let mut found = Vec::new();
+    let mut bad = |kind, message: String| found.push(problem(kind, path, message));
+    match file
+        .metadata()
+        .and_then(|m| verity_of_range(file, alg, 0, m.len()))
+    {
+        Ok(digest) if digest.plain() != recorded => bad(
+            ProblemKind::ArtifactIdMismatch,
+            format!(
+                "the EROFS image has the fs-verity digest {}, its layer records {recorded}",
+                digest.plain()
+            ),
+        ),
+        Ok(_) => {}
+        Err(e) => bad(
+            ProblemKind::ArtifactUnreadable,
+            format!("cannot read the EROFS image of the layer: {e}"),
+        ),
+    }
+    let held = toc.iter().flat_map(|t| &t.entries).filter(|e| {
+        e.entry_type == velarx_storage::TocEntryType::Reg
+            && velarx_types::holds_inline(threshold, e.size)
+    });
+    let mut seen = std::collections::HashSet::new();
+    for (name, digest) in held.filter_map(|e| Some((&e.name, e.verity()?))) {
+        if !seen.insert(digest.clone()) {
+            continue;
+        }
+        let Some(extent) = extents.iter().find(|x| x.digest == digest) else {
+            bad(
+                ProblemKind::ObjectMissing,
+                format!(
+                    "the EROFS image of the layer does not say where it holds `{name}` ({digest})"
+                ),
+            );
+            continue;
+        };
+        match verity_of_range(file, alg, extent.offset, extent.size) {
+            Ok(got) if got.to_string() != digest => bad(
+                ProblemKind::ObjectDiffers,
+                format!(
+                    "the file `{name}` the EROFS image of the layer holds has the fs-verity digest {got}, its table of contents says {digest}"
+                ),
+            ),
+            Ok(_) => {}
+            Err(e) => bad(
+                ProblemKind::ObjectDiffers,
+                format!("cannot read the file `{name}` the EROFS image of the layer holds: {e}"),
+            ),
         }
     }
     found
@@ -1927,18 +2025,27 @@ impl StorageDriver for ComposefsDriver {
         full: bool,
     ) -> DriverResult<Vec<Problem>> {
         let mut tocs = Vec::with_capacity(layers.len());
+        let mut held = Vec::with_capacity(layers.len());
         for l in layers {
             // (a table that cannot be read is no table: the layer's problems
-            // say so; the image of a layer that holds files is not the one
-            // of its table alone, there is none to compare it with)
-            let toc = match l.inline {
-                0 => velarx_content::pull::stored::stored_toc(&self.db, &l.key)
-                    .await
-                    .ok()
-                    .flatten(),
-                _ => None,
-            };
+            // say so)
+            let toc = velarx_content::pull::stored::stored_toc(&self.db, &l.key)
+                .await
+                .ok()
+                .flatten();
             tocs.push(toc);
+            held.push(match l.inline {
+                0 => None,
+                inline => {
+                    let files = self.db.layer_inlined_files(&l.key).await.map_err(|e| {
+                        DriverError::storage(
+                            NAME,
+                            format!("the files the layer {} holds: {e}", l.key),
+                        )
+                    })?;
+                    Some((inline, files))
+                }
+            });
         }
         let mut dirs = self.stores();
         // (the images of the layers of a pull in progress are in the
@@ -2021,12 +2128,20 @@ impl StorageDriver for ComposefsDriver {
         tokio::task::spawn_blocking(move || {
             let mut found = Vec::new();
             let refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
-            for (((stem, recorded), toc), key) in layers.iter().zip(&tocs).zip(&keys) {
+            for ((((stem, recorded), toc), held), key) in
+                layers.iter().zip(&tocs).zip(&held).zip(&keys)
+            {
                 let path = cfs::find_layer_image(&refs, stem)
                     .map(|(p, _)| p)
                     .unwrap_or_else(|| cfs::layer_image_path(&dirs[0], stem));
                 found.extend(
-                    layer_problems(&path, recorded.as_deref(), toc.as_ref(), full)
+                    layer_problems(
+                        &path,
+                        recorded.as_deref(),
+                        toc.as_ref(),
+                        held.as_ref().map(|(n, x)| (*n, x.as_slice())),
+                        full,
+                    )
                         .into_iter()
                         .map(|p| Problem {
                             layer: Some(*key),
@@ -2035,7 +2150,12 @@ impl StorageDriver for ComposefsDriver {
                 );
             }
             if let (Some((alg, want)), true) = (&sealed, full) {
-                let all: Option<Vec<&Toc>> = tocs.iter().map(Option::as_ref).collect();
+                // (the image of a layer that holds files is not made of objects)
+                let all: Option<Vec<&Toc>> = tocs
+                    .iter()
+                    .zip(&held)
+                    .map(|(toc, held)| toc.as_ref().filter(|_| held.is_none()))
+                    .collect();
                 if let Some(all) = all {
                     let open = |key: &str, size| {
                         objects::open_object(NAME, &db, &store, &staging, key, size)
@@ -2567,10 +2687,10 @@ mod tests {
             velarx_storage::composefs_digest_of(velarx_types::digest::Algorithm::Sha256, &bytes),
             m.image_digest
         );
-        assert!(layer_problems(&path, Some(&m.image_digest), Some(&toc), true).is_empty());
+        assert!(layer_problems(&path, Some(&m.image_digest), Some(&toc), None, true).is_empty());
         let kinds = |p: Vec<Problem>| p.into_iter().map(|p| p.kind).collect::<Vec<_>>();
         assert_eq!(
-            kinds(layer_problems(&path, None, None, true)),
+            kinds(layer_problems(&path, None, None, None, true)),
             [ProblemKind::ArtifactMissing]
         );
         let other = Toc {
@@ -2582,6 +2702,7 @@ mod tests {
                 &path,
                 Some(&m.image_digest),
                 Some(&other),
+                None,
                 true
             )),
             [ProblemKind::ArtifactDiffers]
@@ -2593,6 +2714,7 @@ mod tests {
                 &path,
                 Some(&m.image_digest),
                 Some(&toc),
+                None,
                 true
             )),
             [
@@ -2607,9 +2729,103 @@ mod tests {
                 &path,
                 Some(&m.image_digest),
                 Some(&toc),
+                None,
                 false
             )),
             [ProblemKind::ArtifactMissing]
+        );
+    }
+
+    /// A layer image that holds the files `a` (50 bytes) and `b` (a few
+    /// blocks) itself: its path (read-only), the table of contents, the
+    /// extents and the digest recorded.
+    fn held_layer(dir: &Path) -> (PathBuf, Toc, Vec<velarx_db::InlinedFile>, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let contents: HashMap<Digest, Vec<u8>> = [("a", 50), ("b", 10_000)]
+            .into_iter()
+            .map(|(name, size)| {
+                let data = vec![name.as_bytes()[0]; size];
+                let digest = velarx_storage::fsverity_digest_of(Algorithm::Sha256, &data);
+                (Digest::parse_fsverity(&digest).unwrap(), data)
+            })
+            .collect();
+        let entries: Vec<TocEntry> = ["a", "b"]
+            .into_iter()
+            .map(|name| {
+                let (digest, data) = contents
+                    .iter()
+                    .find(|(_, d)| d[0] == name.as_bytes()[0])
+                    .unwrap();
+                let mut e = entry(name, TocEntryType::Reg);
+                (e.size, e.fsverity) = (data.len() as u64, Some(*digest));
+                e
+            })
+            .collect();
+        let open = |d: &Digest| {
+            let path = dir.join(d.hex());
+            std::fs::write(&path, &contents[d])?;
+            std::fs::File::open(path)
+        };
+        let inline = velarx_fuse::layer_erofs::Inline {
+            threshold: -1,
+            open: &open,
+        };
+        let path = dir.join("layer.erofs");
+        let mut image = Vec::new();
+        let written =
+            velarx_fuse::layer_erofs::write_layer_image(&entries, &inline, &mut image).unwrap();
+        std::fs::write(&path, &image).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let extents = written
+            .extents
+            .iter()
+            .map(|e| velarx_db::InlinedFile {
+                digest: e.digest.to_string(),
+                offset: e.offset,
+                size: e.size,
+            })
+            .collect();
+        let toc = Toc {
+            version: 1,
+            entries,
+            tar_split_digest: None,
+        };
+        let recorded = velarx_storage::composefs_digest_of(Algorithm::Sha256, &image);
+        (path, toc, extents, recorded)
+    }
+
+    /// The image of a layer that holds files is read in pieces and each file
+    /// it holds is hashed against its table of contents: whole it passes, a
+    /// byte changed in a file is found (in the image and in the file), and a
+    /// quick check does not read.
+    #[test]
+    fn a_damaged_file_a_layer_image_holds_is_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, toc, extents, recorded) = held_layer(tmp.path());
+        let check = |full| {
+            layer_problems(
+                &path,
+                Some(&recorded),
+                Some(&toc),
+                Some((-1, &extents)),
+                full,
+            )
+            .into_iter()
+            .map(|p| p.kind)
+            .collect::<Vec<_>>()
+        };
+        assert!(check(true).is_empty());
+        let big = extents.iter().max_by_key(|e| e.size).unwrap();
+        let mut image = std::fs::read(&path).unwrap();
+        image[(big.offset + big.size / 2) as usize] ^= 0xff;
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, &image).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o444))
+            .unwrap();
+        assert!(check(false).is_empty());
+        assert_eq!(
+            check(true),
+            [ProblemKind::ArtifactIdMismatch, ProblemKind::ObjectDiffers]
         );
     }
 

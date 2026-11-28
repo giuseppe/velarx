@@ -192,6 +192,7 @@ mod signatures;
 pub use signatures::SignatureJudging;
 mod squash;
 pub(crate) mod storage;
+pub(crate) use storage::leave_inlined;
 
 pub use archive::LoadedImage;
 pub use artifact::ArtifactOptions;
