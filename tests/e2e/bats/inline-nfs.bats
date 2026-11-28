@@ -13,7 +13,7 @@
 # a user that has /etc/subuid) rootless; and a lazy pull of that image on
 # the second machine fetches no layer from the registry.
 #
-#   E2E_NFS_HOST=192.168.125.213 VELARX_BINDIR=target/debug \
+#   E2E_NFS_HOST=192.0.2.2 VELARX_BINDIR=target/debug \
 #       sudo -E bats tests/e2e/bats/inline-nfs.bats
 #
 # Skipped without E2E_NFS_HOST, without root, without an NFS server on this
