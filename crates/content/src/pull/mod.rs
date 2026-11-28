@@ -596,7 +596,10 @@ pub async fn pull_layer_files(
         .ok_or_else(|| ImageError::Layer("the layer is not zstd:chunked".into()))?;
     let key = LayerKey::Toc(info.checksum);
     let ctx = ctx.clone().with_layer(key);
-    let p = chunked::complete_layer(&ctx, layer, meta, 0, diff_id, move |n| progress(n)).await?;
+    let p = chunked::complete_layer(&ctx, layer, meta, Default::default(), diff_id, move |n| {
+        progress(n)
+    })
+    .await?;
     Ok(layer_done(layer, key, p))
 }
 

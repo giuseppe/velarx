@@ -253,16 +253,16 @@ wait_profile () { e2e_wait_glob "$WORKDIR/b/store/composefs/*.profile.json" 5; }
 }
 
 # An eager pull whose only source of files is a peer: node g has node a for
-# a peer, and the registry gives only the metadata (with LAZY_DIGEST=sha512,
+# a peer, and the registry gives at most the metadata (with LAZY_DIGEST=sha512,
 # the chunks asked of the peer are sha512 ones).
-@test "a node pulls eagerly from a peer, the registry gives only the metadata" {
+@test "a node pulls eagerly from a peer, the registry gives at most the metadata" {
     local out
     [ -n "${peer_id:-}" ] || { echo "no peer id of node a (the first test failed or did not run)" >&2; exit 1; }
     node g $((PORT_A + 8)) "/ip4/127.0.0.1/tcp/$PORT_A/p2p/$peer_id" debug
     e2e_wait_line "$WORKDIR/g.p2p.log" "Connected to $peer_id" 30 || true
     out=$(sh_ g image pull --tls-verify=false "$IMAGE" 2>&1)
     check "node g pulls the image" 0 $?
-    check_match "the registry gave only the metadata" "\([0-4]\.[0-9]% registry" "$out"
+    check "the registry gave at most the metadata" "" "$(echo "$out" | grep '% registry' | grep -v '[( ][0-4]\.[0-9]% registry')"
     check_match "the peer gave the files" "(9[5-9]|100)\.[0-9]% p2p" "$out"
 }
 
@@ -270,8 +270,8 @@ wait_profile () { e2e_wait_glob "$WORKDIR/b/store/composefs/*.profile.json" 5; }
 # the first that its store had: that layer is not given to peers (not every
 # byte of it came from the registry), and the chunks the versions share are in
 # the file of the second.  The first version is still given: node f, which
-# has only node e for a peer, takes it from there, the registry gives only the
-# metadata.
+# has only node e for a peer, takes it from there, the registry gives at most
+# the metadata.
 @test "a node that pulled two versions of a file gives the first one" {
     local out i e_id
     [ -n "${VERSIONS:-}" ] || skip "no versions of the file (E2E_NO_VERSIONS)"
@@ -286,7 +286,8 @@ wait_profile () { e2e_wait_glob "$WORKDIR/b/store/composefs/*.profile.json" 5; }
     e2e_wait_line "$WORKDIR/f.p2p.log" "Connected to $e_id" 30 || true
     out=$(sh_ f image pull --tls-verify=false "$VERSIONS:1" 2>&1)
     check "node f pulls the first version" 0 $?
-    # (the text of the pull: "Total: 3.2 MB (0.4% registry, ..., 99.5% p2p)")
-    check_match "the registry gave only the metadata" "\([0-4]\.[0-9]% registry" "$out"
+    # (the text of the pull: "Total: 3.2 MB (0.4% registry, ..., 99.5% p2p)",
+    # or no registry at all when the peer gave the metadata too)
+    check "the registry gave at most the metadata" "" "$(echo "$out" | grep '% registry' | grep -v '[( ][0-4]\.[0-9]% registry')"
     check_match "the peer gave the file" "(9[5-9]|100)\.[0-9]% p2p" "$out"
 }

@@ -613,7 +613,7 @@ impl StagedFetch {
         layer: &OciDescriptor,
         again: bool,
         parts: Parts,
-    ) -> ImageResult<Option<(Vec<u8>, Vec<u8>)>> {
+    ) -> ImageResult<Option<Table>> {
         let Some(at) = self.layers.iter().position(|d| *d == layer.digest) else {
             return Err(ImageError::Layer(format!(
                 "{} is not a layer of the image",
@@ -642,7 +642,7 @@ impl StagedFetch {
         at: &[u32],
         again: bool,
         parts: Parts,
-    ) -> ImageResult<Vec<(Probed, Option<(Vec<u8>, Vec<u8>)>)>> {
+    ) -> ImageResult<Vec<(Probed, Option<Table>)>> {
         self.probed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -651,7 +651,7 @@ impl StagedFetch {
                     .filter_map(|i| self.layers.get(*i as usize))
                     .map(Digest::to_string),
             );
-        let mut found: Vec<(Probed, Option<(Vec<u8>, Vec<u8>)>)> = Vec::new();
+        let mut found: Vec<(Probed, Option<Table>)> = Vec::new();
         let mut left: Vec<u32> = at.to_vec();
         // (the layers the origin said it has no table of contents for)
         let mut told_by_origin: Vec<u32> = Vec::new();
@@ -707,7 +707,9 @@ impl StagedFetch {
                 }
                 left.retain(|l| *l != reply.layer);
                 found.retain(|(r, _)| r.layer != reply.layer);
-                found.push((reply, metadata));
+                let by = (self.origin != Some(fetcher_at)).then(|| fetcher.name.clone());
+                let table = metadata.map(|(toc_z, ts_z)| Table { toc_z, ts_z, by });
+                found.push((reply, table));
             }
         }
         for layer in at {
@@ -1678,6 +1680,26 @@ enum Said {
     Failed(ImageError),
 }
 
+/// The table of contents and tar-split of a layer as a fetcher gave them
+/// (compressed, not verified), and who gave them: `by` the name of the
+/// fetcher, none for the origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Table {
+    pub toc_z: Vec<u8>,
+    pub ts_z: Vec<u8>,
+    pub by: Option<String>,
+}
+
+impl Table {
+    /// The bytes of the table and tar-split, counted under who gave them.
+    pub fn walked(&self) -> Walked {
+        Walked::of(
+            self.by.as_deref(),
+            (self.toc_z.len() + self.ts_z.len()) as u64,
+        )
+    }
+}
+
 /// What a walk of the list for the files of a layer brought.
 #[derive(Debug, Default, Clone)]
 pub struct Walked {
@@ -1690,6 +1712,24 @@ pub struct Walked {
 }
 
 impl Walked {
+    /// `bytes` brought by the fetcher `by` (the origin: none).
+    pub fn of(by: Option<&str>, bytes: u64) -> Walked {
+        match by {
+            None => Walked {
+                bytes,
+                ..Walked::default()
+            },
+            Some(name) => Walked {
+                bytes: 0,
+                sources: vec![velarx_proto::workload::BySource {
+                    name: name.to_string(),
+                    bytes,
+                    files: 0,
+                }],
+            },
+        }
+    }
+
     /// What another walk brought, counted in.
     pub fn add(&mut self, other: Walked) {
         self.bytes = self.bytes.saturating_add(other.bytes);
@@ -2406,6 +2446,7 @@ mod tests {
                 staged.probe_all(&[0], false, parts).await.unwrap()[0]
                     .1
                     .clone()
+                    .map(|t| (t.toc_z, t.ts_z))
             }
         };
         let (toc, ts) = (b"toc".to_vec(), b"ts".to_vec());
@@ -2415,7 +2456,8 @@ mod tests {
         let both = carrying(|_| (true, true));
         let staged = pull(&[], &both).await;
         let got = staged.probe_all(&[0], false, Parts::Toc).await.unwrap();
-        assert_eq!(got[0].1, Some((toc, ts)));
+        let table = got[0].1.clone().unwrap();
+        assert_eq!((table.toc_z, table.ts_z), (toc, ts));
         let wrong = carrying(|_| (true, false));
         let staged = pull(&[], &wrong).await;
         let got = staged
@@ -2423,6 +2465,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((got[0].0.toc, &got[0].1), (TocSource::None, &None));
+    }
+
+    /// The table a fetcher before the origin gave is counted under its
+    /// name, the one of the origin under the origin.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_table_is_counted_under_who_gave_it() {
+        let both = || {
+            LocalFetcher::start(
+                Arc::new(Carries {
+                    carry: |_| (true, true),
+                }),
+                Limits::default(),
+            )
+            .unwrap()
+        };
+        let (peers, registry) = (both(), both());
+        let staged = pull(&[("peers", &peers)], &registry).await;
+        let got = staged.probe_all(&[0], false, Parts::All).await.unwrap();
+        let walked = got[0].1.as_ref().unwrap().walked();
+        assert_eq!(walked.bytes, 0);
+        assert_eq!(
+            walked
+                .sources
+                .iter()
+                .map(|s| (s.name.as_str(), s.bytes))
+                .collect::<Vec<_>>(),
+            [("peers", 5)]
+        );
+        let staged = pull(&[], &registry).await;
+        let got = staged.probe_all(&[0], false, Parts::All).await.unwrap();
+        let walked = got[0].1.as_ref().unwrap().walked();
+        assert_eq!((walked.bytes, walked.sources.len()), (5, 0));
     }
 
     /// The list is walked as given: the registry fetcher where the sources

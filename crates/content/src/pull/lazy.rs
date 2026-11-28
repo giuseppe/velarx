@@ -14,6 +14,7 @@
 
 use super::chunked::{self, Info};
 use super::entry;
+use super::staged_fetch::Table;
 use super::tar::TarReader;
 use super::tarsplit::{self, Contents, Entries, Replay};
 use super::{LayerReport, PullCtx};
@@ -127,30 +128,29 @@ pub async fn pull_metadata(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<
     };
     // (the fetcher finds the table: `Probe`; what it gives is verified
     // below; the tar-split waits for the completion)
-    let (toc_z, ts_z) = chunked::metadata(ctx, layer, Parts::Toc).await?;
-    found_of(info, toc_z, ts_z, layer.digest, max_tar)
-        .await
-        .map(Some)
+    let table = chunked::metadata(ctx, layer, Parts::Toc).await?;
+    found_of(info, table, layer.digest, max_tar).await.map(Some)
 }
 
 /// The lazy layer of `layer` from its table of contents and tar-split as
 /// the fetcher gave them (compressed), verified against the descriptor's
-/// `info`.
+/// `info`; their bytes are counted under the fetcher that gave them.
 async fn found_of(
     info: Info,
-    toc_z: Vec<u8>,
-    ts_z: Vec<u8>,
+    table: Table,
     layer_digest: Digest,
     max_tar: u64,
 ) -> ImageResult<Found> {
-    let fetched = (toc_z.len() + ts_z.len()) as u64;
-    let meta = chunked::verified(&info, toc_z, ts_z, layer_digest, max_tar, true).await?;
+    let fetched = table.walked();
+    let meta =
+        chunked::verified(&info, table.toc_z, table.ts_z, layer_digest, max_tar, true).await?;
     let lazy = LazyLayer {
         toc: meta.stored,
         tarsplit: meta.tarsplit_z,
         toc_z: meta.toc_z,
         report: LayerReport {
-            fetched_bytes: fetched,
+            fetched_bytes: fetched.bytes,
+            sources: fetched.sources,
             ..LayerReport::default()
         },
     };
@@ -165,17 +165,17 @@ async fn found_of(
 pub async fn accept(
     layer: &OciDescriptor,
     reply: &crate::fetcher::fetch::Probed,
-    metadata: Option<(Vec<u8>, Vec<u8>)>,
+    metadata: Option<Table>,
     max_tar: u64,
 ) -> ImageResult<Result<Found, crate::fetcher::fetch::NotLazy>> {
     use crate::fetcher::fetch::{NotLazy as Why, TocSource};
     let Some(info) = chunked::parse_info(layer)? else {
         return Ok(Err(Why::NoToc));
     };
-    let (TocSource::Carried, Some((toc_z, ts_z))) = (reply.toc, metadata) else {
+    let (TocSource::Carried, Some(table)) = (reply.toc, metadata) else {
         return Ok(Err(reply.not_lazy.unwrap_or(Why::Unreachable)));
     };
-    let found = found_of(info, toc_z, ts_z, layer.digest, max_tar).await?;
+    let found = found_of(info, table, layer.digest, max_tar).await?;
     Ok(reply.not_lazy.map_or(Ok(found), Err))
 }
 

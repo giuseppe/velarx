@@ -204,7 +204,7 @@ pub(super) async fn metadata(
     ctx: &PullCtx,
     layer: &OciDescriptor,
     parts: Parts,
-) -> ImageResult<(Vec<u8>, Vec<u8>)> {
+) -> ImageResult<super::staged_fetch::Table> {
     let staged = ctx
         .staged
         .as_ref()
@@ -223,11 +223,11 @@ pub async fn layer_index(ctx: &PullCtx, layer: &OciDescriptor) -> ImageResult<Op
         return Ok(None);
     };
     let by_table = async {
-        let (toc_z, ts_z) = metadata(ctx, layer, Parts::All).await?;
+        let table = metadata(ctx, layer, Parts::All).await?;
         verified(
             &info,
-            toc_z,
-            ts_z,
+            table.toc_z,
+            table.ts_z,
             layer.digest,
             ctx.limits.max_layer_bytes,
             false,
@@ -1772,17 +1772,17 @@ async fn pull_by_table(
     let started = std::time::Instant::now();
     // (what a fetcher found is verified below, as what the registry gives
     // is)
-    let (toc_z, ts_z) = metadata(ctx, layer, Parts::All).await?;
+    let table = metadata(ctx, layer, Parts::All).await?;
     debug!(
         "Layer {}: metadata fetched after {:?}",
         layer.digest,
         started.elapsed()
     );
-    let metadata_bytes = (toc_z.len() + ts_z.len()) as u64;
+    let fetched = table.walked();
     let meta = verified(
         info,
-        toc_z,
-        ts_z,
+        table.toc_z,
+        table.ts_z,
         layer.digest,
         ctx.limits.max_layer_bytes,
         false,
@@ -1794,17 +1794,18 @@ async fn pull_by_table(
         layer.digest,
         started.elapsed()
     );
-    complete_layer(ctx, layer, meta, metadata_bytes, expected_diff_id, progress).await
+    complete_layer(ctx, layer, meta, fetched, expected_diff_id, progress).await
 }
 
 /// Fetch what the store lacks of a layer whose metadata is known and check
 /// the layer against `expected_diff_id` by replaying its tar-split.  This is
 /// what ends a lazy pull too: the files fetched on demand are in the store.
+/// `fetched`: what the metadata of the layer took, by who gave it.
 pub async fn complete_layer(
     ctx: &PullCtx,
     layer: &OciDescriptor,
     meta: Metadata,
-    metadata_bytes: u64,
+    fetched: super::staged_fetch::Walked,
     expected_diff_id: &Digest,
     progress: impl Fn(u64) + Send + Sync + 'static,
 ) -> ImageResult<Pulled> {
@@ -1812,12 +1813,11 @@ pub async fn complete_layer(
     // The files the store lacks are brought by the fetcher into
     // the layer's staging and given to the session: the plan then finds
     // them there, and the replay checks them with the rest.
-    let mut metadata_bytes = metadata_bytes;
     // (a sink of the engine's store takes the files as they are; the files
     // of a storage driver are copied to their places and measured there)
     let staged_sink = !ctx.sink.proves_in_fetch() || ctx.sink.clone().session().is_some();
     let mut ctx = std::borrow::Cow::Borrowed(ctx);
-    let mut sourced = super::staged_fetch::Walked::default();
+    let mut sourced = fetched;
     let mut staged_files = (0u64, 0u64);
     if let (Some(staged), true) = (&ctx.staged, staged_sink) {
         // (an eager pull holds the lease of the layer since before its plan of
@@ -1856,7 +1856,7 @@ pub async fn complete_layer(
             drop(mine);
             if !claim.keys().is_empty() {
                 let reuse = reuse_hints(&ctx, &plan, staging.dir()).await?;
-                sourced = staged
+                let walked = staged
                     .fetch_files(
                         &staging,
                         layer,
@@ -1866,6 +1866,7 @@ pub async fn complete_layer(
                         &progress,
                     )
                     .await?;
+                sourced.add(walked);
             }
             claim.done();
             let mut left = Vec::new();
@@ -1888,7 +1889,6 @@ pub async fn complete_layer(
                     .await?;
                 sourced.add(more);
             }
-            metadata_bytes += sourced.bytes;
             // (what was given is there: the plan of the check fetches
             // nothing more; of a session, only what it holds of the size
             // this table gives: what another layer fetched under the same
@@ -1905,7 +1905,7 @@ pub async fn complete_layer(
         &ctx,
         layer,
         meta,
-        (metadata_bytes, started),
+        (sourced.bytes, started),
         expected_diff_id,
     )
     .await;
@@ -1914,12 +1914,14 @@ pub async fn complete_layer(
         staged.forget(&layer.digest.to_string()).await;
     }
     let mut pulled = verified?;
-    // (what the fetchers but the registry fetcher staged)
+    // (what the fetchers but the registry fetcher staged, and the files the
+    // registry fetcher staged: the others)
+    let by_sources: u64 = sourced.sources.iter().map(|s| s.files).sum();
     for s in std::mem::take(&mut sourced.sources) {
         pulled.report.sources.push(s);
     }
     let report = &mut pulled.report;
-    report.fetched_files += staged_files.0;
+    report.fetched_files += staged_files.0.saturating_sub(by_sources);
     report.reused_files = report.reused_files.saturating_sub(staged_files.0);
     report.reused_bytes = report.reused_bytes.saturating_sub(staged_files.1);
     Ok(pulled)
@@ -2235,7 +2237,9 @@ async fn unpack_by_index(
     let Some(staged) = ctx.staged.as_ref() else {
         return Ok(None);
     };
-    let Some((toc_z, ts_z)) = staged.probe(layer, again, Parts::All).await? else {
+    let Some(super::staged_fetch::Table { toc_z, ts_z, .. }) =
+        staged.probe(layer, again, Parts::All).await?
+    else {
         return Ok(None);
     };
     let (have, cap) = (ctx.have_fn(), ctx.limits.inflate_cap(layer.size));
@@ -2407,7 +2411,7 @@ async fn verify_layer(
     ctx: &PullCtx,
     layer: &OciDescriptor,
     meta: Metadata,
-    (metadata_bytes, started): (u64, std::time::Instant),
+    (origin_bytes, started): (u64, std::time::Instant),
     expected_diff_id: &Digest,
 ) -> ImageResult<Pulled> {
     let alg = LayerKey::expected(layer).digest().alg();
@@ -2455,7 +2459,7 @@ async fn verify_layer(
     let chunks = located_chunks(&toc);
     let diff_id = *expected_diff_id;
     let report = LayerReport {
-        fetched_bytes: metadata_bytes,
+        fetched_bytes: origin_bytes,
         fetched_files: 0,
         reused_bytes: plan.skipped_compressed,
         reused_files: plan.skipped_files,

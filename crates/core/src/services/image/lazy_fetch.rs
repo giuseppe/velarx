@@ -775,7 +775,7 @@ impl ImageService {
         if fetched.is_err() {
             self.reach_again(key, &ctx.walk).await;
         }
-        let (_, ts_z) = fetched?;
+        let ts_z = fetched?.ts_z;
         velarx_content::pull::chunked::check_tarsplit(toc, &ts_z)
             .map_err(|e| velarx_content::pull::chunked::naming(&ctx.desc.digest, e))?;
         Ok(ts_z.into())

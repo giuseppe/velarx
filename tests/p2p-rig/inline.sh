@@ -128,12 +128,12 @@ round () { # N_A N_B N_C
     waitpeers 1
     pull 1 "$2" "$dig"
     verify 1 "$2" "$ref" "$dig"
-    grep -q ' [1-9][0-9.]*% registry' "$OUT/n1-pull.log" && bad "node 1 got bytes from the registry"
+    grep -q '% registry' "$OUT/n1-pull.log" && bad "node 1 got bytes from the registry"
     BOOTN="0 1" node 2 || return
     waitpeers 2
     pull 2 "$3" "$dig"
     verify 2 "$3" "$ref" "$dig"
-    grep -q ' [1-9][0-9.]*% registry' "$OUT/n2-pull.log" && bad "node 2 got bytes from the registry"
+    grep -q '% registry' "$OUT/n2-pull.log" && bad "node 2 got bytes from the registry"
     p 0 serving > "$OUT/serving-$1.txt" 2>&1
 }
 

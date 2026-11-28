@@ -771,5 +771,8 @@ async fn a_layer_with_a_table_is_pulled_by_it_from_any_origin() {
     let done = rig.pull(&layer).await.unwrap();
     assert_eq!(done.key, velarx_types::LayerKey::Toc(info.checksum));
     assert_eq!(rig.origin.unpacked.load(Ordering::SeqCst), 0);
-    assert_eq!(done.report.fetched_files, 2);
+    // (the files are the peers', not the origin's)
+    assert_eq!(done.report.fetched_files, 0);
+    let peers = done.report.sources.iter().find(|s| s.name == "peers");
+    assert_eq!(peers.map(|s| s.files), Some(2));
 }
