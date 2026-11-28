@@ -232,18 +232,14 @@ method Committed(manifest: Object, digest: string, names: []string) -> ()
 # it writes (the end of an archive), the others what they hold.
 method Finish() -> ()
 
+# The request is wrong for every pusher: a bad argument or
+# descriptor, a call before `Open` or a second `Open`
 error InvalidArgument (reason: string)
-
-# A call before `Open`, an `Open` twice
-error NotScoped (reason: string)
-
-# A call this connection may not make
-error Refused (reason: string)
 
 # A destination of a kind this pusher does not do
 error NotSupported (feature: string)
 
-# No connection for this client now (its limit)
+# A limit of the pusher now (connections): not a pusher that failed
 error Busy (reason: string)
 
 # `Commit`: the destination does not have these objects

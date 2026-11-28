@@ -676,9 +676,12 @@ impl StagingFetcher for PeerSource {
                     files.files[w].positions.push(i as u32);
                     continue;
                 }
-                let &at = indexed.at.get(key).ok_or_else(|| FetcherError::Refused {
-                    reason: format!("{key} is not a file of the layer's table of contents"),
-                })?;
+                let &at = indexed
+                    .at
+                    .get(key)
+                    .ok_or_else(|| FetcherError::InvalidArgument {
+                        reason: format!("{key} is not a file of the layer's table of contents"),
+                    })?;
                 if stager::staged(&layer.staging, key) {
                     present.push(i as u32);
                     continue;

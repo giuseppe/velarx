@@ -120,7 +120,7 @@ impl<B: Blobs> StagingFetcher for BlobFetch<B> {
         })
         .await?;
         if bytes.len() as u64 > max {
-            return Err(FetcherError::TooLarge { max });
+            return Err(FetcherError::invalid(format!("larger than {max} bytes")));
         }
         Ok((sealed(&bytes)?, media_type))
     }
@@ -224,7 +224,10 @@ mod tests {
             .unwrap();
         assert_eq!((read(&file), media_type), (data.clone(), None));
         let larger = fetcher.get_file(&scope(), FileKind::Manifest, "", 4).await;
-        assert!(matches!(larger, Err(FetcherError::TooLarge { max: 4 })));
+        assert!(matches!(
+            larger.unwrap_err().failure(),
+            Some(f) if f.class == FailureClass::Invalid
+        ));
         let blob = Blob {
             digest: digest.to_string(),
             size: data.len() as u64,

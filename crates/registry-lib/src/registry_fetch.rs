@@ -277,7 +277,7 @@ impl RegistryFetch {
         let repository = scope
             .source
             .as_deref()
-            .ok_or_else(|| FetcherError::Refused {
+            .ok_or_else(|| FetcherError::InvalidArgument {
                 reason: "this scope names no repository".into(),
             })?;
         let mut kept = scope.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -1077,7 +1077,7 @@ impl StagingFetcher for RegistryFetch {
             let (toc_z, ts_z) = self
                 .metadata(scope, (&pool, &host), layer, (&info, parts))
                 .await
-                .map_err(|e| FetcherError::Refused {
+                .map_err(|e| FetcherError::InvalidArgument {
                     reason: format!("layer {}: its table of contents: {e}", layer.digest),
                 })?;
             // (the engine checks what it keeps against the descriptor, and
@@ -1143,9 +1143,12 @@ impl StagingFetcher for RegistryFetch {
                 files[w].positions.push(i as u32);
                 continue;
             }
-            let &at = indexed.at.get(key).ok_or_else(|| FetcherError::Refused {
-                reason: format!("{key} is not a file of the layer's table of contents"),
-            })?;
+            let &at = indexed
+                .at
+                .get(key)
+                .ok_or_else(|| FetcherError::InvalidArgument {
+                    reason: format!("{key} is not a file of the layer's table of contents"),
+                })?;
             let (_, name) = name_of(&indexed.toc.entries[at]).expect("indexed by its name");
             if staged(&layer.staging, key) {
                 present.push(i as u32);

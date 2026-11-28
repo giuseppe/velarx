@@ -165,7 +165,7 @@ impl Blobs for HttpLayout {
             .take(max.saturating_add(1))
             .read_to_end(&mut index)?;
         if index.len() as u64 > max {
-            return Err(FetcherError::TooLarge { max });
+            return Err(FetcherError::invalid(format!("larger than {max} bytes")));
         }
         entry(&index, name.as_deref())
     }

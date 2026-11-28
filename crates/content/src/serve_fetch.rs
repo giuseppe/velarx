@@ -435,8 +435,8 @@ pub struct FetchEndpoint {
     peer: Option<Arc<Peer>>,
 }
 
-fn refused(reason: &str) -> FetcherError {
-    FetcherError::Refused {
+fn bad(reason: &str) -> FetcherError {
+    FetcherError::InvalidArgument {
         reason: reason.into(),
     }
 }
@@ -462,7 +462,7 @@ impl FetchEndpoint {
             .layers
             .get(layer)
             .cloned()
-            .ok_or_else(|| refused("a layer that was not told or was cancelled"))
+            .ok_or_else(|| bad("a layer that was not told or was cancelled"))
     }
 
     fn failure<T: Send + 'static, E: Send + 'static>(error: E) -> Answers<T, E> {
@@ -878,7 +878,6 @@ trait ScopeKind {
     /// The most the credentials of this interface take.
     const MAX_ACCESS: u64;
     fn invalid(reason: String) -> Self::Error;
-    fn not_scoped(reason: String) -> Self::Error;
     /// A refusal of a new connection, as this interface says it.
     fn refused(e: FetcherError) -> Self::Error;
 }
@@ -899,10 +898,6 @@ impl ScopeKind for FetcherScope {
         FetcherError::InvalidArgument { reason }
     }
 
-    fn not_scoped(reason: String) -> FetcherError {
-        FetcherError::NotScoped { reason }
-    }
-
     fn refused(e: FetcherError) -> FetcherError {
         e
     }
@@ -919,10 +914,6 @@ impl ScopeKind for PusherScope {
 
     fn invalid(reason: String) -> PusherError {
         push::bad(reason)
-    }
-
-    fn not_scoped(reason: String) -> PusherError {
-        PusherError::NotScoped { reason }
     }
 
     fn refused(e: FetcherError) -> PusherError {
@@ -955,11 +946,11 @@ impl<'a, S: ScopeKind> Scoped<'a, S> {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The scope `Open` gave, or `NotScoped`.
+    /// The scope `Open` gave, or a refusal of the call.
     fn get(&self) -> Result<Arc<S::Scope>, S::Error> {
         S::slot(&mut self.state())
             .clone()
-            .ok_or_else(|| S::not_scoped("a call before Open".into()))
+            .ok_or_else(|| S::invalid("a call before Open".into()))
     }
 
     /// The idle time of `Open`.
@@ -986,7 +977,7 @@ impl<'a, S: ScopeKind> Scoped<'a, S> {
             let mut state = self.state();
             let slot = S::slot(&mut state);
             if slot.is_some() {
-                return Err(S::not_scoped("Open twice".into()));
+                return Err(S::invalid("Open twice".into()));
             }
             let scope = Arc::new(scope);
             *slot = Some(scope.clone());
@@ -1119,13 +1110,13 @@ mod service {
             let mut fds = Descriptors::new(fds);
             let dir = File::from(
                 fds.take("the staging directory", staging)
-                    .map_err(|reason| FetcherError::BadStaging { reason })?,
+                    .map_err(|reason| FetcherError::InvalidArgument { reason })?,
             );
             let is_dir = dir.metadata().is_ok_and(|m| m.is_dir());
             let path_only = rustix::fs::fcntl_getfl(&dir)
                 .map_or(true, |f| f.contains(rustix::fs::OFlags::PATH));
             if !is_dir || path_only {
-                return Err(FetcherError::BadStaging {
+                return Err(FetcherError::InvalidArgument {
                     reason: "a directory open for reading (not O_PATH) is needed".into(),
                 });
             }
@@ -1167,7 +1158,7 @@ mod service {
             Ok(Ack {})
         }
 
-        /// Forget the layer: its calls end, later ones are `Refused`, and what
+        /// Forget the layer: its calls end, later ones are `InvalidArgument`, and what
         /// the fetcher kept for its blob is let go (of a layer that was only
         /// probed too).
         pub async fn forget(&self, layer: String) -> Result<Ack, FetcherError> {
@@ -1190,7 +1181,7 @@ mod service {
                     Ok(Ack {})
                 }
                 None if kept => Ok(Ack {}),
-                None => Err(refused("a layer that was not told")),
+                None => Err(bad("a layer that was not told")),
             }
         }
 
@@ -2394,11 +2385,11 @@ mod tests {
                 None,
             )
             .await;
-        assert!(matches!(early, Err(FetcherError::NotScoped { .. })));
+        assert!(matches!(early, Err(FetcherError::InvalidArgument { .. })));
         open(&e).await.unwrap();
         assert!(matches!(
             open(&e).await,
-            Err(FetcherError::NotScoped { .. })
+            Err(FetcherError::InvalidArgument { .. })
         ));
     }
 
@@ -2421,7 +2412,10 @@ mod tests {
                 None,
             )
             .await;
-        assert!(matches!(r, Err(FetcherError::BadStaging { .. })), "{r:?}");
+        assert!(
+            matches!(r, Err(FetcherError::InvalidArgument { .. })),
+            "{r:?}"
+        );
         let file: OwnedFd = tempfile::tempfile().unwrap().into();
         let r = e
             .layer(
@@ -2432,7 +2426,10 @@ mod tests {
                 None,
             )
             .await;
-        assert!(matches!(r, Err(FetcherError::BadStaging { .. })), "{r:?}");
+        assert!(
+            matches!(r, Err(FetcherError::InvalidArgument { .. })),
+            "{r:?}"
+        );
         e.layer(
             vec![dir()],
             "sha256:aa".into(),
@@ -2454,7 +2451,7 @@ mod tests {
         assert_eq!(Arc::strong_count(&kept), 1);
         assert!(matches!(
             e.forget("sha256:aa".into()).await,
-            Err(FetcherError::Refused { .. })
+            Err(FetcherError::InvalidArgument { .. })
         ));
         // and with a layer that was only probed, never told
         scope
@@ -2509,7 +2506,7 @@ mod tests {
             )
             .await;
         let (first, _) = s.next().await.unwrap();
-        assert!(matches!(first, Err(FetcherError::Refused { .. })));
+        assert!(matches!(first, Err(FetcherError::InvalidArgument { .. })));
         e.layer(
             vec![dir()],
             "sha256:aa".into(),

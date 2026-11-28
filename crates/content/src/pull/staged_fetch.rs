@@ -255,10 +255,9 @@ impl Fetcher {
 /// Whether the error of a call ends the walk: the fetcher refused the
 /// request itself (it is wrong for every fetcher), not what it lacks.
 fn refused(e: &CallError) -> bool {
-    use crate::fetcher::fetch::FetcherError as F;
     matches!(
         e,
-        CallError::Fetcher(F::Refused { .. } | F::InvalidArgument { .. } | F::BadStaging { .. })
+        CallError::Fetcher(crate::fetcher::fetch::FetcherError::InvalidArgument { .. })
     )
 }
 
@@ -2092,7 +2091,7 @@ mod tests {
             out: &Out<Probed>,
         ) -> Result<(), FetcherError> {
             if self.refuse {
-                return Err(FetcherError::Refused {
+                return Err(FetcherError::InvalidArgument {
                     reason: "no".into(),
                 });
             }
@@ -2822,7 +2821,7 @@ mod tests {
             out: &Out<Event>,
         ) -> Result<(), FetcherError> {
             let Some(class) = self.0 else {
-                return Err(FetcherError::Refused {
+                return Err(FetcherError::InvalidArgument {
                     reason: "no such request".into(),
                 });
             };

@@ -362,40 +362,19 @@ pub struct Ack {}
 #[derive(Debug, Clone, PartialEq, zlink::ReplyError, introspect::ReplyError)]
 #[zlink(interface = "org.velarx.Fetcher")]
 pub enum FetcherError {
-    InvalidArgument {
-        reason: String,
-    },
-    /// A call before `Open`, an `Open` twice
-    NotScoped {
-        reason: String,
-    },
-    /// A call this connection may not make; a file that is not of the layer;
-    /// a layer that was not told (`Layer`) or was forgotten (`Forget`)
-    Refused {
-        reason: String,
-    },
+    /// The request is wrong for every fetcher: a bad argument or
+    /// descriptor, a call before `Open` or a second `Open`, a layer that
+    /// was not told (`Layer`) or was forgotten (`Forget`), a staging
+    /// directory that cannot be used
+    InvalidArgument { reason: String },
     /// This fetcher does not do what was asked (a format, a kind of layer)
-    NotSupported {
-        feature: String,
-    },
-    /// The answer of a `GetFile` is larger
-    /// than `max`
-    TooLarge {
-        max: u64,
-    },
-    /// No connection for this client now (its limit): asked again after
-    /// one of its own calls ended, not a fetcher that failed
-    Busy {
-        reason: String,
-    },
-    /// Not a directory of a file system that has what the scope asks for
-    BadStaging {
-        reason: String,
-    },
-    /// The call failed: what kind, and why
-    Failed {
-        failure: Failure,
-    },
+    NotSupported { feature: String },
+    /// A limit of the fetcher now (connections, layers): asked again after
+    /// one of the engine's own calls ended, not a fetcher that failed
+    Busy { reason: String },
+    /// The call failed: what kind, and why (larger than the `max` of a
+    /// `GetFile` is `invalid`)
+    Failed { failure: Failure },
 }
 
 impl FetcherError {
@@ -481,11 +460,7 @@ impl std::fmt::Display for FetcherError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidArgument { reason } => write!(f, "invalid argument: {reason}"),
-            Self::NotScoped { reason } => write!(f, "not scoped: {reason}"),
-            Self::Refused { reason } => write!(f, "refused: {reason}"),
             Self::NotSupported { feature } => write!(f, "not supported: {feature}"),
-            Self::BadStaging { reason } => write!(f, "bad staging directory: {reason}"),
-            Self::TooLarge { max } => write!(f, "larger than {max} bytes"),
             Self::Busy { reason } => write!(f, "busy: {reason}"),
             Self::Failed { failure } => write!(f, "{:?}: {}", failure.class, failure.reason),
         }

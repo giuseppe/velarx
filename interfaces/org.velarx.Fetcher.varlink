@@ -282,7 +282,7 @@ method Connect() -> ()
 # (`Busy`).
 method Layer(layer: string, staging: int, blob: Blob, toc: ?int) -> ()
 
-# Forget the layer: its calls end, later ones are `Refused`, and what
+# Forget the layer: its calls end, later ones are `InvalidArgument`, and what
 # the fetcher kept for its blob is let go (of a layer that was only
 # probed too).
 method Forget(layer: string) -> ()
@@ -341,28 +341,19 @@ method Unpack(layer: string, urgency: Urgency) -> (
 # its `staged` events, and names the others.
 method Fetch(layer: string, objects: []string, urgency: Urgency, reuse: ?[]Reuse, handover: ?bool) -> (event: ?FetchEvent)
 
+# The request is wrong for every fetcher: a bad argument or
+# descriptor, a call before `Open` or a second `Open`, a layer that
+# was not told (`Layer`) or was forgotten (`Forget`), a staging
+# directory that cannot be used
 error InvalidArgument (reason: string)
-
-# A call before `Open`, an `Open` twice
-error NotScoped (reason: string)
-
-# A call this connection may not make; a file that is not of the layer;
-# a layer that was not told (`Layer`) or was forgotten (`Forget`)
-error Refused (reason: string)
 
 # This fetcher does not do what was asked (a format, a kind of layer)
 error NotSupported (feature: string)
 
-# The answer of a `GetFile` is larger
-# than `max`
-error TooLarge (max: int)
-
-# No connection for this client now (its limit): asked again after
-# one of its own calls ended, not a fetcher that failed
+# A limit of the fetcher now (connections, layers): asked again after
+# one of the engine's own calls ended, not a fetcher that failed
 error Busy (reason: string)
 
-# Not a directory of a file system that has what the scope asks for
-error BadStaging (reason: string)
-
-# The call failed: what kind, and why
+# The call failed: what kind, and why (larger than the `max` of a
+# `GetFile` is `invalid`)
 error Failed (failure: Failure)

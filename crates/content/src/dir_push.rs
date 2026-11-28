@@ -182,7 +182,7 @@ impl DirPush {
             .inner
             .get()
             .cloned()
-            .ok_or_else(|| PusherError::NotScoped {
+            .ok_or_else(|| PusherError::InvalidArgument {
                 reason: "Open comes first".into(),
             })
     }
@@ -531,7 +531,7 @@ impl Pushing for DirPush {
         self.0
             .inner
             .set(Arc::new(inner))
-            .map_err(|_| PusherError::NotScoped {
+            .map_err(|_| PusherError::InvalidArgument {
                 reason: "Open twice".into(),
             })
     }

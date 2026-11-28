@@ -493,7 +493,7 @@ impl LayerToc {
             .get_or_init(|| std::sync::Arc::new(Self::of(layer).map(std::sync::Arc::new)));
         match kept.downcast_ref::<Kept>() {
             Some(kept) => kept.clone(),
-            None => Err(crate::fetcher::fetch::FetcherError::Refused {
+            None => Err(crate::fetcher::fetch::FetcherError::InvalidArgument {
                 reason: "the layer keeps something else than its table".into(),
             }),
         }
@@ -507,9 +507,12 @@ impl LayerToc {
         use crate::fetcher::fetch::FetcherError;
         use std::io::Read;
         let bad = |reason: String| FetcherError::InvalidArgument { reason };
-        let file = layer.toc.as_ref().ok_or_else(|| FetcherError::Refused {
-            reason: "the layer was told without its table of contents".into(),
-        })?;
+        let file = layer
+            .toc
+            .as_ref()
+            .ok_or_else(|| FetcherError::InvalidArgument {
+                reason: "the layer was told without its table of contents".into(),
+            })?;
         let toc_z = velarx_base::sealed::read_sealed_whole(
             file,
             crate::pull::chunked::MAX_METADATA_COMPRESSED,

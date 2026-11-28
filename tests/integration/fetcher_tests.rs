@@ -440,7 +440,7 @@ async fn test_the_fetcher_refuses_what_it_cannot_serve() {
     )
     .await;
     assert!(
-        matches!(e, CallError::Fetcher(FetcherError::NotScoped { .. })),
+        matches!(e, CallError::Fetcher(FetcherError::InvalidArgument { .. })),
         "{e:?}"
     );
     let mut conn = origin.connect().await.unwrap();
@@ -463,7 +463,7 @@ async fn test_the_fetcher_refuses_what_it_cannot_serve() {
     )
     .await;
     assert!(
-        matches!(e, CallError::Fetcher(FetcherError::Refused { .. })),
+        matches!(e, CallError::Fetcher(FetcherError::InvalidArgument { .. })),
         "{e:?}"
     );
 }

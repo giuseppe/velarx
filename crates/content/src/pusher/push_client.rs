@@ -505,14 +505,14 @@ mod tests {
         let (_local, mut conn) = started(Arc::new(WithPusher(Arc::default())));
         assert!(matches!(
             refusal(conn.push_finish().await),
-            PusherError::NotScoped { .. }
+            PusherError::InvalidArgument { .. }
         ));
         opened(&mut conn, "registry.example/name", None)
             .await
             .unwrap();
         assert!(matches!(
             refusal(opened(&mut conn, "registry.example/name", None).await),
-            PusherError::NotScoped { .. }
+            PusherError::InvalidArgument { .. }
         ));
     }
 

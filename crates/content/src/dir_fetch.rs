@@ -349,7 +349,7 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
             let (mut staged, mut nobody, mut events) = (Vec::new(), Vec::new(), Vec::new());
             for (i, key) in objects.iter().enumerate() {
                 let Some(&at) = indexed.at.get(key) else {
-                    return Err(FetcherError::Refused {
+                    return Err(FetcherError::InvalidArgument {
                         reason: format!("{key} is not a file of the layer's table of contents"),
                     });
                 };

@@ -179,33 +179,17 @@ pub struct Ack {}
 #[derive(Debug, Clone, PartialEq, zlink::ReplyError, introspect::ReplyError)]
 #[zlink(interface = "org.velarx.Pusher")]
 pub enum PusherError {
-    InvalidArgument {
-        reason: String,
-    },
-    /// A call before `Open`, an `Open` twice
-    NotScoped {
-        reason: String,
-    },
-    /// A call this connection may not make
-    Refused {
-        reason: String,
-    },
+    /// The request is wrong for every pusher: a bad argument or
+    /// descriptor, a call before `Open` or a second `Open`
+    InvalidArgument { reason: String },
     /// A destination of a kind this pusher does not do
-    NotSupported {
-        feature: String,
-    },
-    /// No connection for this client now (its limit)
-    Busy {
-        reason: String,
-    },
+    NotSupported { feature: String },
+    /// A limit of the pusher now (connections): not a pusher that failed
+    Busy { reason: String },
     /// `Commit`: the destination does not have these objects
-    ObjectsMissing {
-        digests: Vec<String>,
-    },
+    ObjectsMissing { digests: Vec<String> },
     /// The call failed: what kind, and why
-    Failed {
-        failure: Failure,
-    },
+    Failed { failure: Failure },
 }
 
 impl PusherError {
@@ -242,8 +226,6 @@ impl std::fmt::Display for PusherError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidArgument { reason } => write!(f, "invalid argument: {reason}"),
-            Self::NotScoped { reason } => write!(f, "not scoped: {reason}"),
-            Self::Refused { reason } => write!(f, "refused: {reason}"),
             Self::NotSupported { feature } => write!(f, "not supported: {feature}"),
             Self::Busy { reason } => write!(f, "busy: {reason}"),
             Self::ObjectsMissing { digests } => {
