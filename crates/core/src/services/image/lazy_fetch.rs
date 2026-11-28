@@ -638,6 +638,64 @@ impl ImageService {
         staged
     }
 
+    /// The files of `files` (fs-verity digests) that neither the store nor
+    /// the staging of the layer `key` has.
+    async fn lacking(&self, key: &LayerKey, files: Vec<String>) -> ImageResult<Vec<String>> {
+        let (store, staged) = (
+            self.file_store.clone(),
+            self.staging_area().layer_files(key),
+        );
+        blocking(move || {
+            let staged = velarx_storage::FileStore::new(&staged).ok();
+            Ok(files
+                .into_iter()
+                .filter(|d| {
+                    !store.contains(d) && !staged.as_ref().is_some_and(|s| s.get_path(d).is_some())
+                })
+                .collect())
+        })
+        .await
+    }
+
+    /// Stage the files of the layer `key` (`layer`, its verified table
+    /// `toc`, `toc_z` as the layer has it) that an image made with
+    /// `threshold` holds itself, which the store lacks, under the lease of
+    /// the layer: the files of a lazy pull that stay in its staging until
+    /// the layer is committed.  `walker` is the pull's list of fetchers.
+    /// The lease is given back held: the image is made from the staged files
+    /// before an eager pull of the layer can take its staging away.
+    pub(super) async fn stage_held(
+        &self,
+        walker: &StagedFetch,
+        (key, layer): (&LayerKey, &OciDescriptor),
+        (toc, toc_z): (&Toc, &[u8]),
+        threshold: i64,
+    ) -> ImageResult<Arc<velarx_content::pull::staged::Lease>> {
+        let held = toc
+            .entries
+            .iter()
+            .filter(|e| e.has_content() && velarx_types::holds_inline(threshold, e.size))
+            .filter_map(|e| e.verity())
+            .collect::<std::collections::BTreeSet<_>>();
+        let lease = self.layer_lease(key).await?;
+        let left = self.lacking(key, held.into_iter().collect()).await?;
+        let staged = match left.is_empty() {
+            true => Ok(Walked::default()),
+            false => {
+                walker
+                    .stage_files(
+                        &key.file_stem(),
+                        layer,
+                        (toc, toc_z),
+                        left,
+                        (Urgency::Wait, &|_| {}),
+                    )
+                    .await
+            }
+        };
+        staged.map(|_| lease)
+    }
+
     /// [`Self::stage_batch`], with the lease of the layer held.
     async fn stage_leased(
         &self,
@@ -645,23 +703,7 @@ impl ImageService {
         files: Vec<String>,
         (urgency, told): (Urgency, &(dyn Fn(&str) + Send + Sync)),
     ) -> ImageResult<Walked> {
-        let (store, staged) = (
-            self.file_store.clone(),
-            self.staging_area().layer_files(key),
-        );
-        let left = blocking(move || {
-            let staged = velarx_storage::FileStore::new(&staged).ok();
-            Ok::<_, ImageError>(
-                files
-                    .into_iter()
-                    .filter(|d| {
-                        !store.contains(d)
-                            && !staged.as_ref().is_some_and(|s| s.get_path(d).is_some())
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .await?;
+        let left = self.lacking(key, files).await?;
         if left.is_empty() {
             return Ok(Walked::default());
         }
@@ -742,7 +784,7 @@ impl ImageService {
     /// The slot of the lease of `key` goes when nothing holds the lease nor
     /// waits for it (the table of a service that lives on does not grow
     /// with the layers it ever fetched into).
-    fn prune_lease(&self, key: &LayerKey) {
+    pub(super) fn prune_lease(&self, key: &LayerKey) {
         let mut leases = self.funnel.leases.lock().unwrap_or_else(|e| e.into_inner());
         let idle = leases.get(key).is_some_and(|slot| {
             Arc::strong_count(slot) == 1

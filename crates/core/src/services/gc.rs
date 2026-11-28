@@ -1230,6 +1230,8 @@ mod layer_tests {
                 reach: Default::default(),
                 erofs: "sha256:ee".into(),
                 owners: String::new(),
+                inline: 0,
+                inlined: Vec::new(),
                 created_at: String::new(),
             },
             tarsplit: b"",

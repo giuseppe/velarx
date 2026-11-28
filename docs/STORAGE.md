@@ -127,6 +127,12 @@ made from the table of contents alone.  `system check` does not fetch what
 an inlined layer lacks: a layer to be made again with another threshold is
 removed with `velarx rmi` and pulled again.
 
+A lazy pull (`pull --lazy`) with N other than 0 fetches the files of at most
+N bytes before it makes the image of a layer, keeps them staged with the
+layer until its completion commits it, and fetches the bigger ones on demand
+as before; with -1 nothing is left to fetch and the pull is complete when it
+ends.  A staged layer keeps the N it was made with, as a stored one does.
+
 ## Between versions
 
 Nothing is compatible between versions (README).  A database of another

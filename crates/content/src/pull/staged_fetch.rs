@@ -1835,10 +1835,17 @@ impl Drop for LayerStaging {
 }
 
 /// Remove the staging of the layers that no process stages any more (their
-/// lease is not held: the process died) and no lazy pull keeps; the number
-/// removed.
+/// lease is not held: the process died), no lazy pull keeps and no live
+/// pull pins (a lazy pull stages the files the image of a layer holds
+/// before it publishes the layer); the number removed.
 pub fn sweep(root: &Path) -> io::Result<usize> {
     let mut removed = 0;
+    let pinned: std::collections::BTreeSet<String> = super::holds::pinned(root)?
+        .layers
+        .iter()
+        .filter_map(|k| velarx_types::LayerKey::parse(k))
+        .map(|k| k.file_stem())
+        .collect();
     let stems: std::collections::BTreeSet<std::ffi::OsString> = [LAYERS, META]
         .iter()
         .filter_map(|d| std::fs::read_dir(root.join(d)).ok())
@@ -1850,7 +1857,8 @@ pub fn sweep(root: &Path) -> io::Result<usize> {
             Ok(f) => rustix::fs::flock(f, FlockOperation::NonBlockingLockExclusive).is_ok(),
             Err(e) => e.kind() == io::ErrorKind::NotFound,
         };
-        if !free || lazily_staged(root, &stem.to_string_lossy()) {
+        let name = stem.to_string_lossy();
+        if !free || lazily_staged(root, &name) || pinned.contains(name.as_ref()) {
             continue;
         }
         for dir in [LAYERS, META] {
@@ -2023,6 +2031,24 @@ mod tests {
             e,
             ImageError::Transfer { failure, .. } if failure.class == FailureClass::Unavailable
         ));
+    }
+
+    /// The staging of a layer that no process leases goes with a sweep,
+    /// unless a live pull pins the layer: a lazy pull stages the files its
+    /// image holds before the layer is published.
+    #[test]
+    fn a_staging_a_live_pull_pins_is_not_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key =
+            velarx_types::LayerKey::Toc(format!("sha256:{}", "a".repeat(64)).parse().unwrap());
+        std::fs::create_dir_all(tmp.path().join(LAYERS).join(key.file_stem()).join("files"))
+            .unwrap();
+        let hold = super::super::holds::Hold::create(tmp.path(), "pull-1").unwrap();
+        hold.pin(super::super::holds::LAYER, [key]).unwrap();
+        assert_eq!(sweep(tmp.path()).unwrap(), 0);
+        drop(hold);
+        assert_eq!(sweep(tmp.path()).unwrap(), 1);
+        assert!(!tmp.path().join(LAYERS).join(key.file_stem()).exists());
     }
 
     /// A call whose future is dropped before its replies came (a pull that

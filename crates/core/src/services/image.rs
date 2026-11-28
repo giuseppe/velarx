@@ -191,7 +191,7 @@ mod search;
 mod signatures;
 pub use signatures::SignatureJudging;
 mod squash;
-mod storage;
+pub(crate) mod storage;
 
 pub use archive::LoadedImage;
 pub use artifact::ArtifactOptions;

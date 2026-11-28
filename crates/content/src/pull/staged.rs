@@ -271,6 +271,10 @@ pub struct StagedLayerMeta {
     /// The fs-verity digest of the EROFS image, and the owners of its files
     pub erofs: String,
     pub owners: String,
+    /// The inline threshold the image was made with, and the files it holds
+    /// (the layer keeps them staged until it is committed)
+    pub inline: i64,
+    pub inlined: Vec<velarx_db::InlinedFile>,
     pub created_at: String,
 }
 
@@ -301,7 +305,7 @@ impl StagedLayer {
             erofs: Some(self.meta.erofs.clone()),
             owners: Some(self.meta.owners.clone()),
             stream_size: None,
-            inline: 0,
+            inline: self.meta.inline,
         }
     }
 
@@ -677,6 +681,8 @@ impl Staging {
             let meta = StagedLayerMeta {
                 erofs: there.erofs.clone(),
                 owners: there.owners.clone(),
+                inline: there.inline,
+                inlined: there.inlined.clone(),
                 created_at: there.created_at.clone(),
                 ..layer.meta.clone()
             };
@@ -1213,6 +1219,8 @@ mod tests {
                 reach: LayerReach::default(),
                 erofs: "sha256:00".into(),
                 owners: "[[0],[0]]".into(),
+                inline: 0,
+                inlined: Vec::new(),
                 created_at: now(),
             },
             key,
@@ -1236,6 +1244,36 @@ mod tests {
             serde_json::from_value::<StagedLayerMeta>(layer_json).unwrap(),
             meta
         );
+    }
+
+    /// The layer a second pull publishes again is the first's: the image it
+    /// was made with, the threshold and the files that image holds are kept.
+    #[test]
+    fn a_layer_published_again_keeps_the_threshold_it_was_made_with() {
+        let tmp = tempfile::tempdir().unwrap();
+        let area = Staging::new(tmp.path());
+        let (mut meta, key) = layer(1);
+        meta.inline = 64;
+        meta.inlined = vec![velarx_db::InlinedFile {
+            digest: "fsverity-sha256-12:aa".into(),
+            offset: 4096,
+            size: 3,
+        }];
+        let first = meta.clone();
+        let publish = |meta| {
+            area.publish_layer(&NewLayer {
+                meta,
+                tarsplit: b"ts",
+                toc_z: b"tz",
+            })
+            .unwrap()
+        };
+        publish(meta.clone());
+        (meta.erofs, meta.inline, meta.inlined) = ("sha256:11".into(), 0, Vec::new());
+        publish(meta);
+        let kept = area.layer(&key).unwrap().unwrap();
+        assert_eq!(kept.meta, first);
+        assert_eq!(kept.record().inline, 64);
     }
 
     #[test]

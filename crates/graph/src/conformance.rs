@@ -3027,6 +3027,7 @@ pub async fn a_lazy_layer_waits_and_is_completed(f: &Factory) {
         None,
         velarx_db::LayerReach::default(),
         (&artifact.image_digest, &artifact.owners),
+        (0, &[]),
     )
     .unwrap();
     barrier.commit().unwrap();
@@ -3058,6 +3059,8 @@ pub async fn a_lazy_layer_waits_and_is_completed(f: &Factory) {
             reach: velarx_db::LayerReach::default(),
             erofs: "sha256:00".into(),
             owners: artifact.owners.clone(),
+            inline: 0,
+            inlined: Vec::new(),
             created_at: String::new(),
         },
         tarsplit: &done.tarsplit,

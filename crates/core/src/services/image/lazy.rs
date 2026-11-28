@@ -10,6 +10,7 @@ use velarx_content::pull::staged::{StagedPull, Staging};
 use velarx_content::pull::{layer_commit, LayerDone};
 use velarx_db::LayerKey;
 use velarx_fuse::LazyFileFetcher;
+use velarx_graph::Inlining;
 use velarx_registry::auth::RegistryAccess;
 
 /// The files fetched together by the retrieval, at most.
@@ -37,6 +38,23 @@ pub(super) struct LazyLayer {
     toc_z: bytes::Bytes,
     /// What the staging area says of it (`layer.json`)
     meta: velarx_content::pull::staged::StagedLayerMeta,
+}
+
+impl LazyLayer {
+    /// The files of the layer that are objects of the store once it is
+    /// committed: all but the ones its image holds, which stay staged and go
+    /// with the staging.
+    fn objects(&self) -> Vec<String> {
+        let held: std::collections::HashSet<&str> = self
+            .meta
+            .inlined
+            .iter()
+            .map(|f| f.digest.as_str())
+            .collect();
+        let mut files = self.toc.files();
+        files.retain(|d| !held.contains(d.as_str()));
+        files
+    }
 }
 
 /// What a try of the completion of a pull works on: the layers the store
@@ -229,6 +247,41 @@ impl ImageService {
                 Ok(TransferStats::default())
             }
         }
+    }
+
+    /// Whether a staged layer of the pull `id` has a file that is an object
+    /// of the store once it is committed, which is to be fetched: not all
+    /// its files are held by its image.
+    pub(super) async fn holds_objects(&self, id: &str) -> ImageResult<bool> {
+        let area = self.staging_area();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let pull = area
+                .pull(&id)?
+                .ok_or_else(|| ImageError::Storage(format!("the pull {id} is not staged")))?;
+            for key in pull.layers.iter().filter_map(|k| LayerKey::parse(k)) {
+                let Some(layer) = area.layer(&key)? else {
+                    continue;
+                };
+                let held: std::collections::HashSet<&str> = layer
+                    .meta
+                    .inlined
+                    .iter()
+                    .map(|f| f.digest.as_str())
+                    .collect();
+                if layer
+                    .toc()?
+                    .files()
+                    .iter()
+                    .any(|d| !held.contains(d.as_str()))
+                {
+                    return Ok(true);
+                }
+            }
+            Ok::<_, ImageError>(false)
+        })
+        .await
+        .map_err(|e| ImageError::Storage(e.to_string()))?
     }
 
     /// The pull `id`, finished for a command that waits for it (a `run`
@@ -435,7 +488,16 @@ impl ImageService {
             // (the bytes the first entry of a content takes in the blob)
             let mut blob: Vec<u64> = Vec::new();
             let mut tables: Vec<Vec<velarx_plan_core::File>> = Vec::new();
-            for layer in l.iter() {
+            // (the layers that have each content as an object: one whose image
+            // holds it neither fetches it nor gives its staged copy)
+            let mut owners: Vec<Vec<usize>> = Vec::new();
+            for (at, layer) in l.iter().enumerate() {
+                let held: std::collections::HashSet<&str> = layer
+                    .meta
+                    .inlined
+                    .iter()
+                    .map(|f| f.digest.as_str())
+                    .collect();
                 let mut table = Vec::new();
                 for e in layer.toc.entries.iter().filter(|e| e.has_content()) {
                     let d = e.verity().ok_or_else(|| {
@@ -444,11 +506,16 @@ impl ImageService {
                             layer.desc.digest, e.name
                         ))
                     })?;
+                    if held.contains(d.as_str()) {
+                        continue;
+                    }
                     let content = *id_of.entry(d.clone()).or_insert_with(|| {
                         digests.push(d);
                         blob.push(e.end_offset.saturating_sub(e.offset));
+                        owners.push(Vec::new());
                         digests.len() as u32 - 1
                     });
+                    owners[content as usize].push(at);
                     table.push(velarx_plan_core::File {
                         content,
                         size: e.size,
@@ -458,7 +525,10 @@ impl ImageService {
             }
             let present: Vec<bool> = digests
                 .iter()
-                .map(|d| store.contains(d) || staged.iter().any(|s| s.get_path(d).is_some()))
+                .zip(&owners)
+                .map(|(d, owners)| {
+                    store.contains(d) || owners.iter().any(|&at| staged[at].get_path(d).is_some())
+                })
                 .collect();
             let mut reused: (u64, u64) = (0, 0);
             for (here, bytes) in present.iter().zip(&blob) {
@@ -527,7 +597,7 @@ impl ImageService {
         let mut seen = std::collections::HashSet::new();
         let files = layers
             .iter()
-            .flat_map(|l| l.toc.files())
+            .flat_map(|l| l.objects())
             .filter(|d| seen.insert(d.clone()))
             .collect();
         self.link_files(layers, files, layers.iter().collect())
@@ -643,9 +713,7 @@ impl ImageService {
         // The files and the image of the layer are verified first, with no
         // lock held (the reads and hashes of the commit are all here): the
         // sections that follow only link, rename and sync.
-        let verified = self
-            .verify_files(all, layer.toc.files(), vec![layer])
-            .await?;
+        let verified = self.verify_files(all, layer.objects(), vec![layer]).await?;
         let one = self.commit_layer_lock(&layer.key).await?;
         let store = self.lock_store().await?;
         // The race check of this commit: under the commit lock of the layer,
@@ -705,7 +773,16 @@ impl ImageService {
             .map(|o| o.verity.clone())
             .collect();
         done.checked = checked;
-        let mut commit = layer_commit(&done, layer.meta.registry_ref.as_deref())?;
+        let inlining = Inlining {
+            threshold: layer.meta.inline,
+            files: layer.meta.inlined.clone(),
+        };
+        let mut commit = super::storage::with_image(
+            layer_commit(&done, layer.meta.registry_ref.as_deref())?,
+            &HashMap::new(),
+            &HashMap::from([(layer.key, inlining)]),
+            false,
+        );
         (commit.record.blob, commit.record.size) = (layer.meta.blob.parse().ok(), layer.meta.size);
         (commit.record.erofs, commit.record.owners) = (
             Some(layer.meta.erofs.clone()),
@@ -835,8 +912,7 @@ impl ImageService {
             let mut seen = std::collections::HashSet::new();
             for layer in l.iter() {
                 let lacking: Vec<String> = layer
-                    .toc
-                    .files()
+                    .objects()
                     .into_iter()
                     .filter(|d| seen.insert(d.clone()) && !store.contains(d))
                     .collect();
@@ -905,7 +981,9 @@ impl ImageService {
         let area = self.staging_area();
         let dirs: Vec<PathBuf> = layers.iter().map(|l| area.layer_files(&l.key)).collect();
         let objects = area.objects_stand_in();
-        let owners: Vec<_> = layers.iter().map(|l| l.toc.files()).collect();
+        // (a layer whose image holds a file has no object of it to give:
+        // its staged copy goes with its staging, which its commit removes)
+        let owners: Vec<_> = layers.iter().map(LazyLayer::objects).collect();
         let images: Vec<StagedImageOf> = images
             .into_iter()
             .filter_map(|l| {
@@ -1369,6 +1447,8 @@ mod tests {
                 reach: Default::default(),
                 erofs: String::new(),
                 owners: String::new(),
+                inline: 0,
+                inlined: Vec::new(),
                 created_at: String::new(),
             },
             toc_z: bytes::Bytes::new(),
@@ -1455,6 +1535,44 @@ mod tests {
         assert_eq!(reused, (40, 2));
     }
 
+    /// A file one layer holds in its image, staged with it, is an object of
+    /// another: it is fetched into the staging of the other, whose commit
+    /// links it from there, never from the staging of the first (which goes
+    /// with the commit of its layer).
+    #[tokio::test]
+    async fn a_file_one_layer_holds_is_fetched_for_another_that_needs_its_object() {
+        let (_tmp, service, _) = planner().await;
+        let want = |d: &[u8]| velarx_storage::fsverity_digest_of(Algorithm::Sha256, d);
+        let mut holder = layer_of(&[("a", b"shared")]);
+        holder.meta.inline = 64;
+        holder.meta.inlined = vec![velarx_db::InlinedFile {
+            digest: want(b"shared"),
+            offset: 4096,
+            size: 6,
+        }];
+        let mut other = layer_of(&[("a", b"shared")]);
+        other.key = LayerKey::Toc(format!("sha256:{}", "3".repeat(64)).parse().unwrap());
+        FileStore::new(service.staging_area().layer_files(&holder.key))
+            .unwrap()
+            .put(Algorithm::Sha256, b"shared")
+            .unwrap();
+        let layers: Arc<[LazyLayer]> = vec![holder, other].into();
+        let (groups, reused) = service.plan_groups(&layers, Vec::new()).await.unwrap();
+        assert_eq!(reused, (0, 0));
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            (groups[0].layer, &groups[0].files),
+            (1, &vec![want(b"shared")])
+        );
+        let owners: Vec<_> = layers.iter().map(LazyLayer::objects).collect();
+        let dirs: Vec<_> = layers
+            .iter()
+            .map(|l| service.staging_area().layer_files(&l.key))
+            .collect();
+        let wanted = wanted_by_staging(&owners, &dirs, vec![want(b"shared")]);
+        assert_eq!(wanted, [vec![], vec![want(b"shared")]]);
+    }
+
     /// A content two layers have is planned once, into the first, and the
     /// second waits for it; the profile names it, and what is no file.
     #[tokio::test]
@@ -1501,6 +1619,32 @@ mod tests {
             err.to_string().contains("`f` has no fs-verity digest"),
             "{err}"
         );
+    }
+
+    /// A file the image of a layer holds is no object of the layer: its
+    /// commit links, and the store must have, the others only.
+    #[tokio::test]
+    async fn the_files_an_image_holds_are_not_committed_as_objects() {
+        let (tmp, store) = stores();
+        let db = velarx_db::Database::open_in_memory().await.unwrap();
+        let service =
+            ImageService::new(db, store.clone(), tmp.path().join("pulls"), VerityMode::Off)
+                .unwrap();
+        let mut layer = layer_of(&[("a", b"small"), ("b", b"bigger than N")]);
+        let alg = velarx_types::digest::Algorithm::Sha256;
+        layer.meta.inline = 5;
+        layer.meta.inlined = vec![velarx_db::InlinedFile {
+            digest: velarx_storage::fsverity_digest_of(alg, b"small"),
+            offset: 4096,
+            size: 5,
+        }];
+        assert_eq!(
+            layer.objects(),
+            [velarx_storage::fsverity_digest_of(alg, b"bigger than N")]
+        );
+        let layers: Arc<[LazyLayer]> = vec![layer].into();
+        store.put(alg, b"bigger than N").unwrap();
+        service.require_covered(&layers).await.unwrap();
     }
 
     /// The store does not have every file after the link: nothing is
@@ -1912,6 +2056,8 @@ mod tests {
                     },
                     erofs: String::new(),
                     owners: String::new(),
+                    inline: 0,
+                    inlined: Vec::new(),
                     created_at: String::new(),
                 },
                 toc_z: bytes::Bytes::new(),
@@ -2216,6 +2362,8 @@ mod tests {
                 reach: velarx_db::LayerReach::default(),
                 erofs: "sha256:ee".into(),
                 owners: "[[],[]]".into(),
+                inline: 0,
+                inlined: Vec::new(),
                 created_at: "2026-01-01T00:00:00Z".into(),
             },
             tarsplit: &tarsplit,

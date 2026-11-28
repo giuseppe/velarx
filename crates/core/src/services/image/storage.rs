@@ -486,13 +486,39 @@ async fn identities(layers: Vec<(LayerKey, Toc)>) -> ImageResult<HashMap<LayerKe
 }
 
 /// The content of a file a layer image holds, by its fs-verity digest.
-pub(super) type Open<'a> = &'a (dyn Fn(&Digest) -> std::io::Result<std::fs::File> + Sync);
+pub(crate) type Open<'a> = &'a (dyn Fn(&Digest) -> std::io::Result<std::fs::File> + Sync);
+
+/// The content of the file `digest` for an image that holds it: the file
+/// of one of the `staged` stores, verified as it is opened (what a fetcher
+/// staged is not trusted), else the one of `store`.
+pub(crate) fn open_held(
+    digest: &Digest,
+    staged: &[velarx_storage::FileStore],
+    store: &velarx_storage::FileStore,
+) -> std::io::Result<std::fs::File> {
+    let name = digest.to_string();
+    match staged.iter().find_map(|s| s.get_path(&name)) {
+        Some(path) => {
+            velarx_content::pull::commit::verify_file(
+                &std::fs::File::open(&path)?,
+                &name,
+                &|_| {},
+            )?
+            .map_err(std::io::Error::other)?;
+            std::fs::File::open(path)
+        }
+        None => store
+            .get_path(&name)
+            .ok_or_else(|| std::io::ErrorKind::NotFound.into())
+            .and_then(std::fs::File::open),
+    }
+}
 
 /// The identity of each layer `(key, TOC, inline threshold)` and the EROFS
 /// image it was made from (one thread for each layer; blocking): the images
 /// go to the driver, which stores them as they are rather than build them
 /// again.  `open` and `dir` are those of [`identity_of`].
-pub(super) fn identities_of(
+pub(crate) fn identities_of(
     layers: &[(&LayerKey, &Toc, i64)],
     open: Open<'_>,
     dir: &std::path::Path,
@@ -523,7 +549,7 @@ pub(super) fn identities_of(
 /// `inline` says and opens (blocking).  An image that holds none is made in
 /// memory; one that holds files is written once to a file with no name in
 /// `dir`, hashed as it is written: it can be as big as they are.
-pub(super) fn identity_of(
+pub(crate) fn identity_of(
     key: &LayerKey,
     toc: &Toc,
     inline: &Inline,
@@ -671,6 +697,37 @@ mod tests {
                 .parse()
                 .unwrap(),
         )
+    }
+
+    /// A file an image holds is read from the staging, and only if it is
+    /// what its name says; one the staging lacks, from the store.
+    #[test]
+    fn a_staged_file_is_verified_as_an_image_takes_it() {
+        use std::io::Read;
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = velarx_storage::FileStore::new(tmp.path().join("staged")).unwrap();
+        let store = velarx_storage::FileStore::new(tmp.path().join("store")).unwrap();
+        let alg = velarx_types::digest::Algorithm::Sha256;
+        let read = |d: &str| -> std::io::Result<String> {
+            let digest = Digest::parse_fsverity(d).unwrap();
+            let mut text = String::new();
+            open_held(&digest, std::slice::from_ref(&staged), &store)?.read_to_string(&mut text)?;
+            Ok(text)
+        };
+        let good = staged.put(alg, b"staged").unwrap();
+        assert_eq!(read(&good).unwrap(), "staged");
+        let in_store = store.put(alg, b"stored").unwrap();
+        assert_eq!(read(&in_store).unwrap(), "stored");
+        // (a fetcher staged other bytes under the name)
+        let path = staged.get_path(&good).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"forged").unwrap();
+        assert!(read(&good).is_err());
+        let nowhere = velarx_storage::fsverity_digest_of(alg, b"nowhere");
+        assert_eq!(
+            read(&nowhere).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 
     fn art(erofs: &str, owners: &str) -> LayerArtifact {

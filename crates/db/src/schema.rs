@@ -627,7 +627,7 @@ pub struct LayerCommit {
 }
 
 /// A file a layer holds in its EROFS image: `size` bytes from `offset`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InlinedFile {
     /// The fs-verity digest of the content, as an object is named.
     pub digest: String,

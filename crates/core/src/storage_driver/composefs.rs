@@ -1831,6 +1831,9 @@ impl StorageDriver for ComposefsDriver {
             })?;
         let mut tocs = Vec::new();
         let mut recorded = HashMap::new();
+        // (the files an image holds are staged with the layer, until it is
+        // committed)
+        let mut staged = Vec::new();
         for key in &pull.layers {
             let key = LayerKey::parse(key).ok_or_else(|| {
                 DriverError::of(
@@ -1840,13 +1843,36 @@ impl StorageDriver for ComposefsDriver {
                 )
             })?;
             if let Some(layer) = area.layer(&key).map_err(|e| refused(e.into()))? {
-                tocs.push((key, layer.toc().map_err(|e| refused(e.into()))?));
+                tocs.push((
+                    key,
+                    layer.toc().map_err(|e| refused(e.into()))?,
+                    layer.meta.inline,
+                ));
+                if layer.meta.inline != 0 {
+                    staged.push(
+                        FileStore::new(area.layer_files(&key))
+                            .map_err(|e| DriverError::storage(NAME, e.to_string()))?,
+                    );
+                }
                 recorded.insert(key, layer.meta.erofs.clone());
             }
         }
+        let (store, dir) = (self.store.clone(), self.staging_dir.clone());
         tokio::task::spawn_blocking(move || {
-            let refs: Vec<(LayerKey, &Toc)> = tocs.iter().map(|(d, t)| (*d, t)).collect();
-            let built = build_layer_images(&refs).map_err(storage_error)?;
+            let refs: Vec<(&LayerKey, &Toc, i64)> =
+                tocs.iter().map(|(k, t, n)| (k, t, *n)).collect();
+            let open = |d: &velarx_types::digest::Digest| {
+                crate::services::image::storage::open_held(d, &staged, &store)
+            };
+            let (ids, _) = crate::services::image::storage::identities_of(&refs, &open, &dir)
+                .map_err(refused)?;
+            let mut images = ids.images;
+            let built = Built(
+                ids.artifacts
+                    .into_iter()
+                    .filter_map(|(key, made)| Some((key, images.remove(&key)?, made)))
+                    .collect(),
+            );
             for (key, digest) in built.digests() {
                 if recorded.get(&key) != Some(&digest) {
                     return Err(DriverError::of(

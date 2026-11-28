@@ -643,7 +643,8 @@ pub async fn pull_layer_lazy(
 /// Publish the lazy layer `done` in the staging area: its table of contents
 /// (the table as it came, `done.toc_z`) and tar-split, and what its fetches
 /// need to reach its registry.  `erofs` and `owners` are those of the image made of its
-/// table of contents.  It is durable and named when `barrier` commits.
+/// table of contents, and `inline` the threshold it was made with and the
+/// files it holds.  It is durable and named when `barrier` commits.
 pub fn stage_layer(
     area: &staged::Staging,
     barrier: &mut staged::Barrier,
@@ -651,6 +652,7 @@ pub fn stage_layer(
     registry_ref: Option<&str>,
     reach: velarx_db::LayerReach,
     (erofs, owners): (&str, &str),
+    (inline, inlined): (i64, &[velarx_db::InlinedFile]),
 ) -> ImageResult<()> {
     area.publish_layer_in(
         &staged::NewLayer {
@@ -662,6 +664,8 @@ pub fn stage_layer(
                 reach,
                 erofs: erofs.to_string(),
                 owners: owners.to_string(),
+                inline,
+                inlined: inlined.to_vec(),
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
             tarsplit: &done.tarsplit,
