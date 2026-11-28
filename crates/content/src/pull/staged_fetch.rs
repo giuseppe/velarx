@@ -18,7 +18,7 @@ use super::staged::LayerLease;
 use crate::fetcher::fetch::{
     Blob, EventKind, FetchEvent, Parts, Probed, Reuse, TocSource, Urgency,
 };
-use crate::fetcher::fetch_client::{files_at, CallError, FetchConn, Scoping, Unpacking};
+use crate::fetcher::fetch_client::{files_at, CallError, FetchConn, Scoping};
 use crate::stager::staged_rel;
 use rustix::fs::{FlockOperation, Mode, OFlags, ResolveFlags};
 use std::collections::HashMap;
@@ -1244,19 +1244,19 @@ impl StagedFetch {
         let mut fatal: Option<ImageError> = None;
         let walked = async {
             let (mut conn, _connected) = fetcher.connection().await?;
-            let mut replies =
-                crate::idle::within(fetcher.idle, conn.unpack(&name, Urgency::Wait)).await?;
+            let mut replies = crate::idle::within(fetcher.idle, conn.unpack(&name)).await?;
             loop {
-                match crate::idle::within(fetcher.idle, replies.unpacking()).await {
+                match crate::idle::within(fetcher.idle, replies.event()).await {
                     // (cumulative bytes of the blob; a beat repeats what was
-                    // said or says none)
-                    Ok(Some(Unpacking::Bytes(said))) => {
-                        bytes = bytes.max(said);
+                    // said)
+                    Ok(Some((event, _))) if event.kind == EventKind::Progress => {
+                        bytes = bytes.max(event.bytes.unwrap_or(0));
                         progress(bytes);
                     }
-                    Ok(Some(Unpacking::Files(files))) => {
+                    Ok(Some((event, fds))) if event.kind == EventKind::Staged => {
                         // (a file that cannot be taken in is the engine's
                         // failure, not the fetcher's)
+                        let files = files_at(event.files.as_deref().unwrap_or_default(), fds)?;
                         for file in files {
                             if let Err(e) = intake.give(file).await {
                                 fatal.get_or_insert(e.into());
@@ -1267,6 +1267,8 @@ impl StagedFetch {
                             break;
                         }
                     }
+                    // (an event of another kind is of no use to an unpack)
+                    Ok(Some(_)) => {}
                     // (the last reply: the names are given)
                     Ok(None) => break,
                     Err(CallError::Fetcher(crate::fetcher::fetch::FetcherError::Failed {
@@ -3669,7 +3671,7 @@ mod tests {
             out: &Out<Event>,
         ) -> Result<(), FetcherError> {
             let event = Event {
-                objects: self.at.clone(),
+                files: Some(self.at.clone()),
                 ..Event::of(EventKind::Staged)
             };
             out.send_with(event, (self.give)())

@@ -188,7 +188,8 @@ pub enum EventKind {
     /// It tried and failed for `objects`: `failure`
     Failed,
     /// `bytes` of the one object of `objects` are written so far by this
-    /// call (of the blob of the layer, for a call with no objects)
+    /// call (of the blob of the layer, for an `Unpack`, which has no
+    /// objects)
     Progress,
     /// (what an event this side does not know is read as: ignored)
     #[serde(other)]
@@ -300,7 +301,8 @@ pub struct FetchEvent {
     pub bytes: Option<u64>,
     /// With `staged`: the object at each position of `objects` is the
     /// complete file with no name at this position among the descriptors of
-    /// the reply (a call that asked for `handover`)
+    /// the reply (a call that asked for `handover`); for an `Unpack`, which
+    /// has no objects, the files of the layer at these positions
     pub files: Option<Vec<u32>>,
 }
 
@@ -353,16 +355,6 @@ pub struct FetchReply {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::Type)]
 pub struct BlobReply {
     pub bytes: Option<u64>,
-}
-
-/// What an `Unpack` answers: the bytes of the blob read so far, or files of
-/// the layer, or nothing in the last reply.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, introspect::Type)]
-pub struct UnpackReply {
-    pub bytes: Option<u64>,
-    /// Complete files of the layer, each the position of a descriptor of the
-    /// reply
-    pub files: Option<Vec<u32>>,
 }
 
 /// What a call that returns nothing answers.
@@ -557,11 +549,8 @@ mod proxy {
         async fn unpack(
             &mut self,
             layer: String,
-            urgency: Urgency,
         ) -> zlink::Result<
-            impl futures::Stream<
-                Item = zlink::Result<(Result<UnpackReply, FetcherError>, Vec<OwnedFd>)>,
-            >,
+            impl futures::Stream<Item = zlink::Result<(Result<FetchReply, FetcherError>, Vec<OwnedFd>)>>,
         >;
 
         /// Bring files of `layer` into its staging directory.

@@ -211,7 +211,8 @@ type EventKind (
 	# It tried and failed for `objects`: `failure`
 	failed,
 	# `bytes` of the one object of `objects` are written so far by this
-	# call (of the blob of the layer, for a call with no objects)
+	# call (of the blob of the layer, for an `Unpack`, which has no
+	# objects)
 	progress,
 	# (what an event this side does not know is read as: ignored)
 	unknown
@@ -226,7 +227,8 @@ type FetchEvent (
 	bytes: ?int,
 	# With `staged`: the object at each position of `objects` is the
 	# complete file with no name at this position among the descriptors of
-	# the reply (a call that asked for `handover`)
+	# the reply (a call that asked for `handover`); for an `Unpack`, which
+	# has no objects, the files of the layer at these positions
 	files: ?[]int
 )
 
@@ -324,18 +326,15 @@ method Probe(layers: []Blob, again: ?bool, parts: ?Parts) -> (probed: ?Probed)
 
 # Read the whole blob of `layer` (one with no table of contents) and
 # hand over its files, then give `toc.claim` and `tarsplit` names in
-# its staging.  Called with more: replies with `bytes` (of the blob,
-# read so far) or `files` (complete files of the layer: the
-# position of a descriptor of the reply each, regular files with no
-# name, in memory when small, with fs-verity when the scope says
-# verity), then a last reply with neither once the names are given.
-# A failure is the error `Failed`.
-method Unpack(layer: string, urgency: Urgency) -> (
-	bytes: ?int,
-	# Complete files of the layer, each the position of a descriptor of the
-	# reply
-	files: ?[]int
-)
+# its staging.  Called with more: the replies are the events of a
+# `Fetch` with no objects, `progress` with the `bytes` of the blob
+# read so far (a beat repeats them) or `staged` with `files`
+# (complete files of the layer: the position of a descriptor of
+# the reply each, regular files with no name, in memory when
+# small, with fs-verity when the scope says verity), then a last
+# reply with no event once the names are given.  A failure is the
+# error `Failed`.
+method Unpack(layer: string) -> (event: ?FetchEvent)
 
 # Bring files of `layer` into its staging directory, by the object
 # contract.  Called with more.  Each object is in exactly one of `staged`,

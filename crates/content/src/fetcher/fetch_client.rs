@@ -12,7 +12,7 @@
 
 use super::fetch::{
     Blob, BlobReply, FetchEvent, FetchReply, FetcherError, FetcherProxy, FileKind, Parts,
-    ProbeReply, Probed, Reuse, UnpackReply, Urgency, INTERFACE, MAX_FDS, PROTO,
+    ProbeReply, Probed, Reuse, Urgency, INTERFACE, MAX_FDS, PROTO,
 };
 use super::proto::{
     Downloaded, Found, Hit, RegistryError, RegistryProxy, Remote, Tagged, MAX_ANSWER,
@@ -194,31 +194,6 @@ impl Replies<'_, ProbeReply> {
             .next_with(|r| r.probed.is_none())
             .await?
             .and_then(|(r, fds)| r.probed.map(|p| (p, fds))))
-    }
-}
-
-/// What an `Unpack` tells.
-pub enum Unpacking {
-    /// The bytes of the blob read so far
-    Bytes(u64),
-    /// Complete files of the layer, regular files with no name
-    Files(Vec<File>),
-}
-
-impl Replies<'_, UnpackReply> {
-    /// The next thing an `Unpack` tells; none after the last reply.
-    pub async fn unpacking(&mut self) -> Result<Option<Unpacking>, CallError> {
-        let Some((reply, fds)) = self
-            .next_with(|r| r.bytes.is_none() && r.files.is_none())
-            .await?
-        else {
-            return Ok(None);
-        };
-        let Some(places) = reply.files else {
-            return Ok(Some(Unpacking::Bytes(reply.bytes.unwrap_or(0))));
-        };
-        let files = files_at(&places, fds)?;
-        Ok(Some(Unpacking::Files(files)))
     }
 }
 
@@ -563,15 +538,12 @@ impl FetchConn {
 
     /// Read the whole blob of `layer`, a layer with no table of contents,
     /// and have its files, `toc.claim` and `tarsplit` named in its staging:
-    /// the replies carry the bytes of the blob read so far, the last none.
+    /// the events carry the bytes of the blob read so far (`progress`) and
+    /// the files of the layer (`staged`, with `files`), the last reply none.
     /// A failure is the error of the call.
-    pub async fn unpack(
-        &mut self,
-        layer: &str,
-        urgency: Urgency,
-    ) -> Result<Replies<'_, UnpackReply>, CallError> {
+    pub async fn unpack(&mut self, layer: &str) -> Result<Replies<'_, FetchReply>, CallError> {
         let (conn, busy) = self.begin().await?;
-        match conn.unpack(layer.to_string(), urgency).await {
+        match conn.unpack(layer.to_string()).await {
             Ok(stream) => Ok(replies_fds(stream, &busy)),
             Err(e) => {
                 busy.store(false, Ordering::Release);

@@ -73,7 +73,7 @@ impl Files {
         self.bytes = 0;
         let files = std::mem::take(&mut self.waiting);
         let event = FetchEvent {
-            objects: (0..files.len() as u32).collect(),
+            files: Some((0..files.len() as u32).collect()),
             ..FetchEvent::of(EventKind::Staged)
         };
         self.out

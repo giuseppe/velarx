@@ -14,8 +14,8 @@
 use crate::activation;
 use crate::fetcher::fetch::{
     Ack, Answer, Blob, BlobReply, EventKind, Failure, FailureClass, FetchEvent, FetchReply,
-    FetcherError, FileKind, NotLazy, Parts, ProbeReply, Probed, Reuse, TocSource, UnpackReply,
-    Urgency, MAX_ACCESS, MAX_FDS, PROTO,
+    FetcherError, FileKind, NotLazy, Parts, ProbeReply, Probed, Reuse, TocSource, Urgency,
+    MAX_ACCESS, MAX_FDS, PROTO,
 };
 use crate::fetcher::proto::{
     Ack as RegistryAck, Downloaded, Found, Hit, RegistryError, Remote, Tagged, MAX_ANSWER,
@@ -203,7 +203,6 @@ pub struct FetchCall {
 
 /// What an `Unpack` asks.
 pub struct UnpackCall {
-    pub urgency: Urgency,
     /// Cancelled when the client goes away or the layer is cancelled
     pub cancel: Cancel,
 }
@@ -1343,19 +1342,20 @@ mod service {
 
         /// Read the whole blob of `layer` (one with no table of contents) and
         /// hand over its files, then give `toc.claim` and `tarsplit` names in
-        /// its staging.  Called with more: replies with `bytes` (of the blob,
-        /// read so far) or `files` (complete files of the layer: the
-        /// position of a descriptor of the reply each, regular files with no
-        /// name, in memory when small, with fs-verity when the scope says
-        /// verity), then a last reply with neither once the names are given.
-        /// A failure is the error `Failed`.
+        /// its staging.  Called with more: the replies are the events of a
+        /// `Fetch` with no objects, `progress` with the `bytes` of the blob
+        /// read so far (a beat repeats them) or `staged` with `files`
+        /// (complete files of the layer: the position of a descriptor of
+        /// the reply each, regular files with no name, in memory when
+        /// small, with fs-verity when the scope says verity), then a last
+        /// reply with no event once the names are given.  A failure is the
+        /// error `Failed`.
         #[zlink(more, return_fds)]
         pub async fn unpack(
             &self,
             more: bool,
             layer: String,
-            urgency: Urgency,
-        ) -> impl Stream<Item = (Result<Reply<UnpackReply>, FetcherError>, Vec<OwnedFd>)> + Unpin
+        ) -> impl Stream<Item = (Result<Reply<FetchReply>, FetcherError>, Vec<OwnedFd>)> + Unpin
         {
             let prepared = (|| {
                 if !more {
@@ -1382,7 +1382,6 @@ mod service {
             }
             let (api, idle) = (self.api.clone(), scope.idle);
             let call = UnpackCall {
-                urgency,
                 cancel: cancel.clone(),
             };
             let task = self.runtime.spawn(async move {
@@ -1401,24 +1400,9 @@ mod service {
                 task,
                 None,
                 (
-                    |event| match event.kind {
-                        // (the bytes of the blob so far; a beat has none:
-                        // it says the same as the call began with)
-                        EventKind::Progress if event.objects.is_empty() => Some(UnpackReply {
-                            bytes: Some(event.bytes.unwrap_or(0)),
-                            files: None,
-                        }),
-                        EventKind::Staged => Some(UnpackReply {
-                            bytes: None,
-                            files: Some(event.objects),
-                        }),
-                        _ => None,
-                    },
+                    |event| Some(FetchReply { event: Some(event) }),
                     |reason| FetcherError::failed(reason),
-                    Some(|| UnpackReply {
-                        bytes: None,
-                        files: None,
-                    }),
+                    Some(|| FetchReply { event: None }),
                 ),
             )
         }

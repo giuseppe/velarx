@@ -257,7 +257,7 @@ impl StagingFetcher for Origin {
         }
         let bodies: Vec<_> = self.layer.bodies.values().collect();
         let event = Event {
-            objects: (0..bodies.len() as u32).collect(),
+            files: Some((0..bodies.len() as u32).collect()),
             ..Event::of(EventKind::Staged)
         };
         out.send_with(event, bodies.iter().map(|b| in_memory(b)).collect())
