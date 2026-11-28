@@ -12,6 +12,8 @@ pub mod erofs_read;
 pub mod erofs_tree;
 mod idtranslate;
 mod image_fs;
+#[cfg(test)]
+mod inline_tests;
 pub mod layer_erofs;
 mod merged;
 mod merged_view;

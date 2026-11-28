@@ -1691,6 +1691,75 @@ mod tests {
         mounts.unmount_all();
     }
 
+    /// The files an image holds itself are read from the mapping of the
+    /// image, whole and from any offset: a file under a block (in the block
+    /// of its inode), one over it (in blocks of its own), the end and what
+    /// is past it.  Skipped where FUSE cannot be mounted.
+    #[test]
+    fn the_files_of_the_image_are_read_from_its_mapping() {
+        use crate::inline_tests::{bytes, Contents};
+        use std::os::unix::fs::FileExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileStore::new(tmp.path().join("files")).unwrap());
+        let mut contents = Contents::new();
+        let files: Vec<(String, Vec<u8>)> = [1usize, 100, 4095, 4096, 5000, 1 << 20]
+            .into_iter()
+            .map(|n| (format!("f{n}"), bytes(n as u8, n)))
+            .collect();
+        let entries: Vec<TocEntry> = files.iter().map(|(n, d)| contents.file(n, d)).collect();
+        let image = tmp.path().join("layer.erofs");
+        let open = |d: &velarx_types::digest::Digest| contents.open(d);
+        let written = crate::layer_erofs::write_layer_image(
+            &entries,
+            &crate::layer_erofs::Inline {
+                threshold: -1,
+                open: &open,
+            },
+            File::create(&image).unwrap(),
+        )
+        .unwrap();
+        let layer = crate::erofs_tree::Layer::map(&image).unwrap();
+        let index = crate::erofs_tree::Index::from_bytes(Box::new(written.index)).unwrap();
+        let tree = crate::erofs_tree::Layers::new(
+            vec![layer],
+            Some(vec![index]),
+            false,
+            crate::erofs_tree::Stubs::Every,
+        );
+        let mounts = ImageMounts::at(tmp.path().join("mnt"), store);
+        let Some(root) = mounted(
+            Probe::Plain,
+            mounts.mount_tree(
+                "img",
+                Arc::new(tree),
+                vec!["l0".into()],
+                written.owners,
+                None,
+            ),
+        ) else {
+            return;
+        };
+        let path = root.join("layer1");
+        for (name, data) in &files {
+            assert!(std::fs::read(path.join(name)).unwrap() == *data, "{name}");
+            let f = File::open(path.join(name)).unwrap();
+            let size = data.len();
+            for (at, len) in [
+                (0, 1),
+                (size / 2, 7),
+                (size - 1, 10),
+                (size, 10),
+                (size + 4096, 1),
+            ] {
+                let mut got = vec![0u8; len];
+                let n = f.read_at(&mut got, at as u64).unwrap();
+                let want = &data[at.min(size)..(at + len).min(size)];
+                assert!(got[..n] == *want, "{name} at {at}");
+            }
+        }
+        mounts.unmount_all();
+    }
+
     /// The fs-verity digest the kernel gives for a file of a store that has
     /// fs-verity: here made from its content.
     fn content_verity(file: &File) -> Result<Option<String>, String> {
