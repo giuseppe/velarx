@@ -1,0 +1,11 @@
+-- SPDX-License-Identifier: Apache-2.0
+import Lake
+open Lake DSL
+
+package «inline-model»
+
+-- `#proved` (../../Proved.lean)
+@[default_target] lean_lib Proved
+
+@[default_target] lean_lib InlineModel where
+  globs := #[.submodules `InlineModel]

@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# What ../run needs to know about this directory: it is a model of a
+# design written by hand, with no crate to translate (no Charon, no
+# Aeneas, no Mathlib).
+MODEL_ONLY=1

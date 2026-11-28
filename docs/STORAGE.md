@@ -185,6 +185,23 @@ opened either; a client asks an engine service whose interface, version or
 digest is not its own to `Restart` from the installed binary; a monitor or a
 p2p service of another version is refused with an error.
 
+## The model of the inline threshold
+
+`tools/verify/inline-model` is a model, written by hand in Lean, of the files a
+layer image holds itself (`inline_threshold`): the rule that picks them, where
+the streaming writer of `layer_image` puts each one, the rows of
+`inlined_files` and the lookup of the content of a digest in the stores.  It
+proves, for every layer and every threshold, that the extents are exactly the
+files of at most N bytes (none at 0, every file with content at -1), lie in the
+image, never overlap, read back as the bytes written, follow the block rules,
+that the writer only goes up the image, that a layer has one row for each
+digest (the first extent), and that the lookup answers with the object, else
+the first row, the first store deciding.  It assumes the model is the code (a
+layer image of at most 2^32 blocks, a file with content is not empty, the rows
+of a table are read in one fixed order) and says nothing of the real EROFS
+headers or the database.  `tools/verify/run inline-model` checks it, in about a
+minute and with no Mathlib.
+
 ## Security properties and limits
 
 What the design gives:

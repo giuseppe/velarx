@@ -22,6 +22,9 @@
 # "all N claims of M.Spec are proved" (M: the directory of Spec.lean)
 # the run ends on.  A warning
 # "declaration uses `sorry`" is an error anywhere in the Lean of the crate.
+# A directory with MODEL_ONLY=1 in its options is a model written by hand
+# of a design, with no crate: no Charon, no Aeneas, and no Mathlib (only
+# Lean itself), so the run takes a minute, not hours.
 # Ok.lean, the notion "if it returns" that the proofs of the crates that
 # need it are written in, is shared.  The versions of the tools are in
 # pins.
@@ -71,9 +74,12 @@ if grep -rnE 'debug\.skipKernelTC|addDeclWithoutChecking|addDeclCore|warn\.sorry
     echo "verify: $crate goes around the kernel or hides a sorry (above)" >&2
     exit 1
 fi
-CHARON_FLAGS= AENEAS_FLAGS=
+CHARON_FLAGS= AENEAS_FLAGS= MODEL_ONLY=
 [ ! -f "$here/$crate/options" ] || . "$here/$crate/options"
 . "$here/pins"
+# (what Charon reads: the crate, or nothing for a model)
+source=crates/$crate
+[ -z "$MODEL_ONLY" ] || source=.
 image=localhost/velarx-verify:$(cat "$here/Containerfile" "$here/pins" | sha256sum | cut -c1-12)
 
 if ! $runtime image exists "$image"; then
@@ -91,9 +97,11 @@ $runtime container run --rm --userns=keep-id --security-opt label=disable \
     -e XDG_CACHE_HOME=/xdg -e CHARON_CACHE_DIR=/xdg/charon \
     -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target \
     -e CRATE=$crate -e SPEC=$spec -e AENEAS=$AENEAS -e LEAN=$LEAN \
+    -e MODEL_ONLY=$MODEL_ONLY \
     -e CHARON_FLAGS="$CHARON_FLAGS" -e AENEAS_FLAGS="$AENEAS_FLAGS" \
-    -w /src/crates/$crate "$image" bash -euc '
-        charon cargo --preset=aeneas $CHARON_FLAGS --dest-file /target/$CRATE.llbc
+    -w /src/$source "$image" bash -euc '
+        [ -n "$MODEL_ONLY" ] ||
+            charon cargo --preset=aeneas $CHARON_FLAGS --dest-file /target/$CRATE.llbc
         # (.lake, the built Mathlib, stays)
         find /work -mindepth 1 -maxdepth 1 ! -name .lake -exec rm -rf {} +
         # (the files of the harness last)
@@ -109,18 +117,20 @@ $runtime container run --rm --userns=keep-id --security-opt label=disable \
             { echo "verify: lakefile.lean.in has no line package" >&2; exit 1; }
         echo "$LEAN" > lean-toolchain
         rm -rf Extracted
-        aeneas -backend lean -split-files $AENEAS_FLAGS \
-            -abort-on-error -no-progress-bar \
-            -dest . -subdir Extracted /target/$CRATE.llbc
-        cd Extracted
-        # (a crate that uses no type of the library has no template)
-        [ ! -f TypesExternal_Template.lean ] || mv TypesExternal_Template.lean TypesExternal.lean
-        if [ -f FunsExternal_Template.lean ]; then
-            awk -f /src/tools/verify/externals.awk ../Models.lean \
-                FunsExternal_Template.lean > FunsExternal.lean
-            rm FunsExternal_Template.lean
+        if [ -z "$MODEL_ONLY" ]; then
+            aeneas -backend lean -split-files $AENEAS_FLAGS \
+                -abort-on-error -no-progress-bar \
+                -dest . -subdir Extracted /target/$CRATE.llbc
+            cd Extracted
+            # (a crate that uses no type of the library has no template)
+            [ ! -f TypesExternal_Template.lean ] || mv TypesExternal_Template.lean TypesExternal.lean
+            if [ -f FunsExternal_Template.lean ]; then
+                awk -f /src/tools/verify/externals.awk ../Models.lean \
+                    FunsExternal_Template.lean > FunsExternal.lean
+                rm FunsExternal_Template.lean
+            fi
+            cd ..
         fi
-        cd ..
         # (with no manifest, lake takes the versions Aeneas locks, and
         # Mathlib downloads what is built of it)
         lake build
@@ -149,5 +159,5 @@ if [ $status = 0 ]; then
     fi
 fi
 # where to read what Lean sees of the crate (Funs.lean has `step`)
-echo "verify: the Lean of $crate is in $cache/work/Extracted" >&2
+[ -n "$MODEL_ONLY" ] || echo "verify: the Lean of $crate is in $cache/work/Extracted" >&2
 exit $status
