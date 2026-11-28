@@ -1,0 +1,86 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# The end to end (bats) files of one kind of run, through
+# tests/e2e/run-all.sh, which runs them side by side, prints a table of the
+# results at the end and exits 1 when a file failed:
+#
+#   tools/run-bats rootless [-j JOBS] [-- BATS_ARGS...]   # every file but the p2p ones, 5 at a time
+#   tools/run-bats root [-j JOBS] [-- BATS_ARGS...]       # as root: the files with root tests, 6 at a time
+#   tools/run-bats p2p [-- BATS_ARGS...]                  # the p2p files, one at a time, under P2P_LOCK
+#   tools/run-bats list rootless|root|p2p                 # the names of the files of a run
+#
+# As root the files share the host (its bridges, its service manager, its
+# cgroups); run-all.sh runs the ones that must be alone (ALONE) with no other
+# file, and the files that reload the service manager before unit.bats
+# (AFTER); every other file has a bridge, subnets, units and ports of its
+# own and runs beside the others.  The p2p files listen on fixed ports of
+# the host (E2E_PEERS_PORT, E2E_NAMES_PORT): they run one at a time,
+# holding the lock file P2P_LOCK (default /var/tmp/p2p-rig.lock), which
+# every other peer-to-peer run of the machine (a p2p-rig scenario) is
+# expected to hold too.  VELARX_BINDIR, E2E_LOGDIR and E2E_TIMEOUT are read
+# by run-all.sh; E2E_JOBS is the default of -j.
+set -eu
+
+top_srcdir=$(cd "$(dirname "$0")/.." && pwd)
+RUNALL=$top_srcdir/tests/e2e/run-all.sh
+
+# The files whose tests need a peer-to-peer service and its rig.
+P2P_FILES=(lazy-peers lazy-peers-nodaemon names-peers)
+# The files with tests that run as root (the other files skip as root, or
+# test what a user does and run in the rootless run).
+ROOT_FILES=(api/build-features api/checkpoint api/checkpoint-options
+api/containers api/cp api/pods api/userns cgroups cgroups-disabled cli-compat
+composefs cri cri-checkpoint engine engine-api fetcher-confine flags images
+image-server inline-nfs inline-threshold inotify keyring kube kubeadm-script
+lazy-fixtures metrics network pidfile pod-parity quadlet reboot run-config
+run-engine run-health run-lifecycle run-parity run-podman runtimes
+sha512-digests sha512-produce signature spec stores unit units userns/rootfs
+userns/rootfsdir userns/unshare verity verity-default verity-digest
+verity-start)
+
+usage () {
+    echo "usage: tools/run-bats rootless|root|p2p [-j JOBS] [-- BATS_ARGS...]; tools/run-bats list rootless|root|p2p" >&2
+    exit 2
+}
+
+rootless_files () {
+    (cd "$top_srcdir/tests/e2e/bats" && find . -name '*.bats' | sed 's|^\./||; s|\.bats$||' | sort |
+        grep -vxF -f <(printf '%s\n' "${P2P_FILES[@]}"))
+}
+
+[ $# -gt 0 ] || usage
+kind=$1
+shift
+if [ "$kind" = list ]; then
+    case ${1:-} in
+    rootless) rootless_files ;;
+    root) printf '%s\n' "${ROOT_FILES[@]}" ;;
+    p2p) printf '%s\n' "${P2P_FILES[@]}" ;;
+    *) usage ;;
+    esac
+    exit 0
+fi
+jobs=
+if [ "${1:-}" = -j ]; then
+    [ $# -ge 2 ] || usage
+    jobs=$2
+    shift 2
+fi
+[ $# -eq 0 ] || [ "$1" = -- ] || usage
+
+case $kind in
+rootless)
+    [ "$(id -u)" != 0 ] || { echo "tools/run-bats rootless: run it as a user, not as root" >&2; exit 2; }
+    mapfile -t names < <(rootless_files)
+    exec "$RUNALL" -j "${jobs:-${E2E_JOBS:-5}}" "${names[@]}" "$@"
+    ;;
+root)
+    [ "$(id -u)" = 0 ] || { echo "tools/run-bats root: run it as root" >&2; exit 2; }
+    exec "$RUNALL" -j "${jobs:-${E2E_JOBS:-6}}" "${ROOT_FILES[@]}" "$@"
+    ;;
+p2p)
+    lock=${P2P_LOCK:-/var/tmp/p2p-rig.lock}
+    exec flock "$lock" "$RUNALL" -j 1 "${P2P_FILES[@]}" "$@"
+    ;;
+*) usage ;;
+esac
