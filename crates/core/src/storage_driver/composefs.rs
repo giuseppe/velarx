@@ -59,10 +59,7 @@ static CAPABILITIES: Capabilities = Capabilities {
     // the kernel's overlay checks them on mounts of root, the FUSE file
     // system on open
     verity: Prefs::new(&[VerityEnforcement::Kernel, VerityEnforcement::OnOpen]),
-    shared_stores: true,
-    layer_chain: false,
     max_layers: Some(cfs::OVERLAY_MAX_STACK),
-    overlay_upper: true,
     // (no quota of the layer: `size_limit` is refused)
     writable_size_limit: false,
     root: MountCaps {
@@ -2594,7 +2591,6 @@ mod tests {
         assert_eq!(d.name(), "composefs");
         let c = d.capabilities();
         assert!(c.lazy && c.serve_content && c.rootless);
-        assert!(c.shared_stores && !c.layer_chain);
         assert_eq!(
             c.verity,
             Prefs::new(&[VerityEnforcement::Kernel, VerityEnforcement::OnOpen])
@@ -3571,198 +3567,6 @@ mod tests {
         let none = Writable::new("e", tmp.path().join("bundles/e"));
         assert!(!d.writable_exists(&none).unwrap());
         assert!(d.apply(&none, &opts, &mut tar.as_slice()).is_err());
-    }
-
-    /// The squash reads the changes as a directory: the upper directory
-    /// itself, or (for a driver that has none) the extraction of the tar of
-    /// `diff`: both are walked to the same layer.
-    #[tokio::test]
-    async fn the_changes_as_a_directory_are_the_same_layer_by_either_way() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (d, w, lower, _) = upper_with_changes(tmp.path()).await;
-        let upper = d.writable_paths(&w).upper;
-        let diff = super::super::WritableDiff::new(d, w, Some(lower));
-        let walk = dirtar::Options {
-            exclude: dirtar::ENGINE_FILES.iter().map(|s| s.to_string()).collect(),
-            mtime: dirtar::Mtime::Fixed(1),
-            ..Default::default()
-        };
-        let scratch = tmp.path().join("scratch");
-        let tar_of = |c: &super::super::ChangesDir| {
-            let fd = open_dir(&c.path).unwrap();
-            let mut out = Vec::new();
-            dirtar::write(rustix::fd::AsFd::as_fd(&fd), &c.walk, &mut out).unwrap();
-            out
-        };
-        let direct = diff.directory(&walk, &scratch).unwrap();
-        assert_eq!(direct.path, upper);
-        let via_tar = diff.directory_of_tar(&walk, &scratch).unwrap();
-        assert!(via_tar.path.starts_with(&scratch));
-        assert_ne!(via_tar.path, direct.path);
-        let expected = tar_of(&direct);
-        assert!(!expected.is_empty());
-        assert!(
-            tar_of(&via_tar) == expected,
-            "the directories give another layer"
-        );
-        // the directory made for it goes with it
-        let made = via_tar.path.clone();
-        drop(via_tar);
-        assert!(!made.exists());
-    }
-
-    /// The squash of a driver without an overlay upper (`overlay_upper`
-    /// false) reads the extraction of the tar of `diff`, and it is the same
-    /// layer, byte for byte, as the walk of the upper directory: whiteouts,
-    /// an opaque directory, a metadata only file whose data is below, hard
-    /// links, a sparse file, xattrs, a symlink, modes, the ids the container
-    /// sees through its mapping, the times of the files kept or fixed.
-    #[tokio::test]
-    async fn a_driver_without_an_overlay_upper_squashes_to_the_same_layer() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let (cfs, w, lower, marks) = upper_with_changes(tmp.path()).await;
-        let upper = cfs.writable_paths(&w).upper;
-        // more than `upper_with_changes` has
-        std::os::unix::fs::symlink("../etc/new", upper.join("etc/sub/sym")).unwrap();
-        let xattr = set_xattr(&upper.join("etc/sub/f"), "user.test", b"value");
-        std::fs::set_permissions(upper.join("etc/sub"), PermissionsExt::from_mode(0o751)).unwrap();
-        std::fs::set_permissions(upper.join("etc/new"), PermissionsExt::from_mode(0o4755)).unwrap();
-        // The times of the upper, long before the copy is made (the copy of
-        // a test made in the same second as the upper would agree with it
-        // whatever it did): the symlink, the whiteout, and the directories
-        // after what they hold, as the container left them.
-        let stamp = rustix::fs::Timestamps {
-            last_access: rustix::fs::Timespec {
-                tv_sec: 1_000_000_000,
-                tv_nsec: 0,
-            },
-            last_modification: rustix::fs::Timespec {
-                tv_sec: 1_000_000_000,
-                tv_nsec: 0,
-            },
-        };
-        for p in ["etc/sub/sym", "etc/gone", "etc/sub", "etc", "opt", ""] {
-            if upper.join(p).symlink_metadata().is_ok() {
-                rustix::fs::utimensat(
-                    rustix::fs::CWD,
-                    upper.join(p),
-                    &stamp,
-                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-                )
-                .unwrap();
-            }
-        }
-        let me = rustix::process::geteuid().as_raw();
-        let mut uid_map = vec![dirtar::IdRange {
-            container: 0,
-            host: me,
-            size: 1,
-        }];
-        if me == 0 {
-            // a file of a mapped id other than root's
-            uid_map.push(dirtar::IdRange {
-                container: 1,
-                host: 100_000,
-                size: 1000,
-            });
-            std::os::unix::fs::lchown(upper.join("etc/sub/f"), Some(100_005), Some(0)).unwrap();
-        }
-        let gid_map = vec![dirtar::IdRange {
-            container: 0,
-            host: rustix::process::getegid().as_raw(),
-            size: 1,
-        }];
-        let mut caps = cfs.capabilities().clone();
-        caps.overlay_upper = false;
-        let no_upper: Arc<dyn StorageDriver> = Arc::new(
-            crate::storage_driver::watching::Watching::new(cfs.clone(), caps),
-        );
-        assert!(!no_upper.capabilities().overlay_upper);
-        let scratch = tmp.path().join("scratch");
-        for mtime in [dirtar::Mtime::Keep, dirtar::Mtime::Fixed(1)] {
-            let walk = dirtar::Options {
-                exclude: dirtar::ENGINE_FILES.iter().map(|s| s.to_string()).collect(),
-                uid_map: uid_map.clone(),
-                gid_map: gid_map.clone(),
-                mtime,
-                ..Default::default()
-            };
-            let tar_of = |c: &super::super::ChangesDir| {
-                let fd = open_dir(&c.path).unwrap();
-                let mut out = Vec::new();
-                dirtar::write(rustix::fd::AsFd::as_fd(&fd), &c.walk, &mut out).unwrap();
-                out
-            };
-            let direct =
-                super::super::WritableDiff::new(cfs.clone(), w.clone(), Some(lower.clone()));
-            let via =
-                super::super::WritableDiff::new(no_upper.clone(), w.clone(), Some(lower.clone()));
-            let a = direct.directory(&walk, &scratch).unwrap();
-            assert_eq!(a.path, upper, "an overlay's upper is read in place");
-            let b = via.directory(&walk, &scratch).unwrap();
-            assert!(b.path.starts_with(&scratch), "{}", b.path.display());
-            let (ta, tb) = (tar_of(&a), tar_of(&b));
-            let names = |t: &[u8]| -> Vec<String> {
-                tar::Archive::new(t)
-                    .entries()
-                    .unwrap()
-                    .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
-                    .collect()
-            };
-            let na = names(&ta);
-            for want in [
-                "etc/new",
-                "etc/sub/link",
-                "etc/sub/sym",
-                "etc/sub/f",
-                "sparse",
-            ] {
-                assert!(na.iter().any(|n| n == want), "{want} not in {na:?}");
-            }
-            if marks {
-                for want in ["etc/.wh.gone", "opt/.wh..wh..opq", "etc/old"] {
-                    assert!(na.iter().any(|n| n == want), "{want} not in {na:?}");
-                }
-            }
-            assert_eq!(na, names(&tb), "{mtime:?}");
-            assert!(ta == tb, "{mtime:?}: the directories give another layer");
-            // what the tar says: a hard link, the sparse file's size, the
-            // xattr, the ids of the container
-            let mut ar = tar::Archive::new(&ta[..]);
-            for e in ar.entries().unwrap() {
-                let mut e = e.unwrap();
-                let p = e.path().unwrap().to_string_lossy().into_owned();
-                let h = e.header().clone();
-                match p.as_str() {
-                    "etc/sub/link" => {
-                        assert_eq!(h.entry_type(), tar::EntryType::Link);
-                    }
-                    "etc/sub/f" => {
-                        if me == 0 {
-                            assert_eq!(h.uid().unwrap(), 6);
-                        }
-                        if xattr {
-                            let pax: Vec<_> = e
-                                .pax_extensions()
-                                .unwrap()
-                                .into_iter()
-                                .flatten()
-                                .map(|x| x.unwrap().key().unwrap().to_string())
-                                .collect();
-                            assert!(pax.iter().any(|k| k == "SCHILY.xattr.user.test"), "{pax:?}");
-                        }
-                    }
-                    "etc/new" => {
-                        assert_eq!((h.uid().unwrap(), h.mode().unwrap() & 0o7777), (0, 0o4755));
-                    }
-                    _ => {}
-                }
-            }
-            let made = b.path.clone();
-            drop(b);
-            assert!(!made.exists(), "the extraction goes with the result");
-        }
     }
 
     /// The view of a stopped container shows its upper directory over the

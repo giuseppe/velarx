@@ -6,11 +6,6 @@
 //! Opened by the storage driver (`stopped_view`), which says where the
 //! upper directory is.
 //!
-//! Two layouts (`StoppedView::overlay` and `::directory`): the upper
-//! directory of an overlay over the image, or the whole root of a container
-//! of a driver that copies the layers, in which nothing is below and a 0:0
-//! device is the device the container made.
-//!
 //! What the overlay would show: an entry of the upper directory hides the
 //! image's, a whiteout (a character device 0:0) deletes it, an opaque
 //! directory hides the image's directory under it.  Links are resolved in
@@ -57,25 +52,13 @@ pub struct EntryStat {
     pub is_dir: bool,
 }
 
-/// How the directory of a container's layer says what the container changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Layout {
-    /// The upper directory of an overlay over the image: an entry hides the
+pub struct StoppedView<'a> {
+    /// The upper directory of the container's overlay: an entry hides the
     /// image's, a 0:0 device is a deletion, an opaque directory hides the
     /// image's.
-    Overlay,
-    /// The whole root file system of the container (a copy of the image that
-    /// the container wrote in): nothing is below it, and a 0:0 device is the
-    /// device the container made.
-    Directory,
-}
-
-pub struct StoppedView<'a> {
-    /// The directory of the container's layer.
     upper: OwnedFd,
-    /// The image below an overlay layout (not read for a directory).
+    /// The image below it.
     image: TreeSource<'a>,
-    layout: Layout,
     /// The mount of `upper`: a directory below it on another mount (a
     /// mount point, a bind mount) is not walked into.
     mount: OnceLock<MountOf>,
@@ -180,25 +163,8 @@ impl<'a> StoppedView<'a> {
         Self {
             upper,
             image,
-            layout: Layout::Overlay,
             mount: OnceLock::new(),
         }
-    }
-
-    /// The root file system `root` of a container that is a plain directory
-    /// (the layers copied and written in: nothing is merged with the image,
-    /// which is only the source of the ids translation and is not read).
-    pub fn directory(root: OwnedFd, image: TreeSource<'a>) -> Self {
-        Self {
-            upper: root,
-            image,
-            layout: Layout::Directory,
-            mount: OnceLock::new(),
-        }
-    }
-
-    fn overlay_layout(&self) -> bool {
-        self.layout == Layout::Overlay
     }
 
     fn lower_kind(&self, n: usize) -> Option<FileType> {
@@ -219,10 +185,9 @@ impl<'a> StoppedView<'a> {
         let fd = rustix::io::fcntl_dupfd_cloexec(&self.upper, 0)?;
         let st = fstat(&fd)?;
         // (the overlay never reads the attribute on its root)
-        let lower = self.overlay_layout().then_some(ROOT);
         Ok(Entry {
             upper: Some((fd, st)),
-            lower,
+            lower: Some(ROOT),
             meta: false,
         })
     }
@@ -262,9 +227,7 @@ impl<'a> StoppedView<'a> {
                                 ),
                             ));
                         }
-                        if self.overlay_layout()
-                            && (cp::is_whiteout(&st) || xattr_whiteout(&c, &st))
-                        {
+                        if cp::is_whiteout(&st) || xattr_whiteout(&c, &st) {
                             return Ok(None);
                         }
                         upper = Some((c, st));
@@ -275,8 +238,8 @@ impl<'a> StoppedView<'a> {
             }
         }
         let (metacopy, redirect) = match &upper {
-            Some((fd, st)) if self.overlay_layout() => overlay_attrs(fd, st),
-            _ => (false, None),
+            Some((fd, st)) => overlay_attrs(fd, st),
+            None => (false, None),
         };
         // where it is below: by its name, or where the overlay says it was
         let mut lower = match &redirect {
@@ -286,9 +249,6 @@ impl<'a> StoppedView<'a> {
                 .zip(name.to_str())
                 .and_then(|(l, n)| self.image.tree.lookup(l, n)),
         };
-        if !self.overlay_layout() {
-            lower = None;
-        }
         let mut meta = false;
         if let Some((fd, st)) = &upper {
             if is_dir(st) {
@@ -660,7 +620,7 @@ impl<'a> StoppedView<'a> {
             open_beneath(dir.as_fd(), Path::new(c), Beneath::DirectoryPath)
         };
         let mut cur = rustix::io::fcntl_dupfd_cloexec(&self.upper, 0)?;
-        let mut lower = self.overlay_layout().then_some(ROOT);
+        let mut lower = Some(ROOT);
         for c in &comps {
             lower = lower.and_then(|l| self.image.tree.lookup(l, c));
             cur = match open(&cur, c) {
@@ -933,61 +893,6 @@ mod tests {
         // the content of the key is read
         std::fs::write(&path, &keep).unwrap();
         assert!(view(&f).read_file("/d/a", 1 << 20).is_ok());
-    }
-
-    #[test]
-    fn a_directory_layout_is_the_whole_root_and_reads_no_image() {
-        let f = fx();
-        let root = f.upper.join("copy");
-        std::fs::create_dir_all(root.join("etc")).unwrap();
-        std::fs::write(root.join("etc/own"), "mine").unwrap();
-        symlink("own", root.join("etc/link")).unwrap();
-        // what the image has is not in the directory: it is not there
-        // (a 0:0 device needs no privilege: it is the overlay's whiteout)
-        let dev = rustix::fs::mknodat(
-            rustix::fs::CWD,
-            root.join("etc/zero"),
-            rustix::fs::FileType::CharacterDevice,
-            Mode::from_raw_mode(0o600),
-            0,
-        )
-        .is_ok();
-        let v = StoppedView::directory(
-            rustix::fs::open(&root, OFlags::PATH | OFlags::DIRECTORY, Mode::empty()).unwrap(),
-            source(&f),
-        );
-        assert_eq!(v.read_file("/etc/own", 1 << 20).unwrap(), "mine");
-        assert_eq!(v.stat("/etc/link").unwrap().1, "/etc/own");
-        assert_eq!(
-            v.stat("/etc/passwd").unwrap_err().raw_os_error(),
-            Some(libc::ENOENT)
-        );
-        let mut want = vec!["t", "t/link", "t/own"];
-        if dev {
-            // a 0:0 device is a device here, not a deletion (`cp` copies no
-            // device, so it is not in the archive); the same directory as the
-            // upper of an overlay reads it as a whiteout
-            want.push("t/zero");
-            let (st, _) = v.stat("/etc/zero").unwrap();
-            assert_eq!(st.mode & libc::S_IFMT, libc::S_IFCHR);
-            let o = StoppedView::overlay(
-                rustix::fs::open(&root, OFlags::PATH | OFlags::DIRECTORY, Mode::empty()).unwrap(),
-                source(&f),
-            );
-            assert_eq!(
-                o.stat("/etc/zero").unwrap_err().raw_os_error(),
-                Some(libc::ENOENT)
-            );
-        } else {
-            eprintln!("SKIPPED: no 0:0 device here");
-        }
-        let listed = names(&v, "/etc");
-        assert!(want
-            .iter()
-            .filter(|n| **n != "t/zero")
-            .all(|n| listed.iter().any(|l| l == n)));
-        let d = v.upper_dir_for("/etc").unwrap();
-        rustix::fs::statat(&d, "own", rustix::fs::AtFlags::SYMLINK_NOFOLLOW).unwrap();
     }
 
     #[test]

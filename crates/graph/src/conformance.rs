@@ -34,15 +34,9 @@
 //! The suite writes the content of a container's layer into the directory
 //! `writable_paths(..).upper` of the driver, as the engine does (the files the
 //! monitor mounts as the upper directory, and the engine's own files).  The
-//! layer is made with the image it is of (`writable_create` gets the layers: a
-//! driver that copies them copies them there), and what the container deletes
-//! is a deletion in the way the driver's layer has one: `Subject::overlay_upper`
-//! says the layer is an overlay's upper directory, where a deleted file is a
-//! character device 0:0 and an opaque directory has `user.overlay.opaque`; else
-//! the layer is a copy of the image, where the file is removed and the
-//! directory made again, and `diff` says both as `.wh.` entries (an opaque
-//! directory when none of the image's entries is left).  What the cases
-//! take for every driver:
+//! layer is the overlay's upper directory: what the container deletes is a
+//! character device 0:0, and an opaque directory has `user.overlay.opaque`;
+//! `diff` says both as `.wh.` entries.  What the cases take for every driver:
 //!
 //! - the identity of a layer is the engine's: it makes it from the table of
 //!   contents, for every driver, and refuses a driver that records another.
@@ -90,7 +84,6 @@ pub use crate::forward;
 pub mod registry;
 
 use super::*;
-use crate::forward_storage_driver;
 use futures::future::BoxFuture;
 use registry::Registry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -125,8 +118,6 @@ pub struct Subject {
     pub staging: PathBuf,
     /// The scratch directory (the cases add their own files to it).
     pub dir: PathBuf,
-    /// The writable layer is an overlay's upper directory (see the module).
-    pub overlay_upper: bool,
     /// Damage the artifact the driver made of a layer so that `check` finds
     /// it; false when there is nothing to damage.
     pub damage: Box<dyn Fn(&LayerKey) -> bool + Send + Sync>,
@@ -339,8 +330,6 @@ struct Meddle {
     asked: Mutex<Vec<Digest>>,
     /// The keys the driver said it wants, by layer blob.
     wanted: Mutex<HashMap<Digest, HashSet<String>>>,
-    /// The chain id of each layer the feed is asked for, in order.
-    chains: Mutex<Vec<Digest>>,
     /// The `n`th call of `fetch` (from 0) fails.
     fail_at: Mutex<Option<usize>>,
     /// Every call of `fetch` for this layer (by blob) fails.
@@ -421,7 +410,6 @@ impl PullFeed for OfferFeed {
         let n = {
             let mut asked = self.meddle.asked.lock().unwrap();
             asked.push(layer.descriptor.digest);
-            self.meddle.chains.lock().unwrap().push(layer.chain_id);
             asked.len() - 1
         };
         if *self.meddle.fail_at.lock().unwrap() == Some(n)
@@ -557,17 +545,6 @@ impl Offer {
         let mut layers: Vec<FeedLayer> = order.iter().map(|&i| self.layers[i].clone()).collect();
         set_chains(&mut layers);
         layers
-    }
-
-    /// The pull of `layers` by `driver`, which is not the subject's.
-    async fn pull_by(
-        &self,
-        driver: &dyn StorageDriver,
-        layers: &[FeedLayer],
-        settled: Settled,
-    ) -> DriverResult<Pulled> {
-        let feed: Arc<dyn PullFeed> = self.feed.clone();
-        driver.pull(&feed, layers, settled).await
     }
 
     fn meddle(&self) -> &Meddle {
@@ -812,9 +789,7 @@ fn rootfs_plan_of<T: StorageDriver + ?Sized>(
         .ok_or_else(|| DriverError::storage(driver.name(), "the driver gave no root"))
 }
 
-/// The container the plans of the cases are of: a driver whose root file
-/// system is a directory of the container names it in the plan (it need not
-/// exist for a plan to be made).
+/// The container the plans of the cases are of.
 fn plan_writable() -> &'static Writable {
     static W: std::sync::OnceLock<Writable> = std::sync::OnceLock::new();
     W.get_or_init(|| Writable::new("plan", "/velarx-conformance/bundles/plan"))
@@ -824,11 +799,6 @@ fn plan_writable() -> &'static Writable {
 /// back from the bundle as it was written.
 fn check_plan(plan: &RootfsPlan) {
     match plan {
-        RootfsPlan::Directory(d) => {
-            // (what the monitor accepts: an absolute base, a relative way
-            // down, no `.` or `..`)
-            d.validate().unwrap_or_else(|why| panic!("{d:?}: {why}"));
-        }
         RootfsPlan::MountFd(m) => {
             m.validate().unwrap_or_else(|why| panic!("{m:?}: {why}"));
         }
@@ -869,11 +839,6 @@ pub async fn capabilities_are_consistent(f: &Factory) {
     if let Some(n) = c.max_layers {
         assert!(n > 0);
     }
-    // the suite and the engine read the layer the same way
-    assert_eq!(
-        s.overlay_upper, c.overlay_upper,
-        "Subject::overlay_upper is Capabilities::overlay_upper"
-    );
     // the capabilities are the same each time
     assert_eq!(d.capabilities(), c);
 }
@@ -998,16 +963,13 @@ pub async fn pull_is_idempotent(f: &Factory) {
     assert_eq!(s.driver.usage().unwrap(), before);
     let layers = records(&s, &[&base]).await;
     s.driver.image_view("img", &layers).expect("still readable");
-    // the same layer in another store makes the same artifact, if the
-    // driver says it depends on the layer alone
-    if !s.driver.capabilities().layer_chain {
-        let other = second(f, &s, "other").await;
-        let again = store_layer(&other, base_layer()).await;
-        assert_eq!(
-            again.artifact, base.artifact,
-            "a layer's artifact is reproducible"
-        );
-    }
+    // the same layer in another store makes the same artifact
+    let other = second(f, &s, "other").await;
+    let again = store_layer(&other, base_layer()).await;
+    assert_eq!(
+        again.artifact, base.artifact,
+        "a layer's artifact is reproducible"
+    );
 }
 
 /// The staging areas of pulls that are left once the work in flight has
@@ -3490,16 +3452,12 @@ pub async fn the_kernel_mounts_what_the_status_says(f: &Factory) {
         let r = rootfs_plan_of(&*kernel, &req).unwrap();
         // a mount the driver made comes with its descriptor, the first one,
         // and no process serves it: the kernel does
-        match &r.plan {
-            RootfsPlan::MountFd(m) => {
-                assert_eq!(m.fd_index, 0);
-                let fd = r.fd.expect("a mount-fd plan comes with its descriptor");
-                assert!(is_dir_fd(&fd), "a directory");
-                assert!(cloexec(&fd), "O_CLOEXEC");
-                assert!(r.server.is_none(), "the kernel mounts, no process serves");
-            }
-            other => panic!("the status says the kernel mounts: {other:?}"),
-        }
+        let RootfsPlan::MountFd(m) = &r.plan;
+        assert_eq!(m.fd_index, 0);
+        let fd = r.fd.expect("a mount-fd plan comes with its descriptor");
+        assert!(is_dir_fd(&fd), "a directory");
+        assert!(cloexec(&fd), "O_CLOEXEC");
+        assert!(r.server.is_none(), "the kernel mounts, no process serves");
     }
     kernel.writable_remove(&w).unwrap();
     // a lazy image is served by the other way: its files are not all there
@@ -4400,20 +4358,18 @@ pub async fn usage_adds_up(f: &Factory) {
         .unwrap();
     assert_eq!(s.driver.usage().unwrap(), two);
     // what a layer adds is its artifacts: the same in a store of its own
-    if !s.driver.capabilities().layer_chain {
-        let other = second(f, &s, "other").await;
-        assert_eq!(other.driver.usage().unwrap().artifacts, (0, 0));
-        store_layer(&other, top_layer()).await;
-        let alone = other.driver.usage().unwrap().artifacts;
-        assert_eq!(
-            (
-                two.artifacts.0 - one.artifacts.0,
-                two.artifacts.1 - one.artifacts.1
-            ),
-            alone,
-            "the artifacts of the top layer: {one:?} -> {two:?}, alone {alone:?}"
-        );
-    }
+    let other = second(f, &s, "other").await;
+    assert_eq!(other.driver.usage().unwrap().artifacts, (0, 0));
+    store_layer(&other, top_layer()).await;
+    let alone = other.driver.usage().unwrap().artifacts;
+    assert_eq!(
+        (
+            two.artifacts.0 - one.artifacts.0,
+            two.artifacts.1 - one.artifacts.1
+        ),
+        alone,
+        "the artifacts of the top layer: {one:?} -> {two:?}, alone {alone:?}"
+    );
     // what a collection frees is what the usage drops by
     let freed = s
         .driver
@@ -4453,11 +4409,9 @@ pub async fn writable_layer_lifecycle(f: &Factory) {
     let p = paths(&s, &w);
     assert_eq!(paths(&s, &w), p, "the paths are a function of the layer");
     assert!(p.upper.is_dir(), "the files of the layer");
-    if s.overlay_upper {
-        // (an overlay's three directories)
-        let work = p.work.clone().expect("an overlay has a work directory");
-        assert!(p.upper != work && p.upper != p.merged && work != p.merged);
-    }
+    // (an overlay's three directories)
+    let work = p.work.clone().expect("an overlay has a work directory");
+    assert!(p.upper != work && p.upper != p.merged && work != p.merged);
     // two layers do not share
     let other = Writable::new("c2", s.dir.join("bundles/c2"));
     assert!(paths(&s, &other).upper != p.upper);
@@ -4474,19 +4428,16 @@ pub async fn writable_layer_lifecycle(f: &Factory) {
     assert!(d.writable_size(&w).unwrap() >= 5096);
     // what the driver says of the root file system is its own, with the
     // graph name of podman's `info`
-    // (podman's vfs has none)
     let data = d.graph_data(&w);
     assert!(
         data.iter().all(|(k, v)| !k.is_empty() && !v.is_empty()),
         "{data:?}"
     );
-    if s.overlay_upper {
-        assert!(
-            data.iter()
-                .any(|(k, v)| k == "UpperDir" && Path::new(v) == p.upper),
-            "{data:?}"
-        );
-    }
+    assert!(
+        data.iter()
+            .any(|(k, v)| k == "UpperDir" && Path::new(v) == p.upper),
+        "{data:?}"
+    );
     assert_eq!(d.graph_data(&w), data);
     // removed: gone, and removing it again is fine
     d.writable_remove(&w).expect("writable_remove");
@@ -4665,29 +4616,20 @@ async fn changed(f: &Factory, case: &str) -> Option<Changed> {
     let sparse = std::fs::File::create(upper.join("sparse")).unwrap();
     sparse.set_len(1 << 20).unwrap();
     std::os::unix::fs::FileExt::write_at(&sparse, b"x", (1 << 20) - 1).unwrap();
-    let mut marks = s.overlay_upper;
-    if !s.overlay_upper {
-        // (the layer is a copy of the image: a deletion is a removal)
-        std::fs::remove_file(upper.join("etc/gone")).unwrap();
+    let mut marks = rustix::fs::mknodat(
+        rustix::fs::CWD,
+        upper.join("etc/gone"),
+        rustix::fs::FileType::CharacterDevice,
+        rustix::fs::Mode::empty(),
+        rustix::fs::makedev(0, 0),
+    )
+    .is_ok();
+    put("opt/y", b"y");
+    marks &= set_xattr(&upper.join("opt"), "user.overlay.opaque", b"y");
+    if !marks {
+        eprintln!("NOTE conformance::{case}: no overlay marks here (user xattrs or mknod): the cases of whiteouts and opaque directories are skipped");
+        let _ = std::fs::remove_file(upper.join("etc/gone"));
         velarx_base::tree::remove_dir_all(upper.join("opt")).unwrap();
-        put("opt/y", b"y");
-        marks = true;
-    } else if marks {
-        marks &= rustix::fs::mknodat(
-            rustix::fs::CWD,
-            upper.join("etc/gone"),
-            rustix::fs::FileType::CharacterDevice,
-            rustix::fs::Mode::empty(),
-            rustix::fs::makedev(0, 0),
-        )
-        .is_ok();
-        put("opt/y", b"y");
-        marks &= set_xattr(&upper.join("opt"), "user.overlay.opaque", b"y");
-        if !marks {
-            eprintln!("NOTE conformance::{case}: no overlay marks here (user xattrs or mknod): the cases of whiteouts and opaque directories are skipped");
-            let _ = std::fs::remove_file(upper.join("etc/gone"));
-            velarx_base::tree::remove_dir_all(upper.join("opt")).unwrap();
-        }
     }
     if !xattrs {
         eprintln!("NOTE conformance::{case}: no user xattrs on this file system: the xattr checks are skipped");
@@ -5213,7 +5155,7 @@ pub async fn the_view_of_a_stopped_container(f: &Factory) {
         assert!(view.stat("/etc/gone").is_err());
         assert!(view.stat("/opt/x").is_err());
         assert!(view.stat("/opt/y").is_ok());
-    } else if c.s.overlay_upper {
+    } else {
         assert!(view.stat("/etc/gone").is_ok());
     }
 }
@@ -5408,25 +5350,20 @@ pub async fn rootfs_has_a_descriptor_when_the_plan_names_one(f: &Factory) -> boo
         container: &w,
         ..request(&img, &layers)
     };
-    // (a plan of a kind that names no descriptor has none: the descriptor of
-    // a `MountFd` plan is new at every call, and is the root of a mount)
+    // (the descriptor of a `MountFd` plan is new at every call, and is the
+    // root of a mount)
     let mut held = Vec::new();
     for _ in 0..3 {
         let r = plan_of(&s, &req).expect("a plan");
-        match (&r.plan, r.fd) {
-            (RootfsPlan::MountFd(m), Some(fd)) => {
-                assert_eq!(m.fd_index, 0, "the engine passes the one descriptor first");
-                assert!(is_dir_fd(&fd), "a directory");
-                assert!(
-                    cloexec(&fd),
-                    "O_CLOEXEC: the engine passes it on by its own"
-                );
-                held.push(fd);
-            }
-            (RootfsPlan::MountFd(_), None) => panic!("a mount-fd plan comes with its descriptor"),
-            (_, Some(_)) => panic!("a descriptor with a plan that names none"),
-            (_, None) => {}
-        }
+        let RootfsPlan::MountFd(m) = &r.plan;
+        let fd = r.fd.expect("a mount-fd plan comes with its descriptor");
+        assert_eq!(m.fd_index, 0, "the engine passes the one descriptor first");
+        assert!(is_dir_fd(&fd), "a directory");
+        assert!(
+            cloexec(&fd),
+            "O_CLOEXEC: the engine passes it on by its own"
+        );
+        held.push(fd);
     }
     let raw: std::collections::HashSet<_> =
         held.iter().map(std::os::fd::AsRawFd::as_raw_fd).collect();
@@ -5441,130 +5378,6 @@ pub async fn rootfs_has_a_descriptor_when_the_plan_names_one(f: &Factory) -> boo
     assert_eq!(a, b);
     s.driver.writable_remove(&w).unwrap();
     !held.is_empty()
-}
-
-// A chained driver (a test double)
-
-/// A driver whose layers are chained, as a snapshot driver's are, made of a
-/// real one (it keeps the bytes) with the rules of a chain on top: it holds a
-/// layer under its chain id and **requires the parent** of a layer to be held
-/// (or made earlier in the same pull) before it ingests it.  It fails when
-/// the engine passes only the layers it lacks, without the parents, so a
-/// pass proves the API (the whole list, the chain ids, `stored`, `Keep::chains`)
-/// is enough for such a driver.
-pub struct Chained {
-    inner: Arc<dyn StorageDriver>,
-    caps: Capabilities,
-    /// The chain ids it holds.
-    held: Mutex<HashSet<Digest>>,
-}
-
-impl Chained {
-    pub fn of(inner: Arc<dyn StorageDriver>) -> Arc<Self> {
-        let mut caps = inner.capabilities().clone();
-        caps.layer_chain = true;
-        Arc::new(Self {
-            inner,
-            caps,
-            held: Mutex::default(),
-        })
-    }
-
-    /// Whether the driver holds the layer of the chain id `chain`.
-    pub fn holds(&self, chain: &Digest) -> bool {
-        self.held.lock().unwrap().contains(chain)
-    }
-
-    /// Make it hold the chain ids `chains` (a store that has them).
-    pub fn hold(&self, chains: &[Digest]) {
-        self.held.lock().unwrap().extend(chains.iter().copied());
-    }
-
-    fn refuse(&self, why: String) -> DriverError {
-        DriverError::storage(self.inner.name(), format!("chained driver: {why}"))
-    }
-
-    /// The checks of a pull of `layers`, which add the chains it will make
-    /// to the returned list.
-    fn check_list(&self, layers: &[FeedLayer]) -> DriverResult<Vec<Digest>> {
-        // the list is the whole stack: it starts at the bottom
-        if layers.first().is_some_and(|l| l.parent.is_some()) {
-            return Err(self.refuse(
-                "the list starts above the bottom of the stack: the layers below it are not there"
-                    .into(),
-            ));
-        }
-        let mut made = Vec::new();
-        for (i, l) in layers.iter().enumerate() {
-            // the chain id is the parent's and the diff id's, and the parent
-            // of a layer is the layer before it in the list
-            let derived = match &l.parent {
-                None => l.diff_id,
-                Some(p) => Digest::of(
-                    velarx_types::digest::Algorithm::Sha256,
-                    format!("sha256:{} sha256:{}", p.hex(), l.diff_id.hex()).as_bytes(),
-                ),
-            };
-            if l.chain_id != derived {
-                return Err(self.refuse(format!("layer {i} has the wrong chain id")));
-            }
-            if i > 0 && l.parent != Some(layers[i - 1].chain_id) {
-                return Err(self.refuse(format!("layer {i} has the wrong parent")));
-            }
-            if l.stored {
-                if !self.holds(&l.chain_id) {
-                    return Err(self.refuse(format!("layer {i} is said stored, it is not held")));
-                }
-            } else {
-                if let Some(parent) = &l.parent {
-                    if !self.holds(parent) && !made.contains(parent) {
-                        return Err(self.refuse(format!(
-                            "the parent of layer {i} ({parent}) is not there: the list lacks the layers below it"
-                        )));
-                    }
-                }
-                made.push(l.chain_id);
-            }
-        }
-        Ok(made)
-    }
-}
-
-forward_storage_driver! {
-    impl StorageDriver for Chained {
-        inner: inner;
-        forward: [name graph_name graph_data status repair remake_staged read_objects open_object objects_in_order remove_image image_volume_create mounts image_view leftovers check writable_create writable_paths writable_root writable_size writable_remove writable_exists diff changes apply stopped_view is_root_of usage lock_unused_layers];
-        fn capabilities(&self) -> &Capabilities {
-            &self.caps
-        }
-        async fn pull(
-            &self,
-            feed: &Arc<dyn PullFeed>,
-            layers: &[FeedLayer],
-            settled: Settled,
-        ) -> DriverResult<Pulled> {
-            let made = self.check_list(layers)?;
-            let pulled = self.inner.pull(feed, layers, settled).await?;
-            self.held.lock().unwrap().extend(made);
-            Ok(pulled)
-        }
-        async fn has_layers(&self, layers: &[LayerRef]) -> DriverResult<Vec<bool>> {
-            // a layer is held under its chain: each place of a stack is its own
-            // answer (and the bytes are the inner driver's)
-            let inner = self.inner.has_layers(layers).await?;
-            Ok(inner
-                .into_iter()
-                .zip(layers)
-                .map(|(have, l)| have && self.holds(&l.chain_id))
-                .collect())
-        }
-        fn collect(&self, keep: &Keep) -> DriverResult<Collected> {
-            // the chains it holds are those named; the bytes go by key
-            let named: HashSet<Digest> = keep.chains.iter().copied().collect();
-            self.held.lock().unwrap().retain(|c| named.contains(c));
-            self.inner.collect(keep)
-        }
-    }
 }
 
 /// The commit of a layer a pull stored, as the engine makes it: the files of
@@ -5586,6 +5399,23 @@ async fn record(s: &Subject, pulled: &Pulled) {
         commits.push(commit);
     }
     s.db.commit_layers(commits, vec![]).await.unwrap();
+}
+
+/// The engine gives a pull the whole layer list of an image, the layers the
+/// store has marked `stored`: the driver fetches only the others.
+pub async fn a_layer_marked_stored_is_not_fetched(f: &Factory) {
+    let (_tmp, s) = begin!(f, "a_layer_marked_stored_is_not_fetched");
+    let (base, top) = (base_layer(), top_layer());
+    let first = offer(&s, &[&base]).await;
+    let pulled = first.pull(&s, engine_check()).await.unwrap();
+    record(&s, &pulled).await;
+    let both = offer(&s, &[&base, &top]).await;
+    let mut list = both.stack(&[0, 1]);
+    list[0].stored = true;
+    let pulled = both.pull_layers(&s, &list, engine_check()).await.unwrap();
+    assert_eq!(both.fetches(), 1, "a stored layer is not fetched");
+    assert_eq!(pulled.layers.len(), 1);
+    assert_eq!(pulled.layers[0].key, list[1].key);
 }
 
 /// The chain ids of `diffs` computed here, with no code of the engine: the
@@ -5618,222 +5448,6 @@ fn refs_of(layers: &[FeedLayer]) -> Vec<LayerRef> {
         .collect()
 }
 
-pub async fn the_feed_layers_carry_the_oci_chain_ids(f: &Factory) {
-    let (_tmp, s) = begin!(f, "the_feed_layers_carry_the_oci_chain_ids");
-    let (base, top) = (base_layer(), top_layer());
-    let offer = offer(&s, &[&base, &top]).await;
-    let stack = offer.stack(&[0, 1, 0]);
-    let diffs: Vec<Digest> = stack.iter().map(|l| l.diff_id).collect();
-    let want = independent_chains(&diffs);
-    assert_eq!(
-        stack.iter().map(|l| l.chain_id).collect::<Vec<_>>(),
-        want,
-        "the chain ids of the OCI formula"
-    );
-    assert_eq!(
-        stack[0].chain_id, stack[0].diff_id,
-        "ChainID(L0) = DiffID(L0)"
-    );
-    assert_eq!(stack[0].parent, None);
-    assert_eq!(stack[1].parent, Some(want[0]));
-    assert_eq!(stack[2].parent, Some(want[1]));
-    // what a driver pulls gets to the feed as the engine made it
-    let chained = Chained::of(s.driver.clone());
-    offer
-        .pull_by(chained.as_ref(), &stack, engine_check())
-        .await
-        .expect("a chained driver pulls the whole stack");
-    let seen: HashSet<Digest> = offer
-        .meddle()
-        .chains
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .collect();
-    assert!(
-        seen.is_subset(&want.iter().copied().collect()),
-        "the feed saw a chain id the engine did not make"
-    );
-    assert!(seen.contains(&want[0]) && seen.contains(&want[1]));
-    // a driver that holds layers by chain holds exactly the stack's
-    assert!(want.iter().all(|c| chained.holds(c)));
-    assert!(!chained.holds(&stack[0].diff_id) || stack[0].diff_id == want[0]);
-}
-
-pub async fn a_pull_gets_the_whole_list_with_the_stored_ones_marked(f: &Factory) {
-    let (_tmp, s) = begin!(f, "a_pull_gets_the_whole_list_with_the_stored_ones_marked");
-    let (base, top) = (base_layer(), top_layer());
-    let first = offer(&s, &[&base]).await;
-    let both = offer(&s, &[&base, &top]).await;
-    let chained = Chained::of(s.driver.clone());
-    // the base is stored by a first pull
-    let pulled = first
-        .pull_by(chained.as_ref(), &first.stack(&[0]), engine_check())
-        .await
-        .unwrap();
-    record(&s, &pulled).await;
-    // the image of both: the base is in the list, marked stored, with the
-    // chain below the top layer
-    let mut list = both.stack(&[0, 1]);
-    list[0].stored = true;
-    assert_eq!(
-        chained.has_layers(&refs_of(&list)).await.unwrap(),
-        [true, false],
-        "the driver says it has the base and not the top: the engine marks \
-         the base stored"
-    );
-    let pulled = both
-        .pull_by(chained.as_ref(), &list, engine_check())
-        .await
-        .expect("the top layer's parent is in the list and held");
-    assert_eq!(both.fetches(), 1, "only the missing layer is fetched");
-    assert_eq!(pulled.layers.len(), 1);
-    assert_eq!(pulled.layers[0].key, list[1].key);
-    assert!(chained.holds(&list[1].chain_id));
-    // the same with a driver that is content keyed: only what is missing
-    let other = second(f, &s, "plain").await;
-    let plain = offer(&other, &[&base, &top]).await;
-    let mut list = plain.stack(&[0, 1]);
-    list[0].stored = true;
-    let pulled = plain
-        .pull_layers(&other, &list, engine_check())
-        .await
-        .unwrap();
-    assert_eq!(plain.fetches(), 1, "a stored layer is not fetched");
-    assert_eq!(pulled.layers.len(), 1);
-    // a list of the layers the driver lacks, without the parents, is what a
-    // chained driver cannot use: it refuses it (the API must carry them)
-    let fresh = Chained::of(s.driver.clone());
-    let lacking = both.stack(&[0, 1]);
-    let e = both
-        .pull_by(fresh.as_ref(), &lacking[1..], engine_check())
-        .await
-        .err()
-        .expect("refused");
-    assert!(e.message().contains("not there"), "{e:?}");
-    // and a layer marked stored that the driver does not hold
-    let mut list = both.stack(&[0, 1]);
-    list[0].stored = true;
-    let e = both
-        .pull_by(fresh.as_ref(), &list, engine_check())
-        .await
-        .err()
-        .expect("refused");
-    assert!(e.message().contains("not held"), "{e:?}");
-}
-
-pub async fn the_same_layer_at_another_place_is_another_chain(f: &Factory) {
-    let (_tmp, s) = begin!(f, "the_same_layer_at_another_place_is_another_chain");
-    let (base, top) = (base_layer(), top_layer());
-    let o = offer(&s, &[&base, &top]).await;
-    // X = base, top.  Y = base, top, base.  Z = top, base.
-    let (x, y, z) = (o.stack(&[0, 1]), o.stack(&[0, 1, 0]), o.stack(&[1, 0]));
-    // a shared prefix has the same chain ids
-    assert_eq!(x[0].chain_id, y[0].chain_id);
-    assert_eq!(x[1].chain_id, y[1].chain_id);
-    // after the divergence: the same content, another chain
-    assert_eq!(y[0].diff_id, y[2].diff_id);
-    assert_ne!(y[0].chain_id, y[2].chain_id);
-    assert_ne!(x[1].chain_id, z[0].chain_id);
-    assert_ne!(x[0].chain_id, z[1].chain_id);
-    assert_ne!(x[1].chain_id, z[1].chain_id);
-    // a chained driver that has X has not Y's third layer (the key is the
-    // base's, which it has, under another parent), nor any layer of Z
-    let chained = Chained::of(s.driver.clone());
-    let pulled = o
-        .pull_by(chained.as_ref(), &x, engine_check())
-        .await
-        .unwrap();
-    record(&s, &pulled).await;
-    assert_eq!(
-        chained.has_layers(&refs_of(&x)).await.unwrap(),
-        [true, true],
-        "X is held"
-    );
-    assert_eq!(
-        chained.has_layers(&refs_of(&y)).await.unwrap(),
-        [true, true, false],
-        "Y: the third layer is another chain, not held"
-    );
-    assert_eq!(
-        chained.has_layers(&refs_of(&z)).await.unwrap(),
-        [false, false]
-    );
-    // a key asked at two places is answered at each place (one answer for
-    // each position: the first is held, the other is not)
-    let mut both_places = refs_of(&y[..1]);
-    both_places.extend(refs_of(&y[2..]));
-    assert_eq!(
-        chained.has_layers(&both_places).await.unwrap(),
-        [true, false]
-    );
-    // pulling Y with X's layers stored makes the third one: fetched again
-    // only for its place
-    let mut list = y.clone();
-    list[0].stored = true;
-    list[1].stored = true;
-    let pulled = o
-        .pull_by(chained.as_ref(), &list, engine_check())
-        .await
-        .unwrap();
-    assert_eq!(pulled.layers.len(), 1);
-    assert!(chained.holds(&y[2].chain_id));
-    record(&s, &pulled).await;
-    assert_eq!(
-        chained.has_layers(&both_places).await.unwrap(),
-        [true, true]
-    );
-}
-
-pub async fn collect_accepts_the_chains_it_is_told_to_keep(f: &Factory) {
-    let (_tmp, s) = begin!(f, "collect_accepts_the_chains_it_is_told_to_keep");
-    let (base, top) = (base_layer(), top_layer());
-    let o = offer(&s, &[&base, &top]).await;
-    let stack = o.stack(&[0, 1]);
-    let chained = Chained::of(s.driver.clone());
-    o.pull_by(chained.as_ref(), &stack, engine_check())
-        .await
-        .unwrap();
-    let keys: Vec<LayerKey> = stack.iter().map(|l| l.key).collect();
-    // the chains of the stack named: everything stays
-    let kept = chained.collect(&Keep {
-        layers: keys.clone(),
-        chains: stack.iter().map(|l| l.chain_id).collect(),
-        ..Keep::default()
-    });
-    let kept = kept.expect("collect");
-    assert!(kept.errors.is_empty(), "{kept:?}");
-    assert!(stack.iter().all(|l| chained.holds(&l.chain_id)));
-    // one chain named: the one above it is collected, whatever its key says
-    let kept = chained.collect(&Keep {
-        layers: keys.clone(),
-        chains: vec![stack[0].chain_id],
-        ..Keep::default()
-    });
-    let kept = kept.expect("collect");
-    assert!(kept.errors.is_empty(), "{kept:?}");
-    assert!(chained.holds(&stack[0].chain_id) && !chained.holds(&stack[1].chain_id));
-    // a driver that ignores the chains (content keyed) keeps what its
-    // layers name, whatever the chains say
-    let plain = offer(&s, &[&base, &top]).await;
-    let pulled = plain.pull(&s, engine_check()).await.unwrap();
-    record(&s, &pulled).await;
-    let junk = Digest::of(velarx_types::digest::Algorithm::Sha256, b"no chain");
-    let kept = s.driver.collect(&Keep {
-        layers: keys,
-        chains: vec![junk],
-        ..Keep::default()
-    });
-    let kept = kept.expect("collect");
-    assert!(kept.errors.is_empty(), "{kept:?}");
-    assert_eq!(kept.bytes_freed, 0, "the keys are the layers it keeps");
-    assert_eq!(
-        s.driver.has_layers(&refs_of(&stack)).await.unwrap(),
-        [true, true]
-    );
-}
-
 /// The cases of the suite: one test of the harness for each.  `$factory` is
 /// an expression of the type [`Factory`] (evaluated in each test, so that
 /// each has a driver of its own).
@@ -5860,6 +5474,7 @@ macro_rules! conformance_suite_with {
             pull_is_idempotent,
             a_chunked_pull_asks_only_for_what_the_store_lacks,
             a_chunk_the_driver_holds_is_not_fetched_again,
+            a_layer_marked_stored_is_not_fetched,
             an_interrupted_chunked_pull_is_pulled_again,
             pull_check_sees_the_layers_first,
             a_pull_returns_the_verdict_of_the_check,
@@ -5886,10 +5501,6 @@ macro_rules! conformance_suite_with {
             has_layers_does_not_report_what_is_not_committed,
             has_layers_forgets_what_a_collection_removed,
             has_layers_does_not_report_a_layer_it_cannot_serve,
-            the_feed_layers_carry_the_oci_chain_ids,
-            a_pull_gets_the_whole_list_with_the_stored_ones_marked,
-            the_same_layer_at_another_place_is_another_chain,
-            collect_accepts_the_chains_it_is_told_to_keep,
             repair_gives_the_artifacts_again,
             remake_staged_of_a_pull_that_is_not_there,
             a_lazy_layer_waits_and_is_completed,
@@ -5924,7 +5535,6 @@ macro_rules! conformance_suite_with {
             image_volume_create_is_idempotent,
             mounts_gives_a_new_descriptor_at_each_call,
             removing_a_container_removes_its_volumes,
-            a_volume_that_was_not_made_is_missing,
             the_idmap_of_a_mount_is_what_was_asked,
             the_root_of_a_container_is_found,
             diff_is_the_tar_of_what_the_container_changed,

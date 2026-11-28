@@ -118,7 +118,6 @@ fn factory() -> Factory {
                 store,
                 staging,
                 dir,
-                overlay_upper: true,
                 damage: Box::new(move |key| {
                     std::fs::remove_file(cfs::layer_image_path(for_damage.root(), &key.file_stem()))
                         .is_ok()
@@ -159,13 +158,12 @@ mod suite {
 
 /// The suite of the volume API on a driver that has volumes of its own (a
 /// test-only wrapper): composefs does not, its mounts are made of the
-/// layers.  The ids are mapped by the driver or by the monitor, and the root
-/// is a descriptor too.
+/// layers.  The ids are mapped by the driver or by the monitor.
 mod volumes_by_the_driver {
     use super::*;
     velarx_graph::volume_conformance_suite_with!(
         in_namespace;
-        velarx_graph::conformance::with_volumes(factory(), Prefs::new(&[IdmapWay::AtCopy]), false)
+        velarx_graph::conformance::with_volumes(factory(), Prefs::new(&[IdmapWay::DriverMount]))
     );
 }
 
@@ -175,8 +173,7 @@ mod volumes_by_the_monitor {
         in_namespace;
         velarx_graph::conformance::with_volumes(
             factory(),
-            Prefs::new(&[IdmapWay::MonitorMount, IdmapWay::AtCopy]),
-            true
+            Prefs::new(&[IdmapWay::MonitorMount, IdmapWay::DriverMount])
         )
     );
 }
@@ -185,6 +182,6 @@ mod volumes_without_a_way_to_map {
     use super::*;
     velarx_graph::volume_conformance_suite_with!(
         in_namespace;
-        velarx_graph::conformance::with_volumes(factory(), Prefs::NONE, false)
+        velarx_graph::conformance::with_volumes(factory(), Prefs::NONE)
     );
 }

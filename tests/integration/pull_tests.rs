@@ -7,7 +7,6 @@ use crate::common::*;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use velarx_config::PullConfig;
 
 #[tokio::test]
@@ -628,100 +627,6 @@ async fn test_second_pull_fetches_nothing() {
     let again = e.pull().await.unwrap();
     assert_eq!(e.reg.requests.load(Ordering::SeqCst), before);
     assert_eq!(again.stats.layers_cached, 1);
-}
-
-/// A chained driver (the conformance suite's double of a snapshot driver: it
-/// holds layers by chain id and refuses a layer whose parent it does not
-/// hold) pulls through the engine: the engine gives it the whole list of the
-/// image, in order, with the OCI chain ids, the parents and the layers it has
-/// marked `stored`, and asks `has_layers` per position.  An image on the same
-/// base fetches only its own layer; the base again on top of the stack is
-/// another chain, fetched for that place only.
-#[tokio::test]
-async fn test_a_chained_driver_gets_the_whole_stack_from_the_engine() {
-    use velarx_graph::conformance::Chained;
-    let held: Arc<std::sync::OnceLock<Arc<Chained>>> = Arc::default();
-    let e = {
-        let held = held.clone();
-        env_built(
-            velarx_db::Database::open_in_memory().await.unwrap(),
-            PullConfig::default(),
-            velarx_config::PushConfig::default(),
-            Fetchers::default(),
-            None,
-            move |s| {
-                let chained = Chained::of(s.storage().clone());
-                let _ = held.set(chained.clone());
-                s.with_storage_driver(chained)
-            },
-        )
-        .await
-    };
-    let chained = held.get().unwrap().clone();
-    let base = build_chunked(&sample());
-    let top = build_chunked(&[Item::File {
-        name: "top",
-        data: b"top\n".to_vec(),
-        chunk: 4096,
-    }]);
-    let blob = |b: &Built| {
-        velarx_types::digest::Digest::of(velarx_types::digest::Algorithm::Sha256, &b.blob)
-    };
-    let hits = |b: &Built| {
-        e.reg
-            .hits
-            .lock()
-            .unwrap()
-            .get(&blob(b))
-            .copied()
-            .unwrap_or(0)
-    };
-    let pull = |tag: &'static str| {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let (service, client, name) = (&e.service, e.client(), format!("{}/test:{tag}", e.host));
-        async move { service.pull_with_client(&client, &name, tx).await }
-    };
-    e.publish(&[&base], &[ZSTD]);
-    pull("latest").await.unwrap();
-    let one = velarx_types::chain_ids(&[base.diff_id]);
-    assert!(
-        chained.holds(&one[0]),
-        "the base is held under its chain id"
-    );
-
-    publish_arch(&e.reg, &[&base, &top], &[ZSTD, ZSTD], "amd64", "two");
-    let (base_hits, top_hits) = (hits(&base), hits(&top));
-    pull("two").await.expect("the top's parent is in the list");
-    let two = velarx_types::chain_ids(&[base.diff_id, top.diff_id]);
-    assert!(chained.holds(&two[1]));
-    assert_eq!(hits(&base), base_hits, "the stored base is not fetched");
-    assert!(hits(&top) > top_hits, "the top is fetched");
-
-    // base, top, base: the third layer is the base's content on another
-    // stack, not held: fetched for that place, and nothing else
-    publish_arch(
-        &e.reg,
-        &[&base, &top, &base],
-        &[ZSTD, ZSTD, ZSTD],
-        "amd64",
-        "three",
-    );
-    let (base_hits, top_hits) = (hits(&base), hits(&top));
-    pull("three")
-        .await
-        .expect("a layer at another place is pulled");
-    let three = velarx_types::chain_ids(&[base.diff_id, top.diff_id, base.diff_id]);
-    assert!(chained.holds(&three[2]), "the third place is its own chain");
-    assert_ne!(three[2], three[0]);
-    assert!(
-        hits(&base) > base_hits,
-        "the base is fetched for its new place"
-    );
-    assert_eq!(hits(&top), top_hits, "the stored top is not fetched");
-    let (base_hits, top_hits) = (hits(&base), hits(&top));
-    pull("three").await.unwrap();
-    assert_eq!((hits(&base), hits(&top)), (base_hits, top_hits));
 }
 
 /// The instance an index names is not asked of the registry when the store
@@ -1716,10 +1621,7 @@ async fn test_a_pulled_image_is_used_through_the_storage_driver() {
     }
     // the plan is O(layers): the layer records have no table of contents
     let velarx_fuse::plan::RootfsPlan::MountFd(plan) =
-        plan_of(driver, &image, &layers).unwrap().plan
-    else {
-        panic!("the plan of composefs is a mount of the driver");
-    };
+        plan_of(driver, &image, &layers).unwrap().plan;
     assert_eq!(plan.fd_index, 0);
     let erofs = velarx_fuse::composefs::layer_image_path(
         e.service.file_store().root(),

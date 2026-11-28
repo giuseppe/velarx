@@ -13,11 +13,10 @@
 //! needs to go on across a restart of its process (that the root is a
 //! descriptor the driver hands over); they hold no descriptor and no path of a
 //! mount, and every start writes all of them again from the answer, so a plan
-//! of an earlier start, or of another kind of driver, is never read.
+//! of an earlier start is never read.
 //!
 //! Every answer is checked before the monitor sees it (fail closed): a
-//! descriptor exactly for a mount plan, the kind of plan a purpose may have
-//! (a volume is never a directory), and the mapping: `Mount` only when the
+//! descriptor exactly for a mount plan, and the mapping: `Mount` only when the
 //! engine allowed the monitor to put it on the mount and the plan says it
 //! does, `None` never when a mapping was asked, and `Applied` never when none
 //! was.
@@ -141,14 +140,12 @@ pub(in crate::services) fn plan_of(
     idmap: IdmapDone,
     server: bool,
 ) -> RootfsPlan {
-    match plan {
-        RootfsPlan::MountFd(m) => RootfsPlan::MountFd(velarx_fuse::plan::MountFd {
-            idmap: idmap == IdmapDone::Mount,
-            server,
-            ..*m
-        }),
-        other => other.clone(),
-    }
+    let RootfsPlan::MountFd(m) = plan;
+    RootfsPlan::MountFd(velarx_fuse::plan::MountFd {
+        idmap: idmap == IdmapDone::Mount,
+        server,
+        ..*m
+    })
 }
 
 /// The descriptors a mount of the answer is passed with: its own, then its
@@ -224,8 +221,7 @@ pub struct Accepted {
 /// the enforcement when the digests are enforced: the monitor cannot measure
 /// what it did not mount, so a mount that says none is refused, and the
 /// digests the driver says it measured must be some the manifest's lists
-/// accept, layer by layer (the engine does not take a bare claim).  A plan
-/// the monitor mounts itself (a directory) has no digest to measure.
+/// accept, layer by layer (the engine does not take a bare claim).
 fn check_verity(
     short: &str,
     driver: &str,
@@ -233,10 +229,9 @@ fn check_verity(
     ask: &Ask,
     r: &Rootfs,
 ) -> ContainerResult<()> {
-    let hands_over = matches!(r.plan, RootfsPlan::MountFd(_));
     // (the server is passed to the monitor after the descriptor of the
     // mount it serves: no mount, no place for it)
-    if r.server.is_some() && !(hands_over && r.fd.is_some()) {
+    if r.server.is_some() && r.fd.is_none() {
         return Err(invalid(format!(
             "container {short}: the storage driver {driver} gave a process that serves the {what}, which is no mount descriptor it hands over: the monitor takes the pidfd of a server with the mount it serves"
         )));
@@ -246,17 +241,8 @@ fn check_verity(
         (VerityAsk::Off, _) => Err(invalid(format!(
             "container {short}: the storage driver {driver} says it enforced the digests of the {what}, and they are not enforced"
         ))),
-        (VerityAsk::Enforce { .. }, VerityDone::None) if hands_over => Err(invalid(format!(
-            "container {short}: the digests are enforced and the storage driver {driver} hands over the {what} as a mount that enforces none: the monitor cannot check what it did not mount"
-        ))),
-        (VerityAsk::Enforce { .. }, VerityDone::None) if r.measured.is_empty() => {
-            Ok(())
-        }
         (VerityAsk::Enforce { .. }, VerityDone::None) => Err(invalid(format!(
-            "container {short}: the storage driver {driver} gave digests it measured for the {what}, and says it enforces none"
-        ))),
-        (VerityAsk::Enforce { .. }, _) if !hands_over => Err(invalid(format!(
-            "container {short}: the storage driver {driver} says it enforced the digests of the {what}, whose plan is one the monitor mounts"
+            "container {short}: the digests are enforced and the storage driver {driver} hands over the {what} as a mount that enforces none: the monitor cannot check what it did not mount"
         ))),
         // (a mount checked when a file is opened is checked by the process
         // that serves it, and it gave none: nothing would check the files)
@@ -351,11 +337,6 @@ pub(in crate::services) fn accept_volumes(
                     "container {short}: image mount {n} is a mount that the storage driver {driver} hands over at each start, and it gave none this time: remove the container and create it again"
                 )))
             }
-            (RootfsPlan::Directory(_), _) => {
-                return Err(invalid(format!(
-                    "container {short}: the storage driver {driver} gave image mount {n} as a directory: only a root file system may be one, an image mount is a mount descriptor"
-                )))
-            }
         }
     }
     let dir = bundle.join("imagevol");
@@ -372,8 +353,7 @@ pub(in crate::services) fn accept_volumes(
 /// `driver` made for this start, and the plan written in the bundle for the
 /// monitor to read (its index may have changed).  `expects_fd` is whether the
 /// plan of the bundle says `mount-fd`: the driver must still give a mount then,
-/// and must not when it does not say so; a plan of another kind is a bundle and
-/// a driver that do not go together (the store was changed, or the driver
+/// and must not when it does not say so (the store was changed, or the driver
 /// was), and the start fails rather than running the container on a root the
 /// plan file did not say.
 pub(in crate::services) fn accept_root(
@@ -410,17 +390,6 @@ pub(in crate::services) fn accept_root(
                 "container {short}: its bundle says that the root file system is not a mount that the storage driver {driver} hands over, and the driver now makes one: the store was modified or the driver was changed; remove the container and create it again"
             )))
         }
-        (_, Some(_), _) => {
-            return Err(invalid(format!(
-                "container {short}: the storage driver {driver} gave a mount descriptor with a root file system plan that does not use one"
-            )))
-        }
-        (_, None, true) => {
-            return Err(invalid(format!(
-                "container {short}: its bundle says that the root file system is a mount that the storage driver {driver} hands over at each start, and the driver now makes another kind of plan: the store was modified or the driver was changed; remove the container and create it again"
-            )))
-        }
-        (_, None, false) => Vec::new(),
     };
     velarx_fuse::plan::write(bundle, "", &plan)?;
     Ok(fds)
@@ -487,8 +456,8 @@ pub(in crate::services) struct Needs {
 /// What a start asks of the driver, given the bundle's plan of the root and the
 /// number of image mounts of the container: none (`None`) when the root is
 /// nothing the driver hands over and the container has no image mount.  **The
-/// image mounts are asked for whatever the root is** (a `--rootfs` or a
-/// directory root as well as a mount): the mounts the driver makes for them
+/// image mounts are asked for whatever the root is** (a `--rootfs` as well as
+/// a mount): the mounts the driver makes for them
 /// are descriptors of this start, written in the bundle whatever the plan of
 /// the root is.
 pub(in crate::services) fn needs(
@@ -539,7 +508,7 @@ pub fn start_mounts(
 mod tests {
     use super::*;
     use std::os::fd::{AsFd, AsRawFd};
-    use velarx_fuse::plan::{Directory, MountFd};
+    use velarx_fuse::plan::MountFd;
     use velarx_graph::IdmapDone;
 
     fn mfd(fd_index: u32, idmap: bool) -> MountFd {
@@ -643,11 +612,6 @@ mod tests {
     fn only_a_mount_fd_plan_asks_the_driver() {
         let none = tempfile::tempdir().unwrap();
         assert!(!wants_fd(none.path()).unwrap(), "a --rootfs has no plan");
-        let dir = bundle(&RootfsPlan::Directory(Directory {
-            beneath: "/b".into(),
-            path: "r".into(),
-        }));
-        assert!(!wants_fd(dir.path()).unwrap());
         let m = bundle(&RootfsPlan::MountFd(mfd(0, false)));
         assert!(wants_fd(m.path()).unwrap());
         // an index no monitor gets is an error that names it
@@ -723,24 +687,6 @@ mod tests {
         drop(root);
     }
 
-    /// A root that was a mount of the driver is a mount at every start: a
-    /// driver that now answers another kind of plan is refused, and the
-    /// bundle keeps the plan it has.
-    #[test]
-    fn a_mount_of_the_driver_cannot_become_another_kind_of_plan() {
-        let was = RootfsPlan::MountFd(mfd(0, false));
-        let b = bundle(&was);
-        let answer = Rootfs::from(RootfsPlan::Directory(Directory {
-            beneath: "/b".into(),
-            path: "r".into(),
-        }));
-        let e = accept_root(b.path(), "c", "test", true, &PLAIN, answer)
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("another kind of plan"), "{e}");
-        assert_eq!(velarx_fuse::plan::read(b.path(), "").unwrap(), Some(was));
-    }
-
     #[test]
     fn a_driver_that_gives_no_descriptor_is_said() {
         let b = bundle(&RootfsPlan::MountFd(mfd(0, false)));
@@ -768,40 +714,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let b = bundle(&RootfsPlan::MountFd(mfd(0, false)));
         let mut r = driver_root(root.path());
-        r.plan = RootfsPlan::Directory(Directory {
-            beneath: "/b".into(),
-            path: "r".into(),
-        });
-        let e = accept_root(b.path(), "c", "test", true, &PLAIN, r)
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("does not use one"), "{e}");
-        let mut r = driver_root(root.path());
         r.plan = RootfsPlan::MountFd(mfd(1, false));
         let e = accept_root(b.path(), "c", "test", true, &PLAIN, r)
             .unwrap_err()
             .to_string();
         assert!(e.contains("must be 0"), "{e}");
         // (nothing was written over the plan)
-        assert_eq!(
-            velarx_fuse::plan::read(b.path(), "").unwrap(),
-            Some(RootfsPlan::MountFd(mfd(0, false)))
-        );
-    }
-
-    #[test]
-    fn a_driver_that_makes_another_kind_of_plan_is_refused() {
-        let b = bundle(&RootfsPlan::MountFd(mfd(0, false)));
-        let dir = RootfsPlan::Directory(Directory {
-            beneath: "/b".into(),
-            path: "r".into(),
-        });
-        let e = accept_root(b.path(), "c", "test", true, &PLAIN, Rootfs::from(dir))
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("now makes another kind of plan"), "{e}");
-        assert!(e.contains("create it again"), "{e}");
-        // (the plan of the bundle is as it was)
         assert_eq!(
             velarx_fuse::plan::read(b.path(), "").unwrap(),
             Some(RootfsPlan::MountFd(mfd(0, false)))
@@ -882,11 +800,6 @@ mod tests {
                 .unwrap_err()
                 .to_string()
         };
-        let dir = Rootfs::from(RootfsPlan::Directory(Directory {
-            beneath: "/b".into(),
-            path: "r".into(),
-        }));
-        assert!(e(vec![(0, dir)], 1).contains("only a root file system may be one"));
         let none = Rootfs::from(RootfsPlan::MountFd(plain));
         let msg = e(vec![(0, none)], 1);
         assert!(
@@ -993,7 +906,7 @@ mod tests {
 
     /// A container, its bundle and the test driver (the composefs driver
     /// with the volumes of a test-only wrapper: the root is a descriptor of
-    /// the layer with `root_fd`, the directory of the copy without).
+    /// the layer).
     struct Start {
         _dir: tempfile::TempDir,
         driver: Arc<dyn StorageDriver>,
@@ -1003,11 +916,10 @@ mod tests {
     }
 
     impl Start {
-        async fn new(ways: Prefs<IdmapWay>, root_fd: bool) -> Self {
+        async fn new(ways: Prefs<IdmapWay>) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let inner = crate::storage_driver::composefs::driver_for_tests(dir.path()).await;
-            let driver: Arc<dyn StorageDriver> =
-                Arc::new(VolumeFake::new(Arc::new(inner), ways, root_fd));
+            let driver: Arc<dyn StorageDriver> = Arc::new(VolumeFake::new(Arc::new(inner), ways));
             let bundle = dir.path().join("bundle");
             std::fs::create_dir_all(&bundle).unwrap();
             let w = Writable::new(ID, &bundle);
@@ -1120,7 +1032,7 @@ mod tests {
     /// the order of their index, and the plans the monitor reads say where.
     #[tokio::test]
     async fn every_start_has_a_new_descriptor_for_the_root_and_each_volume() {
-        let x = Start::new(Prefs::new(&[IdmapWay::AtCopy]), true).await;
+        let x = Start::new(Prefs::new(&[IdmapWay::DriverMount])).await;
         x.create(2, true);
         let mut held = Vec::new();
         for _ in 0..5 {
@@ -1145,18 +1057,15 @@ mod tests {
         assert_eq!(raw.len(), 15, "a descriptor of its own at each start");
     }
 
-    /// The image mounts are asked for whatever the root is: a root that is a
-    /// directory of the driver, a `--rootfs` (the early return of the first
-    /// version asked for them only when the root was a descriptor too).  They
-    /// are numbered from 0 when the root has no descriptor.
+    /// The image mounts are asked for whatever the root is: a `--rootfs` too
+    /// (the early return of the first version asked for them only when the
+    /// root was a descriptor too).  They are numbered from 0 when the root
+    /// has no descriptor.
     #[tokio::test]
     async fn the_volumes_are_asked_for_whatever_the_root_is() {
-        let x = Start::new(Prefs::new(&[IdmapWay::AtCopy]), false).await;
-        x.create(2, true);
-        assert!(
-            matches!(x.plan(None), Some(RootfsPlan::Directory(_))),
-            "the root of this driver is a directory"
-        );
+        let x = Start::new(Prefs::new(&[IdmapWay::DriverMount])).await;
+        x.create(2, false);
+        assert_eq!(x.plan(None), None, "a --rootfs has no plan");
         let root_plan = x.plan(None);
         let needs_of = |layers| needs(&x.bundle, layers, 2).unwrap();
         assert_eq!(needs_of(true), Some(Needs { expects_fd: false }));
@@ -1174,17 +1083,17 @@ mod tests {
             assert_eq!(x.plan(Some(1)), mount_plan(1, false));
             assert_eq!(x.plan(None), root_plan, "the root's plan is not touched");
         }
-        // no image mounts and a directory root: no call at all
+        // no image mounts and no root to ask for: no call at all
         assert!(x.start(0, true, None, false).unwrap().is_empty());
     }
 
     /// A root that is a mount of the driver is asked at every start; never a
-    /// `--rootfs`, and not a root of another kind.  Its image mounts are asked
+    /// `--rootfs`.  Its image mounts are asked
     /// at every start all the same, numbered from 0, and a plan of the root that
     /// is not asked is not touched.
     #[tokio::test]
     async fn a_mount_root_has_its_volumes_asked() {
-        let x = Start::new(Prefs::new(&[IdmapWay::AtCopy]), true).await;
+        let x = Start::new(Prefs::new(&[IdmapWay::DriverMount])).await;
         x.create(2, true);
         let asked = |layers, n| needs(&x.bundle, layers, n).unwrap();
         assert_eq!(asked(true, 2), Some(Needs { expects_fd: true }));
@@ -1203,11 +1112,7 @@ mod tests {
     /// say the monitor puts nothing on the mounts, whatever the driver can.
     #[tokio::test]
     async fn a_container_without_a_user_namespace_gets_no_idmap() {
-        let x = Start::new(
-            Prefs::new(&[IdmapWay::MonitorMount, IdmapWay::AtCopy]),
-            true,
-        )
-        .await;
+        let x = Start::new(Prefs::new(&[IdmapWay::MonitorMount, IdmapWay::DriverMount])).await;
         x.create(2, true);
         let fds = x.start(2, true, None, false).unwrap();
         assert_eq!(fds.len(), 3);
@@ -1226,11 +1131,7 @@ mod tests {
     #[tokio::test]
     async fn the_idmap_result_is_what_the_plan_says() {
         let map = mapping();
-        let x = Start::new(
-            Prefs::new(&[IdmapWay::MonitorMount, IdmapWay::AtCopy]),
-            true,
-        )
-        .await;
+        let x = Start::new(Prefs::new(&[IdmapWay::MonitorMount, IdmapWay::DriverMount])).await;
         x.create(2, true);
         x.start(2, true, Some(&map), true).unwrap();
         assert_eq!(x.plan(None), mount_plan(0, false));
@@ -1242,7 +1143,7 @@ mod tests {
         assert_eq!(x.plan(Some(0)), mount_plan(1, false));
         assert_eq!(x.plan(Some(1)), mount_plan(2, false));
         // a driver with no way to map the ids of a volume: refused at create
-        let none = Start::new(Prefs::new(&[]), true).await;
+        let none = Start::new(Prefs::new(&[])).await;
         let e = none
             .driver
             .image_volume_create(&none.ask(Purpose::Volume { index: 0 }, Some(&map), false))
@@ -1255,20 +1156,19 @@ mod tests {
     /// idmap) becomes the mount of this start.
     #[tokio::test]
     async fn the_plans_of_an_earlier_start_are_written_again() {
-        let x = Start::new(Prefs::new(&[IdmapWay::AtCopy]), false).await;
-        x.create(2, true);
+        let x = Start::new(Prefs::new(&[IdmapWay::DriverMount])).await;
+        x.create(2, false);
         let dir = x.bundle.join("imagevol");
         for (n, index, idmap) in [("0.", 5, false), ("1.", 7, true)] {
             velarx_fuse::plan::write(&dir, n, &RootfsPlan::MountFd(mfd(index, idmap))).unwrap();
         }
-        x.start(2, true, None, false).unwrap();
+        x.start(2, false, None, false).unwrap();
         assert_eq!(x.plan(Some(0)), mount_plan(0, false));
         assert_eq!(x.plan(Some(1)), mount_plan(1, false));
     }
 
     /// The image mounts a driver hands over as descriptors are counted at
-    /// create: one more than a monitor takes is refused there, and the other
-    /// kinds of plan are not counted.
+    /// create: one more than a monitor takes is refused there.
     #[test]
     fn too_many_descriptor_volumes_are_refused_at_create() {
         let fd = velarx_graph::Planned {
@@ -1276,17 +1176,9 @@ mod tests {
             idmap: IdmapDone::None,
             label: LabelDone::None,
         };
-        let dir = velarx_graph::Planned {
-            plan: RootfsPlan::Directory(Directory {
-                beneath: "/".into(),
-                path: "x".into(),
-            }),
-            ..fd.clone()
-        };
         let mut n = 0;
         for _ in 0..velarx_fuse::plan::MAX_VOLUME_FDS {
             count_volume_fd("d", &fd, &mut n).unwrap();
-            count_volume_fd("d", &dir, &mut n).unwrap();
         }
         assert_eq!(n, velarx_fuse::plan::MAX_VOLUME_FDS as usize);
         let e = count_volume_fd("d", &fd, &mut n).unwrap_err().to_string();
@@ -1339,7 +1231,7 @@ mod tests {
 
     /// With the digests enforced a mount the driver hands over must say that
     /// it enforces them, with the digest it measured on every layer, each
-    /// one the manifest accepts; a plan the monitor mounts (a directory) states none.
+    /// one the manifest accepts.
     /// A driver that enforces what was not asked, or hands over a process
     /// that serves what is no mount descriptor, is refused.
     #[test]
@@ -1381,21 +1273,6 @@ mod tests {
         );
         let e = accept(enforced, kernel(&["sha256:a1"])).unwrap_err();
         assert!(e.contains("measured 1 images"), "{e}");
-        // a plan the monitor mounts (a directory) has no digest to measure
-        let check = |ask: Ask, r: &Rootfs| {
-            check_verity(ID, "test", "root file system", &ask, r).map_err(|e| e.to_string())
-        };
-        let directory = || {
-            Rootfs::from(RootfsPlan::Directory(Directory {
-                beneath: "/b".into(),
-                path: "r".into(),
-            }))
-        };
-        check(enforced, &directory()).unwrap();
-        let mut said = directory();
-        said.verity = VerityDone::Kernel;
-        let e = check(enforced, &said).unwrap_err();
-        assert!(e.contains("the monitor mounts"), "{e}");
         // checked on open, with no process that checks
         let mut on_open = kernel(&["sha256:a1", "sha256:b1"]);
         on_open.verity = VerityDone::OnOpen;
@@ -1426,11 +1303,13 @@ mod tests {
         on_open.server = Some(server());
         let e = accept(PLAIN, on_open).unwrap_err();
         assert!(e.contains("they are not enforced"), "{e}");
-        // a process that serves what the monitor mounts itself: there is no
-        // descriptor for the pidfd to follow
-        let mut served = directory();
+        // a process that serves a mount with no descriptor: there is none
+        // for the pidfd to follow
+        let mut served = Rootfs::from(RootfsPlan::MountFd(plan));
         served.server = Some(server());
-        let e = check(PLAIN, &served).unwrap_err();
+        let e = check_verity(ID, "test", "root file system", &PLAIN, &served)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("no mount descriptor"), "{e}");
     }
 
@@ -1567,30 +1446,22 @@ mod tests {
         accept_mounts(b.path(), ID, "test", Some((&PLAIN, true)), &asked, answer).unwrap_err();
         assert!(root_closed(true) && v0_closed(true));
         // the root and the first volume accepted, the second refused (a
-        // directory), the third not looked at
+        // mapping that was not asked), the third not looked at
         let (root, root_closed) = tracked();
         let (v0, v0_closed) = tracked();
         let (v1, v1_closed) = tracked();
         let (v2, v2_closed) = tracked();
+        let mut mapped = with_fd(mount(0), v1);
+        mapped.idmap = IdmapDone::Mount;
         let answer = Mounts {
             root: Some(with_fd(mount(0), root)),
-            volumes: vec![
-                with_fd(mount(0), v0),
-                with_fd(
-                    RootfsPlan::Directory(Directory {
-                        beneath: "/b".into(),
-                        path: "r".into(),
-                    }),
-                    v1,
-                ),
-                with_fd(mount(0), v2),
-            ],
+            volumes: vec![with_fd(mount(0), v0), mapped, with_fd(mount(0), v2)],
         };
         let asked = [(0, PLAIN), (1, PLAIN), (2, PLAIN)];
         let e = accept_mounts(b.path(), ID, "test", Some((&PLAIN, true)), &asked, answer)
             .unwrap_err()
             .to_string();
-        assert!(e.contains("as a directory"), "{e}");
+        assert!(e.contains("image mount 1"), "{e}");
         assert!(root_closed(true) && v0_closed(true) && v1_closed(true) && v2_closed(true));
         // a root refused: the volumes go too
         let (root, root_closed) = tracked();

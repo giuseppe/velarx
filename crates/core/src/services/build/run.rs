@@ -1109,35 +1109,22 @@ impl Build<'_> {
                 Ok((diff, mut walk)) => {
                     walk.exclude.extend(targets);
                     walk.root = velarx_content::layer::dirtar::Root::Changed;
-                    // (for a driver whose layer is not an upper directory this
-                    // extracts the tar of the changes: off the async thread)
                     let squash = match (&diff, &st.squash_dir) {
-                        (Some(d), Some(_)) => {
-                            let (d, walk, scratch) =
-                                (d.clone(), walk.clone(), self.work.path().to_path_buf());
-                            tokio::task::spawn_blocking(move || d.directory(&walk, &scratch))
-                                .await
-                                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
-                                .map(Some)
-                        }
-                        _ => Ok(None),
+                        (Some(d), Some(_)) => Some(d.directory(&walk)),
+                        _ => None,
                     };
-                    match squash {
-                        Err(e) => Err(e.into()),
-                        Ok(squash) => self
-                            .commit(
-                                st,
-                                &created_by(i),
-                                diff.map(Changes::Writable),
-                                walk.clone(),
-                                (!mounts.changed).then_some(&key),
-                            )
-                            .await
-                            .and_then(|()| match (st.squash_dir.clone(), &squash) {
-                                (Some(sq), Some(up)) => self.merge_squash(&up.path, &sq, &up.walk),
-                                _ => Ok(()),
-                            }),
-                    }
+                    self.commit(
+                        st,
+                        &created_by(i),
+                        diff.map(Changes::Writable),
+                        walk.clone(),
+                        (!mounts.changed).then_some(&key),
+                    )
+                    .await
+                    .and_then(|()| match (st.squash_dir.clone(), &squash) {
+                        (Some(sq), Some(up)) => self.merge_squash(&up.path, &sq, &up.walk),
+                        _ => Ok(()),
+                    })
                 }
                 Err(e) => Err(e.into()),
             },

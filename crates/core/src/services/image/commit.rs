@@ -186,19 +186,11 @@ pub enum Changes {
 
 impl Changes {
     /// The directory of the changes and how to walk it, for what reads the
-    /// changes as a directory (the squash: `commit --squash`); what it takes
-    /// to make one goes to `scratch`.
-    fn directory(
-        &self,
-        walk: &dirtar::Options,
-        scratch: &Path,
-    ) -> std::io::Result<crate::storage_driver::ChangesDir> {
+    /// changes as a directory (the squash: `commit --squash`).
+    fn directory(&self, walk: &dirtar::Options) -> crate::storage_driver::ChangesDir {
         match self {
-            Self::Dir(d) => Ok(crate::storage_driver::ChangesDir::of(
-                d.clone(),
-                walk.clone(),
-            )),
-            Self::Writable(w) => w.directory(walk, scratch),
+            Self::Dir(d) => crate::storage_driver::ChangesDir::of(d.clone(), walk.clone()),
+            Self::Writable(w) => w.directory(walk),
         }
     }
 }
@@ -230,18 +222,13 @@ struct SquashedTree<'a> {
     objects: Arc<dyn velarx_storage::ObjectOpener>,
     changes: Option<Changes>,
     walk: &'a dirtar::Options,
-    staging: &'a Path,
     alg: Algorithm,
     progress: Option<mpsc::Sender<TransferProgress>>,
 }
 
 /// What makes the layer of the merged tree of an image (`--squash-all`),
-/// with the changes in a directory applied (`commit --squash`), its meter,
-/// and what is kept until the layer is made (the directory, if one was made
-/// for the changes: the squash reads the files from it).
-fn producer_of_tree(
-    squash: SquashedTree<'_>,
-) -> std::io::Result<(Producer, Meter, Option<crate::storage_driver::ChangesDir>)> {
+/// with the changes in a directory applied (`commit --squash`), and its meter.
+fn producer_of_tree(squash: SquashedTree<'_>) -> std::io::Result<(Producer, Meter)> {
     use rustix::fs::{openat, Mode, OFlags};
     let SquashedTree {
         tree,
@@ -249,14 +236,12 @@ fn producer_of_tree(
         objects,
         changes,
         walk,
-        staging,
         alg,
         progress,
     } = squash;
-    let dir = changes.map(|c| c.directory(walk, staging)).transpose()?;
-    let upper = dir
-        .as_ref()
-        .map(|d| {
+    let upper = changes
+        .map(|c| {
+            let d = c.directory(walk);
             let fd = openat(
                 rustix::fs::CWD,
                 &d.path,
@@ -276,7 +261,7 @@ fn producer_of_tree(
             super::squash::write_tree(&tree, &*objects, upper.as_ref(), out)
         })
     });
-    Ok((produce, meter, dir))
+    Ok((produce, meter))
 }
 
 impl ImageService {
@@ -291,9 +276,9 @@ impl ImageService {
         meter: Meter,
         cancel: crate::services::Cancel,
     ) -> ImageResult<Blob> {
-        let (walk, staging) = (walk.clone(), self.staging_dir.clone());
+        let walk = walk.clone();
         let produce: Producer = Box::new(move |sink, max, observe| {
-            let dir = changes.directory(&walk, &staging)?;
+            let dir = changes.directory(&walk);
             let fd = rustix::fs::openat(
                 rustix::fs::CWD,
                 &dir.path,
@@ -713,20 +698,19 @@ impl ImageService {
 
         let blob = match (changes, tree) {
             (changes, Some((tree, size))) => {
-                let (objects, staging) = (Arc::new(self.objects()), self.staging_dir.clone());
+                let objects = Arc::new(self.objects());
                 let (walk, progress, cancel) = (
                     opts.walk.clone(),
                     opts.progress.clone(),
                     opts.cancel.clone(),
                 );
-                let (produce, meter, dir) = tokio::task::spawn_blocking(move || {
+                let (produce, meter) = tokio::task::spawn_blocking(move || {
                     producer_of_tree(SquashedTree {
                         tree,
                         size,
                         objects,
                         changes,
                         walk: &walk,
-                        staging: &staging,
                         alg,
                         progress,
                     })
@@ -734,9 +718,7 @@ impl ImageService {
                 .await
                 .map_err(|e| ImageError::Layer(e.to_string()))?
                 .map_err(|e| ImageError::Layer(format!("cannot make the squashed layer: {e}")))?;
-                let blob = self.layer_made(produce, meter, cancel).await;
-                drop(dir);
-                Some(blob?)
+                Some(self.layer_made(produce, meter, cancel).await?)
             }
             (Some(changes), None) => {
                 let cancel = opts.cancel.clone();

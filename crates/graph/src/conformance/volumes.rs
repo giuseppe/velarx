@@ -17,21 +17,11 @@ fn volume_ways(c: &Capabilities) -> Prefs<IdmapWay> {
     c.volume.map_or(Prefs::NONE, |v| v.idmap)
 }
 
-/// Whether the driver makes a copy of the image for each container's mount
-/// when it is created (it maps the ids as it copies): such a mount is gone
-/// with the container and is `Missing` when it was never made.
-fn copies(c: &Capabilities) -> bool {
-    volume_ways(c).contains(IdmapWay::AtCopy)
-}
-
 /// A driver with image volumes made of another driver, for tests: the root
 /// file system and everything else is the wrapped driver's.
 pub struct VolumeFake {
     inner: Arc<dyn StorageDriver>,
     caps: Capabilities,
-    /// The root file system is a `MountFd` of the container's layer (a
-    /// directory descriptor here), not what the wrapped driver says.
-    root_fd: bool,
     /// The descriptors are detached mounts (`open_tree(OPEN_TREE_CLONE)` of the
     /// directories), as a monitor attaches them: [`VolumeFake::detached`].
     detached: bool,
@@ -42,9 +32,10 @@ const FAKE_DIR: &str = "volume-fake";
 
 impl VolumeFake {
     /// `inner` with image volumes that it maps the ids of
-    /// by `ways` (empty: it cannot, and refuses a mapping).  With `root_fd` the
-    /// root file system is a descriptor too.
-    pub fn new(inner: Arc<dyn StorageDriver>, ways: Prefs<IdmapWay>, root_fd: bool) -> Self {
+    /// by `ways` (empty: it cannot, and refuses a mapping).  The root file
+    /// system is a `MountFd` of the container's layer (a directory descriptor
+    /// here), not what the wrapped driver says.
+    pub fn new(inner: Arc<dyn StorageDriver>, ways: Prefs<IdmapWay>) -> Self {
         let caps = Capabilities {
             volume: Some(MountCaps { idmap: ways }),
             ..inner.capabilities().clone()
@@ -52,7 +43,6 @@ impl VolumeFake {
         Self {
             inner,
             caps,
-            root_fd,
             detached: false,
         }
     }
@@ -105,7 +95,7 @@ impl VolumeFake {
 
     /// Who maps the ids of a volume: nobody when there is no mapping, the
     /// monitor when that is the first way the driver has and it may, else the
-    /// driver (the copy), and a refusal for a driver with no way.
+    /// driver, and a refusal for a driver with no way.
     fn idmap_of(&self, m: &MountRequest<'_>) -> DriverResult<IdmapDone> {
         if m.mapping.is_none() {
             return Ok(IdmapDone::None);
@@ -163,17 +153,6 @@ impl VolumeFake {
     }
 
     fn root(&self, w: &Writable, m: &MountRequest<'_>) -> DriverResult<Rootfs> {
-        if !self.root_fd {
-            let one = MountsRequest {
-                root: Some(m.clone()),
-                volumes: Vec::new(),
-            };
-            return self
-                .inner
-                .mounts(&one)?
-                .root
-                .ok_or_else(|| DriverError::storage(self.name(), "the driver gave no root"));
-        }
         Ok(Rootfs {
             plan: RootfsPlan::MountFd(velarx_fuse::plan::MountFd {
                 server: false,
@@ -252,10 +231,7 @@ forward_storage_driver! {
             opts: &WritableOptions,
             base: Option<&MountRequest<'_>>,
         ) -> DriverResult<Option<Planned>> {
-            let planned = self.inner.writable_create(w, owner, opts, base)?;
-            if !self.root_fd {
-                return Ok(planned);
-            }
+            self.inner.writable_create(w, owner, opts, base)?;
             // (the root is a descriptor of the layer at every start: what the
             // create says is that plan, as `root` answers it)
             Ok(base.map(|m| Planned {
@@ -277,13 +253,13 @@ forward_storage_driver! {
 
 /// `factory`'s driver wrapped in a [`VolumeFake`]: for the drivers that have no
 /// volumes, so that the suite runs on one that does.
-pub fn with_volumes(factory: Factory, ways: Prefs<IdmapWay>, root_fd: bool) -> Factory {
+pub fn with_volumes(factory: Factory, ways: Prefs<IdmapWay>) -> Factory {
     let factory = Arc::new(factory);
     Box::new(move |dir| {
         let made = factory(dir);
         Box::pin(async move {
             let mut s = made.await;
-            s.driver = Arc::new(VolumeFake::new(s.driver, ways, root_fd));
+            s.driver = Arc::new(VolumeFake::new(s.driver, ways));
             s
         })
     })
@@ -371,8 +347,8 @@ fn mapping(size: u32) -> velarx_fuse::IdTranslate {
 }
 
 /// What every answer is, whatever the driver: a descriptor exactly for a mount,
-/// a directory, closed on exec; only a root is a `Directory`.
-fn check_answer(r: &Rootfs, root: bool) {
+/// a directory, closed on exec.
+fn check_answer(r: &Rootfs) {
     assert_eq!(
         r.fd.is_some(),
         matches!(r.plan, RootfsPlan::MountFd(_)),
@@ -381,12 +357,6 @@ fn check_answer(r: &Rootfs, root: bool) {
     if let Some(fd) = &r.fd {
         assert!(is_dir_fd(fd), "a directory");
         assert!(cloexec(fd), "O_CLOEXEC");
-    }
-    if !root {
-        assert!(
-            !matches!(r.plan, RootfsPlan::Directory(_)),
-            "only a root file system is a directory: {r:?}"
-        );
     }
 }
 
@@ -423,7 +393,7 @@ pub async fn image_volumes_are_what_the_capabilities_say(f: &Factory) {
             let m = x.mounts(None, vec![x.volume(0)]).expect("its mount");
             assert!(m.root.is_none(), "no root was asked");
             assert_eq!(m.volumes.len(), 1);
-            check_answer(&m.volumes[0], false);
+            check_answer(&m.volumes[0]);
             // what the create said the mount would be is what every start
             // gives (the engine wrote the plan and counted the descriptors
             // from it)
@@ -555,9 +525,9 @@ pub async fn mounts_gives_a_new_descriptor_at_each_call(f: &Factory) {
         .iter()
         .map(|m| {
             let root = m.root.as_ref().expect("the root that was asked");
-            check_answer(root, true);
+            check_answer(root);
             assert_eq!(m.volumes.len(), 2, "one answer for each volume, in order");
-            m.volumes.iter().for_each(|v| check_answer(v, false));
+            m.volumes.iter().for_each(check_answer);
             (
                 root.plan.clone(),
                 m.volumes.iter().map(|v| v.plan.clone()).collect::<Vec<_>>(),
@@ -608,53 +578,9 @@ pub async fn removing_a_container_removes_its_volumes(f: &Factory) {
     x.mounts(None, vec![x.volume(0), x.volume(1)])
         .expect("made");
     x.s.driver.writable_remove(&x.w).unwrap();
-    if copies(c) {
-        // a volume that is gone is `Missing`, and says to make the container
-        // again: nothing of the container is left
-        for v in [0, 1] {
-            let e = expect_err(x.mounts(None, vec![x.volume(v)]), "a removed volume");
-            assert!(
-                matches!(e.kind, DriverErrorKind::Missing { remedy } if remedy == Remedy::RecreateContainer),
-                "{e:?}"
-            );
-        }
-        let m =
-            x.s.driver
-                .mounts(&MountsRequest {
-                    root: None,
-                    volumes: vec![MountRequest {
-                        container: &other,
-                        ..x.volume(0)
-                    }],
-                })
-                .expect("the volume of another container stays");
-        assert_eq!(m.volumes.len(), 1);
-    }
     // (removed again: nothing is an error)
     x.s.driver.writable_remove(&x.w).unwrap();
     x.s.driver.writable_remove(&other).unwrap();
-}
-
-pub async fn a_volume_that_was_not_made_is_missing(f: &Factory) {
-    let Some(x) = World::new(f, "a_volume_that_was_not_made_is_missing").await else {
-        return;
-    };
-    if !copies(x.s.driver.capabilities()) {
-        skip!(
-            "a_volume_that_was_not_made_is_missing",
-            "the driver makes no copy for a volume"
-        );
-    }
-    x.create(x.volume(0)).unwrap();
-    let e = expect_err(
-        x.mounts(None, vec![x.volume(0), x.volume(1)]),
-        "a volume that was not made",
-    );
-    assert!(
-        matches!(e.kind, DriverErrorKind::Missing { remedy } if remedy == Remedy::RecreateContainer),
-        "{e:?}"
-    );
-    of_driver(&x.s, &e);
 }
 
 pub async fn the_idmap_of_a_mount_is_what_was_asked(f: &Factory) {
@@ -709,9 +635,6 @@ pub async fn the_idmap_of_a_mount_is_what_was_asked(f: &Factory) {
     let creates = x.create(x.ask(Purpose::Volume { index: 0 }, Some(&map), false));
     if volumes_map {
         creates.expect("a mapping the driver has a way to apply");
-    } else if copies(&c) {
-        let e = expect_err(creates, "a mapping a copy cannot apply");
-        assert!(matches!(e.kind, DriverErrorKind::Unsupported), "{e:?}");
     }
     if volumes_map && !c.root.idmap.is_empty() {
         let (r, v) = answers(true, false).expect("a mapping the driver can apply");
@@ -732,99 +655,6 @@ pub async fn the_idmap_of_a_mount_is_what_was_asked(f: &Factory) {
         );
         assert!(matches!(e.kind, DriverErrorKind::Unsupported), "{e:?}");
     }
-}
-
-/// What a driver that copies its images (`IdmapWay::AtCopy`, with a copy of
-/// the image as the volume) hands over: the files of the image, owned by the
-/// ids of the container's mapping (root only: a user cannot give them), and a
-/// mount that cannot be written through (`EROFS` for a file made, a file
-/// written, a file removed, a mode changed, whoever asks).  Not part of
-/// [`volume_conformance_suite`] (the [`VolumeFake`] has no image in its
-/// volumes), and false when the descriptor is not the root of a mount, which a
-/// process that may not mount cannot make: the read-only part could not run.
-pub async fn a_volume_has_the_image_mapped_and_is_read_only(f: &Factory) -> bool {
-    use rustix::fs::{openat, unlinkat, AtFlags, Mode, OFlags};
-    let Some(x) = World::new(f, "a_volume_has_the_image_mapped_and_is_read_only").await else {
-        return false;
-    };
-    assert!(copies(x.s.driver.capabilities()), "a driver that copies");
-    let map = mapping(65_536);
-    let ask = || x.ask(Purpose::Volume { index: 0 }, Some(&map), false);
-    x.create(ask()).expect("the copy, mapped as it is made");
-    let m = x.mounts(None, vec![ask()]).expect("its mount");
-    let v = &m.volumes[0];
-    check_answer(v, false);
-    assert_eq!(v.idmap, IdmapDone::Applied, "the copy was made mapped");
-    let fd = v.fd.as_ref().expect("a descriptor");
-    let read = |path: &str| -> String {
-        let f = openat(fd, path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-            .unwrap_or_else(|e| panic!("{path} is in the image: {e}"));
-        std::io::read_to_string(std::fs::File::from(f)).unwrap()
-    };
-    assert_eq!(read("etc/os-release"), "base", "the files of the image");
-    assert_eq!(read("etc/hard"), "base", "a hard link of it");
-    let at = |path: &str| {
-        rustix::fs::statat(fd, path, AtFlags::SYMLINK_NOFOLLOW)
-            .unwrap_or_else(|e| panic!("{path}: {e}"))
-    };
-    assert_eq!(
-        rustix::fs::readlinkat(fd, "etc/link", Vec::new()).unwrap(),
-        c"os-release".to_owned(),
-        "a link is a link"
-    );
-    if is_root() {
-        // (the image is owned by root: the root of the container, host id 100000)
-        for path in [".", "etc", "etc/os-release", "usr/lib/big", "etc/link"] {
-            let st = at(path);
-            assert_eq!(
-                (st.st_uid, st.st_gid),
-                (100_000, 100_000),
-                "the owner of {path} is the container's"
-            );
-        }
-    }
-    // read-only: only a mount that is one can be checked
-    if rustix::fs::fstatvfs(fd)
-        .map(|s| !s.f_flag.contains(rustix::fs::StatVfsMountFlags::RDONLY))
-        .unwrap_or(true)
-    {
-        return false;
-    }
-    let erofs = |what: &str, r: Result<(), rustix::io::Errno>| {
-        assert_eq!(r, Err(rustix::io::Errno::ROFS), "{what}");
-    };
-    erofs(
-        "a file made",
-        openat(
-            fd,
-            "etc/new",
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
-            Mode::from_raw_mode(0o644),
-        )
-        .map(drop),
-    );
-    erofs(
-        "a file written",
-        openat(fd, "etc/os-release", OFlags::WRONLY, Mode::empty()).map(drop),
-    );
-    erofs("a file removed", unlinkat(fd, "etc/old", AtFlags::empty()));
-    erofs(
-        "a directory made",
-        rustix::fs::mkdirat(fd, "newdir", Mode::from_raw_mode(0o755)),
-    );
-    erofs(
-        "a mode changed",
-        rustix::fs::chmodat(
-            fd,
-            "etc/os-release",
-            Mode::from_raw_mode(0o777),
-            AtFlags::empty(),
-        ),
-    );
-    // the copy under the bundle is not read-only (the mount is): the engine
-    // can remove it with its container
-    x.s.driver.writable_remove(&x.w).unwrap();
-    true
 }
 
 /// The cases of the volume API, for a suite that wants these only (a driver
@@ -848,7 +678,6 @@ macro_rules! volume_conformance_suite_with {
             an_image_mount_label_is_what_the_answer_says,
             mounts_gives_a_new_descriptor_at_each_call,
             removing_a_container_removes_its_volumes,
-            a_volume_that_was_not_made_is_missing,
             the_idmap_of_a_mount_is_what_was_asked,
         }
     };

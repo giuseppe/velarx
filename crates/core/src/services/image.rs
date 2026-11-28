@@ -569,26 +569,16 @@ impl ImageService {
     /// container) while the driver checks them at pull only, and the mode that
     /// accepts that (`fsverity_best_effort`) is not set.
     pub fn check_verity_request(&self, fsverity_require: bool, container: bool) -> ImageResult<()> {
-        self.check_request(fsverity_require, container, false)
+        self.check_request(fsverity_require, container)
     }
 
     /// What `[storage]` asks that the driver of the store cannot do: the
-    /// digests enforced (see [`check_verity_request`](Self::check_verity_request))
-    /// and read-only image stores of the same driver.
+    /// digests enforced (see [`check_verity_request`](Self::check_verity_request)).
     pub fn check_store_config(&self, storage: &velarx_config::StorageConfig) -> ImageResult<()> {
-        self.check_request(
-            storage.fsverity_require,
-            false,
-            !storage.additional_image_stores.is_empty(),
-        )
+        self.check_request(storage.fsverity_require, false)
     }
 
-    fn check_request(
-        &self,
-        fsverity_require: bool,
-        container: bool,
-        shared_stores: bool,
-    ) -> ImageResult<()> {
+    fn check_request(&self, fsverity_require: bool, container: bool) -> ImageResult<()> {
         let enforced = fsverity_require
             || container
             || self.storage_options.digests == velarx_config::ComposefsDigests::Require;
@@ -599,7 +589,6 @@ impl ImageService {
                 &velarx_graph::negotiate::Ask {
                     verity_enforced: enforced,
                     verity_best_effort: self.verity_best_effort,
-                    shared_stores,
                     unprivileged: velarx_base::conf::rootless().unwrap_or(false),
                     ..Default::default()
                 },

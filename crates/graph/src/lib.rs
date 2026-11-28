@@ -35,9 +35,8 @@
 //! container, a user namespace, an unprivileged engine, a size limit, enforced
 //! digests, lazy images) is refused up front with what to do, never replaced by
 //! another behaviour without a word.  The capabilities do not assume overlay,
-//! EROFS or fs-verity at run time: a driver which translates the ids as it
-//! copies the layers for a container (`IdmapWay::AtCopy`), or whose verity is
-//! checked only at pull (`VerityEnforcement::PullOnly`), is described by them.
+//! EROFS or fs-verity at run time: a driver whose verity is checked only at
+//! pull (`VerityEnforcement::PullOnly`) is described by them.
 //!
 //! The trait holds the groups the engine routes through it today (layers,
 //! images, the writable layer of a container, maintenance, availability).
@@ -58,18 +57,13 @@
 //! files and redirects (the last two need the image below, an
 //! [`ImageTree`]).  `upper` is the directory the container's own files are in
 //! (the engine writes its `/etc/hosts` there at create, the stats measure its
-//! file system): the upper directory of an overlay, or, for a driver that
-//! copies the layers, the whole root file system (`WritablePaths::work` is
-//! none when the layer needs no mount).  What reads the changes as a
-//! directory, the squash of `commit --squash` and of a build, asks
-//! [`WritableDiff::directory`]: the upper directory itself when
-//! `Capabilities::overlay_upper` says it is an overlay's, else the tar of
-//! `diff` extracted into a directory of the overlay's form.  `stopped_view`
-//! gives a [`StoppedView`] of the layout the driver says (`overlay`: the
-//! layer over the image, `directory`: the whole root, where a 0:0 device is a
-//! device); the merged tree is still the bundle's `rootfs` the engine names.
+//! file system): the upper directory of an overlay.  What reads the changes
+//! as a directory, the squash of `commit --squash` and of a build, asks
+//! [`WritableDiff::directory`]: the upper directory itself.  `stopped_view`
+//! gives a [`StoppedView`] (the layer over the image); the merged tree is
+//! still the bundle's `rootfs` the engine names.
 //! The plan is the driver's: `velarx_fuse::plan::RootfsPlan`, one kind per
-//! way to make the root file system (`Directory`, `MountFd`), in the
+//! way to make the root file system (`MountFd`), in the
 //! bundle file `rootfs.json`; [`StorageDriver::mounts`] answers a [`Rootfs`] for
 //! the root and each image mount, the plan and,
 //! for `MountFd`, the detached mount the engine hands to the monitor (new at
@@ -168,11 +162,6 @@ pub enum IdmapWay {
     /// The driver idmaps its own mounts (the lowers of an overlay) and
     /// hands over the result ([`IdmapDone::Applied`]).
     DriverMount,
-    /// The ids are translated while the files are copied into the root file
-    /// system of the container, when it is created: that copy is the
-    /// container's own, so the image is never mapped by itself and nothing
-    /// is kept for a mapping.
-    AtCopy,
     /// A file system server translates the ids.
     Translate,
 }
@@ -201,27 +190,8 @@ pub struct Capabilities {
     /// content is stored), in the order the
     /// driver prefers.
     pub verity: Prefs<VerityEnforcement>,
-    /// Uses the read-only `additional_image_stores` of the same driver.
-    pub shared_stores: bool,
-    /// The driver's layers are chained: a layer is made on its parent (a
-    /// snapshot of the parent layer), so what it holds depends on the whole
-    /// stack below it, not on the layer alone.  Such a driver keys its
-    /// layers on the chain id ([`LayerRef::chain_id`], [`FeedLayer::chain_id`]
-    /// and [`Keep::chains`]) and needs the whole ordered layer list of an
-    /// image in `pull`.  The engine then asks `has_layers` and collects per
-    /// chain, a layer at two places being two layers.  False (content keyed:
-    /// the artifact of a layer depends on the layer only, shareable between
-    /// images and reproducible) for composefs, which ignores the
-    /// chain ids.
-    pub layer_chain: bool,
     /// The most layers (and data-only layers) of one container.
     pub max_layers: Option<usize>,
-    /// The writable layer is the upper directory of an overlay: the files the
-    /// container wrote, in place, and its deletions as the overlay's marks
-    /// (`WritablePaths::upper`).  The squash, which reads the changes as a
-    /// directory, reads it as it is; for any other driver the changes of
-    /// `diff` are made a directory first.
-    pub overlay_upper: bool,
     /// `WritableOptions::size_limit` is supported.  A driver without it
     /// answers `Unsupported` to a limit that is asked for, and the engine
     /// refuses the request up front.
@@ -333,14 +303,6 @@ pub struct Keep {
     /// containers, which are made of images: a layer in use is always named
     /// here).
     pub layers: Vec<LayerKey>,
-    /// The chain ids of the layers of the images the store has (every
-    /// prefix of the stack of an image, each once), for a driver whose
-    /// layers are chained (`Capabilities::layer_chain`): it keeps a chain
-    /// named here and removes the others, whatever keys it holds them
-    /// under.  Empty for any other driver (the engine fills it only for a
-    /// chained one: it costs the reading of every image's configuration).
-    /// `layers` is filled in every case.
-    pub chains: Vec<Digest>,
     /// The images the store has, by id.
     pub images: Vec<String>,
     /// The containers that exist, by id: whatever the driver holds for them
@@ -631,8 +593,7 @@ impl Writable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WritablePaths {
     /// The directory the container's own files are in: the files the
-    /// container wrote (the upper directory of an overlay), or the whole root
-    /// file system (a driver that copies the layers).
+    /// container wrote (the upper directory of an overlay).
     pub upper: PathBuf,
     /// The scratch directory of the mount (the work directory of an
     /// overlay); none for a driver whose layer needs no mount.
@@ -765,102 +726,36 @@ impl WritableDiff {
 
     /// The changes as a directory in the overlay's form (whiteouts, opaque
     /// directories), for what reads them as a directory itself: `commit
-    /// --squash` and the squash of a build (`squash::Upper`, `squash::merge`).
-    /// The upper directory of an overlay is that directory already; for a
-    /// driver whose layer is not one, the tar of [`StorageDriver::diff`] is
-    /// extracted into a directory of `scratch`, the way `apply` writes a
-    /// layer, and it is removed with the result.
-    pub fn directory(&self, walk: &dirtar::Options, scratch: &Path) -> std::io::Result<ChangesDir> {
-        if self.driver.capabilities().overlay_upper {
-            let upper = self.driver.writable_paths(&self.writable).upper;
-            let lower = self.lower.clone().map(|tree| {
-                Arc::new(dirtar::Lower {
-                    tree,
-                    objects: Arc::new(DriverObjects::new(self.driver.clone())),
-                })
-            });
-            let mut o = walk.clone();
-            o.lower = lower;
-            return Ok(ChangesDir {
-                path: upper,
-                walk: o,
-                _scratch: None,
-            });
-        }
-        self.directory_of_tar(walk, scratch)
-    }
-
-    /// The changes made a directory by extracting their tar (what `directory`
-    /// does for a driver that has no upper directory).
-    pub fn directory_of_tar(
-        &self,
-        walk: &dirtar::Options,
-        scratch: &Path,
-    ) -> std::io::Result<ChangesDir> {
-        use velarx_content::layer::holes::SparseFile;
-        std::fs::create_dir_all(scratch)?;
-        let dir = tempfile::tempdir_in(scratch)?;
-        let mut tar = SparseFile::new(tempfile::tempfile_in(scratch)?);
-        self.write(walk, &mut tar)?;
-        let tar = tar.finish()?;
-        let opts = DiffOptions::from(walk);
-        let (maps, root) = (opts.id_maps(), opts.root_owner());
-        let fd = rustix::fs::openat(
-            rustix::fs::CWD,
-            dir.path(),
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )?;
-        // (a plain root, the one a container has when the tar has no entry
-        // for it: the entry replaces these; a walk that gives no root has
-        // no use for it)
-        if walk.root != dirtar::Root::Never {
-            rustix::fs::fchmod(&fd, rustix::fs::Mode::from_raw_mode(0o755))?;
-            rustix::fs::fchown(
-                &fd,
-                Some(rustix::fs::Uid::from_raw(root.0)),
-                Some(rustix::fs::Gid::from_raw(root.1)),
-            )?;
-        }
-        let ex = velarx_wire::cp::ExtractOptions {
-            archive_owners: Some(maps),
-            owner: Some(root),
-            overlay_upper: true,
-            layer: true,
-            ..Default::default()
-        };
-        velarx_wire::cp::extract(tar, rustix::fd::AsFd::as_fd(&fd), &ex)?;
+    /// --squash` and the squash of a build (`squash::Upper`, `squash::merge`):
+    /// the upper directory of the overlay.
+    pub fn directory(&self, walk: &dirtar::Options) -> ChangesDir {
+        let upper = self.driver.writable_paths(&self.writable).upper;
+        let lower = self.lower.clone().map(|tree| {
+            Arc::new(dirtar::Lower {
+                tree,
+                objects: Arc::new(DriverObjects::new(self.driver.clone())),
+            })
+        });
         let mut o = walk.clone();
-        // (the tar says what changed: nothing is compared with the image
-        // again)
-        o.lower = None;
-        Ok(ChangesDir {
-            path: dir.path().to_path_buf(),
+        o.lower = lower;
+        ChangesDir {
+            path: upper,
             walk: o,
-            _scratch: Some(dir),
-        })
+        }
     }
 }
 
 /// A directory of the changes of a writable layer in the overlay's form, and
-/// the options to walk it.  What was made for it is removed when it is
-/// dropped.
+/// the options to walk it.
 pub struct ChangesDir {
     pub path: PathBuf,
     pub walk: dirtar::Options,
-    _scratch: Option<tempfile::TempDir>,
 }
 
 impl ChangesDir {
     /// A directory of changes that is not the driver's (a build step's).
     pub fn of(path: PathBuf, walk: dirtar::Options) -> Self {
-        Self {
-            path,
-            walk,
-            _scratch: None,
-        }
+        Self { path, walk }
     }
 }
 
@@ -1193,9 +1088,8 @@ pub struct LayerRef {
     pub key: LayerKey,
     pub diff_id: Digest,
     /// The OCI ChainID of the layer as the top of its stack, computed by the
-    /// engine from the diff ids of the image (`velarx_types::chain_ids`).
-    /// A chained driver (`Capabilities::layer_chain`) holds a layer under
-    /// it; the others ignore it.
+    /// engine from the diff ids of the image (`velarx_types::chain_ids`);
+    /// composefs keys layers on their content and ignores it.
     pub chain_id: Digest,
 }
 
@@ -1240,9 +1134,7 @@ pub trait StorageDriver: Send + Sync + 'static {
     /// the driver already has included (`FeedLayer::stored`: nothing to fetch
     /// for those, and nothing of them in `Pulled`).  A content keyed driver
     /// (composefs) fetches the layers that are not stored, each content
-    /// once, as it always did; a chained driver (`Capabilities::layer_chain`)
-    /// needs the rest: the parent of a layer is the chain id of the one before
-    /// it in the list, present or not.
+    /// once.
     ///
     /// `settled` is the engine's check of the layers after every layer is
     /// staged and proven and before the driver publishes: it may refuse the
@@ -1265,9 +1157,8 @@ pub trait StorageDriver: Send + Sync + 'static {
     /// in the order asked (`result[i]` is about `layers[i]`, and the lengths
     /// are equal), true for a layer that is **committed and complete** (what
     /// a pull committed and the engine settled, or a lazy layer's
-    /// completion).  A content keyed driver answers the same for equal keys
-    /// (and diff ids); a chained one answers for the place of each layer in
-    /// its stack.  This is the layer-level "already
+    /// completion).  The driver answers the same for equal keys (and diff
+    /// ids).  This is the layer-level "already
     /// stored" question of a pull, answered by the driver and not by the
     /// engine's look at the store: the engine fetches nothing at all of a
     /// layer the driver has (not even its table of contents).
@@ -1292,10 +1183,7 @@ pub trait StorageDriver: Send + Sync + 'static {
     /// --repair`).  A create or an image mount that finds one lost marks the
     /// layer incomplete (the engine clears its tar-split), and then the layer
     /// is not reported: the next pull fetches it again and makes the artifact
-    /// (the objects the store has are not downloaded again).  For a chained driver
-    /// (`Capabilities::layer_chain`) a layer is held under its chain id: the
-    /// same content at two places of a stack is two layers, held or not each
-    /// by itself.  The engine still checks that the layers it is told of
+    /// (the objects the store has are not downloaded again).  The engine still checks that the layers it is told of
     /// have the index it records an image from, whatever the driver says.
     async fn has_layers(&self, layers: &[LayerRef]) -> DriverResult<Vec<bool>>;
 
@@ -1420,11 +1308,8 @@ pub trait StorageDriver: Send + Sync + 'static {
     ///
     /// `base` is the root file system of the container asked as a mount
     /// request (none: a container of a directory the user gave, `--rootfs`;
-    /// its container is `w`).  A driver whose layer is an overlay's upper
-    /// directory makes nothing of the image; one that copies the layers makes
-    /// its copy of them here (not at pull, not at run: the cost of a
-    /// container that is made), with the ids of the user namespace of
-    /// `base.mapping`; with no image its layer is an empty directory.  The
+    /// its container is `w`).  The overlay's upper directory makes nothing of
+    /// the image; with no image its layer is an empty directory.  The
     /// answer is what the root will be ([`Planned`], none when there was no
     /// `base`), made with no descriptor.
     fn writable_create(
@@ -1436,8 +1321,7 @@ pub trait StorageDriver: Send + Sync + 'static {
     ) -> DriverResult<Option<Planned>>;
 
     /// Where the writable layer is (it need not exist yet).  The engine
-    /// reads `upper` only for a driver whose layer is an overlay's upper
-    /// directory (`Capabilities::overlay_upper`: the monitor's overlay); it
+    /// reads `upper` as the overlay's upper directory; it
     /// reaches the files of the root through [`StorageDriver::writable_root`].
     fn writable_paths(&self, w: &Writable) -> WritablePaths;
 

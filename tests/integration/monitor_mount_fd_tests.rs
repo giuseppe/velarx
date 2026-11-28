@@ -653,67 +653,45 @@ fn a_volume_that_is_not_a_detached_mount_is_refused() {
 }
 
 /// Which plans may go together: an image mount that is a descriptor goes
-/// with a root of any kind (or none); an image mount of any other plan (a
-/// directory, or the plan of a kind the monitor does not have, a `composefs`
-/// one of an engine before the driver handed the mounts over) is refused,
-/// whatever the root.
+/// with a root that is one or with none; an image mount of the plan of a kind
+/// the monitor does not have (a `directory` one, a `composefs` one of an
+/// engine before the driver handed the mounts over) is refused, whatever the
+/// root.
 #[test]
 fn only_a_descriptor_volume_goes_with_a_root_of_another_kind() {
     velarx_base::testing::in_child(|| {
         if !namespace() {
             return;
         }
-        let beneath = tempfile::tempdir().unwrap();
-        std::fs::create_dir(beneath.path().join("r")).unwrap();
-        std::fs::write(beneath.path().join("r/marker"), "dir\n").unwrap();
-        let directory = format!(
-            r#"{{"kind":"directory","beneath":"{}","path":"r"}}"#,
-            beneath.path().display()
-        );
-        // legal: a descriptor volume with a directory root and with no root
-        for (what, root, first) in [
-            ("a directory root", Some(directory.as_str()), 0u32),
-            ("no root", None, 0),
-        ] {
-            let (mut fx, _, _) =
-                volume_fixture("cat {V0}/marker", root, &[vol(first, false)], false);
+        // legal: a descriptor volume with no root
+        {
+            let (mut fx, _, _) = volume_fixture("cat {V0}/marker", None, &[vol(0, false)], false);
             let v = detached_tmpfs_with(b"vol\n");
             let mut m = start_with(&mut fx, &[&v]);
-            assert!(m.first.ok, "{what}: {:?}", m.first.error);
-            assert_eq!(run(&fx, &mut m), ["out F vol"], "{what}");
+            assert!(m.first.ok, "no root: {:?}", m.first.error);
+            assert_eq!(run(&fx, &mut m), ["out F vol"], "no root");
         }
-        // refused: a directory plan for an image mount, next to a mount-fd root
-        // and next to a directory one, and the plan of a kind the monitor
-        // does not have
-        let dirvol = Vol {
-            plan: directory.clone(),
-            subpath: None,
-        };
-        let cfsvol = || Vol {
-            plan: r#"{"kind":"composefs","layers":[],"image_id":"a"}"#.to_string(),
-            subpath: None,
-        };
-        {
-            let (mut fx, _, t) = volume_fixture("true", Some(&plan(0)), &[dirvol], false);
-            let root = detached_tmpfs();
-            let mut m = start_with(&mut fx, &[&root]);
-            refused(&mut m, &["image mount /data0", "type=image"]);
-            assert!(!t[0].exists(), "a directory image mount");
-        }
-        {
-            let dirvol = Vol {
-                plan: directory.clone(),
-                subpath: None,
-            };
-            let (mut fx, _, _) = volume_fixture("true", Some(&directory), &[dirvol], false);
-            let mut m = start_with(&mut fx, &[]);
-            refused(&mut m, &["image mount /data0", "type=image"]);
-        }
-        for root in [Some(plan(0)), None] {
-            let (mut fx, _, _) = volume_fixture("true", root.as_deref(), &[cfsvol()], false);
-            let fd = detached_tmpfs();
-            let mut m = start_with(&mut fx, &[&fd]);
-            refused(&mut m, &["imagevol/0.rootfs.json", "composefs"]);
+        // refused: the plan of a kind the monitor does not have
+        for (kind, plan_text) in [
+            (
+                "directory",
+                r#"{"kind":"directory","beneath":"/b","path":"r"}"#,
+            ),
+            (
+                "composefs",
+                r#"{"kind":"composefs","layers":[],"image_id":"a"}"#,
+            ),
+        ] {
+            for root in [Some(plan(0)), None] {
+                let vol = Vol {
+                    plan: plan_text.to_string(),
+                    subpath: None,
+                };
+                let (mut fx, _, _) = volume_fixture("true", root.as_deref(), &[vol], false);
+                let fd = detached_tmpfs();
+                let mut m = start_with(&mut fx, &[&fd]);
+                refused(&mut m, &["imagevol/0.rootfs.json", kind]);
+            }
         }
     });
 }
@@ -1074,8 +1052,7 @@ fn a_container_starts_from_what_the_engine_asked_of_the_driver() {
                 )),
             );
             let driver: Arc<dyn StorageDriver> = Arc::new(
-                VolumeFake::new(Arc::new(inner), Prefs::new(&[IdmapWay::AtCopy]), root_fd)
-                    .detached(),
+                VolumeFake::new(Arc::new(inner), Prefs::new(&[IdmapWay::DriverMount])).detached(),
             );
             let w = Writable::new("c1", &fx.bundle);
             // create: the root, and the two volumes with what they show

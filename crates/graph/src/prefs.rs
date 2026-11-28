@@ -17,7 +17,7 @@ pub struct Prefs<T: Copy> {
     items: [Option<T>; MAX],
 }
 
-/// As the list it is: `[AtCopy, Translate]`.
+/// As the list it is: `[DriverMount, Translate]`.
 impl<T: Copy + std::fmt::Debug> std::fmt::Debug for Prefs<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.iter()).finish()

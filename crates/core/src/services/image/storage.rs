@@ -341,31 +341,19 @@ impl ImageService {
 
     /// The layers of the image `image` as the engine names them to the
     /// driver: `layers` are its whole stack, in order.  The diff ids, and so
-    /// the chain ids, are those of the image's configuration, as a pull and
-    /// a collection compute them (a chained driver must be asked about the
-    /// chains it was given); the diff ids of the layers' records stand in
-    /// only for a driver that ignores the chain ids, when the configuration
-    /// cannot be read or does not name every layer.
+    /// the chain ids, are those of the image's configuration, as a pull
+    /// computes them; the diff ids of the layers' records stand in when the
+    /// configuration cannot be read or does not name every layer.
     pub(super) fn layer_refs(
         &self,
         image: &velarx_db::ImageRecord,
         layers: &[LayerRecord],
     ) -> ImageResult<Vec<velarx_graph::LayerRef>> {
         let keys: Vec<LayerKey> = layers.iter().map(|l| l.key).collect();
-        let config = serde_json::from_str::<OciConfig>(&image.config);
-        match config {
-            Ok(c) if c.rootfs.diff_ids.len() == layers.len() => {
+        if let Ok(c) = serde_json::from_str::<OciConfig>(&image.config) {
+            if c.rootfs.diff_ids.len() == layers.len() {
                 return Ok(super::pull::layer_refs(&keys, &c.rootfs.diff_ids));
             }
-            _ if self.storage.capabilities().layer_chain => {
-                return Err(ImageError::Layer(format!(
-                    "the configuration of the image {} does not name its {} layers: \
-                     the chain ids of its layers are not known",
-                    image.id,
-                    layers.len()
-                )));
-            }
-            _ => {}
         }
         // (a layer made here, by a commit, has its diff id)
         let diff_ids: Vec<_> = layers

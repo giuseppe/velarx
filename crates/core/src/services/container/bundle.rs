@@ -658,13 +658,6 @@ impl ContainerService {
     ) -> ContainerResult<()> {
         if dir.overlay {
             // (the layer over the directory is an overlay's upper directory)
-            if !self.storage().capabilities().overlay_upper {
-                return Err(ContainerError::InvalidArgument(format!(
-                    "--rootfs {}:O needs a storage driver whose writable layer is an overlay's upper directory; the driver of this store is {}",
-                    dir.path.display(),
-                    self.storage().name()
-                )));
-            }
             self.storage()
                 .writable_create(
                     &Writable::new(id, bundle_path),
@@ -678,8 +671,8 @@ impl ContainerService {
     }
 
     /// The writable layer of a container made of an image: the driver makes
-    /// it from the layers (a driver that copies them copies them here, on the
-    /// blocking pool), owned by the root of the container's user namespace.
+    /// it, on the blocking pool, owned by the root of the container's user
+    /// namespace.
     /// The answer is what the root file system will be (the plan the engine
     /// writes in the bundle), and the files of the root get the container's
     /// label when one is asked for and the mount does not carry it.

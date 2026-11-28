@@ -78,9 +78,8 @@ pub struct FeedLayer {
     /// The diff id the configuration of the image says it has.
     pub diff_id: Digest,
     /// The OCI ChainID of the layer as the top of its image's stack
-    /// (`velarx_types::chain_ids`), the engine's: a chained driver
-    /// (`Capabilities::layer_chain`) keys the layer on it, the others ignore
-    /// it.
+    /// (`velarx_types::chain_ids`), the engine's: composefs keys layers on
+    /// their content and ignores it.
     pub chain_id: Digest,
     /// The chain id of the layer below it in the image, none for the first:
     /// the one the layer is made on.

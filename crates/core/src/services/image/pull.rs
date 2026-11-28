@@ -461,9 +461,8 @@ impl ImageService {
     /// of a TOC never stands for one pulled whole, nor the other way round.
     ///
     /// Whether a layer is in the store is the storage driver's answer
-    /// ([`StorageDriver::has_layers`], one call, one answer per position: a
-    /// chained driver may hold the layer at one place of the image and not at
-    /// another): a layer it has is neither fetched nor looked at again, and a
+    /// ([`StorageDriver::has_layers`], one call, one answer per position): a
+    /// layer it has is neither fetched nor looked at again, and a
     /// driver that is not the engine's files says so by key.  The engine's own
     /// check is of its index only: an image is recorded from the table of
     /// contents of each of its layers, so a layer the driver has but the
@@ -1474,10 +1473,8 @@ impl ImageService {
             limits.inflate_floor_bytes = limits.max_layer_bytes;
         }
         // The whole layer list of the image, in order, with the layers the
-        // driver has marked as stored (a chained driver needs the parent of
-        // each layer, also when only some are missing); a driver that is
-        // content keyed fetches the others, each blob once
-        // (`feed::to_fetch`).
+        // driver has marked as stored; the driver fetches the others, each
+        // blob once (`feed::to_fetch`).
         let to_fetch = feed_layers(
             &manifest.layers,
             &config.rootfs.diff_ids,

@@ -1184,9 +1184,8 @@ impl ContainerService {
         } else {
             None
         };
-        // the writable layer of the container, from its image (a driver that
-        // copies the layers copies them now, before the engine writes its
-        // own files into the root file system)
+        // the writable layer of the container, from its image (made before
+        // the engine writes its own files into the root file system)
         let root_plan = if rootfs_dir.is_none() {
             let ask = super::bundle::RootAsk {
                 mapping: mapping.clone(),

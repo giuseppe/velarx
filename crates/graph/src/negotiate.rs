@@ -16,9 +16,6 @@ pub struct Ask {
     pub verity_enforced: bool,
     /// `[storage] fsverity_best_effort`: a check at pull is enough.
     pub verity_best_effort: bool,
-    /// `[storage] additional_image_stores` lists read-only stores of the same
-    /// driver.
-    pub shared_stores: bool,
     /// The engine runs as an unprivileged user.
     pub unprivileged: bool,
     /// A container with a user namespace of its own: its root file system
@@ -66,10 +63,9 @@ impl Capabilities {
             .max_layers
             .map_or_else(|| "no limit".to_string(), |m| m.to_string());
         format!(
-            "lazy {}, rootless {}, fs-verity {verity}, shared stores {}, image volumes {}, user namespaces {}, size limit {}, layers {layers}",
+            "lazy {}, rootless {}, fs-verity {verity}, image volumes {}, user namespaces {}, size limit {}, layers {layers}",
             yes(self.lazy),
             yes(self.rootless),
-            yes(self.shared_stores),
             yes(self.volume.is_some()),
             yes(!self.root.idmap.is_empty()),
             yes(self.writable_size_limit),
@@ -88,11 +84,6 @@ impl Capabilities {
         if ask.verity_enforced && !self.verity_at_run_time() && !ask.verity_best_effort {
             return no(format!(
                 "the storage driver {driver} checks fs-verity only when a layer is pulled, so its digests cannot be enforced while a container runs (`[storage] fsverity_require`, `composefs_digests = \"require\"`, `--security-opt verity=enforce`): set `[storage] fsverity_best_effort = true` to accept the check at pull, or use the composefs driver"
-            ));
-        }
-        if ask.shared_stores && !self.shared_stores {
-            return no(format!(
-                "the storage driver {driver} does not use read-only image stores (`[storage] additional_image_stores`): the images of another store have no table of contents here; remove them from the configuration, or use the composefs driver"
             ));
         }
         if ask.unprivileged && !self.rootless {
@@ -148,13 +139,10 @@ mod tests {
             serve_content: false,
             rootless: true,
             verity: Prefs::new(verity),
-            shared_stores: false,
-            layer_chain: false,
             max_layers: Some(10),
-            overlay_upper: false,
             writable_size_limit: false,
             root: MountCaps {
-                idmap: Prefs::new(&[IdmapWay::AtCopy]),
+                idmap: Prefs::new(&[IdmapWay::DriverMount]),
             },
             volume: None,
         }
@@ -202,25 +190,15 @@ mod tests {
         // a driver that checks at run time takes it, with or without
         let at_run = caps(&[VerityEnforcement::Kernel, VerityEnforcement::OnOpen]);
         assert_eq!(why(&at_run, enforced), None);
-        assert!(why(
-            &pull_only,
-            Ask {
-                shared_stores: true,
-                ..Default::default()
-            }
-        )
-        .unwrap()
-        .contains("additional_image_stores"));
         // a driver that has what is asked takes it
         let mut all = caps(&[VerityEnforcement::OnOpen]);
-        (all.lazy, all.shared_stores) = (true, true);
+        all.lazy = true;
         assert_eq!(
             why(
                 &all,
                 Ask {
                     lazy: true,
                     verity_enforced: true,
-                    shared_stores: true,
                     ..Default::default()
                 }
             ),
@@ -254,7 +232,7 @@ mod tests {
             "{m}"
         );
         c.volume = Some(MountCaps {
-            idmap: Prefs::new(&[IdmapWay::AtCopy]),
+            idmap: Prefs::new(&[IdmapWay::DriverMount]),
         });
         assert_eq!(why(&c, ask(|a| a.image_volumes = true)), None);
         // a user namespace: needs a way to show the ids
@@ -290,7 +268,7 @@ mod tests {
         )
         .unwrap()
         .contains("needs root"));
-        monitor.root.idmap = Prefs::new(&[IdmapWay::MonitorMount, IdmapWay::AtCopy]);
+        monitor.root.idmap = Prefs::new(&[IdmapWay::MonitorMount, IdmapWay::DriverMount]);
         assert_eq!(
             why(
                 &monitor,

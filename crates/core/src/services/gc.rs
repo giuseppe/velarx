@@ -780,32 +780,6 @@ impl GcService {
         )?);
         let pulls = self.staging().pulls().into_iter().map(|p| p.pull.id);
         let image_records = self.db.list_images().await?;
-        // the chains of a driver whose layers are chained: those of every
-        // prefix of every image's stack, from the configurations (the other
-        // drivers are not asked, nothing is read for them)
-        let mut chains: Vec<velarx_types::digest::Digest> = Vec::new();
-        if self.storage.capabilities().layer_chain {
-            let mut seen = HashSet::new();
-            for image in &image_records {
-                match serde_json::from_str::<velarx_types::OciConfig>(&image.config) {
-                    Ok(config) => chains.extend(
-                        velarx_types::chain_ids(&config.rootfs.diff_ids)
-                            .into_iter()
-                            .filter(|c| seen.insert(*c)),
-                    ),
-                    // (an image whose configuration cannot be read keeps
-                    // nothing it cannot name: the collection must not remove
-                    // the chain of an image it could not read)
-                    Err(e) => {
-                        report.errors.push(format!(
-                            "the configuration of the image {} cannot be read ({e}): the layers of a chained driver are not collected",
-                            image.id
-                        ));
-                        return Ok(());
-                    }
-                }
-            }
-        }
         let images = image_records.into_iter().map(|i| i.id);
         // (the layers of the containers' images are in `layers`: an image a
         // container uses is never removed)
@@ -817,7 +791,6 @@ impl GcService {
             .map(|c| c.id);
         let keep = Keep {
             layers,
-            chains,
             images: images.collect(),
             containers: containers.collect(),
             pulls: pulls.collect(),
@@ -1713,117 +1686,5 @@ mod freed_tests {
         r.add_layer_size(i64::MAX);
         r.add_layer_size(-1);
         assert_eq!((r.bytes_freed, r.layers_size), (u64::MAX, u64::MAX));
-    }
-}
-
-#[cfg(test)]
-mod chain_tests {
-    use super::*;
-    use crate::storage_driver::ComposefsDriver;
-    use velarx_db::ImageRecord;
-    use velarx_graph::conformance::Chained;
-    use velarx_types::digest::{Algorithm, Digest};
-
-    fn digest(text: &str) -> Digest {
-        Digest::of(Algorithm::Sha256, text.as_bytes())
-    }
-
-    fn image(n: u8, diff_ids: &[Digest]) -> ImageRecord {
-        let ids: Vec<String> = diff_ids.iter().map(|d| format!("\"{d}\"")).collect();
-        ImageRecord {
-            id: format!("{n:02x}").repeat(32),
-            manifest_digest: digest(&format!("manifest{n}")),
-            config_digest: digest(&format!("config{n}")),
-            manifest: "{}".into(),
-            config: format!(
-                r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":[{}]}}}}"#,
-                ids.join(",")
-            ),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            is_lazy: false,
-        }
-    }
-
-    /// A collection tells a chained driver the chain ids of every image's
-    /// layers (each prefix of each stack, once): it drops the chain of an
-    /// image that is gone and keeps the shared prefix of one that stays.
-    #[tokio::test]
-    async fn a_chained_driver_is_told_the_chains_of_the_images() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = velarx_db::Database::open_in_memory().await.unwrap();
-        let store = Arc::new(velarx_storage::FileStore::new(tmp.path().join("objects")).unwrap());
-        let staging = tmp.path().join("staging");
-        let driver = Arc::new(ComposefsDriver::new(
-            db.clone(),
-            store.clone(),
-            staging.clone(),
-            velarx_storage::VerityMode::Off,
-            crate::storage_driver::composefs::options_for_tests(&staging),
-        ));
-        let mut service = GcService::of_store(driver, db.clone(), store, &staging);
-        let (a, b, c) = (digest("a"), digest("b"), digest("c"));
-        // two images with the base `a` in common, a stray chain of an image
-        // that is gone
-        db.insert_image(&image(1, &[a, b])).await.unwrap();
-        db.insert_image(&image(2, &[a, c])).await.unwrap();
-        let ab = velarx_types::chain_ids(&[a, b]);
-        let ac = velarx_types::chain_ids(&[a, c]);
-        let gone = velarx_types::chain_ids(&[b, a, c]);
-        let chained = Chained::of(service.storage.clone());
-        let mut held = vec![ab[0], ab[1], ac[1]];
-        held.extend(&gone);
-        chained.hold(&held);
-        service.storage = chained.clone();
-        let mut report = GcReport::default();
-        service.collect_storage(&mut report).await.unwrap();
-        assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert!(chained.holds(&ab[0]) && chained.holds(&ab[1]) && chained.holds(&ac[1]));
-        assert!(
-            gone.iter().all(|g| !chained.holds(g)),
-            "the chains of no image are collected"
-        );
-        // the base is shared: still one chain id for both images
-        assert_eq!(ab[0], ac[0]);
-    }
-
-    /// An image whose configuration cannot be read names no chain: the
-    /// collection then removes nothing of a chained driver (it would remove
-    /// the chains of that image) and says why.
-    #[tokio::test]
-    async fn an_unreadable_configuration_collects_nothing_of_a_chained_driver() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = velarx_db::Database::open_in_memory().await.unwrap();
-        let store = Arc::new(velarx_storage::FileStore::new(tmp.path().join("objects")).unwrap());
-        let staging = tmp.path().join("staging");
-        let driver = Arc::new(ComposefsDriver::new(
-            db.clone(),
-            store.clone(),
-            staging.clone(),
-            velarx_storage::VerityMode::Off,
-            crate::storage_driver::composefs::options_for_tests(&staging),
-        ));
-        let mut service = GcService::of_store(driver, db.clone(), store, &staging);
-        let (a, b) = (digest("a"), digest("b"));
-        db.insert_image(&image(1, &[a, b])).await.unwrap();
-        let mut broken = image(2, &[a]);
-        broken.config = "{not a configuration".into();
-        db.insert_image(&broken).await.unwrap();
-        let ours = velarx_types::chain_ids(&[a, b]);
-        let theirs = velarx_types::chain_ids(&[b]);
-        let chained = Chained::of(service.storage.clone());
-        chained.hold(&ours);
-        chained.hold(&theirs);
-        service.storage = chained.clone();
-        let mut report = GcReport::default();
-        service.collect_storage(&mut report).await.unwrap();
-        assert!(
-            report.errors.iter().any(|e| e.contains(&broken.id)),
-            "{:?}",
-            report.errors
-        );
-        assert!(
-            ours.iter().chain(&theirs).all(|c| chained.holds(c)),
-            "nothing is collected"
-        );
     }
 }

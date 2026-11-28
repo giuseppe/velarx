@@ -27,10 +27,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
 
-pub mod copydiff;
-
 use super::holes::{changed, copy_file, pad, HoleWrite};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use velarx_base::walk::{Visit, Walk};
@@ -135,10 +133,6 @@ pub struct Options {
     pub gid_map: Vec<IdRange>,
     /// The times of the files of the layer.
     pub mtime: Mtime,
-    /// The changes of a copy of an image (`copydiff`): the copy could not
-    /// give its files the owners of the image, so those of this owner (the
-    /// host's ids) are the image's, whatever it says.
-    pub unowned: Option<(u32, u32)>,
     /// When the layer has an entry for the directory itself (`./`).
     pub root: Root,
     /// The root of the file system the changes are made on: the directory
@@ -1591,6 +1585,7 @@ fn added_below(
 mod tests {
     use super::*;
     use rustix::fd::AsFd;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, MetadataExt};
 
     fn entries(tar: &[u8]) -> Vec<(String, tar::EntryType, Option<String>)> {
@@ -2330,112 +2325,6 @@ mod tests {
                 "./ccc/old*./aaa/d/a"
             ]
         );
-    }
-
-    /// A directory of a copy that is the image's, with nothing changed below
-    /// it, is not in the layer, even when something after it is.
-    #[test]
-    fn test_an_unchanged_directory_of_a_copy_is_not_in_the_layer() {
-        let d = tempfile::tempdir().unwrap();
-        let copy = d.path().join("copy");
-        let (lower, files) = lower(d.path());
-        for dir in ["etc", "run"] {
-            std::fs::create_dir_all(copy.join(dir)).unwrap();
-            std::fs::set_permissions(
-                copy.join(dir),
-                std::os::unix::fs::PermissionsExt::from_mode(0o755),
-            )
-            .unwrap();
-        }
-        let old = copy.join("etc/old");
-        std::fs::write(&old, &files[0].1).unwrap();
-        std::fs::set_permissions(&old, std::os::unix::fs::PermissionsExt::from_mode(0o644))
-            .unwrap();
-        let (_, node) = lower.node("etc/old").unwrap();
-        let (sec, nsec) = node.entry.mtime();
-        let t = rustix::fs::Timestamps {
-            last_access: rustix::fs::Timespec {
-                tv_sec: sec,
-                tv_nsec: nsec.into(),
-            },
-            last_modification: rustix::fs::Timespec {
-                tv_sec: sec,
-                tv_nsec: nsec.into(),
-            },
-        };
-        rustix::fs::utimensat(rustix::fs::CWD, &old, &t, rustix::fs::AtFlags::empty()).unwrap();
-        let opts = Options {
-            lower: Some(lower),
-            unowned: Some((
-                rustix::process::getuid().as_raw(),
-                rustix::process::getgid().as_raw(),
-            )),
-            ..Default::default()
-        };
-        let mut tar = Vec::new();
-        copydiff::write(open(&copy).as_fd(), &opts, &mut tar).unwrap();
-        let names: Vec<String> = entries(&tar).into_iter().map(|e| e.0).collect();
-        // (opt is gone: its whiteout comes after etc and run)
-        assert_eq!(names, [".wh.opt"]);
-    }
-
-    /// A copy that kept none of the entries of the image's root, and has
-    /// others: each is a whiteout, as a marker in the root hides nothing.
-    #[test]
-    fn test_a_copy_without_the_entries_of_the_root_whiteouts_each() {
-        let d = tempfile::tempdir().unwrap();
-        let copy = d.path().join("copy");
-        std::fs::create_dir_all(&copy).unwrap();
-        std::fs::write(copy.join("new"), b"new").unwrap();
-        let (lower, _) = lower(d.path());
-        let opts = Options {
-            lower: Some(lower),
-            ..Default::default()
-        };
-        let mut tar = Vec::new();
-        copydiff::write(open(&copy).as_fd(), &opts, &mut tar).unwrap();
-        let names: Vec<String> = entries(&tar).into_iter().map(|e| e.0).collect();
-        assert_eq!(names, ["new", ".wh.etc", ".wh.opt", ".wh.run"]);
-    }
-
-    /// The tar of a copy has the entry for its root when the options ask for
-    /// it: always, or when the root is not a plain one.
-    #[test]
-    fn test_the_tar_of_a_copy_has_its_root_when_asked() {
-        use std::os::unix::fs::PermissionsExt;
-        let d = tempfile::tempdir().unwrap();
-        let copy = d.path().join("copy");
-        std::fs::create_dir_all(&copy).unwrap();
-        let (lower, _) = lower(d.path());
-        let names = |mode: u32, root: Root| {
-            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(mode)).unwrap();
-            let own = |host| {
-                vec![IdRange {
-                    container: 0,
-                    host,
-                    size: 1,
-                }]
-            };
-            let opts = Options {
-                lower: Some(lower.clone()),
-                uid_map: own(rustix::process::getuid().as_raw()),
-                gid_map: own(rustix::process::getgid().as_raw()),
-                root,
-                ..Default::default()
-            };
-            let mut tar = Vec::new();
-            copydiff::write(open(&copy).as_fd(), &opts, &mut tar).unwrap();
-            entries(&tar)
-                .into_iter()
-                .map(|e| e.0)
-                .filter(|n| n.starts_with("./"))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(names(0o755, Root::Never), [] as [&str; 0]);
-        assert_eq!(names(0o711, Root::Never), [] as [&str; 0]);
-        assert_eq!(names(0o755, Root::Changed), [] as [&str; 0]);
-        assert_eq!(names(0o711, Root::Changed), ["./"]);
-        assert_eq!(names(0o755, Root::Always), ["./"]);
     }
 
     /// A tree the container made, deeper than a thread of the blocking pool

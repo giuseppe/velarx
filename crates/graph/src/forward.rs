@@ -345,7 +345,6 @@ mod tests {
             .collect();
         assert!(methods.len() > 25, "{methods:?}");
         for (ty, file) in [
-            ("Chained", include_str!("conformance.rs")),
             ("VolumeFake", include_str!("conformance/volumes.rs")),
             (
                 "Watching",
