@@ -223,6 +223,49 @@ db_side_files () { # store root
     sh_ container rm -t 0 -f c1 > /dev/null 2>&1
 }
 
+@test "an image of the other store is pushed, saved, committed and built on" {
+    need_main
+    local repo=$E2E_REGISTRY/stores-rule/alpine
+    sh_ image push --tls-verify=false "$IMAGE" "$repo:pushed" > "$WORKDIR/push.out" 2>&1
+    check "it is pushed" 0 $?
+    layers=$(skopeo inspect --tls-verify=false --raw "docker://$repo:pushed" | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)["layers"]))')
+    check "with its layers" "$(sh_ image inspect "$IMAGE" | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)[0]["RootFS"]["Layers"]))')" "$layers"
+    sh_ image save -o "$WORKDIR/saved.tar" "$IMAGE" > /dev/null 2>&1
+    check "it is saved" 0 $?
+    check "as an archive of its layers" "$layers" \
+        "$(skopeo inspect --raw "oci-archive:$WORKDIR/saved.tar" | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)["layers"]))')"
+    rm -f "$WORKDIR/saved.tar"
+    mkdir -p "$WORKDIR/ctx"
+    printf 'FROM %s\nRUN echo built > /built\n' "$IMAGE" > "$WORKDIR/ctx/Containerfile"
+    sh_ image build -q --network none -t localhost/derived:1 "$WORKDIR/ctx" > /dev/null 2>&1
+    check "an image is built from it" 0 $?
+    check "which runs, with the file it made" "built" \
+        "$(sh_ container run --rm --pull=never --network none localhost/derived:1 cat /built 2>&1)"
+    check_match "and has the layers of the other store" "^[0-9]+\.[0-9]+" \
+        "$(sh_ container run --rm --pull=never --network none localhost/derived:1 cat /etc/alpine-release 2>&1)"
+    sh_ container run -d --name c2 --network none "$IMAGE" sleep 300 > /dev/null 2>&1
+    sh_ container exec c2 sh -c 'echo x > /written' > /dev/null 2>&1
+    sh_ container commit c2 localhost/committed:1 > /dev/null 2>&1
+    check "a container of it is committed" 0 $?
+    sh_ container rm -t 0 -f c2 > /dev/null 2>&1
+    check "the commit has the file" "x" \
+        "$(sh_ container run --rm --pull=never --network none localhost/committed:1 cat /written 2>&1)"
+    check "and the other layers" "$layers" \
+        "$(sh_ image inspect localhost/committed:1 | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)[0]["RootFS"]["Layers"]) - 1)')"
+    sh_ image rm localhost/derived:1 localhost/committed:1 > /dev/null 2>&1
+    skopeo delete --tls-verify=false "docker://$repo:pushed" > /dev/null 2>&1 || true
+}
+
+@test "a rootless container of the other store is served by the image server" {
+    [ "$(id -u)" != 0 ] || skip "rootless only"
+    need_main
+    sh_ container run -d --name c1 --network none "$IMAGE" sleep 300 > /dev/null 2>&1
+    id=$(sh_ container inspect --format '{{.Id}}' c1)
+    log=$(find "$WORKDIR/main-state" -path "*/${id:0:12}/*" -name monitor.log 2> /dev/null | head -1 | xargs -r cat)
+    check_match "its root is the image server's mount" "image server of the root file system: pid" "$log"
+    sh_ container rm -t 0 -f c1 > /dev/null 2>&1
+}
+
 @test "prune and pull leave the other store as it is" {
     need_main
     before=$(cat "$WORKDIR/ro.sum" 2> /dev/null)
@@ -291,11 +334,32 @@ db_side_files () { # store root
     check "which is closed" "" "$(db_side_files "$WORKDIR/unclean")"
 }
 
-@test "a store that is not one is not used" {
+@test "a store that is not one fails the start" {
     config bad "$WORKDIR/bad" "additional_image_stores = [\"$WORKDIR/nowhere\"]"
-    start_daemon bad
-    check "a daemon with a missing store starts" 0 $?
-    check_match "and says it does not use it" "nowhere: .*not used" "$(cat "$WORKDIR/bad.log")"
-    check "without its images" "" "$(sh_ image list --format '{{.Repository}}' 2>&1)"
-    stop_daemon
+    ! start_daemon bad || e2e_die "the daemon starts"
+    check_match "the error names it and how to start without it" \
+        "additional image store .*nowhere: .*remove it from \[storage\] additional_image_stores" "$(cat "$WORKDIR/bad.log")"
+    out=$("$BIN/velarx" --config "$WORKDIR/bad.toml" image list 2>&1)
+    check "a command without a daemon fails" 1 "$([ $? != 0 ] && echo 1 || echo 0)"
+    check_match "with the same error" "additional image store .*nowhere: " "$out"
+}
+
+@test "a store of another schema version fails the start" {
+    mkdir -p "$WORKDIR/future"
+    sqlite3 "$WORKDIR/future/db.sqlite" 'PRAGMA user_version = 99; CREATE TABLE t (a);'
+    config future "$WORKDIR/futuremain" "additional_image_stores = [\"$WORKDIR/future\"]"
+    ! start_daemon future || e2e_die "the daemon starts"
+    check_match "the error names it and the version" "additional image store .*future: .*schema version 99" "$(cat "$WORKDIR/future.log")"
+}
+
+@test "a store made with another storage driver fails the start" {
+    # (the row of a copy of the database says so: it is all the check reads)
+    mkdir -p "$WORKDIR/vfsstore"
+    cp "$WORKDIR/ro/db.sqlite" "$WORKDIR/vfsstore/db.sqlite"
+    chmod u+w "$WORKDIR/vfsstore/db.sqlite"
+    sqlite3 "$WORKDIR/vfsstore/db.sqlite" "INSERT OR REPLACE INTO store_settings (key, value) VALUES ('driver', 'vfs')"
+    config vfsmain "$WORKDIR/vfsmain" "additional_image_stores = [\"$WORKDIR/vfsstore\"]"
+    ! start_daemon vfsmain || e2e_die "the daemon starts"
+    check_match "the error names the store and its driver" \
+        "additional image store .*vfsstore: .*storage driver \"vfs\".*composefs" "$(cat "$WORKDIR/vfsmain.log")"
 }
