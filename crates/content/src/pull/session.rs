@@ -25,6 +25,14 @@ use std::sync::{Arc, Mutex};
 use tracing::warn;
 use velarx_storage::{FileStore, FsVerityManager, Object};
 
+/// Where the store holds a file that is no object of it: in the EROFS image
+/// of a layer (`layers.inline`).
+pub trait Inlined: Send + Sync {
+    /// The image that holds the file `digest`, opened, with the offset of
+    /// the file in it and its size.
+    fn extent(&self, digest: &str) -> Option<(File, u64, u64)>;
+}
+
 pub struct Session {
     dir: PathBuf,
     /// What tells the others the session is live (none for a scratch
@@ -38,6 +46,8 @@ pub struct Session {
     counter: AtomicU64,
     /// The session this one is the scratch of: what it staged is here too
     parent: std::sync::OnceLock<Arc<Session>>,
+    /// Where the files are that the store holds in the images of its layers
+    inlined: std::sync::OnceLock<Arc<dyn Inlined>>,
     /// The staged files known by their fs-verity digest, and their names:
     /// the commit moves nothing unless each has it
     by_verity: Mutex<HashMap<String, String>>,
@@ -118,10 +128,18 @@ impl Session {
             staged: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
             parent: std::sync::OnceLock::new(),
+            inlined: std::sync::OnceLock::new(),
             by_verity: Mutex::new(HashMap::new()),
             by_content: Mutex::new(HashMap::new()),
             verified: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// The session has what the images of the layers of the store hold
+    /// (`inlined`): a file of them is not fetched again.
+    pub fn with_inlined(self: Arc<Self>, inlined: Arc<dyn Inlined>) -> Arc<Self> {
+        let _ = self.inlined.set(inlined);
+        self
     }
 
     /// The directories the temporary files of the session are in.
@@ -240,7 +258,8 @@ impl Session {
 
     /// Whether the content is in the store or already staged.  What only
     /// a read-only store has is staged from there, checked: the
-    /// images of this store keep only files of their own.
+    /// images of this store keep only files of their own.  What the image
+    /// of a layer holds is staged from there, checked.
     pub fn have(&self, digest: &str) -> bool {
         if self.staged.lock().unwrap().contains_key(digest) || self.store.contains_local(digest) {
             return true;
@@ -248,7 +267,7 @@ impl Session {
         if self.parent.get().is_some_and(|p| p.has_staged(digest)) {
             return true;
         }
-        self.stage_additional(digest)
+        self.stage_additional(digest) || self.stage_inlined(digest)
     }
 
     /// Stage the copy of the file of a read-only store that has it.
@@ -271,7 +290,11 @@ impl Session {
     pub fn holds(&self, digest: &str, size: u64) -> bool {
         match self.staged_size(digest) {
             Some(staged) => staged == size,
-            None => self.store.holds(digest, size) || self.stage_additional(digest),
+            None => {
+                self.store.holds(digest, size)
+                    || self.stage_additional(digest)
+                    || self.stage_inlined(digest)
+            }
         }
     }
 
@@ -281,16 +304,39 @@ impl Session {
         own.or_else(|| self.parent.get()?.staged_size(digest))
     }
 
+    /// Stage the copy of the file of the image of a layer that holds it.
+    fn stage_inlined(&self, digest: &str) -> bool {
+        let Some((mut image, offset, size)) = self.inlined.get().and_then(|i| i.extent(digest))
+        else {
+            return false;
+        };
+        let staged = io::Seek::seek(&mut image, io::SeekFrom::Start(offset))
+            .and_then(|_| self.stage_from(io::Read::take(image, size), digest));
+        match staged {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("{digest} of the image of a layer: {e}: fetched");
+                false
+            }
+        }
+    }
+
     /// Stage the copy of a file of a read-only store, whose content must
     /// have its fs-verity digest.
     fn stage_copy(&self, src: &Path, digest: &str) -> io::Result<()> {
-        let mut from = OpenOptions::new()
+        let from = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(src)?;
         if !from.metadata()?.is_file() {
             return Err(io::Error::other("not a regular file"));
         }
+        self.stage_from(from, digest)
+    }
+
+    /// Stage what `from` reads, whose content must have its fs-verity
+    /// digest.
+    fn stage_from(&self, mut from: impl io::Read, digest: &str) -> io::Result<()> {
         let (to, temp) = self.create_temp()?;
         let copied = (|| {
             let alg = super::key_algorithm(digest)
