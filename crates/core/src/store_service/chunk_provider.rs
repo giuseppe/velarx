@@ -5,9 +5,14 @@
 //! Chunks can be served from:
 //! 1. File store (complete files stored by file digest)
 //! 2. Database chunk_locations (extract chunk from stored file at offset)
+//!
+//! A file of a layer whose EROFS image holds it (`layers.inline`) is served
+//! as a range of that image, as an object is a file: the content of a digest
+//! is found as `velarx_graph::objects::find_content` does, store by store.
 
 use std::sync::Arc;
 use velarx_db::{ChunkLocation, Database};
+use velarx_graph::objects::find_content;
 use velarx_storage::{ChunkFile, FileStore, MAX_SERVED_BYTES};
 use velarx_types::digest::Digest;
 
@@ -50,43 +55,45 @@ impl StorageChunkProvider {
                 (d, location)
             })
             .collect();
-        let files = self.file_store.clone();
+        let (files, db) = (self.file_store.clone(), self.db.clone());
         tokio::task::spawn_blocking(move || {
             wanted
                 .into_iter()
-                .map(|(digest, location)| Self::opened(&files, &digest, location))
+                .map(|(digest, location)| Self::opened(&db, &files, &digest, location))
                 .collect()
         })
         .await
         .unwrap_or_default()
     }
 
-    /// The file of `digest`: the whole file the file store has by that
-    /// digest, else the piece of a file `location` says.  Blocking.
+    /// The range of a file that is the content of the file `key`, if the
+    /// stores have it.
+    fn held(db: &Database, files: &FileStore, key: &str) -> Option<ChunkFile> {
+        find_content("chunks", db, files, key)
+            .and_then(|content| content.range("chunks"))
+            .ok()
+    }
+
+    /// The file of `digest`: the whole file the stores have by that digest
+    /// (an object, or the file of the image of a layer), else the piece of a
+    /// file `location` says.  Blocking.
     fn opened(
+        db: &Database,
         files: &FileStore,
         digest: &Digest,
         location: Option<ChunkLocation>,
     ) -> Option<ChunkFile> {
         let max = MAX_SERVED_BYTES as u64;
-        let whole = files.get_path(&digest.to_string()).and_then(|path| {
-            let file = std::fs::File::open(path).ok()?;
-            let len = file.metadata().ok()?.len();
-            (len <= max).then_some(ChunkFile {
-                file,
-                offset: 0,
-                len,
-            })
-        });
+        let whole = Self::held(db, files, &digest.to_string()).filter(|w| w.len <= max);
         if whole.is_some() {
             return whole;
         }
         let loc = location.filter(|loc| loc.size <= max)?;
-        let file = std::fs::File::open(files.get_path(&loc.file_digest)?).ok()?;
+        let held = Self::held(db, files, &loc.file_digest)?;
         let end = loc.offset.checked_add(loc.size)?;
-        (file.metadata().ok()?.len() >= end).then_some(ChunkFile {
-            file,
-            offset: loc.offset,
+        (held.len >= end).then_some(ChunkFile {
+            file: held.file,
+            offset: held.offset + loc.offset,
             len: loc.size,
         })
     }
@@ -182,5 +189,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(read(&provider, &ok).await.unwrap().len(), MAX_SERVED_BYTES);
+    }
+
+    /// A file the EROFS image of a layer holds is served as a range of the
+    /// image, and so is a chunk of it, as an object and a chunk of an object
+    /// are: the peer is told nothing about where the file is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_file_an_image_holds_is_served_as_a_range_of_the_image() {
+        use velarx_db::{InlinedFile, LayerCommit, LayerKey, LayerRecord};
+        use velarx_storage::VerityHasher;
+        use velarx_types::digest::Algorithm;
+        let dir = tempdir().unwrap();
+        let objects = dir.path().join("objects");
+        let file_store = Arc::new(FileStore::new(&objects).unwrap());
+        let db = Database::open(dir.path().join("db.sqlite")).await.unwrap();
+        let sha = |b: &[u8]| Digest::of(Algorithm::Sha256, b);
+        let mut hasher = VerityHasher::new(Algorithm::Sha256);
+        hasher.update(b"hello world");
+        let file = hasher.finish();
+        let layer = LayerKey::Whole(sha(b"layer"));
+        let mut image = vec![b'.'; 64];
+        image[20..31].copy_from_slice(b"hello world");
+        let path = velarx_fuse::composefs::layer_image_path(&objects, &layer.file_stem());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, image).unwrap();
+        let chunk = sha(b"world");
+        db.commit_layers(
+            vec![LayerCommit {
+                record: LayerRecord {
+                    stream_size: Some(0),
+                    inline: -1,
+                    key: layer,
+                    blob: None,
+                    diff_id: Some(sha(b"diff")),
+                    other_diff_id: None,
+                    size: 1,
+                    status: "ready".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    registry_ref: None,
+                    erofs: Some("sha256:a".into()),
+                    owners: Some("[]".into()),
+                },
+                files: vec![],
+                refs: vec![],
+                chunks: vec![ChunkLocation {
+                    chunk_digest: chunk,
+                    file_digest: file.clone(),
+                    offset: 6,
+                    size: 5,
+                }],
+                toc_digest: sha(b"toc"),
+                tarsplit: None,
+                blob_checked: false,
+                sealed: false,
+                inlined: vec![InlinedFile {
+                    digest: file.clone(),
+                    offset: 20,
+                    size: 11,
+                }],
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+        let provider = StorageChunkProvider::new(file_store, db);
+        assert_eq!(read(&provider, &file).await.unwrap(), b"hello world");
+        assert_eq!(read(&provider, &chunk.to_string()).await.unwrap(), b"world");
     }
 }
