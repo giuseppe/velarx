@@ -67,27 +67,12 @@ engine.
 .B storage
 The store: its root, the storage driver
 .RB ( driver :
-.B composefs
-is the default, the EROFS image of each layer;
-.B vfs
-is a full copy of the files of the image for
-each container, made when it is created (the cost of a container is linear in the size of its
-image, reflinks make it cheap where the file system has them; it needs no
-mount, and takes no
-.BR \-\-lazy ", " "\-\-mount type=image" " nor " "\-\-storage\-opt size" ;
-it is never chosen for you);
-a store keeps the driver it was made with, and
-opening it with another is an error), the fs\-verity of its files, which
+.BR composefs ,
+the only one, the EROFS image of each layer; any other value is an error, and
+so is opening a store that was made with another driver), the fs\-verity of
+its files, which
 .B fsverity_require
-makes necessary for every file, and which a driver that checks it only when a
-layer is pulled (vfs) accepts, for
-.BR fsverity_require ", " "composefs_digests = \(dqrequire\(dq" " and " "\-\-security\-opt verity=enforce" ,
-only with
-.B fsverity_best_effort = true
-(the check is at pull and nothing is promised while a container runs; without
-it those settings are an error with vfs; a process that may not give files
-the owners of the image leaves them its own with
-.BR vfs_ignore_chown_errors ),
+makes necessary for every file,
 the EROFS images of the
 layers
 .RB ( composefs ),

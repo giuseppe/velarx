@@ -2,7 +2,7 @@
 # Storage
 
 How Velarx stores images, its security properties and limits, and the
-interface of a storage driver.
+interface of the storage driver.
 
 ## Overview
 
@@ -61,7 +61,7 @@ is the same file in every image that has the layer, whatever is below it.
 The root of a layer is its `./` entry, or a plain directory (0755, owned by
 root, no time, no attributes) when it has none, and so is a directory it has
 entries in but does not list: its attributes replace those of the directory
-below, whose entries stay, in every view of the image (the overlay, `vfs`,
+below, whose entries stay, in every view of the image (the overlay,
 `build`, `commit --squash`, `cp`). A hard link names a file of its own
 layer. An opaque marker (`.wh..wh..opq`) in the root of a layer hides
 nothing, as in the kernel's overlay, whose root is the merge of the roots of
@@ -78,18 +78,21 @@ create, a mode other than 0700, and anything else under `volumes`.
 only shells, with `unlink` and `rmdir`: it never deletes data, and what is
 not a volume is left untouched.
 
-The driver is chosen by `[storage] driver` or `--storage-driver`: `composefs`
-(the default) and `vfs` (never chosen for you). A store keeps the
-driver it was made with; opening it with another is an error that names both.
+A store has one storage driver, and `composefs` is the only one there is.
+`[storage] driver`, `--storage-driver` and `VELARX_STORAGE_DRIVER` accept
+`composefs` or nothing; any other value is an error. The driver is recorded in
+the store, and a store recorded with another driver is not opened (the error
+names the driver and the store: use the velarx that made it, or remove the
+store).
 
 ## The driver trait
 
 The engine owns the network, the identities (diff ids, EROFS digests, owners)
-and the reachability of everything (what is kept).  A **storage driver** owns
-where the bytes live and how a root file system is made of them.  The
+and the reachability of everything (what is kept).  The **storage driver**
+owns where the bytes live and how a root file system is made of them.  The
 interface is the Rust trait `StorageDriver` (`crates/graph/src/lib.rs`); the
-drivers are in the engine's process, and the conformance suite of
-`crates/graph` is run against each of them.
+driver, `composefs`, is in the engine's process, and the conformance suite of
+`crates/graph` is run against it.
 
 What is not in the trait because it is the engine's own: the stream of a
 layer's diff id (`objects::open_layer`, from the tar-split and `read_objects`, or
@@ -207,9 +210,8 @@ object name.
   complete), layers recorded when the file system had no
   fs-verity (a pull of the image, and a full `system check`, seal a layer
   whose EROFS image the kernel measures as the digest recorded for it, one
-  ioctl each, and never otherwise), and a driver that checks at pull only
-  (vfs) are held to nothing, silently; the debug log says `verity
-  chain: OFF (reason)` for each.  `--security-opt verity=off` and `[storage]
+  ioctl each, and never otherwise) are held to nothing, silently; the debug
+  log says `verity chain: OFF (reason)` for each.  `--security-opt verity=off` and `[storage]
   verity_chain = "off"` turn it off, and are refused where the digests or
   signatures are required (`composefs_digests = "require"`,
   `image_signature = "require"`, `signature=require`, `verity=enforce`).
