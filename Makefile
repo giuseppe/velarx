@@ -451,7 +451,7 @@ e2e: e2e-man ## bats suites side by side: make e2e [T="run-lifecycle kube"] [BAT
 e2e-root: e2e-man ## e2e as root, which runs the root-only files too (SUDO=... to change how)
 	$(SUDO) env VELARX_BINDIR=$(abspath $(VELARX_BINDIR)) $(if $(E2E_JOBS),E2E_JOBS=$(E2E_JOBS)) $(if $(E2E_TIMEOUT),E2E_TIMEOUT=$(E2E_TIMEOUT)) $(if $(E2E_LOGDIR),E2E_LOGDIR=$(E2E_LOGDIR)) $(RUNALL)
 
-p2p-rig: ## real-process swarm in network namespaces, as root: make p2p-rig [SCENARIO=rollout|holder-loss|certificates|netem|overlay|repull|mute-member] [RIG_ARGS="-n 20"] (tests/p2p-rig)
+p2p-rig: ## real-process swarm in network namespaces, as root: make p2p-rig [SCENARIO=rollout|holder-loss|certificates|netem|overlay|repull|mute-member|inline] [RIG_ARGS="-n 20"] (tests/p2p-rig)
 	$(SUDO) env VELARX_BINDIR=$(abspath $(VELARX_BINDIR)) tests/p2p-rig/$(or $(SCENARIO),rollout).sh $(RIG_ARGS)
 
 e2e-list: ## the names usable as T=
