@@ -573,8 +573,7 @@ impl StagingFetcher for PeerSource {
             let none = Probed {
                 layer: at as u32,
                 toc: TocSource::None,
-                on_demand: false,
-                reason: Some(NotLazy::Unreachable),
+                not_lazy: Some(NotLazy::Unreachable),
                 toc_file: None,
                 tarsplit_file: None,
             };
@@ -588,8 +587,7 @@ impl StagingFetcher for PeerSource {
             }
             let reply = Probed {
                 toc: TocSource::Carried,
-                on_demand: !whole,
-                reason: whole.then_some(NotLazy::NoToc),
+                not_lazy: whole.then_some(NotLazy::NoToc),
                 toc_file: Some(0),
                 tarsplit_file: (!tarsplit.is_empty()).then_some(1),
                 ..none

@@ -715,8 +715,7 @@ impl StagedFetch {
                 let reply = Probed {
                     layer: *layer,
                     toc: TocSource::None,
-                    on_demand: false,
-                    reason: Some(crate::fetcher::fetch::NotLazy::Unreachable),
+                    not_lazy: Some(crate::fetcher::fetch::NotLazy::Unreachable),
                     toc_file: None,
                     tarsplit_file: None,
                 };
@@ -2124,8 +2123,7 @@ mod tests {
                     } else {
                         TocSource::None
                     },
-                    on_demand: has,
-                    reason: (!has).then_some(self.reason),
+                    not_lazy: (!has).then_some(self.reason),
                     toc_file: None,
                     tarsplit_file: None,
                 };
@@ -2319,7 +2317,7 @@ mod tests {
         .await
         .unwrap();
         let got = staged.probe_all(&[0], false, Parts::All).await.unwrap();
-        assert_eq!(got[0].0.reason, Some(NotLazy::NoToc));
+        assert_eq!(got[0].0.not_lazy, Some(NotLazy::NoToc));
     }
 
     /// A fetcher that carries the table of contents and the tar-split of
@@ -2357,8 +2355,7 @@ mod tests {
                 let reply = Probed {
                     layer: at,
                     toc: TocSource::Carried,
-                    on_demand: true,
-                    reason: None,
+                    not_lazy: None,
                     toc_file: file(toc, b"toc"),
                     tarsplit_file: file(ts, b"ts"),
                 };

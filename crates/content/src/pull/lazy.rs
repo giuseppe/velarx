@@ -173,13 +173,10 @@ pub async fn accept(
         return Ok(Err(Why::NoToc));
     };
     let (TocSource::Carried, Some((toc_z, ts_z))) = (reply.toc, metadata) else {
-        return Ok(Err(reply.reason.unwrap_or(Why::Unreachable)));
+        return Ok(Err(reply.not_lazy.unwrap_or(Why::Unreachable)));
     };
     let found = found_of(info, toc_z, ts_z, layer.digest, max_tar).await?;
-    Ok(match reply.on_demand {
-        true => Ok(found),
-        false => Err(reply.reason.unwrap_or(Why::NoRanges)),
-    })
+    Ok(reply.not_lazy.map_or(Ok(found), Err))
 }
 
 #[cfg(test)]

@@ -1053,11 +1053,10 @@ impl StagingFetcher for RegistryFetch {
         let (pool, host) = self.pool(scope)?;
         for (at, blob) in layers.iter().enumerate() {
             let at = at as u32;
-            let reply = |toc, on_demand, reason| Probed {
+            let reply = |toc, not_lazy| Probed {
                 layer: at,
                 toc,
-                on_demand,
-                reason,
+                not_lazy,
                 toc_file: None,
                 tarsplit_file: None,
             };
@@ -1066,12 +1065,12 @@ impl StagingFetcher for RegistryFetch {
             let info = match chunked::parse_info(layer) {
                 Ok(Some(info)) => info,
                 Ok(None) => {
-                    let unpack = reply(TocSource::Unpack, false, Some(NotLazy::NoToc));
+                    let unpack = reply(TocSource::Unpack, Some(NotLazy::NoToc));
                     out.send(unpack).await.map_err(|_| failed("gone"))?;
                     continue;
                 }
                 Err(_) => {
-                    let none = reply(TocSource::None, false, Some(NotLazy::Unsupported));
+                    let none = reply(TocSource::None, Some(NotLazy::Unsupported));
                     out.send(none).await.map_err(|_| failed("gone"))?;
                     continue;
                 }
@@ -1100,7 +1099,7 @@ impl StagingFetcher for RegistryFetch {
                 Probed {
                     toc_file,
                     tarsplit_file,
-                    ..reply(TocSource::Carried, true, None)
+                    ..reply(TocSource::Carried, None)
                 },
                 fds,
             )

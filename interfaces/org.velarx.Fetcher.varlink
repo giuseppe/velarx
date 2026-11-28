@@ -237,10 +237,9 @@ type Probed (
 	# The position of the layer in the call
 	layer: int,
 	toc: TocSource,
-	# Its files can be fetched one by one, on demand
-	on_demand: bool,
-	# Why not, when `on_demand` is false
-	reason: ?NotLazy,
+	# Why its files cannot be fetched one by one, on demand: absent, they
+	# can
+	not_lazy: ?NotLazy,
 	# With `toc` carried: the table of contents and the tar-split, as the
 	# `parts` of the probe ask, sealed memory files among the descriptors of
 	# this reply (a layer whose table of contents has `"version": 2` has no

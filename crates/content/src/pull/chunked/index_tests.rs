@@ -136,8 +136,7 @@ impl StagingFetcher for Source_ {
             let none = Probed {
                 layer: at,
                 toc: TocSource::None,
-                on_demand: false,
-                reason: Some(NotLazy::Unreachable),
+                not_lazy: Some(NotLazy::Unreachable),
                 toc_file: None,
                 tarsplit_file: None,
             };
@@ -152,7 +151,7 @@ impl StagingFetcher for Source_ {
             ];
             let reply = Probed {
                 toc: TocSource::Carried,
-                reason: Some(NotLazy::NoToc),
+                not_lazy: Some(NotLazy::NoToc),
                 toc_file: Some(0),
                 tarsplit_file: Some(1),
                 ..none

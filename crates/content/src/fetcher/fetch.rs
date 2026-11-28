@@ -202,10 +202,9 @@ pub struct Probed {
     /// The position of the layer in the call
     pub layer: u32,
     pub toc: TocSource,
-    /// Its files can be fetched one by one, on demand
-    pub on_demand: bool,
-    /// Why not, when `on_demand` is false
-    pub reason: Option<NotLazy>,
+    /// Why its files cannot be fetched one by one, on demand: absent, they
+    /// can
+    pub not_lazy: Option<NotLazy>,
     /// With `toc` carried: the table of contents and the tar-split, as the
     /// `parts` of the probe ask, sealed memory files among the descriptors of
     /// this reply (a layer whose table of contents has `"version": 2` has no

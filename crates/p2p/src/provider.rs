@@ -4210,13 +4210,13 @@ mod tests {
                 .unwrap();
             let (reply, fds) = rx.recv().await.unwrap();
             assert_eq!(reply.toc == TocSource::Carried, carried, "{key}");
-            assert_eq!(reply.on_demand, carried && lazy);
+            assert_eq!(reply.not_lazy.is_none(), carried && lazy);
             assert_eq!(fds.len(), if carried { 2 } else { 0 });
             if carried && !lazy {
-                assert_eq!(reply.reason, Some(NotLazy::NoToc));
+                assert_eq!(reply.not_lazy, Some(NotLazy::NoToc));
             }
             if !carried {
-                assert_eq!(reply.reason, Some(NotLazy::Unreachable));
+                assert_eq!(reply.not_lazy, Some(NotLazy::Unreachable));
             }
         }
     }

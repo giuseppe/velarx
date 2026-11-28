@@ -271,8 +271,7 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
             let none = Probed {
                 layer: at as u32,
                 toc: TocSource::None,
-                on_demand: false,
-                reason: Some(NotLazy::Unreachable),
+                not_lazy: Some(NotLazy::Unreachable),
                 toc_file: None,
                 tarsplit_file: None,
             };
@@ -285,7 +284,7 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
             let fds = vec![sealed(toc_z)?.into(), sealed(tarsplit_z)?.into()];
             let reply = Probed {
                 toc: TocSource::Carried,
-                reason: Some(NotLazy::NoToc),
+                not_lazy: Some(NotLazy::NoToc),
                 toc_file: Some(0),
                 tarsplit_file: Some(1),
                 ..none
@@ -596,15 +595,15 @@ mod tests {
             .unwrap();
         let mut got = Vec::new();
         while let Ok((reply, fds)) = rx.try_recv() {
-            got.push((reply.toc, reply.on_demand, reply.reason, fds.len()));
+            got.push((reply.toc, reply.not_lazy, fds.len()));
         }
         assert_eq!(
             got,
             [
-                (TocSource::Carried, false, Some(NotLazy::NoToc), 2),
-                (TocSource::None, false, Some(NotLazy::Unreachable), 0),
-                (TocSource::None, false, Some(NotLazy::Unreachable), 0),
-                (TocSource::None, false, Some(NotLazy::Unreachable), 0),
+                (TocSource::Carried, Some(NotLazy::NoToc), 2),
+                (TocSource::None, Some(NotLazy::Unreachable), 0),
+                (TocSource::None, Some(NotLazy::Unreachable), 0),
+                (TocSource::None, Some(NotLazy::Unreachable), 0),
             ]
         );
     }

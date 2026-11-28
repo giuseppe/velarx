@@ -298,8 +298,7 @@ pub trait StagingFetcher: Send + Sync + 'static {
             out.send(Probed {
                 layer: at as u32,
                 toc: TocSource::None,
-                on_demand: false,
-                reason: Some(NotLazy::Unreachable),
+                not_lazy: Some(NotLazy::Unreachable),
                 toc_file: None,
                 tarsplit_file: None,
             })
@@ -2606,7 +2605,7 @@ mod tests {
         assert!(got[2].probed.is_none());
         assert!(got[..2].iter().all(|p| {
             let p = p.probed.as_ref().unwrap();
-            p.toc == TocSource::None && p.reason == Some(NotLazy::Unreachable)
+            p.toc == TocSource::None && p.not_lazy == Some(NotLazy::Unreachable)
         }));
         // an item: nobody has it
         for kind in [FileKind::Manifest, FileKind::Profile, FileKind::Signatures] {
