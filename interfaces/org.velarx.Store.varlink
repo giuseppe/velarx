@@ -80,11 +80,12 @@ method GetInfo() -> (
 	name: string,
 	# The version of the package
 	version: string,
-	# The version of the protocol (1)
+	# The version of the protocol (1): compared for equality, it changes
+	# only for a deliberate break
 	proto: int,
 	# Words; a client ignores those it does not know
 	capabilities: []string,
-	# Named limits (`max_objects`, `max_wants`, ...); a client ignores those it does not know
+	# Named limits (`max_objects`, ...); a client ignores those it does not know
 	limits: [string]int
 )
 

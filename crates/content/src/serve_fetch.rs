@@ -2113,70 +2113,113 @@ pub fn definition() -> String {
     format!(
         "# SPDX-License-Identifier: Apache-2.0\n\
          #\n\
-         # The interface of fetchers: a process that brings the\n\
-         # content of images into the staging directories of a store.  Every fetcher\n\
-         # serves it; nothing in it names a kind of fetcher.  Generated from the Rust\n\
-         # types (crates/content/src/fetcher/fetch.rs and crates/content/src/serve_fetch.rs)\n\
+         # The interface of fetchers: a process that brings the content of images\n\
+         # into the staging directories of a store.  Every fetcher serves it;\n\
+         # nothing in it names a kind of fetcher.  Generated from the Rust types\n\
+         # (crates/content/src/fetcher/fetch.rs and crates/content/src/serve_fetch.rs)\n\
          # by the test `serve_fetch::tests::the_interface_file_is_current`:\n\
          # VELARX_WRITE_INTERFACES=1 cargo test -p velarx-content --lib serve_fetch writes it.\n\
          #\n\
-         # ONE FETCHER.  A fetcher answers only for itself: what it does not have is\n\
-         # unavailable, what it tried and could not bring is failed, with a class that says what to do next.  It knows nothing\n\
-         # of other fetchers; the engine walks its ordered list of them, and is the\n\
-         # one that asks the next.  Every item of a call is answered exactly once.\n\
+         # THE METHODS, in three groups.  The connection: GetInfo, Open, Connect.\n\
+         # Small things and blobs: GetFile, GetBlob.  Layers: Layer, Forget, Probe,\n\
+         # Unpack, Fetch.  A fetcher answers `unavailable` to what it does not do, and\n\
+         # is a valid fetcher with none of the methods.\n\
          #\n\
-         # THE STAGING DIRECTORY OF A LAYER.  A directory open for reading (not O_PATH) on\n\
-         # the file system of the store, made by the engine, one per layer.  A fetcher\n\
-         # resolves every path beneath it with openat2(RESOLVE_BENEATH |\n\
+         # THE LEAST FETCHER.  An origin of a scheme (a layout on a web server, an\n\
+         # archive, a bucket) answers GetFile of the manifest, GetBlob and Unpack: in\n\
+         # Rust it is the two functions of `Blobs` and `BlobFetch` (examples/httplayout.rs).\n\
+         # A source of content (a cache, peers) answers Probe and Fetch, by the object\n\
+         # contract below (examples/dircache.rs).  Nothing else is needed.\n\
+         #\n\
+         # ONE FETCHER.  A fetcher answers only for itself: what it does not have is\n\
+         # unavailable, what it tried and could not bring is failed, with a class that\n\
+         # says what to do next.  It knows nothing of other fetchers; the engine walks\n\
+         # its ordered list of them, and is the one that asks the next.  Every item of\n\
+         # a call is answered exactly once.  Who the origin of a pull is comes from the\n\
+         # configuration, not from a word of the fetcher.\n\
+         #\n\
+         # THE STAGING DIRECTORY OF A LAYER.  A directory open for reading (not\n\
+         # O_PATH) on the file system of the store, made by the engine, one per layer.\n\
+         # A fetcher resolves every path beneath it with openat2(RESOLVE_BENEATH |\n\
          # RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV) and uses\n\
-         # incoming/ (files with no name), files/ab/cd... (the files of the layer, named\n\
-         # after fs-verity was enabled, by the digest the table of contents gives), and\n\
-         # toc.claim and tarsplit (only for a layer without a table of contents).\n\
-         # A built-in fetcher may also be confined, at its start, to the staging\n\
-         # root of its store; that is its sandbox, not part of this interface: an\n\
-         # external fetcher reaches a layer's staging only through the descriptor\n\
-         # of `Layer`.\n\
+         # incoming/ (files with no name), files/ab/cd... (the files of the layer,\n\
+         # named after fs-verity was enabled, by the digest the table of contents\n\
+         # gives), and toc.claim and tarsplit (only for a layer without a table of\n\
+         # contents).  A built-in fetcher may also be confined, at its start, to the\n\
+         # staging root of its store; that is its sandbox, not part of this interface:\n\
+         # an external fetcher reaches a layer's staging only through the descriptor of\n\
+         # `Layer`.\n\
          #\n\
          # THE OBJECT CONTRACT.  A file is written into a file with no name, each chunk\n\
          # checked against the sha256 the table of contents gives for it; the file is\n\
-         # closed for writing; fs-verity is enabled on it (when the scope says verity);\n\
-         # its mode is 0444; then it is given its name with linkat, never replacing.  A\n\
-         # name that exists is success.  A fetcher syncs nothing, removes no name,\n\
-         # writes nowhere else, and never reads the store: the chunks of the store it\n\
-         # may take (`reuse` of Fetch, only for a fetcher that announces the word\n\
-         # reuse) come in one file the engine made of exactly those bytes, read-only.\n\
+         # closed for writing; fs-verity is enabled on it (when the scope says\n\
+         # verity); its mode is 0444; then it is given its name with linkat, never\n\
+         # replacing.  A name that exists is success.  A fetcher syncs nothing,\n\
+         # removes no name, writes nowhere else, and never reads the store: the chunks\n\
+         # of the store it may take (`reuse` of Fetch, only for a fetcher that\n\
+         # announces the word reuse) come in one file the engine made of exactly those\n\
+         # bytes, read-only.\n\
          #\n\
          # UNPACK.  The origin reads a layer with no table of contents whole, and its\n\
-         # regular files are handed over, not named: each is a descriptor of a reply of\n\
-         # `Unpack`, a complete file with no name (a small one may be a file in memory)\n\
-         # that has fs-verity when the scope says verity.  Then it gives `toc.claim` and\n\
-         # `tarsplit` their names in the staging directory.  A file of two names is handed\n\
-         # over once.\n\
+         # regular files are handed over, not named: each is a descriptor of a `staged`\n\
+         # event of `Unpack`, at the position `files` says, a complete file with no\n\
+         # name (a small one may be a file in memory) that has fs-verity when the scope\n\
+         # says verity.  Then it gives `toc.claim` and `tarsplit` their names in the\n\
+         # staging directory.  A file of two names is handed over once.\n\
          #\n\
          # HANDOVER.  A fetcher that announces the word handover and is called with\n\
          # `handover` may answer for a small file, written in memory, with a `staged`\n\
-         # event that has `files`: for each of its `objects` the descriptor of the file, a\n\
-         # complete file with no name, instead of a name in the staging directory.  A file\n\
-         # that is not small, or that needs fs-verity, is named as before.\n\
+         # event that has `files`: for each of its `objects` the descriptor of the\n\
+         # file, a complete file with no name, instead of a name in the staging\n\
+         # directory.  A file that is not small, or that needs fs-verity, is named as\n\
+         # before.\n\
          #\n\
          # TABLES.  A zstd:chunked layer whose descriptor has the annotations\n\
          # `table-position` and `table-checksum` is pulled by its binary table, not by\n\
          # its JSON table of contents: only a fetcher that announces the word table is\n\
          # asked for it, and the table is what `Probe` carries and `Layer` gives.\n\
          #\n\
-         # TRUST.  A fetcher is not trusted.  A name it made is a claim; the engine opens\n\
-         # it and takes the kernel's measure.  A file it hands over is a claim too: the\n\
-         # engine copies it, or takes the kernel's measure of it, and knows it by the\n\
-         # digest of the bytes it read.  What it returns with GetFile (a manifest),\n\
-         # GetBlob and Probe is hashed by the engine before it is used,\n\
-         # and the signatures of GetFile are judged by the engine's policy.\n\
+         # TRUST.  A fetcher is not trusted.  A name it made is a claim; the engine\n\
+         # opens it and takes the kernel's measure.  A file it hands over is a claim\n\
+         # too: the engine copies it, or takes the kernel's measure of it, and knows it\n\
+         # by the digest of the bytes it read.  What it returns with GetFile (a\n\
+         # manifest), GetBlob and Probe is hashed by the engine before it is used, and\n\
+         # the signatures of GetFile are judged by the engine's policy.\n\
          #\n\
-         # CAPABILITIES.  What a fetcher can do is a word of capabilities in GetInfo; a\n\
-         # client ignores the words it does not know.  The\n\
-         # interface grows only so: a new parameter or reply field is optional, a new\n\
-         # value of an enum of a call is sent only to a fetcher that announces its word,\n\
-         # and a value of an enum of a reply that a client does not know is read as\n\
-         # the most general one (other, none, unsupported) or ignored (an event).\n\
+         # GETFILE.  `reference` is what `kind` says: for `manifest`, a tag or a\n\
+         # digest of the origin; for `profile`, the id of the image; for `signatures`,\n\
+         # a `repository:tag` or a manifest digest.  Absent, it is what the source of\n\
+         # the scope names (the manifest of the location of a pull).  A `kind` the\n\
+         # fetcher does not know is `unavailable`.\n\
+         #\n\
+         # ACCESS.  The credentials of `Open` are the JSON of a `RegistryAccess` in a\n\
+         # sealed memory file, read once: {{\"creds\": CREDENTIALS, \"auths\": {{\"HOST\":\n\
+         # CREDENTIALS, ...}}, \"certs\": {{\"ca\": [PEM, ...], \"cert\": PEM, \"key\": PEM}}}},\n\
+         # where creds, auths, certs, cert and key may be absent, CREDENTIALS being\n\
+         # {{\"username\": \"...\", \"password\": \"...\", \"identity_token\": \"...\",\n\
+         # \"registry_token\": \"...\"}} (the two tokens may be absent).  Credentials\n\
+         # that change are a new connection with a new `Open`.\n\
+         #\n\
+         # CAPABILITIES.  Three words of GetInfo, which the engine reads: reuse (it is\n\
+         # given the chunks of the store), handover and table.  A word exists only\n\
+         # where the engine must do work, or choose what to send, before the call;\n\
+         # a client ignores the words it does not know.\n\
+         #\n\
+         # EXTENSION.  The interface grows without a version, and with no code for an\n\
+         # older party on either side:\n\
+         #  1. A new parameter or reply field is optional; absent is the behaviour\n\
+         #     before it, and a parameter a fetcher does not know is ignored.\n\
+         #  2. A new method: a fetcher that does not have it answers the varlink\n\
+         #     MethodNotFound, which the engine reads as `unavailable`.  No word.\n\
+         #  3. A new value of an enum of a call: the receiver reads a value it does not\n\
+         #     know as its catch-all, `unavailable` for the kind of a file, the most\n\
+         #     general one for the others (`wait` for an urgency, `all` for parts).\n\
+         #  4. A new value of an enum of a reply: the catch-all that exists (other,\n\
+         #     none, unsupported) or an event that is ignored.\n\
+         #  5. A capability word only by the rule above.\n\
+         #  6. `proto` stays 1.  It changes only for a deliberate break, in the same\n\
+         #     commit as every fetcher of the tree: there is no negotiation and no\n\
+         #     second code path.\n\
          #\n\
          # DESCRIPTORS.  A descriptor is a field of type `int` (or `?int` when it may\n\
          # be absent), named after what it is, whose value is its position among the\n\
@@ -2185,20 +2228,22 @@ pub fn definition() -> String {
          # length: the receiver checks the seals and applies the interface's maximum.\n\
          #\n\
          # REPLIES.  A method called with more answers one record a reply; its last\n\
-         # reply carries no record and has continues false (`Fetch`: no event;\n\
-         # `Probe`: no probed; `Unpack`: neither bytes nor files).  A server whose connection is closed sends nothing\n\
-         # more.  `progress` carries `objects` (exactly one) and `bytes`, the cumulative\n\
-         # bytes of that object moved by this call; with no object, the cumulative\n\
-         # bytes of the blob of the layer; one with no object and no bytes is a beat.\n\
-         # Every other method has one reply.\n\
+         # reply carries no record and has continues false (`GetBlob`: no bytes;\n\
+         # `Probe`: no probed; `Unpack` and `Fetch`: no event).  A server whose\n\
+         # connection is closed sends nothing more.  `progress` carries `objects`\n\
+         # (exactly one) and `bytes`, the cumulative bytes of that object moved by this\n\
+         # call; with no object, the cumulative bytes of the blob of the layer; one with\n\
+         # no object and no bytes is a beat.  Every other method has one reply.\n\
          #\n\
-         # LIVENESS.  `Open` carries `idle_ms`.  A call with more sends a reply (a\n\
-         # progress when it has nothing else) at least every `idle_ms / 2`; a call with\n\
-         # one reply answers within `idle_ms`.  Otherwise the engine closes the\n\
-         # connection and records a transient failure, `silent for N ms`, for that\n\
-         # party.\n\
-         # Who may call: a peer of the same user or root (SO_PEERCRED); any\n\
-         # accepted peer may make every call.\n\
+         # LIVENESS.  `Open` carries `idle_ms`.  Every call that can last (GetBlob,\n\
+         # Probe, Unpack, Fetch) is made with more and says something at least every\n\
+         # `idle_ms / 2`, a beat when it has nothing else; the other calls answer\n\
+         # within `idle_ms`.  Otherwise the engine closes the connection and records a\n\
+         # transient failure, `silent for N ms`, for that party.\n\
+         #\n\
+         # CANCEL.  Closing the connection of a call cancels it; `Forget` ends what a\n\
+         # layer holds.  Who may call: a peer of the same user or root (SO_PEERCRED);\n\
+         # any accepted peer may make every call.\n\
          \n{}\n",
         service::description()
     )

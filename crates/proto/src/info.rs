@@ -15,11 +15,12 @@ pub struct Info {
     pub name: String,
     /// The version of the package
     pub version: String,
-    /// The version of the protocol (1)
+    /// The version of the protocol (1): compared for equality, it changes
+    /// only for a deliberate break
     pub proto: u32,
     /// Words; a client ignores those it does not know
     pub capabilities: Vec<String>,
-    /// Named limits (`max_objects`, `max_wants`, ...); a client ignores those it does not know
+    /// Named limits (`max_objects`, ...); a client ignores those it does not know
     pub limits: BTreeMap<String, u64>,
 }
 
