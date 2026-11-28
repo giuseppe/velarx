@@ -11,7 +11,7 @@
 //!
 //! It serves:
 //!
-//! * `GetFile("")`: the index of the images the selector of the source
+//! * `GetFile(manifest)`: the index of the images the selector of the source
 //!   (`Open(source)`: the scheme and the selector, `oci-archive:NAME`, never
 //!   the path) takes, as an OCI index (`rootfs:` has the algorithm of the
 //!   digests of its image for selector: `rootfs:sha512`); each name an image has in the archive
@@ -841,7 +841,7 @@ mod tests {
             kept: Arc::default(),
         };
         let (index, _) = origin
-            .get_file(&scope, FileKind::Manifest, "", MAX_METADATA)
+            .get_file(&scope, FileKind::Manifest, None, MAX_METADATA)
             .await?;
         let mut bytes = vec![0u8; index.metadata().unwrap().len() as usize];
         std::os::unix::fs::FileExt::read_exact_at(&index, &mut bytes, 0).unwrap();

@@ -833,7 +833,7 @@ mod tests {
             &self,
             _scope: &crate::serve_fetch::Scope,
             _kind: crate::fetcher::fetch::FileKind,
-            _reference: &str,
+            _reference: Option<&str>,
             _max: u64,
         ) -> Result<(std::fs::File, Option<String>), crate::fetcher::fetch::FetcherError> {
             std::future::pending().await
@@ -865,7 +865,7 @@ mod tests {
         let mut handed = conn.connect().await.unwrap();
         let e = crate::idle::within(
             idle,
-            handed.get_file(crate::fetcher::fetch::FileKind::Manifest, "a", 1),
+            handed.get_file(crate::fetcher::fetch::FileKind::Manifest, Some("a"), 1),
         )
         .await
         .unwrap_err();

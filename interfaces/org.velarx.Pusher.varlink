@@ -29,9 +29,10 @@
 # CAPABILITIES.  A pusher announces no word: a word exists only where the
 # engine must do work, or choose what to send, before the call; a client
 # ignores the words it does not know.  The interface grows only so: a new
-# parameter or reply field is optional, and a value of an enum that the
-# receiver does not know is read as the most general one (other, unknown)
-# or ignored.
+# parameter or reply field is optional, a new method is answered
+# MethodNotFound by a pusher that does not have it (read as `unavailable`),
+# and a value of an enum that the receiver does not know is read as the most
+# general one (other, unknown) or ignored.
 #
 # DESCRIPTORS.  A descriptor is a field of type `int` (or `?int` when it may
 # be absent), named after what it is, whose value is its position among the

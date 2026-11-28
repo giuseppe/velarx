@@ -137,6 +137,9 @@ pub fn image_error(party: &str, e: CallError) -> ImageError {
         e @ CallError::Pusher(_) => {
             ImageError::transfer(party, FailureClass::Failed, e.to_string())
         }
+        e @ CallError::NoMethod => {
+            ImageError::transfer(party, FailureClass::Unavailable, e.to_string())
+        }
         e => ImageError::transfer(party, FailureClass::Transient, e.to_string()),
     }
 }

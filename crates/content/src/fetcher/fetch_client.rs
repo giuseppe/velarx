@@ -35,6 +35,10 @@ type Conn = Connection<zlink::tokio::unix::Stream>;
 pub enum CallError {
     #[error("the fetcher: {0}")]
     Io(#[from] io::Error),
+    /// The process has no such method of its interface: it does not have
+    /// what the method gives
+    #[error("the fetcher has no such method")]
+    NoMethod,
     #[error("the fetcher broke the protocol: {0}")]
     Protocol(String),
     #[error("the fetcher: {0}")]
@@ -49,6 +53,14 @@ pub(crate) fn zerr(e: zlink::Error) -> CallError {
     match e {
         zlink::Error::Io(e) => CallError::Io(e),
         zlink::Error::UnexpectedEof => CallError::Io(io::ErrorKind::UnexpectedEof.into()),
+        zlink::Error::VarlinkService(e)
+            if matches!(
+                e.inner(),
+                zlink::varlink_service::Error::MethodNotFound { .. }
+            ) =>
+        {
+            CallError::NoMethod
+        }
         e => CallError::Protocol(e.to_string()),
     }
 }
@@ -476,19 +488,20 @@ impl FetchConn {
         done(got).map(|_| ())
     }
 
-    /// The small file `kind` names, of `reference`, at most `max` bytes: the
-    /// sealed memory file of the reply, and its media type.
+    /// The small file `kind` names, of `reference` (none: what the source of
+    /// the scope names), at most `max` bytes: the sealed memory file of the
+    /// reply, and its media type.
     pub async fn get_file(
         &mut self,
         kind: FileKind,
-        reference: &str,
+        reference: Option<&str>,
         max: u64,
     ) -> Result<(File, Option<String>), CallError> {
         let (conn, busy) = self.begin().await?;
         let got = conn.get_file(kind, reference, max).await;
         busy.store(false, Ordering::Release);
         let (answer, fds) = done_fds(got)?;
-        Ok((file_at(fds, answer.file, reference)?, answer.media_type))
+        Ok((file_at(fds, answer.file, "the file")?, answer.media_type))
     }
 
     /// The blob, written by the fetcher into `dest` (a file of the engine,

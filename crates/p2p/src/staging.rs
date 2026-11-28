@@ -31,7 +31,7 @@ use velarx_content::fetcher::fetch::{
     Parts, SignedRecord, Urgency,
 };
 use velarx_content::serve_fetch::{
-    BlobFile, Described, FetchCall, LayerScope, Out, Scope, StagingFetcher,
+    named, BlobFile, Described, FetchCall, LayerScope, Out, Scope, StagingFetcher,
 };
 use velarx_content::stager::{self, name_of, LayerToc, Name, Unnamed};
 use velarx_storage::Toc;
@@ -608,9 +608,10 @@ impl StagingFetcher for PeerSource {
         &self,
         _scope: &Scope,
         kind: FileKind,
-        reference: &str,
+        reference: Option<&str>,
         max: u64,
     ) -> Result<(std::fs::File, Option<String>), FetcherError> {
+        let reference = named(reference)?;
         let mut one = One(None);
         match kind {
             FileKind::Manifest => {
@@ -650,6 +651,7 @@ impl StagingFetcher for PeerSource {
                     .await
                     .map_err(failed)?;
             }
+            FileKind::Unknown => return Err(FetcherError::unavailable("nobody has it")),
         }
         Ok((self.given(one, reference).await?, None))
     }

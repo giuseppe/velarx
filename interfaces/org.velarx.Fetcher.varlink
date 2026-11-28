@@ -96,7 +96,9 @@ type FileKind (
 	# The startup profile of an image
 	profile,
 	# The signatures of a manifest or a tag
-	signatures
+	signatures,
+	# (what a kind this side does not know is read as: `unavailable`)
+	unknown
 )
 
 # How much a request is waited for.  It orders a fetcher's work.
@@ -105,7 +107,8 @@ type Urgency (
 	background,
 	# A guess
 	ahead,
-	# A command waits for the image
+	# A command waits for the image (also what a value this side does not
+	# know is read as)
 	wait,
 	# A process of a container is blocked on it
 	on_demand
@@ -296,9 +299,10 @@ method Forget(layer: string) -> ()
 # `reference` names (a `repository:tag`, or a manifest digest), a
 # JSON array of records, `{"digest": "sha256:...", "signatures":
 # ["<base64 of a signature blob>", ...]}`, which the engine judges
-# itself.  What the fetcher has none of is `Failed` of class
-# `unavailable`.
-method GetFile(kind: FileKind, reference: string, max: int) -> (file: int, media_type: ?string)
+# itself.  `reference` absent: what the source of the scope names.
+# What the fetcher has none of, and a `kind` it does not know, is
+# `Failed` of class `unavailable`.
+method GetFile(kind: FileKind, reference: ?string, max: int) -> (file: int, media_type: ?string)
 
 # A blob, its bytes written into `file`, a file with no name the
 # engine made, open for writing, among the descriptors of the call:

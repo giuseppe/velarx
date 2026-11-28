@@ -43,6 +43,7 @@ fn fetcher_error(party: &str, e: CallError) -> ImageError {
     use crate::fetcher::fetch::FetcherError;
     let (class, reason) = match e {
         CallError::Fetcher(FetcherError::Failed { failure }) => (failure.class, failure.reason),
+        e @ CallError::NoMethod => (FailureClass::Unavailable, e.to_string()),
         e => (FailureClass::Transient, e.to_string()),
     };
     ImageError::transfer(party, class, reason)
@@ -2012,6 +2013,17 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// A fetcher that does not have the method of a call is a fetcher that
+    /// does not have what it gives: the walk goes to the next one.
+    #[test]
+    fn a_fetcher_without_the_method_is_unavailable() {
+        let e = fetcher_error("late", CallError::NoMethod);
+        assert!(matches!(
+            e,
+            ImageError::Transfer { failure, .. } if failure.class == FailureClass::Unavailable
+        ));
+    }
+
     /// A call whose future is dropped before its replies came (a pull that
     /// ends while one of its layers probes) leaves the connection usable:
     /// the next call reads and drops what was left, and is answered.
@@ -2021,7 +2033,11 @@ mod tests {
         let mut conn = FetchConn::new(f.connect().unwrap()).unwrap();
         conn.open(Scoping::bare(TEST_IDLE)).await.unwrap();
         // (dropped before any reply is read)
-        let call = conn.get_file(crate::fetcher::fetch::FileKind::Manifest, "latest", 100);
+        let call = conn.get_file(
+            crate::fetcher::fetch::FileKind::Manifest,
+            Some("latest"),
+            100,
+        );
         let polled = futures::FutureExt::now_or_never(Box::pin(call));
         assert!(polled.is_none(), "the reply came at once");
         let info = conn.get_info().await.unwrap();

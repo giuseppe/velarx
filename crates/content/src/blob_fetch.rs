@@ -91,27 +91,29 @@ impl<B: Blobs> StagingFetcher for BlobFetch<B> {
         self.blobs.opened(scope)
     }
 
-    /// The manifest: `""` is the one the location names; a digest is a blob
+    /// The manifest: none is the one the location names; a digest is a blob
     /// of the origin.  An origin has no other small file.
     async fn get_file(
         &self,
         scope: &Scope,
         kind: FileKind,
-        reference: &str,
+        reference: Option<&str>,
         max: u64,
     ) -> Result<(File, Option<String>), FetcherError> {
         if kind != FileKind::Manifest {
-            return Err(FetcherError::unavailable(format!("{reference}: not here")));
+            return Err(FetcherError::unavailable("not here"));
         }
-        let (blobs, scope, reference) = (self.blobs.clone(), scope.clone(), reference.to_string());
+        let (blobs, scope) = (self.blobs.clone(), scope.clone());
+        let reference = reference.map(str::to_string);
         let (bytes, media_type) = blocking(move || {
-            let (digest, media_type) = if reference.is_empty() {
-                blobs.resolve(&scope, max)?
-            } else {
-                let digest = reference
-                    .parse()
-                    .map_err(|_| FetcherError::unavailable(format!("{reference}: not here")))?;
-                (digest, None)
+            let (digest, media_type) = match reference {
+                None => blobs.resolve(&scope, max)?,
+                Some(reference) => {
+                    let digest = reference
+                        .parse()
+                        .map_err(|_| FetcherError::unavailable(format!("{reference}: not here")))?;
+                    (digest, None)
+                }
             };
             let (from, _) = blobs.open(&scope, &digest)?;
             let mut bytes = Vec::new();
@@ -211,7 +213,7 @@ mod tests {
         let settings = HelperSettings::of(&velarx_config::Config::default());
         let fetcher = BlobFetch::new("one", settings, One(data.clone()));
         let (file, media_type) = fetcher
-            .get_file(&scope(), FileKind::Manifest, "", 1 << 20)
+            .get_file(&scope(), FileKind::Manifest, None, 1 << 20)
             .await
             .unwrap();
         assert_eq!(
@@ -219,11 +221,18 @@ mod tests {
             (data.clone(), Some("text/plain"))
         );
         let (file, media_type) = fetcher
-            .get_file(&scope(), FileKind::Manifest, &digest.to_string(), 1 << 20)
+            .get_file(
+                &scope(),
+                FileKind::Manifest,
+                Some(&digest.to_string()),
+                1 << 20,
+            )
             .await
             .unwrap();
         assert_eq!((read(&file), media_type), (data.clone(), None));
-        let larger = fetcher.get_file(&scope(), FileKind::Manifest, "", 4).await;
+        let larger = fetcher
+            .get_file(&scope(), FileKind::Manifest, None, 4)
+            .await;
         assert!(matches!(
             larger.unwrap_err().failure(),
             Some(f) if f.class == FailureClass::Invalid

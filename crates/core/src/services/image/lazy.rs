@@ -120,7 +120,7 @@ impl ImageService {
                     ))
                     .await?;
                 link.conn
-                    .get_file(FileKind::Profile, &name, max_bytes)
+                    .get_file(FileKind::Profile, Some(&name), max_bytes)
                     .await
                     .map(|(file, _)| file)
             })

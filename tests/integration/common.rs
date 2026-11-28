@@ -1807,7 +1807,7 @@ pub async fn profile_from(socket: &std::path::Path, image: &str, max: u64) -> Op
     let (file, _) = conn
         .get_file(
             velarx_content::fetcher::fetch::FileKind::Profile,
-            image,
+            Some(image),
             max,
         )
         .await

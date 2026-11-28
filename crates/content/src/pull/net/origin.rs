@@ -96,6 +96,7 @@ pub fn image_error_of(party: &str, e: CallError) -> ImageError {
     let (class, reason) = match e {
         CallError::Fetcher(FetcherError::Failed { failure })
         | CallError::Registry(RegistryError::Failed { failure }) => (failure.class, failure.reason),
+        e @ CallError::NoMethod => (FailureClass::Unavailable, e.to_string()),
         e => (FailureClass::Transient, e.to_string()),
     };
     ImageError::transfer(party, class, reason)
@@ -104,6 +105,7 @@ pub fn image_error_of(party: &str, e: CallError) -> ImageError {
 /// Whether the registry says it does not have the item.
 fn absent(e: &CallError) -> bool {
     let failure = match e {
+        CallError::NoMethod => return true,
         CallError::Fetcher(FetcherError::Failed { failure })
         | CallError::Registry(RegistryError::Failed { failure }) => failure,
         _ => return false,
@@ -351,7 +353,7 @@ impl OriginNet {
         let mut slot = self.conn.lock().await;
         let conn = self.scoped(&mut slot).await?;
         let got = conn
-            .get_file(FileKind::Signatures, reference, SIGNATURES_MAX_BYTES)
+            .get_file(FileKind::Signatures, Some(reference), SIGNATURES_MAX_BYTES)
             .await
             .map(|(file, _)| file);
         let Some(file) = self.answered(&mut slot, got)? else {
@@ -393,11 +395,14 @@ impl OriginNet {
         got
     }
 
+    /// [`OriginNet::manifest_opt`] of the origin; no reference (`""`) is the
+    /// manifest the location of the scope names.
     async fn registry_manifest(&self, reference: &str) -> ImageResult<Option<(Bytes, Digest)>> {
         let mut slot = self.conn.lock().await;
         let conn = self.scoped(&mut slot).await?;
+        let named = (!reference.is_empty()).then_some(reference);
         let got = conn
-            .get_file(FileKind::Manifest, reference, MAX_MANIFEST_SIZE)
+            .get_file(FileKind::Manifest, named, MAX_MANIFEST_SIZE)
             .await;
         let Some((file, _)) = self.answered(&mut slot, got)? else {
             return Ok(None);
@@ -440,7 +445,7 @@ impl OriginNet {
         let mut slot = self.conn.lock().await;
         let conn = self.scoped(&mut slot).await?;
         let (file, _) = match conn
-            .get_file(FileKind::Manifest, "", MAX_MANIFEST_SIZE)
+            .get_file(FileKind::Manifest, None, MAX_MANIFEST_SIZE)
             .await
         {
             Ok(got) => got,
@@ -622,8 +627,11 @@ impl MetadataSources {
         for link in links.iter_mut() {
             let got = crate::idle::within(
                 link.idle,
-                link.conn
-                    .get_file(FileKind::Manifest, &digest.to_string(), MAX_MANIFEST_SIZE),
+                link.conn.get_file(
+                    FileKind::Manifest,
+                    Some(&digest.to_string()),
+                    MAX_MANIFEST_SIZE,
+                ),
             )
             .await;
             if let Some(bytes) =
@@ -646,7 +654,7 @@ impl MetadataSources {
             let got = crate::idle::within(
                 link.idle,
                 link.conn
-                    .get_file(FileKind::Signatures, reference, SIGNATURES_MAX_BYTES),
+                    .get_file(FileKind::Signatures, Some(reference), SIGNATURES_MAX_BYTES),
             )
             .await
             .map(|(file, _)| file);

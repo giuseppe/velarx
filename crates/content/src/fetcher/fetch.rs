@@ -34,18 +34,7 @@ pub const SIGNATURES_MAX_BYTES: u64 = 1 << 20;
 pub const CAPABILITIES: [&str; 3] = ["reuse", "handover", "table"];
 
 /// How much a request is waited for.  It orders a fetcher's work.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-    introspect::CustomType,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, introspect::CustomType)]
 #[serde(rename_all = "snake_case")]
 #[zlink(rename_all = "snake_case")]
 pub enum Urgency {
@@ -53,10 +42,22 @@ pub enum Urgency {
     Background = 0,
     /// A guess
     Ahead = 1,
-    /// A command waits for the image
+    /// A command waits for the image (also what a value this side does not
+    /// know is read as)
     Wait = 2,
     /// A process of a container is blocked on it
     OnDemand = 3,
+}
+
+impl<'de> Deserialize<'de> for Urgency {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "background" => Self::Background,
+            "ahead" => Self::Ahead,
+            "on_demand" => Self::OnDemand,
+            _ => Self::Wait,
+        })
+    }
 }
 
 impl TryFrom<u8> for Urgency {
@@ -276,6 +277,9 @@ pub enum FileKind {
     Profile,
     /// The signatures of a manifest or a tag
     Signatures,
+    /// (what a kind this side does not know is read as: `unavailable`)
+    #[serde(other)]
+    Unknown,
 }
 
 /// What `GetFile` answers: the file is in the sealed memory file `file` of
@@ -514,7 +518,7 @@ mod proxy {
         async fn get_file(
             &mut self,
             kind: FileKind,
-            reference: &str,
+            reference: Option<&str>,
             max: u64,
         ) -> zlink::Result<(Result<Answer, FetcherError>, Vec<OwnedFd>)>;
 

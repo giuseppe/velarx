@@ -122,13 +122,11 @@ impl StagingFetcher for Metadata {
         &self,
         _scope: &Scope,
         kind: FileKind,
-        reference: &str,
+        _reference: Option<&str>,
         _max: u64,
     ) -> Result<(std::fs::File, Option<String>), FetcherError> {
         if kind == FileKind::Profile {
-            return Err(FetcherError::unavailable(format!(
-                "{reference}: nobody has it"
-            )));
+            return Err(FetcherError::unavailable("nobody has it"));
         }
         Ok((sealed(&self.0)?, None))
     }

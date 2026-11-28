@@ -971,10 +971,11 @@ impl StagingFetcher for RegistryFetch {
         &self,
         scope: &Scope,
         kind: FileKind,
-        reference: &str,
+        reference: Option<&str>,
         max: u64,
     ) -> Result<(File, Option<String>), FetcherError> {
         let (pool, _) = self.pool(scope)?;
+        let reference = velarx_content::serve_fetch::named(reference)?;
         match kind {
             FileKind::Manifest => {
                 velarx_content::serve_registry::checked_reference(reference)
@@ -1000,7 +1001,7 @@ impl StagingFetcher for RegistryFetch {
                 })?;
                 Ok((sealed(&bytes)?, None))
             }
-            FileKind::Profile => Err(FetcherError::unavailable(format!(
+            FileKind::Profile | FileKind::Unknown => Err(FetcherError::unavailable(format!(
                 "{reference}: nobody has it"
             ))),
         }
@@ -1692,7 +1693,7 @@ mod tests {
         let digest = format!("sha256:{}", "ab".repeat(32));
         let reference = format!("registry.invalid/r/app:v1@{digest}");
         let (file, _) = fetch
-            .get_file(&scope, FileKind::Signatures, &reference, 1 << 20)
+            .get_file(&scope, FileKind::Signatures, Some(&reference), 1 << 20)
             .await
             .unwrap();
         let records: Vec<SignedRecord> = serde_json::from_slice(
@@ -1724,7 +1725,7 @@ mod tests {
             .get_file(
                 &scope,
                 FileKind::Signatures,
-                "registry.invalid/r/app:v1",
+                Some("registry.invalid/r/app:v1"),
                 1 << 20,
             )
             .await;

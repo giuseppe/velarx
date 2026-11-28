@@ -19,7 +19,9 @@ use crate::fetcher::fetch::{
     sealed, Blob, EventKind, Failure, FailureClass, FetchEvent as Event, FetcherError, FileKind,
     NotLazy, Parts, Probed, TocSource,
 };
-use crate::serve_fetch::{BlobFile, Described, FetchCall, LayerScope, Out, Scope, StagingFetcher};
+use crate::serve_fetch::{
+    named, BlobFile, Described, FetchCall, LayerScope, Out, Scope, StagingFetcher,
+};
 use crate::stager::{self, content_of, name_of, LayerToc, Unnamed};
 use async_trait::async_trait;
 use std::io::Read;
@@ -320,13 +322,13 @@ impl<I: Items + 'static> StagingFetcher for ItemFetch<I> {
         &self,
         _scope: &Scope,
         kind: FileKind,
-        reference: &str,
+        reference: Option<&str>,
         max: u64,
     ) -> Result<(std::fs::File, Option<String>), FetcherError> {
         if kind != FileKind::Profile {
-            return Err(FetcherError::unavailable(format!("{reference}: not here")));
+            return Err(FetcherError::unavailable("not here"));
         }
-        Ok((self.item_file(reference, None, max).await?, None))
+        Ok((self.item_file(named(reference)?, None, max).await?, None))
     }
 
     async fn fetch(

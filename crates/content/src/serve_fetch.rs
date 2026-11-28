@@ -324,20 +324,19 @@ pub trait StagingFetcher: Send + Sync + 'static {
         Ok(())
     }
 
-    /// The small file `kind` names, of `reference`, at most `max` bytes: the
-    /// manifest or index a tag or digest names (and its media type, when it
-    /// is known), the startup profile of an image, or the signatures of a
-    /// manifest or tag (a JSON array of [`SignedRecord`]).
+    /// The small file `kind` names, of `reference` (none: what the source of
+    /// the scope names), at most `max` bytes: the manifest or index a tag
+    /// or digest names (and its media type, when it is known), the startup
+    /// profile of an image, or the signatures of a manifest or tag (a JSON
+    /// array of [`SignedRecord`]).
     async fn get_file(
         &self,
         _scope: &Scope,
         _kind: FileKind,
-        reference: &str,
+        _reference: Option<&str>,
         _max: u64,
     ) -> Result<(File, Option<String>), FetcherError> {
-        Err(FetcherError::unavailable(format!(
-            "{reference}: nobody has it"
-        )))
+        Err(FetcherError::unavailable("nobody has it"))
     }
 
     /// The blob the descriptor names, written from the start of `file`
@@ -433,6 +432,11 @@ pub struct FetchEndpoint {
     runtime: tokio::runtime::Handle,
     state: Arc<Mutex<State>>,
     peer: Option<Arc<Peer>>,
+}
+
+/// The reference of a `GetFile` of a fetcher whose files are all named.
+pub fn named(reference: Option<&str>) -> Result<&str, FetcherError> {
+    reference.ok_or_else(|| bad("a reference is needed"))
 }
 
 fn bad(reason: &str) -> FetcherError {
@@ -1194,13 +1198,14 @@ mod service {
         /// `reference` names (a `repository:tag`, or a manifest digest), a
         /// JSON array of records, `{"digest": "sha256:...", "signatures":
         /// ["<base64 of a signature blob>", ...]}`, which the engine judges
-        /// itself.  What the fetcher has none of is `Failed` of class
-        /// `unavailable`.
+        /// itself.  `reference` absent: what the source of the scope names.
+        /// What the fetcher has none of, and a `kind` it does not know, is
+        /// `Failed` of class `unavailable`.
         #[zlink(return_fds)]
         pub async fn get_file(
             &self,
             kind: FileKind,
-            reference: String,
+            reference: Option<String>,
             max: u64,
         ) -> (Result<Answer, FetcherError>, Vec<OwnedFd>) {
             let scope = match self.scope() {
@@ -1213,7 +1218,7 @@ mod service {
             let api = self.api.clone();
             // (the asker went: what is being read is dropped with the call)
             let got = owned(&self.runtime, async move {
-                api.get_file(&scope, kind, &reference, max).await
+                api.get_file(&scope, kind, reference.as_deref(), max).await
             })
             .await
             .unwrap_or_else(|e| Err(stopped(e)));
@@ -2029,9 +2034,10 @@ pub fn pusher_definition() -> String {
          # CAPABILITIES.  A pusher announces no word: a word exists only where the\n\
          # engine must do work, or choose what to send, before the call; a client\n\
          # ignores the words it does not know.  The interface grows only so: a new\n\
-         # parameter or reply field is optional, and a value of an enum that the\n\
-         # receiver does not know is read as the most general one (other, unknown)\n\
-         # or ignored.\n\
+         # parameter or reply field is optional, a new method is answered\n\
+         # MethodNotFound by a pusher that does not have it (read as `unavailable`),\n\
+         # and a value of an enum that the receiver does not know is read as the most\n\
+         # general one (other, unknown) or ignored.\n\
          #\n\
          # DESCRIPTORS.  A descriptor is a field of type `int` (or `?int` when it may\n\
          # be absent), named after what it is, whose value is its position among the\n\
@@ -2587,13 +2593,95 @@ mod tests {
         }));
         // an item: nobody has it
         for kind in [FileKind::Manifest, FileKind::Profile, FileKind::Signatures] {
-            let got = e.get_file(kind, "latest".into(), 100).await;
+            let got = e.get_file(kind, Some("latest".into()), 100).await;
             assert!(matches!(got.0, Err(FetcherError::Failed { .. })));
         }
         let got = e.get_blob(vec![dir()], blob("sha256:aa"), 0).await;
         assert!(matches!(got, Err(FetcherError::Failed { .. })));
         // (an item is asked for with a maximum)
-        let got = e.get_file(FileKind::Manifest, "latest".into(), 0).await;
+        let got = e
+            .get_file(FileKind::Manifest, Some("latest".into()), 0)
+            .await;
         assert!(matches!(got.0, Err(FetcherError::InvalidArgument { .. })));
+    }
+
+    /// What a client of a later version sends: a method, a parameter, a kind
+    /// of file and an urgency this fetcher does not have.
+    #[zlink::proxy("org.velarx.Fetcher")]
+    trait Later {
+        async fn teleport(&mut self) -> zlink::Result<Result<Ack, FetcherError>>;
+
+        async fn forget(
+            &mut self,
+            layer: &str,
+            teleport: Option<bool>,
+        ) -> zlink::Result<Result<Ack, FetcherError>>;
+
+        #[zlink(return_fds)]
+        async fn get_file(
+            &mut self,
+            kind: &str,
+            reference: Option<&str>,
+            max: u64,
+        ) -> zlink::Result<(Result<Answer, FetcherError>, Vec<OwnedFd>)>;
+    }
+
+    /// The first rule of the interface: what a fetcher does not know is
+    /// answered, and read, as `unavailable`.  The service of zlink answers
+    /// `MethodNotFound` for a method it does not have, ignores a parameter
+    /// it does not have, and the kind of a file and the urgency it does not
+    /// know are read as `unknown` and `wait`.
+    #[tokio::test]
+    async fn what_a_fetcher_does_not_know_is_unavailable() {
+        use crate::fetcher::fetch_client::{CallError, FetchConn};
+        use std::sync::atomic::Ordering;
+        let local = LocalFetcher::start(Arc::new(Last), activation::Limits::default()).unwrap();
+        let mut conn = FetchConn::new(local.connect().unwrap()).unwrap();
+        conn.open(crate::fetcher::fetch_client::Scoping::bare(
+            std::time::Duration::from_secs(60),
+        ))
+        .await
+        .unwrap();
+        // a method it does not have
+        let (call, busy) = conn.begin().await.unwrap();
+        let got = Later::teleport(call).await;
+        busy.store(false, Ordering::Release);
+        let got = got.expect_err("an unknown method is an error of the service");
+        assert!(matches!(
+            crate::fetcher::fetch_client::zerr(got),
+            CallError::NoMethod
+        ));
+        // a parameter it does not have is ignored (the call goes on)
+        let (call, busy) = conn.begin().await.unwrap();
+        let got = Later::forget(call, "sha256:aa", Some(true)).await;
+        busy.store(false, Ordering::Release);
+        assert!(matches!(
+            got.unwrap(),
+            Err(FetcherError::InvalidArgument { .. })
+        ));
+        // a kind of file it does not have is nobody's
+        let (call, busy) = conn.begin().await.unwrap();
+        let got = Later::get_file(call, "referrers", Some("sha256:aa"), 100).await;
+        busy.store(false, Ordering::Release);
+        let (got, _) = got.unwrap();
+        assert!(matches!(
+            got,
+            Err(FetcherError::Failed { failure }) if failure.class == FailureClass::Unavailable
+        ));
+        // (and an urgency it does not have is the one of a command that
+        // waits; those it has are themselves)
+        let urgency = |word: &str| serde_json::from_str::<Urgency>(&format!("\"{word}\"")).unwrap();
+        assert_eq!(urgency("later"), Urgency::Wait);
+        for u in [
+            Urgency::Background,
+            Urgency::Ahead,
+            Urgency::Wait,
+            Urgency::OnDemand,
+        ] {
+            assert_eq!(
+                urgency(serde_json::to_value(u).unwrap().as_str().unwrap()),
+                u
+            );
+        }
     }
 }
