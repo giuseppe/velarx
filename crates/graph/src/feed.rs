@@ -62,7 +62,6 @@ use velarx_content::pull::sink::{FilesSink, Finished, Sink};
 pub use velarx_content::pull::LayerDone;
 use velarx_content::pull::{self, Have, ImageBudget, Limits, PullCtx};
 use velarx_db::Database;
-use velarx_fuse::layer_erofs::LayerImage;
 use velarx_storage::{FileStore, Toc, VerityMode};
 use velarx_types::digest::{Algorithm, Digest};
 use velarx_types::{ImageError, ImageResult, LayerKey, OciDescriptor};
@@ -380,7 +379,45 @@ pub struct Identities {
     /// The EROFS image of a layer, as the identity digests it: a driver that
     /// keeps the images writes these, never building them: the engine made
     /// one for every layer it pulled.
-    pub images: HashMap<LayerKey, LayerImage>,
+    pub images: HashMap<LayerKey, MadeImage>,
+}
+
+/// The EROFS image of a layer the engine made, for the driver to write.
+pub struct MadeImage {
+    pub image: ImageBytes,
+    /// Its stubs, by fs-verity digest (`erofs_tree::write_index`).
+    pub index: Vec<u8>,
+}
+
+/// Where the bytes of an image are: in memory (an image of the table of
+/// contents alone), or in the file with no name it was written to once (an
+/// image that holds files, as big as they are).
+pub enum ImageBytes {
+    Memory(Vec<u8>),
+    File(std::fs::File),
+}
+
+impl ImageBytes {
+    /// Write the image to `to`, from its start.
+    pub fn write_to(&self, mut to: &std::fs::File) -> std::io::Result<()> {
+        use std::io::Write;
+        match self {
+            ImageBytes::Memory(bytes) => to.write_all(bytes),
+            ImageBytes::File(file) => {
+                let len = file.metadata()?.len();
+                velarx_storage::copy_region(file, 0, to, 0, len, || Ok(()))
+            }
+        }
+    }
+}
+
+impl From<velarx_fuse::layer_erofs::LayerImage> for MadeImage {
+    fn from(made: velarx_fuse::layer_erofs::LayerImage) -> Self {
+        MadeImage {
+            image: ImageBytes::Memory(made.image),
+            index: made.index,
+        }
+    }
 }
 
 /// The engine's check of a pull, called by the driver after every layer is
@@ -393,7 +430,7 @@ pub struct Identities {
 pub type Settled = Box<
     dyn FnOnce(
             &mut Vec<LayerDone>,
-            &dyn Fn(&str) -> Option<std::path::PathBuf>,
+            &(dyn Fn(&str) -> Option<std::path::PathBuf> + Sync),
         ) -> ImageResult<Settlement>
         + Send,
 >;
@@ -414,6 +451,15 @@ impl CheckId {
     }
 }
 
+/// How the EROFS image of a layer was made as for the files it holds
+/// itself: the threshold and the extent of each file, which the engine
+/// records with the image (`layers.inline`, `inlined_files`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Inlining {
+    pub threshold: i64,
+    pub files: Vec<velarx_db::InlinedFile>,
+}
+
 /// What the engine's check concluded of the image.
 pub struct Checked {
     /// The key of each layer of the image (a layer whose table of contents
@@ -426,6 +472,8 @@ pub struct Checked {
     /// The identity of each layer pulled, as the engine made it: what the
     /// driver records is checked against it.
     pub ours: HashMap<LayerKey, LayerArtifact>,
+    /// How each of those images holds files itself.
+    pub inlining: HashMap<LayerKey, Inlining>,
 }
 
 /// What the engine's check concluded, sealed with the id of the check.  The
@@ -1456,6 +1504,7 @@ mod tests {
             merged_id: None,
             stored_erofs: HashMap::new(),
             ours: HashMap::new(),
+            inlining: HashMap::new(),
         };
         let (a, b) = (CheckId::fresh(), CheckId::fresh());
         let opened = Verdict::sealed(&a, checked()).open(&a).expect("its own");

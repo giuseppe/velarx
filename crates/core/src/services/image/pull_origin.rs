@@ -299,6 +299,7 @@ impl ImageService {
                         digest_names: Vec::new(),
                         lazy: false,
                         sources: options.sources.clone(),
+                        inline_threshold: options.inline_threshold,
                         reach: Default::default(),
                         seal: false,
                         states: false,

@@ -574,7 +574,7 @@ fn engine_identities(pulled: &[LayerDone]) -> ImageResult<Identities> {
                 owners: id.owners,
             },
         );
-        ids.images.insert(l.key, image);
+        ids.images.insert(l.key, image.into());
     }
     Ok(ids)
 }
@@ -588,6 +588,7 @@ fn checked_of(ids: &Identities, pulled: &[LayerDone]) -> Checked {
         merged_id: None,
         stored_erofs: HashMap::new(),
         ours: ids.artifacts.clone(),
+        inlining: HashMap::new(),
     }
 }
 

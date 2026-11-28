@@ -813,6 +813,11 @@ pub struct PullSpec {
     /// absent: `[pull] sources`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<Vec<String>>,
+    /// The regular files of this many bytes or less that the layers this pull
+    /// adds hold in their EROFS image (-1: every file, 0: none), as
+    /// `--inline-threshold` says; absent: `[storage] inline_threshold`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_threshold: Option<i64>,
 }
 
 /// A layer of an image that cannot be pulled lazily, and why: `no_toc`,

@@ -209,6 +209,9 @@ pub(super) struct EngineOptions {
     pub reach: LayerReach,
     /// The platform asked for; by default the one of the host.
     pub platform: Option<Platform>,
+    /// What the layers of the pull are made with, as
+    /// [`PullOptions::inline_threshold`] says
+    pub inline_threshold: Option<i64>,
 }
 
 /// An image to install: its manifest and configuration as they were
@@ -235,6 +238,9 @@ pub(super) struct Incoming {
     /// The fetchers of a pull from a registry, as
     /// [`EngineOptions::sources`] says
     pub sources: Option<Vec<String>>,
+    /// What its layers are made with: the pull's own, else the
+    /// configured one ([`ImageService::inline_threshold`])
+    pub inline_threshold: Option<i64>,
     /// How the registry is reached, to fetch files later.
     pub reach: LayerReach,
     /// An image made here: the manifest gets the digest of its merged
@@ -907,7 +913,7 @@ impl ImageService {
         let key = LayerKey::expected(layer);
         let identity = tokio::task::spawn_blocking({
             let toc = toc.clone();
-            move || storage::identity_of(&key, &toc)
+            move || storage::identity_of_table(&key, &toc)
         });
         let files: Vec<(String, u64)> = toc
             .entries
@@ -1125,6 +1131,7 @@ impl ImageService {
             reach,
             ref platform,
             ref sources,
+            inline_threshold,
         } = *options;
         // (an option the driver lacks is refused before anything is fetched)
         self.storage
@@ -1301,6 +1308,7 @@ impl ImageService {
             digest_names,
             lazy,
             sources: sources.clone(),
+            inline_threshold,
             reach,
             seal: false,
             states: false,
@@ -1351,6 +1359,7 @@ impl ImageService {
             digest_names,
             lazy,
             sources,
+            inline_threshold,
             reach,
             seal,
             states,
@@ -1361,6 +1370,7 @@ impl ImageService {
             recorded,
         } = incoming;
         let started_at = chrono::Utc::now().to_rfc3339();
+        let inline = inline_threshold.unwrap_or(self.inline_threshold);
         // (an image made here is named by the digest of its configuration,
         // which holds the diff ids of its layers whatever compression the
         // push gives them; one pulled by its manifest's)
@@ -1620,6 +1630,7 @@ impl ImageService {
             expected: &expected,
             seal,
             states,
+            inline,
             progress: &progress_tx,
             made: made_early,
         });
@@ -1644,6 +1655,7 @@ impl ImageService {
             merged_id,
             stored_erofs,
             ours: made,
+            inlining,
         } = opened(&check, verdict, &driven_layers, &recorded)?;
         let done_layers: HashMap<LayerKey, LayerDone> =
             driven_layers.into_iter().map(|p| (p.key, p)).collect();
@@ -1659,6 +1671,12 @@ impl ImageService {
                     .map(|m| m.image_digest.clone())
                     .or_else(|| stored_erofs.get(k).cloned().flatten());
                 if let Some(erofs) = erofs {
+                    let inline = match inlining.get(k) {
+                        Some(i) => i.threshold,
+                        None => self.db.get_layer(k).await?.inline,
+                    };
+                    let toc = done_layers.get(k).map(|d| d.toc.clone());
+                    let erofs = self.stated_erofs(k, erofs, inline, toc).await?;
                     restated |= seal::state_layer(l, &erofs);
                 }
             }
@@ -1698,7 +1716,7 @@ impl ImageService {
             .filter(|d| !d.lazy)
             .map(|d| {
                 layer_commit(d, registry_ref.as_deref())
-                    .map(|c| super::storage::with_image(c, &made, sealed))
+                    .map(|c| super::storage::with_image(c, &made, &inlining, sealed))
             })
             .collect::<ImageResult<Vec<velarx_db::LayerCommit>>>()?;
         debug!("Rows prepared after {:?}", start.elapsed());
@@ -1931,6 +1949,9 @@ pub(super) struct Settling<'a> {
     pub seal: bool,
     /// The pull states the digests of the EROFS images in the manifest.
     pub states: bool,
+    /// The threshold the images of the layers are made with, unless a layer
+    /// of the store is made again: that one keeps its own.
+    pub inline: i64,
     pub progress: &'a mpsc::Sender<TransferProgress>,
     /// The identities and images already made, by layer (the lazy layers:
     /// made as their tables were checked); the others are made when the
@@ -1951,9 +1972,18 @@ struct Accepted {
 struct MadeOfTable {
     key: LayerKey,
     artifact: crate::storage_driver::LayerArtifact,
-    image: velarx_fuse::layer_erofs::LayerImage,
+    image: velarx_graph::MadeImage,
     files: Vec<(String, u64)>,
     stored_conflict: Option<(String, u64, u64)>,
+}
+
+/// What the image of a layer is made with: what its record says when it
+/// has an image already (a layer fetched again is made as it was, the first
+/// threshold wins and nothing is said), else `asked`.
+fn threshold_of(record: Option<&velarx_db::LayerRecord>, asked: i64) -> i64 {
+    record
+        .filter(|r| r.erofs.is_some())
+        .map_or(asked, |r| r.inline)
 }
 
 /// The identity of layers and the EROFS image it was made from.
@@ -1961,7 +1991,7 @@ pub(super) type Made = HashMap<
     LayerKey,
     (
         crate::storage_driver::LayerArtifact,
-        velarx_fuse::layer_erofs::LayerImage,
+        velarx_graph::MadeImage,
     ),
 >;
 
@@ -1979,8 +2009,9 @@ impl ImageService {
         let settled: Settled = {
             let check = check.clone();
             let (manifest, expected) = (s.manifest.clone(), s.expected.to_vec());
-            let (seal, states) = (s.seal, s.states);
+            let (seal, states, inline) = (s.seal, s.states, s.inline);
             let (db, mode) = (self.db.clone(), self.composefs_digests());
+            let staging = self.staging_dir.clone();
             let (progress_tx, handle) = (s.progress.clone(), tokio::runtime::Handle::current());
             let manifest_alg = s.manifest_digest.alg();
             let mut early = s.made;
@@ -2033,19 +2064,30 @@ impl ImageService {
                     }
                 }
                 let (mut ours, mut images) = (HashMap::new(), HashMap::new());
-                let mut tocs: Vec<(&LayerKey, &velarx_storage::Toc)> = Vec::new();
+                let mut tocs: Vec<(&LayerKey, &velarx_storage::Toc, i64)> = Vec::new();
                 for p in pulled.iter() {
                     match early.remove(&p.key) {
                         Some((artifact, image)) => {
                             ours.insert(p.key, artifact);
                             images.insert(p.key, image);
                         }
-                        None => tocs.push((&p.key, &*p.toc)),
+                        None => {
+                            let own = threshold_of(stored(&p.key).ok().as_ref(), inline);
+                            tocs.push((&p.key, &*p.toc, own))
+                        }
                     }
                 }
-                let (artifacts, made) = storage::identities_of(&tocs)?;
-                ours.extend(artifacts);
-                images.extend(made);
+                // (the content of a file an image holds: the staged file, or
+                // the store's, by its fs-verity digest)
+                let open = |d: &Digest| {
+                    let path = objects(&d.to_string()).ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "not in the pull")
+                    })?;
+                    std::fs::File::open(path)
+                };
+                let (made, inlined) = storage::identities_of(&tocs, &open, &staging)?;
+                ours.extend(made.artifacts);
+                images.extend(made.images);
                 if !states {
                     let theirs: Vec<Option<String>> = layer_keys
                         .iter()
@@ -2069,6 +2111,7 @@ impl ImageService {
                             merged_id,
                             stored_erofs,
                             ours: ours.clone(),
+                            inlining: inlined,
                         },
                     ),
                     identities: Identities {
@@ -2175,6 +2218,7 @@ mod opened_tests {
             merged_id: None,
             stored_erofs: HashMap::new(),
             ours: HashMap::new(),
+            inlining: HashMap::new(),
         }
     }
 
@@ -2418,6 +2462,62 @@ mod stored_tests {
             velarx_storage::VerityMode::Off,
         )
         .unwrap()
+    }
+
+    /// The first threshold a layer is made with wins, silently: a layer with
+    /// an image keeps its record's, one without takes the pull's.
+    #[test]
+    fn a_layer_with_an_image_keeps_the_threshold_it_was_made_with() {
+        let mut record = commit(1, "{}", b"ts").record;
+        record.inline = 64;
+        assert_eq!(threshold_of(None, 4096), 4096);
+        // (no image recorded: nothing was made with 64)
+        assert_eq!(threshold_of(Some(&record), 4096), 4096);
+        record.erofs = Some("sha256:a".into());
+        assert_eq!(threshold_of(Some(&record), 4096), 64);
+        record.inline = 0;
+        assert_eq!(threshold_of(Some(&record), -1), 0);
+    }
+
+    /// The files the image of a layer holds are no objects of the layer:
+    /// its record says the threshold and the extents, and its files and
+    /// references leave them out.
+    #[test]
+    fn the_files_an_image_holds_are_not_the_objects_of_its_layer() {
+        let file = |n: u8| velarx_db::FileRecord {
+            digest: format!("fsverity-sha256-12:{}", format!("{n:02x}").repeat(32)),
+            size: 3,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            checked: false,
+        };
+        let mut c = commit(1, "{}", b"ts");
+        c.files = vec![file(1), file(2)];
+        c.refs = c.files.iter().map(|f| (f.digest.clone(), 1)).collect();
+        let key = c.record.key;
+        let held = velarx_db::InlinedFile {
+            digest: file(1).digest,
+            offset: 4096,
+            size: 3,
+        };
+        let inlining = HashMap::from([(
+            key,
+            velarx_graph::Inlining {
+                threshold: 64,
+                files: vec![held.clone()],
+            },
+        )]);
+        let made = HashMap::new();
+        let c = super::storage::with_image(c, &made, &inlining, true);
+        assert_eq!(c.record.inline, 64);
+        assert_eq!(c.inlined, [held]);
+        assert_eq!(
+            c.files.iter().map(|f| &f.digest).collect::<Vec<_>>(),
+            [&file(2).digest]
+        );
+        assert_eq!(c.refs, [(file(2).digest, 1)]);
+        // (a layer the engine made no image for is as it was)
+        let c = super::storage::with_image(commit(2, "{}", b"ts"), &made, &inlining, true);
+        assert_eq!(c.record.inline, 0);
     }
 }
 

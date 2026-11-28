@@ -1248,7 +1248,8 @@ async fn build_core(config: Arc<Config>, config_path: &Path, role: &Role) -> any
     )
     .with_composefs(&config.storage.composefs)
     .with_composefs_digests(config.storage.composefs_digests)
-    .with_verity_chain(config.storage.verity_chain);
+    .with_verity_chain(config.storage.verity_chain)
+    .with_inline_threshold(config.storage.inline_threshold);
     // The fetchers of the pulls but the registry fetcher
     image_service = image_service.with_fetchers(config.sources.external.clone());
     // a lazy pull outlives the command that made it: it is the engine

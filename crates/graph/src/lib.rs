@@ -117,9 +117,9 @@ pub use blocking::blocking;
 pub use cpview::StoppedView;
 pub use feed::{
     is_pull_id, new_pull_id, prove_by_read_back, prove_with, to_fetch, CheckId, Checked,
-    ContentFeed, FeedLayer, FilesIncoming, Identities, InProcess, Incoming, LayerDone, LayerIndex,
-    LocalContent, PullFeed, Pulled, SessionIncoming, Settled, Settlement, StagedFeed, StoreContent,
-    Verdict, Wanted,
+    ContentFeed, FeedLayer, FilesIncoming, Identities, ImageBytes, InProcess, Incoming, Inlining,
+    LayerDone, LayerIndex, LocalContent, MadeImage, PullFeed, Pulled, SessionIncoming, Settled,
+    Settlement, StagedFeed, StoreContent, Verdict, Wanted,
 };
 pub use imagecopy::TreeSource;
 pub use prefs::Prefs;

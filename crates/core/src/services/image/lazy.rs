@@ -564,6 +564,7 @@ impl ImageService {
             expected: keys,
             seal: false,
             states: false,
+            inline: 0,
             progress: &progress,
             made: Default::default(),
         });
@@ -606,6 +607,7 @@ impl ImageService {
             let mut commit = super::storage::with_image(
                 layer_commit(&pulled, layer.meta.registry_ref.as_deref())?,
                 &checked.ours,
+                &checked.inlining,
                 self.layers_sealed_now(),
             );
             (commit.record.blob, commit.record.size) =

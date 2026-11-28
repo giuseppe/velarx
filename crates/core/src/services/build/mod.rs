@@ -2061,6 +2061,7 @@ impl<'a> Build<'a> {
                         platform: platform.map(str::to_string),
                         access: a.clone(),
                         sources: None,
+                        inline_threshold: None,
                     };
                     let remote = self
                         .svc
@@ -2101,6 +2102,7 @@ impl<'a> Build<'a> {
             platform: platform.map(str::to_string),
             access,
             sources: None,
+            inline_threshold: None,
         };
         // `--retry` (podman sends 3 by default)
         let pulled = self
@@ -2898,6 +2900,7 @@ impl<'a> Build<'a> {
                 platform: self.platform.as_ref().map(ToString::to_string),
                 access,
                 sources: None,
+                inline_threshold: None,
             };
             let (tx, forwarded) = self.blobs();
             let pulled = self

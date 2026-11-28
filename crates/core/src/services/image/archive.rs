@@ -235,6 +235,7 @@ impl ImageService {
             digest_names: Vec::new(),
             lazy: false,
             sources: None,
+            inline_threshold: None,
             reach: Default::default(),
             seal: false,
             states: true,

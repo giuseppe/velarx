@@ -476,7 +476,8 @@ impl CheckService {
                 .iter()
                 .filter(|e| e.entry_type == TocEntryType::Reg)
             {
-                if e.size == 0 {
+                // (an empty file has no object, nor one its image holds)
+                if e.size == 0 || velarx_types::holds_inline(layer.inline, e.size) {
                     continue;
                 }
                 let Some(d) = &e.verity() else {

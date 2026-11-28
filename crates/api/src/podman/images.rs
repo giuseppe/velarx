@@ -691,6 +691,7 @@ async fn do_pull(call: Call, reference: String, compat: bool) -> ApiResult {
         tls_verify,
         lazy: false,
         sources: None,
+        inline_threshold: None,
     };
     let format = if compat {
         PullFormat::Docker

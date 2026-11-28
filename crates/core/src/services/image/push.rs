@@ -801,12 +801,13 @@ impl ImageService {
             // without one is a store to repair, not a manifest without it)
             let mut erofs = Vec::with_capacity(manifest.layers.len());
             for r in &records {
-                erofs.push(r.erofs.clone().ok_or_else(|| {
+                let recorded = r.erofs.clone().ok_or_else(|| {
                     ImageError::Storage(format!(
                         "the layer {} has no EROFS image recorded: `velarx system check --repair` makes it",
                         r.key
                     ))
-                })?);
+                })?;
+                erofs.push(self.stated_erofs(&r.key, recorded, r.inline, None).await?);
             }
             let rebuilt = OciManifest {
                 schema_version: 2,

@@ -45,6 +45,7 @@ use velarx_fuse::composefs::{self as cfs};
 use velarx_fuse::plan::{MountFd, RootfsPlan};
 use velarx_fuse::view::{ImageTree, ImageView};
 use velarx_graph::objects::{open_dir, problem, sweep};
+use velarx_graph::MadeImage;
 use velarx_storage::{FileStore, Toc, VerityMode};
 use velarx_types::digest::{Algorithm, Digest};
 use velarx_types::{ImageError, OciManifest};
@@ -381,6 +382,16 @@ impl<'a> Durable<'a> {
         verity: Option<Algorithm>,
     ) -> std::io::Result<()> {
         use std::io::Write;
+        self.replace_with(path, verity, |mut to| to.write_all(contents))
+    }
+
+    /// [`Durable::replace`] with what `write` writes to the file.
+    fn replace_with(
+        &mut self,
+        path: &Path,
+        verity: Option<Algorithm>,
+        write: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let dir = path
             .parent()
@@ -388,8 +399,8 @@ impl<'a> Durable<'a> {
         std::fs::create_dir_all(dir)?;
         // (locked until it has its name, which is how the check tells it
         // from a leftover)
-        let (mut tmp, lock) = velarx_storage::create_locked(dir, ".tmp", 0o600)?;
-        tmp.write_all(contents)?;
+        let (tmp, lock) = velarx_storage::create_locked(dir, ".tmp", 0o600)?;
+        write(tmp.as_file())?;
         // (closed for writing, and writable by its owner: what enabling
         // fs-verity needs)
         let tmp = tmp.into_temp_path();
@@ -442,8 +453,9 @@ impl<'a> Durable<'a> {
     }
 }
 
-/// The images of layers made, not yet in the store.
-struct Built(Vec<(LayerKey, velarx_fuse::layer_erofs::LayerImage, String)>);
+/// The images of layers made, not yet in the store, with what is recorded
+/// of each.
+struct Built(Vec<(LayerKey, MadeImage, LayerArtifact)>);
 
 impl Built {
     /// The images of the layers `keys` apart from the others.
@@ -456,7 +468,7 @@ impl Built {
     fn digests(&self) -> HashMap<LayerKey, String> {
         self.0
             .iter()
-            .map(|(layer, _, erofs)| (*layer, erofs.clone()))
+            .map(|(layer, _, made)| (*layer, made.image_digest.clone()))
             .collect()
     }
 }
@@ -489,11 +501,14 @@ fn build_layer_images(layers: &[(LayerKey, &velarx_storage::Toc)]) -> std::io::R
         .map(|b| {
             let (digest, image) = b?;
             // (in the algorithm of the digests of the layer: its key)
-            let erofs = image
+            let id = image
                 .identity(digest.digest().alg())
-                .map_err(std::io::Error::other)?
-                .erofs;
-            Ok((digest, image, erofs))
+                .map_err(std::io::Error::other)?;
+            let made = LayerArtifact {
+                image_digest: id.erofs,
+                owners: id.owners,
+            };
+            Ok((digest, image.into(), made))
         })
         .collect::<std::io::Result<_>>()
         .map(Built)
@@ -524,24 +539,18 @@ fn write_layer_images_in(
     ))
     .map_err(std::io::Error::other)?;
     let mut out = HashMap::new();
-    for (digest, image, erofs) in built.0 {
+    for (digest, image, made) in built.0 {
         durable.replace(
             &cfs::layer_index_path(objects, &digest.file_stem()),
             &image.index,
             None,
         )?;
-        durable.replace(
+        durable.replace_with(
             &cfs::layer_image_path(objects, &digest.file_stem()),
-            &image.image,
             Some(digest.digest().alg()),
+            |to| image.image.write_to(to),
         )?;
-        out.insert(
-            digest,
-            LayerArtifact {
-                image_digest: erofs,
-                owners: image.owners_json().map_err(std::io::Error::other)?,
-            },
-        );
+        out.insert(digest, made);
     }
     durable.commit()?;
     Ok(out)
@@ -1664,17 +1673,10 @@ impl StorageDriver for ComposefsDriver {
                 }
                 let mut built = Built(Vec::new());
                 for (key, image) in std::mem::take(&mut ids.images) {
-                    let erofs = ids
-                        .artifacts
-                        .get(&key)
-                        .map(|a| a.image_digest.clone())
-                        .ok_or_else(|| {
-                            DriverError::storage(
-                                NAME,
-                                format!("no identity was made for layer {key}"),
-                            )
-                        })?;
-                    built.0.push((key, image, erofs));
+                    let made = ids.artifacts.get(&key).cloned().ok_or_else(|| {
+                        DriverError::storage(NAME, format!("no identity was made for layer {key}"))
+                    })?;
+                    built.0.push((key, image, made));
                 }
                 // (the leases of all the layers are held while each part is
                 // written: room for all of them, before the first part)
@@ -1862,13 +1864,16 @@ impl StorageDriver for ComposefsDriver {
         let mut tocs = Vec::with_capacity(layers.len());
         for l in layers {
             // (a table that cannot be read is no table: the layer's problems
-            // say so)
-            tocs.push(
-                velarx_content::pull::stored::stored_toc(&self.db, &l.key)
+            // say so; the image of a layer that holds files is not the one
+            // of its table alone, there is none to compare it with)
+            let toc = match l.inline {
+                0 => velarx_content::pull::stored::stored_toc(&self.db, &l.key)
                     .await
                     .ok()
                     .flatten(),
-            );
+                _ => None,
+            };
+            tocs.push(toc);
         }
         let mut dirs = self.objects_dirs();
         // (the images of the layers of a pull in progress are in the

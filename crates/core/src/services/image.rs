@@ -93,6 +93,9 @@ pub struct PullOptions {
     /// The list of fetchers of this pull (`--sources`), the head first;
     /// none: `[pull] sources`
     pub sources: Option<Vec<String>>,
+    /// `--inline-threshold`: what the layers this pull adds are made with
+    /// (`[storage] inline_threshold`); none: that
+    pub inline_threshold: Option<i64>,
 }
 
 impl Default for PullOptions {
@@ -102,6 +105,7 @@ impl Default for PullOptions {
             platform: None,
             access: Default::default(),
             sources: None,
+            inline_threshold: None,
         }
     }
 }
@@ -222,6 +226,9 @@ pub struct ImageService {
     composefs_mode: Option<String>,
     /// `[storage] verity_chain`.
     verity_chain: velarx_config::VerityChain,
+    /// `[storage] inline_threshold`: what the layers made here are made
+    /// with unless a pull says another
+    inline_threshold: i64,
     pull_config: velarx_config::PullConfig,
     push_config: velarx_config::PushConfig,
     /// `[[transports]]`: the processes that are the origin of a scheme
@@ -406,6 +413,7 @@ impl ImageService {
             storage_options,
             composefs_mode: None,
             verity_chain: velarx_config::VerityChain::Auto,
+            inline_threshold: 0,
             pull_config: velarx_config::PullConfig::default(),
             push_config: velarx_config::PushConfig::default(),
             transports: Arc::default(),
@@ -510,6 +518,12 @@ impl ImageService {
     pub fn with_composefs_digests(mut self, mode: velarx_config::ComposefsDigests) -> Self {
         self.storage_options.digests = mode;
         self.remake_storage();
+        self
+    }
+
+    /// `[storage] inline_threshold`.
+    pub fn with_inline_threshold(mut self, threshold: i64) -> Self {
+        self.inline_threshold = threshold;
         self
     }
 
@@ -694,6 +708,7 @@ impl ImageService {
                 certs: options.access.certs.is_some(),
             },
             platform,
+            inline_threshold: options.inline_threshold,
         };
         // A short name can mean several images: they are tried in order.
         let candidates = self.candidates(reference)?;

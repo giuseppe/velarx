@@ -9,17 +9,31 @@ use crate::storage_driver::{LayerArtifact, MountRequest, MountsRequest, Planned}
 use velarx_config::ComposefsDigests;
 use velarx_content::pull::stored::{stored_toc, stored_tocs};
 use velarx_db::{LayerKey, LayerRecord};
+use velarx_fuse::layer_erofs::Inline;
+use velarx_graph::{Identities, ImageBytes, Inlining, MadeImage};
 
-/// The commit of a layer with the record of what the driver made of it.
+/// The commit of a layer with the record of what the driver made of it:
+/// its image and the files the image holds itself, which are no objects of
+/// the layer.
 pub(super) fn with_image(
     mut commit: velarx_db::LayerCommit,
     made: &HashMap<LayerKey, LayerArtifact>,
+    inlining: &HashMap<LayerKey, Inlining>,
     sealed: bool,
 ) -> velarx_db::LayerCommit {
-    if let Some(m) = made.get(&commit.record.key) {
+    let key = commit.record.key;
+    if let Some(m) = made.get(&key) {
         commit.record.erofs = Some(m.image_digest.clone());
         commit.record.owners = Some(m.owners.clone());
         commit.sealed = sealed;
+    }
+    if let Some(i) = inlining.get(&key) {
+        let held: std::collections::HashSet<&str> =
+            i.files.iter().map(|f| f.digest.as_str()).collect();
+        commit.files.retain(|f| !held.contains(f.digest.as_str()));
+        commit.refs.retain(|(d, _)| !held.contains(d.as_str()));
+        commit.record.inline = i.threshold;
+        commit.inlined = i.files.clone();
     }
     commit
 }
@@ -251,6 +265,13 @@ impl ImageService {
             // (the artifact came back while the lock was waited for)
             return Ok(());
         };
+        if let Some(held) = layers.iter().find(|l| l.key == key && l.inline != 0) {
+            leave_inlined(held);
+            return Err(ImageError::Storage(format!(
+                "image {}: the layer {key}: {}; it holds files in its image: remove the image and pull it again",
+                image.id, lost.message
+            )));
+        }
         // (a layer made here, by a commit, a build or a load, keeps its
         // tar-split: no pull brings it back, the repair makes its image)
         let marked = match self.db.mark_layer_incomplete(&key).await? {
@@ -278,6 +299,36 @@ impl ImageService {
         Err(ImageError::Storage(format!(
             "the image {name} is damaged (layer {key} {what}): pull it again"
         )))
+    }
+
+    /// The digest of the EROFS image of the layer `key` that a manifest
+    /// written here states: `recorded`, the digest of the image the store
+    /// has, unless the layer holds files in that image (`inline`), whose
+    /// digest no other node makes: the one its table of contents alone
+    /// makes, `toc` or the stored one.
+    pub(super) async fn stated_erofs(
+        &self,
+        key: &LayerKey,
+        recorded: String,
+        inline: i64,
+        toc: Option<Arc<Toc>>,
+    ) -> ImageResult<String> {
+        if inline == 0 {
+            return Ok(recorded);
+        }
+        let toc = match toc {
+            Some(toc) => toc,
+            None => Arc::new(stored_toc(&self.db, key).await?.ok_or_else(|| {
+                ImageError::Layer(format!("layer {key} has no table of contents"))
+            })?),
+        };
+        let alg = key.digest().alg();
+        tokio::task::spawn_blocking(move || {
+            velarx_fuse::layer_erofs::layer_identity(alg, &toc.entries).map(|id| id.erofs)
+        })
+        .await
+        .map_err(|e| ImageError::Layer(format!("the identity task: {e}")))?
+        .map_err(|e| ImageError::Layer(format!("the identity of layer {key}: {e}")))
     }
 
     /// The digest of the merged image of the layers of the image `image_id`
@@ -374,6 +425,13 @@ impl ImageService {
     pub async fn remake_image(&self, image_id: &str) -> ImageResult<()> {
         let image = self.db.get_image(image_id).await?;
         let layers = self.db.get_image_layers(image_id).await?;
+        if let Some(held) = layers.iter().find(|l| l.inline != 0) {
+            leave_inlined(held);
+            return Err(ImageError::Storage(format!(
+                "the layer {} holds files in its EROFS image, which cannot be made again from the table of contents",
+                held.key
+            )));
+        }
         let tocs = stored_tocs(&self.db, &layers.iter().map(|l| l.key).collect::<Vec<_>>()).await?;
         let tocs: Vec<(LayerKey, Toc)> = layers.iter().map(|l| l.key).zip(tocs).collect();
         let _shared = self.lock_store().await?;
@@ -393,66 +451,161 @@ impl ImageService {
     }
 }
 
+/// Say that `layer`, which holds files in its EROFS image, is left as it is:
+/// nothing is fetched for it, and it stays recorded as it is.
+fn leave_inlined(layer: &LayerRecord) {
+    debug!(
+        "Layer {} holds files in its EROFS image (inline threshold {}): it stays as it is, nothing is fetched for it; to make it again, with another threshold too, remove its image with `velarx rmi` and pull it again",
+        layer.key, layer.inline
+    );
+}
+
 /// The identity of each layer, made from its table of contents by the engine
 /// (one thread for each layer): what the engine records, whatever the driver
 /// says.
 async fn identities(layers: Vec<(LayerKey, Toc)>) -> ImageResult<HashMap<LayerKey, LayerArtifact>> {
     tokio::task::spawn_blocking(move || {
-        let refs: Vec<(&LayerKey, &Toc)> = layers.iter().map(|(k, t)| (k, t)).collect();
-        identities_of(&refs).map(|(artifacts, _)| artifacts)
+        std::thread::scope(|s| {
+            let handles: Vec<_> = layers
+                .iter()
+                .map(|(key, toc)| s.spawn(move || identity_of_table(key, toc)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    let (key, artifact, _) = h
+                        .join()
+                        .unwrap_or_else(|_| Err(ImageError::Layer("the making panicked".into())))?;
+                    Ok((key, artifact))
+                })
+                .collect()
+        })
     })
     .await
     .map_err(|e| ImageError::Layer(format!("the identity task: {e}")))?
 }
 
-/// The identity of each layer `(key, TOC)` and the EROFS image it was made
-/// from (one thread for each layer; blocking): the images go to the driver,
-/// which stores them as they are rather than build them again.
+/// The content of a file a layer image holds, by its fs-verity digest.
+pub(super) type Open<'a> = &'a (dyn Fn(&Digest) -> std::io::Result<std::fs::File> + Sync);
+
+/// The identity of each layer `(key, TOC, inline threshold)` and the EROFS
+/// image it was made from (one thread for each layer; blocking): the images
+/// go to the driver, which stores them as they are rather than build them
+/// again.  `open` and `dir` are those of [`identity_of`].
 pub(super) fn identities_of(
-    layers: &[(&LayerKey, &Toc)],
-) -> ImageResult<(
-    HashMap<LayerKey, LayerArtifact>,
-    HashMap<LayerKey, velarx_fuse::layer_erofs::LayerImage>,
-)> {
+    layers: &[(&LayerKey, &Toc, i64)],
+    open: Open<'_>,
+    dir: &std::path::Path,
+) -> ImageResult<(Identities, HashMap<LayerKey, Inlining>)> {
     std::thread::scope(|s| {
         let handles: Vec<_> = layers
             .iter()
-            .map(|(key, toc)| s.spawn(move || identity_of(key, toc)))
+            .map(|&(key, toc, threshold)| {
+                s.spawn(move || identity_of(key, toc, &Inline { threshold, open }, dir))
+            })
             .collect();
-        let mut artifacts = HashMap::new();
-        let mut images = HashMap::new();
+        let mut ids = Identities::default();
+        let mut inlining = HashMap::new();
         for h in handles {
-            let (key, artifact, image) = h
+            let (key, artifact, image, inlined) = h
                 .join()
                 .unwrap_or_else(|_| Err(ImageError::Layer("the making panicked".into())))?;
-            artifacts.insert(key, artifact);
-            images.insert(key, image);
+            ids.artifacts.insert(key, artifact);
+            ids.images.insert(key, image);
+            inlining.insert(key, inlined);
         }
-        Ok((artifacts, images))
+        Ok((ids, inlining))
     })
 }
 
-/// The identity of the layer `key` from its table of contents, and the EROFS
-/// image it was made from (blocking).
+/// The identity of the layer `key` from its table of contents, the EROFS
+/// image it was made from and the files the image holds itself, which
+/// `inline` says and opens (blocking).  An image that holds none is made in
+/// memory; one that holds files is written once to a file with no name in
+/// `dir`, hashed as it is written: it can be as big as they are.
 pub(super) fn identity_of(
     key: &LayerKey,
     toc: &Toc,
-) -> ImageResult<(
-    LayerKey,
-    LayerArtifact,
-    velarx_fuse::layer_erofs::LayerImage,
-)> {
+    inline: &Inline,
+    dir: &std::path::Path,
+) -> ImageResult<(LayerKey, LayerArtifact, MadeImage, Inlining)> {
+    let threshold = inline.threshold;
+    if threshold == 0 {
+        let (key, artifact, image) = identity_of_table(key, toc)?;
+        let none = Inlining {
+            threshold,
+            files: Vec::new(),
+        };
+        return Ok((key, artifact, image, none));
+    }
+    let fail = |e: String| ImageError::Layer(format!("the identity of layer {key}: {e}"));
+    let alg = key.digest().alg();
+    let file = velarx_content::pull::unnamed::unnamed_file(dir).map_err(|e| fail(e.to_string()))?;
+    let mut hashed = Hashed {
+        file: &file,
+        hasher: velarx_storage::VerityHasher::new(alg),
+    };
+    let written = velarx_fuse::layer_erofs::write_layer_image(
+        &toc.entries,
+        inline,
+        std::io::BufWriter::new(&mut hashed),
+    )
+    .map_err(fail)?;
+    let erofs = Digest::parse_fsverity(&hashed.hasher.finish())
+        .map_err(|e| fail(e.to_string()))?
+        .plain();
+    let artifact = LayerArtifact {
+        image_digest: erofs,
+        owners: serde_json::to_string(&written.owners).map_err(|e| fail(e.to_string()))?,
+    };
+    let files = written
+        .extents
+        .into_iter()
+        .map(|e| velarx_db::InlinedFile {
+            digest: e.digest.to_string(),
+            offset: e.offset,
+            size: e.size,
+        })
+        .collect();
+    let image = MadeImage {
+        image: ImageBytes::File(file),
+        index: written.index,
+    };
+    Ok((*key, artifact, image, Inlining { threshold, files }))
+}
+
+/// The identity of the layer `key` from its table of contents alone, and
+/// the EROFS image it was made from, in memory (blocking).
+pub(super) fn identity_of_table(
+    key: &LayerKey,
+    toc: &Toc,
+) -> ImageResult<(LayerKey, LayerArtifact, MadeImage)> {
     let fail = |e: String| ImageError::Layer(format!("the identity of layer {key}: {e}"));
     let image = velarx_fuse::layer_erofs::layer_image(&toc.entries).map_err(fail)?;
     let id = image.identity(key.digest().alg()).map_err(fail)?;
-    Ok((
-        *key,
-        LayerArtifact {
-            image_digest: id.erofs,
-            owners: id.owners,
-        },
-        image,
-    ))
+    let artifact = LayerArtifact {
+        image_digest: id.erofs,
+        owners: id.owners,
+    };
+    Ok((*key, artifact, image.into()))
+}
+
+/// A file that an image is written to, and the fs-verity hash of what is.
+struct Hashed<'a> {
+    file: &'a std::fs::File,
+    hasher: velarx_storage::VerityHasher,
+}
+
+impl std::io::Write for Hashed<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let n = self.file.write(bytes)?;
+        self.hasher.update(&bytes[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// The artifacts a driver recorded must be the engine's identity: a driver

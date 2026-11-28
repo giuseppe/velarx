@@ -181,6 +181,8 @@ pub(crate) struct PullArgs {
     pub access: velarx_registry::auth::RegistryAccess,
     /// The fetchers of the pull, in order; none: `[pull] sources`
     pub sources: Option<Vec<String>>,
+    /// What the layers of the pull are made with; none: the configured one
+    pub inline_threshold: Option<i64>,
 }
 
 /// The path of a pull as the client gave it.
@@ -234,6 +236,7 @@ pub(crate) async fn pull_images(
         lazy,
         access,
         sources,
+        inline_threshold,
     } = args;
     use velarx_proto::engine::PullPolicy;
     // the lazy pulls that have no completer go on
@@ -249,6 +252,7 @@ pub(crate) async fn pull_images(
                 platform,
                 access,
                 sources,
+                inline_threshold,
             };
             return pull_origin_of(state, &origin, target, &options, progress).await;
         }
@@ -301,6 +305,7 @@ pub(crate) async fn pull_images(
             platform: platform.clone(),
             access: access.clone(),
             sources: None,
+            inline_threshold: None,
         };
         let remote = state
             .image_service
@@ -340,6 +345,7 @@ pub(crate) async fn pull_images(
         platform,
         access,
         sources,
+        inline_threshold,
     };
     let pulled = async {
         let refs = if all_tags {

@@ -3745,6 +3745,7 @@ mod service {
                     lazy: spec.lazy,
                     access,
                     sources: spec.sources,
+                    inline_threshold: spec.inline_threshold,
                 };
                 podman::images::pull::pull_images(&state, args, tx).await
             });
