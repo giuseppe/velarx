@@ -487,6 +487,15 @@ impl Database {
             .await
     }
 
+    /// The files the EROFS image of the layer holds and where, from the
+    /// store that has the layer.
+    pub async fn layer_inlined_files(&self, key: &LayerKey) -> DbResult<Vec<InlinedFile>> {
+        self.layer_owner(key)
+            .await?
+            .layer_inlined_files_here(key)
+            .await
+    }
+
     /// The objects of the files `ids` that are recorded, of this store, then
     /// of the read-only stores for those it has not got.
     pub async fn file_objects(&self, digests: Vec<String>) -> DbResult<HashMap<String, Object>> {

@@ -1992,6 +1992,34 @@ impl Database {
             .await?)
     }
 
+    /// The files the EROFS image of the layer holds, as `inlined_files`
+    /// records them.
+    pub(crate) async fn layer_inlined_files_here(
+        &self,
+        key: &LayerKey,
+    ) -> DbResult<Vec<InlinedFile>> {
+        let key = *key;
+        Ok(self
+            .conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT file_digest, offset, size FROM inlined_files
+                     WHERE layer_id = ?1 ORDER BY offset",
+                )?;
+                let files = stmt
+                    .query_map([&key], |r| {
+                        Ok(InlinedFile {
+                            digest: r.get(0)?,
+                            offset: r.get::<_, i64>(1)? as u64,
+                            size: r.get::<_, i64>(2)? as u64,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok(files)
+            })
+            .await?)
+    }
+
     /// The first of the files `(digest, size)` that the store records with
     /// another size: its digest, the size the store has and the one given.
     /// A digest names one content, which has one size.
@@ -4252,6 +4280,10 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(db.has_inlined_files().await.unwrap());
+        assert_eq!(
+            db.layer_inlined_files(&one).await.unwrap(),
+            vec![inlined(1, 0, 10), inlined(2, 8192, 5)]
+        );
         // a record that says nothing of the image keeps what it had
         let mut again = layer_commit(one, sha(b"t"), None);
         again.record.inline = 7;
