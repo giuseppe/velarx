@@ -13,9 +13,6 @@ pub(crate) struct Watching {
     caps: Capabilities,
     /// What each collection was told to keep, in order.
     pub(crate) collected: Mutex<Vec<Keep>>,
-    /// The stores it was told to drop (it answers as a driver of stores
-    /// does: done).
-    pub(crate) dropped: Mutex<Vec<String>>,
 }
 
 impl Watching {
@@ -24,7 +21,6 @@ impl Watching {
             inner,
             caps,
             collected: Mutex::new(Vec::new()),
-            dropped: Mutex::new(Vec::new()),
         }
     }
 }
@@ -32,7 +28,7 @@ impl Watching {
 forward_storage_driver! {
     impl StorageDriver for Watching {
         inner: inner;
-        forward: [name graph_name graph_data status pull has_layers repair remake_staged read_objects open_object objects_in_order remove_image image_volume_create mounts image_view holds_objects leftovers check writable_create writable_paths writable_root writable_size writable_remove writable_release writable_exists diff changes apply stopped_view is_root_of usage list_stores release_engine_copies lock_unused_layers];
+        forward: [name graph_name graph_data status pull has_layers repair remake_staged read_objects open_object objects_in_order remove_image image_volume_create mounts image_view leftovers check writable_create writable_paths writable_root writable_size writable_remove writable_exists diff changes apply stopped_view is_root_of usage lock_unused_layers];
         fn capabilities(&self) -> &Capabilities {
             &self.caps
         }
@@ -42,10 +38,6 @@ forward_storage_driver! {
                 .unwrap_or_else(|e| e.into_inner())
                 .push(keep.clone());
             self.inner.collect(keep)
-        }
-        fn drop_store(&self, store: &str) -> DriverResult<()> {
-            self.dropped.lock().unwrap().push(store.to_string());
-            Ok(())
         }
     }
 }

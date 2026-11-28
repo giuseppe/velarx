@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Why a transfer failed, and what the party that reads it does next: one
 //! taxonomy for every interface that moves objects (Fetcher, Pusher,
-//! Registry, StorageFeed, ImageFetch).
+//! Registry, ImageFetch).
 
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "proxy")]

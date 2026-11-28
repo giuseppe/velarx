@@ -676,9 +676,9 @@ impl ContainerService {
             )))
         })
         .await?;
-        // A driver that cannot remove the layer of a listed container now (a
-        // storage service that is down) leaves the container as it was, not
-        // one that is listed and cannot be started: nothing else of it is
+        // A driver that cannot remove the layer of a listed container now
+        // leaves the container as it was, not one that is listed and cannot
+        // be started: nothing else of it is
         // removed, and the next removal does all of it.
         let (cgroup, bundle) = match removed_layer {
             Ok(done) => done,

@@ -168,49 +168,14 @@ fn remove_file(path: &Path) -> io::Result<()> {
 /// the local drivers keep there), its volumes' data, its logs, its monitor
 /// directory, its secrets, the files its configuration named, its lock
 /// files.  All of it is tried; the first error is given back.  Also what
-/// removes the files of a container no row names (`id`).
-pub fn files(id: &str, r: &super::RemovalPlan, volumes: &[Volume]) -> io::Result<()> {
+/// removes the files of a container no row names.
+pub fn files(r: &super::RemovalPlan, volumes: &[Volume]) -> io::Result<()> {
     let mut first = None;
     let mut note = |res: io::Result<()>| {
         if let Err(e) = res {
             first.get_or_insert(e);
         }
     };
-    // (the writable layer first: a service that cannot remove it keeps the
-    // container, whose files then stay for the next removal)
-    match &r.writable {
-        velarx_graph::WritableRelease::InBundle { pin } => {
-            if let Some(pin) = pin {
-                note(remove_file(pin));
-            }
-        }
-        velarx_graph::WritableRelease::Service {
-            socket,
-            timeout_secs,
-            store,
-            pin,
-        } => {
-            let link = velarx_storage_client::Link {
-                socket: socket.clone(),
-                timeout: std::time::Duration::from_secs(*timeout_secs),
-            };
-            match velarx_storage_client::remove_root(&link, store, id) {
-                Ok(()) => {
-                    if let Some(pin) = pin {
-                        note(remove_file(pin));
-                    }
-                }
-                Err(e) => {
-                    note(Err(io::Error::other(format!(
-                        "the layer the storage service holds: {e}"
-                    ))));
-                    // (the rest stays: the container is still listed and the
-                    // next removal does all of it)
-                    return first.map_or(Ok(()), Err);
-                }
-            }
-        }
-    }
     note(remove_tree(&r.bundle));
     for v in volumes {
         note(remove_tree(&v.mountpoint));
@@ -261,7 +226,7 @@ pub fn finish(
         _storage,
         _volumes,
     } = prepared;
-    if let Err(e) = files(&plan.id, &plan.removal, &volumes) {
+    if let Err(e) = files(&plan.removal, &volumes) {
         tracing::warn!("Cannot remove the files of container {}: {e}", plan.id);
         // (reported once; it stays listed for the `rm` that finishes it, and
         // no command that opens the store tries it again)
@@ -493,7 +458,6 @@ mod tests {
                 volumes_dir: dir.path().join("volumes"),
                 volumes_lock: dir.path().join("volumes.lock"),
                 lock_files: Vec::new(),
-                writable: velarx_graph::WritableRelease::InBundle { pin: None },
             },
             image: image.then(|| ImageRef {
                 id: "img".into(),
@@ -614,12 +578,10 @@ mod tests {
     #[test]
     fn a_failed_removal_is_not_tried_again_by_every_start() {
         let mut f = fixture(false);
-        f.plan.removal.writable = velarx_graph::WritableRelease::Service {
-            socket: f.dir.path().join("no-such-service"),
-            timeout_secs: 1,
-            store: "s".into(),
-            pin: None,
-        };
+        // (a directory is not a file `remove_file` can remove)
+        let stuck = f.dir.path().join("stuck");
+        std::fs::create_dir(&stuck).unwrap();
+        f.plan.removal.named_files = vec![stuck];
         let removal = finish(&f.store, &f.plan, go(&f), Some(7));
         assert!(!removal.removed && removal.failure.is_some());
         assert_eq!(rows(&f, "SELECT count(*) FROM containers"), 1);
@@ -627,7 +589,6 @@ mod tests {
             rows(&f, "SELECT count(*) FROM containers WHERE removing = 1"),
             0
         );
-        assert!(f.plan.removal.bundle.exists());
     }
 
     /// The volumes that go with the container are removed under the lock of

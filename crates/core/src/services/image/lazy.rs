@@ -250,7 +250,6 @@ impl ImageService {
             return Ok(None);
         };
         let manifest: OciManifest = serde_json::from_str(&pull.manifest)?;
-        let driver_pulls = !self.storage.holds_objects();
         if self.image_stored(&pull.manifest_digest).await {
             // (committed by another process, by an earlier run of this one,
             // or pulled whole meanwhile: the names of the pull are its)
@@ -289,7 +288,7 @@ impl ImageService {
         // start did without, fetched before the files)
         self.set_lazy_access(access);
         let layers: Arc<[LazyLayer]> = self
-            .lazy_layers(&area, &manifest, &config, &keys, driver_pulls)
+            .lazy_layers(&area, &manifest, &config, &keys)
             .await?
             .into();
         let profile = velarx_fuse::profile::read(
@@ -317,11 +316,6 @@ impl ImageService {
         }
         self.commit_image(&plan.pull, &plan.manifest, Some(&plan.keys))
             .await?;
-        if !self.storage.holds_objects() {
-            // (the image is the store's and the pull is gone: what the
-            // containers made on the pull do not name is not needed)
-            self.release_engine_copies(Some(&plan.keys)).await;
-        }
         Ok(())
     }
 
@@ -335,7 +329,6 @@ impl ImageService {
         manifest: &OciManifest,
         config: &OciConfig,
         keys: &[LayerKey],
-        staged_too: bool,
     ) -> ImageResult<Vec<LazyLayer>> {
         // which of them the store has is the driver's answer, once for all
         let have = self.stored_layers(keys, config).await?;
@@ -350,11 +343,7 @@ impl ImageService {
             .zip(&have)
             .enumerate()
         {
-            // (`staged_too`: a layer the driver has and the pull staged is
-            // the engine's to keep as well, for the containers made on the
-            // pull; one it has and nothing staged was kept by the completion
-            // that released it)
-            if *have && !(staged_too && area.layer(key)?.is_some()) {
+            if *have {
                 // proven when it was committed, against this image's diff id
                 continue;
             }
@@ -762,7 +751,7 @@ impl ImageService {
         if keys.is_none() {
             // (still there: it was looked for before the lock)
             self.db.get_image_by_digest(&read.manifest_digest).await?;
-        } else if self.storage.holds_objects() && !super::seal::expected(manifest)?.is_empty() {
+        } else if !super::seal::expected(manifest)?.is_empty() {
             let tocs = velarx_content::pull::stored::stored_tocs(&self.db, layers).await?;
             let (store, want) = (self.file_store.clone(), manifest.clone());
             let alg = read.manifest_digest.alg();
@@ -2167,7 +2156,7 @@ mod tests {
         let area = service.staging_area();
         let keys = [key];
         let lacking = service
-            .lazy_layers(&area, &manifest, &config, &keys, false)
+            .lazy_layers(&area, &manifest, &config, &keys)
             .await
             .unwrap();
         assert!(lacking.is_empty(), "the driver has it");
@@ -2181,10 +2170,9 @@ mod tests {
                 fsverity: service.fsverity,
             },
             &service.driver_options(),
-        )
-        .unwrap();
+        );
         let e = service
-            .lazy_layers(&area, &manifest, &config, &keys, false)
+            .lazy_layers(&area, &manifest, &config, &keys)
             .await
             .map(|l| l.len())
             .unwrap_err();
@@ -2243,7 +2231,7 @@ mod tests {
         .unwrap();
         config.rootfs.diff_ids = vec![sha("diff")];
         let e = service
-            .lazy_layers(&area, &manifest, &config, &[key], false)
+            .lazy_layers(&area, &manifest, &config, &[key])
             .await
             .map(|l| l.len())
             .unwrap_err();

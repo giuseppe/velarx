@@ -90,9 +90,6 @@ pub struct RemovalPlan {
     pub volumes_lock: PathBuf,
     /// The lock files of the container that go with it (`<state>/mon`)
     pub lock_files: Vec<PathBuf>,
-    /// How its writable layer goes when the driver keeps it elsewhere than
-    /// in the bundle (a storage service), and the pin of the lazy phase
-    pub writable: velarx_graph::WritableRelease,
 }
 
 /// The rfc 3339 time of nanoseconds since the epoch, as the rows keep it.

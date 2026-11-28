@@ -612,11 +612,7 @@ impl ContainerService {
         // A container with a monitor that answers is removed by it, as it is
         // removed when it exits with `--rm`; the lock of its start is not
         // held while it works.
-        let layers = self.db.container_layers(&container.id).await?;
         if self.remove_by_monitor(&container, force, volumes).await? {
-            self.image_service
-                .release_engine_copies(Some(&layers))
-                .await;
             return Ok(());
         }
         let mut container = container;
@@ -688,7 +684,6 @@ impl ContainerService {
         if let Some(config) = &config {
             remove_named_files(config)?;
         }
-        let layers = self.db.container_layers(&container.id).await?;
         match self.db.delete_container(&container.id).await {
             Ok(()) | Err(velarx_types::DbError::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
@@ -701,11 +696,6 @@ impl ContainerService {
         }
         info!("Deleted container {}", container.id);
         drop(lock);
-        // (the last container whose root the engine served from the copy of
-        // a lazy image it made: the copy goes)
-        self.image_service
-            .release_engine_copies(Some(&layers))
-            .await;
         let exit = container
             .exit_code
             .map(|c| vec![("containerExitCode".to_string(), c.to_string())])

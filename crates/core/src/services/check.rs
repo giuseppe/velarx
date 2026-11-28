@@ -502,11 +502,6 @@ impl CheckService {
             }
         }
 
-        // (the objects of a driver of another process are its own: its check
-        // reads them)
-        if !self.images.storage().holds_objects() {
-            files.clear();
-        }
         let digests: Vec<String> = files.keys().cloned().collect();
         let rows = self.db.file_objects(digests).await?;
         let mut to_read = Vec::new();
@@ -679,16 +674,12 @@ impl CheckService {
         let rows = self.db.all_file_objects().await?;
         let recorded: HashSet<String> = rows.values().map(|o| o.verity.clone()).collect();
 
-        // rows of files that are gone (the objects of a driver of another
-        // process are its own: the rows name them, the engine has none)
-        let mut gone: Vec<(&String, PathBuf)> = if self.images.storage().holds_objects() {
-            rows.iter()
-                .map(|(d, o)| (d, self.store.object_path(o)))
-                .filter(|(_, p)| std::fs::symlink_metadata(p).is_err())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // rows of files that are gone
+        let mut gone: Vec<(&String, PathBuf)> = rows
+            .iter()
+            .map(|(d, o)| (d, self.store.object_path(o)))
+            .filter(|(_, p)| std::fs::symlink_metadata(p).is_err())
+            .collect();
         gone.sort();
         for (digest, path) in &gone {
             scan.rows.push((*digest).clone());

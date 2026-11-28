@@ -165,7 +165,7 @@ struct WireCall<'a, P> {
 /// else; a contract test per interface checks that every method it serves
 /// has exactly one.
 pub trait Method: Serialize {
-    /// The interface: `org.velarx.Storage`
+    /// The interface: `org.velarx.Engine`
     const INTERFACE: &'static str;
     /// The method, without the interface
     const NAME: &'static str;

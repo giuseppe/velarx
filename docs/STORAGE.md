@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Storage
 
-How Velarx stores images, its security properties and limits, and the wire
+How Velarx stores images, its security properties and limits, and the
 interface of a storage driver.
 
 ## Overview
@@ -79,116 +79,20 @@ only shells, with `unlink` and `rmdir`: it never deletes data, and what is
 not a volume is left untouched.
 
 The driver is chosen by `[storage] driver` or `--storage-driver`: `composefs`
-(the default), `vfs` and `varlink` (never chosen for you). A store keeps the
+(the default) and `vfs` (never chosen for you). A store keeps the
 driver it was made with; opening it with another is an error that names both.
 
-## The driver interface (`org.velarx.Storage`, version 2)
+## The driver trait
 
 The engine owns the network, the identities (diff ids, EROFS digests, owners)
-and the reachability of everything (what is kept); the table of contents and
-tar-split of each layer are files of the driver (`Index` of the feed gives them
-to it, `LayerFiles` brings them back), which the engine hashes against the
-digests of its record each time it reads one.  A **storage driver** owns where the bytes live and
-how a root file system is made of them.  The interface is the Rust trait
-`StorageDriver` (`crates/graph/src/lib.rs`); a driver that is a separate
-process serves `org.velarx.Storage`
-([interfaces/org.velarx.Storage.varlink](../interfaces/org.velarx.Storage.varlink),
-whose header has the rules of every call: versions, limits, descriptors,
-errors, idempotence) and is fed by the engine through `org.velarx.StorageFeed`
-([interfaces/org.velarx.StorageFeed.varlink](../interfaces/org.velarx.StorageFeed.varlink)).
-Both are generated from the types of `crates/storage-client`; the engine's
-side is `velarx_storage_client::VarlinkDriver`.  The socket must be served by
-the engine's user or root (`SO_PEERCRED`, checked on every connection).  Tests
-fail when the definition and the two tables below disagree.
-
-`GetInfo -> (name, version, proto, capabilities, limits, mounts)` is the first
-call of every connection: who the driver is, its words of capabilities, its
-limits and the ways it can show the ids of a mapping.
-
-### The calls
-
-Every call but `GetInfo` and `ListStores` takes the `store` (the id of the
-store the engine keeps in a file of its graph root).  `LayerRef` is `(key, diff_id, chain_id)` (the chain id is the OCI ChainID of
-the layer as the top of its stack, computed by the engine; a driver that is not
-`layer_chain` ignores it, and one that is keeps a layer for each stack it is
-in, not one for every image that has it); `MountAsk` is
-`(mapping?, idmap_mount, label?, verity?)` with `verity` the digests the engine
-accepts for each layer in order (`VerityAsk::Enforce { accepted }`); `Mounted` is
-`(kind: (directory, mount_fd), fd?, path?, idmap: (none, applied, mount),
-label: (none, mount_context, files))`; the `path` of a `directory` root is
-relative to the `workdir` that `CreateRoot` names, the work directory of the
-store (`<graph root>/varlink/work`, made by the engine at open, owned by its
-user, 0700, named without links): the client makes the plan
-`RootfsPlan::Directory { beneath: workdir, path }` and refuses an absolute
-path, `..`, `.` or an empty component, so a driver cannot have the monitor
-mount any other directory of the host; an image mount is never a `directory`.
-
-| call | arguments and reply | notes |
-|---|---|---|
-| `HasLayers` | `(layers: []LayerRef) -> (have: []bool)` | at most `max_layers`; one answer for each layer asked, in the order asked (the same layer at two places of a stack is two questions, for a `layer_chain` driver two answers); true for committed and complete layers only |
-| `HasObjects` | `(objects: []string) -> (have: []bool)` | asked only of a driver whose `objects` capability is true; at most `limits.wants` keys; one answer for each, in the order asked, true for an object the driver has committed and can read now, under that key or by an alias of it (an object it names by its fs-verity digest is held for the hash of its content too); not an object that is only staged by a pull, nor one a collection removed; answered from the driver's own store, the engine keeps no table of its own; the engine names a held object as the source of a `copy` event of a `Fetch`, below |
-| `BeginPull` | `(pull, layers: []PullLayer) -> (kind)` | the pull of an image, driven by the driver; the whole ordered layer list, each layer with its `chain_id`, its `parent` chain id and `stored` (what `HasLayers` answered for its place), and only the layers not stored are fetched; the descriptor 0 is the driver's end of the feed socket pair (`org.velarx.StorageFeed`); `more`: replies of kind `progress` (with a `progress` field), then `staged` (the engine's `Settled` check comes after it, **before** the driver publishes: a refusal leaves nothing visible) |
-| `ReadObjects` | `(pull?, ranges: []Range) -> (index, size?)` | `more`: one reply for each range, in the order asked, and the bytes of the range follow on the pipe that is the descriptor 0; `pull` names the objects a pull staged and has not committed; at most `limits.ranges` |
-| `Commit` | `(pull, layers: []LayerRef) -> ()` | the layers the pull brought in; all or nothing, made durable by the driver (the engine takes no barrier) |
-| `Abort` | `(pull) -> ()` | ends a pull; drops only what no other live pull and no committed layer uses |
-| `CreateRoot` | `(container, workdir, image?, layers: []LayerRef, owner?, ask: MountAsk, size_limit?) -> (root?: Mounted)` | idempotent; `more`; makes what the driver keeps for the root; the reply has the kind of the mount (`plan`, `idmap`, `label`) and **no descriptor**, none without an image (`--rootfs`); every later `Mounts` answers the same kind, `idmap` and `label` |
-| `CreateImageVolume` | `(container, index, image, layers: []LayerRef, ask: MountAsk) -> (volume?: Mounted)` | idempotent; `more`; the same for an image mount (the engine counts the `mount_fd` ones and refuses more than 15 at create) |
-| `Mounts` | `(container, root?: MountAsk, volumes: []VolumeAsk) -> (root?: Mounted, volumes: []Mounted)` | the only source of descriptors; the mounts of one container per call (the client takes it from `MountsRequest::container`, which refuses a request of two); a volume never created is `missing` with `recreate_container` |
-| `LayerFiles` | `(layer) -> ()` | the files of a committed layer as the driver kept them, as regular files opened read-only: `toc.zst` is the descriptor 0 and `tarsplit.zst`, if the layer has one, the descriptor 1; the engine hashes them against the digests of its record, so a file that is not those bytes is refused; a layer that is not committed is `missing` with `pull_again` |
-| `MountImage` | `(layers: []LayerRef) -> ()` | one descriptor: a new read-only mount of the root file system of the image made of the layers (a directory where the service cannot make a mount), for the engine's reads of what a create needs of the image; no container, no mapping, no label; the engine reads below it with `openat2` and drops it |
-| `WritableRoot` | `(container) -> ()` | one descriptor: the container's writable layer, the directory its writes land in (the upper of an overlay, the copy of a copying driver), for the engine's walks: the user files and the label at create, `cp` and `export` of a stopped container, and `diff`, `changes` and `commit`, which may be of a **running** one.  A driver whose layer is a mount answers a new detached clone of the mount the container runs on (the same superblock), never a second mount of the same upper |
-| `Size` | `(container) -> (bytes)` | mandatory: a walk over the wire costs a call per file |
-| `Exists` | `(container) -> (exists)` | |
-| `RemoveRoot` | `(container) -> ()` | the volumes go with it; idempotent |
-| `RemoveImage` | `(image) -> ()` | forgets what the driver keeps of the image |
-| `Check` | `(image, layers: []LayerRef, full) -> (problems: []Problem)` | `more`; `Problem` is `(kind, message, layer?, path?, repair)` with `kind` an enum |
-| `Repair` | `(layers: []LayerRef) -> (artifacts: []Artifact)` | `more`; an `Artifact` is `(key, erofs, owners)`: makes the artifacts again from what the driver keeps and answers their identities, which the engine checks against those it makes from the tables of contents before it records them; idempotent |
-| `Usage` | `() -> (files, bytes)` | of the driver's own artifacts; the objects are the engine's |
-| `Status` | `() -> (pairs)` | names and values the driver reports of itself |
-| `ListStores` | `() -> (stores)` | no `store`; the stores of the caller's uid that the driver holds, each `(store, bytes, last_open?)`, for a driver that serves several stores; the engine's `StoreId` of each is in a file of its graph root, so a store whose graph root is gone is found here |
-| `DropStore` | `(store) -> ()` | removes the store and everything under it (layers, roots, image mounts, staging); idempotent; `busy` while a pull or a container of it is in progress; a name that is not a store id (32 hex digits) is refused before it names a path |
-| `Collect` | `(keep_length) -> (bytes_freed, errors)` | `more`; the keep set is JSON lines of the sealed memfd that is the descriptor 0, `keep_length` bytes |
-
-### Trait method to wire call
-
-Every method of `StorageDriver`, and what a varlink client does for it.
-
-| trait method | wire call or engine-side form |
-|---|---|
-| `name`, `graph_name` | `GetInfo.name` (the graph name is the engine's table) |
-| `capabilities` | `GetInfo` (cached for the life of the connection's version) |
-| `graph_data` | engine-side: empty `GraphDriver.Data` for a remote store |
-| `status` | `Status` |
-| `pull` | `BeginPull` ... `Commit`, with the feed (`Fetch`, `ReadObjects`) |
-| `has_layers` | `HasLayers` |
-| `remake_staged` | the engine's own `composefs` driver, which runs the image while it is pulled; no wire call |
-| `repair` | `Repair` |
-| `read_objects`, `open_object` | `ReadObjects` (`open_object` spools the bytes into an unnamed file of `<graph root>/varlink/scratch`, on disk, not in `TMPDIR`) |
-| `objects_in_order` | `ReadObjects`, one call for the next objects of a list the reader takes in order (up to the limits of the proof of a pull), not one call for each; no other change on the wire |
-| `remove_image` | `RemoveImage` |
-| `image_volume_create` | `CreateImageVolume` |
-| `mounts` | `Mounts` |
-| `image_view` | `MountImage`, read through its descriptor (`velarx_fuse::MountedImage`); the tables of contents of the layers are not read |
-| `holds_objects` | engine-side: false (the objects are the service's, which its `Check` reads) |
-| `writable_create` | `CreateRoot` |
-| `writable_paths` | engine-side: a path only for the engine's own driver (an overlay's upper); a remote store has none |
-| `writable_root` | `WritableRoot` |
-| `writable_size` | `Size` |
-| `writable_remove` | `RemoveRoot` |
-| `writable_release` | none: what the monitor of an `--rm` container needs to send `RemoveRoot` itself (the socket, the store) |
-| `writable_exists` | `Exists` |
-| `diff`, `changes`, `apply`, `stopped_view` | engine-side: the engine walks the descriptor of `WritableRoot` (`diff_native` is announced for later); the files of the image below that a change needs (a metadata-only copy-up, a renamed directory) and the files of a squash are read back with `ReadObjects` (the next ones of the walk in one call, `objects_in_order`), never from the engine's own store |
-| `is_root_of` | engine-side: the engine compares the process's root with the root it attached itself |
-| `lock_unused_layers` | engine-side: none in use (the layers are the service's, which mounts them itself; the engine does not know what the service holds, and the service removes only what its own `Collect` is told to keep) |
-| `check` | `Check` |
-| `release_engine_copies` | engine-side: the engine's own copy of the files of a lazy image, which only the engine's lazy phase keeps (the pins of the containers it serves); the service is not asked, a driver with no copy of its own has nothing to release |
-| `leftovers` | engine-side: the engine scans its objects, and a remote store answers no file of its own |
-| `collect` | `Collect` |
-| `usage` | `Usage` |
-| `list_stores`, `drop_store` | `ListStores`, `DropStore` (a driver of a single store, the engine's own, answers `unsupported`) |
+and the reachability of everything (what is kept).  A **storage driver** owns
+where the bytes live and how a root file system is made of them.  The
+interface is the Rust trait `StorageDriver` (`crates/graph/src/lib.rs`); the
+drivers are in the engine's process, and the conformance suite of
+`crates/graph` is run against each of them.
 
 What is not in the trait because it is the engine's own: the stream of a
-layer's diff id (`objects::open_layer`, from the tar-split and `ReadObjects`, or
+layer's diff id (`objects::open_layer`, from the tar-split and `read_objects`, or
 from the table of contents alone for a layer that is a canonical tar, which has
 no tar-split),
 the owners of the files of the layers (`objects::image_owners`), the digest of

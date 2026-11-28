@@ -653,7 +653,6 @@ impl Fixture {
                 volumes_dir: self.dir.path().join("volumes"),
                 volumes_lock: self.dir.path().join("volumes.lock"),
                 lock_files: Vec::new(),
-                writable: velarx_graph::WritableRelease::InBundle { pin: None },
             },
         });
         StoreFx { db, events }

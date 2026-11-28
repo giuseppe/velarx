@@ -4937,7 +4937,6 @@ dependencies = [
  "velarx-sandbox",
  "velarx-signature",
  "velarx-storage",
- "velarx-storage-client",
  "velarx-sys",
  "velarx-types",
  "velarx-vfs",
@@ -5470,7 +5469,6 @@ dependencies = [
  "velarx-content",
  "velarx-db",
  "velarx-fuse",
- "velarx-graph",
  "velarx-limit-core",
  "velarx-mcs-core",
  "velarx-netdetach",
@@ -5478,7 +5476,6 @@ dependencies = [
  "velarx-nsid",
  "velarx-proto",
  "velarx-storage",
- "velarx-storage-client",
  "velarx-sys",
  "velarx-types",
  "velarx-user-core",
@@ -5570,32 +5567,6 @@ dependencies = [
  "velarx-sys",
  "velarx-tarsplit-header",
  "velarx-types",
-]
-
-[[package]]
-name = "velarx-storage-client"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "rustix",
- "serde",
- "serde_json",
- "tar",
- "tempfile",
- "tokio",
- "tracing",
- "velarx-base",
- "velarx-content",
- "velarx-db",
- "velarx-fuse",
- "velarx-graph",
- "velarx-proto",
- "velarx-storage",
- "velarx-types",
- "velarx-wire",
- "zlink",
 ]
 
 [[package]]

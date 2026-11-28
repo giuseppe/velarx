@@ -147,11 +147,6 @@ fn factory() -> Factory {
                     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
                     std::fs::write(p, b"[]").is_ok()
                 }),
-                chunked_only: false,
-                remote: false,
-                upper: None,
-                bundle: None,
-                keep: None,
             }
         })
     })

@@ -197,125 +197,6 @@ impl GcService {
         Ok(pinned)
     }
 
-    /// Drop the copy of its own files that the driver keeps of `layers` (the
-    /// layers with such a copy, if none are named) when nothing needs it: no
-    /// container whose root the driver serves and no pull in progress names
-    /// them.  The lock of the store is taken exclusive without waiting (a pull
-    /// holds it shared for as long as it runs): when it is busy nothing is
-    /// done, and the next call or collection does it.  `skipped` says so.
-    pub async fn release_engine_copies(
-        &self,
-        layers: Option<&[velarx_db::LayerKey]>,
-    ) -> GcResult<GcReport> {
-        let mut report = GcReport::default();
-        if !self.has_engine_copies() {
-            return Ok(report);
-        }
-        let Some(_lock) = StorageLock::try_exclusive(&self.lock_path)? else {
-            debug!("The store is in use: the engine's copy of the lazy images stays for now");
-            report.skipped = true;
-            return Ok(report);
-        };
-        self.release_engine_copies_locked(layers, &mut report)
-            .await?;
-        Ok(report)
-    }
-
-    /// Whether the driver may keep a copy of its own of the layers of a lazy
-    /// image: it serves them itself while the image is pulled, and the layers
-    /// are in a driver of another process afterwards.
-    fn has_engine_copies(&self) -> bool {
-        self.storage.capabilities().lazy && !self.storage.holds_objects()
-    }
-
-    /// [`Self::release_engine_copies`] by the holder of the exclusive lock of
-    /// the store.
-    async fn release_engine_copies_locked(
-        &self,
-        layers: Option<&[velarx_db::LayerKey]>,
-        report: &mut GcReport,
-    ) -> GcResult<()> {
-        if !self.has_engine_copies() {
-            return Ok(());
-        }
-        let layers = match layers {
-            Some(l) => l.to_vec(),
-            None => self.db.layer_digests().await?,
-        };
-        let area = self.staging();
-        let held = velarx_graph::EngineHeld {
-            containers: self
-                .db
-                .list_containers(true)
-                .await?
-                .into_iter()
-                .map(|c| c.id)
-                .collect(),
-            layers: area
-                .pinned_layers()
-                .iter()
-                .filter_map(|k| velarx_db::LayerKey::parse(k))
-                .collect(),
-            files: area.wanted_files().into_keys().collect(),
-        };
-        let out = self
-            .storage
-            .release_engine_copies(&layers, &held)
-            .await
-            .map_err(|e| GcError::Io(e.into_io()))?;
-        report.add_freed(out.bytes_freed);
-        report.errors.extend(out.errors);
-        Ok(())
-    }
-
-    /// After everything was removed (`system prune --all --volumes`): when the
-    /// database has no image, layer or container left, a driver that keeps
-    /// stores of its own (`varlink`) is told to drop this one with all it
-    /// holds (layers, roots, staging), so that deleting the graph root by hand
-    /// afterwards leaves nothing of it behind.  The driver of a single store
-    /// has none to drop.  Whether the store was dropped; a pull or a container
-    /// in progress is the driver's `Busy`.
-    pub async fn drop_emptied_store(&self, store: &velarx_graph::StoreId) -> GcResult<bool> {
-        let _lock = StorageLock::exclusive(&self.lock_path).await?;
-        if !self.db.list_containers(true).await?.is_empty()
-            || !self.db.list_images().await?.is_empty()
-            || !self.db.list_layers().await?.is_empty()
-        {
-            return Ok(false);
-        }
-        let driver = self.storage.clone();
-        let id = store.as_str().to_string();
-        match crate::storage_driver::blocking(|| driver.drop_store(&id)) {
-            Ok(()) => Ok(true),
-            Err(e) if matches!(e.kind, velarx_graph::DriverErrorKind::Unsupported) => Ok(false),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// The stores the driver holds for the engine's user (a driver of one
-    /// store: `Unsupported`).
-    pub async fn stores(&self) -> GcResult<Vec<velarx_graph::StoreInfo>> {
-        let driver = self.storage.clone();
-        Ok(crate::storage_driver::blocking(|| driver.list_stores())?)
-    }
-
-    /// Drop the store `id` the driver holds with all it keeps (layers, roots,
-    /// staging), never `own`, the store of this engine: its containers and
-    /// images are in the database.  A store with a container or a pull in
-    /// progress is the driver's `Busy`.
-    pub async fn drop_other_store(&self, own: &velarx_graph::StoreId, id: &str) -> GcResult<()> {
-        if id == own.as_str() {
-            return Err(GcError::Driver(velarx_graph::DriverError::of(
-                self.storage.name(),
-                velarx_graph::DriverErrorKind::Busy,
-                format!("{id} is the store of this engine: remove its images and containers and run `system prune --all --volumes` to drop it"),
-            )));
-        }
-        let driver = self.storage.clone();
-        let id = id.to_string();
-        Ok(crate::storage_driver::blocking(|| driver.drop_store(&id))?)
-    }
-
     /// After images were removed: remove the layers no image uses and no
     /// pull pins, then the files only those layers had.  Waits for the
     /// pulls and commits in progress (the exclusive lock of the store).
@@ -522,14 +403,6 @@ impl GcService {
             let locks = self.file_store.root().with_file_name("locks");
             let removed = velarx_storage::locks::remove_unused(&locks);
             debug!("Removed {removed} lock files nothing held");
-            // (the copy a lazy image left in the engine that no container
-            // and no pull needs: whatever a release that did not run, or
-            // stopped, left is dropped here)
-            if let Err(e) = self.release_engine_copies_locked(None, &mut report).await {
-                report
-                    .errors
-                    .push(format!("the engine's copy of the lazy images: {e}"));
-            }
         }
         let mut would_go = HashSet::new();
         if options.collect_layers {
@@ -1279,40 +1152,25 @@ mod tests {
     }
 }
 
+/// What the report says it freed: each object once, by what it took, and the
+/// layers by their size as the images count it.
 #[cfg(test)]
-mod engine_copy_tests {
+mod layer_tests {
     use super::*;
-    use crate::storage_driver::{ComposefsDriver, LazyPhase};
-    use velarx_db::{ContainerRecord, RecordState};
+    use crate::storage_driver::ComposefsDriver;
     use velarx_fuse::composefs as cfs;
     use velarx_graph::forward_storage_driver;
-
-    /// A storage service of another process: it keeps its own objects.
-    struct Remote {
-        inner: Arc<dyn StorageDriver>,
-    }
-
-    forward_storage_driver! {
-        impl StorageDriver for Remote {
-            inner: inner;
-            forward: [name graph_name capabilities graph_data status pull has_layers repair remake_staged read_objects open_object objects_in_order collect release_engine_copies remove_image image_volume_create mounts image_view leftovers check writable_create writable_paths writable_root writable_size writable_remove writable_release writable_exists diff changes apply stopped_view is_root_of usage list_stores drop_store lock_unused_layers];
-            fn holds_objects(&self) -> bool {
-                false
-            }
-        }
-    }
 
     struct Fixture {
         _dir: tempfile::TempDir,
         db: velarx_db::Database,
         store: Arc<FileStore>,
-        staging: std::path::PathBuf,
         gc: GcService,
         key: velarx_db::LayerKey,
     }
 
-    /// An engine over a service, with the completed lazy layer `key`: its row,
-    /// its object and its image in the engine's store.
+    /// A store with the layer `key` that no image uses: its row, its object
+    /// and its image.
     async fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let db = velarx_db::Database::open(dir.path().join("db"))
@@ -1320,18 +1178,14 @@ mod engine_copy_tests {
             .unwrap();
         let store = Arc::new(FileStore::new(dir.path().join("objects")).unwrap());
         let staging = dir.path().join("staging");
-        let local = Arc::new(ComposefsDriver::new(
+        let driver = Arc::new(ComposefsDriver::new(
             db.clone(),
             store.clone(),
             staging.clone(),
             velarx_storage::VerityMode::Off,
             crate::storage_driver::composefs::options_for_tests(&staging),
         ));
-        let service: Arc<dyn StorageDriver> = Arc::new(Remote {
-            inner: local.clone(),
-        });
-        let phase: Arc<dyn StorageDriver> = Arc::new(LazyPhase::new(service, local));
-        let gc = GcService::of_store(phase, db.clone(), store.clone(), &staging);
+        let gc = GcService::of_store(driver, db.clone(), store.clone(), &staging);
         let key = velarx_db::LayerKey::Toc(format!("sha256:{}", "ab".repeat(32)).parse().unwrap());
         let file = format!("sha256-12:{}", "cd".repeat(32));
         let toc = serde_json::json!({"version": 1, "entries": [
@@ -1360,7 +1214,6 @@ mod engine_copy_tests {
             _dir: dir,
             db,
             store,
-            staging,
             gc,
             key,
         };
@@ -1381,74 +1234,8 @@ mod engine_copy_tests {
         fn image(&self) -> std::path::PathBuf {
             cfs::layer_image_path(self.store.root(), &self.key.file_stem())
         }
-
-        fn held(&self) -> bool {
-            self.object().exists() && self.image().exists()
-        }
-
-        /// A container whose root the engine serves: its row and its pin.
-        async fn container(&self, id: &str) {
-            self.db
-                .insert_image(&velarx_db::ImageRecord {
-                    id: "img".into(),
-                    manifest_digest: velarx_types::digest::Digest::empty(
-                        velarx_types::digest::Algorithm::Sha256,
-                    ),
-                    config_digest: velarx_types::digest::Digest::empty(
-                        velarx_types::digest::Algorithm::Sha256,
-                    ),
-                    manifest: "{}".into(),
-                    config: "{}".into(),
-                    created_at: String::new(),
-                    is_lazy: false,
-                })
-                .await
-                .ok();
-            self.db
-                .insert_container(&ContainerRecord {
-                    id: id.into(),
-                    name: None,
-                    image_id: "img".into(),
-                    config: "{}".into(),
-                    state: RecordState::Created,
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            let pins = self.store.root().parent().unwrap().join("lazy-pins");
-            std::fs::create_dir_all(&pins).unwrap();
-            std::fs::write(pins.join(id), format!("{}\n", self.key)).unwrap();
-        }
     }
 
-    /// The release and the store lock: a create is between its pin and its
-    /// row (it holds the lock shared), so the release does nothing and says
-    /// so; the one after the create is done sees its pin and keeps the copy;
-    /// the one after the container is removed drops it.
-    #[tokio::test]
-    async fn a_release_waits_for_no_one_and_never_runs_under_a_create() {
-        let f = fixture().await;
-        let create = StorageLock::shared(&StorageLock::path_of_staging(&f.staging))
-            .await
-            .unwrap();
-        let report = f.gc.release_engine_copies(None).await.unwrap();
-        assert!(report.skipped && f.held(), "not under a create");
-        f.container("c1").await;
-        drop(create);
-        let report = f.gc.release_engine_copies(None).await.unwrap();
-        assert!(!report.skipped);
-        assert!(f.held(), "the container made on the pull holds the copy");
-        f.db.delete_container("c1").await.unwrap();
-        f.gc.release_engine_copies(Some(&[f.key])).await.unwrap();
-        assert!(
-            !f.object().exists() && !f.image().exists(),
-            "dropped with the last one"
-        );
-    }
-
-    /// A collection finishes what a release did not: the copy of a lazy image
-    /// nothing holds goes, one a container holds stays, and a pull in progress
-    /// holds the layers it names.
     /// The staged layers a collection removes are reported: the engine that
     /// runs it tells the fetchers of its pulls to forget them.
     #[tokio::test]
@@ -1503,9 +1290,6 @@ mod engine_copy_tests {
                 assert!(report.errors.is_empty(), "{:?}", report.errors);
                 assert_eq!(f.db.layer_digests().await.unwrap(), [f.key]);
                 assert!(f.image().exists(), "the image stays");
-                // (a copy the engine releases stays too)
-                f.gc.release_engine_copies(Some(&[f.key])).await.unwrap();
-                assert!(f.image().exists());
                 drop(held);
                 assert_eq!(f.gc.collect(dry).await.unwrap().layers_removed, 1);
                 let report = f.gc.collect(GcOptions::default()).await.unwrap();
@@ -1542,7 +1326,7 @@ mod engine_copy_tests {
     forward_storage_driver! {
         impl StorageDriver for Counting {
             inner: inner;
-            forward: [name graph_name capabilities graph_data status pull has_layers repair remake_staged read_objects open_object objects_in_order collect release_engine_copies remove_image image_volume_create mounts image_view leftovers check writable_create writable_paths writable_root writable_size writable_remove writable_release writable_exists diff changes apply stopped_view is_root_of usage list_stores drop_store holds_objects];
+            forward: [name graph_name capabilities graph_data status pull has_layers repair remake_staged read_objects open_object objects_in_order collect remove_image image_volume_create mounts image_view leftovers check writable_create writable_paths writable_root writable_size writable_remove writable_exists diff changes apply stopped_view is_root_of usage];
             fn lock_unused_layers(
                 &self,
                 layers: &[velarx_types::LayerKey],
@@ -1580,7 +1364,7 @@ mod engine_copy_tests {
         // (the release after an `rmi` first, then a collection)
         for round in 0..2 {
             for i in 0..n {
-                add_layer(&db, &store, i, None).await;
+                add_layer(&db, &store, i).await;
             }
             let dry = GcOptions {
                 dry_run: true,
@@ -1602,24 +1386,10 @@ mod engine_copy_tests {
         );
     }
 
-    /// The layer number `i`, ready, with its image in the store (and the
-    /// files of `files`, named by the table of contents of the row, as
-    /// objects).
-    async fn add_layer(
-        db: &velarx_db::Database,
-        store: &FileStore,
-        i: usize,
-        files: Option<&[String]>,
-    ) -> velarx_db::LayerKey {
+    /// The layer number `i`, ready, with its image in the store.
+    async fn add_layer(db: &velarx_db::Database, store: &FileStore, i: usize) {
         let key = velarx_db::LayerKey::Toc(format!("sha256:{i:064x}").parse().unwrap());
-        let toc = files.map(|files| {
-            let entries: Vec<_> = files
-                .iter()
-                .map(|f| serde_json::json!({"name": f, "type": "reg", "size": 4, "fsverity": f.trim_start_matches("fsverity-")}))
-                .collect();
-            serde_json::json!({"version": 1, "entries": entries}).to_string()
-        });
-        let record = velarx_db::LayerRecord {
+        db.insert_layer(&velarx_db::LayerRecord {
             stream_size: Some(0),
             key,
             blob: Some(format!("sha256:{}", "ef".repeat(32)).parse().unwrap()),
@@ -1629,34 +1399,14 @@ mod engine_copy_tests {
             status: "ready".into(),
             created_at: String::new(),
             registry_ref: None,
-            erofs: files.map(|_| "sha256:ee".into()),
+            erofs: None,
             owners: None,
-        };
-        match toc {
-            Some(toc) => db
-                .insert_layer_with_toc(
-                    velarx_db::layer_files::root_of(store.root()),
-                    &record,
-                    &zstd::encode_all(toc.as_bytes(), 3).unwrap(),
-                )
-                .await
-                .unwrap(),
-            None => db.insert_layer(&record).await.unwrap(),
-        }
+        })
+        .await
+        .unwrap();
         let image = cfs::layer_image_path(store.root(), &key.file_stem());
         std::fs::create_dir_all(image.parent().unwrap()).unwrap();
         std::fs::write(image, b"image").unwrap();
-        for f in files.unwrap_or_default() {
-            let path = store.local_path(f).unwrap();
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, b"data").unwrap();
-        }
-        key
-    }
-
-    /// The name of the object number `i`.
-    fn object_named(i: usize) -> String {
-        format!("fsverity-sha256-12:{i:064x}")
     }
 
     /// More layers than the soft limit of open files, that a test runs
@@ -1710,7 +1460,7 @@ mod engine_copy_tests {
                 let gc = GcService::of_store(driver, db.clone(), store.clone(), &staging);
                 for round in 0..2 {
                     for i in 0..MANY {
-                        add_layer(&db, &store, i, None).await;
+                        add_layer(&db, &store, i).await;
                     }
                     let report = if round == 0 {
                         gc.release_unused_layers().await.unwrap()
@@ -1723,86 +1473,8 @@ mod engine_copy_tests {
             });
         });
     }
-
-    /// The release of the engine's copy of a lazy image of more layers than
-    /// the process may open files drops every copy, but the layers whose
-    /// image is held and the files that those still name, wherever in the
-    /// order the layers that share them are.
-    #[test]
-    fn releasing_more_engine_copies_than_the_open_file_limit_goes_in_turns() {
-        velarx_base::testing::in_child(|| {
-            with_few_descriptors(async {
-                let f = fixture().await;
-                let shared = object_named(1_000_000);
-                let dropped = object_named(1_000_001);
-                let mut keys = Vec::new();
-                for i in 0..MANY {
-                    // (the first and the last name one file, which the last
-                    // is held on: it must stay with the first layer gone;
-                    // the second and one in the middle name another, which
-                    // goes with them)
-                    let mut files = vec![object_named(i)];
-                    if i == 0 || i == MANY - 1 {
-                        files.push(shared.clone());
-                    }
-                    if i == 1 || i == MANY / 2 {
-                        files.push(dropped.clone());
-                    }
-                    keys.push(add_layer(&f.db, &f.store, i + 1, Some(&files)).await);
-                }
-                let last = keys[MANY - 1];
-                let held = cfs::open_layer_image(&cfs::layer_image_path(
-                    f.store.root(),
-                    &last.file_stem(),
-                ))
-                .unwrap();
-                let report = f.gc.release_engine_copies(None).await.unwrap();
-                assert!(report.errors.is_empty(), "{:?}", report.errors);
-                let image_of = |k: &velarx_db::LayerKey| {
-                    cfs::layer_image_path(f.store.root(), &k.file_stem()).exists()
-                };
-                assert!(!image_of(&keys[0]) && !image_of(&keys[MANY / 2]));
-                assert!(!f
-                    .store
-                    .local_path(&object_named(MANY / 2))
-                    .unwrap()
-                    .exists());
-                assert!(!f.store.local_path(&dropped).unwrap().exists());
-                assert!(image_of(&last), "a layer whose image is held stays");
-                assert!(f.store.local_path(&shared).unwrap().exists());
-                assert!(f
-                    .store
-                    .local_path(&object_named(MANY - 1))
-                    .unwrap()
-                    .exists());
-                drop(held);
-                let report = f.gc.release_engine_copies(None).await.unwrap();
-                assert!(report.errors.is_empty(), "{:?}", report.errors);
-                assert!(!image_of(&last));
-                assert!(!f.store.local_path(&shared).unwrap().exists());
-            });
-        });
-    }
-
-    #[tokio::test]
-    async fn a_collection_drops_the_copy_nothing_holds() {
-        let only_engine_copies = GcOptions {
-            collect_layers: false,
-            collect_files: false,
-            ..Default::default()
-        };
-        let f = fixture().await;
-        f.container("c1").await;
-        f.gc.collect(only_engine_copies.clone()).await.unwrap();
-        assert!(f.held(), "a container holds it");
-        f.db.delete_container("c1").await.unwrap();
-        f.gc.collect(only_engine_copies).await.unwrap();
-        assert!(!f.held(), "and nothing is left of it when it is gone");
-    }
 }
 
-/// What the report says it freed: each object once, by what it took, and the
-/// layers by their size as the images count it.
 #[cfg(test)]
 mod freed_tests {
     use super::*;
@@ -2048,7 +1720,7 @@ mod freed_tests {
 mod chain_tests {
     use super::*;
     use crate::storage_driver::ComposefsDriver;
-    use velarx_db::{ImageRecord, RecordState};
+    use velarx_db::ImageRecord;
     use velarx_graph::conformance::Chained;
     use velarx_types::digest::{Algorithm, Digest};
 
@@ -2075,110 +1747,6 @@ mod chain_tests {
     /// A collection tells a chained driver the chain ids of every image's
     /// layers (each prefix of each stack, once): it drops the chain of an
     /// image that is gone and keeps the shared prefix of one that stays.
-    #[tokio::test]
-    async fn a_store_left_empty_is_dropped_by_a_driver_that_keeps_stores() {
-        use crate::storage_driver::watching::Watching;
-        let tmp = tempfile::tempdir().unwrap();
-        let db = velarx_db::Database::open_in_memory().await.unwrap();
-        let store = Arc::new(velarx_storage::FileStore::new(tmp.path().join("objects")).unwrap());
-        let staging = tmp.path().join("staging");
-        let inner: Arc<dyn StorageDriver> = Arc::new(ComposefsDriver::new(
-            db.clone(),
-            store.clone(),
-            staging.clone(),
-            velarx_storage::VerityMode::Off,
-            crate::storage_driver::composefs::options_for_tests(&staging),
-        ));
-        let caps = inner.capabilities().clone();
-        let watching = Arc::new(Watching::new(inner.clone(), caps));
-        let id = velarx_graph::StoreId::of_root(tmp.path()).unwrap();
-        let service = GcService::of_store(watching.clone(), db.clone(), store.clone(), &staging);
-        let a = digest("a");
-        let kept = image(1, &[a]);
-        db.insert_image(&kept).await.unwrap();
-        assert!(!service.drop_emptied_store(&id).await.unwrap());
-        assert!(
-            watching.dropped.lock().unwrap().is_empty(),
-            "a store with an image is not dropped"
-        );
-        db.delete_image(&kept.id).await.unwrap();
-        // (a container left: kept too)
-        db.insert_container(&velarx_db::ContainerRecord {
-            id: "c1".into(),
-            name: None,
-            image_id: kept.id.clone(),
-            config: "{}".into(),
-            state: RecordState::Created,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        assert!(!service.drop_emptied_store(&id).await.unwrap());
-        assert!(watching.dropped.lock().unwrap().is_empty());
-        db.delete_container("c1").await.unwrap();
-        assert!(service.drop_emptied_store(&id).await.unwrap());
-        assert_eq!(*watching.dropped.lock().unwrap(), [id.as_str().to_string()]);
-        // a driver of a single store has none to drop
-        let single = GcService::of_store(inner, db.clone(), store, &staging);
-        assert!(!single.drop_emptied_store(&id).await.unwrap());
-        // (a layer left, of no image: kept too)
-        db.insert_layer(&velarx_db::LayerRecord {
-            stream_size: Some(0),
-            key: velarx_types::LayerKey::Whole(a),
-            blob: Some(a),
-            diff_id: Some(a),
-            other_diff_id: None,
-            size: 1,
-            status: "ready".into(),
-            created_at: String::new(),
-            registry_ref: None,
-            erofs: None,
-            owners: None,
-        })
-        .await
-        .unwrap();
-        assert!(!service.drop_emptied_store(&id).await.unwrap());
-        assert_eq!(watching.dropped.lock().unwrap().len(), 1);
-    }
-
-    /// The administrator drops a store that is not the engine's own (the one
-    /// a lost `store-id` file left); the engine's own is refused, and a driver
-    /// of one store lists none.
-    #[tokio::test]
-    async fn a_store_that_is_not_the_engine_s_is_dropped_on_request() {
-        use crate::storage_driver::watching::Watching;
-        let tmp = tempfile::tempdir().unwrap();
-        let db = velarx_db::Database::open_in_memory().await.unwrap();
-        let store = Arc::new(velarx_storage::FileStore::new(tmp.path().join("objects")).unwrap());
-        let staging = tmp.path().join("staging");
-        let inner: Arc<dyn StorageDriver> = Arc::new(ComposefsDriver::new(
-            db.clone(),
-            store.clone(),
-            staging.clone(),
-            velarx_storage::VerityMode::Off,
-            crate::storage_driver::composefs::options_for_tests(&staging),
-        ));
-        let caps = inner.capabilities().clone();
-        let watching = Arc::new(Watching::new(inner.clone(), caps));
-        let own = velarx_graph::StoreId::of_root(tmp.path()).unwrap();
-        let service = GcService::of_store(watching.clone(), db, store, &staging);
-        let err = service
-            .drop_other_store(&own, own.as_str())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("store of this engine"), "{err}");
-        assert!(watching.dropped.lock().unwrap().is_empty());
-        let old = "0123456789abcdef0123456789abcdef";
-        service.drop_other_store(&own, old).await.unwrap();
-        assert_eq!(*watching.dropped.lock().unwrap(), [old.to_string()]);
-        // (a driver of a single store keeps no others)
-        let err = service.stores().await.unwrap_err();
-        assert!(
-            matches!(&err, GcError::Driver(e) if matches!(e.kind, velarx_graph::DriverErrorKind::Unsupported)),
-            "{err}"
-        );
-    }
-
     #[tokio::test]
     async fn a_chained_driver_is_told_the_chains_of_the_images() {
         let tmp = tempfile::tempdir().unwrap();

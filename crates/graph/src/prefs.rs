@@ -9,9 +9,8 @@
 pub const MAX: usize = 4;
 
 /// Up to [`MAX`] distinct values, the preferred first.  The list is owned
-/// data, `Copy` and comparable, so that a driver states it in a `const` and
-/// a client builds it from what a remote driver says, with nothing to keep
-/// alive.  The values are packed at the front (`None` only after the last),
+/// data, `Copy` and comparable, so that a driver states it in a `const`,
+/// with nothing to keep alive.  The values are packed at the front (`None` only after the last),
 /// so two lists are equal when they list the same values in the same order.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Prefs<T: Copy> {
@@ -76,7 +75,7 @@ impl<T: Copy + PartialEq> Prefs<T> {
 }
 
 /// The values in order, each once: a value seen before is dropped, so that
-/// the list a remote driver states cannot overflow with repeats.  The enums
+/// a list cannot overflow with repeats.  The enums
 /// a `Prefs` lists have at most [`MAX`] variants, so distinct values never
 /// exceed it; if one ever had more, the values past the fourth would be
 /// dropped (the least preferred), never an error or a panic.

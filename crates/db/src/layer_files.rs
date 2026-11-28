@@ -67,7 +67,7 @@ pub fn write(root: &Path, key: &LayerKey, kind: &str, bytes: &[u8]) -> io::Resul
 }
 
 /// Where the files of the layers of a store are read from: its directory,
-/// or the storage driver that keeps them (a service of another process).
+/// or another one (the tests of a database in memory).
 /// What a source gives is not trusted: the reader checks it against the
 /// digest of the row.
 pub trait Source: Send + Sync {

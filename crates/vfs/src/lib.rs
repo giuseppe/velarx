@@ -65,10 +65,10 @@ use velarx_graph::objects::problem;
 use velarx_graph::{
     feed, objects, Capabilities, Collected, DiffOptions, DriverError, DriverErrorKind, DriverParts,
     DriverResult, FeedLayer, IdmapDone, IdmapWay, InProcess, Keep, LabelDone, LayerArtifact,
-    LayerRef, Limits, MountCaps, MountRequest, Mounts, MountsRequest, ObjectRange, ObjectSink,
-    Planned, Prefs, Problem, ProblemKind, PullFeed, Pulled, Purpose, Remedy, Rootfs, Settled,
-    Settlement, StoppedView, StorageDriver, TreeSource, Usage, VerityEnforcement, Writable,
-    WritableOptions, WritablePaths,
+    LayerRef, MountCaps, MountRequest, Mounts, MountsRequest, ObjectRange, ObjectSink, Planned,
+    Prefs, Problem, ProblemKind, PullFeed, Pulled, Purpose, Remedy, Rootfs, Settled, Settlement,
+    StoppedView, StorageDriver, TreeSource, Usage, VerityEnforcement, Writable, WritableOptions,
+    WritablePaths,
 };
 use velarx_storage::{FileStore, Toc, VerityMode};
 
@@ -97,7 +97,6 @@ static CAPABILITIES: Capabilities = Capabilities {
     volume: Some(MountCaps {
         idmap: Prefs::new(&[IdmapWay::AtCopy]),
     }),
-    limits: Limits::V1,
 };
 
 /// What the configuration says of the driver.
@@ -1490,11 +1489,6 @@ mod conformance {
                         std::os::unix::fs::symlink(to, link).unwrap();
                     }),
                     image_state: Box::new(|_| false),
-                    chunked_only: false,
-                    remote: false,
-                    upper: None,
-                    bundle: None,
-                    keep: None,
                 }
             })
         })

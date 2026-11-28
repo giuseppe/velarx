@@ -197,7 +197,7 @@ impl VolumeFake {
 forward_storage_driver! {
     impl StorageDriver for VolumeFake {
         inner: inner;
-        forward: [name graph_name graph_data status pull has_layers repair remake_staged read_objects open_object objects_in_order remove_image image_view holds_objects leftovers check collect writable_paths writable_root writable_size writable_release writable_exists diff changes apply stopped_view is_root_of usage list_stores drop_store release_engine_copies lock_unused_layers];
+        forward: [name graph_name graph_data status pull has_layers repair remake_staged read_objects open_object objects_in_order remove_image image_view leftovers check collect writable_paths writable_root writable_size writable_exists diff changes apply stopped_view is_root_of usage lock_unused_layers];
         fn image_volume_create(&self, req: &MountRequest<'_>) -> DriverResult<Planned> {
             let index = self.index(req)?;
             // (a mapping it cannot honour is refused now, not at a start)

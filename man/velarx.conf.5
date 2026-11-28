@@ -75,21 +75,7 @@ each container, made when it is created (the cost of a container is linear in th
 image, reflinks make it cheap where the file system has them; it needs no
 mount, and takes no
 .BR \-\-lazy ", " "\-\-mount type=image" " nor " "\-\-storage\-opt size" ;
-it is never chosen for you;
-.B varlink
-passes the storage to a program of its own that serves
-.B org.velarx.Storage
-on the unix socket of the table
-.BR [storage.varlink] :
-.B socket
-(an absolute path, required),
-.B timeout_secs
-(how long a call may be silent, 60 by default: a long call is answered with progress
-at least every half of it, the others whole within it) and
-.B name
-(the name the service must give itself); the engine connects when it starts,
-and a service that is not running or speaks another version is an error that
-says so, as is a setting that the service does not advertise);
+it is never chosen for you);
 a store keeps the driver it was made with, and
 opening it with another is an error), the fs\-verity of its files, which
 .B fsverity_require

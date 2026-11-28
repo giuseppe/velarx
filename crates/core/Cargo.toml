@@ -45,7 +45,6 @@ velarx-storage = { path = "../storage" }
 velarx-content = { path = "../content" }
 velarx-graph = { path = "../graph" }
 velarx-vfs = { path = "../vfs" }
-velarx-storage-client = { path = "../storage-client" }
 velarx-signature = { path = "../signature" }
 velarx-fuse = { path = "../fuse" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process", "net", "signal", "fs", "io-util", "io-std"] }

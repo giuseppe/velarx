@@ -112,7 +112,7 @@ teardown_file () {
     check "composefs" 0 $?
     out=$(sh_cfg --storage-driver zfs image list 2>&1)
     check "zfs: refused" 125 $?
-    check_match "the known ones are listed" 'storage driver of this velarx \(known: composefs, vfs, varlink\)' "$out"
+    check_match "the known ones are listed" 'storage driver of this velarx \(known: composefs, vfs\)' "$out"
     out=$("$BIN/velarx" --storage-driver "" --socket "$ESOCK" image list 2>&1)
     check "the empty name chooses nothing" 0 $?
     out=$("$BIN/velarx" --storage-driver overlay --socket "$ESOCK" image list 2>&1)
@@ -127,7 +127,7 @@ teardown_file () {
     config_with 'driver = "zfs"'
     out=$("$BIN/velarx" --config "$XDG_CONFIG_HOME/velarx/config.toml" varlink 2>&1)
     check "the daemon does not start" 125 $?
-    check_match "it says which key" '\[storage\] driver = "zfs" is not a storage driver of this velarx \(known: composefs, vfs, varlink\)' "$out"
+    check_match "it says which key" '\[storage\] driver = "zfs" is not a storage driver of this velarx \(known: composefs, vfs\)' "$out"
 }
 
 @test "a store keeps the driver it was made with" {
@@ -145,7 +145,7 @@ teardown_file () {
     config_with ""
     out=$("$BIN/velarx" --config "$XDG_CONFIG_HOME/velarx/config.toml" varlink 2>&1)
     check "the daemon does not open it either" 125 $?
-    check_match "the store's driver is not one of the build's" 'was made with the storage driver "zfs", which this velarx does not have \(known: composefs, vfs, varlink\): use the velarx that made it, or remove the store' "$out"
+    check_match "the store's driver is not one of the build's" 'was made with the storage driver "zfs", which this velarx does not have \(known: composefs, vfs\): use the velarx that made it, or remove the store' "$out"
     out=$("$BIN/velarx" --config "$XDG_CONFIG_HOME/velarx/config.toml" --storage-driver composefs varlink 2>&1)
     check "--storage-driver is the same" 125 $?
     check_match "--storage-driver: the mismatch" 'was made with the storage driver "zfs", but composefs is asked for' "$out"

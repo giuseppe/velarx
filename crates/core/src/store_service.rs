@@ -494,10 +494,7 @@ impl StoreService {
             files.clone(),
             db.clone(),
         ));
-        // (the driver of another process, `varlink`, serves nothing: the
-        // engine has no files of its own to name the chunks by)
-        let serves_content =
-            crate::storage_driver::local_capabilities(kind).is_some_and(|c| c.serve_content);
+        let serves_content = crate::storage_driver::local_capabilities(kind).serve_content;
         let shared = Shared::of(announcement(&db, checkpoints.as_ref()).await?);
         let (changes, _) = broadcast::channel(CHANGES_KEPT);
         Ok(Self {

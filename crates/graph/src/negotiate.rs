@@ -157,7 +157,6 @@ mod tests {
                 idmap: Prefs::new(&[IdmapWay::AtCopy]),
             },
             volume: None,
-            limits: crate::Limits::V1,
         }
     }
 

@@ -62,12 +62,6 @@ mod tests {
             [
                 "crates/core/src/store_service.rs",
                 "crates/runtime/src/monitor/lazy.rs",
-                // the client of a storage driver: object bytes travel on a
-                // pipe (`ReadObjects`) and into the driver's own files
-                // (`Fetch`), never in a memory file of the engine's
-                "crates/storage-client/src/conn.rs",
-                "crates/storage-client/src/driver.rs",
-                "crates/storage-client/src/feed.rs",
             ]
             .map(String::from),
         );
@@ -84,17 +78,10 @@ mod tests {
             }
             // (the exceptions, decisions of the owner: the credentials of a
             // call, a secret that must not be on a disk, in the sealed memory
-            // file of `Access::new` (fetch_client.rs); for a storage driver, what the engine
-            // makes and hands over that is no content: the table of contents
-            // and tar-split of `Index` of the feed (one call for both), the
-            // keep set of `Collect`)
+            // file of `Access::new` (fetch_client.rs))
             // (remote.rs has its tests in a file of their own)
             let remote = name.ends_with("fetcher/remote.rs");
-            let allowed = usize::from(
-                name.ends_with("fetcher/fetch_client.rs")
-                    || name.ends_with("storage-client/src/feed.rs")
-                    || name.ends_with("storage-client/src/driver.rs"),
-            );
+            let allowed = usize::from(name.ends_with("fetcher/fetch_client.rs"));
             let code = match remote {
                 true => &text,
                 false => text.split("#[cfg(test)]").next().unwrap(),

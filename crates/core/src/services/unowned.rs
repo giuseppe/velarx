@@ -161,8 +161,7 @@ impl ContainerService {
                 Err(e) => return Err(e.into()),
             }
         }
-        let id = id.to_string();
-        crate::off_thread(move || settle::remove::files(&id, &plan, &[])).await?;
+        crate::off_thread(move || settle::remove::files(&plan, &[])).await?;
         Ok(true)
     }
 }

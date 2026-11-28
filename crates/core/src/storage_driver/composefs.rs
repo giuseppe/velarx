@@ -22,10 +22,10 @@
 use super::{
     feed, objects, Capabilities, Collected, DiffOptions, DriverError, DriverErrorKind,
     DriverResult, FeedLayer, IdmapDone, IdmapWay, InProcess, Keep, LabelDone, LayerArtifact,
-    LayerRef, Limits, MountCaps, MountRequest, Mounts, MountsRequest, ObjectRange, ObjectSink,
-    Planned, Prefs, Problem, ProblemKind, PullFeed, Pulled, Purpose, Remedy, Rootfs, Settled,
-    StorageDriver, UnusedLayers, Usage, VerityAsk, VerityDone, VerityEnforcement, Writable,
-    WritableOptions, WritablePaths,
+    LayerRef, MountCaps, MountRequest, Mounts, MountsRequest, ObjectRange, ObjectSink, Planned,
+    Prefs, Problem, ProblemKind, PullFeed, Pulled, Purpose, Remedy, Rootfs, Settled, StorageDriver,
+    UnusedLayers, Usage, VerityAsk, VerityDone, VerityEnforcement, Writable, WritableOptions,
+    WritablePaths,
 };
 use crate::services::cpview::StoppedView;
 use crate::services::image::seal;
@@ -73,7 +73,6 @@ static CAPABILITIES: Capabilities = Capabilities {
     volume: Some(MountCaps {
         idmap: Prefs::new(&[IdmapWay::DriverMount, IdmapWay::Translate]),
     }),
-    limits: Limits::V1,
 };
 
 /// What the configuration says of the driver (`[storage] composefs` and
@@ -902,141 +901,6 @@ impl ComposefsDriver {
         *self
             .store_verity
             .get_or_init(|| velarx_storage::probe(self.store.root()).is_ok())
-    }
-
-    /// A directory beside the objects of the store (the one the images of the
-    /// layers are in is `composefs`).
-    pub(super) fn beside_objects(&self, name: &str) -> PathBuf {
-        let objects = self.store.root();
-        objects.parent().unwrap_or(objects).join(name)
-    }
-
-    /// Drop the files of the layers of `layers` that have an image in this
-    /// store and are not in `keep`: the objects their tables of contents name
-    /// (except the files in `retain`, and those of the layers of `keep`, which
-    /// the layers that stay still name), then the image and its index.  The
-    /// image goes last and says that a layer has files of this store, so a
-    /// call that stops anywhere is finished by the next one.  The rows of the
-    /// layers stay.  The caller holds the lock of the store exclusive.
-    pub(super) async fn drop_layers(
-        &self,
-        layers: &[LayerKey],
-        keep: &std::collections::HashSet<LayerKey>,
-        retain: &std::collections::HashSet<String>,
-    ) -> DriverResult<Collected> {
-        let objects = self.store.root().to_path_buf();
-        let mut dropping = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for key in layers {
-            let image = cfs::layer_image_path(&objects, &key.file_stem());
-            if !keep.contains(key) && seen.insert(*key) && image.is_file() {
-                dropping.push(*key);
-            }
-        }
-        let mut out = Collected::default();
-        if dropping.is_empty() {
-            return Ok(out);
-        }
-        // A layer a mount or a server uses stays, with its files; the
-        // others are held (nothing mounts them) until their files are
-        // removed, a batch at a time (a descriptor each).  The files a layer
-        // that stays names stay: those of `keep` and of the layers found in
-        // use.  A file that several of the layers to drop name goes with the
-        // last of them: a layer of a later batch, not asked yet, may still
-        // turn out in use.  (the tables of contents are read only when there
-        // is something to drop, each of a layer to drop once more when its
-        // files go; one that cannot be read makes the call drop nothing:
-        // the files of that layer are not known)
-        let mut retained = retain.clone();
-        for key in keep {
-            if let Some(toc) = self.toc_of(key).await? {
-                retained.extend(toc.files());
-            }
-        }
-        let mut last: std::collections::HashMap<String, usize> = Default::default();
-        for (i, key) in dropping.iter().enumerate() {
-            if let Some(toc) = self.toc_of(key).await? {
-                last.extend(toc.files().into_iter().map(|d| (d, i)));
-            }
-        }
-        let numbered: Vec<(usize, LayerKey)> = dropping.into_iter().enumerate().collect();
-        for batch in velarx_graph::unused::unused_batches(self, numbered, |(_, k)| Some(*k)) {
-            let batch = batch?;
-            for (_, key) in &batch.in_use {
-                if let Some(toc) = self.toc_of(key).await? {
-                    retained.extend(toc.files());
-                }
-            }
-            for &(i, key) in &batch.unused {
-                let Some(toc) = self.toc_of(&key).await? else {
-                    // (a layer with no row or no table of contents is the
-                    // collection's: it names the files of no layer)
-                    continue;
-                };
-                let files: Vec<String> = toc
-                    .files()
-                    .into_iter()
-                    .filter(|d| !retained.contains(d) && last.get(d) == Some(&i))
-                    .collect();
-                let store = self.store.clone();
-                let stem = key.file_stem();
-                let (freed, errors) = tokio::task::spawn_blocking(move || {
-                    let objects = store.root().to_path_buf();
-                    let (mut freed, mut errors) = (0u64, Vec::new());
-                    for d in &files {
-                        let Some(path) = store.local_path(d) else {
-                            continue;
-                        };
-                        match std::fs::symlink_metadata(&path)
-                            .and_then(|m| std::fs::remove_file(&path).map(|()| m.len()))
-                        {
-                            Ok(len) => freed += len,
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => {
-                                errors.push(format!("Failed to remove {}: {e}", path.display()))
-                            }
-                        }
-                    }
-                    if errors.is_empty() {
-                        for path in [
-                            cfs::layer_index_path(&objects, &stem),
-                            cfs::layer_image_path(&objects, &stem),
-                        ] {
-                            match std::fs::symlink_metadata(&path)
-                                .and_then(|m| std::fs::remove_file(&path).map(|()| m.len()))
-                            {
-                                Ok(len) => freed += len,
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(e) => {
-                                    errors.push(format!("Failed to remove {}: {e}", path.display()))
-                                }
-                            }
-                        }
-                    }
-                    (freed, errors)
-                })
-                .await
-                .map_err(|e| DriverError::storage(NAME, e.to_string()))?;
-                debug!("The engine's copy of the layer {key} is dropped ({freed} bytes)");
-                out.bytes_freed += freed;
-                out.errors.extend(errors);
-            }
-        }
-        Ok(out)
-    }
-
-    /// The table of contents the store records for a layer: none for a
-    /// layer with no row or no table of contents (it names no file of this
-    /// store), an error when the row or the table of contents cannot be read.
-    async fn toc_of(&self, key: &LayerKey) -> DriverResult<Option<Toc>> {
-        match velarx_content::pull::stored::stored_toc(&self.db, key).await {
-            Ok(toc) => Ok(toc),
-            Err(velarx_types::ImageError::Database(e)) if e.is_not_found() => Ok(None),
-            Err(e) => Err(DriverError::storage(
-                NAME,
-                format!("the table of contents of layer {key}: {e}"),
-            )),
-        }
     }
 
     /// The objects of this store and of the read-only image stores there are.
@@ -3259,25 +3123,12 @@ mod tests {
                 staging_dir: dir.path().join("staging"),
                 fsverity: VerityMode::Off,
             };
-            match crate::storage_driver::open_local(
+            let made = crate::storage_driver::open(
                 *kind,
                 parts(),
                 &crate::storage_driver::DriverOptions::new(options_for_tests(dir.path())),
-            ) {
-                Some(made) => assert_eq!(kind.name(), made.name()),
-                // (a driver of another process is connected to, and needs its
-                // service)
-                None => {
-                    let e = crate::storage_driver::open(
-                        *kind,
-                        parts(),
-                        &crate::storage_driver::DriverOptions::new(options_for_tests(dir.path())),
-                    )
-                    .map(|_| ())
-                    .unwrap_err();
-                    assert!(e.to_string().contains("[storage.varlink]"), "{e}");
-                }
-            }
+            );
+            assert_eq!(kind.name(), made.name());
         }
     }
 

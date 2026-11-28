@@ -86,7 +86,6 @@ impl ContainerService {
                 self.pause_lock_file(id),
                 self.restart_lock_file(id),
             ],
-            writable: self.storage().writable_release(&self.writable(id)),
         }
     }
 

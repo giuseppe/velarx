@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::storage_driver::{
     self, ComposefsDriver, ComposefsOptions, DriverOptions, DriverParts, StorageDriver,
-    VarlinkOptions,
 };
 use bytes::Bytes;
 use serde::Serialize;
@@ -229,8 +228,6 @@ pub struct ImageService {
     verity_best_effort: bool,
     /// `[storage] vfs_ignore_chown_errors`.
     vfs_ignore_chown_errors: bool,
-    /// `[storage.varlink]`, for the `varlink` driver.
-    varlink: Option<VarlinkOptions>,
     pull_config: velarx_config::PullConfig,
     push_config: velarx_config::PushConfig,
     /// `[[transports]]`: the processes that are the origin of a scheme
@@ -420,7 +417,6 @@ impl ImageService {
             verity_chain: velarx_config::VerityChain::Auto,
             verity_best_effort: false,
             vfs_ignore_chown_errors: false,
-            varlink: None,
             pull_config: velarx_config::PullConfig::default(),
             push_config: velarx_config::PushConfig::default(),
             transports: Arc::default(),
@@ -629,30 +625,10 @@ impl ImageService {
         self
     }
 
-    /// The `varlink` driver of the store, opened at the service of
-    /// `[storage.varlink]` now (the connection, the store id and the version
-    /// are checked, so a service that is not there is the error).  The kind
-    /// of the driver is `varlink` from here on.
-    pub fn with_varlink(mut self, options: Option<VarlinkOptions>) -> ImageResult<Self> {
-        self.storage_kind = velarx_config::StorageDriverKind::Varlink;
-        self.varlink = options;
-        self.storage = self.open_storage().map_err(ImageError::from)?;
-        Ok(self)
-    }
-
-    /// The driver of the store, as the options of the service say; the
-    /// `varlink` one is kept as it is (it was opened by `with_varlink`, and
-    /// no option of the other drivers is one of it).
+    /// The driver of the store, as the options of the service say.
     fn remake_storage(&mut self) {
-        if let Some(storage) =
-            storage_driver::open_local(self.storage_kind, self.parts(), &self.driver_options())
-        {
-            self.storage = storage;
-        }
-    }
-
-    fn open_storage(&self) -> crate::storage_driver::DriverResult<Arc<dyn StorageDriver>> {
-        storage_driver::open(self.storage_kind, self.parts(), &self.driver_options())
+        self.storage =
+            storage_driver::open(self.storage_kind, self.parts(), &self.driver_options());
     }
 
     fn parts(&self) -> DriverParts {
@@ -671,7 +647,6 @@ impl ImageService {
                 digests: self.storage_options.digests,
                 ignore_chown_errors: self.vfs_ignore_chown_errors,
             },
-            varlink: self.varlink.clone(),
         }
     }
 
@@ -1369,29 +1344,6 @@ impl ImageService {
         }
         self.release_unused_layers("removed with its container")
             .await;
-    }
-
-    /// Drop the engine's copy of the files of `layers` (every layer, if none
-    /// are named) that nothing needs any more: what a lazy image left in the
-    /// engine when it was completed into a storage service, once no container
-    /// made on the pull is left.  Without waiting for the store (a pull
-    /// holds it): a busy store is for the next collection.  The callers hold
-    /// no lock of the store.
-    pub async fn release_engine_copies(&self, layers: Option<&[LayerKey]>) {
-        let gc = super::GcService::of_store(
-            self.storage.clone(),
-            self.db.clone(),
-            self.file_store.clone(),
-            &self.staging_dir,
-        );
-        match gc.release_engine_copies(layers).await {
-            Ok(report) => {
-                for e in report.errors {
-                    warn!("The engine's copy of a lazy image: {e}");
-                }
-            }
-            Err(e) => warn!("The engine's copy of a lazy image is not dropped: {e}"),
-        }
     }
 
     pub async fn tag(&self, source: &str, target: &str) -> ImageResult<()> {

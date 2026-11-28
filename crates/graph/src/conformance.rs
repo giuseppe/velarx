@@ -58,8 +58,7 @@
 //!   pull takes nothing from the committed one, and every pull has an id of its
 //!   own (`concurrent_pulls_of_a_shared_layer_both_complete`); the diff id of a
 //!   pulled layer is proved by reading it back from the driver
-//!   (`the_diff_id_is_proved_by_reading_back_from_the_driver`); a range larger
-//!   than a pipe is read after its reply (`longcall::read_pipe_ranges`);
+//!   (`the_diff_id_is_proved_by_reading_back_from_the_driver`);
 //! - a collection keeps what a live container (its writable layer) and a pull
 //!   in progress use (`Keep::containers`, `Keep::pulls`);
 //! - a kernel mount (the status says `kernel mount: yes`) is only for root;
@@ -114,9 +113,6 @@ pub type Factory = Box<dyn Fn(PathBuf) -> BoxFuture<'static, Subject> + Send + S
 /// (`Some`: its paths) or another file system's (`None`).
 pub type ProcRoot = Box<dyn Fn(&Path, Option<&WritablePaths>) + Send + Sync>;
 
-/// Where the files of a container are on this host.
-pub type WhereIs = Box<dyn Fn(&Writable) -> PathBuf + Send + Sync>;
-
 /// A driver and what the cases look at around it.
 pub struct Subject {
     pub driver: Arc<dyn StorageDriver>,
@@ -142,28 +138,6 @@ pub struct Subject {
     /// `remove_image` forgets and `collect` keeps for a kept image; false
     /// when the driver keeps none.
     pub image_state: Box<dyn Fn(&str) -> bool + Send + Sync>,
-    /// The cases offer every layer as a zstd:chunked blob of a registry of
-    /// their own, which the engine fetches by ranges (a storage service in
-    /// another process asks for the files it lacks by their keys), and not as
-    /// a tar the registry fetcher unpacks (the cases of the layers read whole
-    /// offer those whatever this says).
-    pub chunked_only: bool,
-    /// The driver is in another process, over a socket: its roots are made at
-    /// the create of the container and its `Mounts` answers for them, the
-    /// layers it holds are its own (the engine's database does not change
-    /// them), and the objects are not in `store`.
-    pub remote: bool,
-    /// Where the files of the writable layer of a container are on this
-    /// host, for a driver whose `writable_paths` names none (a remote one:
-    /// it hands the root over as a descriptor, and the cases read and write
-    /// its files in place).
-    pub upper: Option<WhereIs>,
-    /// The directory of the container on this host that holds `upper`, for
-    /// the same driver.
-    pub bundle: Option<WhereIs>,
-    /// What lives as long as the subject and is dropped with it, before the
-    /// scratch directory goes: the server of a driver in another process.
-    pub keep: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 /// What a case says when it stops for what the host lacks.
@@ -208,17 +182,6 @@ async fn second(f: &Factory, s: &Subject, name: &str) -> Subject {
     let dir = s.dir.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     f(dir).await
-}
-
-/// A case (or a part of one) that cannot apply to a driver in another process,
-/// and why: the case stops, saying so.
-macro_rules! remote_skip {
-    ($s:expr, $case:expr, $($why:tt)*) => {
-        if $s.remote {
-            eprintln!("SKIPPED conformance::{}: {}", $case, format!($($why)*));
-            return;
-        }
-    };
 }
 
 macro_rules! begin {
@@ -546,19 +509,15 @@ async fn offer_with(
     let reg = Registry::start_blocking();
     let (mut layers, mut feeds) = (Vec::new(), Vec::new());
     for (i, tar) in tars.iter().enumerate() {
-        let layer = if s.chunked_only {
-            chunked_layer_with(&reg, tar, |d| diff_id(i, d), |blob| bytes(i, blob)).0
-        } else {
-            registry_layer(
-                &reg,
-                tar,
-                velarx_content::layer::writer::Compression::None,
-                true,
-                |d| diff_id(i, d),
-                |blob| bytes(i, blob),
-            )
-            .0
-        };
+        let layer = registry_layer(
+            &reg,
+            tar,
+            velarx_content::layer::writer::Compression::None,
+            true,
+            |d| diff_id(i, d),
+            |blob| bytes(i, blob),
+        )
+        .0;
         let feed = registry_feed(&reg, &s.db, &s.dir, &layer.descriptor, false).await;
         feeds.push((layer.descriptor.digest, feed));
         layers.push(layer);
@@ -785,27 +744,14 @@ async fn open_layer_for(
     crate::objects::open_layer_expecting(s.driver.name(), &s.db, key, expected).await
 }
 
-/// The paths of the writable layer of a container: the driver's, or where a
-/// driver in another process keeps it, which `Subject::upper` says.
+/// The paths of the writable layer of a container, the driver's.
 fn paths(s: &Subject, w: &Writable) -> WritablePaths {
-    match &s.upper {
-        Some(upper) => {
-            let dir = upper(w);
-            WritablePaths {
-                upper: dir.clone(),
-                work: None,
-                merged: dir,
-            }
-        }
-        None => s.driver.writable_paths(w),
-    }
+    s.driver.writable_paths(w)
 }
 
-/// The plan of the root `req` as a start gives it.  A driver that makes its
-/// roots at the create of the container (a remote one: its `Mounts` answers
-/// for a root it made) is asked to make it first, and one that mounts them
-/// over the writable layer of the container (composefs) has the layer made,
-/// where the subject is.
+/// The plan of the root `req` as a start gives it.  A driver that mounts the
+/// roots over the writable layer of the container (composefs) has the layer
+/// made, where the subject is.
 fn plan_of(s: &Subject, req: &MountRequest<'_>) -> DriverResult<Rootfs> {
     let own;
     let req = match req.container.id() == plan_writable().id() {
@@ -821,36 +767,17 @@ fn plan_of(s: &Subject, req: &MountRequest<'_>) -> DriverResult<Rootfs> {
         }
         false => req.clone(),
     };
-    if matches!(req.purpose, Purpose::Root) {
-        if s.remote {
-            s.driver.writable_create(
-                req.container,
-                Some(ids()),
-                &WritableOptions::default(),
-                Some(&req),
-            )?;
-        } else if !s.driver.writable_exists(req.container)? {
-            // (its layer alone: what the image lacks is the error of the mount)
-            s.driver.writable_create(
-                req.container,
-                Some(ids()),
-                &WritableOptions::default(),
-                None,
-            )?;
-        }
+    if matches!(req.purpose, Purpose::Root) && !s.driver.writable_exists(req.container)? {
+        // (its layer alone: what the image lacks is the error of the mount)
+        s.driver.writable_create(
+            req.container,
+            Some(ids()),
+            &WritableOptions::default(),
+            None,
+        )?;
     }
     let r = rootfs_plan_of(&*s.driver, &req)?;
     check_server(&r);
-    // a driver in another process never claims to enforce digests, or to
-    // serve a mount: the engine cannot check what it did
-    if s.remote {
-        assert_eq!(
-            r.verity,
-            crate::VerityDone::None,
-            "a remote driver enforces"
-        );
-        assert!(r.measured.is_empty() && r.server.is_none());
-    }
     Ok(r)
 }
 
@@ -1168,72 +1095,6 @@ fn chunked_layer_made(
     registry_layer(reg, tar, Compression::ZstdChunked, verity, diff_id, bytes)
 }
 
-/// The zstd:chunked blob of the layer `tar` with the table of contents that
-/// `edit` makes of its own (the descriptor vouches for the new one): what the
-/// tar stream and the tar-split say is not changed.
-fn chunked_layer_edited(
-    reg: &Registry,
-    tar: &[u8],
-    edit: impl FnOnce(&mut serde_json::Value),
-) -> FeedLayer {
-    use velarx_content::layer::writer::{write_layer, Compression};
-    let p = "io.github.containers.zstd-chunked.";
-    let mut blob = Vec::new();
-    let w = write_layer(
-        tar,
-        velarx_types::digest::Algorithm::Sha256,
-        Compression::ZstdChunked,
-        &mut blob,
-    )
-    .expect("a layer");
-    let numbers = |name: &str| -> Vec<usize> {
-        w.annotations[&format!("{p}{name}")]
-            .split(':')
-            .map(|x| x.parse().unwrap())
-            .collect()
-    };
-    let pos = numbers("manifest-position");
-    let ts = numbers("tarsplit-position");
-    let mut toc: serde_json::Value =
-        serde_json::from_slice(&zstd::decode_all(&blob[pos[0]..pos[0] + pos[1]]).unwrap()).unwrap();
-    edit(&mut toc);
-    let json = serde_json::to_vec(&toc).unwrap();
-    let toc_z = zstd::encode_all(&json[..], 3).unwrap();
-    let mut edited = blob[..pos[0]].to_vec();
-    edited[pos[0] - 4..pos[0]].copy_from_slice(&(toc_z.len() as u32).to_le_bytes());
-    edited.extend(&toc_z);
-    edited.extend(&blob[pos[0] + pos[1]..]);
-    let mut annotations = w.annotations.clone();
-    annotations.insert(
-        format!("{p}manifest-position"),
-        format!("{}:{}:{}:1", pos[0], toc_z.len(), json.len()),
-    );
-    annotations.insert(
-        format!("{p}manifest-checksum"),
-        Digest::of(velarx_types::digest::Algorithm::Sha256, &toc_z).to_string(),
-    );
-    annotations.insert(
-        format!("{p}tarsplit-position"),
-        format!("{}:{}:{}", ts[0] + toc_z.len() - pos[1], ts[1], ts[2]),
-    );
-    let digest = Digest::of(velarx_types::digest::Algorithm::Sha256, &edited);
-    reg.put(&digest.to_string(), edited.clone());
-    let desc = OciDescriptor {
-        media_type: w.media_type.to_string(),
-        digest,
-        size: edited.len() as i64,
-        annotations: annotations.into_iter().collect(),
-    };
-    FeedLayer {
-        key: LayerKey::expected(&desc),
-        descriptor: desc,
-        diff_id: w.diff_id,
-        chain_id: w.diff_id,
-        parent: None,
-        stored: false,
-    }
-}
-
 /// The same in the compression `compression`: a layer that is not
 /// zstd:chunked has no table of contents to fetch by.
 fn registry_layer(
@@ -1431,8 +1292,7 @@ pub async fn a_chunked_pull_asks_only_for_what_the_store_lacks(f: &Factory) {
 /// by a later layer: the engine records where the chunks of a layer it
 /// pulled are in the driver's objects, and the fetch of the next layer gives
 /// the registry fetcher the chunks of the engine's store that are there, in
-/// its files (the reuse hints of `Fetch`; a driver in another process holds
-/// objects the engine cannot hand: their chunks are fetched).  Whatever the
+/// its files (the reuse hints of `Fetch`).  Whatever the
 /// driver does, the layer comes out as it does from a store that had nothing,
 /// and the registry is asked for the chunks that differ.
 pub async fn a_chunk_the_driver_holds_is_not_fetched_again(f: &Factory) {
@@ -1483,78 +1343,11 @@ pub async fn a_chunk_the_driver_holds_is_not_fetched_again(f: &Factory) {
         "the layer is the one a cold pull makes"
     );
     // (the registry fetcher is told the chunks the engine's store holds,
-    // in its files: the reuse hints of `Fetch`; the objects of a driver in
-    // another process are not files of the engine, its chunks are fetched)
-    if s.remote {
-        assert!(
-            warm_bytes <= cold_bytes,
-            "{warm_bytes} against {cold_bytes}"
-        );
-        return;
-    }
+    // in its files: the reuse hints of `Fetch`)
     assert!(
         warm_bytes * 2 < cold_bytes,
         "the chunks the store holds are not asked for again: {warm_bytes} against {cold_bytes}"
     );
-}
-
-/// A layer is stored by the entries of its table as a layer keeps them: the
-/// name normalised, the permission bits only, none of the attributes of the
-/// overlay file system.  The table of a registry that says otherwise (and
-/// agrees with the tar once cleaned) is not what the driver is handed or
-/// what it records, whatever the driver.
-pub async fn a_driver_is_handed_the_table_a_layer_keeps(f: &Factory) {
-    let (_tmp, s) = begin!(f, "a_driver_is_handed_the_table_a_layer_keeps");
-    if !s.chunked_only {
-        eprintln!("SKIPPED conformance::a_driver_is_handed_the_table_a_layer_keeps: the layers have no table");
-        return;
-    }
-    let reg = Registry::start().await;
-    let (_, tar) = chunked_layers();
-    let layer = chunked_layer_edited(&reg, &tar, |toc| {
-        for e in toc["entries"].as_array_mut().unwrap() {
-            if e["name"] == "usr/f1" {
-                e["name"] = "./usr//f1".into();
-                e["mode"] = 0o100644.into();
-                e["xattrs"] = serde_json::json!({
-                    "trusted.overlay.redirect": "L2V0Yy9zaGFkb3c=",
-                    "user.overlay.opaque": "eQ==",
-                });
-            }
-        }
-    });
-    let mut layers = vec![layer];
-    set_chains(&mut layers);
-    let feed = registry_feed(&reg, &s.db, &s.dir, &layers[0].descriptor, false).await;
-    let offer = Offer {
-        feed: Arc::new(OfferFeed {
-            layers: vec![(layers[0].descriptor.digest, feed)],
-            meddle: Arc::default(),
-        }),
-        layers,
-        _registry: None,
-    };
-    let seen = Arc::new(Mutex::new(None));
-    let seen2 = seen.clone();
-    offer
-        .pull(
-            &s,
-            Box::new(move |pulled, _| {
-                *seen2.lock().unwrap() = Some(pulled[0].toc.clone());
-                engine_settlement(pulled)
-            }),
-        )
-        .await
-        .expect("a pull");
-    let toc = seen.lock().unwrap().take().expect("the check ran");
-    let e = toc
-        .entries
-        .iter()
-        .find(|e| e.name.ends_with("f1"))
-        .expect("the file");
-    assert_eq!(e.name, "usr/f1");
-    assert_eq!(e.mode, 0o644);
-    assert!(e.xattrs.is_empty(), "{:?}", e.xattrs);
 }
 
 /// A chunked pull that is cut off in the middle stores nothing and leaves no
@@ -1925,83 +1718,6 @@ pub async fn concurrent_pulls_of_a_shared_layer_both_complete(f: &Factory) {
     assert_eq!(c.artifacts[&shared(&c)], a.artifacts[&shared(&a)]);
     let stale = no_staging_left(&s).await;
     assert!(stale.is_empty(), "a staging area was left: {stale:?}");
-}
-
-/// Two pulls at the same time of images that share a layer fetch the shared
-/// layer once between them: the driver of a store that is shared by
-/// several engine processes keeps the claims of the pulls in progress, so the
-/// second pull waits for the first and then finds the layer committed.  The
-/// count is the engine's: how many times its feed was asked for the files of
-/// the shared layer.  A driver of the engine's process stages each pull in a
-/// session of its own and fetches for each pull.
-pub async fn a_layer_shared_by_concurrent_pulls_is_fetched_at_most_once(f: &Factory) {
-    let (_tmp, s) = begin!(
-        f,
-        "a_layer_shared_by_concurrent_pulls_is_fetched_at_most_once"
-    );
-    if !s.remote {
-        eprintln!("SKIPPED conformance::a_layer_shared_by_concurrent_pulls_is_fetched_at_most_once: a driver of the engine's process stages each pull in a session of its own and fetches for each");
-        return;
-    }
-    let (base, top, other) = (base_layer(), top_layer(), other_layer());
-    let (a, b) = (
-        offer(&s, &[&base, &top]).await,
-        offer(&s, &[&base, &other]).await,
-    );
-    let shared = a.layers[0].descriptor.digest;
-    assert_eq!(shared, b.layers[0].descriptor.digest, "one layer");
-    let (ra, rb) = tokio::join!(a.pull(&s, engine_check()), b.pull(&s, engine_check()));
-    ra.expect("the first pull");
-    rb.expect("the second pull");
-    let calls = |o: &Offer| {
-        o.meddle()
-            .asked
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|d| **d == shared)
-            .count()
-    };
-    let keys = |o: &Offer| {
-        o.meddle()
-            .wanted
-            .lock()
-            .unwrap()
-            .get(&shared)
-            .map_or(0, HashSet::len)
-    };
-    assert_eq!(
-        calls(&a) + calls(&b),
-        1,
-        "the files of the shared layer were fetched once in all"
-    );
-    assert!(
-        keys(&a) == 0 || keys(&b) == 0,
-        "one pull asked for them: {} and {}",
-        keys(&a),
-        keys(&b)
-    );
-    assert!(keys(&a) + keys(&b) > 0);
-    // the layers of both are there
-    let all: Vec<LayerRef> = refs_of(&a.stack(&[0, 1]))
-        .into_iter()
-        .chain(refs_of(&b.stack(&[0, 1])).into_iter().skip(1))
-        .collect();
-    assert_eq!(s.driver.has_layers(&all).await.unwrap(), [true, true, true]);
-    // the driver says how many fetches it made, when it counts them: one for
-    // each time the engine's feed was asked
-    if let Some((_, made)) = s
-        .driver
-        .status()
-        .into_iter()
-        .find(|(k, _)| k == "fetch calls")
-    {
-        assert_eq!(
-            made.parse::<usize>().unwrap(),
-            a.fetches() + b.fetches(),
-            "the driver's count is the engine's"
-        );
-    }
 }
 
 /// A pull that is aborted while another pull of the same store commits a layer
@@ -2475,10 +2191,7 @@ pub async fn a_layer_read_whole_is_stored_and_read_back(f: &Factory) {
         }
         // the pull again of what is there fetches nothing
         let again = blob_offer(&own, &[&base, &top], compression).await;
-        let pulled = again.pull(&own, engine_check()).await.unwrap();
-        if own.remote {
-            assert!(pulled.layers.iter().all(|l| l.report.fetched_files == 0));
-        }
+        again.pull(&own, engine_check()).await.unwrap();
     }
 }
 
@@ -2491,98 +2204,33 @@ pub async fn a_layer_read_whole_asks_only_for_what_the_store_lacks(f: &Factory) 
     use velarx_content::layer::writer::Compression;
     let (_tmp, s) = begin!(f, "a_layer_read_whole_asks_only_for_what_the_store_lacks");
     let (one, two) = chunked_layers();
-    if !s.remote {
-        // A driver of the engine's process keeps the files of its store,
-        // named by their fs-verity digest: a file of a layer read whole that
-        // the store has is recognised by it as the layer is read, not written
-        // again, and counted as reused.
-        let first = blob_offer(&s, &[&one], Compression::Gzip)
-            .await
-            .pull(&s, engine_check())
-            .await
-            .expect("the first layer");
-        let r = &first.layers[0].report;
-        assert_eq!((r.fetched_files, r.reused_files), (3, 0), "{r:?}");
-        let sharing = blob_offer(&s, &[&two], Compression::Gzip)
-            .await
-            .pull(&s, engine_check())
-            .await
-            .expect("a layer that shares a file with it");
-        let r = &sharing.layers[0].report;
-        assert_eq!((r.fetched_files, r.reused_files), (1, 1), "{r:?}");
-        // a store of its own has neither
-        let cold_store = second(f, &s, "cold").await;
-        let cold = blob_offer(&cold_store, &[&two], Compression::Gzip)
-            .await
-            .pull(&cold_store, engine_check())
-            .await
-            .expect("a cold pull");
-        let r = &cold.layers[0].report;
-        assert_eq!((r.fetched_files, r.reused_files), (2, 0), "{r:?}");
-        return;
-    }
-    let wanted = |o: &Offer| -> Vec<usize> {
-        o.meddle()
-            .wanted
-            .lock()
-            .unwrap()
-            .values()
-            .map(HashSet::len)
-            .collect()
-    };
-    // the second layer in a store of its own: both its files
+    // A driver of the engine's process keeps the files of its store,
+    // named by their fs-verity digest: a file of a layer read whole that
+    // the store has is recognised by it as the layer is read, not written
+    // again, and counted as reused.
+    let first = blob_offer(&s, &[&one], Compression::Gzip)
+        .await
+        .pull(&s, engine_check())
+        .await
+        .expect("the first layer");
+    let r = &first.layers[0].report;
+    assert_eq!((r.fetched_files, r.reused_files), (3, 0), "{r:?}");
+    let sharing = blob_offer(&s, &[&two], Compression::Gzip)
+        .await
+        .pull(&s, engine_check())
+        .await
+        .expect("a layer that shares a file with it");
+    let r = &sharing.layers[0].report;
+    assert_eq!((r.fetched_files, r.reused_files), (1, 1), "{r:?}");
+    // a store of its own has neither
     let cold_store = second(f, &s, "cold").await;
-    let cold_offer = blob_offer(&cold_store, &[&two], Compression::Gzip).await;
-    let cold = cold_offer
+    let cold = blob_offer(&cold_store, &[&two], Compression::Gzip)
+        .await
         .pull(&cold_store, engine_check())
         .await
         .expect("a cold pull");
     let r = &cold.layers[0].report;
     assert_eq!((r.fetched_files, r.reused_files), (2, 0), "{r:?}");
-    assert_eq!(wanted(&cold_offer), [2], "the driver wants both files");
-    // the layers, which the store has now: nothing is asked for
-    blob_offer(&s, &[&one], Compression::Gzip)
-        .await
-        .pull(&s, engine_check())
-        .await
-        .expect("the first layer");
-    blob_offer(&s, &[&two], Compression::Gzip)
-        .await
-        .pull(&s, engine_check())
-        .await
-        .expect("the second layer");
-    let all = blob_offer(&s, &[&one, &two], Compression::Gzip).await;
-    let again = all.pull(&s, engine_check()).await.expect("what is there");
-    assert!(again.layers.iter().all(|l| l.report.fetched_files == 0));
-    assert!(wanted(&all).iter().all(|n| *n == 0), "nothing is asked for");
-    // a file that a layer has under three names and as a hard link is one
-    // object: asked for once, fetched once
-    let content = random(9, 50_000);
-    let shared = Tar::new()
-        .dir("d", 0o755)
-        .file("d/a", &content, 0o644)
-        .file("d/b", &content, 0o600)
-        .file("d/c", &content, 0o644)
-        .hardlink("d/h", "d/a")
-        .done();
-    let o = blob_offer(&s, &[&shared], Compression::Gzip).await;
-    let pulled = o.pull(&s, engine_check()).await.expect("shared files");
-    assert_eq!(pulled.layers[0].report.fetched_files, 1);
-    assert_eq!(wanted(&o), [1], "the object is asked for once");
-    let tar_back = {
-        let stored = pulled.layers[0].clone();
-        record(&s, &pulled).await;
-        let l = open_layer_for(&s, &stored.key, &stored.diff_id)
-            .await
-            .unwrap();
-        let mut out = Vec::new();
-        l.verified_stream(Arc::new(DriverObjects::new(s.driver.clone())))
-            .unwrap()
-            .read_to_end(&mut out)
-            .unwrap();
-        out
-    };
-    assert!(tar_back == shared, "the three names read back");
 }
 
 /// A layer the engine reads whole that is not sound is refused, whatever the
@@ -2996,8 +2644,7 @@ pub async fn a_layer_keyed_by_sha256_only_is_refused(f: &Factory) {
 
 /// A gzip layer of a registry, which has no table of contents to fetch by,
 /// is read whole by the engine and its files are given to the driver as the
-/// driver asks: pulled, it is stored and reads back byte for byte, for a
-/// driver that keeps its files in another process as for one of this.  The
+/// driver asks: pulled, it is stored and reads back byte for byte.  The
 /// engine's copies of the files go with the pull, and with a pull of a layer
 /// that is not its diff id.
 pub async fn a_gzip_layer_of_a_registry_is_pulled_and_read_back(f: &Factory) {
@@ -3191,11 +2838,6 @@ pub async fn has_layers_reports_what_a_pull_stored(f: &Factory) {
 
 pub async fn has_layers_does_not_report_what_is_not_committed(f: &Factory) {
     let (_tmp, s) = begin!(f, "has_layers_does_not_report_what_is_not_committed");
-    remote_skip!(
-        s,
-        "has_layers_does_not_report_what_is_not_committed",
-        "a layer is committed for a driver in another process by its Commit, not by the engine's record of the image"
-    );
     let base = base_layer();
     // pulled into the store by the driver, the engine has not recorded it
     // (the window of a pull between the driver's commit and the image's): the
@@ -3285,11 +2927,6 @@ pub async fn has_layers_forgets_what_a_collection_removed(f: &Factory) {
 
 pub async fn has_layers_does_not_report_a_layer_it_cannot_serve(f: &Factory) {
     let (_tmp, s) = begin!(f, "has_layers_does_not_report_a_layer_it_cannot_serve");
-    remote_skip!(
-        s,
-        "has_layers_does_not_report_a_layer_it_cannot_serve",
-        "the case damages the row of the layer in the engine's database, which a driver in another process does not read"
-    );
     let base = store_layer(&s, base_layer()).await;
     let top = store_layer(&s, top_layer()).await;
     let both = layer_refs(&[&base, &top]);
@@ -3380,12 +3017,6 @@ pub async fn remake_staged_of_a_pull_that_is_not_there(f: &Factory) {
 
 pub async fn a_lazy_layer_waits_and_is_completed(f: &Factory) {
     let (_tmp, s) = begin!(f, "a_lazy_layer_waits_and_is_completed");
-    if !s.driver.holds_objects() {
-        skip!(
-            "a_lazy_layer_waits_and_is_completed",
-            "the driver keeps its own files: its layers are completed by a pull (see a_lazy_pull_is_staged_by_the_engine_and_completed_into_the_driver)"
-        );
-    }
     let c = s.driver.capabilities();
     let base = base_layer();
     let lazy = offer(&s, &[&base]).await;
@@ -3635,9 +3266,7 @@ pub async fn rootfs_plan_of_a_missing_layer_says_its_remedy(f: &Factory) {
     let img = image("img", &[&base]);
     // not recorded
     let mut layers = records(&s, &[&base]).await;
-    if s.remote {
-        eprintln!("SKIPPED conformance::rootfs_plan_of_a_missing_layer_says_its_remedy (an artifact not recorded): a driver in another process plans from the records it keeps, not the ones the request carries");
-    } else {
+    {
         layers[0].erofs = None;
         let e = expect_err(
             plan_of(&s, &request(&img, &layers)).map(|r| r.plan),
@@ -3970,12 +3599,6 @@ pub async fn an_enforced_mount_carries_what_the_driver_measured(f: &Factory) {
 
 pub async fn a_lazy_image_has_a_plan_if_the_driver_is_lazy(f: &Factory) {
     let (_tmp, s) = begin!(f, "a_lazy_image_has_a_plan_if_the_driver_is_lazy");
-    if !s.driver.holds_objects() {
-        skip!(
-            "a_lazy_image_has_a_plan_if_the_driver_is_lazy",
-            "the driver keeps its own files: an image being pulled is the engine's, a layer it has is the driver's"
-        );
-    }
     let base = store_layer(&s, base_layer()).await;
     let layers = records(&s, &[&base]).await;
     let mut img = image("img", &[&base]);
@@ -3989,265 +3612,6 @@ pub async fn a_lazy_image_has_a_plan_if_the_driver_is_lazy(f: &Factory) {
         let e = expect_err(r, "a lazy image of a driver without lazy images");
         assert!(matches!(e.kind, DriverErrorKind::Unsupported), "{e:?}");
     }
-}
-
-// the lazy phase of a driver that keeps its own files
-
-/// A driver that keeps its own files (a storage service) is given lazy
-/// images by the engine: it says it is lazy, and the engine stages the layers
-/// and runs the image from the files of its own.  The cases need the layers
-/// as zstd:chunked blobs of a registry.
-fn lazy_phase(s: &Subject, case: &str) -> bool {
-    let lazy = s.driver.capabilities().lazy && !s.driver.holds_objects();
-    if lazy && !s.chunked_only {
-        eprintln!("SKIPPED conformance::{case}: the layers have no table, a lazy pull needs one");
-        return false;
-    }
-    if !lazy {
-        eprintln!(
-            "SKIPPED conformance::{case}: the driver does not run lazy images for the engine"
-        );
-    }
-    lazy
-}
-
-/// The layer `tar` as a lazy pull offers it: a blob of `reg` whose table of
-/// contents gives the fs-verity digest of every file (`verity`) or the sha256
-/// only, as a layer written by containers/storage has it.
-async fn lazy_offer(s: &Subject, reg: &Registry, tar: &[u8], verity: bool) -> Offer {
-    let (layer, _) = chunked_layer_made(reg, tar, verity, |d| d, |b| b.to_vec());
-    let mut layers = vec![layer];
-    set_chains(&mut layers);
-    let feed = registry_feed(reg, &s.db, &s.dir, &layers[0].descriptor, true).await;
-    Offer {
-        feed: Arc::new(OfferFeed {
-            layers: vec![(layers[0].descriptor.digest, feed)],
-            meddle: Arc::default(),
-        }),
-        layers,
-        _registry: None,
-    }
-}
-
-/// `done`, a layer a lazy pull staged without its tar-split, with the one
-/// its completion fetches: the tar-split of the blob of `tar` (the writer
-/// makes the same blob of the same tar), checked against the table.
-fn completed(mut done: LayerDone, tar: &[u8]) -> LayerDone {
-    use velarx_content::layer::writer::{write_layer, Compression};
-    let mut blob = Vec::new();
-    let w = write_layer(
-        tar,
-        velarx_types::digest::Algorithm::Sha256,
-        Compression::ZstdChunked,
-        &mut blob,
-    )
-    .expect("a layer");
-    let at: Vec<usize> = w.annotations["io.github.containers.zstd-chunked.tarsplit-position"]
-        .split(':')
-        .map(|x| x.parse().unwrap())
-        .collect();
-    let ts_z = &blob[at[0]..at[0] + at[1]];
-    velarx_content::pull::chunked::check_tarsplit(&done.toc, ts_z).expect("its tar-split");
-    done.tarsplit = ts_z.to_vec().into();
-    done
-}
-
-/// A pool of the files of `tar`, by their fs-verity digest, as the engine
-/// fills it while a lazy pull is completed.
-fn pool_of(dir: &Path, tar: &[u8]) -> Arc<FileStore> {
-    let pool = Arc::new(FileStore::new(dir).unwrap());
-    let mut archive = tar::Archive::new(tar);
-    for entry in archive.entries().unwrap() {
-        let mut entry = entry.unwrap();
-        if entry.header().entry_type() == tar::EntryType::Regular && entry.size() > 0 {
-            let mut data = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
-            pool.put(velarx_types::digest::Algorithm::Sha256, &data)
-                .unwrap();
-        }
-    }
-    pool
-}
-
-/// The layers of a lazy pull are staged by the engine and the driver has
-/// none of them; the engine reads the image from the staged images.  When
-/// the files are in the pool the driver pulls the layers from it, as it pulls
-/// from a registry: it asks for the files it lacks, the engine copies them
-/// into the places the driver gave and measures them, and reads each layer
-/// back to prove its diff id.  Then the driver has the layers.
-pub async fn a_lazy_pull_is_staged_by_the_engine_and_completed_into_the_driver(f: &Factory) {
-    let case = "a_lazy_pull_is_staged_by_the_engine_and_completed_into_the_driver";
-    let (_tmp, s) = begin!(f, case);
-    if !lazy_phase(&s, case) {
-        return;
-    }
-    let tar = base_layer();
-    let reg = Registry::start_blocking();
-    let lazy = lazy_offer(&s, &reg, &tar, true).await;
-    let pulled = lazy.pull(&s, engine_check()).await.expect("a lazy pull");
-    let done = completed(pulled.layers[0].clone(), &tar);
-    assert!(done.lazy, "the layer is staged, not pulled");
-    let artifact = pulled.artifacts[&done.key].clone();
-    let refs = vec![LayerRef {
-        key: done.key,
-        diff_id: done.diff_id,
-        chain_id: lazy.layers[0].chain_id,
-    }];
-    assert_eq!(
-        s.driver.has_layers(&refs).await.unwrap(),
-        vec![false],
-        "the driver has nothing of a lazy layer"
-    );
-    // the image of the staged layer is the engine's to read
-    let mut commit = layer_commit(&done, None).unwrap();
-    commit.record.erofs = Some(artifact.image_digest.clone());
-    commit.record.owners = Some(artifact.owners.clone());
-    s.driver
-        .image_view("lazy", std::slice::from_ref(&commit.record))
-        .expect("the staged image is read");
-    // completed: the driver pulls the layer from the pool
-    let pool = pool_of(&s.dir.join("pool"), &tar);
-    let index = LayerIndex {
-        key: done.key,
-        toc: done.toc.clone(),
-        tarsplit: done.tarsplit.clone(),
-        toc_z: done.toc_z.clone(),
-    };
-    let feed: Arc<dyn PullFeed> = Arc::new(StagedFeed::new(
-        vec![index],
-        Arc::new(StoreContent(vec![pool])),
-        2,
-    ));
-    let layers = vec![FeedLayer {
-        key: done.key,
-        ..lazy.layers[0].clone()
-    }];
-    let completed = s
-        .driver
-        .pull(&feed, &layers, engine_check())
-        .await
-        .expect("the layer is pulled from the pool");
-    assert!(!completed.layers[0].lazy);
-    assert_eq!(s.driver.has_layers(&refs).await.unwrap(), vec![true]);
-    // what the driver stored is what the layer holds
-    let ranges: Vec<ObjectRange> = done
-        .toc
-        .entries
-        .iter()
-        .filter(|e| e.has_content())
-        .filter_map(|e| {
-            Some(ObjectRange {
-                key: e.content_key()?,
-                offset: 0,
-                length: e.size,
-            })
-        })
-        .collect();
-    let mut bytes: Vec<Vec<u8>> = vec![Vec::new(); ranges.len()];
-    s.driver
-        .read_objects(&ranges, &mut |i: usize, data: &[u8]| {
-            bytes[i].extend_from_slice(data);
-            Ok(())
-        })
-        .unwrap();
-    assert!(
-        bytes.iter().any(|b| b == &big()),
-        "the files of the layer are read back"
-    );
-    assert!(bytes.iter().any(|b| b == b"old content"));
-}
-
-/// The engine copies from the pool only what measures as the key says, and
-/// the driver proves the layer by reading it back: a file of the pool that is
-/// not what its name says (the pool is the engine's, a file in it was
-/// changed) is not stored, and the driver does not have the layer.
-pub async fn a_staged_file_that_is_not_its_name_is_not_stored(f: &Factory) {
-    let case = "a_staged_file_that_is_not_its_name_is_not_stored";
-    let (_tmp, s) = begin!(f, case);
-    if !lazy_phase(&s, case) {
-        return;
-    }
-    let tar = base_layer();
-    let reg = Registry::start_blocking();
-    let lazy = lazy_offer(&s, &reg, &tar, true).await;
-    let pulled = lazy.pull(&s, engine_check()).await.expect("a lazy pull");
-    let done = completed(pulled.layers[0].clone(), &tar);
-    let pool = pool_of(&s.dir.join("pool"), &tar);
-    // a file of the pool with the bytes of another of the same size
-    let big_key = done
-        .toc
-        .entries
-        .iter()
-        .find(|e| e.size == big().len() as u64)
-        .and_then(|e| e.content_key())
-        .expect("the big file");
-    let path = pool.get_path(&big_key).expect("in the pool");
-    let mut bytes = std::fs::read(&path).unwrap();
-    bytes[100] ^= 0xff;
-    std::fs::remove_file(&path).unwrap();
-    std::fs::write(&path, bytes).unwrap();
-    let feed: Arc<dyn PullFeed> = Arc::new(StagedFeed::new(
-        vec![LayerIndex {
-            key: done.key,
-            toc: done.toc.clone(),
-            tarsplit: done.tarsplit.clone(),
-            toc_z: done.toc_z.clone(),
-        }],
-        Arc::new(StoreContent(vec![pool])),
-        2,
-    ));
-    let layers = vec![FeedLayer {
-        key: done.key,
-        ..lazy.layers[0].clone()
-    }];
-    let e = expect_err(
-        s.driver.pull(&feed, &layers, engine_check()).await,
-        "a file that is not its name",
-    );
-    assert!(
-        e.to_string().contains("reads back") || e.to_string().contains("mismatch"),
-        "{e}"
-    );
-    let refs = vec![LayerRef {
-        key: done.key,
-        diff_id: done.diff_id,
-        chain_id: lazy.layers[0].chain_id,
-    }];
-    assert_eq!(s.driver.has_layers(&refs).await.unwrap(), vec![false]);
-}
-
-/// A layer whose table of contents does not give the fs-verity digest of its
-/// files is refused, lazily or not: the pull ends before a byte of it is
-/// staged, naming the layer and the file, and the driver and the staging area
-/// have nothing.
-pub async fn a_lazy_pull_of_a_layer_without_file_digests_is_refused(f: &Factory) {
-    let case = "a_lazy_pull_of_a_layer_without_file_digests_is_refused";
-    let (_tmp, s) = begin!(f, case);
-    if !lazy_phase(&s, case) {
-        return;
-    }
-    let tar = base_layer();
-    let reg = Registry::start_blocking();
-    let lazy = lazy_offer(&s, &reg, &tar, false).await;
-    let e = expect_err(
-        lazy.pull(&s, engine_check()).await,
-        "a layer without fs-verity digests",
-    );
-    let text = e.to_string();
-    assert!(
-        text.contains(&lazy.layers[0].descriptor.digest.to_string()),
-        "{text}"
-    );
-    assert!(text.contains("no fs-verity digest for `"), "{text}");
-    assert_eq!(lazy.fetches(), 0, "no layer was fetched");
-    let area = velarx_content::pull::staged::Staging::new(&s.staging);
-    assert!(area.layer_keys().is_empty(), "nothing is staged");
-    let refs = vec![LayerRef {
-        key: lazy.layers[0].key,
-        diff_id: lazy.layers[0].diff_id,
-        chain_id: lazy.layers[0].chain_id,
-    }];
-    assert_eq!(s.driver.has_layers(&refs).await.unwrap(), vec![false]);
 }
 
 // image_view and owners
@@ -4290,10 +3654,8 @@ pub async fn image_view_is_the_merge_of_the_layers(f: &Factory) {
     let os = node("etc/os-release");
     // (the layer a file comes from is for the fetch of a lazy file: a view
     // read from a mount of the image has no layers to name)
-    if !s.remote {
-        assert_eq!(os.layer, 1, "the file of the top layer");
-        assert_eq!(node("etc/old").layer, 0);
-    }
+    assert_eq!(os.layer, 1, "the file of the top layer");
+    assert_eq!(node("etc/old").layer, 0);
     assert_eq!(
         (os.entry.entry_type, os.entry.size, os.entry.mode & 0o777),
         (TocEntryType::Reg, 3, 0o600)
@@ -4317,11 +3679,7 @@ pub async fn image_view_is_the_merge_of_the_layers(f: &Factory) {
     // (a view of the tables of contents counts the links the layer that
     // made the file had; a mount shows the file as the merged tree has it,
     // where the other name was replaced)
-    if s.remote {
-        assert!(a.nlink >= 1);
-    } else {
-        assert_eq!(a.nlink, 2, "etc/hard and etc/os-release in the lower layer");
-    }
+    assert_eq!(a.nlink, 2, "etc/hard and etc/os-release in the lower layer");
     let _ = b;
     // what is not there
     assert!(view.resolve("etc/gone").is_none());
@@ -4409,8 +3767,7 @@ pub async fn image_view_follows_links_only_inside_the_image(f: &Factory) {
 }
 
 /// Views of one image may be held at once and each reads on after the other
-/// is dropped (a driver in another process hands a new mount for each,
-/// `MountImage`, which the engine drops with the view); a view asked again
+/// is dropped; a view asked again
 /// after all were dropped reads the same files.
 pub async fn image_view_is_read_while_held_and_asked_again(f: &Factory) {
     let (_tmp, s) = begin!(f, "image_view_is_read_while_held_and_asked_again");
@@ -4543,11 +3900,6 @@ pub async fn check_finds_nothing_in_a_good_image(f: &Factory) {
     }
     // a layer whose artifact is not recorded is a problem that a remake
     // mends
-    remote_skip!(
-        s,
-        "check_finds_nothing_in_a_good_image (the part with a record changed)",
-        "a driver in another process checks the records it keeps, not the ones the request carries"
-    );
     let mut bad = layers.clone();
     bad[0].erofs = None;
     let found = s.driver.check(&img, &bad, false).await.unwrap();
@@ -4562,11 +3914,6 @@ pub async fn check_finds_nothing_in_a_good_image(f: &Factory) {
 
 pub async fn leftovers_are_not_what_the_rows_name(f: &Factory) {
     let (_tmp, s) = begin!(f, "leftovers_are_not_what_the_rows_name");
-    remote_skip!(
-        s,
-        "leftovers_are_not_what_the_rows_name",
-        "the objects of a driver in another process are its own, not the engine's `store`; its collection removes them"
-    );
     let base = store_layer(&s, base_layer()).await;
     let recorded: HashSet<String> = base.objects.clone();
     assert!(!recorded.is_empty());
@@ -4766,111 +4113,6 @@ pub async fn read_objects_gives_the_ranges_of_stored_objects(f: &Factory) {
         "a failing sink",
     );
     assert_eq!(e.into_io().raw_os_error(), Some(libc::EPIPE));
-}
-
-/// What a driver behind a pipe gives, read the way the engine reads it
-/// ([`crate::longcall::read_pipe_ranges`]): the reply of a range before its
-/// bytes, the pipe polled under the deadline.  The pipe holds less than the
-/// object (`F_GETPIPE_SZ` is shrunk to a page), so a driver that wrote before
-/// its reply, or an engine that read the pipe before the reply, would block
-/// on a full pipe: neither does.
-pub async fn a_range_larger_than_a_pipe_is_read_after_its_reply(f: &Factory) {
-    use std::io::Write;
-    let (_tmp, s) = begin!(f, "a_range_larger_than_a_pipe_is_read_after_its_reply");
-    let tar = base_layer();
-    let l = store_layer(&s, tar.clone()).await;
-    let (key, bytes) = object_of(&l, "usr/lib/big", &tar);
-    let ranges = vec![
-        ObjectRange::whole(&key, bytes.len() as u64),
-        ObjectRange {
-            key: key.clone(),
-            offset: 5,
-            length: 0,
-        },
-        ObjectRange {
-            key: key.clone(),
-            offset: 100,
-            length: bytes.len() as u64 - 100,
-        },
-    ];
-    let (r, w) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
-    rustix::pipe::fcntl_setpipe_size(&w, 4096).unwrap();
-    let pipe_size = rustix::pipe::fcntl_getpipe_size(&w).unwrap();
-    assert!(
-        (pipe_size as usize) < bytes.len(),
-        "the object ({}) is larger than the pipe ({pipe_size})",
-        bytes.len()
-    );
-    let (tx, rx) = std::sync::mpsc::channel::<usize>();
-    // the driver's end of a ReadObjects call: the reply of every range up to
-    // the one whose bytes are written, and then its bytes
-    let (driver, asked) = (s.driver.clone(), ranges.clone());
-    let server = std::thread::spawn(move || {
-        let mut w = std::fs::File::from(w);
-        let mut replied = 0usize;
-        let r = driver.read_objects(&asked, &mut |i: usize, data: &[u8]| {
-            while replied <= i {
-                tx.send(replied).map_err(std::io::Error::other)?;
-                replied += 1;
-            }
-            w.write_all(data)
-        });
-        // (the ranges that gave no bytes are answered too)
-        while replied < asked.len() {
-            let _ = tx.send(replied);
-            replied += 1;
-        }
-        r
-    });
-    let pipe = std::fs::File::from(r);
-    let mut got = Collect::default();
-    crate::longcall::read_pipe_ranges(
-        &ranges,
-        &mut |wait| Ok(rx.recv_timeout(wait).ok()),
-        &pipe,
-        &mut crate::longcall::IdleDeadline::new(Duration::from_secs(20)),
-        &mut got,
-    )
-    .expect("the bytes after their replies");
-    server.join().unwrap().expect("the driver's read");
-    assert_eq!(got.order, vec![0, 2]);
-    assert!(got.ranges[&0] == bytes);
-    assert!(got.ranges[&2] == bytes[100..]);
-}
-
-pub async fn more_ranges_than_a_call_takes_are_read_in_order(f: &Factory) {
-    let (_tmp, s) = begin!(f, "more_ranges_than_a_call_takes_are_read_in_order");
-    let base = store_layer(&s, base_layer()).await;
-    let max = s.driver.capabilities().limits.ranges;
-    assert!(max > 0, "a driver states how many ranges a call takes");
-    // a whole object, asked for again and again past the limit: a layer
-    // of more files than `max` is read in more than one call
-    let key = base
-        .done
-        .toc
-        .entries
-        .iter()
-        .find(|e| e.size > 0 && e.verity().is_some())
-        .expect("a file with content");
-    let (name, size) = (key.verity().unwrap().to_string(), key.size);
-    let ranges: Vec<ObjectRange> = (0..2 * max + 7)
-        .map(|n| ObjectRange {
-            key: name.clone(),
-            offset: (n as u64) % size,
-            length: size - (n as u64) % size,
-        })
-        .collect();
-    let mut got: Vec<Vec<u8>> = vec![Vec::new(); ranges.len()];
-    read_objects_in_batches(&*s.driver, &ranges, &mut |i: usize, b: &[u8]| {
-        got[i].extend_from_slice(b);
-        Ok(())
-    })
-    .expect("the ranges, in calls of the limit");
-    let whole = &got[0];
-    assert_eq!(whole.len() as u64, size);
-    for (n, bytes) in got.iter().enumerate() {
-        assert_eq!(bytes[..], whole[n % size as usize..], "range {n}");
-    }
 }
 
 /// The objects a reader takes in the order of a list (`ObjectOpener::ordered`,
@@ -5129,46 +4371,6 @@ pub async fn collect_never_removes_what_a_container_or_a_pull_uses(f: &Factory) 
     changes("the layers are gone");
 }
 
-/// The stores a driver holds can be listed and dropped by one that serves
-/// several; the driver of the engine's one store has none to name and says so
-/// (`Unsupported`, both calls), and drops nothing.
-pub async fn stores_are_listed_and_dropped_by_a_driver_that_serves_several(f: &Factory) {
-    let (_tmp, s) = begin!(
-        f,
-        "stores_are_listed_and_dropped_by_a_driver_that_serves_several"
-    );
-    let ghost = "0123456789abcdef0123456789abcdef";
-    let listed = s.driver.list_stores();
-    let Ok(_) = listed else {
-        // the driver of the engine's one store
-        let before = s.driver.usage().unwrap();
-        for e in [
-            expect_err(listed.map(|_| ()), "list_stores of a single store"),
-            expect_err(s.driver.drop_store(ghost), "drop_store of a single store"),
-        ] {
-            assert!(matches!(e.kind, DriverErrorKind::Unsupported), "{e:?}");
-            of_driver(&s, &e);
-            assert!(e.message().contains("one store"), "{e:?}");
-        }
-        assert_eq!(s.driver.usage().unwrap(), before, "nothing was dropped");
-        return;
-    };
-    // a store nobody made is dropped without harm, again and again, and is not
-    // listed; a name that is not a store id is refused before it names a path
-    for _ in 0..2 {
-        s.driver
-            .drop_store(ghost)
-            .expect("a store that is not there");
-    }
-    let stores = s.driver.list_stores().expect("list_stores");
-    assert!(stores.iter().all(|i| i.store != ghost), "{stores:?}");
-    assert!(stores.iter().all(|i| crate::stores::is_store_id(&i.store)));
-    for bad in ["", "../x", "0123", "0123456789abcdef0123456789abcdeg"] {
-        let e = expect_err(s.driver.drop_store(bad), "a name that is no store id");
-        assert!(!matches!(e.kind, DriverErrorKind::Unsupported), "{e:?}");
-    }
-}
-
 pub async fn usage_adds_up(f: &Factory) {
     let (_tmp, s) = begin!(f, "usage_adds_up");
     let empty = s.driver.usage().unwrap();
@@ -5178,7 +4380,7 @@ pub async fn usage_adds_up(f: &Factory) {
     // (the content of the images is the engine's to measure)
     let content = crate::objects::content_usage(&s.store);
     assert!(
-        s.remote || (content.0 > 0 && content.1 > 0),
+        content.0 > 0 && content.1 > 0,
         "the files of the layer: {content:?}"
     );
     assert!(
@@ -5188,7 +4390,7 @@ pub async fn usage_adds_up(f: &Factory) {
     let top = store_layer(&s, top_layer()).await;
     let two = s.driver.usage().unwrap();
     let content_two = crate::objects::content_usage(&s.store);
-    assert!(s.remote || (content_two.0 >= content.0 && content_two.1 >= content.1));
+    assert!(content_two.0 >= content.0 && content_two.1 >= content.1);
     assert!(two.artifacts.0 > one.artifacts.0 && two.artifacts.1 > one.artifacts.1);
     // the same layer again adds nothing
     offer(&s, &[&top.tar])
@@ -5222,23 +4424,16 @@ pub async fn usage_adds_up(f: &Factory) {
         .unwrap();
     let after = s.driver.usage().unwrap();
     let total = |u: Usage| u.artifacts.1;
-    // (a driver in another process owns the objects too, and frees them)
-    if s.remote {
-        assert!(freed.bytes_freed >= total(two) - total(after));
-    } else {
-        assert_eq!(
-            total(two) - total(after),
-            freed.bytes_freed,
-            "{two:?} -> {after:?}"
-        );
-    }
+    assert_eq!(
+        total(two) - total(after),
+        freed.bytes_freed,
+        "{two:?} -> {after:?}"
+    );
     assert!(after.artifacts.0 < two.artifacts.0);
     assert_eq!(s.driver.usage().unwrap(), after, "the same each time");
     // (the collection leaves the objects: the engine removes those, with
     // the rows that name them)
-    if !s.remote {
-        assert_eq!(crate::objects::content_usage(&s.store), content_two);
-    }
+    assert_eq!(crate::objects::content_usage(&s.store), content_two);
 }
 
 // The writable layer
@@ -5368,11 +4563,6 @@ pub async fn writable_layer_owner_and_limits(f: &Factory) {
 
 pub async fn the_root_of_a_container_is_found(f: &Factory) {
     let (_tmp, s) = begin!(f, "the_root_of_a_container_is_found");
-    remote_skip!(
-        s,
-        "the_root_of_a_container_is_found",
-        "the root of a process is told apart by the root the monitor attached (`is_root_of` has no wire call): the engine records it, not the driver"
-    );
     let d = &s.driver;
     let w = Writable::new("r", s.dir.join("bundles/r"));
     d.writable_create(&w, None, &WritableOptions::default(), None)
@@ -5949,12 +5139,7 @@ pub async fn diff_apply_and_view_of_a_layer_that_was_never_made(f: &Factory) {
         "diff",
     );
     of_driver(&c.s, &e);
-    // (a driver in another process says the root is not there)
-    assert!(
-        matches!(e.kind, DriverErrorKind::Io(_))
-            || (c.s.remote && matches!(e.kind, DriverErrorKind::Missing { .. })),
-        "{e:?}"
-    );
+    assert!(matches!(e.kind, DriverErrorKind::Io(_)), "{e:?}");
     assert!(d.changes(&none, Some(c.lower.clone()), &opts).is_err());
     let tar = diff_of(&c, &opts);
     assert!(d.apply(&none, &opts, &mut tar.as_slice()).is_err());
@@ -5975,11 +5160,7 @@ pub async fn diff_apply_and_view_of_a_layer_that_was_never_made(f: &Factory) {
     ) else {
         panic!("no layer, no view")
     };
-    assert!(
-        matches!(e.kind, DriverErrorKind::Io(_))
-            || (c.s.remote && matches!(e.kind, DriverErrorKind::Missing { .. })),
-        "{e:?}"
-    );
+    assert!(matches!(e.kind, DriverErrorKind::Io(_)), "{e:?}");
     // what is not a layer is refused, and leaves the layer as it was
     let here = Writable::new("here", c.s.dir.join("bundles/here"));
     d.writable_create(&here, Some(ids()), &WritableOptions::default(), None)
@@ -6165,10 +5346,7 @@ pub async fn writable_root_is_the_root_of_the_layer(f: &Factory) {
     assert!(p.upper.join("second").is_file());
     // the descriptor is the directory, not its name: it stays valid when the
     // bundle is renamed, and what is written goes to the renamed directory
-    let bundle = match &s.bundle {
-        Some(bundle) => bundle(&w),
-        None => s.dir.join("bundles/c1"),
-    };
+    let bundle = s.dir.join("bundles/c1");
     let moved = s.dir.join("bundles/c1.moved");
     std::fs::create_dir_all(s.dir.join("bundles")).unwrap();
     std::fs::rename(&bundle, &moved).unwrap();
@@ -6355,7 +5533,7 @@ impl Chained {
 forward_storage_driver! {
     impl StorageDriver for Chained {
         inner: inner;
-        forward: [name graph_name graph_data status repair remake_staged read_objects open_object objects_in_order remove_image image_volume_create mounts image_view holds_objects leftovers check writable_create writable_paths writable_root writable_size writable_remove writable_release writable_exists diff changes apply stopped_view is_root_of usage list_stores drop_store release_engine_copies lock_unused_layers];
+        forward: [name graph_name graph_data status repair remake_staged read_objects open_object objects_in_order remove_image image_volume_create mounts image_view leftovers check writable_create writable_paths writable_root writable_size writable_remove writable_exists diff changes apply stopped_view is_root_of usage lock_unused_layers];
         fn capabilities(&self) -> &Capabilities {
             &self.caps
         }
@@ -6682,7 +5860,6 @@ macro_rules! conformance_suite_with {
             pull_is_idempotent,
             a_chunked_pull_asks_only_for_what_the_store_lacks,
             a_chunk_the_driver_holds_is_not_fetched_again,
-            a_driver_is_handed_the_table_a_layer_keeps,
             an_interrupted_chunked_pull_is_pulled_again,
             pull_check_sees_the_layers_first,
             a_pull_returns_the_verdict_of_the_check,
@@ -6691,7 +5868,6 @@ macro_rules! conformance_suite_with {
             an_interrupted_pull_is_pulled_again,
             concurrent_pulls_of_a_shared_layer_both_complete,
             an_aborted_pull_leaves_what_another_pull_committed,
-            a_layer_shared_by_concurrent_pulls_is_fetched_at_most_once,
             every_pull_has_an_id_of_its_own,
             the_diff_id_is_proved_by_reading_back_from_the_driver,
             a_feed_writes_into_the_files_a_driver_hands_over,
@@ -6717,9 +5893,6 @@ macro_rules! conformance_suite_with {
             repair_gives_the_artifacts_again,
             remake_staged_of_a_pull_that_is_not_there,
             a_lazy_layer_waits_and_is_completed,
-            a_lazy_pull_is_staged_by_the_engine_and_completed_into_the_driver,
-            a_staged_file_that_is_not_its_name_is_not_stored,
-            a_lazy_pull_of_a_layer_without_file_digests_is_refused,
             rootfs_plan_of_a_request,
             the_plan_of_a_create_is_the_plan_of_every_start,
             rootfs_plan_of_a_missing_layer_says_its_remedy,
@@ -6739,13 +5912,10 @@ macro_rules! conformance_suite_with {
             collect_keeps_what_it_is_told_to_keep,
             collect_never_removes_what_a_container_or_a_pull_uses,
             read_objects_gives_the_ranges_of_stored_objects,
-            more_ranges_than_a_call_takes_are_read_in_order,
             objects_taken_in_order_are_the_objects_of_open_object,
-            a_range_larger_than_a_pipe_is_read_after_its_reply,
             read_objects_errors_are_typed,
             owners_are_those_of_the_layers,
             usage_adds_up,
-            stores_are_listed_and_dropped_by_a_driver_that_serves_several,
             writable_layer_lifecycle,
             writable_layer_owner_and_limits,
             writable_root_is_the_root_of_the_layer,

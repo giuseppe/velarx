@@ -10,10 +10,7 @@
 //! driver owns the store: it says what it lacks ([`Incoming::wants`], which
 //! for composefs and vfs is [`Session::have`], asked for each file as the
 //! plan of the layer is made) and it receives the bytes in the files of its
-//! own staging session (`Stage`).  A driver
-//! whose store is not the engine's files (the `varlink` driver) implements
-//! [`Incoming`] with files it hands over and answers the same questions
-//! from the other side of a socket.
+//! own staging session (`Stage`).
 //!
 //! The flow of [`StorageDriver::pull`]:
 //!
@@ -120,9 +117,7 @@ pub trait Incoming: Send + Sync {
     /// store to say it has it).
     fn wants(&self, key: &str, size: u64) -> bool;
 
-    /// The id of this pull: what the engine's hold on it is named by, and
-    /// what a driver whose store is in another process calls the pull
-    /// (`BeginPull`).  A random id made for each attempt (a v4 UUID, 122
+    /// The id of this pull: what the engine's hold on it is named by.  A random id made for each attempt (a v4 UUID, 122
     /// random bits: [`new_pull_id`], or for a driver of the engine's process
     /// the name of its staging session, `pull-` and a v4 UUID), never one that
     /// another pull, in this process or in
@@ -327,7 +322,7 @@ pub fn prove_by_read_back(
 
 /// [`prove_by_read_back`] with the objects read by `objects`: for a driver
 /// that reads the objects a pull staged, which it has not committed yet,
-/// with the id of the pull (a client of a driver in another process).
+/// with the id of the pull.
 pub fn prove_with(
     name: &str,
     objects: Arc<dyn velarx_storage::ObjectOpener>,
@@ -807,9 +802,8 @@ impl ContentFeed {
         };
         let total: u64 = held.keys.iter().map(|(_, s)| s).sum();
         // (what the layer read whole is: its table of contents and tar-split
-        // are shared with the spool, not copied; a stage of this process
-        // records the layer from it, a driver in another process was given
-        // them with `Index` and takes only the report)
+        // are shared with the spool, not copied; the stage records the
+        // layer from it)
         let ingested = held.ingested.clone();
         let mut done = pull::whole_done(&layer.descriptor, ingested);
         done.blob_checked = held.blob_checked;

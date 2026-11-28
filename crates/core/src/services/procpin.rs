@@ -178,7 +178,7 @@ mod tests {
     velarx_graph::forward_storage_driver! {
         impl StorageDriver for CannotTell {
             inner: inner;
-            forward: [name graph_name capabilities graph_data status pull has_layers repair remake_staged read_objects open_object objects_in_order collect release_engine_copies remove_image image_volume_create mounts image_view holds_objects leftovers check writable_create writable_paths writable_root writable_size writable_remove writable_release writable_exists diff changes apply stopped_view usage list_stores drop_store lock_unused_layers];
+            forward: [name graph_name capabilities graph_data status pull has_layers repair remake_staged read_objects open_object objects_in_order collect remove_image image_volume_create mounts image_view leftovers check writable_create writable_paths writable_root writable_size writable_remove writable_exists diff changes apply stopped_view usage lock_unused_layers];
             fn is_root_of(&self, _w: &Writable, _proc_dir: &Path) -> velarx_graph::DriverResult<bool> {
                 Err(velarx_graph::DriverError::of(
                     "test",

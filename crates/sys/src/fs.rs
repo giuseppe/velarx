@@ -272,7 +272,7 @@ pub fn open_beneath(
 }
 
 /// [`open_beneath`] with more resolve flags: `RESOLVE_NO_XDEV` for a
-/// directory that is one mount (an image a storage service mounted), whose
+/// directory that is one mount (a mounted image), whose
 /// names never lead into another mount (`EXDEV`).
 pub fn open_beneath_with(
     dir: BorrowedFd<'_>,

@@ -728,26 +728,9 @@ fn removing_of(plan: &SettlePlan, volumes: &[settle::remove::Volume]) -> confine
         .chain(r.lock_files.iter())
         .filter_map(|f| f.parent().map(std::path::Path::to_path_buf))
         .collect();
-    let mut unix_dirs = Vec::new();
-    match &r.writable {
-        velarx_graph::WritableRelease::InBundle { pin } => {
-            file_dirs.extend(
-                pin.iter()
-                    .filter_map(|p| p.parent().map(std::path::Path::to_path_buf)),
-            );
-        }
-        velarx_graph::WritableRelease::Service { socket, pin, .. } => {
-            unix_dirs.extend(socket.parent().map(std::path::Path::to_path_buf));
-            file_dirs.extend(
-                pin.iter()
-                    .filter_map(|p| p.parent().map(std::path::Path::to_path_buf)),
-            );
-        }
-    }
     file_dirs.sort();
     file_dirs.dedup();
     confine::Removing {
-        unix_dirs,
         recording: recording_of(plan),
         trees,
         file_dirs,
@@ -833,7 +816,6 @@ mod tests {
                 volumes_dir: dir.join("volumes"),
                 volumes_lock: dir.join("volumes.lock"),
                 lock_files: Vec::new(),
-                writable: velarx_graph::WritableRelease::InBundle { pin: None },
             },
             image: None,
             pod: None,

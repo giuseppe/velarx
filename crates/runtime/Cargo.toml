@@ -41,8 +41,6 @@ velarx-confine-core = { path = "../confine-core" }
 velarx-netkernel = { path = "../netkernel" }
 velarx-netdetach = { path = "../netdetach" }
 velarx-storage = { path = "../storage" }
-velarx-storage-client = { path = "../storage-client" }
-velarx-graph = { path = "../graph" }
 velarx-content = { path = "../content" }
 velarx-fuse = { path = "../fuse" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process", "net", "signal", "fs", "io-util", "io-std"] }

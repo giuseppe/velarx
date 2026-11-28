@@ -442,9 +442,6 @@ pub struct Removing {
     pub trees: Vec<PathBuf>,
     /// Directories a file is removed from
     pub file_dirs: Vec<PathBuf>,
-    /// The directories of the unix sockets it connects to (the storage
-    /// service, which removes the layer it holds)
-    pub unix_dirs: Vec<PathBuf>,
     /// The monitor is root: it has the capability to remove what a container
     /// left unreadable; else the removal makes it readable first
     pub root: bool,
@@ -465,9 +462,6 @@ pub fn remove_thread(reach: &Removing) -> io::Result<()> {
     }
     for d in &reach.file_dirs {
         rules.push((d.as_path(), sys::fs::REMOVE_FILE, false));
-    }
-    for d in &reach.unix_dirs {
-        rules.push((d.as_path(), sys::fs::RESOLVE_UNIX, false));
     }
     landlock_rules(&rules)?;
     sys::seccomp_thread(remove_filter(reach.root))
@@ -525,7 +519,6 @@ mod tests {
                 recording,
                 trees: Vec::new(),
                 file_dirs: Vec::new(),
-                unix_dirs: Vec::new(),
                 root: false,
             })
             .is_err());
@@ -891,7 +884,6 @@ mod tests {
             recording,
             trees: vec![p("bundle")],
             file_dirs: Vec::new(),
-            unix_dirs: Vec::new(),
             root,
         };
         let abi = sys::landlock_abi();

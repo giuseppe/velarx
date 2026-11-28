@@ -996,9 +996,9 @@ impl Database {
             .await?)
     }
 
-    /// This database with the files of its layers read from `source`: the
-    /// storage driver that keeps them, or a directory (for the tests of a
-    /// database in memory, and of a store made apart).  The clones of the
+    /// This database with the files of its layers read from `source`: a
+    /// directory (for the tests of a database in memory, and of a store made
+    /// apart).  The clones of the
     /// database have it too.
     pub fn with_layer_files(self, source: Arc<dyn layer_files::Source>) -> Self {
         *self.files.write().unwrap_or_else(|e| e.into_inner()) = Some(source);

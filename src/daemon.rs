@@ -1262,14 +1262,6 @@ async fn build_core(
     .with_verity_chain(config.storage.verity_chain)
     .with_verity_best_effort(config.storage.fsverity_best_effort)
     .with_vfs_ignore_chown_errors(config.storage.vfs_ignore_chown_errors);
-    // the storage service of the varlink driver is connected to now: one that
-    // is not there is an error that says to start it, never a wait
-    if driver == velarx_config::StorageDriverKind::Varlink {
-        let options = velarx_core::storage_driver::VarlinkOptions::of(&config.storage);
-        image_service =
-            velarx_core::storage_driver::blocking(|| image_service.with_varlink(options))
-                .map_err(|e| anyhow::anyhow!("[storage] driver = \"varlink\": {e}"))?;
-    }
     // The fetchers of the pulls but the registry fetcher
     image_service = image_service.with_fetchers(config.sources.external.clone());
     // a lazy pull outlives the command that made it: it is the engine

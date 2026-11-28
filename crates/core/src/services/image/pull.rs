@@ -1056,8 +1056,7 @@ impl ImageService {
     /// signatures are added to the staged ones, and an eager pull completes
     /// it (the files are not fetched a second time).  A pull that failed is
     /// not joined: it is discarded, as joining it would fail again on what
-    /// it lacks (a layer lost from the storage service), and the new pull
-    /// starts over; unless a container is made on it, whose files its
+    /// it lacks, and the new pull starts over; unless a container is made on it, whose files its
     /// staging serves.  None: there is no such pull.
     async fn join_staged(
         &self,
@@ -1989,19 +1988,13 @@ impl ImageService {
             let (progress_tx, handle) = (s.progress.clone(), tokio::runtime::Handle::current());
             let manifest_alg = s.manifest_digest.alg();
             let mut early = s.made;
-            let holds_objects = self.storage.holds_objects();
             Box::new(move |pulled: &mut Vec<LayerDone>, objects| {
                 // (each layer of the image is under the key it was asked by)
                 let layer_keys = expected;
                 let done: HashMap<&LayerKey, &LayerDone> =
                     pulled.iter().map(|p| (&p.key, p)).collect();
                 let stored = |d: &LayerKey| handle.block_on(db.get_layer(d));
-                // (the merged EROFS is made of the files of the engine's
-                // own store: a driver that keeps its own has none to make it
-                // of, and the manifest's statement of it is not checked; the
-                // layers' own digests are)
                 let merged = (seal || !seal::expected(&manifest)?.is_empty())
-                    && holds_objects
                     && !pulled.iter().any(|p| p.lazy);
                 let mut merged_id = None;
                 if merged {
@@ -2190,8 +2183,8 @@ mod opened_tests {
     }
 
     /// The verdict a driver returns (of an eager pull, and of the completion
-    /// of a lazy one into a storage service) is opened only with the id of
-    /// the check that sealed it.
+    /// of a lazy one) is opened only with the id of the check that sealed
+    /// it.
     #[test]
     fn a_verdict_is_opened_only_with_the_id_of_its_check() {
         let check = CheckId::fresh();
@@ -2410,8 +2403,7 @@ mod stored_tests {
                     fsverity: service.fsverity,
                 },
                 &service.driver_options(),
-            )
-            .unwrap();
+            );
             let stored = service.stored_layers(&keys, &config).await.unwrap();
             assert!(
                 stored.iter().all(|ok| !ok),

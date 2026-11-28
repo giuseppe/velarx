@@ -181,9 +181,6 @@ shutdown_timeout_secs = 30
 # this key, the driver of the store, "composefs" for a new one.  An unknown
 # name is an error that lists the known ones.  (--storage-driver also takes
 # "overlay", the name reported for composefs, which chooses nothing.)
-# The third driver, "varlink", passes the storage to a program of its own that
-# serves org.velarx.Storage on a unix socket ([storage.varlink] below;
-# docs/STORAGE.md): it is never chosen for you either.
 # driver = "composefs"
 # Enable fs-verity on the stored files (kernel 5.4+ and a file system that
 # has it); without it the files are not protected against changes
@@ -276,33 +273,6 @@ composefs_digests = "check"
 #           digest and no accepted signature) is refused with the reason, and
 #           `--security-opt verity=off` is refused
 verity_chain = "auto"
-
-# The storage service of `driver = "varlink"` (refused with another driver).
-# The engine connects to it when it starts: a service that is not running,
-# or that speaks another version of org.velarx.Storage, is an error that says
-# so and what to do.  It must be run by the engine's user or root (checked on
-# every connection: a socket another user put at the path is refused).  The
-# options the service does not advertise (fs-verity enforced while a container
-# runs, read-only image stores, a lazy pull, a quota of the writable layer...)
-# are refused up front, naming the driver.  `system prune --all --volumes` that leaves nothing in the store tells
-# the service to drop it.
-# Running a service (a unit, rootless and root), what it cannot do yet and what
-# the engine trusts of it: docs/STORAGE.md, "Running a storage service", and
-# docs/THREAT-MODEL.md, "A storage service".
-[storage.varlink]
-# The unix socket of the service: an absolute path, required
-# socket = "/run/user/1000/velarx-storage/storage.sock"
-# How long a call may be silent before it fails, in seconds (2 to 86400).
-# A long call (making a root, a pull, a collection, a check) is answered with
-# progress at least every half of it; the others (HasLayers, Commit,
-# RemoveImage, Usage, DropStore...) must be answered whole within it: raise it
-# for a service whose store is large.  No call lasts more than a day (or four
-# times this, when that is longer), whatever progress the service sends
-timeout_secs = 60
-# The name the service must give itself (its GetInfo `name`: 1 to 64 letters,
-# digits, `.`, `_`, `-`); another is refused, which tells a socket that is not
-# the expected service.  Unset: any
-# name = "velarx-storage-server"
 
 [pull]
 # Layers fetched at the same time

@@ -167,10 +167,7 @@ impl Completions {
                 service: service.clone(),
                 activity: self.activity.clone(),
                 keep: None,
-                core: Core::new(Cfg {
-                    driver_pulls: !service.storage.holds_objects(),
-                    ..self.cfg
-                }),
+                core: Core::new(self.cfg),
                 pulls: HashMap::new(),
                 next_pull: 0,
                 parts: HashMap::new(),

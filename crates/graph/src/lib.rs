@@ -21,8 +21,7 @@
 //! reproducible EROFS image for each layer made at pull time, and the
 //! overlay, the kernel's for root and FUSE for the rest, the monitor makes of
 //! them), `vfs` (`crates/vfs`, podman's driver of that name: a full copy of
-//! the layers for each container) and `varlink` (a driver in a program of its
-//! own behind `org.velarx.Storage`, such as `velarx-storage-server`).
+//! the layers for each container).
 //!
 //! What stays in the engine (`services::image` and friends), whatever the
 //! driver: the registry transport and the fetchers, the manifests and
@@ -96,8 +95,7 @@
 //! the objects of the store service and the scan of the objects for leftovers.
 //! What the engine records of a layer is [`LayerArtifact`] (the columns `erofs`
 //! and `owners`, which the engine still reads for the digests a start checks).
-//! `docs/STORAGE.md` has the whole interface, with the wire call or the
-//! engine-side form of every method.
+//! `docs/STORAGE.md` describes the interface.
 
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -118,12 +116,9 @@ pub mod cpview;
 pub mod directory;
 pub mod feed;
 pub mod imagecopy;
-pub mod keep;
-pub mod longcall;
 pub mod negotiate;
 pub mod objects;
 pub mod prefs;
-pub mod stores;
 pub mod unused;
 pub use blocking::blocking;
 pub use cpview::StoppedView;
@@ -135,7 +130,6 @@ pub use feed::{
 };
 pub use imagecopy::TreeSource;
 pub use prefs::Prefs;
-pub use stores::{StoreId, StoreInfo};
 
 pub mod forward;
 
@@ -193,31 +187,6 @@ pub struct MountCaps {
     pub idmap: Prefs<IdmapWay>,
 }
 
-/// The limits of the interface that the engine applies to a driver, and that
-/// a driver states in `GetInfo` (`limits`).  A request that would exceed one
-/// is split by the engine, never sent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Limits {
-    /// The most bytes of one message (the JSON of a call or a reply).
-    pub message: usize,
-    /// The most descriptors of one message.
-    pub fds: usize,
-    /// The most layers one `Fetch` asks for.
-    pub wants: usize,
-    /// The most ranges of one `ReadObjects`.
-    pub ranges: usize,
-}
-
-impl Limits {
-    /// The limits of version 2 of the interface.
-    pub const V1: Limits = Limits {
-        message: velarx_wire::varlink::MAX_MESSAGE,
-        fds: velarx_wire::varlink::MAX_FDS,
-        wants: 4096,
-        ranges: 4096,
-    };
-}
-
 /// What a driver can do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
@@ -263,8 +232,6 @@ pub struct Capabilities {
     /// The images mounted in a container (`--mount type=image`); none: the
     /// driver has no such mount and `negotiate` refuses it up front.
     pub volume: Option<MountCaps>,
-    /// The limits of the calls the engine makes to it.
-    pub limits: Limits,
 }
 
 /// What the engine records with a layer of what the driver made of it (the
@@ -315,7 +282,7 @@ impl ProblemKind {
         ProblemKind::ObjectDiffers,
     ];
 
-    /// The name of the kind: what `system check` reports and the wire carries.
+    /// The name of the kind: what `system check` reports.
     pub fn as_str(self) -> &'static str {
         match self {
             ProblemKind::ArtifactMissing => "artifact_missing",
@@ -333,18 +300,6 @@ impl ProblemKind {
             ProblemKind::ObjectDiffers => "object_differs",
         }
     }
-
-    /// The kind a name stands for.  A name this build does not know is an
-    /// error that names it (a `Storage` one), never a protocol error: a
-    /// driver of a later version may have more kinds.
-    pub fn from_wire(driver: &str, name: &str) -> DriverResult<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|k| k.as_str() == name)
-            .ok_or_else(|| {
-                DriverError::unknown_value(driver, "the problem kind", format!("{name:?}"))
-            })
-    }
 }
 
 /// A problem a check found with what a driver made of an image.
@@ -354,8 +309,7 @@ pub struct Problem {
     pub message: String,
     /// The layer it is about, when it is about one.
     pub layer: Option<LayerKey>,
-    /// The file it is about, when the driver has one (a remote store has
-    /// none to name).
+    /// The file it is about, when the driver has one.
     pub path: Option<PathBuf>,
     /// Making the artifacts again mends it (not a manifest that states
     /// another digest).
@@ -408,22 +362,6 @@ pub struct Keep {
     /// collection holds it exclusively), so this only covers what a crash
     /// left.
     pub grace: std::time::Duration,
-}
-
-/// What still needs the copy of its own files that a driver with a lazy phase
-/// keeps of the layers of an image that was pulled lazily
-/// ([`StorageDriver::release_engine_copies`]).
-#[derive(Debug, Clone, Default)]
-pub struct EngineHeld {
-    /// The containers that exist, by id: one whose root the driver serves
-    /// itself needs the copy of the layers of its image for as long as it
-    /// exists.
-    pub containers: Vec<String>,
-    /// The layers of the pulls in progress: a container can still be made on
-    /// them.
-    pub layers: Vec<LayerKey>,
-    /// The files those layers name (by fs-verity digest).
-    pub files: std::collections::HashSet<String>,
 }
 
 /// What keeps layers from being used while they are removed
@@ -568,29 +506,6 @@ pub struct MountsRequest<'a> {
     pub volumes: Vec<MountRequest<'a>>,
 }
 
-impl MountsRequest<'_> {
-    /// The container the mounts are of (none when nothing is asked): the
-    /// one `Mounts` call of the wire names.  Mounts of two containers in one
-    /// request are an error, never sent as the first one's.
-    pub fn container(&self, driver: &str) -> DriverResult<Option<&Writable>> {
-        let mut all = self.root.iter().chain(&self.volumes).map(|m| m.container);
-        let Some(first) = all.next() else {
-            return Ok(None);
-        };
-        match all.find(|w| w.id() != first.id() || w.bundle() != first.bundle()) {
-            Some(other) => Err(DriverError::storage(
-                driver,
-                format!(
-                    "one request asks for mounts of the containers {} and {}",
-                    first.id(),
-                    other.id()
-                ),
-            )),
-            None => Ok(Some(first)),
-        }
-    }
-}
-
 /// What [`StorageDriver::mounts`] answers: the root file system when it was
 /// asked, and the volumes in the order they were asked.
 #[derive(Debug, Default)]
@@ -636,9 +551,7 @@ pub struct Rootfs {
     /// Whether the label that was asked is on it.
     pub label: LabelDone,
     /// What enforces the digests of what is mounted.  Not
-    /// [`VerityDone::None`] only from a driver of the engine's own process
-    /// (a driver reached over the wire never claims it: the engine cannot
-    /// check what it did), and exactly for a [`RootfsPlan::MountFd`] when the
+    /// [`VerityDone::None`] exactly for a [`RootfsPlan::MountFd`] when the
     /// request was [`VerityAsk::Enforce`] (the engine refuses a mount that
     /// carries none then; the other kinds of plan are measured by the
     /// monitor).
@@ -648,8 +561,8 @@ pub struct Rootfs {
     /// layers, each one of the digests the request accepted for it.  The
     /// engine checks that, and says the links of the chain of trust from it.
     pub measured: Vec<String>,
-    /// A process that serves the mount (a file system server), as a pidfd:
-    /// in-process drivers only, never on the wire.  The engine refuses an
+    /// A process that serves the mount (a file system server), as a pidfd.
+    /// The engine refuses an
     /// answer that has one until it can place the process with the monitor.
     pub server: Option<std::os::fd::OwnedFd>,
 }
@@ -681,64 +594,10 @@ impl From<RootfsPlan> for Rootfs {
     }
 }
 
-/// The descriptors of the reply of a call that hands over several mounts,
-/// given to the mounts by the position each says it has among the descriptors
-/// of the reply (the wire's `Mounted.fd`): a position that is out of the
-/// reply, used twice, or a descriptor no mount names, is an error (a reply
-/// that numbers its mounts wrongly is refused, never guessed at).
-pub fn assign_fds(
-    driver: &str,
-    positions: &[Option<usize>],
-    fds: Vec<std::os::fd::OwnedFd>,
-) -> DriverResult<Vec<Option<std::os::fd::OwnedFd>>> {
-    let mut slots: Vec<Option<std::os::fd::OwnedFd>> = fds.into_iter().map(Some).collect();
-    let total = slots.len();
-    let mut out = Vec::with_capacity(positions.len());
-    for (n, p) in positions.iter().enumerate() {
-        let Some(p) = p else {
-            out.push(None);
-            continue;
-        };
-        let fd = slots.get_mut(*p).ok_or_else(|| {
-            DriverError::storage(
-                driver,
-                format!("mount {n} names the descriptor {p}, and the reply has {total}"),
-            )
-        })?;
-        out.push(Some(fd.take().ok_or_else(|| {
-            DriverError::storage(driver, format!("the descriptor {p} is named by two mounts"))
-        })?));
-    }
-    if let Some(left) = slots.iter().position(Option::is_some) {
-        return Err(DriverError::storage(
-            driver,
-            format!("the descriptor {left} of the reply is named by no mount"),
-        ));
-    }
-    Ok(out)
-}
-
 /// The writable layer of one container: what the driver is asked to make,
 /// find, measure and remove.  It names the container and its bundle; where
 /// the layer is, and what it is made of, is the driver's to say
 /// ([`StorageDriver::writable_paths`]): the engine never builds those paths.
-/// What it takes to remove the writable layer of a container without the
-/// driver: the monitor of an `--rm` container does it from its own thread.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum WritableRelease {
-    /// It goes with the bundle (composefs, vfs); `pin`: the pin of the lazy
-    /// phase of the engine, which goes with it
-    InBundle { pin: Option<PathBuf> },
-    /// The storage service holds it: `RemoveRoot` of the store `store`
-    /// through `socket`, and then the pin of the container (the lazy phase of
-    /// the engine) when there is one
-    Service {
-        socket: PathBuf,
-        timeout_secs: u64,
-        store: String,
-        pin: Option<PathBuf>,
-    },
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Writable {
@@ -1007,8 +866,7 @@ impl ChangesDir {
 }
 
 /// What mends an artifact that is missing or wrong, a volume that is gone or a
-/// layer the store does not have: the words of the message end with it, and
-/// the wire carries its name (`pull_again`, `repair`, `recreate_container`).
+/// layer the store does not have: the words of the message end with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Remedy {
     /// The image is pulled again.
@@ -1033,24 +891,6 @@ impl Remedy {
             }
         }
     }
-
-    /// The name of the remedy on the wire.
-    pub fn wire_name(self) -> &'static str {
-        match self {
-            Remedy::PullAgain => "pull_again",
-            Remedy::Repair => "repair",
-            Remedy::RecreateContainer => "recreate_container",
-        }
-    }
-
-    /// The remedy a wire name stands for; none for a name this build does not
-    /// know (the error is then a plain `Storage` one, see
-    /// [`DriverError::from_wire`]).
-    pub fn from_wire_name(name: &str) -> Option<Self> {
-        [Remedy::PullAgain, Remedy::Repair, Remedy::RecreateContainer]
-            .into_iter()
-            .find(|r| r.wire_name() == name)
-    }
 }
 
 /// Why a driver failed.  The message is what the user reads (it carries the
@@ -1065,14 +905,8 @@ pub struct DriverError {
     message: String,
 }
 
-/// The kinds of error of a driver.  A remote driver sends `Missing`,
-/// `Corrupt`, `Unsupported`, `NotFound`, `Busy`, `LabelRefused`, `Unavailable` (its own
-/// backend does not answer) and `Storage` (the last one for every error name
-/// the client does not know); `Unavailable` (connect refused, the socket
-/// gone), `TimedOut` and `ProtocolMismatch` are also what the client makes of
-/// a failed transport;
-/// `Contradicted`, `DigestEnforced` and `Refused` are verdicts of the engine
-/// and a driver never sends them.
+/// The kinds of error of a driver.  `Contradicted`, `DigestEnforced` and
+/// `Refused` are verdicts of the engine.
 #[derive(Debug)]
 pub enum DriverErrorKind {
     /// An artifact is not there or not recorded; `remedy` mends it.
@@ -1096,15 +930,6 @@ pub enum DriverErrorKind {
     /// image mount (this user may not put it on a file, or the policy
     /// refuses it): another label, or none, is asked.
     LabelRefused,
-    /// The backend cannot be reached (connection refused, socket gone): the
-    /// storage service is started.
-    Unavailable,
-    /// The backend did not answer within the deadline (`[storage.varlink]
-    /// timeout_secs`).
-    TimedOut,
-    /// The backend speaks another version of the interface: one side is
-    /// upgraded.
-    ProtocolMismatch,
     /// An operation of the file system failed.
     Io(std::io::Error),
     /// The engine's own verdict (a check it handed to the driver), passed
@@ -1179,87 +1004,6 @@ impl DriverError {
         Self::new(driver, DriverErrorKind::Refused(Box::new(e)), None, message)
     }
 
-    /// The backend does not answer the connection.
-    pub fn unavailable(driver: &str, what: impl std::fmt::Display) -> Self {
-        Self::new(
-            driver,
-            DriverErrorKind::Unavailable,
-            None,
-            format!("{what}: start the storage service"),
-        )
-    }
-
-    /// The backend did not answer `call` within `secs` seconds.
-    pub fn timed_out(driver: &str, call: &str, secs: u64) -> Self {
-        Self::new(
-            driver,
-            DriverErrorKind::TimedOut,
-            None,
-            format!("the storage service did not answer {call} in {secs} s: raise `[storage.varlink] timeout_secs`, or look at why the service is slow"),
-        )
-    }
-
-    /// The backend speaks `theirs`, this build `ours`.
-    pub fn protocol_mismatch(driver: &str, theirs: &str, ours: &str) -> Self {
-        Self::new(
-            driver,
-            DriverErrorKind::ProtocolMismatch,
-            None,
-            format!("the storage service speaks {theirs} and velarx {ours}: upgrade the driver or velarx so that both speak the same"),
-        )
-    }
-
-    /// A value of an enum in a reply that this build does not know (a driver
-    /// of a later minor version): a `Storage` error that names it, never a
-    /// protocol error.  The engine asks only for what it can take, so a driver
-    /// that answers another value says it cannot do what was asked.
-    pub fn unknown_value(driver: &str, what: &str, value: impl std::fmt::Display) -> Self {
-        Self::storage(
-            driver,
-            format!("the storage service answered {what} {value}, which this version of velarx does not know"),
-        )
-    }
-
-    /// The error a remote driver sent, by the name it gave it: `missing` and
-    /// `corrupt` with their `remedy` (a name this build does not know is
-    /// none: `Repair` is not assumed), `unsupported`, `not_found`, `busy`,
-    /// `unavailable` (the driver's own backend does not answer) and `failed`.
-    /// Any other name, and one the engine alone gives (`contradicted`,
-    /// `digest_enforced`, `refused`), is a `Storage` error that names it.
-    pub fn from_wire(
-        driver: &str,
-        name: &str,
-        reason: &str,
-        layer: Option<&str>,
-        remedy: Option<&str>,
-    ) -> Self {
-        let remedy = remedy.and_then(Remedy::from_wire_name);
-        let kind = match (name, remedy) {
-            ("missing", Some(remedy)) => DriverErrorKind::Missing { remedy },
-            ("corrupt", Some(remedy)) => DriverErrorKind::Corrupt { remedy },
-            ("unsupported", _) => DriverErrorKind::Unsupported,
-            ("not_found", _) => DriverErrorKind::NotFound,
-            ("busy", _) => DriverErrorKind::Busy,
-            ("unavailable", _) => DriverErrorKind::Unavailable,
-            ("label_refused", _) => DriverErrorKind::LabelRefused,
-            ("storage" | "failed", _) => DriverErrorKind::Storage,
-            _ => {
-                return Self {
-                    driver: driver.to_owned(),
-                    kind: DriverErrorKind::Storage,
-                    layer: layer.map(str::to_string),
-                    message: format!("{reason} (the storage service answered {name:?})"),
-                }
-            }
-        };
-        Self {
-            driver: driver.to_owned(),
-            kind,
-            layer: layer.map(str::to_string),
-            message: reason.to_string(),
-        }
-    }
-
     /// The text the user reads.
     pub fn message(&self) -> &str {
         &self.message
@@ -1292,9 +1036,6 @@ impl From<DriverError> for ImageError {
             | DriverErrorKind::Unsupported
             | DriverErrorKind::Busy
             | DriverErrorKind::LabelRefused
-            | DriverErrorKind::Unavailable
-            | DriverErrorKind::TimedOut
-            | DriverErrorKind::ProtocolMismatch
             | DriverErrorKind::Storage => ImageError::Storage(e.message),
             DriverErrorKind::Contradicted => ImageError::Contradicted(e.message),
             DriverErrorKind::DigestEnforced => ImageError::ComposefsDigest(e.message),
@@ -1303,18 +1044,6 @@ impl From<DriverError> for ImageError {
             DriverErrorKind::Refused(e) => *e,
         }
     }
-}
-
-/// The error of a driver that keeps one store, the engine's own, asked to list
-/// or drop one by name.
-fn single_store(driver: &str) -> DriverError {
-    DriverError::of(
-        driver,
-        DriverErrorKind::Unsupported,
-        format!(
-            "the storage driver {driver} keeps the one store of this graph root, which is removed with it, not by name"
-        ),
-    )
 }
 
 /// The result of a driver call.
@@ -1361,40 +1090,10 @@ impl<F: FnMut(usize, &[u8]) -> std::io::Result<()>> ObjectSink for F {
     }
 }
 
-/// [`StorageDriver::read_objects`] for any number of ranges: the list is split
-/// in calls of at most `max` ranges (`Limits::ranges`, which a message of a
-/// remote driver is bounded by), made in order, and `sink` gets the index of
-/// the range in the whole list, the ranges in the order asked.
-pub fn read_objects_in_batches(
-    driver: &dyn StorageDriver,
-    ranges: &[ObjectRange],
-    sink: &mut dyn ObjectSink,
-) -> DriverResult<()> {
-    let max = driver.capabilities().limits.ranges;
-    batches(ranges, max, sink, |batch, sink| {
-        driver.read_objects(batch, sink)
-    })
-}
-
-fn batches(
-    ranges: &[ObjectRange],
-    max: usize,
-    sink: &mut dyn ObjectSink,
-    mut call: impl FnMut(&[ObjectRange], &mut dyn ObjectSink) -> DriverResult<()>,
-) -> DriverResult<()> {
-    for (n, batch) in ranges.chunks(max.max(1)).enumerate() {
-        let first = n * max.max(1);
-        let mut shifted = |range: usize, bytes: &[u8]| sink.data(first + range, bytes);
-        call(batch, &mut shifted)?;
-    }
-    Ok(())
-}
-
 /// The object `key` of `size` bytes as an unnamed temporary file, read with
 /// `read` (a [`StorageDriver::read_objects`]): the default of
 /// [`StorageDriver::open_object`] for a driver whose bytes are not local
-/// files, and what a client of a driver in another process reads a staged
-/// object with.
+/// files.
 pub fn spool_object(
     driver: &str,
     key: &str,
@@ -1572,9 +1271,7 @@ pub trait StorageDriver: Send + Sync + 'static {
     /// its stack.  This is the layer-level "already
     /// stored" question of a pull, answered by the driver and not by the
     /// engine's look at the store: the engine fetches nothing at all of a
-    /// layer the driver has (not even its table of contents), and a driver
-    /// that is not the engine's files (a program behind a socket) says what
-    /// it has by key and diff id.
+    /// layer the driver has (not even its table of contents).
     ///
     /// A layer that is only staged (its pull is not committed: an interrupted
     /// or lazy one), unknown, committed with another diff id than the one
@@ -1614,9 +1311,7 @@ pub trait StorageDriver: Send + Sync + 'static {
     /// they must be the ones the pull recorded.
     async fn remake_staged(&self, pull: &str) -> DriverResult<()>;
 
-    /// Read back the bytes of stored objects: at most `Limits::ranges` ranges
-    /// in one call (the engine splits a longer list with
-    /// [`read_objects_in_batches`]); each range of each object, by
+    /// Read back the bytes of stored objects: each range of each object, by
     /// the key the table of contents of a layer names it by, is given to
     /// `sink` in order.  This is how the engine reads what a driver stores
     /// (it never opens a path of the driver's own): the tar of a layer is
@@ -1651,9 +1346,7 @@ pub trait StorageDriver: Send + Sync + 'static {
     /// The objects of a reader that will take `order` (key and size, each
     /// once) in that order, as [`velarx_storage::ObjectOpener`] reads them
     /// (`ordered`), when that is cheaper than [`StorageDriver::open_object`]
-    /// for each: a driver whose bytes are behind a socket reads the next
-    /// objects of the list with one [`StorageDriver::read_objects`] (up to
-    /// its limits) and hands them over as they are asked for.  The default
+    /// for each.  The default
     /// is `None`: the reader opens each object, a driver of local files
     /// opens them with no copy.  `order` is called only if the driver uses it.
     fn objects_in_order(
@@ -1713,14 +1406,6 @@ pub trait StorageDriver: Send + Sync + 'static {
         image_id: &str,
         layers: &[LayerRecord],
     ) -> DriverResult<Arc<dyn ImageTree>>;
-
-    /// Whether the objects of the layers are files of the engine's own file
-    /// store (`composefs`, `vfs`).  A driver of another process keeps its
-    /// own, which the engine cannot find or check by a path: `system check`
-    /// leaves them to the driver's `check`.
-    fn holds_objects(&self) -> bool {
-        true
-    }
 
     // the writable layer of a container
     //
@@ -1782,13 +1467,6 @@ pub trait StorageDriver: Send + Sync + 'static {
     /// container's image volumes included; nothing is an error when it is not
     /// there.
     fn writable_remove(&self, w: &Writable) -> DriverResult<()>;
-
-    /// How the layer is removed without this driver (see
-    /// [`WritableRelease`]): with the bundle, unless the driver says
-    /// otherwise.
-    fn writable_release(&self, _w: &Writable) -> WritableRelease {
-        WritableRelease::InBundle { pin: None }
-    }
 
     /// Whether the container has a writable layer made (a container that was
     /// never set up has none: it has no changes, and a commit of it makes no
@@ -1852,8 +1530,7 @@ pub trait StorageDriver: Send + Sync + 'static {
     /// (an overlay): for a root that is a mount descriptor or a directory
     /// plan it compares the process's root with the one the monitor attached
     /// (`velarx_wire::monitor::rootid`), since a driver may make a new mount at
-    /// every start, and a later `mounts` is another one.  The method has no
-    /// wire call.
+    /// every start, and a later `mounts` is another one.
     fn is_root_of(&self, w: &Writable, proc_dir: &Path) -> DriverResult<bool>;
 
     // maintenance
@@ -1871,32 +1548,12 @@ pub trait StorageDriver: Send + Sync + 'static {
     /// The files of the driver's own artifacts that nothing accounts for and
     /// that have not changed for `grace` (a pull that runs may be writing
     /// one), with why each is one.  The objects of the engine's store are the
-    /// engine's to scan: a remote driver has no file the engine could name.
+    /// engine's to scan.
     async fn leftovers(&self, grace: std::time::Duration) -> DriverResult<Vec<(PathBuf, String)>>;
 
     /// Remove what the driver holds that is not of what `keep` names, and
     /// what an interrupted pull left.
     fn collect(&self, keep: &Keep) -> DriverResult<Collected>;
-
-    /// Drop the driver's own copy of the files of `layers` (every layer it
-    /// holds a copy of) that nothing in `held` needs: the
-    /// objects and the images of the layers it made while their image was
-    /// being pulled, which a driver in another process has itself once the
-    /// layers are in it.  A copy is dropped only when no container whose root
-    /// the driver serves, and no pull in progress, names the layer; a file a
-    /// layer that stays names too stays.  The caller holds the store lock
-    /// exclusive (no create is between its first call to the driver and its
-    /// row), and calls it again for what an interrupted call left: it can be
-    /// repeated from any point.  A driver with no copy of its own has nothing
-    /// to release.
-    async fn release_engine_copies(
-        &self,
-        layers: &[LayerKey],
-        held: &EngineHeld,
-    ) -> DriverResult<Collected> {
-        let _ = (layers, held);
-        Ok(Collected::default())
-    }
 
     /// Which of `layers` something uses right now (a kernel mount of the
     /// image of the layer, an image server that serves it), found without
@@ -1904,8 +1561,8 @@ pub trait StorageDriver: Send + Sync + 'static {
     /// what a new use would have to take first and gives it back in
     /// [`UnusedLayers::hold`], so the caller removes them with no mount made
     /// meanwhile.  A failure to tell is an error: a layer is never taken for
-    /// unused when it is not known to be.  A driver that mounts nothing (or
-    /// whose layers are in another process, which keeps its own) uses none.
+    /// unused when it is not known to be.  A driver that mounts nothing uses
+    /// none.
     fn lock_unused_layers(&self, layers: &[LayerKey]) -> DriverResult<UnusedLayers> {
         let _ = layers;
         Ok(UnusedLayers::default())
@@ -1914,78 +1571,11 @@ pub trait StorageDriver: Send + Sync + 'static {
     /// What the driver holds on the disk for itself (the engine measures the
     /// content of the images).
     fn usage(&self) -> DriverResult<Usage>;
-
-    /// The stores the driver holds, for the one that serves several (a driver
-    /// in another process, which keeps the data of every engine that connects):
-    /// each with what it takes and when an
-    /// engine last opened it, so that an administrator can find a store that
-    /// no engine opens any more (a graph root that was deleted, and with it the
-    /// file that names the store: [`StoreId`]).  A driver isolates the stores
-    /// by the pair (peer uid, store), and lists those of the caller's uid.  The
-    /// driver of a single store, the engine's own, has nothing to list:
-    /// `Unsupported`.
-    fn list_stores(&self) -> DriverResult<Vec<StoreInfo>> {
-        Err(single_store(self.name()))
-    }
-
-    /// Remove a store and everything the driver holds under it (layers, roots,
-    /// image mounts, staging) and the record that it exists.  Idempotent: a
-    /// store that is not there is dropped.  The caller must be sure no engine
-    /// uses it (a driver refuses a store with a pull or a container in
-    /// progress as `busy`).  `Unsupported` for a driver of a single store.
-    fn drop_store(&self, store: &str) -> DriverResult<()> {
-        let _ = store;
-        Err(single_store(self.name()))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// More ranges than a call takes are split in calls of at most the limit,
-    /// made in order, and the sink gets the index of each range in the whole
-    /// list.
-    #[test]
-    fn many_ranges_are_read_in_calls_of_the_limit() {
-        let ranges: Vec<ObjectRange> = (0..10_000)
-            .map(|n| ObjectRange {
-                key: format!("k{n}"),
-                offset: n,
-                length: 1,
-            })
-            .collect();
-        let mut sizes = Vec::new();
-        let mut got = Vec::new();
-        let mut sink = |range: usize, bytes: &[u8]| {
-            got.push((range, bytes.to_vec()));
-            Ok(())
-        };
-        batches(&ranges, 4096, &mut sink, |batch, sink| {
-            sizes.push(batch.len());
-            for (i, r) in batch.iter().enumerate() {
-                // (the bytes of a range say which range it is)
-                sink.data(i, r.key.as_bytes())
-                    .map_err(|e| DriverError::io("d", e))?;
-            }
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(sizes, [4096, 4096, 1808]);
-        assert_eq!(got.len(), 10_000);
-        for (n, (range, bytes)) in got.iter().enumerate() {
-            assert_eq!((*range, bytes.as_slice()), (n, format!("k{n}").as_bytes()));
-        }
-        // an error ends the read at the call that has it
-        let mut calls = 0;
-        let e = batches(&ranges, 4096, &mut |_: usize, _: &[u8]| Ok(()), |_, _| {
-            calls += 1;
-            Err(DriverError::storage("d", "gone"))
-        });
-        assert!(e.is_err() && calls == 1);
-        // nothing asked, nothing called
-        batches(&[], 4096, &mut |_: usize, _: &[u8]| Ok(()), |_, _| panic!()).unwrap();
-    }
 
     /// The remedy of today's messages is in the text the user reads and is
     /// said by the error; the kinds map to the errors of the engine they
@@ -2037,221 +1627,5 @@ mod tests {
         let e = DriverError::io("composefs", std::io::Error::from_raw_os_error(2));
         assert!(matches!(&e.kind, DriverErrorKind::Io(_)));
         assert_eq!(e.into_io().raw_os_error(), Some(2));
-    }
-
-    /// A remote driver's errors: the names the engine knows give their kind
-    /// and remedy; any other name is a `Storage` error that says it; the
-    /// verdicts of the engine are never taken from a driver.
-    #[test]
-    fn wire_errors_map_to_kinds_and_unknown_names_to_storage() {
-        let e = DriverError::from_wire(
-            "r",
-            "missing",
-            "gone",
-            Some("sha256:ab"),
-            Some("recreate_container"),
-        );
-        assert_eq!(e.remedy(), Some(Remedy::RecreateContainer));
-        assert_eq!(e.layer.as_deref(), Some("sha256:ab"));
-        let e = DriverError::from_wire("r", "corrupt", "bad", None, Some("repair"));
-        assert!(matches!(
-            e.kind,
-            DriverErrorKind::Corrupt {
-                remedy: Remedy::Repair
-            }
-        ));
-        // a remedy this build does not know does not make a Missing one
-        let e = DriverError::from_wire("r", "missing", "gone", None, Some("reboot"));
-        assert!(matches!(e.kind, DriverErrorKind::Storage), "{e:?}");
-        assert!(e.message().contains("\"missing\""), "{e}");
-        assert!(matches!(
-            DriverError::from_wire("r", "busy", "x", None, None).kind,
-            DriverErrorKind::Busy
-        ));
-        // (the driver's own backend does not answer)
-        assert!(matches!(
-            DriverError::from_wire("r", "unavailable", "x", None, None).kind,
-            DriverErrorKind::Unavailable
-        ));
-        for engine_only in [
-            "contradicted",
-            "digest_enforced",
-            "refused",
-            "something_new",
-        ] {
-            let e = DriverError::from_wire("r", engine_only, "x", None, None);
-            assert!(matches!(e.kind, DriverErrorKind::Storage), "{engine_only}");
-            assert!(e.message().contains(engine_only), "{e}");
-        }
-        for r in [Remedy::PullAgain, Remedy::Repair, Remedy::RecreateContainer] {
-            assert_eq!(Remedy::from_wire_name(r.wire_name()), Some(r));
-        }
-        assert!(Remedy::RecreateContainer.text(false).contains("lost"));
-    }
-
-    /// The failures of the transport say what to do, each its own.
-    #[test]
-    fn transport_failures_say_their_remedy() {
-        let e = DriverError::unavailable("r", "connect /run/s.sock: refused");
-        assert!(matches!(e.kind, DriverErrorKind::Unavailable));
-        assert!(e.message().ends_with("start the storage service"));
-        let e = DriverError::timed_out("r", "Collect", 30);
-        assert!(matches!(e.kind, DriverErrorKind::TimedOut));
-        assert!(e.message().contains("Collect") && e.message().contains("timeout_secs"));
-        let e = DriverError::protocol_mismatch("r", "org.velarx.Storage.2", "org.velarx.Storage.1");
-        assert!(matches!(e.kind, DriverErrorKind::ProtocolMismatch));
-        assert!(e.message().contains(".2") && e.message().contains("upgrade"));
-        for e in [
-            DriverError::unavailable("r", "x"),
-            DriverError::timed_out("r", "x", 1),
-            DriverError::protocol_mismatch("r", "a", "b"),
-        ] {
-            assert!(matches!(ImageError::from(e), ImageError::Storage(_)));
-        }
-    }
-
-    /// An unknown problem kind from a driver is a `Storage` error that names
-    /// it; the known ones round-trip.
-    #[test]
-    fn problem_kinds_round_trip_and_unknown_ones_are_named() {
-        for k in ProblemKind::ALL {
-            assert_eq!(ProblemKind::from_wire("r", k.as_str()).unwrap(), k);
-        }
-        let e = ProblemKind::from_wire("r", "new_kind").unwrap_err();
-        assert!(matches!(e.kind, DriverErrorKind::Storage));
-        assert!(e.message().contains("new_kind"));
-    }
-
-    fn fd() -> std::os::fd::OwnedFd {
-        std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap())
-    }
-
-    /// The container of a `Mounts` call is the one every mount names; mounts
-    /// of two containers are refused, whichever comes first.
-    #[test]
-    fn a_mounts_request_is_of_one_container() {
-        let image = ImageRecord {
-            id: "img".into(),
-            manifest_digest: Digest::empty(velarx_types::digest::Algorithm::Sha256),
-            config_digest: Digest::empty(velarx_types::digest::Algorithm::Sha256),
-            manifest: "{}".into(),
-            config: "{}".into(),
-            created_at: String::new(),
-            is_lazy: false,
-        };
-        let (a, b) = (Writable::new("a", "/b/a"), Writable::new("b", "/b/b"));
-        let other_bundle = Writable::new("a", "/elsewhere/a");
-        let m = |w: &'static Writable, purpose| MountRequest {
-            container: w,
-            purpose,
-            image: &image,
-            layers: &[],
-            mapping: None,
-            translate: None,
-            idmap_mount: false,
-            label: None,
-            verity: VerityAsk::Off,
-            volatile: false,
-        };
-        // (leaked: the requests borrow them for the test)
-        let (a, b, other_bundle): (&'static Writable, &'static Writable, &'static Writable) = (
-            Box::leak(Box::new(a)),
-            Box::leak(Box::new(b)),
-            Box::leak(Box::new(other_bundle)),
-        );
-        let vol = |n| Purpose::Volume { index: n };
-        let none = MountsRequest {
-            root: None,
-            volumes: vec![],
-        };
-        assert!(none.container("d").unwrap().is_none());
-        let one = MountsRequest {
-            root: Some(m(a, Purpose::Root)),
-            volumes: vec![m(a, vol(0)), m(a, vol(1))],
-        };
-        assert_eq!(one.container("d").unwrap().unwrap().id(), "a");
-        let volumes_only = MountsRequest {
-            root: None,
-            volumes: vec![m(b, vol(0))],
-        };
-        assert_eq!(volumes_only.container("d").unwrap().unwrap().id(), "b");
-        for mixed in [
-            MountsRequest {
-                root: Some(m(a, Purpose::Root)),
-                volumes: vec![m(a, vol(0)), m(b, vol(1))],
-            },
-            MountsRequest {
-                root: None,
-                volumes: vec![m(b, vol(0)), m(a, vol(1))],
-            },
-            MountsRequest {
-                root: Some(m(a, Purpose::Root)),
-                volumes: vec![m(other_bundle, vol(0))],
-            },
-        ] {
-            let e = mixed.container("d").unwrap_err();
-            assert!(e.message().contains("one request asks"), "{e}");
-        }
-    }
-
-    /// The descriptors of a reply go to the mounts that name them, and a
-    /// reply that numbers them wrongly is refused.
-    #[test]
-    fn descriptors_go_to_the_mounts_that_name_them() {
-        use std::os::fd::AsRawFd;
-        let (a, b) = (fd(), fd());
-        let (ra, rb) = (a.as_raw_fd(), b.as_raw_fd());
-        // (the second mount is a directory: it names none; the third has the
-        // descriptor the first has not)
-        let out = assign_fds("r", &[Some(1), None, Some(0)], vec![a, b]).unwrap();
-        assert_eq!(out[0].as_ref().unwrap().as_raw_fd(), rb);
-        assert!(out[1].is_none());
-        assert_eq!(out[2].as_ref().unwrap().as_raw_fd(), ra);
-        let e = assign_fds("r", &[Some(0), Some(0)], vec![fd(), fd()]).unwrap_err();
-        assert!(e.message().contains("two mounts"), "{e}");
-        let e = assign_fds("r", &[Some(2)], vec![fd()]).unwrap_err();
-        assert!(e.message().contains("names the descriptor 2"), "{e}");
-        let e = assign_fds("r", &[Some(0)], vec![fd(), fd()]).unwrap_err();
-        assert!(e.message().contains("named by no mount"), "{e}");
-        assert!(assign_fds("r", &[None], vec![]).unwrap()[0].is_none());
-    }
-
-    /// Every method of the trait has a wire call or a stated engine-side form
-    /// in the table of `docs/STORAGE.md`, and the table names no method the
-    /// trait lacks.
-    #[test]
-    fn every_method_of_the_trait_is_in_the_interface_table() {
-        let source = include_str!("lib.rs");
-        let trait_text = &source[source.find("pub trait StorageDriver").unwrap()..];
-        let trait_text = &trait_text[..trait_text.find("\n}\n").unwrap()];
-        let methods: Vec<&str> = trait_text
-            .lines()
-            .filter_map(|l| {
-                let l = l.strip_prefix("    ")?;
-                let l = l.strip_prefix("async ").unwrap_or(l);
-                let name = l.strip_prefix("fn ")?;
-                Some(&name[..name.find(['(', '<'])?])
-            })
-            .collect();
-        assert!(methods.len() > 25, "{methods:?}");
-        let doc = include_str!("../../../docs/STORAGE.md");
-        let table = &doc[doc.find("### Trait method to wire call").unwrap()..];
-        let table = &table[..table.find("What is not in the trait").unwrap()];
-        for m in &methods {
-            assert!(
-                table.contains(&format!("`{m}`")),
-                "docs/STORAGE.md does not say what the varlink client does for `{m}`"
-            );
-        }
-        // and what the table names is a method
-        for row in table.lines().filter(|l| l.starts_with("| `")) {
-            let cell = row.trim_start_matches('|').split('|').next().unwrap();
-            for name in cell.split(',').map(|n| n.trim().trim_matches('`')) {
-                assert!(
-                    methods.contains(&name),
-                    "the table names `{name}`, which is no method of the trait"
-                );
-            }
-        }
     }
 }

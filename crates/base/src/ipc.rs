@@ -16,17 +16,6 @@ fn me() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-/// Whether `name` is a name a service gives itself: 1 to 64 letters, digits,
-/// `.`, `_` or `-`, never text that could pass for another line or a
-/// terminal's escape (the storage service's, `[storage.varlink] name`).
-pub fn is_service_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
 pub use velarx_proto::trusted_uid;
 
 /// What a failed `accept` asks of the loop that called it.

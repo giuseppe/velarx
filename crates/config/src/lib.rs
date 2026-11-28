@@ -980,10 +980,6 @@ pub struct StorageConfig {
     /// Unset: the one of the store, `composefs` for a new one.
     #[serde(default)]
     pub driver: Option<String>,
-    /// The storage service of the `varlink` driver (`socket`, `timeout_secs`,
-    /// `name`); refused with another driver.
-    #[serde(default)]
-    pub varlink: Option<VarlinkStorage>,
     #[serde(default = "default_gc_interval")]
     pub gc_interval_secs: u64,
     /// Enable fs-verity for stored files (requires kernel 5.4+ and supported filesystem)
@@ -1066,40 +1062,6 @@ pub enum VerityChain {
     Require,
 }
 
-/// `[storage.varlink]`: the program that serves `org.velarx.Storage` for the
-/// `varlink` driver.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VarlinkStorage {
-    /// The unix socket the service listens on: an absolute path, required.
-    /// The service must be run by the user of the engine, or root.
-    #[serde(default)]
-    pub socket: Option<PathBuf>,
-    /// How long a call may be silent before it fails.  A call that can take
-    /// longer (creating a root, a pull, a collection, a check) is answered with
-    /// progress at least every half of it; the others (`HasLayers`,
-    /// `Commit`, `RemoveImage`, `Usage`, `DropStore`...) must be answered
-    /// within it whole.
-    #[serde(default = "default_varlink_timeout")]
-    pub timeout_secs: u64,
-    /// The name the service must give itself in its `GetInfo`: a service that
-    /// says another is refused (a socket that is not the one expected).
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
-/// The default of `[storage.varlink] timeout_secs`.
-pub const VARLINK_TIMEOUT_SECS: u64 = 60;
-/// The least `[storage.varlink] timeout_secs`: a service sends progress every
-/// half of it.
-pub const VARLINK_TIMEOUT_MIN_SECS: u64 = 2;
-/// The most `[storage.varlink] timeout_secs`.
-pub const VARLINK_TIMEOUT_MAX_SECS: u64 = 86400;
-
-fn default_varlink_timeout() -> u64 {
-    VARLINK_TIMEOUT_SECS
-}
-
 /// The storage drivers this build has, by the name of `[storage] driver`.
 /// Adding one adds a variant: every `match` on it stops compiling until the
 /// driver is handled there.
@@ -1111,14 +1073,11 @@ pub enum StorageDriverKind {
     /// A full copy of the files of the image for each container (podman's vfs
     /// driver).  An explicit choice, never a default.
     Vfs,
-    /// A program of its own that serves `org.velarx.Storage` on a unix socket
-    /// (`[storage.varlink]`).  An explicit choice, never a default.
-    Varlink,
 }
 
 impl StorageDriverKind {
     /// Every driver of this build.
-    pub const ALL: &'static [StorageDriverKind] = &[Self::Composefs, Self::Vfs, Self::Varlink];
+    pub const ALL: &'static [StorageDriverKind] = &[Self::Composefs, Self::Vfs];
     /// The driver of a store that was made without choosing one.
     pub const DEFAULT: Self = Self::Composefs;
 
@@ -1127,7 +1086,6 @@ impl StorageDriverKind {
         match self {
             Self::Composefs => "composefs",
             Self::Vfs => "vfs",
-            Self::Varlink => "varlink",
         }
     }
 
@@ -1220,62 +1178,6 @@ fn default_fsverity() -> bool {
 }
 
 impl StorageConfig {
-    /// `[storage.varlink]` against `[storage] driver`: the table is for the
-    /// `varlink` driver alone, which needs it (an absolute `socket`) and
-    /// bounds its `timeout_secs` and `name`.  A driver not yet named (the
-    /// store's own is used) is not judged: the daemon asks again once it is.
-    pub fn validate_varlink(&self) -> Result<(), ConfigError> {
-        let invalid = |msg: String| Err(ConfigError::Invalid(msg));
-        let Some(driver) = self.requested_driver()? else {
-            return Ok(());
-        };
-        let Some(v) = &self.varlink else {
-            return if driver == StorageDriverKind::Varlink {
-                invalid(
-                    "[storage] driver = \"varlink\" needs [storage.varlink] with socket = \"/path\""
-                        .into(),
-                )
-            } else {
-                Ok(())
-            };
-        };
-        if driver != StorageDriverKind::Varlink {
-            return invalid(format!(
-                "[storage.varlink] is set and the storage driver is {driver}: it is for \
-                 [storage] driver = \"varlink\" alone (remove it, or ask for that driver)"
-            ));
-        }
-        match &v.socket {
-            None => {
-                return invalid(
-                    "[storage.varlink] socket is required: the path of the unix socket of the storage service"
-                        .into(),
-                )
-            }
-            Some(s) if !s.is_absolute() => {
-                return invalid(format!(
-                    "[storage.varlink] socket: `{}` is not an absolute path",
-                    s.display()
-                ))
-            }
-            Some(_) => {}
-        }
-        if !(VARLINK_TIMEOUT_MIN_SECS..=VARLINK_TIMEOUT_MAX_SECS).contains(&v.timeout_secs) {
-            return invalid(format!(
-                "[storage.varlink] timeout_secs = {}: between {VARLINK_TIMEOUT_MIN_SECS} and {VARLINK_TIMEOUT_MAX_SECS}",
-                v.timeout_secs
-            ));
-        }
-        if let Some(n) = &v.name {
-            if !velarx_base::ipc::is_service_name(n) {
-                return invalid(format!(
-                    "[storage.varlink] name = {n:?}: 1 to 64 letters, digits, `.`, `_` or `-`"
-                ));
-            }
-        }
-        Ok(())
-    }
-
     /// The driver the configuration asks for (`[storage] driver`, or
     /// `--storage-driver`); none when it asks for none.
     pub fn requested_driver(&self) -> Result<Option<StorageDriverKind>, ConfigError> {
@@ -1566,7 +1468,6 @@ impl Default for StorageConfig {
         Self {
             root: default_storage_root(),
             driver: None,
-            varlink: None,
             gc_interval_secs: default_gc_interval(),
             fsverity: default_fsverity(),
             fsverity_require: false,
@@ -1734,7 +1635,6 @@ impl Config {
             }
         }
         self.storage.requested_driver()?;
-        self.storage.validate_varlink()?;
         let c = &self.containers.cgroups;
         if !c.is_empty() && !CGROUPS_MODES.contains(&c.as_str()) {
             return Err(ConfigError::Invalid(format!(
@@ -2085,97 +1985,6 @@ mod tests {
         );
     }
 
-    fn varlink_error(toml: &str) -> String {
-        parse(toml)
-            .and_then(|c| c.validate().map(|()| c))
-            .unwrap_err()
-            .to_string()
-    }
-
-    #[test]
-    fn the_varlink_driver_is_chosen_like_vfs_and_its_table_is_read() {
-        let c =
-            parse("[storage]\ndriver = \"varlink\"\n[storage.varlink]\nsocket = \"/run/s.sock\"\n")
-                .unwrap();
-        c.validate().unwrap();
-        assert_eq!(
-            c.storage.requested_driver().unwrap(),
-            Some(StorageDriverKind::Varlink)
-        );
-        let v = c.storage.varlink.unwrap();
-        assert_eq!(
-            v.socket.as_deref(),
-            Some(std::path::Path::new("/run/s.sock"))
-        );
-        assert_eq!(v.timeout_secs, VARLINK_TIMEOUT_SECS);
-        assert_eq!(v.name, None);
-        assert_eq!(
-            StorageDriverKind::parse("varlink"),
-            Ok(StorageDriverKind::Varlink)
-        );
-        assert_eq!(
-            storage_with(None).resolve_driver("varlink").unwrap(),
-            StorageDriverKind::Varlink
-        );
-        // (never a default)
-        assert_eq!(StorageDriverKind::DEFAULT, StorageDriverKind::Composefs);
-        let c = parse(
-            "[storage]\ndriver = \"varlink\"\n[storage.varlink]\nsocket = \"/s\"\ntimeout_secs = 5\nname = \"my.store-1\"\n",
-        )
-        .unwrap();
-        c.validate().unwrap();
-        assert_eq!(c.storage.varlink.as_ref().unwrap().timeout_secs, 5);
-        assert_eq!(
-            c.storage.varlink.unwrap().name.as_deref(),
-            Some("my.store-1")
-        );
-    }
-
-    #[test]
-    fn the_varlink_settings_that_do_not_mean_anything_name_their_key() {
-        let drv = "[storage]\ndriver = \"varlink\"\n";
-        let e = varlink_error(drv);
-        assert!(
-            e.contains("needs [storage.varlink]") && e.contains("socket"),
-            "{e}"
-        );
-        let e = varlink_error(&format!("{drv}[storage.varlink]\ntimeout_secs = 5\n"));
-        assert!(e.contains("[storage.varlink] socket is required"), "{e}");
-        let e = varlink_error(&format!("{drv}[storage.varlink]\nsocket = \"s.sock\"\n"));
-        assert!(
-            e.contains("[storage.varlink] socket") && e.contains("not an absolute path"),
-            "{e}"
-        );
-        for t in [0, 1, 86401] {
-            let e = varlink_error(&format!(
-                "{drv}[storage.varlink]\nsocket = \"/s\"\ntimeout_secs = {t}\n"
-            ));
-            assert!(
-                e.contains("[storage.varlink] timeout_secs") && e.contains("between 2"),
-                "{e}"
-            );
-        }
-        let e = varlink_error(&format!(
-            "{drv}[storage.varlink]\nsocket = \"/s\"\nname = \"a b\"\n"
-        ));
-        assert!(e.contains("[storage.varlink] name"), "{e}");
-        // an unknown key of the table, and the table with another driver
-        let e = varlink_error(&format!(
-            "{drv}[storage.varlink]\nsocket = \"/s\"\ntimeout = 5\n"
-        ));
-        assert!(e.contains("timeout"), "{e}");
-        let e = varlink_error("[storage]\ndriver = \"vfs\"\n[storage.varlink]\nsocket = \"/s\"\n");
-        assert!(
-            e.contains("[storage.varlink] is set") && e.contains("driver = \"varlink\""),
-            "{e}"
-        );
-        // (no driver named: the store's own is not judged here)
-        parse("[storage.varlink]\nsocket = \"/s\"\n")
-            .unwrap()
-            .validate()
-            .unwrap();
-    }
-
     #[test]
     fn a_store_is_not_opened_with_another_driver_than_its_own() {
         // a store made with a driver this build lacks
@@ -2187,7 +1996,7 @@ mod tests {
             e.contains("/s/store")
                 && e.contains(
                     "made with the storage driver \"zfs\", which this velarx does not have \
-                     (known: composefs, vfs, varlink)"
+                     (known: composefs, vfs)"
                 ),
             "{e}"
         );
@@ -2229,7 +2038,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            e.contains("\"zfs\"") && e.contains("(known: composefs, vfs, varlink)"),
+            e.contains("\"zfs\"") && e.contains("(known: composefs, vfs)"),
             "{e}"
         );
         assert!(parse("[storage]\ndriver = \"composefs\"\n")
@@ -2830,16 +2639,6 @@ mod tests {
         let v = toml::Value::try_from(Config::default()).unwrap();
         let mut keys = Vec::new();
         names(&v, &mut keys);
-        // (the table that a configuration of the varlink driver adds)
-        names(
-            &toml::Value::try_from(VarlinkStorage {
-                socket: Some("/s".into()),
-                name: Some("n".into()),
-                ..Default::default()
-            })
-            .unwrap(),
-            &mut keys,
-        );
         let mut missing = Vec::new();
         for k in keys {
             let found = example.lines().any(|l| {

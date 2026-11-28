@@ -183,15 +183,6 @@ macro_rules! forward_storage_driver {
             self.$f.collect(keep)
         }], [$($rest)*]);
     };
-    (@one $f:ident release_engine_copies; $ty:ty; [$($acc:tt)*]; [$($rest:ident)*]) => {
-        $crate::forward_storage_driver!(@go $ty, $f, [$($acc)* async fn release_engine_copies(
-            &self,
-            layers: &[$crate::forward::types::LayerKey],
-            held: &$crate::forward::types::EngineHeld,
-        ) -> $crate::DriverResult<$crate::forward::types::Collected> {
-            self.$f.release_engine_copies(layers, held).await
-        }], [$($rest)*]);
-    };
     (@one $f:ident lock_unused_layers; $ty:ty; [$($acc:tt)*]; [$($rest:ident)*]) => {
         $crate::forward_storage_driver!(@go $ty, $f, [$($acc)* fn lock_unused_layers(
             &self,
@@ -235,11 +226,6 @@ macro_rules! forward_storage_driver {
     (@one $f:ident writable_remove; $ty:ty; [$($acc:tt)*]; [$($rest:ident)*]) => {
         $crate::forward_storage_driver!(@go $ty, $f, [$($acc)* fn writable_remove(&self, w: &$crate::forward::types::Writable) -> $crate::DriverResult<()> {
             self.$f.writable_remove(w)
-        }], [$($rest)*]);
-    };
-    (@one $f:ident writable_release; $ty:ty; [$($acc:tt)*]; [$($rest:ident)*]) => {
-        $crate::forward_storage_driver!(@go $ty, $f, [$($acc)* fn writable_release(&self, w: &$crate::forward::types::Writable) -> $crate::WritableRelease {
-            self.$f.writable_release(w)
         }], [$($rest)*]);
     };
     (@one $f:ident writable_exists; $ty:ty; [$($acc:tt)*]; [$($rest:ident)*]) => {
@@ -287,9 +273,6 @@ macro_rules! forward_storage_driver {
             self.$f.stopped_view(w, image)
         }], [$($rest)*]);
     };
-    (@one $f:ident holds_objects; $ty:ty; [$($acc:tt)*]; [$($rest:ident)*]) => {
-        $crate::forward_storage_driver!(@go $ty, $f, [$($acc)* fn holds_objects(&self) -> bool { self.$f.holds_objects() }], [$($rest)*]);
-    };
     (@one $f:ident is_root_of; $ty:ty; [$($acc:tt)*]; [$($rest:ident)*]) => {
         $crate::forward_storage_driver!(@go $ty, $f, [$($acc)* fn is_root_of(
             &self,
@@ -302,16 +285,6 @@ macro_rules! forward_storage_driver {
     (@one $f:ident usage; $ty:ty; [$($acc:tt)*]; [$($rest:ident)*]) => {
         $crate::forward_storage_driver!(@go $ty, $f, [$($acc)* fn usage(&self) -> $crate::DriverResult<$crate::forward::types::Usage> {
             self.$f.usage()
-        }], [$($rest)*]);
-    };
-    (@one $f:ident list_stores; $ty:ty; [$($acc:tt)*]; [$($rest:ident)*]) => {
-        $crate::forward_storage_driver!(@go $ty, $f, [$($acc)* fn list_stores(&self) -> $crate::DriverResult<Vec<$crate::forward::types::StoreInfo>> {
-            self.$f.list_stores()
-        }], [$($rest)*]);
-    };
-    (@one $f:ident drop_store; $ty:ty; [$($acc:tt)*]; [$($rest:ident)*]) => {
-        $crate::forward_storage_driver!(@go $ty, $f, [$($acc)* fn drop_store(&self, store: &str) -> $crate::DriverResult<()> {
-            self.$f.drop_store(store)
         }], [$($rest)*]);
     };
 }
@@ -335,10 +308,10 @@ mod tests {
             forward: [
                 name graph_name graph_data status pull  has_layers
                 repair remake_staged read_objects open_object objects_in_order remove_image
-                image_volume_create mounts image_view holds_objects
+                image_volume_create mounts image_view
                 leftovers check collect writable_create writable_paths writable_root writable_size
-                writable_remove writable_release writable_exists diff changes apply stopped_view
-                is_root_of usage list_stores drop_store release_engine_copies lock_unused_layers
+                writable_remove writable_exists diff changes apply stopped_view
+                is_root_of usage lock_unused_layers
             ];
             fn capabilities(&self) -> &Capabilities {
                 &self.caps
@@ -354,9 +327,8 @@ mod tests {
 
     /// Every wrapper names each method of the trait once: in `forward` or
     /// as a method of its own.  A method with a default body (`open_object`,
-    /// `image_volume_create`, `holds_objects`,
-    /// `list_stores`, `drop_store`) that a wrapper
-    /// left out would compile and run the default, not the wrapped driver's.
+    /// `image_volume_create`) that a wrapper left out would compile and run
+    /// the default, not the wrapped driver's.
     #[test]
     fn every_wrapper_forwards_or_states_every_method() {
         let source = include_str!("lib.rs");
@@ -378,10 +350,6 @@ mod tests {
             (
                 "Watching",
                 include_str!("../../core/src/storage_driver/watching.rs"),
-            ),
-            (
-                "LazyPhase",
-                include_str!("../../core/src/storage_driver/lazy_phase.rs"),
             ),
             ("Wrap", include_str!("forward.rs")),
         ] {
