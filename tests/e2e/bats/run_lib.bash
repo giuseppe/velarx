@@ -13,8 +13,7 @@
 #                    velarx-monitor (default: target/debug)
 #   E2E_REGISTRY     registry with alpine:chunked (default localhost:5000)
 #   E2E_STORAGE_LINES  lines of dotted keys of the root table added to the
-#                    configuration (`storage.driver = "vfs"`,
-#                    `pull.lazy_completers = 0`)
+#                    configuration (`pull.lazy_completers = 0`)
 #   E2E_BEFORE_DAEMON  the function run (with the work directory made) before
 #                    the daemon starts, for what it needs running
 #   E2E_NO_DAEMON    1: start no daemon, the commands serve the engine of their

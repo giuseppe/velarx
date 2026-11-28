@@ -2269,8 +2269,7 @@ fn set_root(
     fchmod(&dir, Mode::from_raw_mode(a.perm.into())).map_err(|e| context("mode", e))?;
     // (the other files have their attributes in the image of their layer,
     // which nothing has to be allowed to write: here the host is asked, and
-    // it may refuse one, as the file system of the copy of the `vfs` driver
-    // does)
+    // it may refuse one)
     let mut warned = false;
     for (name, value) in layer.raw_xattrs(root) {
         let name = String::from_utf8(name).map_err(std::io::Error::other)?;

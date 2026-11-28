@@ -139,18 +139,7 @@ EOT
     echo "$daemon_pid" > "$WORKDIR/daemon.pid"
     [ "$ready" = 0 ] || { echo "the daemon does not start"; cat "$WORKDIR/sh.log"; exit 1; }
     "$BIN/velarx" --socket "$WORKDIR/sh.sock" image list > /dev/null 2>&1 || { echo "the daemon does not answer"; cat "$WORKDIR/sh.log"; exit 1; }
-    # an image whose second layer has an opaque marker in its root, loaded in
-    # the store of this file and in one of the vfs driver
-    cat > "$WORKDIR/vfs.toml" <<EOT
-storage.driver = "vfs"
-storage.root = "$WORKDIR/vfs"
-[engine]
-socket = "$WORKDIR/vfs-engine.sock"
-[server]
-socket = "$WORKDIR/vfs-engine.sock"
-state_dir = "$WORKDIR/vfs-state"
-root_dir = "$WORKDIR/vfs"
-EOT
+    # an image whose second layer has an opaque marker in its root
     BINARIES="sh cat ls" e2e_make_rootfs
     python3 -I - "$WORKDIR/rootfs" "$WORKDIR/opaque-root.tar" <<'PY'
 import gzip, hashlib, io, json, os, sys, tarfile
@@ -195,7 +184,6 @@ with tarfile.open(out, "w") as t:
         put(t, "blobs/sha256/" + d.split(":")[1], data)
 PY
     "$BIN/velarx" --socket "$WORKDIR/sh.sock" image load < "$WORKDIR/opaque-root.tar" > /dev/null || { echo "the image does not load"; exit 1; }
-    "$BIN/velarx" --config "$WORKDIR/vfs.toml" image load < "$WORKDIR/opaque-root.tar" > /dev/null || { echo "the image does not load"; exit 1; }
 }
 
 teardown_file () {
@@ -222,14 +210,9 @@ teardown_file () {
 # the image has the files of the layers below (the image has `a`, `b` and
 # `d/x`).  As root the composefs driver mounts the layers with the kernel,
 # rootless the image server serves them.
-v_ () { "$BIN/velarx" --config "$WORKDIR/vfs.toml" "$@"; }
 
 @test "an opaque root hides nothing: a container on composefs" {
     check "the files" abx "$(sh_ container run --rm --network none localhost/opaque-root cat /a /b /d/x)"
-}
-
-@test "an opaque root hides nothing: a container on vfs" {
-    check "the files" abx "$(v_ container run --rm --network none localhost/opaque-root cat /a /b /d/x)"
 }
 
 @test "an opaque root hides nothing: build --squash-all and commit --squash" {

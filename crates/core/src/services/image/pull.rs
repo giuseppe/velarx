@@ -2387,29 +2387,25 @@ mod stored_tests {
         // the answer is the driver's, not the engine's look at its rows: a
         // driver that has none of them (here: one that keeps its records
         // elsewhere) makes the pull fetch them, complete rows or not
-        for kind in [
-            velarx_config::StorageDriverKind::Composefs,
-            velarx_config::StorageDriverKind::Vfs,
-        ] {
-            let mut service = service_of(&tmp, kind).await;
-            let stored = service.stored_layers(&keys, &config).await.unwrap();
-            assert!(stored[0], "{kind:?}: the driver of the same records has it");
-            service.storage = storage_driver::open(
-                kind,
-                DriverParts {
-                    db: velarx_db::Database::open_in_memory().await.unwrap(),
-                    store: service.file_store.clone(),
-                    staging_dir: service.staging_dir.clone(),
-                    fsverity: service.fsverity,
-                },
-                &service.driver_options(),
-            );
-            let stored = service.stored_layers(&keys, &config).await.unwrap();
-            assert!(
-                stored.iter().all(|ok| !ok),
-                "{kind:?}: a layer the driver does not have is not stored: {stored:?}"
-            );
-        }
+        let kind = velarx_config::StorageDriverKind::Composefs;
+        let mut service = service_of(&tmp, kind).await;
+        let stored = service.stored_layers(&keys, &config).await.unwrap();
+        assert!(stored[0], "the driver of the same records has it");
+        service.storage = storage_driver::open(
+            kind,
+            DriverParts {
+                db: velarx_db::Database::open_in_memory().await.unwrap(),
+                store: service.file_store.clone(),
+                staging_dir: service.staging_dir.clone(),
+                fsverity: service.fsverity,
+            },
+            &service.driver_options(),
+        );
+        let stored = service.stored_layers(&keys, &config).await.unwrap();
+        assert!(
+            stored.iter().all(|ok| !ok),
+            "a layer the driver does not have is not stored: {stored:?}"
+        );
     }
 
     /// An engine whose database has layer 1 complete, on the driver `kind`.

@@ -991,7 +991,6 @@ pub struct StorageConfig {
     #[serde(default)]
     pub fsverity_require: bool,
     /// A storage driver that checks fs-verity only when a layer is pulled
-    /// (`vfs`: the directories it copies for a container carry no digest)
     /// accepts `fsverity_require`, `composefs_digests = "require"` and
     /// `--security-opt verity=enforce` as checks at pull, and nothing more is
     /// promised while a container runs.  Without it those settings are an
@@ -999,15 +998,6 @@ pub struct StorageConfig {
     /// time (`composefs`).
     #[serde(default)]
     pub fsverity_best_effort: bool,
-    /// The vfs driver, run by a process that may not give files the owners
-    /// the image has (neither root nor in a user namespace that maps them),
-    /// leaves them its own instead of failing (containers-storage's
-    /// `ignore_chown_errors`): every file of a container is then owned by that
-    /// user, and the changes of a container take those of that owner for the
-    /// image's.  Without it the create of such a container is an error that
-    /// says so.
-    #[serde(default)]
-    pub vfs_ignore_chown_errors: bool,
     /// The EROFS images of the layers of root containers mounted by the
     /// kernel: "auto" where it can (root, a kernel that mounts them; FUSE
     /// serves them otherwise), or "off"
@@ -1070,14 +1060,11 @@ pub enum StorageDriverKind {
     /// Per-layer EROFS images over a store of files named by their fs-verity
     /// digest.
     Composefs,
-    /// A full copy of the files of the image for each container (podman's vfs
-    /// driver).  An explicit choice, never a default.
-    Vfs,
 }
 
 impl StorageDriverKind {
     /// Every driver of this build.
-    pub const ALL: &'static [StorageDriverKind] = &[Self::Composefs, Self::Vfs];
+    pub const ALL: &'static [StorageDriverKind] = &[Self::Composefs];
     /// The driver of a store that was made without choosing one.
     pub const DEFAULT: Self = Self::Composefs;
 
@@ -1085,7 +1072,6 @@ impl StorageDriverKind {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Composefs => "composefs",
-            Self::Vfs => "vfs",
         }
     }
 
@@ -1472,7 +1458,6 @@ impl Default for StorageConfig {
             fsverity: default_fsverity(),
             fsverity_require: false,
             fsverity_best_effort: false,
-            vfs_ignore_chown_errors: false,
             composefs: default_composefs(),
             additional_image_stores: Vec::new(),
             check_leftover_age_secs: default_check_leftover_age(),
@@ -1996,39 +1981,20 @@ mod tests {
             e.contains("/s/store")
                 && e.contains(
                     "made with the storage driver \"zfs\", which this velarx does not have \
-                     (known: composefs, vfs)"
+                     (known: composefs)"
                 ),
             "{e}"
         );
-        // composefs asked for, a vfs store, and the other way round
+        // a store of another driver than the one asked for
         let e = storage_with(Some("composefs"))
-            .resolve_driver("vfs")
+            .resolve_driver("zfs")
             .unwrap_err()
             .to_string();
-        assert!(
-            e.contains("made with the storage driver \"vfs\", but composefs is asked for")
-                && e.contains("remove the store"),
-            "{e}"
-        );
-        let e = storage_with(Some("vfs"))
-            .resolve_driver("composefs")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            e.contains("made with the storage driver \"composefs\", but vfs is asked for"),
-            "{e}"
-        );
-        // the store's own is used when none is asked for, and vfs is accepted
+        assert!(e.contains("but composefs is asked for"), "{e}");
         assert_eq!(
-            storage_with(None).resolve_driver("vfs").unwrap(),
-            StorageDriverKind::Vfs
+            storage_with(None).resolve_driver("composefs").unwrap(),
+            StorageDriverKind::Composefs
         );
-        assert_eq!(
-            storage_with(Some("vfs")).resolve_driver("vfs").unwrap(),
-            StorageDriverKind::Vfs
-        );
-        assert_eq!(StorageDriverKind::parse("vfs"), Ok(StorageDriverKind::Vfs));
-        // (never a default)
         assert_eq!(StorageDriverKind::DEFAULT, StorageDriverKind::Composefs);
     }
 
@@ -2038,7 +2004,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            e.contains("\"zfs\"") && e.contains("(known: composefs, vfs)"),
+            e.contains("\"zfs\"") && e.contains("(known: composefs)"),
             "{e}"
         );
         assert!(parse("[storage]\ndriver = \"composefs\"\n")
@@ -2053,7 +2019,7 @@ mod tests {
             .validate()
             .unwrap_err()
             .to_string()
-            .contains("known: composefs, vfs"));
+            .contains("known: composefs"));
         // and wins over the file
         let mut c = parse("[storage]\ndriver = \"composefs\"\n").unwrap();
         c.apply_global_options(|n| (n == ENV_STORAGE_DRIVER).then(|| "zfs".into()))

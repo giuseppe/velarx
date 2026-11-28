@@ -979,7 +979,7 @@ fn an_enforced_start_is_refused_for_a_descriptor_volume() {
 }
 
 /// A start as the engine makes it, through the monitor: the test driver with
-/// image volumes (`VolumeFake` over vfs, its descriptors detached mounts) is
+/// image volumes (`VolumeFake` over composefs, its descriptors detached mounts) is
 /// asked once by `start_mounts`, which checks the answer and writes the plan
 /// files, and the monitor started with the descriptors it gave runs a
 /// container that reads the root and both volumes, and has none of the
@@ -990,8 +990,8 @@ fn a_container_starts_from_what_the_engine_asked_of_the_driver() {
     use std::sync::Arc;
     use velarx_core::storage_driver::conformance::VolumeFake;
     use velarx_core::storage_driver::{
-        DriverParts, IdmapWay, MountRequest, Prefs, Purpose, StorageDriver, VerityAsk, VfsDriver,
-        Writable, WritableOptions,
+        ComposefsDriver, ComposefsOptions, IdmapWay, ImageServer, MountRequest, Prefs, Purpose,
+        StorageDriver, VerityAsk, Writable, WritableOptions,
     };
     velarx_base::testing::in_child(|| {
         if !namespace() {
@@ -1061,14 +1061,21 @@ fn a_container_starts_from_what_the_engine_asked_of_the_driver() {
             let db = rt
                 .block_on(velarx_db::Database::open(store.join("db")))
                 .unwrap();
-            let vfs = VfsDriver::new(DriverParts {
+            let inner = ComposefsDriver::new(
                 db,
-                store: Arc::new(velarx_storage::FileStore::new(store.join("objects")).unwrap()),
-                staging_dir: store.join("staging"),
-                fsverity: velarx_storage::VerityMode::Off,
-            });
+                Arc::new(velarx_storage::FileStore::new(store.join("objects")).unwrap()),
+                store.join("staging"),
+                velarx_storage::VerityMode::Off,
+                ComposefsOptions::new(ImageServer::new(
+                    crate::common::built_binary("velarx-monitor")
+                        .expect("no velarx-monitor next to the tests: cargo build --bins"),
+                    store.join("run"),
+                    Arc::new(velarx_config::Config::default()),
+                )),
+            );
             let driver: Arc<dyn StorageDriver> = Arc::new(
-                VolumeFake::new(Arc::new(vfs), Prefs::new(&[IdmapWay::AtCopy]), root_fd).detached(),
+                VolumeFake::new(Arc::new(inner), Prefs::new(&[IdmapWay::AtCopy]), root_fd)
+                    .detached(),
             );
             let w = Writable::new("c1", &fx.bundle);
             // create: the root, and the two volumes with what they show

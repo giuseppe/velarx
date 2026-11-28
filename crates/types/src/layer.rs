@@ -119,7 +119,7 @@ impl rusqlite::types::FromSql for LayerKey {
 /// another chain id.  The engine computes them (a driver is never trusted
 /// with it, and nothing stores them: they come from the configuration of the
 /// image); a driver whose layers are chained by parent (a snapshot of the
-/// parent layer) keys on them, the others (composefs, vfs: content keyed)
+/// parent layer) keys on them, the others (composefs: content keyed)
 /// ignore them.
 pub fn chain_ids(diff_ids: &[Digest]) -> Vec<Digest> {
     let mut out: Vec<Digest> = Vec::with_capacity(diff_ids.len());

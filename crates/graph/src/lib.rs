@@ -20,8 +20,7 @@
 //! digest, a table of contents and a tar-split for each layer, one
 //! reproducible EROFS image for each layer made at pull time, and the
 //! overlay, the kernel's for root and FUSE for the rest, the monitor makes of
-//! them), `vfs` (`crates/vfs`, podman's driver of that name: a full copy of
-//! the layers for each container).
+//! them).
 //!
 //! What stays in the engine (`services::image` and friends), whatever the
 //! driver: the registry transport and the fetchers, the manifests and
@@ -212,7 +211,7 @@ pub struct Capabilities {
     /// image in `pull`.  The engine then asks `has_layers` and collects per
     /// chain, a layer at two places being two layers.  False (content keyed:
     /// the artifact of a layer depends on the layer only, shareable between
-    /// images and reproducible) for composefs and vfs, which ignore the
+    /// images and reproducible) for composefs, which ignores the
     /// chain ids.
     pub layer_chain: bool,
     /// The most layers (and data-only layers) of one container.
@@ -1240,7 +1239,7 @@ pub trait StorageDriver: Send + Sync + 'static {
     /// `layers` is the **whole ordered layer list of the image**, the layers
     /// the driver already has included (`FeedLayer::stored`: nothing to fetch
     /// for those, and nothing of them in `Pulled`).  A content keyed driver
-    /// (composefs, vfs) fetches the layers that are not stored, each content
+    /// (composefs) fetches the layers that are not stored, each content
     /// once, as it always did; a chained driver (`Capabilities::layer_chain`)
     /// needs the rest: the parent of a layer is the chain id of the one before
     /// it in the list, present or not.

@@ -22,23 +22,17 @@ pub mod composefs;
 #[cfg(test)]
 pub(crate) mod watching;
 pub use composefs::{ComposefsDriver, ComposefsOptions, ImageServer};
-pub use velarx_vfs::{VfsDriver, VfsOptions};
 
 /// The options of the drivers (each reads its own).
 #[derive(Debug, Clone)]
 pub struct DriverOptions {
     pub composefs: ComposefsOptions,
-    pub vfs: VfsOptions,
 }
 
 impl DriverOptions {
-    /// The options of the drivers of a store: the composefs driver's, the
-    /// others' as they are without a configuration.
+    /// The options of the drivers of a store.
     pub fn new(composefs: ComposefsOptions) -> Self {
-        Self {
-            composefs,
-            vfs: VfsOptions::default(),
-        }
+        Self { composefs }
     }
 }
 
@@ -47,7 +41,6 @@ pub fn local_capabilities(kind: velarx_config::StorageDriverKind) -> &'static Ca
     use velarx_config::StorageDriverKind;
     match kind {
         StorageDriverKind::Composefs => ComposefsDriver::capabilities_of(),
-        StorageDriverKind::Vfs => VfsDriver::capabilities_of(),
     }
 }
 
@@ -68,6 +61,5 @@ pub fn open(
             parts.fsverity,
             options.composefs.clone(),
         )),
-        StorageDriverKind::Vfs => Arc::new(VfsDriver::new(parts).with_options(options.vfs.clone())),
     }
 }

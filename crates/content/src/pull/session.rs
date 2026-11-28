@@ -1845,7 +1845,7 @@ mod tests {
         assert!(dirs.iter().all(|d| !d.exists()));
     }
 
-    /// A pull on a store without fs-verity (composefs, vfs: the session): the
+    /// A pull on a store without fs-verity (composefs: the session): the
     /// engine reads each staged byte once to verify it (before the locks) and
     /// names the very inode the fetcher wrote, so that no byte is written a
     /// second time; the locked part reads, hashes and copies nothing.

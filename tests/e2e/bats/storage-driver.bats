@@ -117,9 +117,6 @@ teardown_file () {
     check "the empty name chooses nothing" 0 $?
     out=$("$BIN/velarx" --storage-driver overlay --socket "$ESOCK" image list 2>&1)
     check "overlay, podman's name, chooses nothing" 0 $?
-    out=$(sh_cfg --storage-driver vfs image list 2>&1)
-    check "vfs: a driver of its own, not taken for composefs" 125 $?
-    check_match "vfs: this store was made with composefs" 'was made with the storage driver "composefs", but vfs is asked for' "$out"
 }
 
 @test "an unknown [storage] driver is refused at start, with the known ones" {
@@ -134,11 +131,11 @@ teardown_file () {
     stop_daemon
     # the store was made above with composefs: another driver in its database
     config_with 'driver = "composefs"'
-    sqlite3 "$WORKDIR/store/db.sqlite" "UPDATE store_settings SET value = 'vfs' WHERE key = 'driver'"
+    sqlite3 "$WORKDIR/store/db.sqlite" "UPDATE store_settings SET value = 'zfs' WHERE key = 'driver'"
     out=$("$BIN/velarx" --config "$XDG_CONFIG_HOME/velarx/config.toml" varlink 2>&1)
     check "the daemon does not open it" 125 $?
-    check_match "the error names both drivers" 'was made with the storage driver "vfs", but composefs is asked for' "$out"
-    check_match "and says what to do" 'ask for "vfs", or remove the store' "$out"
+    check_match "the error names both drivers" 'was made with the storage driver "zfs", but composefs is asked for' "$out"
+    check_match "and says what to do" 'ask for "zfs", or remove the store' "$out"
     check_match "and which store" "$WORKDIR/store" "$out"
     # with nothing asked for, the store's own is wanted, and this build lacks it
     sqlite3 "$WORKDIR/store/db.sqlite" "UPDATE store_settings SET value = 'zfs' WHERE key = 'driver'"

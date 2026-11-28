@@ -8,7 +8,7 @@
 //! merge of the ranges of a request by their cost, the decompression and the
 //! checks of every chunk against the digests of the table of contents.  The
 //! driver owns the store: it says what it lacks ([`Incoming::wants`], which
-//! for composefs and vfs is [`Session::have`], asked for each file as the
+//! for composefs is [`Session::have`], asked for each file as the
 //! plan of the layer is made) and it receives the bytes in the files of its
 //! own staging session (`Stage`).
 //!
@@ -1268,8 +1268,8 @@ fn refused(driver: &str, e: ImageError) -> DriverError {
     DriverError::refused(driver, e)
 }
 
-/// The pull of a driver that keeps its store in this process (composefs,
-/// vfs): the want of each file is `Session::have`, the bytes go to a staging
+/// The pull of a driver that keeps its store in this process (composefs):
+/// the want of each file is `Session::have`, the bytes go to a staging
 /// session, and what is pulled is committed with two barriers (a `syncfs`
 /// before the files are moved into the store and one after, which makes the
 /// names and what the driver writes in between durable).  The layers

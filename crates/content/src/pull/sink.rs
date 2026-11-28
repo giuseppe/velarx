@@ -10,7 +10,7 @@
 //!
 //! Two kinds exist:
 //!
-//! * the staging [`Session`] of a store in this process (composefs, vfs): the
+//! * the staging [`Session`] of a store in this process (composefs): the
 //!   files are made in its directory, under names that are no digest, known
 //!   by what they are known by when they are complete, and given the name of
 //!   their fs-verity digest as they move into the store at the commit.  It keeps

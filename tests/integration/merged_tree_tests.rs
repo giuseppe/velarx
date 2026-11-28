@@ -483,7 +483,7 @@ fn images(layers: &[Vec<TocEntry>]) -> (Vec<Vec<TocEntry>>, Vec<TocEntry>) {
 }
 
 /// The root file system the tables of the layers make when they are applied
-/// (`MergedTree`: what the copy of a vfs root, a squash and a build read),
+/// (`MergedTree`: what a squash and a build read),
 /// as `view_entries` gives it.
 fn tree_entries(tree: &MergedTree) -> Vec<TocEntry> {
     let mut out = Vec::new();

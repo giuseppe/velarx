@@ -3,8 +3,7 @@
 //! memory: each layer as its image has it (`layer_erofs`), with its
 //! whiteouts (`.wh.name`, `.wh..wh..opq`) and hard links resolved, laid over
 //! the layers below it as the overlay of a container lays the images of its
-//! layers.  What a build, a squash and the copy of the `vfs` driver read of
-//! an image.
+//! layers.  What a build and a squash read of an image.
 
 use crate::layer_erofs::{components, resolve_entries};
 use std::collections::{BTreeMap, BTreeSet, HashMap};

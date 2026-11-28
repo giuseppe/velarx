@@ -45,7 +45,7 @@ FORBIDDEN = {
 
 # What the monitor of a container and the libraries it records and releases
 # with may not link either: the engine's services, the signature code, the
-# sandbox, the vfs driver and OpenSSL.
+# sandbox and OpenSSL.
 MONITOR_PACKAGES = ("velarx-monitor-bin", "velarx-netkernel", "velarx-netdetach")
 MONITOR_FORBIDDEN = {
     "openssl",
@@ -53,7 +53,6 @@ MONITOR_FORBIDDEN = {
     "velarx-core",
     "velarx-signature",
     "velarx-sandbox",
-    "velarx-vfs",
 }
 
 bad = False

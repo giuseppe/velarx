@@ -3,8 +3,8 @@
 # image: the mode, owner, time and attributes of the entry `./` of the top
 # layer, with the owner as the container's user namespace shows it, whatever
 # the storage driver.  As root the composefs driver mounts the root with the
-# kernel, rootless the image server serves it; the vfs driver copies it.  The
-# image is imported from a tar: no registry is needed.
+# kernel, rootless the image server serves it.  The image is imported from a
+# tar: no registry is needed.
 #
 #   VELARX_BINDIR=target/debug bats tests/e2e/bats/root-dir.bats
 #   (as root too)
@@ -15,13 +15,9 @@ setup_file () {
     command -v getfattr > /dev/null || skip "no getfattr"
     command -v crun > /dev/null || skip "crun is missing"
     e2e_setup_file
-    local d
-    for d in composefs vfs; do
-        mkdir -p "$WORKDIR/$d"
-        sed "s|^storage.root = .*|storage.root = \"$WORKDIR/$d\"|; s|^root_dir = .*|root_dir = \"$WORKDIR/$d\"|" \
-            "$XDG_CONFIG_HOME/velarx/config.toml" > "$WORKDIR/$d.toml"
-    done
-    echo 'storage.driver = "vfs"' | cat - "$WORKDIR/vfs.toml" > "$WORKDIR/vfs.new" && mv "$WORKDIR/vfs.new" "$WORKDIR/vfs.toml"
+    mkdir -p "$WORKDIR/composefs"
+    sed "s|^storage.root = .*|storage.root = \"$WORKDIR/composefs\"|; s|^root_dir = .*|root_dir = \"$WORKDIR/composefs\"|" \
+        "$XDG_CONFIG_HOME/velarx/config.toml" > "$WORKDIR/composefs.toml"
     BINARIES="sh cat env sleep true false echo ls stat getfattr chmod" e2e_make_rootfs
     # the files of the image, and a first entry `./` that is not a plain
     # directory: mode 01750, owner 1000:1000, a time before 1970, an attribute
@@ -50,10 +46,8 @@ for dir, dirs, files in os.walk(root):
 t.close()
 PY
     done
-    for d in composefs vfs; do
-        "$BIN/velarx" --config "$WORKDIR/$d.toml" image import "$WORKDIR/root-dir.tar" localhost/root-dir:1 > /dev/null
-        "$BIN/velarx" --config "$WORKDIR/$d.toml" image import "$WORKDIR/root-dir-refused.tar" localhost/root-dir:refused > /dev/null
-    done
+    "$BIN/velarx" --config "$WORKDIR/composefs.toml" image import "$WORKDIR/root-dir.tar" localhost/root-dir:1 > /dev/null
+    "$BIN/velarx" --config "$WORKDIR/composefs.toml" image import "$WORKDIR/root-dir-refused.tar" localhost/root-dir:refused > /dev/null
 }
 
 teardown_file () {
@@ -89,28 +83,13 @@ dg
 1969-12-30 23:59:59.250000000 +0000" "$(root_of composefs --userns auto)"
 }
 
-@test "vfs: the root of the container is the root of the layer" {
-    check "the root" "1750 1000:1000 -2
-dg
-1969-12-30 23:59:59.250000000 +0000" "$(root_of vfs)"
-}
-
-@test "vfs: with a user namespace of its own, the owner is the container's id" {
-    check "the root" "1750 1000:1000 -2
-dg
-1969-12-30 23:59:59.250000000 +0000" "$(root_of vfs --userns auto)"
-}
-
 # An attribute of the `./` the engine cannot set on the directory of the
 # container (security.ima with a value that is no header: refused by the
-# kernel, and rootless by the permission) is skipped with a warning, as the
-# vfs driver does: the container runs with the mode and owner of the layer.
-@test "composefs and vfs: an attribute of the root the host refuses does not stop the container" {
-    local d
-    for d in composefs vfs; do
-        check "the root on $d" "1750 1000:1000" \
-            "$("$BIN/velarx" --config "$WORKDIR/$d.toml" container run --rm --network none localhost/root-dir:refused stat -c '%a %u:%g' / 2> /dev/null)"
-    done
+# kernel, and rootless by the permission) is skipped with a warning: the
+# container runs with the mode and owner of the layer.
+@test "composefs: an attribute of the root the host refuses does not stop the container" {
+    check "the root" "1750 1000:1000" \
+        "$("$BIN/velarx" --config "$WORKDIR/composefs.toml" container run --rm --network none localhost/root-dir:refused stat -c '%a %u:%g' / 2> /dev/null)"
     "$BIN/velarx" --config "$WORKDIR/composefs.toml" container run --rm --network none localhost/root-dir:refused true 2>&1 | grep -c "security.ima" | grep -qx 1 || {
         echo "FAIL: not one warning naming the attribute" >&2; exit 1; }
 }
@@ -118,12 +97,12 @@ dg
 # The image a commit or a build step makes of a container keeps its root: the
 # layer has the entry `./` (a layer without it has a plain root), whatever the
 # step is (those that run a container and those that copy files or make
-# directories), whatever the driver, and for a build that squashes its layers.
-@test "composefs and vfs: a commit and a build step keep the root" {
+# directories), and for a build that squashes its layers.
+@test "composefs: a commit and a build step keep the root" {
     local d step
     mkdir -p "$WORKDIR/ctx"
     echo f > "$WORKDIR/ctx/f"
-    for d in composefs vfs; do
+    for d in composefs; do
         v () { "$BIN/velarx" --config "$WORKDIR/$d.toml" "$@"; }
         v container create --name c --network none localhost/root-dir:1 true > /dev/null || exit 1
         v container commit c localhost/root-dir:commit > /dev/null || exit 1

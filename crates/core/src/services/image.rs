@@ -226,8 +226,6 @@ pub struct ImageService {
     /// `[storage] fsverity_best_effort`: a driver that checks fs-verity at
     /// pull only is accepted with the settings that enforce it.
     verity_best_effort: bool,
-    /// `[storage] vfs_ignore_chown_errors`.
-    vfs_ignore_chown_errors: bool,
     pull_config: velarx_config::PullConfig,
     push_config: velarx_config::PushConfig,
     /// `[[transports]]`: the processes that are the origin of a scheme
@@ -416,7 +414,6 @@ impl ImageService {
             composefs_mode: None,
             verity_chain: velarx_config::VerityChain::Auto,
             verity_best_effort: false,
-            vfs_ignore_chown_errors: false,
             pull_config: velarx_config::PullConfig::default(),
             push_config: velarx_config::PushConfig::default(),
             transports: Arc::default(),
@@ -520,13 +517,6 @@ impl ImageService {
     /// images of their layers (`[storage] composefs_digests`).
     pub fn with_composefs_digests(mut self, mode: velarx_config::ComposefsDigests) -> Self {
         self.storage_options.digests = mode;
-        self.remake_storage();
-        self
-    }
-
-    /// `[storage] vfs_ignore_chown_errors`.
-    pub fn with_vfs_ignore_chown_errors(mut self, ignore: bool) -> Self {
-        self.vfs_ignore_chown_errors = ignore;
         self.remake_storage();
         self
     }
@@ -643,10 +633,6 @@ impl ImageService {
     fn driver_options(&self) -> DriverOptions {
         DriverOptions {
             composefs: self.storage_options.clone(),
-            vfs: velarx_vfs::VfsOptions {
-                digests: self.storage_options.digests,
-                ignore_chown_errors: self.vfs_ignore_chown_errors,
-            },
         }
     }
 

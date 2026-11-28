@@ -69,11 +69,6 @@ teardown_file () {
     check "--tmpdir: the directory is made" 0 $?
     out=$("$SH" --storage-driver zfs images 2>&1)
     check "--storage-driver that is none of velarx's" 125 $?
-    # (vfs is not podman's spelling of nothing: the driver of its own, and
-    # a store made with composefs is not opened with it)
-    out=$("$SH" --storage-driver vfs images 2>&1)
-    check "--storage-driver vfs on a composefs store" 125 $?
-    check_match "--storage-driver vfs says which store it is" 'made with the storage driver "composefs", but vfs is asked for' "$out"
     out=$("$SH" --runtime nosuchruntime $G run --rm --network none localhost/e2e-other:1 true 2>&1)
     check "--runtime that is not there" 125 $?
     check_match "--runtime says so" "nosuchruntime.*not found" "$out"

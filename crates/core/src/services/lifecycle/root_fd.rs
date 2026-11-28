@@ -592,16 +592,20 @@ mod tests {
             label,
         };
         let none = planned(LabelDone::None);
-        let e = require_volume_label("vfs", &none, Some("system_u:object_r:container_file_t:s0"))
-            .unwrap_err()
-            .to_string();
+        let e = require_volume_label(
+            "composefs",
+            &none,
+            Some("system_u:object_r:container_file_t:s0"),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
-            e.contains("driver vfs") && e.contains("SELinux label"),
+            e.contains("driver composefs") && e.contains("SELinux label"),
             "{e}"
         );
-        require_volume_label("vfs", &none, None).unwrap();
+        require_volume_label("composefs", &none, None).unwrap();
         for done in [LabelDone::Files, LabelDone::MountContext] {
-            require_volume_label("vfs", &planned(done), Some("l")).unwrap();
+            require_volume_label("composefs", &planned(done), Some("l")).unwrap();
         }
         // and at a start
         let d = tempfile::tempdir().unwrap();
@@ -613,7 +617,7 @@ mod tests {
         let e = accept_volumes(
             b.path(),
             "0123456789abcdef",
-            "vfs",
+            "composefs",
             0,
             vec![(0, asked, driver_root(d.path()))],
         )
@@ -628,7 +632,7 @@ mod tests {
         accept_volumes(
             b.path(),
             "0123456789abcdef",
-            "vfs",
+            "composefs",
             0,
             vec![(0, asked, labelled)],
         )
@@ -952,9 +956,9 @@ mod tests {
 
     use crate::storage_driver::conformance::VolumeFake;
     use crate::storage_driver::{
-        DriverParts, IdmapWay, Prefs, Purpose, StorageDriver, VerityAsk, Writable, WritableOptions,
+        IdmapWay, Prefs, Purpose, StorageDriver, VerityAsk, Writable, WritableOptions,
     };
-    use velarx_db::{Database, ImageRecord};
+    use velarx_db::ImageRecord;
     use velarx_graph::MountsRequest;
     use velarx_types::digest::{Algorithm, Digest};
 
@@ -987,9 +991,9 @@ mod tests {
         }
     }
 
-    /// A container, its bundle and the test driver (the vfs driver with the
-    /// volumes of a test-only wrapper: the root is a descriptor of the layer
-    /// with `root_fd`, the directory of the copy without).
+    /// A container, its bundle and the test driver (the composefs driver
+    /// with the volumes of a test-only wrapper: the root is a descriptor of
+    /// the layer with `root_fd`, the directory of the copy without).
     struct Start {
         _dir: tempfile::TempDir,
         driver: Arc<dyn StorageDriver>,
@@ -1001,17 +1005,9 @@ mod tests {
     impl Start {
         async fn new(ways: Prefs<IdmapWay>, root_fd: bool) -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let db = Database::open(dir.path().join("db")).await.unwrap();
-            let store =
-                Arc::new(velarx_storage::FileStore::new(dir.path().join("objects")).unwrap());
-            let vfs = velarx_vfs::VfsDriver::new(DriverParts {
-                db,
-                store,
-                staging_dir: dir.path().join("staging"),
-                fsverity: velarx_storage::VerityMode::Off,
-            });
+            let inner = crate::storage_driver::composefs::driver_for_tests(dir.path()).await;
             let driver: Arc<dyn StorageDriver> =
-                Arc::new(VolumeFake::new(Arc::new(vfs), ways, root_fd));
+                Arc::new(VolumeFake::new(Arc::new(inner), ways, root_fd));
             let bundle = dir.path().join("bundle");
             std::fs::create_dir_all(&bundle).unwrap();
             let w = Writable::new(ID, &bundle);

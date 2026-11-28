@@ -4939,7 +4939,6 @@ dependencies = [
  "velarx-storage",
  "velarx-sys",
  "velarx-types",
- "velarx-vfs",
  "velarx-wire",
  "xattr",
  "zlink",
@@ -5623,30 +5622,6 @@ dependencies = [
 [[package]]
 name = "velarx-user-core"
 version = "0.1.0"
-
-[[package]]
-name = "velarx-vfs"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "libc",
- "rustix",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "velarx-config",
- "velarx-content",
- "velarx-db",
- "velarx-fuse",
- "velarx-graph",
- "velarx-proto",
- "velarx-storage",
- "velarx-sys",
- "velarx-types",
- "velarx-wire",
- "zstd",
-]
 
 [[package]]
 name = "velarx-wire"
