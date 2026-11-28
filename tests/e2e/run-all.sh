@@ -11,7 +11,9 @@
 # (default E2E_JOBS, else 6) of them at a time, each in its own `bats` (the
 # tests of a file run in order).  Not `bats --jobs`: that has no timeout per
 # file, no order and no way to keep unit.bats away from the files that
-# reload the user manager.  The tests that need what this machine lacks
+# reload the user manager, or to run a file alone as root (ALONE below).
+# At the end a table gives each file's result, time and tests passed,
+# failed and skipped.  The tests that need what this machine lacks
 # (root, a registry, podman's sources, velarx-p2p...) skip themselves.
 #
 # VELARX_BINDIR is the directory of velarx, velarx-client and
@@ -55,33 +57,51 @@ LOGDIR=${E2E_LOGDIR:-$(mktemp -d "${TMPDIR:-/var/tmp}/velarx-e2e-logs.XXXXXX")}
 mkdir -p "$LOGDIR"
 
 # The longest first, so that the run takes about as long as the longest
-# file; then the others in the order of their names.  The files that
-# reload the user manager come first of all: unit.bats waits for them.
+# file; then the others in the order given (of their names by default).
+# The files that reload the user manager come first of all: unit.bats waits
+# for them.
 LONGEST="quadlet units engine engine-api unit api/* run-* kube build-loop userns/* userns-tree"
 # unit.bats times its units' start (TimeoutStartSec): a daemon-reload of the
 # manager in the middle cuts the extension, so the files that reload it end
 # before unit.bats starts.
 declare -A AFTER=([unit]="quadlet units engine engine-api")
+# As root, the files that run with no other file at the same time, first of
+# all: inotify.bats counts the inotify instances of every process of the
+# user and runs 150 containers.  The other root files share nothing of the
+# host but what is made to be shared (the nftables table, the lock of the
+# root engines): every file has its own bridge and subnets
+# (e2e_bridge_toml of helpers.bash), and the units and ports it makes have
+# names and numbers of its own.
+ALONE="inotify"
 
 if [ ${#names[@]} -eq 0 ]; then
     mapfile -t all < <(cd "$BATSDIR" && find . -name '*.bats' | sed 's|^\./||; s|\.bats$||' | sort)
-    for pat in $LONGEST; do
-        for n in "${all[@]}"; do
-            # shellcheck disable=SC2254
-            case $n in $pat) names+=("$n") ;; esac
-        done
-    done
-    names+=("${all[@]}")
-    mapfile -t names < <(printf '%s\n' "${names[@]}" | awk '!seen[$0]++')
+else
+    all=("${names[@]}")
+    names=()
 fi
+for pat in $LONGEST; do
+    for n in "${all[@]}"; do
+        # shellcheck disable=SC2254
+        case $n in $pat) names+=("$n") ;; esac
+    done
+done
+names+=("${all[@]}")
+mapfile -t names < <(printf '%s\n' "${names[@]}" | awk '!seen[$0]++')
 for n in "${names[@]}"; do
     [ -f "$BATSDIR/$n.bats" ] || { echo "no tests/e2e/bats/$n.bats" >&2; exit 2; }
 done
-SCRIPTS=("${names[@]}")
+# alone: whether the file NAME runs alone (as root)
+alone () {
+    [ "$(id -u)" = 0 ] && printf '%s\n' $ALONE | grep -qx "$1"
+}
+SCRIPTS=()
+for n in "${names[@]}"; do alone "$n" && SCRIPTS+=("$n"); done
+for n in "${names[@]}"; do alone "$n" || SCRIPTS+=("$n"); done
 
 now () { date +%s.%N; }
 start=$(now)
-declare -A PID_OF=() STARTED=() DONE=()
+declare -A PID_OF=() STARTED=() ENDED=()
 results=()
 
 # Ctrl-C or a TERM: a file's timeout passes the TERM on to the process group
@@ -99,11 +119,12 @@ logof () { echo "$LOGDIR/${1//\//_}.log"; }
 
 finish () { # pid status
     local name=${PID_OF[$1]} status=$2 secs what log extra=
-    local total skipped
+    local total skipped failed
     log=$(logof "$name")
     secs=$(echo "$(now) - ${STARTED[$name]}" | bc)
     total=$(grep -c -E '^(not )?ok ' "$log")
     skipped=$(grep -c -E '^ok .* # skip' "$log")
+    failed=$(grep -c '^not ok ' "$log")
     case $status in
     0)
         if [ "$total" -gt 0 ] && [ "$skipped" = "$total" ]; then
@@ -116,20 +137,28 @@ finish () { # pid status
     124 | 137) what=TIMEOUT ;;
     *) what=FAIL ;;
     esac
-    results+=("$(printf '%-8s %7.1f s  %s' "$what" "$secs" "$name")")
+    results+=("$(printf '%-8s %7.1f s  %-26s %5d %5d %5d' "$what" "$secs" "$name" \
+        $((total - skipped - failed)) "$failed" "$skipped")")
     printf '%-8s %7.1f s  %s%s\n' "$what" "$secs" "$name" "$extra"
     if [ "$what" = skip ]; then
         printf '         (%s)\n' "$(grep -E '^ok .* # skip' "$log" | tail -1 | sed 's/.*# skip *//')"
     fi
-    DONE[$name]=1
+    ENDED[$name]=1
     unset "PID_OF[$1]"
 }
 
-# Whether the files NAME waits for (AFTER) are done or not run at all.
+# Whether NAME may start: the files it waits for (AFTER) are done or not run
+# at all, and neither it nor a file that runs is one that runs alone.
 ready () {
     local n
+    if [ ${#PID_OF[@]} -gt 0 ]; then
+        alone "$1" && return 1
+        for n in "${PID_OF[@]}"; do
+            alone "$n" && return 1
+        done
+    fi
     for n in ${AFTER[$1]:-}; do
-        if [ -z "${DONE[$n]:-}" ] && printf '%s\n' "${QUEUE[@]}" "${PID_OF[@]}" | grep -qx "$n"; then
+        if [ -z "${ENDED[$n]:-}" ] && printf '%s\n' "${QUEUE[@]}" "${PID_OF[@]}" | grep -qx "$n"; then
             return 1
         fi
     done
@@ -173,10 +202,14 @@ while [ ${#QUEUE[@]} -gt 0 ] || [ ${#PID_OF[@]} -gt 0 ]; do
     fi
 done
 
+# the table of the files, by name: result, time, tests passed, failed, skipped
+printf '\n%-8s %9s  %-26s %5s %5s %5s\n' result time file pass fail skip
+printf '%s\n' "${results[@]}" | sort -k4,4
+printf '%s\n' "${results[@]}" | awk '{ p += $5; f += $6; s += $7 } END { printf "%-8s %9s  %-26s %5d %5d %5d\n", "total", "", "", p, f, s }'
 failed=$(printf '%s\n' "${results[@]}" | grep -c -e '^FAIL' -e '^TIMEOUT')
 printf 'e2e: %d files, %d failed, %.0f s wall, logs in %s\n' \
     ${#results[@]} "$failed" "$(echo "$(now) - $start" | bc)" "$LOGDIR"
-printf '%s\n' "${results[@]}" | grep -e '^FAIL' -e '^TIMEOUT' | while read -r _ _ _ name; do
+printf '%s\n' "${results[@]}" | grep -e '^FAIL' -e '^TIMEOUT' | while read -r _ _ _ name _; do
     echo "--- $name"
     grep -e '^not ok' -e FAIL -e panicked "$(logof "$name")" | head -5
 done
