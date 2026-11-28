@@ -598,6 +598,7 @@ fn engine_settlement(pulled: &[LayerDone]) -> ImageResult<Settlement> {
     let identities = engine_identities(pulled)?;
     let verdict = Verdict::sealed(&CheckId::fresh(), checked_of(&identities, pulled));
     Ok(Settlement {
+        held: Default::default(),
         identities,
         verdict,
     })
@@ -1445,6 +1446,7 @@ pub async fn a_pull_returns_the_verdict_of_the_check(f: &Factory) {
                     .insert(stored_key, Some("stored".to_string()));
                 *sent2.lock().unwrap() = Some((checked.layer_keys.clone(), checked.ours.clone()));
                 Ok(Settlement {
+                    held: Default::default(),
                     identities,
                     verdict: Verdict::sealed(&check2, checked),
                 })
@@ -1504,6 +1506,7 @@ pub async fn a_pull_the_engine_made_no_image_for_is_refused(f: &Factory) {
                 ids.images.clear();
                 let verdict = Verdict::sealed(&CheckId::fresh(), checked_of(&ids, layers));
                 Ok(Settlement {
+                    held: Default::default(),
                     identities: ids,
                     verdict,
                 })

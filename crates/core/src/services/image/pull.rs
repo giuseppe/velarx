@@ -1986,6 +1986,34 @@ fn threshold_of(record: Option<&velarx_db::LayerRecord>, asked: i64) -> i64 {
         .map_or(asked, |r| r.inline)
 }
 
+/// The files, by fs-verity digest, that the images hold and no layer of
+/// the pull needs as an object: a file one layer holds and another one
+/// (made with a smaller threshold) does not is an object.
+fn held_files(
+    pulled: &[LayerDone],
+    inlining: &HashMap<LayerKey, velarx_graph::Inlining>,
+) -> HashSet<String> {
+    let needed: HashSet<&str> = pulled
+        .iter()
+        .filter(|p| !p.lazy)
+        .flat_map(|p| {
+            let own: HashSet<&str> = inlining
+                .get(&p.key)
+                .map(|i| i.files.iter().map(|f| f.digest.as_str()).collect())
+                .unwrap_or_default();
+            p.files
+                .iter()
+                .map(|f| f.digest.as_str())
+                .filter(move |d| !own.contains(d))
+        })
+        .collect();
+    inlining
+        .values()
+        .flat_map(|i| i.files.iter().map(|f| f.digest.clone()))
+        .filter(|d| !needed.contains(d.as_str()))
+        .collect()
+}
+
 /// The identity of layers and the EROFS image it was made from.
 pub(super) type Made = HashMap<
     LayerKey,
@@ -2088,6 +2116,7 @@ impl ImageService {
                 let (made, inlined) = storage::identities_of(&tocs, &open, &staging)?;
                 ours.extend(made.artifacts);
                 images.extend(made.images);
+                let held = held_files(pulled, &inlined);
                 if !states {
                     let theirs: Vec<Option<String>> = layer_keys
                         .iter()
@@ -2104,6 +2133,7 @@ impl ImageService {
                 // identities, which what the driver recorded is checked
                 // against)
                 Ok(Settlement {
+                    held,
                     verdict: Verdict::sealed(
                         &check,
                         Checked {
@@ -2462,6 +2492,56 @@ mod stored_tests {
             velarx_storage::VerityMode::Off,
         )
         .unwrap()
+    }
+
+    /// A file the images hold is left out of the commit, unless a layer
+    /// that does not hold it needs it as an object.
+    #[test]
+    fn a_file_a_layer_needs_as_an_object_is_not_left_out() {
+        let id = |n: u8| format!("fsverity-sha256-12:{}", format!("{n:02x}").repeat(32));
+        let layer = |n: u8, files: &[u8]| LayerDone {
+            key: LayerKey::Whole(digest(&format!("blob{n}"))),
+            blob: digest("blob"),
+            diff_id: digest("diff"),
+            size: 0,
+            toc: Arc::new(velarx_storage::Toc {
+                version: 1,
+                entries: Vec::new(),
+                tar_split_digest: None,
+            }),
+            files: files
+                .iter()
+                .map(|&f| velarx_content::pull::entry::FileUse {
+                    digest: id(f),
+                    size: 3,
+                })
+                .collect(),
+            chunks: Vec::new(),
+            report: Default::default(),
+            tarsplit: Default::default(),
+            toc_z: Default::default(),
+            lazy: false,
+            blob_checked: false,
+            checked: Default::default(),
+        };
+        let holding = |files: &[u8]| velarx_graph::Inlining {
+            threshold: 64,
+            files: files
+                .iter()
+                .map(|&f| velarx_db::InlinedFile {
+                    digest: id(f),
+                    offset: 0,
+                    size: 3,
+                })
+                .collect(),
+        };
+        let (a, b) = (layer(1, &[1, 2]), layer(2, &[2, 3]));
+        // (a holds 1 and 2, b holds 3 only: 2 is an object of b)
+        let inlining = HashMap::from([(a.key, holding(&[1, 2])), (b.key, holding(&[3]))]);
+        assert_eq!(
+            held_files(&[a, b], &inlining),
+            HashSet::from([id(1), id(3)])
+        );
     }
 
     /// The first threshold a layer is made with wins, silently: a layer with

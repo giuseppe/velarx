@@ -506,6 +506,10 @@ impl Verdict {
 /// record, and the verdict for the engine.
 pub struct Settlement {
     pub identities: Identities,
+    /// The files, by fs-verity digest, that the images of the layers hold
+    /// and no layer needs as an object: the pull stages them to write the
+    /// images and the commit leaves them out of the store.
+    pub held: std::collections::HashSet<String>,
     pub verdict: Verdict,
 }
 
@@ -1436,7 +1440,7 @@ async fn pull_session<R: Send + 'static>(
         // sees what each is to be named by and reads it where it is staged:
         // a pull it refuses names nothing in the store.  The commit that
         // follows only links, renames and syncs.
-        let verified = session.verify(verity.as_ref()).map_err(failed)?;
+        let mut verified = session.verify(verity.as_ref()).map_err(failed)?;
         let (objects, staged) = verified.objects().map_err(failed)?;
         let objects: HashMap<String, velarx_storage::Object> =
             objects.into_iter().map(|c| (c.digest, c.object)).collect();
@@ -1447,6 +1451,7 @@ async fn pull_session<R: Send + 'static>(
         }
         let at = |d: &str| staged.get(d).cloned().or_else(|| store.get_path(d));
         let mut settlement = settled(&mut pulled, &at).map_err(|e| refused(&driver, e))?;
+        verified.leave(&settlement.held);
         let mut write = Some(write);
         let mut written = None;
         let mut between = |_: &[velarx_content::pull::session::Committed]| {

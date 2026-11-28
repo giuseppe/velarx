@@ -331,6 +331,15 @@ pub fn verify_layers(
 pub type Ready = Result<(Object, Option<std::path::PathBuf>), Refusal>;
 
 impl Verified {
+    /// Leave out of the commit the files of each staging for which `keep`
+    /// (one answer for each file, in order) says no: they are not named.
+    pub fn retain(&mut self, keep: &[Vec<bool>]) {
+        for (prepared, keep) in self.prepared.iter_mut().zip(keep) {
+            let mut keep = keep.iter();
+            prepared.retain(|_| *keep.next().unwrap_or(&true));
+        }
+    }
+
     /// What each file of each staging is to be named by, as it was verified,
     /// and where its bytes are until then (none: the store has them); the
     /// refusal of a file that is not to be named.

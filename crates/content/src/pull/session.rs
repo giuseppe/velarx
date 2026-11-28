@@ -933,6 +933,42 @@ fn not_committed(
 }
 
 impl Verification {
+    /// Leave out of the commit the staged files named by the fs-verity
+    /// digests `held`: a file that an image holds is written into the image
+    /// and has no object in the store.  They were verified like the others.
+    pub fn leave(&mut self, held: &std::collections::HashSet<String>) {
+        let Some(v) = &mut self.0 else {
+            return;
+        };
+        let stagings: Vec<super::commit::Staging<'_>> = v
+            .homes
+            .iter()
+            .zip(&v.by_home)
+            .map(|((dir, _), wants)| super::commit::Staging {
+                dir,
+                wants: wants.clone(),
+                image: None,
+            })
+            .collect();
+        let keep: Vec<Vec<bool>> = v
+            .verified
+            .ready(&stagings)
+            .iter()
+            .map(|ready| {
+                ready
+                    .iter()
+                    .map(|r| !matches!(r, Ok((object, _)) if held.contains(&object.verity)))
+                    .collect()
+            })
+            .collect();
+        drop(stagings);
+        for (wants, keep) in v.by_home.iter_mut().zip(&keep) {
+            let mut keep = keep.iter();
+            wants.retain(|_| *keep.next().unwrap_or(&true));
+        }
+        v.verified.retain(&keep);
+    }
+
     /// What the commit of the verified files will name each key by, before
     /// anything is named ([`Session::commit_verified`] gives the same), and
     /// where the bytes of each of those objects are until then, by its
@@ -1707,6 +1743,27 @@ mod tests {
         assert_eq!(mode & 0o777, 0o444);
         assert!(s.have(&d));
         assert_eq!(s.staged_totals(), (0, 0));
+    }
+
+    /// A file an image holds is verified like the others and staged until
+    /// the image is written, but the commit does not name it in the store.
+    #[test]
+    fn a_held_file_is_verified_and_not_committed() {
+        let (_tmp, s) = session();
+        let alg = velarx_types::digest::Algorithm::Sha256;
+        let held = velarx_storage::fsverity_digest_of(alg, b"small");
+        let kept = velarx_storage::fsverity_digest_of(alg, b"big enough to stay");
+        s.put(&held, b"small").unwrap();
+        s.put(&kept, b"big enough to stay").unwrap();
+        let mut verified = s.verify(None).unwrap();
+        let (objects, at) = verified.objects().unwrap();
+        assert_eq!(objects.len(), 2);
+        assert!(at.contains_key(&held));
+        verified.leave(&[held.clone()].into());
+        let moved = s.commit_verified(verified, None).unwrap();
+        assert_eq!(moved.iter().map(|c| &c.digest).collect::<Vec<_>>(), [&kept]);
+        assert!(s.store().contains(&kept));
+        assert!(!s.store().contains(&held));
     }
 
     #[test]
