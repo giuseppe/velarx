@@ -36,30 +36,18 @@ impl DriverOptions {
     }
 }
 
-/// What the driver `kind` can do, without opening it.
-pub fn local_capabilities(kind: velarx_config::StorageDriverKind) -> &'static Capabilities {
-    use velarx_config::StorageDriverKind;
-    match kind {
-        StorageDriverKind::Composefs => ComposefsDriver::capabilities_of(),
-    }
+/// What the driver can do, without opening it.
+pub fn local_capabilities() -> &'static Capabilities {
+    ComposefsDriver::capabilities_of()
 }
 
-/// The driver `kind` of the store made of `parts`.  This is the one place
-/// that knows which driver is which: a driver added to `StorageDriverKind`
-/// stops this from compiling until it is made here.
-pub fn open(
-    kind: velarx_config::StorageDriverKind,
-    parts: DriverParts,
-    options: &DriverOptions,
-) -> Arc<dyn StorageDriver> {
-    use velarx_config::StorageDriverKind;
-    match kind {
-        StorageDriverKind::Composefs => Arc::new(ComposefsDriver::new(
-            parts.db,
-            parts.store,
-            parts.staging_dir,
-            parts.fsverity,
-            options.composefs.clone(),
-        )),
-    }
+/// The driver of the store made of `parts`.
+pub fn open(parts: DriverParts, options: &DriverOptions) -> Arc<dyn StorageDriver> {
+    Arc::new(ComposefsDriver::new(
+        parts.db,
+        parts.store,
+        parts.staging_dir,
+        parts.fsverity,
+        options.composefs.clone(),
+    ))
 }

@@ -453,18 +453,12 @@ impl StoreService {
         // (read once, and again when the shares change: this service sees
         // them change)
         let checkpoints = SharedCheckpoints::new(&config.storage.root)?.cached();
-        // (the driver the store was made with: what it serves is its own)
-        let kind = match db.recorded_driver().await {
-            Ok(recorded) => config.storage.resolve_driver(&recorded).ok(),
-            Err(_) => None,
-        }
-        .unwrap_or_else(|| config.storage.driver_kind());
-        Self::build(db, files, Some(Arc::new(checkpoints)), kind).await
+        Self::build(db, files, Some(Arc::new(checkpoints))).await
     }
 
     /// The service of `db` and `files`.
     pub async fn new(db: Database, files: Arc<FileStore>) -> io::Result<Self> {
-        Self::build(db, files, None, velarx_config::StorageDriverKind::DEFAULT).await
+        Self::build(db, files, None).await
     }
 
     /// The service of `db` and `files`, which also gives the pieces of the
@@ -474,27 +468,20 @@ impl StoreService {
         files: Arc<FileStore>,
         checkpoints: Arc<SharedCheckpoints>,
     ) -> io::Result<Self> {
-        Self::build(
-            db,
-            files,
-            Some(checkpoints),
-            velarx_config::StorageDriverKind::DEFAULT,
-        )
-        .await
+        Self::build(db, files, Some(checkpoints)).await
     }
 
     async fn build(
         db: Database,
         files: Arc<FileStore>,
         checkpoints: Option<Arc<SharedCheckpoints>>,
-        kind: velarx_config::StorageDriverKind,
     ) -> io::Result<Self> {
         let objects = files.root().to_path_buf();
         let chunks = Arc::new(chunk_provider::StorageChunkProvider::new(
             files.clone(),
             db.clone(),
         ));
-        let serves_content = crate::storage_driver::local_capabilities(kind).serve_content;
+        let serves_content = crate::storage_driver::local_capabilities().serve_content;
         let shared = Shared::of(announcement(&db, checkpoints.as_ref()).await?);
         let (changes, _) = broadcast::channel(CHANGES_KEPT);
         Ok(Self {

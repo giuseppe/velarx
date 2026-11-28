@@ -125,7 +125,6 @@ impl Database {
     pub async fn open_store(storage: &velarx_config::StorageConfig) -> DbResult<Self> {
         let main = Database::open(storage.database_path()).await?;
         let own = std::fs::canonicalize(&storage.root).ok();
-        let composefs = velarx_config::StorageDriverKind::Composefs.name();
         let mut more = Vec::new();
         for root in &storage.additional_image_stores {
             if own.is_some() && std::fs::canonicalize(root).ok() == own {
@@ -159,7 +158,7 @@ impl Database {
                 .recorded_driver()
                 .await
                 .map_err(|e| refuse(e.to_string()))?;
-            if theirs != composefs {
+            if theirs != velarx_config::STORAGE_DRIVER {
                 return Err(refuse(format!(
                     "it was made with the storage driver {theirs:?}; this velarx \
                      reads composefs stores only"
@@ -187,10 +186,7 @@ impl Database {
             })
             .await
             .map_err(DbError::Sqlite)?;
-        Ok(
-            recorded
-                .unwrap_or_else(|| velarx_config::StorageDriverKind::DEFAULT.name().to_string()),
-        )
+        Ok(recorded.unwrap_or_else(|| velarx_config::STORAGE_DRIVER.to_string()))
     }
 
     /// The layer, of this store only (not of the read-only stores).

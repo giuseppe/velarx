@@ -14,8 +14,6 @@ pub struct Ask {
     /// fsverity_require`, `composefs_digests = "require"`, or the
     /// container's `--security-opt verity=enforce`.
     pub verity_enforced: bool,
-    /// `[storage] fsverity_best_effort`: a check at pull is enough.
-    pub verity_best_effort: bool,
     /// The engine runs as an unprivileged user.
     pub unprivileged: bool,
     /// A container with a user namespace of its own: its root file system
@@ -81,9 +79,9 @@ impl Capabilities {
                 "the storage driver {driver} copies whole layers and has no images whose files are partly missing: pull without --lazy"
             ));
         }
-        if ask.verity_enforced && !self.verity_at_run_time() && !ask.verity_best_effort {
+        if ask.verity_enforced && !self.verity_at_run_time() {
             return no(format!(
-                "the storage driver {driver} checks fs-verity only when a layer is pulled, so its digests cannot be enforced while a container runs (`[storage] fsverity_require`, `composefs_digests = \"require\"`, `--security-opt verity=enforce`): set `[storage] fsverity_best_effort = true` to accept the check at pull, or use the composefs driver"
+                "the storage driver {driver} checks fs-verity only when a layer is pulled, so its digests cannot be enforced while a container runs (`[storage] fsverity_require`, `composefs_digests = \"require\"`, `--security-opt verity=enforce`): use the composefs driver"
             ));
         }
         if ask.unprivileged && !self.rootless {
@@ -169,24 +167,14 @@ mod tests {
         )
         .unwrap()
         .contains("pull without --lazy"));
-        // enforced digests: an error, unless best effort is said
+        // enforced digests: an error
         let enforced = Ask {
             verity_enforced: true,
             ..Default::default()
         };
         assert!(why(&pull_only, enforced.clone())
             .unwrap()
-            .contains("fsverity_best_effort = true"));
-        assert_eq!(
-            why(
-                &pull_only,
-                Ask {
-                    verity_best_effort: true,
-                    ..enforced.clone()
-                }
-            ),
-            None
-        );
+            .contains("digests cannot be enforced"));
         // a driver that checks at run time takes it, with or without
         let at_run = caps(&[VerityEnforcement::Kernel, VerityEnforcement::OnOpen]);
         assert_eq!(why(&at_run, enforced), None);

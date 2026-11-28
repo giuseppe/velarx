@@ -975,9 +975,8 @@ pub enum CgroupDriver {
 pub struct StorageConfig {
     #[serde(default = "default_storage_root")]
     pub root: PathBuf,
-    /// The storage driver of a store that is made now (`composefs`); a store
-    /// keeps the one it was made with, and is not opened with another.
-    /// Unset: the one of the store, `composefs` for a new one.
+    /// The storage driver: unset or `composefs`, the only one.  Any other
+    /// value is an error.
     #[serde(default)]
     pub driver: Option<String>,
     #[serde(default = "default_gc_interval")]
@@ -990,14 +989,6 @@ pub struct StorageConfig {
     /// not served; the store must be on a file system that has it
     #[serde(default)]
     pub fsverity_require: bool,
-    /// A storage driver that checks fs-verity only when a layer is pulled
-    /// accepts `fsverity_require`, `composefs_digests = "require"` and
-    /// `--security-opt verity=enforce` as checks at pull, and nothing more is
-    /// promised while a container runs.  Without it those settings are an
-    /// error with such a driver.  No effect on a driver that enforces at run
-    /// time (`composefs`).
-    #[serde(default)]
-    pub fsverity_best_effort: bool,
     /// The EROFS images of the layers of root containers mounted by the
     /// kernel: "auto" where it can (root, a kernel that mounts them; FUSE
     /// serves them otherwise), or "off"
@@ -1052,58 +1043,10 @@ pub enum VerityChain {
     Require,
 }
 
-/// The storage drivers this build has, by the name of `[storage] driver`.
-/// Adding one adds a variant: every `match` on it stops compiling until the
-/// driver is handled there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum StorageDriverKind {
-    /// Per-layer EROFS images over a store of files named by their fs-verity
-    /// digest.
-    Composefs,
-}
-
-impl StorageDriverKind {
-    /// Every driver of this build.
-    pub const ALL: &'static [StorageDriverKind] = &[Self::Composefs];
-    /// The driver of a store that was made without choosing one.
-    pub const DEFAULT: Self = Self::Composefs;
-
-    /// The name in the configuration, the store and `velarx info`.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Composefs => "composefs",
-        }
-    }
-
-    /// The names of `ALL`, as one list for a message.
-    pub fn known() -> String {
-        Self::ALL
-            .iter()
-            .map(|k| k.name())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    /// The driver called `name`.
-    pub fn parse(name: &str) -> Result<Self, String> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|k| k.name() == name)
-            .ok_or_else(|| {
-                format!(
-                    "{name:?} is not a storage driver of this velarx (known: {})",
-                    Self::known()
-                )
-            })
-    }
-}
-
-impl std::fmt::Display for StorageDriverKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
-    }
-}
+/// The storage driver of this velarx, the only one: the files named by their
+/// fs-verity digest and one EROFS image for each layer.  It is the name in
+/// `[storage] driver`, `--storage-driver`, the store and `velarx info`.
+pub const STORAGE_DRIVER: &str = "composefs";
 
 /// The `[storage] composefs_digests` setting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1164,51 +1107,30 @@ fn default_fsverity() -> bool {
 }
 
 impl StorageConfig {
-    /// The driver the configuration asks for (`[storage] driver`, or
-    /// `--storage-driver`); none when it asks for none.
-    pub fn requested_driver(&self) -> Result<Option<StorageDriverKind>, ConfigError> {
-        self.driver
-            .as_deref()
-            .map(|d| {
-                StorageDriverKind::parse(d)
-                    .map_err(|e| ConfigError::Invalid(format!("[storage] driver = {e}")))
-            })
-            .transpose()
-    }
-
-    /// The driver of the store whose settings say `recorded` (the driver it
-    /// was made with): that one when the configuration asks for none, and an
-    /// error when it asks for another or the store has one this build does
-    /// not.
-    pub fn resolve_driver(&self, recorded: &str) -> Result<StorageDriverKind, ConfigError> {
-        let root = self.root.display();
-        if let Some(asked) = self.requested_driver()? {
-            if asked.name() != recorded {
-                return Err(ConfigError::Invalid(format!(
-                    "the store {root} was made with the storage driver {recorded:?}, but {asked} \
-                     is asked for ([storage] driver, --storage-driver or {ENV_STORAGE_DRIVER}): \
-                     ask for {recorded:?}, or remove the store"
-                )));
-            }
+    /// The configuration asks for no other driver than composefs
+    /// (`[storage] driver`, `--storage-driver`).
+    pub fn check_driver(&self) -> Result<(), ConfigError> {
+        match self.driver.as_deref() {
+            None | Some(STORAGE_DRIVER) => Ok(()),
+            Some(other) => Err(ConfigError::Invalid(format!(
+                "the storage driver {other:?} is not available: this velarx has only \
+                 {STORAGE_DRIVER:?} ([storage] driver, --storage-driver or \
+                 {ENV_STORAGE_DRIVER}; remove the setting to use it)"
+            ))),
         }
-        StorageDriverKind::parse(recorded).map_err(|_| {
-            ConfigError::Invalid(format!(
-                "the store {root} was made with the storage driver {recorded:?}, which this \
-                 velarx does not have (known: {}): use the velarx that made it, or remove the \
-                 store",
-                StorageDriverKind::known()
-            ))
-        })
     }
 
-    /// The driver of the store once it is known (the daemon resolves it
-    /// against the store and writes it back into the configuration): the
-    /// requested one, else the default.
-    pub fn driver_kind(&self) -> StorageDriverKind {
-        self.requested_driver()
-            .ok()
-            .flatten()
-            .unwrap_or(StorageDriverKind::DEFAULT)
+    /// The driver the store was made with (`recorded`) is composefs: a store
+    /// of another driver is not opened.
+    pub fn check_recorded_driver(&self, recorded: &str) -> Result<(), ConfigError> {
+        if recorded == STORAGE_DRIVER {
+            return Ok(());
+        }
+        Err(ConfigError::Invalid(format!(
+            "the store {} was made with the storage driver {recorded:?}, and this velarx has \
+             only {STORAGE_DRIVER:?}: use the velarx that made it, or remove the store",
+            self.root.display()
+        )))
     }
 
     /// The files of the store, each named by its fs-verity digest
@@ -1457,7 +1379,6 @@ impl Default for StorageConfig {
             gc_interval_secs: default_gc_interval(),
             fsverity: default_fsverity(),
             fsverity_require: false,
-            fsverity_best_effort: false,
             composefs: default_composefs(),
             additional_image_stores: Vec::new(),
             check_leftover_age_secs: default_check_leftover_age(),
@@ -1619,7 +1540,7 @@ impl Config {
                 return Err(ConfigError::Invalid(format!("[server] runtime: {e}")));
             }
         }
-        self.storage.requested_driver()?;
+        self.storage.check_driver()?;
         let c = &self.containers.cgroups;
         if !c.is_empty() && !CGROUPS_MODES.contains(&c.as_str()) {
             return Err(ConfigError::Invalid(format!(
@@ -1946,85 +1867,56 @@ mod tests {
     }
 
     #[test]
-    fn the_storage_driver_is_the_stores_unless_the_configuration_asks_for_another() {
-        let kind = StorageDriverKind::Composefs;
+    fn composefs_is_the_storage_driver_when_none_is_named_or_it_is() {
         assert_eq!(parse("").unwrap().storage.driver, None);
-        assert_eq!(storage_with(None).driver_kind(), kind);
-        assert_eq!(
-            storage_with(None).resolve_driver("composefs").unwrap(),
-            kind
-        );
-        assert_eq!(
-            storage_with(Some("composefs"))
-                .resolve_driver("composefs")
-                .unwrap(),
-            kind
-        );
-        assert_eq!(
-            parse("[storage]\ndriver = \"composefs\"\n")
-                .unwrap()
-                .storage
-                .requested_driver()
-                .unwrap(),
-            Some(kind)
-        );
-    }
-
-    #[test]
-    fn a_store_is_not_opened_with_another_driver_than_its_own() {
-        // a store made with a driver this build lacks
-        let e = storage_with(None)
-            .resolve_driver("zfs")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            e.contains("/s/store")
-                && e.contains(
-                    "made with the storage driver \"zfs\", which this velarx does not have \
-                     (known: composefs)"
-                ),
-            "{e}"
-        );
-        // a store of another driver than the one asked for
-        let e = storage_with(Some("composefs"))
-            .resolve_driver("zfs")
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("but composefs is asked for"), "{e}");
-        assert_eq!(
-            storage_with(None).resolve_driver("composefs").unwrap(),
-            StorageDriverKind::Composefs
-        );
-        assert_eq!(StorageDriverKind::DEFAULT, StorageDriverKind::Composefs);
-    }
-
-    #[test]
-    fn an_unknown_storage_driver_is_refused_with_the_known_ones() {
-        let e = parse("[storage]\ndriver = \"zfs\"\n")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            e.contains("\"zfs\"") && e.contains("(known: composefs)"),
-            "{e}"
-        );
-        assert!(parse("[storage]\ndriver = \"composefs\"\n")
+        storage_with(None).check_driver().unwrap();
+        storage_with(Some("composefs")).check_driver().unwrap();
+        parse("[storage]\ndriver = \"composefs\"\n")
             .unwrap()
             .validate()
-            .is_ok());
-        // --storage-driver says it the same way
-        let mut c = Config::default();
-        c.apply_global_options(|n| (n == ENV_STORAGE_DRIVER).then(|| "zfs".into()))
             .unwrap();
-        assert!(c
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("known: composefs"));
-        // and wins over the file
-        let mut c = parse("[storage]\ndriver = \"composefs\"\n").unwrap();
-        c.apply_global_options(|n| (n == ENV_STORAGE_DRIVER).then(|| "zfs".into()))
+        storage_with(None)
+            .check_recorded_driver("composefs")
             .unwrap();
-        assert_eq!(c.storage.driver.as_deref(), Some("zfs"));
+    }
+
+    #[test]
+    fn another_storage_driver_is_refused_naming_the_one_there_is() {
+        for other in ["vfs", "varlink", "overlay", "zfs"] {
+            // [storage] driver
+            let e = parse(&format!("[storage]\ndriver = \"{other}\"\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains(&format!("{other:?} is not available"))
+                    && e.contains("only \"composefs\""),
+                "{e}"
+            );
+            // --storage-driver and its variable say it the same way, and win
+            // over the file
+            let mut c = parse("[storage]\ndriver = \"composefs\"\n").unwrap();
+            c.apply_global_options(|n| (n == ENV_STORAGE_DRIVER).then(|| other.into()))
+                .unwrap();
+            assert_eq!(c.storage.driver.as_deref(), Some(other));
+            let e = c.validate().unwrap_err().to_string();
+            assert!(e.contains(&format!("{other:?} is not available")), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_store_of_another_driver_is_not_opened() {
+        for recorded in ["vfs", "varlink", "overlay", "zfs"] {
+            let e = storage_with(None)
+                .check_recorded_driver(recorded)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("/s/store")
+                    && e.contains(&format!("storage driver {recorded:?}"))
+                    && e.contains("only \"composefs\""),
+                "{e}"
+            );
+        }
     }
 
     #[test]

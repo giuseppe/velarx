@@ -1157,11 +1157,7 @@ pub(crate) async fn build_services(
     Ok(state)
 }
 
-async fn build_core(
-    mut config: Arc<Config>,
-    config_path: &Path,
-    role: &Role,
-) -> anyhow::Result<Core> {
+async fn build_core(config: Arc<Config>, config_path: &Path, role: &Role) -> anyhow::Result<Core> {
     let engine = matches!(role, Role::Engine { .. });
     // (the engine service holds a connection for each client, and the
     // descriptors its calls carry: more than the 1024 of a shell.  The
@@ -1219,20 +1215,14 @@ async fn build_core(
              database configuration mismatch"
         );
     }
-    // A store keeps the storage driver it was made with.
-    let driver = config
+    // Only a store of the composefs driver is opened.
+    config
         .storage
-        .resolve_driver(
-            &db.store_setting("driver", config.storage.driver_kind().name())
+        .check_recorded_driver(
+            &db.store_setting("driver", velarx_config::STORAGE_DRIVER)
                 .await?,
         )
         .map_err(anyhow::Error::from)?;
-    if config.storage.driver.as_deref() != Some(driver.name()) {
-        Arc::make_mut(&mut config).storage.driver = Some(driver.name().into());
-        // (what the store's driver needs of the configuration, now that it
-        // is known)
-        config.validate().map_err(anyhow::Error::from)?;
-    }
     let file_store = Arc::new(config.storage.file_store()?);
 
     std::fs::create_dir_all(config.storage.staging_dir())?;
@@ -1251,7 +1241,6 @@ async fn build_core(
     .with_transports(config.transports.clone())
     .with_sinks(config.sinks.external.clone())
     .with_default_digest(config.build.digest)
-    .with_driver(config.storage.driver_kind())
     .with_image_server(
         velarx_base::spawn::binary(),
         config.server.state_dir.clone(),
@@ -1259,8 +1248,7 @@ async fn build_core(
     )
     .with_composefs(&config.storage.composefs)
     .with_composefs_digests(config.storage.composefs_digests)
-    .with_verity_chain(config.storage.verity_chain)
-    .with_verity_best_effort(config.storage.fsverity_best_effort);
+    .with_verity_chain(config.storage.verity_chain);
     // The fetchers of the pulls but the registry fetcher
     image_service = image_service.with_fetchers(config.sources.external.clone());
     // a lazy pull outlives the command that made it: it is the engine

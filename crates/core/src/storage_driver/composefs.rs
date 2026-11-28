@@ -3110,21 +3110,17 @@ mod tests {
             ]
             .map(|(k, v)| (k.to_string(), v.to_string()))
         );
-        // (the kind of the configuration is the one the factory makes)
-        for kind in velarx_config::StorageDriverKind::ALL {
-            let parts = || crate::storage_driver::DriverParts {
+        // (the name of the configuration is the one the factory makes)
+        let made = crate::storage_driver::open(
+            crate::storage_driver::DriverParts {
                 db: d.db.clone(),
                 store: d.store.clone(),
                 staging_dir: dir.path().join("staging"),
                 fsverity: VerityMode::Off,
-            };
-            let made = crate::storage_driver::open(
-                *kind,
-                parts(),
-                &crate::storage_driver::DriverOptions::new(options_for_tests(dir.path())),
-            );
-            assert_eq!(kind.name(), made.name());
-        }
+            },
+            &crate::storage_driver::DriverOptions::new(options_for_tests(dir.path())),
+        );
+        assert_eq!(velarx_config::STORAGE_DRIVER, made.name());
     }
 
     #[tokio::test]

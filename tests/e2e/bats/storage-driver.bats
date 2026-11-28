@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # The storage driver of a store: what `info` and `inspect` say of it (the
 # name podman and Docker report, velarx's own, the data the driver gives), the
-# choice by --storage-driver and [storage] driver, and the refusal of a
-# store that was made with another driver.  Rootless.
+# choice by --storage-driver and [storage] driver (composefs, the only
+# one), and the refusal of a store that was made with another driver.
+# Rootless.
 #
 #   VELARX_BINDIR=target/debug bats tests/e2e/bats/storage-driver.bats
 
@@ -107,47 +108,52 @@ teardown_file () {
     check_match "the leftover is a problem" "stale_temp|temporary file of the composefs" "$out"
 }
 
-@test "--storage-driver: composefs is the driver, an unknown name is an error that lists the known ones" {
+@test "--storage-driver: composefs is the driver, any other name is an error that says which one there is" {
     sh_cfg --storage-driver composefs image list > /dev/null 2>&1
     check "composefs" 0 $?
-    out=$(sh_cfg --storage-driver zfs image list 2>&1)
-    check "zfs: refused" 125 $?
-    check_match "the known ones are listed" 'storage driver of this velarx \(known: composefs, vfs\)' "$out"
-    out=$("$BIN/velarx" --storage-driver "" --socket "$ESOCK" image list 2>&1)
-    check "the empty name chooses nothing" 0 $?
-    out=$("$BIN/velarx" --storage-driver overlay --socket "$ESOCK" image list 2>&1)
-    check "overlay, podman's name, chooses nothing" 0 $?
+    local name
+    for name in zfs vfs varlink overlay; do
+        out=$(sh_cfg --storage-driver "$name" image list 2>&1)
+        check "$name: refused" 125 $?
+        check_match "$name: the one there is is named" "the storage driver \"$name\" is not available: this velarx has only \"composefs\"" "$out"
+    done
 }
 
-@test "an unknown [storage] driver is refused at start, with the known ones" {
+@test "a [storage] driver other than composefs is refused at start, with the one there is" {
     stop_daemon
-    config_with 'driver = "zfs"'
-    out=$("$BIN/velarx" --config "$XDG_CONFIG_HOME/velarx/config.toml" varlink 2>&1)
-    check "the daemon does not start" 125 $?
-    check_match "it says which key" '\[storage\] driver = "zfs" is not a storage driver of this velarx \(known: composefs, vfs\)' "$out"
-}
-
-@test "a store keeps the driver it was made with" {
-    stop_daemon
-    # the store was made above with composefs: another driver in its database
+    local name
+    for name in zfs vfs varlink; do
+        config_with "driver = \"$name\""
+        out=$("$BIN/velarx" --config "$XDG_CONFIG_HOME/velarx/config.toml" varlink 2>&1)
+        check "$name: the daemon does not start" 125 $?
+        check_match "$name: it says which one there is" "the storage driver \"$name\" is not available: this velarx has only \"composefs\" \\(\\[storage\\] driver" "$out"
+    done
     config_with 'driver = "composefs"'
-    sqlite3 "$WORKDIR/store/db.sqlite" "UPDATE store_settings SET value = 'zfs' WHERE key = 'driver'"
-    out=$("$BIN/velarx" --config "$XDG_CONFIG_HOME/velarx/config.toml" varlink 2>&1)
-    check "the daemon does not open it" 125 $?
-    check_match "the error names both drivers" 'was made with the storage driver "zfs", but composefs is asked for' "$out"
-    check_match "and says what to do" 'ask for "zfs", or remove the store' "$out"
-    check_match "and which store" "$WORKDIR/store" "$out"
-    # with nothing asked for, the store's own is wanted, and this build lacks it
-    sqlite3 "$WORKDIR/store/db.sqlite" "UPDATE store_settings SET value = 'zfs' WHERE key = 'driver'"
+    e2e_start_daemon
+    check "composefs starts" composefs "$(sh_ info --format '{{.Store.StorageDriver}}')"
+}
+
+@test "a store made with another driver is not opened" {
+    stop_daemon
+    local name
+    for name in vfs zfs; do
+        # a scratch store: its recorded driver is set by hand
+        rm -rf "$WORKDIR/other"
+        mkdir -p "$WORKDIR/other"
+        cp "$WORKDIR/store/db.sqlite" "$WORKDIR/other/db.sqlite"
+        sqlite3 "$WORKDIR/other/db.sqlite" "UPDATE store_settings SET value = '$name' WHERE key = 'driver'"
+        config_with ""
+        sed -i "s|^root = .*|root = \"$WORKDIR/other\"|" "$XDG_CONFIG_HOME/velarx/config.toml"
+        out=$("$BIN/velarx" --config "$XDG_CONFIG_HOME/velarx/config.toml" varlink 2>&1)
+        check "$name: the daemon does not open it" 125 $?
+        check_match "$name: the error names the driver and the store" "the store $WORKDIR/other was made with the storage driver \"$name\", and this velarx has only \"composefs\"" "$out"
+        check_match "$name: and says what to do" "use the velarx that made it, or remove the store" "$out"
+        out=$("$BIN/velarx" --config "$XDG_CONFIG_HOME/velarx/config.toml" image list 2>&1)
+        check "$name: a command that serves the engine itself does not open it" 125 $?
+        check_match "$name: with the same error" "was made with the storage driver \"$name\"" "$out"
+    done
+    # the database of the store of the file is as it was
     config_with ""
-    out=$("$BIN/velarx" --config "$XDG_CONFIG_HOME/velarx/config.toml" varlink 2>&1)
-    check "the daemon does not open it either" 125 $?
-    check_match "the store's driver is not one of the build's" 'was made with the storage driver "zfs", which this velarx does not have \(known: composefs, vfs\): use the velarx that made it, or remove the store' "$out"
-    out=$("$BIN/velarx" --config "$XDG_CONFIG_HOME/velarx/config.toml" --storage-driver composefs varlink 2>&1)
-    check "--storage-driver is the same" 125 $?
-    check_match "--storage-driver: the mismatch" 'was made with the storage driver "zfs", but composefs is asked for' "$out"
-    # the database is as it was: the store opens again with its driver
-    sqlite3 "$WORKDIR/store/db.sqlite" "UPDATE store_settings SET value = 'composefs' WHERE key = 'driver'"
     e2e_start_daemon
     check "the store opens with its own driver" composefs "$(sh_ info --format '{{.Store.StorageDriver}}')"
     check "the driver is recorded in the store" composefs "$(sqlite3 "$WORKDIR/store/db.sqlite" "SELECT value FROM store_settings WHERE key = 'driver'")"

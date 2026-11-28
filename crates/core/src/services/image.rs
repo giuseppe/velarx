@@ -214,7 +214,6 @@ pub struct ImageService {
     /// the root file systems of containers (`crate::storage_driver`).
     storage: Arc<dyn StorageDriver>,
     /// Which driver it is (`[storage] driver`, resolved against the store).
-    storage_kind: velarx_config::StorageDriverKind,
     /// What `[storage]` says of it (the driver is made again from these
     /// when they change).
     storage_options: ComposefsOptions,
@@ -223,9 +222,6 @@ pub struct ImageService {
     composefs_mode: Option<String>,
     /// `[storage] verity_chain`.
     verity_chain: velarx_config::VerityChain,
-    /// `[storage] fsverity_best_effort`: a driver that checks fs-verity at
-    /// pull only is accepted with the settings that enforce it.
-    verity_best_effort: bool,
     pull_config: velarx_config::PullConfig,
     push_config: velarx_config::PushConfig,
     /// `[[transports]]`: the processes that are the origin of a scheme
@@ -381,9 +377,7 @@ impl ImageService {
             Err(e) => warn!("Cannot lock the store: {e}"),
         }
 
-        // (the driver of the store replaces it: `with_driver`; the image
-        // server is the engine's own, `with_image_server`)
-        let storage_kind = velarx_config::StorageDriverKind::DEFAULT;
+        // (the image server is the engine's own, `with_image_server`)
         let storage_options = ComposefsOptions::new(storage_driver::ImageServer::new(
             velarx_base::spawn::binary(),
             staging_dir.with_file_name("run"),
@@ -409,11 +403,9 @@ impl ImageService {
             fsverity,
             store_verity: Arc::default(),
             storage,
-            storage_kind,
             storage_options,
             composefs_mode: None,
             verity_chain: velarx_config::VerityChain::Auto,
-            verity_best_effort: false,
             pull_config: velarx_config::PullConfig::default(),
             push_config: velarx_config::PushConfig::default(),
             transports: Arc::default(),
@@ -532,12 +524,6 @@ impl ImageService {
         self.verity_chain
     }
 
-    /// `[storage] fsverity_best_effort`.
-    pub fn with_verity_best_effort(mut self, best_effort: bool) -> Self {
-        self.verity_best_effort = best_effort;
-        self
-    }
-
     /// Whether the digests of the layers are checked at pull only (the driver
     /// cannot check them while a container runs, and the configuration
     /// accepts that): nothing is enforced at a start.
@@ -566,8 +552,7 @@ impl ImageService {
     /// What the driver of the store cannot do of what the configuration
     /// asks: the digests enforced (`fsverity_require`, `composefs_digests =
     /// "require"`, or `container`: the `--security-opt verity=enforce` of a
-    /// container) while the driver checks them at pull only, and the mode that
-    /// accepts that (`fsverity_best_effort`) is not set.
+    /// container) while the driver checks them at pull only.
     pub fn check_verity_request(&self, fsverity_require: bool, container: bool) -> ImageResult<()> {
         self.check_request(fsverity_require, container)
     }
@@ -588,7 +573,6 @@ impl ImageService {
                 self.storage.name(),
                 &velarx_graph::negotiate::Ask {
                     verity_enforced: enforced,
-                    verity_best_effort: self.verity_best_effort,
                     unprivileged: velarx_base::conf::rootless().unwrap_or(false),
                     ..Default::default()
                 },
@@ -596,18 +580,9 @@ impl ImageService {
             .map_err(ImageError::from)
     }
 
-    /// The storage driver of the store (`[storage] driver`, as the store
-    /// has it).
-    pub fn with_driver(mut self, kind: velarx_config::StorageDriverKind) -> Self {
-        self.storage_kind = kind;
-        self.remake_storage();
-        self
-    }
-
     /// The driver of the store, as the options of the service say.
     fn remake_storage(&mut self) {
-        self.storage =
-            storage_driver::open(self.storage_kind, self.parts(), &self.driver_options());
+        self.storage = storage_driver::open(self.parts(), &self.driver_options());
     }
 
     fn parts(&self) -> DriverParts {

@@ -125,9 +125,8 @@ pub struct GlobalArgs {
     #[arg(long, value_name = "PATH")]
     pub tmpdir: Option<PathBuf>,
 
-    /// The storage driver of the store (`composefs`; the one the store was
-    /// made with when none is given); `overlay`, the name reported for
-    /// it, is accepted and chooses nothing
+    /// The storage driver of the store: `composefs`, the only one (any
+    /// other name is an error)
     #[arg(long, value_name = "DRIVER")]
     pub storage_driver: Option<String>,
 
@@ -743,18 +742,7 @@ fn export_global_options(global: &GlobalArgs) {
         std::env::set_var(c::ENV_EVENTS_LOGGER, b);
     }
     if let Some(d) = &global.storage_driver {
-        match d.as_str() {
-            // (podman's default, and the graph driver velarx reports: it
-            // chooses nothing here; `vfs` is a driver of its own, chosen only
-            // when asked for)
-            "" | "overlay" => {}
-            name => match c::StorageDriverKind::parse(name) {
-                Ok(kind) => std::env::set_var(c::ENV_STORAGE_DRIVER, kind.name()),
-                Err(e) => refuse(format!(
-                    "--storage-driver {e}; overlay is accepted as podman's name and chooses nothing"
-                )),
-            },
-        }
+        std::env::set_var(c::ENV_STORAGE_DRIVER, d);
     }
     if let Some(dir) = &global.tmpdir {
         let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.clone());

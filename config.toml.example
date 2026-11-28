@@ -165,10 +165,9 @@ shutdown_timeout_secs = 30
 # The storage driver: "composefs", the only one (the files named by their
 # fs-verity digest and one EROFS image per layer, mounted as the root file
 # system of a container: a container costs the same whatever the size of its
-# image).  A store keeps the driver it was made with, recorded in its
-# database.  The command line says it with --storage-driver, which wins over
-# this file; any other name is an error (--storage-driver also takes
-# "overlay", the name reported for composefs, which chooses nothing).
+# image).  Any other value is an error, here, in --storage-driver and in
+# VELARX_STORAGE_DRIVER; so is opening a store that was made with another
+# driver.
 # driver = "composefs"
 # Enable fs-verity on the stored files (kernel 5.4+ and a file system that
 # has it); without it the files are not protected against changes
@@ -176,14 +175,6 @@ fsverity = true
 # Every file of the store must have fs-verity: a file whose fs-verity cannot
 # be enabled fails its pull, and a file without it is not served
 fsverity_require = false
-# A driver that checks fs-verity only when a layer is pulled cannot
-# enforce it while a container runs: with it, `fsverity_require`,
-# `composefs_digests = "require"` and `--security-opt verity=enforce` are an
-# error.  true accepts them as checks at pull (a file without fs-verity fails
-# the pull, a manifest that states no digest is refused), and nothing is
-# promised after: the copy of the layers a container runs on is not held to
-# the digests.  No effect with composefs, which enforces at run time
-fsverity_best_effort = false
 # The EROFS images of the layers of the containers of root mounted by the
 # kernel: "auto" where it can (root, a kernel that mounts them, a complete
 # image whose owners the user namespace maps), or "off": the monitor serves

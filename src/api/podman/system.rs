@@ -456,7 +456,7 @@ pub(crate) async fn system_record(state: &AppState) -> ApiResult<SystemRecord> {
     let (distribution, distribution_version, distribution_name) = os_release().await;
     let driver = state.image_service.storage();
     let mut store = StoreRecord {
-        storage_driver: cfg.storage.driver_kind().name().to_string(),
+        storage_driver: velarx_config::STORAGE_DRIVER.to_string(),
         graph_driver: driver.graph_name().to_string(),
         graph_status: driver.status().into_iter().collect(),
         config_file: match &cfg.source {

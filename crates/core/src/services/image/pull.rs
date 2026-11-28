@@ -2384,12 +2384,10 @@ mod stored_tests {
         // the answer is the driver's, not the engine's look at its rows: a
         // driver that has none of them (here: one that keeps its records
         // elsewhere) makes the pull fetch them, complete rows or not
-        let kind = velarx_config::StorageDriverKind::Composefs;
-        let mut service = service_of(&tmp, kind).await;
+        let mut service = service_of(&tmp).await;
         let stored = service.stored_layers(&keys, &config).await.unwrap();
         assert!(stored[0], "the driver of the same records has it");
         service.storage = storage_driver::open(
-            kind,
             DriverParts {
                 db: velarx_db::Database::open_in_memory().await.unwrap(),
                 store: service.file_store.clone(),
@@ -2405,11 +2403,8 @@ mod stored_tests {
         );
     }
 
-    /// An engine whose database has layer 1 complete, on the driver `kind`.
-    async fn service_of(
-        tmp: &tempfile::TempDir,
-        kind: velarx_config::StorageDriverKind,
-    ) -> ImageService {
+    /// An engine whose database has layer 1 complete.
+    async fn service_of(tmp: &tempfile::TempDir) -> ImageService {
         let db = velarx_db::Database::open_in_memory().await.unwrap();
         db.commit_layers(vec![commit(1, "{}", b"ts")], vec![])
             .await
@@ -2422,7 +2417,6 @@ mod stored_tests {
             velarx_storage::VerityMode::Off,
         )
         .unwrap()
-        .with_driver(kind)
     }
 }
 

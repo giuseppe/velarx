@@ -15,9 +15,9 @@
 //! conformance suite (`conformance`, a feature of this package): a new
 //! driver registers itself with a factory (`conformance`).
 //!
-//! The drivers are those of `velarx_config::StorageDriverKind`: the default
-//! `ComposefsDriver` (name `composefs`: the objects named by their fs-verity
-//! digest, a table of contents and a tar-split for each layer, one
+//! The driver is `ComposefsDriver`, the only one (name
+//! `velarx_config::STORAGE_DRIVER`, `composefs`: the objects named by their
+//! fs-verity digest, a table of contents and a tar-split for each layer, one
 //! reproducible EROFS image for each layer made at pull time, and the
 //! overlay, the kernel's for root and FUSE for the rest, the monitor makes of
 //! them).

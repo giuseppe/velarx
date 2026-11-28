@@ -55,7 +55,7 @@ teardown_file () {
 
 @test "podman's global options" {
     check "-v" "$("$BIN/velarx" --version)" "$("$SH" -v)"
-    G="--storage-driver overlay --root $WORKDIR/groot --runroot $WORKDIR/grun --tmpdir $WORKDIR/gtmp"
+    G="--root $WORKDIR/groot --runroot $WORKDIR/grun --tmpdir $WORKDIR/gtmp"
     # shellcheck disable=SC2086
     "$SH" $G image import "$WORKDIR/rootfs.tar" localhost/e2e-other:1 > /dev/null
     check "--root: an image in another store" 0 $?
@@ -69,6 +69,9 @@ teardown_file () {
     check "--tmpdir: the directory is made" 0 $?
     out=$("$SH" --storage-driver zfs images 2>&1)
     check "--storage-driver that is none of velarx's" 125 $?
+    out=$("$SH" --storage-driver vfs images 2>&1)
+    check "--storage-driver vfs: there is only composefs" 125 $?
+    check_match "--storage-driver vfs says so" 'the storage driver "vfs" is not available: this velarx has only "composefs"' "$out"
     out=$("$SH" --runtime nosuchruntime $G run --rm --network none localhost/e2e-other:1 true 2>&1)
     check "--runtime that is not there" 125 $?
     check_match "--runtime says so" "nosuchruntime.*not found" "$out"

@@ -2162,7 +2162,6 @@ mod tests {
         assert!(lacking.is_empty(), "the driver has it");
         // a driver that keeps its records elsewhere and has none of them
         service.storage = storage_driver::open(
-            service.storage_kind,
             DriverParts {
                 db: velarx_db::Database::open_in_memory().await.unwrap(),
                 store: service.file_store.clone(),
